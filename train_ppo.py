@@ -2046,7 +2046,14 @@ def run_training(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """统一 CLI 入口；无参数与 ``--train`` 都进入正式论文训练。"""
+
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config-check",
+        action="store_true",
+        help="只解析并检查 config.yaml，不启动任何训练。",
+    )
     parser.add_argument("--interface-smoke", action="store_true")
     parser.add_argument("--learning-check", action="store_true")
     parser.add_argument("--learning-check-output", default=None)
@@ -2054,20 +2061,56 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args(argv)
-    if args.learning_check and args.train:
-        parser.error("--learning-check与--train不能同时使用。")
+
+    mode_flags = {
+        "--config-check": bool(args.config_check),
+        "--interface-smoke": bool(args.interface_smoke),
+        "--learning-check": bool(args.learning_check),
+        "--train": bool(args.train),
+    }
+    selected_modes = [name for name, selected in mode_flags.items() if selected]
+    if len(selected_modes) > 1:
+        parser.error(
+            "运行模式互斥，不能同时使用：" + ", ".join(selected_modes)
+        )
+
+    if args.learning_check_output is not None and not args.learning_check:
+        parser.error("--learning-check-output只能与--learning-check一起使用。")
+    if args.learning_check and (
+        args.total_timesteps is not None or args.output_dir is not None
+    ):
+        parser.error("--learning-check不能与--total-timesteps或--output-dir一起使用。")
+    if args.interface_smoke and (
+        args.total_timesteps is not None or args.output_dir is not None
+    ):
+        parser.error("--interface-smoke不能与--total-timesteps或--output-dir一起使用。")
+    if args.config_check and (
+        args.total_timesteps is not None or args.output_dir is not None
+    ):
+        parser.error("--config-check不能与--total-timesteps或--output-dir一起使用。")
+
+    if args.config_check:
+        # 配置检查是唯一的显式“只检查不训练”入口；默认入口不能走这里。
+        load_config()
+        print(
+            json.dumps(
+                {"config_parse": "PASS", "training_started": False},
+                ensure_ascii=False,
+            )
+        )
+        return
     if args.learning_check:
         result = run_learning_check(output_dir=args.learning_check_output)
         print(json.dumps(_json_safe(result), ensure_ascii=False, indent=2))
         return
-    if args.train:
-        run_training(total_timesteps=args.total_timesteps, output_dir=args.output_dir)
+    if args.interface_smoke:
+        print(json.dumps(_json_safe(run_interface_smoke()), ensure_ascii=False, indent=2))
         return
-    result = run_interface_smoke() if args.interface_smoke else {
-        "config_parse": "PASS",
-        "training_started": False,
-    }
-    print(result)
+
+    # 无参数和显式 --train 共用唯一正式论文训练实现；默认读取 config.yaml
+    # 中的 total_timesteps/eval_freq，并在 pipeline 内完成 preflight、validation、
+    # best model + VecNormalize 保存、final test 和正式主图生成。
+    run_training(total_timesteps=args.total_timesteps, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":

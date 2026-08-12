@@ -2300,3 +2300,14 @@ base HEAD = 3dcf672
 implementation commit SHA = `5d3494cff3b076a899462c21804bf091047dda0c`
 push origin main = PASS
 origin/main SHA = `5d3494cff3b076a899462c21804bf091047dda0c`
+
+## 2026-08-12：默认正式训练入口修正
+
+`train_ppo.py` 的 CLI 现在只有显式 `--config-check` 才执行配置检查后退出。
+无参数运行与 `--train` 统一调用同一个 `run_training()` 正式论文训练 pipeline，
+继续使用 config.yaml 中的 25600 steps、5120 eval frequency、validation 选优、
+best model + VecNormalize、best 后 final test 和四张正式主图输出。
+
+`--interface-smoke` 和 `--learning-check` 保留原入口；各运行模式互斥，非法组合统一
+通过 `parser.error` 拒绝。CLI monkeypatch dispatch、冲突参数、py_compile 和实际
+`--config-check` 均通过，本轮 `model.learn` 调用次数为 0。
