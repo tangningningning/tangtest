@@ -554,6 +554,46 @@ class VehicleRoleManager:
     update = assign
     select_roles = assign
 
+    def fixed_episode_assign(
+        self,
+        task_vehicle_ids: Sequence[str],
+        service_vehicle_ids: Sequence[str],
+        *,
+        all_vehicle_ids: Sequence[str] | None = None,
+        slot: int | None = None,
+    ) -> dict[str, Any]:
+        """在正式 episode 内固定角色，不执行离开后的 replacement/remap。"""
+
+        task_ids = tuple(dict.fromkeys(str(item) for item in task_vehicle_ids))
+        service_ids = tuple(dict.fromkeys(str(item) for item in service_vehicle_ids))
+        if len(task_ids) != self.num_task_vehicles:
+            raise ValueError("fixed_episode task vehicle 数量与配置不一致")
+        if len(service_ids) != self.num_service_vehicles:
+            raise ValueError("fixed_episode service vehicle 数量与配置不一致")
+        if set(task_ids) & set(service_ids):
+            raise ValueError("fixed_episode task/service vehicle 不能重叠")
+        all_ids = tuple(dict.fromkeys(str(item) for item in (all_vehicle_ids or ())))
+        selected = set(task_ids) | set(service_ids)
+        background = tuple(item for item in all_ids if item not in selected)
+        result = {
+            "task_vehicle_ids": task_ids,
+            "service_vehicle_ids": service_ids,
+            "background_vehicle_ids": background,
+            "role_change_events": tuple(),
+            "num_task_vehicles": len(task_ids),
+            "num_service_vehicles": len(service_ids),
+            "task_join_count": 0,
+            "task_leave_count": 0,
+            "service_replace_count": 0,
+            "slot": slot,
+        }
+        self._previous_roles = {
+            "task_vehicle_ids": task_ids,
+            "service_vehicle_ids": service_ids,
+            "background_vehicle_ids": background,
+        }
+        return result
+
 
 def resolve_vehicle_roles(
     config: Mapping[str, Any],
@@ -563,6 +603,34 @@ def resolve_vehicle_roles(
     """Return deterministic ``(service_vehicle_ids, task_vehicle_ids)`` for a scene."""
 
     resolved = config.get("_resolved")
+    # 正式场景可显式固定研究车辆；优先于历史 stable-priority 选择，避免 trace
+    # 中的背景车辆进入 task workload 后在 episode 内发生身份错位。
+    roles = config.get("vehicle_roles", {})
+    configured_service_ids = VehicleRoleManager._role_ids(roles, "service_vehicle_ids")
+    configured_task_ids = VehicleRoleManager._role_ids(roles, "task_vehicle_ids")
+    if configured_service_ids or configured_task_ids:
+        if all_vehicle_ids is None:
+            resolved_all_ids = resolved.get("all_vehicle_ids") if isinstance(resolved, Mapping) else None
+            if resolved_all_ids is not None:
+                complete_ids = tuple(dict.fromkeys(str(item) for item in resolved_all_ids))
+            else:
+                sumo = _section(config, "sumo")
+                configuration_file = sumo.get("configuration_file")
+                if configuration_file is None:
+                    raise ValueError("SUMO 配置缺失，无法解析场景车辆集合")
+                complete_ids = _discover_vehicle_ids_from_routes(configuration_file)
+        else:
+            complete_ids = tuple(dict.fromkeys(str(item) for item in all_vehicle_ids))
+        task_count, service_count = _role_counts(config)
+        if len(configured_service_ids) != service_count or len(configured_task_ids) != task_count:
+            raise ValueError("vehicle_roles 显式角色 ID 数量与配置不一致")
+        missing = sorted(
+            (set(configured_service_ids) | set(configured_task_ids)) - set(complete_ids)
+        )
+        if missing:
+            raise ValueError(f"vehicle_roles 显式角色 ID 不在场景车辆集合中: {missing}")
+        return configured_service_ids, configured_task_ids
+
     if all_vehicle_ids is None and isinstance(resolved, Mapping):
         service_value = resolved.get("service_vehicle_ids")
         task_value = resolved.get("task_vehicle_ids")
@@ -649,9 +717,14 @@ def load_config(path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH) -> dict[str,
         ).strip():
             raise ValueError("mobility.source=trace时必须提供mobility.trace_root。")
     all_vehicle_ids = _discover_vehicle_ids_from_routes(configuration_file)
-    assignment = VehicleRoleManager(config).assign(all_vehicle_ids, slot=0)
-    service_ids = assignment["service_vehicle_ids"]
-    task_ids = assignment["task_vehicle_ids"]
+    service_ids, task_ids = resolve_vehicle_roles(config, all_vehicle_ids=all_vehicle_ids)
+    assignment = {
+        "service_vehicle_ids": service_ids,
+        "task_vehicle_ids": task_ids,
+        "background_vehicle_ids": tuple(
+            item for item in all_vehicle_ids if item not in set(service_ids) | set(task_ids)
+        ),
+    }
     if len(task_ids) < task_vehicle_count:
         raise ValueError(
             "SUMO场景可用车辆不足以满足vehicle_roles.num_task_vehicles。"
@@ -1556,6 +1629,12 @@ class MobilityAwarePopularityPredictor:
         return self._last_observed_slot
 
     @property
+    def latest_observed_request_slot(self) -> int:
+        """供环境因果审计使用的最新已登记 request slot。"""
+
+        return self._last_observed_slot
+
+    @property
     def observed_request_slots(self) -> tuple[int, ...]:
         return tuple(self._observed_request_slots)
 
@@ -1879,8 +1958,8 @@ def load_trajectory_npz(
     if result["speeds"].shape != result["positions"].shape[:2]:
         raise ValueError("轨迹speeds必须是(T,V)。")
     result["vehicle_ids"] = tuple(str(item) for item in result["vehicle_ids"])
-    # 离线轨迹同样以完整vehicle_ids作为候选全集；角色由稳定优先级确定，
-    # 具体slot的当前角色由VehicleRoleManager根据当前状态更新。
+    # 离线轨迹同样以完整vehicle_ids作为候选全集；正式 fixed_episode 使用配置中的
+    # 显式研究车辆 ID，历史动态模式才由 VehicleRoleManager 按当前状态更新角色。
     trajectory_config = config or load_config()
     service_ids, task_ids = resolve_vehicle_roles(
         trajectory_config, all_vehicle_ids=result["vehicle_ids"]
@@ -1969,7 +2048,10 @@ def build_gru_inputs(
     return result
 
 
-def generate_workload(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def generate_workload(
+    config: Mapping[str, Any] | None = None,
+    episode_seed: int | None = None,
+) -> dict[str, Any]:
     """按论文请求和Zipf语义生成最小工作负载。
 
     该函数只生成数据，不执行任务、计算 reward 或进行任何优化。
@@ -1986,10 +2068,33 @@ def generate_workload(config: Mapping[str, Any] | None = None) -> dict[str, Any]
     slot_count = int(simulation["slot_count"])
     _, task_ids = resolve_vehicle_roles(loaded_config)
     service_count = int(services["count"])
-    arrival_rng = np.random.default_rng(int(workload["arrival_seed"]))
-    popularity_rng = np.random.default_rng(int(workload["popularity_seed"]))
-    request_rng = np.random.default_rng(int(workload["service_request_seed"]))
-    load_rng = np.random.default_rng(int(workload["task_input_seed"]))
+    if episode_seed is None:
+        resolved_seeds = {
+            "resolved_arrival_seed": int(workload["arrival_seed"]),
+            "resolved_popularity_seed": int(workload["popularity_seed"]),
+            "resolved_service_request_seed": int(workload["service_request_seed"]),
+            "resolved_task_input_seed": int(workload["task_input_seed"]),
+        }
+        arrival_rng = np.random.default_rng(resolved_seeds["resolved_arrival_seed"])
+        popularity_rng = np.random.default_rng(resolved_seeds["resolved_popularity_seed"])
+        request_rng = np.random.default_rng(resolved_seeds["resolved_service_request_seed"])
+        load_rng = np.random.default_rng(resolved_seeds["resolved_task_input_seed"])
+    else:
+        root = np.random.SeedSequence(int(episode_seed))
+        children = root.spawn(4)
+        seed_names = (
+            "resolved_arrival_seed",
+            "resolved_popularity_seed",
+            "resolved_service_request_seed",
+            "resolved_task_input_seed",
+        )
+        resolved_seeds = {
+            name: int(child.generate_state(1, dtype=np.uint32)[0])
+            for name, child in zip(seed_names, children)
+        }
+        arrival_rng, popularity_rng, request_rng, load_rng = tuple(
+            np.random.default_rng(child) for child in children
+        )
 
     change_interval = int(workload["popularity_change_interval_slots"])
     if change_interval <= 0:
@@ -2057,6 +2162,8 @@ def generate_workload(config: Mapping[str, Any] | None = None) -> dict[str, Any]
     if times.shape != (slot_count,):
         raise ValueError("simulation时间范围与slot_count不一致。")
     return {
+        "episode_seed": None if episode_seed is None else int(episode_seed),
+        **resolved_seeds,
         "times": times,
         "task_vehicle_ids": task_ids,
         "task_arrivals": arrivals,

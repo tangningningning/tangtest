@@ -50,6 +50,10 @@ vehicle_roles:
   # SUMO背景交通车辆不计入研究车辆数量。角色身份仍使用SUMO原始vehicle_id。
   num_task_vehicles: 8
   num_service_vehicles: 2
+  # 正式 PPO/Proposed episode 内固定研究车辆身份，避免 observation/action 与 workload 行错位。
+  role_update_mode: fixed_episode
+  service_vehicle_ids: [sv_000, sv_001]
+  task_vehicle_ids: [tv_000, tv_001, tv_002, tv_003, tv_004, tv_005, tv_006, tv_007]
   # 服务车辆仅使用当前状态计算驻留和覆盖评分；后续可替换评分实现。
   service_score_alpha: 0.5
   service_v2v_range_m: 300.0

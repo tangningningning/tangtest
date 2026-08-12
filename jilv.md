@@ -2209,3 +2209,93 @@ temporary test outputs removed = YES
 model.learn calls = 0
 formal training restarted = NO
 ```
+
+## 2026-08-12：正式训练前实现一致性修复
+
+本轮只修复 `adaptive_cache_mec` 正式训练前的实现一致性问题，未启动正式或长步数 PPO，
+`model.learn` 调用次数为 0。第三章 P0、C1-C16、reward、Matching、KKT、0-1 knapsack
+缓存求解结构、有限候选 UAV 求解结构及物理场景参数均保持不变，parameter drift = 0。
+
+### 基础场景与角色
+
+```text
+Task = 8
+SV = 2
+RSU = 2
+UAV = 2
+F = 10
+cache nodes = 6
+action space = MultiBinary(8)
+observation dimension = 95
+role mode = fixed_episode
+task IDs = tv_000 ... tv_007
+SV IDs = sv_000, sv_001
+silent replacement/remap = NO
+```
+
+固定角色 trace 预检通过：每个 episode 内研究任务车和服务车 ID、角色及 action layout
+不漂移；背景车辆不进入 workload。服务目录固定为 10 类，episode seed 只改变 workload
+随机流，不改变服务目录和角色映射。
+
+### Seed、trace 与因果性
+
+```text
+formal training episodes = 256
+training reset reserve = 1
+training traces = 20260811 ... 20261067
+validation traces = 20271811 ... 20271815
+test traces = 20281811 ... 20281820
+total required traces = 272
+missing seeds = []
+```
+
+25600 environment steps、100-slot episode 的容量按
+`floor(effective_env_steps / horizon) + 1` 计算，最后 1 条仅用于 DummyVecEnv
+terminal 后的 automatic reset，不计入正式完成 episode。训练、验证、测试 seed 语义分别为
+sequential、fixed、fixed；workload 的 resolved seeds 已写入诊断。
+
+请求、轨迹和 mobility 的未来信息诊断均来自实际运行时 origin/observation slot，
+不是硬编码。正常 smoke 结果为：
+
+```text
+future_request_leakage = 0
+future_trajectory_leakage = 0
+future_mobility_leakage = 0
+```
+
+### 通信、指标与正式入口
+
+SV/RSU/UAV 正式价值统一调用现有物理通信速率、任务执行和任务效用模型；300 m 半径
+仅保留为覆盖展示/辅助字段，不替代正式物理价值。实际执行仍使用当前时隙真实位置、
+真实请求、Matching 和 C13-C16 KKT 资源分配。
+
+指标已分离为：edge cache availability（到达任务可由边缘缓存物理服务的比例）、
+edge execution rate（已完成任务中的 SV/RSU/UAV 执行比例）和 non-cloud rate
+（已完成任务中的非 Cloud 执行比例），不再互相替代。
+
+正式入口只在用户显式执行 `--train` 时调用一次 `model.learn`。callback 仅按
+`eval_freq = 5120` 做 validation，按 validation 平均 raw `G` 选择 best checkpoint，
+并同时保存匹配的 PPO 与 VecNormalize；test 只在 best 选择之后运行。Figure 1 使用
+training raw `G` per slot，Figure 2 使用 best-model final test，四种 PNG/PDF 绘图
+smoke 均通过。
+
+### 本轮最小验收
+
+```text
+py_compile = PASS
+seed reproducibility/difference = PASS
+fixed-role and action-layout test = PASS
+trace preflight = PASS
+SB3 check_env/startup smoke = PASS
+causality diagnostics smoke = PASS
+communication physical-value consistency = PASS
+metric definition test = PASS
+formal callback best-selection mock = PASS
+plot smoke = PASS
+model.learn calls = 0
+formal training started = NO
+base HEAD = 3dcf672
+```
+
+commit SHA and `origin/main` push result are recorded in the final Git handoff after the
+single consistency-fix commit is created.

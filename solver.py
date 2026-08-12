@@ -73,6 +73,8 @@ class SolverResult:
     ground_service_gap: float
     # 每个任务的可行执行列集合。
     feasible_nodes: tuple[tuple[int, ...], ...]
+    # 到达任务在 Matching/KKT 前是否存在可缓存且物理可达的边缘节点。
+    edge_cache_available: np.ndarray
     # 任务到执行列的 0/1 assignment 矩阵。
     assignment: np.ndarray
     # matching 最终选择的节点名称，未到达任务为 None。
@@ -463,6 +465,95 @@ def _representative_workload(environment: MECEnvironment) -> tuple[float, float]
     return input_bits, cpu_cycles
 
 
+def _build_physical_predicted_edge_benefit(
+    *,
+    node_positions: np.ndarray,
+    vehicle_positions: np.ndarray,
+    node_types: Sequence[NodeType | str],
+    environment: MECEnvironment,
+    input_bits: float,
+    cpu_cycles: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """用正式通信/执行物理模型计算预测边缘收益和可达性。
+
+    预测阶段只使用代表性任务规模与未来位置，不读取未来真实请求；SV、RSU、UAV
+    分别调用环境中的实际速率函数，避免把辅助覆盖半径当成正式通信可达条件。
+    """
+
+    kinds = tuple(_node_kind(item) for item in node_types)
+    node_count, horizon, _ = node_positions.shape
+    vehicle_count = vehicle_positions.shape[0]
+    edge_benefit = np.zeros((node_count, vehicle_count, horizon), dtype=float)
+    physically_available = np.zeros(
+        (node_count, vehicle_count, horizon), dtype=bool
+    )
+    try:
+        cloud_execution = environment.execute_task(
+            NodeType.CLOUD,
+            arrived=True,
+            input_bits=input_bits,
+            cpu_cycles=cpu_cycles,
+        )
+        cloud_utility = float(
+            environment.task_utility(
+                np.asarray([True]),
+                np.asarray([cloud_execution["completion_delay_s"]]),
+                np.asarray([cloud_execution["vehicle_energy_j"]]),
+            )["total_task_utility"]
+        )
+    except (ValueError, FloatingPointError, KeyError):
+        cloud_utility = 0.0
+
+    for node_index, kind in enumerate(kinds):
+        for vehicle_index in range(vehicle_count):
+            for horizon_index in range(horizon):
+                vehicle_position = vehicle_positions[vehicle_index, horizon_index]
+                node_position = node_positions[node_index, horizon_index]
+                try:
+                    if kind is NodeType.UAV:
+                        rate = environment.uav_rate(
+                            vehicle_position,
+                            node_position,
+                            bandwidth_fraction=1.0,
+                        )
+                    else:
+                        rate = environment.ground_rate(
+                            vehicle_position,
+                            node_position,
+                            kind,
+                            bandwidth_fraction=1.0,
+                        )
+                    if not math.isfinite(float(rate)) or float(rate) <= 0.0:
+                        continue
+                    physically_available[node_index, vehicle_index, horizon_index] = True
+                    kwargs: dict[str, Any] = {
+                        "arrived": True,
+                        "input_bits": input_bits,
+                        "cpu_cycles": cpu_cycles,
+                        "compute_resource_fraction": 1.0,
+                        "bandwidth_fraction": 1.0,
+                        "vehicle_position": vehicle_position,
+                    }
+                    if kind is NodeType.UAV:
+                        kwargs["uav_position"] = node_position
+                    else:
+                        kwargs["node_position"] = node_position
+                    edge_execution = environment.execute_task(kind, **kwargs)
+                    edge_utility = float(
+                        environment.task_utility(
+                            np.asarray([True]),
+                            np.asarray([edge_execution["completion_delay_s"]]),
+                            np.asarray([edge_execution["vehicle_energy_j"]]),
+                        )["total_task_utility"]
+                    )
+                    edge_benefit[node_index, vehicle_index, horizon_index] = max(
+                        0.0, edge_utility - cloud_utility
+                    )
+                except (ValueError, FloatingPointError, KeyError):
+                    continue
+    return edge_benefit, physically_available
+
+
 def _prepare_predicted_cache_utility(
     *,
     cache_prediction: Mapping[str, Any] | None,
@@ -535,6 +626,9 @@ def _prepare_predicted_cache_utility(
         horizon_weights = horizon_weights / total_weight
 
     edge_benefit = np.ones((node_count, vehicle_count, horizon), dtype=float)
+    physical_available = np.zeros(
+        (node_count, vehicle_count, horizon), dtype=bool
+    )
     raw_node_positions = (
         None
         if not isinstance(cache_prediction, Mapping)
@@ -559,59 +653,23 @@ def _prepare_predicted_cache_utility(
     )
     if have_positions:
         input_bits, cpu_cycles = _representative_workload(environment)
-        try:
-            cloud_execution = environment.execute_task(
-                NodeType.CLOUD,
-                arrived=True,
-                input_bits=input_bits,
-                cpu_cycles=cpu_cycles,
-            )
-            cloud_utility = float(
-                environment.task_utility(
-                    np.asarray([True]),
-                    np.asarray([cloud_execution["completion_delay_s"]]),
-                    np.asarray([cloud_execution["vehicle_energy_j"]]),
-                )["total_task_utility"]
-            )
-        except (ValueError, FloatingPointError, KeyError):
-            cloud_utility = 0.0
-        for node_index, kind in enumerate(kinds):
-            for vehicle_index in range(vehicle_count):
-                for horizon_index in range(horizon):
-                    if coverage[node_index, vehicle_index, horizon_index] <= 0.0:
-                        edge_benefit[node_index, vehicle_index, horizon_index] = 0.0
-                        continue
-                    try:
-                        kwargs: dict[str, Any] = {
-                            "arrived": True,
-                            "input_bits": input_bits,
-                            "cpu_cycles": cpu_cycles,
-                            "compute_resource_fraction": 1.0,
-                            "bandwidth_fraction": 1.0,
-                            "vehicle_position": vehicle_positions[vehicle_index, horizon_index],
-                        }
-                        if kind is NodeType.UAV:
-                            kwargs["uav_position"] = node_positions[node_index, horizon_index]
-                        else:
-                            kwargs["node_position"] = node_positions[node_index, horizon_index]
-                        edge_execution = environment.execute_task(kind, **kwargs)
-                        edge_utility = float(
-                            environment.task_utility(
-                                np.asarray([True]),
-                                np.asarray([edge_execution["completion_delay_s"]]),
-                                np.asarray([edge_execution["vehicle_energy_j"]]),
-                            )["total_task_utility"]
-                        )
-                        edge_benefit[node_index, vehicle_index, horizon_index] = max(
-                            0.0, edge_utility - cloud_utility
-                        )
-                    except (ValueError, FloatingPointError, KeyError):
-                        edge_benefit[node_index, vehicle_index, horizon_index] = 0.0
+        edge_benefit, physical_available = _build_physical_predicted_edge_benefit(
+            node_positions=node_positions,
+            vehicle_positions=vehicle_positions,
+            node_types=kinds,
+            environment=environment,
+            input_bits=input_bits,
+            cpu_cycles=cpu_cycles,
+        )
 
     def evaluate(cache: np.ndarray) -> float:
         # shape: node × vehicle × service × horizon; max over nodes models the
         # best available edge service and suppresses duplicate benefit in overlap.
-        available = coverage[:, :, np.newaxis, :] > 0.0
+        available = (
+            physical_available[:, :, np.newaxis, :]
+            if have_positions
+            else coverage[:, :, np.newaxis, :] > 0.0
+        )
         cached = cache[:, np.newaxis, :, np.newaxis] > 0.0
         covered_benefit = np.where(
             available & cached,
@@ -897,6 +955,7 @@ def _ground_service_gap_hotspots(
     cache_prediction: Mapping[str, Any] | None,
     node_types: Sequence[NodeType | str],
     *,
+    environment: MECEnvironment | None = None,
     max_hotspots: int = 3,
 ) -> tuple[float, tuple[np.ndarray, ...]]:
     """用未来服务需求乘地面服务缺口生成少量热点评估位置。"""
@@ -904,12 +963,16 @@ def _ground_service_gap_hotspots(
     if not isinstance(cache_prediction, Mapping):
         return 0.0, tuple()
     raw_coverage = cache_prediction.get("predicted_coverage")
+    raw_node_positions = cache_prediction.get("node_positions_m")
     raw_positions = cache_prediction.get("vehicle_positions_m")
     raw_preferences = cache_prediction.get("vehicle_preferences")
     vehicle_ids = tuple(str(item) for item in cache_prediction.get("vehicle_ids", ()))
     if raw_coverage is None or raw_positions is None or not isinstance(raw_preferences, Mapping):
         return 0.0, tuple()
     coverage = np.asarray(raw_coverage, dtype=float)
+    node_positions = (
+        None if raw_node_positions is None else np.asarray(raw_node_positions, dtype=float)
+    )
     vehicle_positions = np.asarray(raw_positions, dtype=float)
     if coverage.ndim != 3 or vehicle_positions.ndim != 3:
         return 0.0, tuple()
@@ -936,9 +999,30 @@ def _ground_service_gap_hotspots(
         (vehicle_positions.shape[0], vehicle_positions.shape[1], current_cache.shape[1]),
         dtype=bool,
     )
+    physical_available = None
+    if (
+        environment is not None
+        and node_positions is not None
+        and node_positions.shape == (node_count, vehicle_positions.shape[1], 2)
+        and np.all(np.isfinite(node_positions))
+        and np.all(np.isfinite(vehicle_positions))
+    ):
+        input_bits, cpu_cycles = _representative_workload(environment)
+        _, physical_available = _build_physical_predicted_edge_benefit(
+            node_positions=node_positions,
+            vehicle_positions=vehicle_positions,
+            node_types=node_types,
+            environment=environment,
+            input_bits=input_bits,
+            cpu_cycles=cpu_cycles,
+        )
     for node_index in ground_indices:
         served |= (
-            (coverage[node_index] > 0.0)[:, :, np.newaxis]
+            (
+                physical_available[node_index]
+                if physical_available is not None
+                else coverage[node_index] > 0.0
+            )[:, :, np.newaxis]
             & (current_cache[node_index] > 0.0)[np.newaxis, np.newaxis, :]
         )
     # ground_service_gap[v,h] 只看预测请求偏好中没有被 SV/RSU 缓存服务的部分。
@@ -1023,6 +1107,7 @@ def _demand_uav_candidate_sets(
     cache_prediction: Mapping[str, Any] | None,
     node_types: Sequence[NodeType | str],
     *,
+    environment: MECEnvironment,
     max_speed_mps: float,
     slot_duration_s: float,
     region: tuple[float, float, float, float],
@@ -1034,6 +1119,7 @@ def _demand_uav_candidate_sets(
         current_cache,
         cache_prediction,
         node_types,
+        environment=environment,
         max_hotspots=max_hotspots,
     )
     hotspots: list[np.ndarray] = []
@@ -1130,6 +1216,7 @@ def select_triggered_uav_positions(
         old_cache,
         cache_prediction,
         kinds,
+        environment=environment,
         max_speed_mps=max_speed,
         slot_duration_s=slot_duration,
         region=region_values,
@@ -2205,6 +2292,16 @@ def solve_slot(
         )
         for task, nodes in enumerate(feasible)
     )
+    edge_cache_available = np.asarray(
+        [
+            bool(
+                arrivals[task]
+                and any(node in service for node in nodes)
+            )
+            for task, nodes in enumerate(feasible)
+        ],
+        dtype=bool,
+    )
 
     computation = config["computation"]
     communication = config["communication"]
@@ -2334,6 +2431,7 @@ def solve_slot(
         uav_candidate_count=int(uav_result["uav_candidate_count"]),
         ground_service_gap=float(uav_result["ground_service_gap"]),
         feasible_nodes=feasible,
+        edge_cache_available=_readonly(edge_cache_available, dtype=bool),
         assignment=_readonly(matching["assignment"]),
         execution_nodes=tuple(matching["execution_nodes"]),
         compute_allocations=_readonly(matching["compute_allocations"]),

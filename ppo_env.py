@@ -86,6 +86,7 @@ class AdaptiveCachePPOEnv(_EnvBase):
         self._episode_index = 0
         self._last_episode_seed: int | None = None
         self._needs_reset = True
+        self._reset_action_layout: dict[str, Any] | None = None
 
         config = environment.config
         service_count = int(config["services"]["count"])
@@ -165,6 +166,7 @@ class AdaptiveCachePPOEnv(_EnvBase):
         layout = self.environment.action_layout
         if int(layout["action_length"]) != int(self.action_space.shape[0]):
             raise RuntimeError("reset后的节点布局与MultiBinary维度不一致。")
+        self._reset_action_layout = layout
         observation = self._observation()
         self._needs_reset = False
         return observation, {
@@ -181,6 +183,8 @@ class AdaptiveCachePPOEnv(_EnvBase):
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         if self._needs_reset:
             raise RuntimeError("PPO环境必须先调用reset()。")
+        if self._reset_action_layout is not None and self.action_layout != self._reset_action_layout:
+            raise RuntimeError("action_layout changed within a fixed episode")
         action_array = np.asarray(action, dtype=np.int8)
         if not self.action_space.contains(action_array):
             raise ValueError("PPO动作必须满足MultiBinary(M+U)契约。")
@@ -203,6 +207,8 @@ class AdaptiveCachePPOEnv(_EnvBase):
             )
         )
         observation = self._observation()
+        if self._reset_action_layout is not None and self.action_layout != self._reset_action_layout:
+            raise RuntimeError("action_layout changed within a fixed episode")
         info.update(
             {
                 "ppo_raw_reward": float(reward),
@@ -289,10 +295,13 @@ def runtime_diagnostics(
     except (KeyError, TypeError, ValueError, FloatingPointError):
         finite = False
         capacity_violations += 1
+    prediction = getattr(environment, "last_prediction_diagnostics", {})
+    mobility = getattr(environment, "mobility_diagnostics", {})
+    base_info = info or {}
     return {
-        "future_request_leakage": 0,
-        "future_trajectory_leakage": 0,
-        "future_mobility_leakage": 0,
+        "future_request_leakage": int(prediction.get("future_request_leakage", 0)),
+        "future_trajectory_leakage": int(prediction.get("future_trajectory_leakage", 0)),
+        "future_mobility_leakage": int(mobility.get("future_access_count", 0)),
         "capacity_violations": capacity_violations,
         "compute_violations": compute_violations,
         "bandwidth_violations": bandwidth_violations,
@@ -300,10 +309,10 @@ def runtime_diagnostics(
         "uav_region_violations": region_violations,
         "uav_safety_violations": safety_violations,
         "uav_violations": speed_violations + region_violations + safety_violations,
-        "invalid_service_ids": 0,
-        "invalid_node_ids": 0,
+        "invalid_service_ids": int(base_info.get("invalid_service_ids", 0)),
+        "invalid_node_ids": int(base_info.get("invalid_node_ids", 0)),
         "nan_inf_count": int(not finite),
-        "kkt_failure_count": int((info or {}).get("kkt_failure_count", 0)),
+        "kkt_failure_count": int(base_info.get("kkt_failure_count", 0)),
     }
 
 

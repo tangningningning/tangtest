@@ -1190,3 +1190,16 @@ Source: 11.pdf p.28-32
 - 不得用 Hungarian、stable marriage 或 max-weight matching 替换 transfer-exchange matching。
 - 不得在 reward 中加入论文没有定义的重复 cache/UAV 惩罚。
 - 不得使用旧工程、GitHub 或“合理推断”补齐论文未定义的理论机制。
+
+## 19. 正式 PPO 场景角色与预测通信一致性
+
+正式基础场景固定为 8 辆任务车、2 辆服务车、2 个 RSU、2 个 UAV 和 10 类服务。
+`vehicle_roles.role_update_mode=fixed_episode` 时，研究车辆 ID 在整个 episode 内固定为
+配置中的 `tv_000`--`tv_007` 与 `sv_000`、`sv_001`。背景交通车辆不进入 workload；若离线
+trace 中任一固定研究车辆在 100 个优化 slot 内不活跃，trace 预检直接失败，不执行静默
+replacement、角色 remap 或 action layout 漂移。
+
+预测辅助配置可以保留 `service_v2v_range_m` 作为覆盖展示/辅助字段，但正式 SV、RSU、UAV
+缓存边际收益、UAV 候选评分和地面服务缺口必须调用现有物理通信速率、任务执行和任务效用
+函数。因而统一的 300 m 半径不决定正式配置价值；实际任务执行仍使用当前时隙真实位置、
+真实请求、Matching 和 C13--C16 KKT 资源分配。

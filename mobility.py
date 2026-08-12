@@ -441,6 +441,41 @@ class TraceMobilityProvider(MobilityProvider):
             }
         return states
 
+    def validate_fixed_episode_roles(
+        self,
+        vehicle_ids: Sequence[str],
+        *,
+        slot_count: int | None = None,
+    ) -> dict[str, tuple[int, ...]]:
+        """只读 active mask，检查 fixed_episode 角色覆盖整个优化区间。"""
+
+        selected = tuple(dict.fromkeys(str(item) for item in vehicle_ids))
+        missing_ids = [item for item in selected if item not in self._columns]
+        if missing_ids:
+            raise ValueError(
+                "trace incompatible with fixed_episode roles; missing vehicle IDs: "
+                f"{missing_ids}"
+            )
+        count = self._times.size if slot_count is None else int(slot_count)
+        if count <= 0 or count > self._times.size:
+            raise ValueError("fixed_episode trace slot_count 超出 trace 范围")
+        active = np.asarray(self._archive["active"][:count], dtype=bool)
+        incompatible: dict[str, tuple[int, ...]] = {}
+        for vehicle_id in selected:
+            column = self._columns[vehicle_id]
+            inactive = tuple(int(item) for item in np.flatnonzero(~active[:, column]))
+            if inactive:
+                incompatible[vehicle_id] = inactive
+        if incompatible:
+            details = "; ".join(
+                f"Fixed research vehicle {vehicle_id} inactive at slots: {list(slots)}"
+                for vehicle_id, slots in incompatible.items()
+            )
+            raise ValueError(
+                "trace incompatible with fixed_episode roles: " + details
+            )
+        return incompatible
+
     def states_at(self, slot_index: int) -> dict[str, dict[str, Any]]:
         index = int(slot_index)
         same_slot = index == self._current_slot

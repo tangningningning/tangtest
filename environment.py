@@ -700,6 +700,14 @@ class MECEnvironment:
         self._role_manager: Any | None = None
         self._role_state: dict[str, Any] = {}
         self._prediction_origin_slot: int | None = None
+        self._episode_seed: int | None = None
+        self._role_update_mode = "dynamic"
+        self._reset_action_layout: dict[str, Any] | None = None
+        self._latest_actual_mobility_slot_used_for_configuration = -1
+        self._last_prediction_audit = {
+            "future_request_leakage": 0,
+            "future_trajectory_leakage": 0,
+        }
 
     @staticmethod
     def _optional_epsilon(value: Real | None, name: str) -> float | None:
@@ -800,6 +808,15 @@ class MECEnvironment:
             raise ValueError("mobility.source must be either 'sumo' or 'trace'")
         return source
 
+    def _configured_role_update_mode(self) -> str:
+        roles = self.config.get("vehicle_roles", {})
+        if not isinstance(roles, Mapping):
+            roles = {}
+        mode = str(roles.get("role_update_mode", "dynamic")).strip().lower()
+        if mode not in {"dynamic", "fixed_episode"}:
+            raise ValueError("vehicle_roles.role_update_mode 必须是 dynamic 或 fixed_episode")
+        return mode
+
     def _read_vehicle_states(self, slot_index: int) -> dict[str, dict[str, Any]]:
         """Read only the current slot from the selected mobility provider."""
 
@@ -886,8 +903,28 @@ class MECEnvironment:
             states = get_vehicle_states(self._sumo_api)
         else:
             raise RuntimeError("当前环境没有可读取的SUMO或轨迹车辆状态。")
-        role_state = self._role_manager.assign(states, slot=slot_index)
-        changed = self._apply_role_state(role_state)
+        if self._role_update_mode == "fixed_episode":
+            missing = [
+                vehicle_id
+                for vehicle_id in self._vehicle_ids
+                if vehicle_id not in states
+            ]
+            if missing:
+                raise RuntimeError(
+                    "trace incompatible with fixed_episode roles: "
+                    f"fixed vehicles inactive at slot {slot_index}: {missing}"
+                )
+            expected = tuple(self._service_vehicle_ids), tuple(self._task_vehicle_ids)
+            if (
+                tuple(self._role_state.get("service_vehicle_ids", ())),
+                tuple(self._role_state.get("task_vehicle_ids", ())),
+            ) != expected:
+                raise RuntimeError("fixed_episode role mapping changed during the episode")
+            role_state = self._role_state
+            changed = False
+        else:
+            role_state = self._role_manager.assign(states, slot=slot_index)
+            changed = self._apply_role_state(role_state)
         if self._road_predictor is not None:
             # 转移统计只使用本次读到的全体活动车辆；不使用角色选择结果推断未来。
             self._road_predictor.observe(states, slot=slot_index)
@@ -952,6 +989,51 @@ class MECEnvironment:
         return dict(self._mobility_provider.diagnostics())
 
     @property
+    def workload_seed_diagnostics(self) -> dict[str, Any]:
+        workload = {} if self._data is None else self._data.get("workload", {})
+        if not isinstance(workload, Mapping):
+            return {}
+        names = (
+            "episode_seed",
+            "resolved_arrival_seed",
+            "resolved_popularity_seed",
+            "resolved_service_request_seed",
+            "resolved_task_input_seed",
+        )
+        return {name: workload.get(name) for name in names if name in workload}
+
+    @property
+    def prediction_diagnostics(self) -> dict[str, Any]:
+        return {
+            "latest_observed_request_slot": (
+                -1
+                if self._mobility_popularity_predictor is None
+                else int(
+                    getattr(
+                        self._mobility_popularity_predictor,
+                        "latest_observed_request_slot",
+                        -1,
+                    )
+                )
+            ),
+            "latest_actual_mobility_slot_used_for_configuration": int(
+                self._latest_actual_mobility_slot_used_for_configuration
+            ),
+            "future_request_leakage": int(
+                self._last_prediction_audit.get("future_request_leakage", 0)
+            ),
+            "future_trajectory_leakage": int(
+                self._last_prediction_audit.get("future_trajectory_leakage", 0)
+            ),
+        }
+
+    @property
+    def last_prediction_diagnostics(self) -> dict[str, int]:
+        return {
+            key: int(value) for key, value in self._last_prediction_audit.items()
+        }
+
+    @property
     def service_sizes_mb(self) -> np.ndarray:
         """按现有服务配置生成一次固定服务目录，不生成任务请求。
 
@@ -983,6 +1065,8 @@ class MECEnvironment:
     def _load_rollout_data(
         self,
         data_source: Mapping[str, Any] | None,
+        *,
+        episode_seed: int | None = None,
     ) -> Mapping[str, Any]:
         """选择环境数据来源并补齐最小数据契约。
 
@@ -995,7 +1079,7 @@ class MECEnvironment:
             loaded = data_source
         elif self._data_source is not None:
             loaded = self._data_source
-        elif self._config_is_mapping:
+        elif self._config_is_mapping or episode_seed is not None:
             try:
                 from .data import (
                     generate_workload,
@@ -1006,7 +1090,7 @@ class MECEnvironment:
                     generate_workload,
                     load_sumo_scene,
                 )
-            workload = generate_workload(self.config)
+            workload = generate_workload(self.config, episode_seed=episode_seed)
             loaded = {
                 "config": self.config,
                 "sumo_scene": load_sumo_scene(self.config),
@@ -1333,12 +1417,36 @@ class MECEnvironment:
 
         if self._data is None or self._mobility_popularity_predictor is None:
             raise RuntimeError("移动感知流行度预测器尚未初始化。")
+        decision_slot = int(slot_index)
+        latest_request_slot = int(
+            getattr(self._mobility_popularity_predictor, "latest_observed_request_slot", -1)
+        )
+        if latest_request_slot > decision_slot - 1:
+            self._last_prediction_audit["future_request_leakage"] = int(
+                self._last_prediction_audit.get("future_request_leakage", 0)
+            ) + 1
+            raise RuntimeError(
+                "causal prediction violation: request observations must be no later than t-1"
+            )
+        prediction_origins = [
+            int(value.get("prediction_origin_slot", -1))
+            for value in self._road_predictions.values()
+            if isinstance(value, Mapping)
+        ]
+        latest_prediction_slot = max(prediction_origins, default=-1)
+        if latest_prediction_slot > decision_slot - 1:
+            self._last_prediction_audit["future_trajectory_leakage"] = int(
+                self._last_prediction_audit.get("future_trajectory_leakage", 0)
+            ) + 1
+            raise RuntimeError(
+                "causal prediction violation: trajectory prediction origin must be no later than t-1"
+            )
         horizon = self._prediction_horizon()
         nodes = self._cache_prediction_nodes(horizon)
         workload = self._data["workload"]
         task_vehicle_ids = tuple(str(item) for item in workload["task_vehicle_ids"])
         result = self._mobility_popularity_predictor.predict_node_demand(
-            origin_slot=int(slot_index),
+            origin_slot=decision_slot,
             task_vehicle_ids=task_vehicle_ids,
             vehicle_predictions=self._road_predictions,
             nodes=nodes,
@@ -1365,7 +1473,7 @@ class MECEnvironment:
         if total <= 0.0:
             raise ValueError("预测服务流行度总和必须为正。")
         normalized = prediction / total
-        self._prediction_origin_slot = int(slot_index)
+        self._prediction_origin_slot = decision_slot
         return normalized
 
     @property
@@ -1413,6 +1521,10 @@ class MECEnvironment:
             ),
             "action_length": len(cache_ids) + len(uav_ids),
         }
+
+    def _assert_action_layout_stable(self) -> None:
+        if self._reset_action_layout is not None and self.action_layout != self._reset_action_layout:
+            raise RuntimeError("action_layout changed within a fixed episode")
 
     def configuration_observation(self) -> np.ndarray:
         """构造严格因果的配置 observation，并按区域归一化到 [0,1]。
@@ -1617,6 +1729,10 @@ class MECEnvironment:
 
         # reset 先释放本环境拥有的旧 SUMO 连接，保证重复 reset 不会遗留后台进程。
         self.close()
+        resolved_seed = int(
+            _section(self.config, "project").get("seed", 0) if seed is None else seed
+        )
+        self._episode_seed = resolved_seed
         self._predictor = None
         self._road_predictor = None
         self._mobility_popularity_predictor = None
@@ -1625,10 +1741,19 @@ class MECEnvironment:
         self._service_vehicle_replacement_rows = np.empty(0, dtype=bool)
         self._last_actual_states = {}
         self._prediction_origin_slot = None
-        self._data = self._load_rollout_data(data_source)
+        self._last_prediction_audit = {
+            "future_request_leakage": 0,
+            "future_trajectory_leakage": 0,
+        }
+        self._latest_actual_mobility_slot_used_for_configuration = -1
+        self._reset_action_layout = None
+        self._data = self._load_rollout_data(
+            data_source, episode_seed=resolved_seed
+        )
         data_config = self._data.get("config")
         if isinstance(data_config, Mapping):
             self.config = dict(data_config)
+        self._role_update_mode = self._configured_role_update_mode()
         if sumo_configuration_file is not None:
             self._sumo_configuration_file = str(sumo_configuration_file)
 
@@ -1661,13 +1786,13 @@ class MECEnvironment:
         interval_s = _positive(simulation["decision_interval_s"], "simulation.decision_interval_s")
         mobility_source = self._configured_mobility_source()
         self._mobility_source = mobility_source
-        # 工作负载维度由完整 SUMO 车辆全集和稳定优先级确定；实际角色在
-        # 当前状态读取后由 VehicleRoleManager 更新，车辆 ID 不依赖数组下标。
+        # 工作负载维度由已解析的研究车辆 ID 确定；fixed_episode 正式模式下，
+        # 这些 ID 在整个 episode 内保持不变，动态模式仍由 VehicleRoleManager 更新。
         self._service_vehicle_ids, resolved_task_ids = resolve_vehicle_roles(self.config)
         self._task_vehicle_ids = tuple(str(item) for item in workload["task_vehicle_ids"])
         if tuple(self._task_vehicle_ids) != tuple(resolved_task_ids):
             raise ValueError(
-                "workload.task_vehicle_ids必须与稳定优先级确定的任务车辆集合一致。"
+                "workload.task_vehicle_ids必须与已解析的任务车辆集合一致。"
             )
         self._vehicle_ids = self._service_vehicle_ids + self._task_vehicle_ids
         if not self._vehicle_ids or len(set(self._vehicle_ids)) != len(self._vehicle_ids):
@@ -1736,9 +1861,7 @@ class MECEnvironment:
         if not np.all(np.isfinite(self._cache_capacities)) or np.any(self._cache_capacities < 0.0):
             raise ValueError("缓存容量必须是有限非负数。")
 
-        random_seed = int(
-            _section(self.config, "project").get("seed", 0) if seed is None else seed
-        )
+        random_seed = resolved_seed
         self._role_manager = VehicleRoleManager(self.config, seed=random_seed)
         edge_rng = np.random.default_rng(random_seed + 1)
         local_rng = np.random.default_rng(random_seed + 2)
@@ -1782,9 +1905,17 @@ class MECEnvironment:
         if trajectory is not None:
             self._road_predictor = None
             initial_all_states = self._trajectory_states(0)
-            initial_role_state = self._role_manager.assign(
-                initial_all_states, slot=0
-            )
+            if self._role_update_mode == "fixed_episode":
+                initial_role_state = self._role_manager.fixed_episode_assign(
+                    self._task_vehicle_ids,
+                    self._service_vehicle_ids,
+                    all_vehicle_ids=initial_all_states.keys(),
+                    slot=0,
+                )
+            else:
+                initial_role_state = self._role_manager.assign(
+                    initial_all_states, slot=0
+                )
             self._apply_role_state(initial_role_state, initial=True)
             self._last_actual_states = dict(initial_all_states)
             # 离线轨迹优先使用已提供的预测；没有预测数组时才用 Kalman 在线递推。
@@ -1800,7 +1931,7 @@ class MECEnvironment:
                 )
                 self._predicted_positions = initial_positions.copy()
             self._road_predictions = self._prediction_mapping_from_positions(
-                self._predicted_positions, origin_slot=0
+                self._predicted_positions, origin_slot=-1
             )
         elif mobility_source in {"sumo", "trace"}:
             # 没有离线轨迹时，SUMO 是唯一的真实位置来源。这里启动项目内正式
@@ -1823,7 +1954,19 @@ class MECEnvironment:
                 self._times,
                 begin_s=begin_time,
             )
-            initial_role_state = self._role_manager.assign(all_initial_states, slot=0)
+            if mobility_source == "trace" and self._role_update_mode == "fixed_episode":
+                self._mobility_provider.validate_fixed_episode_roles(
+                    self._vehicle_ids, slot_count=int(self._times.size)
+                )
+            if self._role_update_mode == "fixed_episode":
+                initial_role_state = self._role_manager.fixed_episode_assign(
+                    self._task_vehicle_ids,
+                    self._service_vehicle_ids,
+                    all_vehicle_ids=all_initial_states.keys(),
+                    slot=0,
+                )
+            else:
+                initial_role_state = self._role_manager.assign(all_initial_states, slot=0)
             self._apply_role_state(initial_role_state, initial=True)
             self._last_actual_states = dict(all_initial_states)
             initial_states = {
@@ -1833,10 +1976,10 @@ class MECEnvironment:
             initial_positions = self._position_matrix(initial_states, self._vehicle_ids)
             self._road_predictor = self._new_road_predictor(interval_s)
             # 先登记当前时刻的全体车辆，再只为当前角色输出位置矩阵。
-            self._road_predictor.observe(all_initial_states, slot=0)
+            self._road_predictor.observe(all_initial_states, slot=-1)
             initial_predictions = self._road_predictor.predict(
                 initial_states,
-                origin_slot=0,
+                origin_slot=-1,
                 update_history=False,
             )
             self._road_predictions = dict(initial_predictions)
@@ -1852,6 +1995,7 @@ class MECEnvironment:
 
         self._slot_index = 0
         self._predicted_popularity = self._prediction_popularity(0)
+        self._reset_action_layout = self.action_layout
         return self._configuration_state()
 
     def step(
@@ -1879,6 +2023,11 @@ class MECEnvironment:
         if self._slot_index >= self._times.size:
             raise RuntimeError("episode已经结束，请先调用reset()。")
         current_slot = int(self._slot_index)
+        self._last_prediction_audit = {
+            "future_request_leakage": 0,
+            "future_trajectory_leakage": 0,
+        }
+        self._assert_action_layout_stable()
         mode = self.cache_controller_mode
         try:
             from .data import get_slot_data, step as step_sumo
@@ -1892,7 +2041,37 @@ class MECEnvironment:
         slot = get_slot_data(self._data, current_slot) if self._data is not None else None
         if slot is None:
             raise RuntimeError("环境数据尚未初始化。")
+        arrivals = np.asarray(slot["task_arrivals"], dtype=bool)
+        task_service_types = np.asarray(slot["task_service_types"], dtype=int)
+        invalid_service_ids = int(
+            np.sum(
+                arrivals
+                & (
+                    (task_service_types < 0)
+                    | (task_service_types >= self._service_sizes.size)
+                )
+            )
+        )
+        if invalid_service_ids:
+            raise ValueError(
+                f"task_service_types contains {invalid_service_ids} invalid arrived service IDs"
+            )
         actual_positions, actual_velocities = self._actual_motion(current_slot)
+        prediction_origins = [
+            int(value.get("prediction_origin_slot", -1))
+            for value in self._road_predictions.values()
+            if isinstance(value, Mapping)
+        ]
+        self._latest_actual_mobility_slot_used_for_configuration = max(
+            prediction_origins, default=current_slot - 1
+        )
+        if self._latest_actual_mobility_slot_used_for_configuration > current_slot - 1:
+            self._last_prediction_audit["future_trajectory_leakage"] = int(
+                self._last_prediction_audit.get("future_trajectory_leakage", 0)
+            ) + 1
+            raise RuntimeError(
+                "causal prediction violation: configuration mobility must be no later than t-1"
+            )
         # 服务车辆身份变化后，上一时隙的节点级预测行可能仍对应旧 SV。
         # 在当前真实请求登记前，仅按新的节点身份/当前位置重建一次预测，
         # 保证新 SV 的空缓存与协同候选使用同一套节点顺序和因果输入。
@@ -1947,7 +2126,6 @@ class MECEnvironment:
         )
 
         # 只对已到达任务统计执行节点；未到达任务必须保持零时延、零能耗、无分配。
-        arrivals = np.asarray(slot["task_arrivals"], dtype=bool)
         execution_counts = {
             "local": 0,
             "service_vehicle": 0,
@@ -1979,6 +2157,16 @@ class MECEnvironment:
             task_result = result.task_results[task_index]
             total_delay += float(task_result["completion_delay_s"])
             total_energy += float(task_result["vehicle_energy_j"])
+        valid_execution_nodes = {"LOCAL", "SERVICE_VEHICLE", "RSU", "UAV", "CLOUD"}
+        invalid_node_ids = int(
+            sum(
+                bool(arrived and node is not None and node not in valid_execution_nodes)
+                for arrived, node in zip(arrivals, result.execution_nodes)
+            )
+        )
+        edge_cache_available = np.asarray(result.edge_cache_available, dtype=bool).copy()
+        if edge_cache_available.shape != arrivals.shape:
+            raise RuntimeError("solver edge_cache_available shape does not match task arrivals")
         execution_rates = {
             key: (float(value) / completed if completed else 0.0)
             for key, value in execution_counts.items()
@@ -2032,6 +2220,7 @@ class MECEnvironment:
             else:  # pragma: no cover - defensive state guard
                 raise RuntimeError("预测器状态未初始化。")
             self._predicted_popularity = self._prediction_popularity(next_slot)
+            self._latest_actual_mobility_slot_used_for_configuration = current_slot
             self._slot_index = next_slot
             if self._sumo_api is not None:
                 step_sumo(self._sumo_api, float(self._times[next_slot]))
@@ -2047,6 +2236,16 @@ class MECEnvironment:
             "time_s": float(slot["time_s"]),
             "execution_counts": execution_counts,
             "execution_rates": execution_rates,
+            "edge_cache_available": edge_cache_available.copy(),
+            "edge_cache_availability_count": int(np.sum(edge_cache_available)),
+            "edge_execution_count": int(
+                execution_counts["service_vehicle"]
+                + execution_counts["rsu"]
+                + execution_counts["uav"]
+            ),
+            "invalid_service_ids": int(invalid_service_ids),
+            "invalid_node_ids": int(invalid_node_ids),
+            "task_service_types": task_service_types.copy(),
             "completed_tasks": int(completed),
             "failed_tasks": int(failed),
             "total_delay": float(total_delay),
@@ -2143,6 +2342,9 @@ class MECEnvironment:
             "service_vehicle_ids": tuple(self._service_vehicle_ids),
             "mobility_source": self._mobility_source,
             "mobility_diagnostics": self.mobility_diagnostics,
+            "prediction_diagnostics": self.prediction_diagnostics,
+            "last_prediction_diagnostics": self.last_prediction_diagnostics,
+            "workload_seed_diagnostics": self.workload_seed_diagnostics,
         }
         node_prediction = self.last_node_prediction
         if node_prediction:

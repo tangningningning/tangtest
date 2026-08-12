@@ -580,9 +580,14 @@ class _MetricAccumulator:
         current_failed = max(0, int(info.get("failed_tasks", 0)))
         self.failed_count += current_failed
         self.arrival_count += current_completed + current_failed
-        self.edge_cache_available_count += sum(
-            max(0, int(raw_counts.get(key, 0))) for key in ("service_vehicle", "rsu", "uav")
-        )
+        raw_edge_available = info.get("edge_cache_available")
+        if raw_edge_available is not None:
+            edge_available = np.asarray(raw_edge_available, dtype=bool).reshape(-1)
+            self.edge_cache_available_count += int(np.sum(edge_available))
+        else:
+            self.edge_cache_available_count += max(
+                0, int(info.get("edge_cache_availability_count", 0))
+            )
 
         cache_trigger = _bool_vector(
             info.get("requested_cache_triggers"), self.cache_count
@@ -650,16 +655,33 @@ class _MetricAccumulator:
             "completed_task_count": int(self.completed_count),
             "arrival_count": int(self.arrival_count),
             "failed_count": int(self.failed_count),
-            # non_cloud_rate 是性能统计，不进入 reward；Failed 不进入该分母。
-            "non_cloud_rate": float(non_cloud_count / float(arrival_divisor)),
+            # non_cloud/执行率按已完成任务统计；Failed 不进入该分母。
+            "non_cloud_rate": float(non_cloud_count / float(completed_divisor)),
+            "edge_cache_availability_rate": float(
+                self.edge_cache_available_count / float(arrival_divisor)
+            ),
+            # 兼容旧汇总字段，但语义与 edge_cache_availability_rate 相同。
             "cache_service_availability": float(
                 self.edge_cache_available_count / float(arrival_divisor)
+            ),
+            "edge_execution_count": int(
+                self.execution_counts["service_vehicle"]
+                + self.execution_counts["rsu"]
+                + self.execution_counts["uav"]
+            ),
+            "edge_execution_rate": float(
+                (
+                    self.execution_counts["service_vehicle"]
+                    + self.execution_counts["rsu"]
+                    + self.execution_counts["uav"]
+                )
+                / float(completed_divisor)
             ),
         }
         for key, label in LEARNING_CHECK_EXECUTION_KEYS:
             count = int(self.execution_counts[key])
             row[f"{label}_count"] = count
-            row[f"{label}_rate"] = float(count / float(arrival_divisor))
+            row[f"{label}_rate"] = float(count / float(completed_divisor))
 
         for index in range(self.cache_count):
             prefix = f"cache_node_{index}"
@@ -970,6 +992,121 @@ class LearningCheckCallback(BaseCallback):
         return int(self._completed_episodes)
 
 
+def _select_best_validation_record(
+    records: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    valid = []
+    for record in records:
+        try:
+            score = float(record["mean_original_validation_system_reward"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(score):
+            valid.append((score, int(record.get("timesteps", 0)), record))
+    if not valid:
+        return None
+    valid.sort(key=lambda item: (-item[0], item[1]))
+    return valid[0][2]
+
+
+class FormalTrainingCallback(LearningCheckCallback):
+    """在固定 eval 频率保存 validation 最优的 model/VecNormalize 对。"""
+
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        config: Mapping[str, Any],
+        action_layout: Mapping[str, Any] | None,
+        eval_freq: int,
+        expected_updates: int,
+    ) -> None:
+        super().__init__(
+            output_dir=output_dir,
+            action_layout=action_layout,
+            expected_updates=expected_updates,
+        )
+        self.config = config
+        self.eval_freq = int(eval_freq)
+        if self.eval_freq <= 0:
+            raise ValueError("eval_freq must be positive")
+        self.validation_rows: list[dict[str, Any]] = []
+        self.validation_history: list[dict[str, Any]] = []
+        self.validation_diagnostics = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
+        self.evaluated_timesteps: set[int] = set()
+        self.best_score = -math.inf
+        self.best_timesteps: int | None = None
+        self.best_update: int | None = None
+        self.best_model_path: Path | None = None
+        self.best_vecnormalize_path: Path | None = None
+
+    def _evaluate_checkpoint(self, timesteps: int) -> None:
+        step = int(timesteps)
+        if step <= 0 or step in self.evaluated_timesteps:
+            return
+        if self.layout is None:
+            raise RuntimeError("formal callback has no action layout")
+        self.evaluated_timesteps.add(step)
+        rows, diagnostics = _run_deterministic_validation(
+            self.model,
+            self.config,
+            training_vector=self.training_env,
+            action_layout=self.layout,
+        )
+        aggregate = _validation_aggregate(rows)
+        score = float(aggregate.get("mean", {}).get("mean_raw_G", -math.inf))
+        update = int(step // max(1, int(_section(self.config, "ppo").get("n_steps", 256))))
+        for row in rows:
+            enriched = dict(row)
+            enriched.update(
+                {
+                    "timesteps": step,
+                    "update": update,
+                    "mean_original_validation_system_reward": score,
+                    "best_criterion": "mean_original_validation_system_reward",
+                }
+            )
+            self.validation_rows.append(enriched)
+        self.validation_history.append(
+            {
+                "timesteps": step,
+                "update": update,
+                "mean_original_validation_system_reward": score,
+                "validation_std_raw_G": float(
+                    aggregate.get("std", {}).get("mean_raw_G", 0.0)
+                ),
+                "validation_seed_count": len(rows),
+            }
+        )
+        for key in LEARNING_CHECK_HARD_KEYS:
+            self.validation_diagnostics[key] += max(0, int(diagnostics.get(key, 0)))
+        if score > self.best_score:
+            self.best_score = score
+            self.best_timesteps = step
+            self.best_update = update
+            self.best_model_path = self.output_dir / "best_model"
+            self.best_vecnormalize_path = self.output_dir / "best_vecnormalize.pkl"
+            self.model.save(self.best_model_path)
+            self.training_env.save(self.best_vecnormalize_path)
+
+    def _on_rollout_start(self) -> None:
+        super()._on_rollout_start()
+        step = int(getattr(self.model, "num_timesteps", 0))
+        if step > 0 and step % self.eval_freq == 0:
+            self._evaluate_checkpoint(step)
+
+    def _on_training_end(self) -> None:
+        super()._on_training_end()
+        step = int(getattr(self.model, "num_timesteps", 0))
+        if step > 0:
+            self._evaluate_checkpoint(step)
+
+    def write_outputs(self) -> None:
+        super().write_outputs()
+        _write_csv(self.output_dir / "validation_results.csv", self.validation_rows)
+        _write_csv(self.output_dir / "validation_history.csv", self.validation_history)
+
+
 def _learning_check_output_dir(
     config: Mapping[str, Any], output_dir: str | Path | None = None
 ) -> Path:
@@ -993,6 +1130,183 @@ def _learning_check_output_dir(
     return target
 
 
+def _formal_output_dir(
+    config: Mapping[str, Any], output_dir: str | Path | None = None
+) -> Path:
+    if output_dir is not None:
+        target = Path(output_dir).expanduser()
+        target.mkdir(parents=True, exist_ok=False)
+        return target
+    configured_root = _section(config, "output").get("root", "outputs")
+    root = Path(str(configured_root)).expanduser()
+    if not root.is_absolute():
+        root = PROJECT_ROOT / root
+    base = root / "ppo_training"
+    base.mkdir(parents=True, exist_ok=True)
+    run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = base / run_id
+    suffix = 1
+    while target.exists():
+        suffix += 1
+        target = base / f"{run_id}_{suffix:02d}"
+    target.mkdir(parents=True, exist_ok=False)
+    return target
+
+
+def _formal_training_trace_seeds(
+    config: Mapping[str, Any], total_timesteps: int | None = None
+) -> dict[str, Any]:
+    ppo = _section(config, "ppo")
+    simulation = _section(config, "simulation")
+    n_steps = int(ppo.get("n_steps", 256))
+    requested_steps = int(
+        ppo.get("total_timesteps", 25600)
+        if total_timesteps is None
+        else total_timesteps
+    )
+    horizon = int(simulation.get("slot_count", 100))
+    if n_steps <= 0 or requested_steps <= 0 or horizon <= 0:
+        raise ValueError("formal PPO steps and episode horizon must be positive")
+    effective_steps = int(math.ceil(requested_steps / n_steps) * n_steps)
+    formal_episodes = int(effective_steps // horizon)
+    trace_count = int(math.floor(effective_steps / horizon) + 1)
+    base = int(ppo.get("train_seed_base", ppo.get("seed", 0)))
+    return {
+        "requested_env_steps": requested_steps,
+        "effective_env_steps": effective_steps,
+        "episode_horizon": horizon,
+        "n_steps": n_steps,
+        "formal_training_episodes": formal_episodes,
+        "training_reset_reserve": trace_count - formal_episodes,
+        "training_trace_seeds": [base + offset for offset in range(trace_count)],
+    }
+
+
+def preflight_training_traces(
+    config: Mapping[str, Any],
+    *,
+    total_timesteps: int | None = None,
+    raise_on_error: bool = True,
+) -> dict[str, Any]:
+    """只检查离线 trace 的覆盖、schema、slot 数和固定研究车辆角色。"""
+
+    mobility = _section(config, "mobility")
+    if str(mobility.get("source", "sumo")).strip().lower() != "trace":
+        raise RuntimeError("formal PPO training requires mobility.source=trace")
+    try:
+        from .mobility import TraceMobilityProvider, trace_path
+    except ImportError:  # pragma: no cover
+        from mobility import TraceMobilityProvider, trace_path
+
+    roles = _section(config, "vehicle_roles")
+    service_ids = tuple(str(item) for item in roles.get("service_vehicle_ids", ()))
+    task_ids = tuple(str(item) for item in roles.get("task_vehicle_ids", ()))
+    fixed_ids = service_ids + task_ids
+    if not fixed_ids:
+        raise RuntimeError("fixed_episode preflight requires explicit research vehicle IDs")
+    trace_plan = _formal_training_trace_seeds(config, total_timesteps)
+    validation_seeds = _formal_validation_seeds(config)
+    test_seeds = _formal_test_seeds(config)
+    categories = {
+        "training": list(trace_plan["training_trace_seeds"]),
+        "validation": validation_seeds,
+        "test": test_seeds,
+    }
+    horizon = int(trace_plan["episode_horizon"])
+    coverage: dict[str, Any] = {}
+    missing: dict[str, list[int]] = {key: [] for key in categories}
+    invalid: list[dict[str, Any]] = []
+    for category, seeds in categories.items():
+        for seed in seeds:
+            path = trace_path(config, seed=int(seed))
+            if not path.is_file():
+                missing[category].append(int(seed))
+                continue
+            provider = None
+            try:
+                provider = TraceMobilityProvider(config, seed=int(seed))
+                slot_count = int(provider._times.size)
+                if slot_count != horizon:
+                    raise ValueError(
+                        f"slot_count={slot_count}, expected {horizon}"
+                    )
+                provider.validate_fixed_episode_roles(fixed_ids, slot_count=horizon)
+            except Exception as error:
+                invalid.append(
+                    {
+                        "category": category,
+                        "seed": int(seed),
+                        "path": str(path),
+                        "error": str(error),
+                    }
+                )
+            finally:
+                if provider is not None:
+                    provider.close()
+        coverage[category] = {
+            "count": len(seeds),
+            "first_seed": None if not seeds else int(seeds[0]),
+            "last_seed": None if not seeds else int(seeds[-1]),
+            "missing": list(missing[category]),
+        }
+    missing_flat = {
+        key: values for key, values in missing.items() if values
+    }
+    if missing_flat:
+        print(f"Trace preflight missing seeds: {missing_flat}")
+    if invalid:
+        print(f"Trace preflight invalid traces: {invalid}")
+    result = {
+        **trace_plan,
+        "formal_training_traces": len(categories["training"]),
+        "validation_traces": len(validation_seeds),
+        "test_traces": len(test_seeds),
+        "total_required": sum(len(values) for values in categories.values()),
+        "coverage": coverage,
+        "missing": missing,
+        "missing_seeds": sorted(
+            seed for values in missing.values() for seed in values
+        ),
+        "invalid": invalid,
+        "fixed_role_ids": fixed_ids,
+        "passed": not missing_flat and not invalid,
+    }
+    if raise_on_error and not result["passed"]:
+        raise RuntimeError(
+            "formal training trace preflight failed: "
+            f"missing={missing_flat}, invalid={invalid}"
+        )
+    return result
+
+
+def _formal_startup_checks(
+    config: Mapping[str, Any], *, first_training_seed: int
+) -> dict[str, Any]:
+    environment = build_ppo_environment(
+        config, seed_mode="fixed", fixed_seed=int(first_training_seed)
+    )
+    try:
+        observation, reset_info = environment.reset(seed=int(first_training_seed))
+        expected_action_length = int(environment.action_space.shape[0])
+        layout = _layout_copy(reset_info["action_layout"])
+        if int(layout["action_length"]) != expected_action_length:
+            raise RuntimeError("formal startup action layout dimension mismatch")
+        if observation.shape != environment.observation_space.shape:
+            raise RuntimeError("formal startup observation dimension mismatch")
+        check_status = sb3_check_env(environment)
+        return {
+            "check_env": check_status,
+            "action_space": str(environment.action_space),
+            "action_layout": layout,
+            "observation_dimension": int(observation.shape[0]),
+            "observation_finite": bool(np.all(np.isfinite(observation))),
+            "task_vehicle_ids": tuple(environment.environment._task_vehicle_ids),
+            "service_vehicle_ids": tuple(environment.environment._service_vehicle_ids),
+        }
+    finally:
+        environment.close()
+
+
 def _learning_check_validation_seeds(config: Mapping[str, Any]) -> list[int]:
     values = _section(config, "ppo").get("validation_seeds")
     if not isinstance(values, (list, tuple)) or not values:
@@ -1001,6 +1315,24 @@ def _learning_check_validation_seeds(config: Mapping[str, Any]) -> list[int]:
     if len(set(seeds)) != len(seeds):
         raise ValueError("validation_seeds不能重复。")
     return seeds
+
+
+def _configured_seed_list(config: Mapping[str, Any], name: str) -> list[int]:
+    values = _section(config, "ppo").get(name)
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"ppo.{name} must be a non-empty list")
+    seeds = [int(item) for item in values]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"ppo.{name} cannot contain duplicates")
+    return seeds
+
+
+def _formal_validation_seeds(config: Mapping[str, Any]) -> list[int]:
+    return _configured_seed_list(config, "validation_seeds")
+
+
+def _formal_test_seeds(config: Mapping[str, Any]) -> list[int]:
+    return _configured_seed_list(config, "test_seeds")
 
 
 def _build_validation_vector(
@@ -1044,11 +1376,16 @@ def _run_deterministic_validation(
     *,
     training_vector: Any,
     action_layout: Mapping[str, Any],
+    seeds: Sequence[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     results: list[dict[str, Any]] = []
     diagnostics = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
-    seeds = _learning_check_validation_seeds(config)
-    for seed in seeds:
+    evaluation_seeds = (
+        _formal_validation_seeds(config)
+        if seeds is None
+        else [int(item) for item in seeds]
+    )
+    for seed in evaluation_seeds:
         vector = _build_validation_vector(
             config,
             seed=int(seed),
@@ -1136,7 +1473,8 @@ def _early_late_summary(
         "uav_cost",
         "mean_delay",
         "mean_vehicle_energy",
-        "cache_service_availability",
+        "edge_cache_availability_rate",
+        "edge_execution_rate",
     ]
     fields.extend(f"{label}_rate" for _key, label in LEARNING_CHECK_EXECUTION_KEYS)
     for index in range(len(action_layout["cache_node_ids"])):
@@ -1475,26 +1813,236 @@ def run_learning_check(
             vector.close()
 
 
+def _build_loaded_vecnormalize(
+    config: Mapping[str, Any], *, seed: int, path: Path
+) -> Any:
+    try:
+        from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
+    except ImportError as error:  # pragma: no cover
+        raise RuntimeError("stable-baselines3 is required for formal evaluation") from error
+
+    def factory() -> Any:
+        return build_ppo_environment(
+            config,
+            seed_mode="fixed",
+            fixed_seed=int(seed),
+        )
+
+    vector = VecMonitor(DummyVecEnv([factory]))
+    loaded = VecNormalize.load(str(path), vector)
+    loaded.training = False
+    loaded.norm_reward = False
+    return loaded
+
+
+def _formal_plot_outputs(
+    output_dir: Path,
+    training_rows: Sequence[Mapping[str, Any]],
+    test_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    try:
+        from .plot_results import plot_final_execution_rate, plot_training_reward_curve
+    except ImportError:  # pragma: no cover
+        from plot_results import plot_final_execution_rate, plot_training_reward_curve
+    complete_training = [
+        row for row in training_rows if bool(row.get("completed", True))
+    ]
+    if not complete_training:
+        raise RuntimeError("formal training produced no completed episode rows")
+    episodes = [int(row["episode"]) for row in complete_training]
+    rewards = [float(row["sum_raw_G"]) for row in complete_training]
+    steps = [int(row["steps"]) for row in complete_training]
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    reward_paths = plot_training_reward_curve(
+        episodes,
+        rewards,
+        steps,
+        figure_dir,
+        moving_average_window=10,
+        file_stem="reward_convergence",
+    )
+    counts = {
+        "local": sum(int(row.get("Local_count", 0)) for row in test_rows),
+        "service_vehicle": sum(int(row.get("SV_count", 0)) for row in test_rows),
+        "rsu": sum(int(row.get("RSU_count", 0)) for row in test_rows),
+        "uav": sum(int(row.get("UAV_count", 0)) for row in test_rows),
+        "cloud": sum(int(row.get("Cloud_count", 0)) for row in test_rows),
+        "failed": sum(int(row.get("failed_count", 0)) for row in test_rows),
+    }
+    execution_paths = plot_final_execution_rate(
+        counts["local"],
+        counts["service_vehicle"],
+        counts["rsu"],
+        counts["uav"],
+        counts["cloud"],
+        counts["failed"],
+        figure_dir,
+        file_stem="final_execution_rate",
+    )
+    return {
+        "reward_convergence": {
+            "png": str(reward_paths[0]),
+            "pdf": str(reward_paths[1]),
+            "source": "training raw G per slot",
+        },
+        "final_execution_rate": {
+            "png": str(execution_paths[0]),
+            "pdf": str(execution_paths[1]),
+            "source": "best-model final test",
+        },
+        "execution_counts": counts,
+    }
+
+
 def run_training(
     config: Mapping[str, Any] | str | Path | None = None,
     *,
     total_timesteps: int | None = None,
+    output_dir: str | Path | None = None,
 ) -> Any:
-    """显式训练入口；本轮重构验收不会调用此函数。"""
+    """正式 PPO 入口：trace 预检、validation 选优、best checkpoint 后 test。"""
 
     prepared = prepare_ppo_config(config)
-    vector = build_vecnormalize_environment(
-        prepared,
-        episode_seed_base=int(_section(prepared, "ppo").get("train_seed_base", 0)),
-    )
-    model = build_sb3_ppo(vector, prepared)
-    steps = int(
-        _section(prepared, "ppo").get("total_timesteps", 25600)
+    ppo = _section(prepared, "ppo")
+    requested_steps = int(
+        ppo.get("total_timesteps", 25600)
         if total_timesteps is None
         else total_timesteps
     )
-    model.learn(total_timesteps=steps)
-    return model, vector
+    trace_preflight = preflight_training_traces(
+        prepared, total_timesteps=requested_steps
+    )
+    startup = _formal_startup_checks(
+        prepared,
+        first_training_seed=int(trace_preflight["training_trace_seeds"][0]),
+    )
+    n_steps = int(ppo.get("n_steps", 256))
+    eval_freq = int(ppo.get("eval_freq", 5120))
+    if eval_freq <= 0 or eval_freq % n_steps != 0:
+        raise ValueError("formal eval_freq must be a positive multiple of n_steps")
+    expected_updates = int(trace_preflight["effective_env_steps"] // n_steps)
+    target = _formal_output_dir(prepared, output_dir)
+    snapshot = copy.deepcopy(prepared)
+    _write_json(
+        target / "config_snapshot.json",
+        {
+            "config": snapshot,
+            "formal_training": {
+                "requested_timesteps": requested_steps,
+                "effective_env_steps": trace_preflight["effective_env_steps"],
+                "n_steps": n_steps,
+                "eval_freq": eval_freq,
+                "training_seed_mode": "sequential",
+                "validation_seed_mode": "fixed",
+                "test_after_best_only": True,
+                "preflight": trace_preflight,
+                "startup": startup,
+            },
+        },
+    )
+
+    vector = None
+    model = None
+    callback = None
+    best_vector = None
+    try:
+        vector = build_vecnormalize_environment(
+            prepared,
+            episode_seed_base=int(ppo.get("train_seed_base", ppo.get("seed", 0))),
+        )
+        model = build_sb3_ppo(vector, prepared)
+        callback = FormalTrainingCallback(
+            output_dir=target,
+            config=prepared,
+            action_layout=startup["action_layout"],
+            eval_freq=eval_freq,
+            expected_updates=expected_updates,
+        )
+        model.learn(total_timesteps=requested_steps, callback=callback)
+        callback.write_outputs()
+        if callback.best_model_path is None or callback.best_vecnormalize_path is None:
+            raise RuntimeError("formal training did not produce a best model/VecNormalize pair")
+
+        # 只有在 best validation checkpoint 已确定后，才读取并评估 test seeds。
+        test_seeds = _formal_test_seeds(prepared)
+        best_vector = _build_loaded_vecnormalize(
+            prepared,
+            seed=int(test_seeds[0]),
+            path=callback.best_vecnormalize_path,
+        )
+        try:
+            from stable_baselines3 import PPO
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("stable-baselines3 is required for formal evaluation") from error
+        best_model = PPO.load(str(callback.best_model_path), env=best_vector)
+        test_rows, test_diagnostics = _run_deterministic_validation(
+            best_model,
+            prepared,
+            training_vector=best_vector,
+            action_layout=startup["action_layout"],
+            seeds=test_seeds,
+        )
+        _write_csv(target / "test_results.csv", test_rows)
+        figures = _formal_plot_outputs(target, callback.episode_rows, test_rows)
+        diagnostics = {
+            "training": callback.hard_diagnostics,
+            "validation": callback.validation_diagnostics,
+            "test": test_diagnostics,
+            "preflight": trace_preflight,
+        }
+        diagnostics_dir = target / "figures" / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(diagnostics_dir / "formal_diagnostics.json", diagnostics)
+        test_aggregate = _validation_aggregate(test_rows)
+        summary = {
+            "status": "PASS",
+            "requested_timesteps": requested_steps,
+            "effective_env_steps": trace_preflight["effective_env_steps"],
+            "n_steps": n_steps,
+            "eval_freq": eval_freq,
+            "expected_updates": expected_updates,
+            "logged_updates": callback.logged_updates,
+            "best_criterion": "mean_original_validation_system_reward",
+            "best_score": callback.best_score,
+            "best_timesteps": callback.best_timesteps,
+            "best_update": callback.best_update,
+            "best_model": str(callback.best_model_path.with_suffix(".zip")),
+            "best_vecnormalize": str(callback.best_vecnormalize_path),
+            "training_seed_mode": "sequential",
+            "validation_seed_mode": "fixed",
+            "validation_seeds": _formal_validation_seeds(prepared),
+            "test_seed_mode": "fixed",
+            "test_seeds": test_seeds,
+            "test": {
+                "results": test_rows,
+                "aggregate": test_aggregate,
+                "mean_raw_G": float(test_aggregate["mean"].get("mean_raw_G", 0.0)),
+                "std_raw_G": float(test_aggregate["std"].get("mean_raw_G", 0.0)),
+            },
+            "action_layout": startup["action_layout"],
+            "observation_dimension": startup["observation_dimension"],
+            "hard_constraints": diagnostics,
+            "figures": figures,
+            "artifacts": {
+                "config_snapshot": "config_snapshot.json",
+                "training_episodes": "training_episodes.csv",
+                "training_updates": "training_updates.csv",
+                "validation_results": "validation_results.csv",
+                "validation_history": "validation_history.csv",
+                "test_results": "test_results.csv",
+                "best_model": "best_model.zip",
+                "best_vecnormalize": "best_vecnormalize.pkl",
+                "figures": "figures",
+            },
+        }
+        _write_json(target / "final_summary.json", summary)
+        return {"output_dir": str(target), **summary}
+    finally:
+        if best_vector is not None:
+            best_vector.close()
+        if vector is not None:
+            vector.close()
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1504,6 +2052,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--learning-check-output", default=None)
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--total-timesteps", type=int, default=None)
+    parser.add_argument("--output-dir", default=None)
     args = parser.parse_args(argv)
     if args.learning_check and args.train:
         parser.error("--learning-check与--train不能同时使用。")
@@ -1512,7 +2061,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(_json_safe(result), ensure_ascii=False, indent=2))
         return
     if args.train:
-        run_training(total_timesteps=args.total_timesteps)
+        run_training(total_timesteps=args.total_timesteps, output_dir=args.output_dir)
         return
     result = run_interface_smoke() if args.interface_smoke else {
         "config_parse": "PASS",
@@ -1533,5 +2082,7 @@ __all__ = [
     "run_interface_smoke",
     "run_semantic_smoke",
     "run_learning_check",
+    "preflight_training_traces",
+    "FormalTrainingCallback",
     "run_training",
 ]
