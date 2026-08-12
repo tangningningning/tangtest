@@ -153,15 +153,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _auxiliary_action(environment: Any) -> dict[str, np.ndarray]:
     return {
         "cache_triggers": np.ones(environment._cache.shape[0], dtype=float),
-        "cache_scores": np.full(
-            (environment._cache.shape[0], environment._service_sizes.size),
-            0.9,
-            dtype=float,
-        ),
         "uav_triggers": np.ones(environment._uav_positions.shape[0], dtype=float),
-        "uav_displacements": np.zeros(
-            (environment._uav_positions.shape[0], 2), dtype=float
-        ),
     }
 
 

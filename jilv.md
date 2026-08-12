@@ -1751,6 +1751,138 @@ model.learn calls = 0
 formal Stage15 restarted = NO
 ```
 
+## 2026-08-12 第四章 P0 求解主链重构
+
+任务：将第四章正式工程求解器从旧全局 `Discrete(2)` KEEP/UPDATE 重构为
+`MultiBinary adaptive trigger + deterministic configuration optimization`。
+
+修改原因：旧实现用固定 8 维 `J_keep/J_update` 状态和全局二元动作控制 A/B/C/D
+候选，并在正式缓存路径使用 addition + 最多一次 1-swap；同时 `solve_slot()`
+丢弃 UAV trigger。该结构没有直接表达“逐缓存节点/逐 UAV 是否允许配置”的 P0
+在线近似决策。
+
+```text
+第三章 P0 changed = NO
+C1-C16 changed = NO
+Matching changed = NO
+KKT changed = NO
+reward changed = NO
+```
+
+### 原求解器与当前求解器
+
+`paper_spec.md` 已把服务评分 `y_{m,f}`、连续位移 `e_u`、条件因子化混合动作
+明确标记为 **11.pdf original solver design**；当前正式工程方案标记为
+**current implementation solver**：
+
+```text
+causal prediction
+-> MultiBinary(M+U) trigger
+-> finite-candidate UAV positioning
+-> one-round sequential cooperative full 0-1 knapsack
+-> transfer-exchange Matching
+-> KKT
+-> G(t)
+-> standard SB3 PPO
+```
+
+这是第四章分层近似在线求解器替换，不声称获得 P0 全局最优。
+
+### 成熟实现复用
+
+本机 conda 环境确认：`stable-baselines3==2.9.0`、`gymnasium==1.3.0`。
+SB3 `PPO.__init__` 官方实现原生声明支持 `spaces.MultiBinary`，实际策略分布为
+`BernoulliDistribution/Bernoulli`。项目直接复用：
+
+```text
+stable_baselines3.PPO + MlpPolicy
+gymnasium.spaces.MultiBinary
+gymnasium.spaces.Box
+stable_baselines3 VecNormalize / DummyVecEnv / VecMonitor
+```
+
+项目 adapter 仅构造因果状态、拆分 trigger、调用确定性配置器并返回原始系统
+reward；未自定义 PPO 分布、loss、GAE、clip 或 entropy。
+
+### 新 observation/action
+
+```text
+observation groups = C(t-1), q_U(t-1), qhat_V(t), rhohat(t), t/T
+observation dimension (current config) = 99
+observation dtype = float32
+observation range before VecNormalize = [0,1]
+J_keep/J_update in Proposed observation = NO
+
+action space = MultiBinary(8)
+cache trigger bits = 6
+UAV position trigger bits = 2
+fixed order = SV cache, RSU cache, UAV cache, UAV position
+```
+
+`action_layout` 在 reset/info 中显式输出 `cache_node_ids`、`cache_node_types`、
+`uav_ids` 和各 bit 索引。服务车辆替换继续按 vehicle id 重映射；新 SV 行置零，
+不继承旧 SV cache，动作/缓存行/节点类型仍一一对应。
+
+### Cache/UAV 配置
+
+被触发 Cache 节点不再执行 addition/1-swap；先以其它节点当前配置计算逐服务
+边际预测价值，再复用 `_integerize_cache_weights` 与 `_solve_knapsack_dp` 求一次
+完整严格 0-1 knapsack。节点按 SV→RSU→UAV、同类型稳定行号只协同一轮；未
+触发行逐元素保持。PPO trigger 与 actual update 分离，成本只按 `C_old->C_final`。
+
+UAV 对未触发节点严格保持；触发节点只比较当前位置、预测需求热点和地面服务
+缺口热点，复用 C6-C8 速度/区域/安全约束，并按预测服务效用减原 UAV movement
+cost 选择。每个 slot 固定 UAV 先于 Cache，不执行多轮 alternating。
+
+### 修改与删除
+
+修改：`paper_spec.md`、`config.yaml`、`environment.py`、`solver.py`、`ppo_env.py`、
+`train_ppo.py`、`generate_mobility_traces.py`、`jilv.md`。
+
+删除正式生产逻辑：固定 8 维状态、全局 `Discrete(2)` KEEP/UPDATE、A/B/C/D、
+forced UPDATE、`ppo_J_keep/ppo_J_update` preview、PPO service scores、PPO continuous
+displacement、addition + `max_local_swaps=1`、Stage15 固定状态/动作训练诊断主链。
+Stage15 历史结果目录和 272 条 mobility trace 均未删除或重新生成。
+
+### 轻量验收
+
+```text
+py_compile = PASS
+config parse = PASS
+SB3 check_env = PASS
+SB3 MultiBinary predict = PASS
+VecNormalize interface = PASS
+10-slot deterministic smoke = PASS
+
+all-zero cache exact = PASS
+all-zero UAV exact = PASS
+all-zero cache/UAV cost = 0 / 0
+single cache trigger other rows exact = PASS
+single UAV trigger cache exact = PASS
+single UAV trigger other UAVs exact = PASS
+cache trigger no-op actual update/cost = 0 / 0
+UAV trigger no-op actual update/cost = 0 / 0
+
+10-slot Q = 51.40921997459373
+10-slot cache cost = 0.004
+10-slot UAV cost = 0.0
+10-slot reward = 51.405219974593734
+reward formula residual max = 0.0
+
+future request leakage = 0
+future mobility leakage = 0
+capacity violations = 0
+UAV speed/region/safety violations = 0/0/0
+compute violations = 0
+bandwidth violations = 0
+KKT failures = 0
+NaN/Inf = 0
+
+model.learn calls = 0
+formal training restarted = NO
+current formal training allowed = NO (本轮只完成重构与轻量验收)
+```
+
 ## 2026-08-12 Stage16临时审计代码清理
 
 Stage16A/B 仅用于问题定位；本次审计临时代码、审计输出和运行时缓存已清理，未继续扩展 Stage16 审计框架。

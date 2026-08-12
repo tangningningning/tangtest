@@ -6,6 +6,22 @@
 > 权威优先级：11.pdf > paper_spec.md > GitHub/官方代码 > 旧工程代码。
 > 如果本文件与 11.pdf 冲突，必须以 11.pdf 为准，并只修订本文件本身。
 
+### 【当前求解方法说明】
+
+第三章 P0、`G(t)`、C1-C16、任务效用、缓存更新成本和 UAV 移动成本继续严格
+采用 11.pdf 的定义。本项目只正式替换第四章求解方法：不再把 11.pdf 原始的
+PPO 服务评分 `y_{m,f}`、PPO 连续 UAV 位移 `e_u` 和条件因子化混合动作 PPO
+作为当前工程主链，改用：
+
+    MultiBinary PPO 自适应触发
+    + 确定性 Cache/UAV 配置优化
+    + transfer-exchange Matching/KKT
+
+这是第四章求解器替换，不修改第三章目标函数。当前算法是分层近似在线求解，
+不声称获得 P0 全局最优解；正式性能仍只按未折扣原始 `G(t)` 和第三章指标评价。
+下文明确区分 **11.pdf original solver design** 与
+**current implementation solver**，原论文求解方案保留为历史理论记录。
+
 ## 0. 缓存有效性与一次性读取规则
 
 ### 当前论文版本信息
@@ -89,16 +105,16 @@ Source: 11.pdf p.1-2
 | c_{v,f}(0) | 任务车辆 v 的固定本地缓存 | {0,1} | 初始/固定状态 | 全优化时域不变 |
 | z_m^ca(t) | 实际缓存更新变量 | {0,1} | 实际配置结果 | 长时标 |
 | tilde z_m^ca(t) | PPO 输出的缓存更新请求/意图 | {0,1} | PPO 辅助动作 | 长时标 |
-| y_{m,f}(t) | 触发缓存更新时对服务 f 的评分 | 0 < y < 1 | PPO 辅助动作 | 长时标 |
+| y_{m,f}(t) | 11.pdf 原求解器的服务评分；当前实现不使用 | 0 < y < 1 | original solver 动作 | 长时标 |
 | c(t-1) | 上一时隙可更新缓存状态 | 仅含 M 中节点的缓存 | 配置状态 | 长时标 |
 
-### 2.3 UAV 辅助动作和可行化变量
+### 2.3 11.pdf 原 UAV 辅助动作和可行化变量
 
 | 变量 | 含义 | 维度/范围 | 状态/动作 | 时标 |
 |---|---|---|---|---|
 | z_u^q(t) | 可行化后实际发生 UAV 位置变化 | {0,1} | 实际配置结果 | 长时标 |
 | tilde z_u^q(t) | PPO 输出的 UAV 位置更新请求/意图 | {0,1} | PPO 辅助动作 | 长时标 |
-| e_u(t) | UAV 二维辅助位移参数 | R^2 | PPO 辅助动作 | 长时标 |
+| e_u(t) | 11.pdf 原 UAV 二维辅助位移；当前实现不使用 | R^2 | original solver 动作 | 长时标 |
 | Delta q_u(t) | 径向缩放后的候选位移 | R^2，范数不超过 V_u^max Delta t | 可行化中间量 | 长时标 |
 | q_u^raw(t) | 根据请求和候选位移得到的候选位置 | R^2 | 可行化中间量 | 长时标 |
 | q_u^(k)(t) | 第 k 轮 SCA 局部点 | R^2 | SCA 中间量 | 长时标 |
@@ -133,7 +149,7 @@ Source: 11.pdf p.1-2
 | 变量 | 含义 | 维度/范围 | 状态/动作 | 时标 |
 |---|---|---|---|---|
 | s^cfg(t) | 配置状态/observation | 见第 5 节 | PPO 输入状态 | 长时标 |
-| a_t^cfg | PPO 采样的辅助配置动作 | 见第 6 节 | PPO 动作 | 长时标 |
+| a_t^cfg | 当前节点级配置 trigger | MultiBinary(M+U)，见第 6 节 | PPO 动作 | 长时标 |
 | r(t) | 即时奖励 | G(t) | 环境反馈 | 当前时隙 |
 | G(t) | 实际系统效用 | 任务效用减实际配置成本 | 环境反馈 | 当前时隙 |
 | A_hat(t) | GAE 优势估计 | 实数 | PPO 训练量 | rollout |
@@ -266,9 +282,84 @@ Source: 11.pdf p.4-5
 
 Source: 11.pdf p.10-11
 
-## 4. 完整决策顺序
+## 4. 当前实现求解流程（current implementation solver）
 
-### 4.1 代码审查顺序
+每个时隙固定执行：
+
+    截至 t-1 的历史车辆/请求
+    -> 因果车辆位置预测与服务需求预测
+    -> PPO MultiBinary configuration triggers
+    -> UAV 有限候选位置优化
+    -> 基于最终预测覆盖的一轮顺序协同缓存重配置
+    -> 最终 C(t), q_U(t)
+    -> 当前实际任务/位置/信道
+    -> feasible nodes
+    -> transfer-exchange Matching
+    -> KKT 计算/带宽分配
+    -> Local/SV/RSU/UAV/Cloud 实际执行
+    -> Q(t)
+    -> G(t)=Q(t)-C^ca(t)-C^q(t)
+    -> 标准 SB3 PPO update
+
+PPO 只决定哪些缓存节点允许重配置、哪些 UAV 允许调整位置；被触发后的“配置成
+什么”由确定性近似算法决定。UAV 先确定，以便缓存价值使用最终预测覆盖关系；
+Cache/UAV 不来回迭代。
+
+## 5. 当前 PPO observation
+
+    s_cfg(t) = { C(t-1), q_U(t-1), qhat_V(t), rhohat(t), t/T }
+
+- 不读取 `task_arrivals[t]`、`task_service_types[t]`、当前真实 `q_V(t)` 或未来 trace。
+- `qhat_V(t)` 与 `rhohat(t)` 只由截至 t-1 的历史产生；`t/T` 表示有限时域进度。
+- Cache 保持 0/1；UAV 和预测车辆位置按配置区域归一化；预测流行度与进度位于
+  `[0,1]`。展平维度由 M、U、V、F 动态构造，不固定为 8 维。
+- `J_keep/J_update`、候选成本、变化比例不进入当前 Proposed observation。
+
+## 6. 当前 PPO action
+
+    a_cfg(t) = [ztilde_ca_1,...,ztilde_ca_M,ztilde_q_1,...,ztilde_q_U]
+    a_cfg(t) in MultiBinary(M+U)
+
+固定索引顺序为：SV cache triggers、RSU cache triggers、UAV cache triggers、
+UAV position triggers；同类型按稳定 node id/行号排序。工程显式保存
+`cache_node_ids`、`cache_node_types`、`uav_ids` 和 `action_layout`，不依赖字典顺序。
+
+## 7. 当前 Cache 求解
+
+- `ztilde_ca_m=0`：严格保持 `C_m(t)=C_m(t-1)`。
+- `ztilde_ca_m=1`：根据预测位置、预测需求、覆盖、其它节点当前已提供服务、
+  服务大小和容量计算 `v_hat[m,f]`，然后调用严格 0-1 knapsack DP：
+
+      max sum_f v_hat[m,f] c[m,f]
+      s.t. sum_f s_f c[m,f] <= K_m, c[m,f] in {0,1}
+
+一次 trigger 对应一次完整缓存配置重算，不是逐时隙 1-swap。节点只按
+SV→RSU→UAV 的固定顺序协同更新一轮；重叠区域已有服务会降低边际价值，空间
+分离节点仍可缓存相同服务。这是 sequential cooperative cache reconfiguration，
+不声称联合缓存全局最优。
+
+实际更新变量始终为：
+
+    z_m^ca(t) = I{C_m(t) != C_m(t-1)}
+
+trigger=1 但背包结果相同时，实际更新和缓存成本均为 0。成本仍只计算
+`C_old -> C_final`，删除不计 loading energy，新增才计 loading energy。
+
+## 8. 当前 UAV 求解
+
+- `ztilde_q_u=0`：严格保持 `q_u(t)=q_u(t-1)`。
+- `ztilde_q_u=1`：比较当前位置、预测需求热点和地面服务覆盖缺口热点。
+- 候选必须满足最大移动距离、区域和 UAV 安全距离；不可行候选直接丢弃。
+- 评价只使用因果预测服务收益减 11.pdf 定义的实际 UAV movement cost，不读取
+  当前真实任务，不增加新 penalty。
+
+这是 finite candidate approximate UAV positioning，不是连续 UAV 全局最优。
+若没有更优可行候选则保持原位；只有真实位移超过 `epsilon_q` 才令
+`z_u^q(t)=1` 并产生成本。
+
+## Appendix A. 11.pdf original solver design（历史记录，不是当前工程主链）
+
+### A.1 原求解流程
 
     SUMO 数据
     -> 请求/预测
@@ -301,7 +392,7 @@ Source: 11.pdf p.10-11
 12. 用实际缓存状态、实际 UAV 位置、实际 matching、实际 KKT 资源分配和实际成本计算 G(t)，并令 r(t)=G(t)。
 13. rollout 保存 PPO 原始辅助动作、原始联合 log-prob、奖励和下一状态；轨迹末端按 GAE 规则 bootstrap 或置零，随后进行 PPO policy/value update。
 
-### 4.2 重要时序边界
+### A.2 原时序边界
 
 - 配置使用预测信息，但不使用当前完整任务请求、当前实际车辆位置和即时信道状态。
 - 任务调度使用当前实际观测，不使用预测位置替代实际位置。
@@ -310,7 +401,7 @@ Source: 11.pdf p.10-11
 
 Source: 11.pdf p.1-2、p.12、p.21-23
 
-## 5. 配置状态/observation
+### A.3 原配置状态/observation
 
 论文真正定义的配置状态：
 
@@ -326,7 +417,7 @@ Source: 11.pdf p.1-2、p.12、p.21-23
 
 配置状态不是任务调度状态；任务调度阶段直接使用时隙 t 的实际位置、实际请求和即时信道。
 
-### 5.1 预测器
+#### A.3.1 原预测器
 
 #### 车辆位置预测
 
@@ -350,9 +441,9 @@ GRU 在 PPO 训练前预训练，PPO 训练和在线执行期间参数固定。L
 
 Source: 11.pdf p.12-14
 
-## 6. PPO 辅助动作、mask 和联合 log-prob
+### A.4 原 PPO 辅助动作、mask 和联合 log-prob
 
-### 6.1 辅助动作空间
+#### A.4.1 原辅助动作空间
 
     tilde a^cfg(t) = { tilde z_m^ca(t), y_m(t), tilde z_u^q(t), e_u(t) }
 
@@ -363,7 +454,7 @@ Source: 11.pdf p.12-14
 
 这些是 PPO 采样的辅助动作，不是 P0 中直接优化的实际变量。
 
-### 6.2 条件因子化联合策略
+#### A.4.2 原条件因子化联合策略
 
     pi_theta(tilde a^cfg(t) | s^cfg(t))
     = product_{m in M} pi_theta^ca(tilde z_m^ca(t) | s^cfg(t))
@@ -371,7 +462,7 @@ Source: 11.pdf p.12-14
       * product_{u in U} pi_theta^q(tilde z_u^q(t) | s^cfg(t))
       * [pi_theta^e(e_u(t) | s^cfg(t))]^(tilde z_u^q(t))
 
-### 6.3 动作 mask、log-prob 和 entropy
+#### A.4.3 原动作 mask、log-prob 和 entropy
 
 逐样本联合 log-prob 使用触发 mask：
 
@@ -393,9 +484,9 @@ Source: 11.pdf p.12-14
 
 Source: 11.pdf p.14-15、p.26
 
-## 7. 缓存模型和严格 0-1 背包映射
+### A.5 原缓存映射
 
-### 7.1 实际缓存状态转移
+#### A.5.1 原缓存状态转移
 
 当 tilde z_m^ca(t)=0 时，直接令 c_{m,f}(t)=c_{m,f}(t-1)。当 tilde z_m^ca(t)=1 时，使用 PPO 对每个服务输出 y_{m,f}(t)，求解严格 0-1 背包：
 
@@ -405,14 +496,14 @@ Source: 11.pdf p.14-15、p.26
 
 服务大小和缓存容量统一尺度整数化后使用动态规划求解。这里是严格 0-1 背包：每个服务只能选或不选，不是分数背包、连续缓存、按分数排序截断或额外的 counterfactual 选择器。
 
-### 7.2 实际触发和更新成本边界
+#### A.5.2 实际触发和更新成本边界
 
     z_m^ca(t) = I{ sum_{f in F} |c_{m,f}(t)-c_{m,f}(t-1)| > 0 }
     z_m^ca(t) <= tilde z_m^ca(t)
 
 如果映射后的缓存和上一时隙相同，强制 z_m^ca(t)=0，不产生固定更新成本和服务加载能耗。即使 PPO 请求了更新，也不能把没有实际变化的配置记成一次实际更新。
 
-### 7.3 缓存更新能耗和成本
+#### A.5.3 缓存更新能耗和成本
 
     E_m^ca(t) = xi_m^ca sum_{f in F} s_f [c_{m,f}(t)-c_{m,f}(t-1)]^+
     [x]^+ = max{x,0}
@@ -422,16 +513,16 @@ Source: 11.pdf p.14-15、p.26
 
 Source: 11.pdf p.2-3、p.8-9、p.15
 
-## 8. UAV 模型、可行化、SCA 和失败回退
+### A.6 原 UAV 连续位移/SCA 求解
 
-### 8.1 位置更新和移动限制
+#### A.6.1 位置更新和移动限制
 
     z_u^q(t) in {0,1}
     ||q_u(t)-q_u(t-1)||_2 <= z_u^q(t) V_u^max Delta t
     q_u(t) in A
     ||q_u(t)-q_u'(t)||_2 >= d_U^min,  u != u'
 
-### 8.2 从 PPO 位移到候选位置
+#### A.6.2 从 PPO 位移到候选位置
 
 PPO 输出的 e_u(t) 不是最终位移。先做径向缩放：
 
@@ -445,7 +536,7 @@ PPO 输出的 e_u(t) 不是最终位移。先做径向缩放：
 
 若所有候选位置联合满足原始 C6-C8，直接采用 q_u(t)=q_u^raw(t)。
 
-### 8.3 SCA 位置修正
+#### A.6.3 SCA 位置修正
 
 若联合候选位置违反原始约束，以 q_u^(k)(t) 为第 k 轮局部点，定义：
 
@@ -472,7 +563,7 @@ PPO 输出的 e_u(t) 不是最终位移。先做径向缩放：
 
 当 |J_UAV^(k+1)(t)-J_UAV^(k)(t)| <= epsilon_sca 时停止。epsilon_sca 和 K_max 只在论文中以符号出现，没有数值。
 
-### 8.4 失败回退和实际更新变量
+#### A.6.4 失败回退和实际更新变量
 
 以下任一情况判定位置修正失败：凸子问题无可行解、数值求解失败、达到 K_max 仍未满足停止条件，或结果复检不满足原始 C6-C8。失败时所有 UAV 回退到上一时隙位置：
 
@@ -485,7 +576,7 @@ PPO 输出的 e_u(t) 不是最终位移。先做径向缩放：
 
 即使 tilde z_u^q(t)=1，如果修正或失败回退后最终位置不变，也必须令 z_u^q(t)=0，不产生固定位置更新成本和移动能耗。
 
-### 8.5 UAV 移动成本
+#### A.6.5 UAV 移动成本
 
     E_u^mov(t) = xi_u^mov ||q_u(t)-q_u(t-1)||_2
     C^q(t) = sum_{u in U} [ eta_u^q z_u^q(t) + lambda^mov E_u^mov(t) ]
@@ -765,9 +856,25 @@ Reward 使用最终实际执行结果，而不是 PPO 的预测配置意图、�
 
 Source: 11.pdf p.8-10、p.14、p.22、p.31
 
-## 14. PPO 训练规范
+## 14. 当前 PPO 训练规范
 
-### 14.1 rollout 保存内容
+当前实现直接复用 `stable_baselines3.PPO("MlpPolicy", ...)`、
+`gymnasium.spaces.MultiBinary`、`gymnasium.spaces.Box` 和 SB3 `VecNormalize`。
+项目 adapter 只负责构造因果 observation、拆分节点级 trigger、调用确定性
+Cache/UAV 配置器并返回原始 `G(t)`；不自定义 Bernoulli 分布，不重写 PPO loss、
+GAE、clip 或 entropy。
+
+保持已验证参数：`gamma=0.99`、`gae_lambda=0.95`、`learning_rate=3e-4`、
+`n_steps=256`、`batch_size=64`、`n_epochs=10`、`clip_range=0.2`、
+`ent_coef=0`、`vf_coef=0.5`、`max_grad_norm=0.5`。外部可继续使用
+`norm_obs=true`、`norm_reward=true`、`clip_obs=10`。
+
+`gamma<1` 只是 PPO 的训练代理目标；模型选择和正式性能报告仍使用未折扣原始
+平均 `G(t)`，不使用 normalized reward 替代论文指标。
+
+## Appendix B. 11.pdf original PPO training design（历史记录）
+
+### B.1 rollout 保存内容
 
 每个时隙保存：
 
@@ -779,7 +886,7 @@ Source: 11.pdf p.8-10、p.14、p.22、p.31
 
 不把可行化后的实际缓存状态、实际 UAV 位置或实际更新变量重新当成策略网络动作。PPO ratio 必须使用采样时原始辅助动作及其原始 log-prob。
 
-### 14.2 bootstrap、GAE、returns
+### B.2 bootstrap、GAE、returns
 
 若轨迹在完整优化时域结束前截断：
 
@@ -808,7 +915,7 @@ Source: 11.pdf p.8-10、p.14、p.22、p.31
 
 论文默认 gamma=0.99、lambda=0.95。二者是 config 可调超参数，不是禁止修改的理论常数。
 
-### 14.3 PPO ratio 和 clip
+### B.3 PPO ratio 和 clip
 
     chi_t(theta)
     = pi_theta(tilde a^cfg(t) | s^cfg(t))
@@ -820,12 +927,12 @@ Source: 11.pdf p.8-10、p.14、p.22、p.31
         clip(chi_t(theta), 1-epsilon, 1+epsilon) A_hat(t)
       ) ]
 
-这里的 pi 必须是第 6 节条件 mask 后的联合策略。未触发的连续动作头不参与该时隙的 ratio 对应 log-prob、策略梯度和 entropy。
+在 11.pdf 原设计中，这里的 pi 是 Appendix A.4 条件 mask 后的联合策略；该句不描述当前 MultiBinary 实现。
 
-### 14.4 value、entropy 和论文未给出的训练细节
+### B.4 value、entropy 和论文未给出的训练细节
 
 - value 网络以 R_hat(t) 为训练目标，根据 R_hat(t) 与 value 输出的误差更新。
-- entropy 按第 6 节的条件因子化动作头计算；未触发的连续头不计算 entropy。
+- 11.pdf 原设计的 entropy 按 Appendix A.4 的条件因子化动作头计算；当前实现直接使用 SB3 MultiBinary entropy。
 - PDF 没有给出独立的 value clipping 公式。
 - PDF 没有给出 entropy coefficient、value loss coefficient、policy/value loss 的完整加权总损失公式。
 - PDF 没有给出 clip 系数 epsilon 的数值。
@@ -1000,7 +1107,7 @@ Source: 11.pdf p.28-32
 - RSU 位于固定位置，UAV 固定高度并在二维区域内移动，Cloud 存储全部服务。
 - 所有算法应共享同一组 SUMO 轨迹、任务到达记录、服务请求序列、初始缓存、UAV 初始位置和系统参数，以保证公平比较。
 
-### 17.2 论文对比算法
+### 17.2 11.pdf original solver design 的论文对比算法
 
 - CF-PPO-MKKT：预测 + 条件因子化 PPO + cache/UAV 可行化 + transfer-exchange matching + KKT。
 - PPO-MKKT：相同状态、辅助动作、奖励、可行化、matching 和 KKT，但连续头不做条件 mask。
@@ -1008,7 +1115,7 @@ Source: 11.pdf p.28-32
 - Static-MKKT：初始缓存和 UAV 位置全程固定；matching 和 KKT 不变。
 - Random-MKKT：随机产生配置请求、评分和位移，再走同样的可行化；matching 和 KKT 不变。
 
-### 17.3 论文消融算法
+### 17.3 11.pdf original solver design 的论文消融算法
 
 - CF-PPO-NoPred：不预测车辆位置和服务流行度，使用上一时隙观测位置和历史请求统计。
 - CF-PPO-Transfer：保留单任务 transfer，取消双任务 exchange。

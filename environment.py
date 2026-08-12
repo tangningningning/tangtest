@@ -640,9 +640,9 @@ def system_utility(
 class MECEnvironment:
     """论文闭环环境门面，连接数据层、solver 和物理公式。
 
-    ``reset`` 建立 SUMO、缓存、UAV 位置、Kalman 预测器和初始观测；``step``
-    接受 policy 的四类辅助动作，按“缓存 → UAV → 可行节点 → matching → KKT →
-    实际执行 → reward”的顺序调用 solver，并把最终配置写回下一状态。
+    ``reset`` 建立 SUMO、缓存、UAV 位置、道路预测器和初始观测；``step``
+    接受节点级 Cache/UAV trigger，按“UAV → Cache → 可行节点 → matching → KKT
+    → 实际执行 → reward”的顺序调用 solver，并把最终配置写回下一状态。
     纯物理函数仍可独立调用，便于单元测试和代表性任务检查。
     """
 
@@ -699,9 +699,6 @@ class MECEnvironment:
         self._prediction_mode = "uninitialized"
         self._role_manager: Any | None = None
         self._role_state: dict[str, Any] = {}
-        # PPO 只观察缓存高层摘要；这些量均由已完成的 slot 更新，不能读取当前请求结果。
-        self._cache_age_slots = 0
-        self._demand_shift = 0.0
         self._prediction_origin_slot: int | None = None
 
     @staticmethod
@@ -842,8 +839,8 @@ class MECEnvironment:
         )
         if changed and not initial:
             # SV 身份替换是独立物理事件：新服务车辆对应缓存行先置空，
-            # 该失效不直接记为 adaptive cache trigger；后续候选是否重新加载
-            # 仍由 C_old/C_cand 的净收益判断决定。
+            # 该失效不直接记为 adaptive cache trigger；新行后续是否重新加载
+            # 仍由对应 MultiBinary cache trigger 决定。
             old_service_rows = {
                 vehicle_id: index for index, vehicle_id in enumerate(old_service_ids)
             }
@@ -1368,16 +1365,6 @@ class MECEnvironment:
         if total <= 0.0:
             raise ValueError("预测服务流行度总和必须为正。")
         normalized = prediction / total
-        # 只在预测 origin slot 前进时更新 demand_shift；同一 slot 因角色刷新
-        # 重新计算预测不会被误当成新的历史需求变化。
-        if (
-            self._prediction_origin_slot is not None
-            and int(slot_index) > int(self._prediction_origin_slot)
-            and self._predicted_popularity.shape == normalized.shape
-        ):
-            self._demand_shift = float(
-                np.mean(np.abs(normalized - self._predicted_popularity))
-            )
         self._prediction_origin_slot = int(slot_index)
         return normalized
 
@@ -1395,95 +1382,75 @@ class MECEnvironment:
                 result[key] = value
         return result
 
-    def preview_cache_controller(self, action: Mapping[str, Any]) -> dict[str, Any]:
-        """只读计算 PPO 状态摘要所需的 A/B/C/D 预测量。
+    @property
+    def cache_node_ids(self) -> tuple[str, ...]:
+        """返回缓存行的显式稳定布局；SV 身份替换后只更新对应 ID。"""
 
-        该 preview 不读取当前 slot 的 task_arrivals/task_service_types，不执行
-        Matching/KKT，也不写入 cache/UAV；它只复用已经验证的协同缓存和 UAV
-        候选评价，因此不会把当前请求或候选状态提交到真实环境。
+        rsu_count = len(np.asarray(_section(self.config, "rsu")["positions_m"]))
+        return tuple(
+            [f"service_vehicle:{item}" for item in self._service_vehicle_ids]
+            + [f"rsu:{index}" for index in range(rsu_count)]
+            + [f"uav:{index}" for index in range(len(self._uav_positions))]
+        )
+
+    @property
+    def uav_ids(self) -> tuple[str, ...]:
+        return tuple(f"uav:{index}" for index in range(len(self._uav_positions)))
+
+    @property
+    def action_layout(self) -> dict[str, Any]:
+        """显式给出 MultiBinary 索引，禁止依赖字典迭代顺序。"""
+
+        cache_ids = self.cache_node_ids
+        uav_ids = self.uav_ids
+        return {
+            "cache_node_ids": cache_ids,
+            "cache_node_types": tuple(item.value for item in self._service_node_types),
+            "uav_ids": uav_ids,
+            "cache_trigger_indices": tuple(range(len(cache_ids))),
+            "uav_position_trigger_indices": tuple(
+                range(len(cache_ids), len(cache_ids) + len(uav_ids))
+            ),
+            "action_length": len(cache_ids) + len(uav_ids),
+        }
+
+    def configuration_observation(self) -> np.ndarray:
+        """构造严格因果的配置 observation，并按区域归一化到 [0,1]。
+
+        这里只读取 C(t-1)、q_U(t-1)、截至 t-1 历史产生的预测位置/需求和
+        t/T；当前真实请求和当前真实车辆位置不进入 PPO 配置决策。
         """
 
-        if self._slot_index is None or self._data is None:
-            raise RuntimeError("必须先调用reset()，才能生成缓存控制器状态。")
-        try:
-            from .solver import select_demand_aware_uav_cache_state
-        except ImportError:  # pragma: no cover - direct script import
-            from solver import select_demand_aware_uav_cache_state
+        state = self._configuration_state()
+        region = _section(self.config, "uav")["region"]
+        x_min = float(region["x_min_m"])
+        x_max = float(region["x_max_m"])
+        y_min = float(region["y_min_m"])
+        y_max = float(region["y_max_m"])
+        spans = np.asarray([x_max - x_min, y_max - y_min], dtype=float)
+        if np.any(spans <= 0.0):
+            raise ValueError("UAV region 必须具有正的二维跨度。")
 
-        cache_triggers, cache_scores, _uav_triggers, _displacements = self._parse_action(
-            action
-        )
-        uav_config = _section(self.config, "uav")
-        simulation = _section(self.config, "simulation")
-        state = select_demand_aware_uav_cache_state(
-            self._uav_positions.copy(),
-            previous_cache=self._cache.copy(),
-            requested_cache_triggers=cache_triggers,
-            cache_scores=cache_scores,
-            service_sizes=self.service_sizes_mb,
-            cache_capacities=self._cache_capacities.copy(),
-            cache_prediction=self._last_node_prediction,
-            node_types=self._service_node_types,
-            uav_service_indices=self._uav_service_indices,
-            environment=self,
-            max_speed_mps=uav_config["max_speed_mps"],
-            slot_duration_s=simulation["decision_interval_s"],
-            region=uav_config["region"],
-            minimum_separation_m=uav_config["minimum_safety_distance_m"],
-            integer_scale=1,
-            cache_control_action=None,
-        )
-        return state
+        def normalize_positions(values: np.ndarray) -> np.ndarray:
+            normalized = (
+                np.asarray(values, dtype=float) - np.asarray([x_min, y_min])
+            ) / spans
+            return np.clip(normalized, 0.0, 1.0)
 
-    def cache_controller_observation(
-        self,
-        action: Mapping[str, Any],
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        """生成固定 8 维、严格因果的高层缓存控制状态。"""
-
-        preview = self.preview_cache_controller(action)
-        speeds: list[float] = []
-        for vehicle_id in self._task_vehicle_ids:
-            state = self._last_actual_states.get(vehicle_id, {})
-            speed_x = float(state.get("speed_x_mps", math.nan))
-            speed_y = float(state.get("speed_y_mps", math.nan))
-            if math.isfinite(speed_x) and math.isfinite(speed_y):
-                speeds.append(float(math.hypot(speed_x, speed_y)))
-                continue
-            speed = float(state.get("speed_mps", 0.0))
-            if math.isfinite(speed) and speed >= 0.0:
-                speeds.append(speed)
-        mobility_index = 0.0 if not speeds else float(np.mean(speeds) / 30.0)
-        mobility_index = float(np.clip(mobility_index, 0.0, 1.0))
-        age_scale = max(1, int(self._times.size))
-        cache_age = float(np.clip(self._cache_age_slots / age_scale, 0.0, 1.0))
-        if self._slot_index is None or self._times.size < 2:
-            raise RuntimeError("PPO observation requires an initialized finite horizon.")
-        # 有限时域的价值取决于剩余时隙；用当前配置的 horizon 归一化，
-        # 不把 100 写死，也不增加第9维。delta_J 可由 J_update-J_keep 恢复，
-        # 因此用 episode_progress 替换该冗余输入，保持状态仍为8维。
-        episode_progress = _normalized_decision_time(
-            self._slot_index,
-            self._times.size,
-        )
-        preview = dict(preview)
-        preview["ppo_episode_progress"] = float(episode_progress)
-        features = np.asarray(
-            [
-                preview["ppo_J_keep"],
-                preview["ppo_J_update"],
-                episode_progress,
-                preview["ppo_candidate_cache_cost"],
-                preview["ppo_changed_service_ratio"],
-                self._demand_shift,
-                cache_age,
-                mobility_index,
-            ],
-            dtype=np.float32,
-        )
-        if features.shape != (8,) or not np.all(np.isfinite(features)):
-            raise ValueError("PPO缓存控制状态必须是有限的8维float32向量。")
-        return features, preview
+        observation = np.concatenate(
+            (
+                np.asarray(state["previous_cache"], dtype=float).reshape(-1),
+                normalize_positions(state["previous_uav_positions_m"]).reshape(-1),
+                normalize_positions(state["predicted_vehicle_positions_m"]).reshape(-1),
+                np.asarray(state["predicted_popularity"], dtype=float).reshape(-1),
+                np.asarray(state["normalized_time"], dtype=float).reshape(-1),
+            )
+        ).astype(np.float32)
+        if not np.all(np.isfinite(observation)) or np.any(observation < 0.0) or np.any(
+            observation > 1.0
+        ):
+            raise ValueError("PPO configuration observation 必须是有限的 [0,1] 向量。")
+        return observation
 
     def _actual_motion(self, slot_index: int) -> tuple[np.ndarray, np.ndarray]:
         """读取同一时隙的实际位置与速度，供调度和下一时隙预测校正使用。"""
@@ -1559,61 +1526,25 @@ class MECEnvironment:
     def _parse_action(
         self,
         action: Mapping[str, Any],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """校验 policy 的四类原始辅助动作并转换为 solver 输入。
-
-        未触发的 cache 节点评分不会被采样，内部只填充占位值；真正送入 solver
-        的 trigger 和 score 形状仍分别是 ``(M,)`` 与 ``(M,F)``。这样可以保持
-        policy 的联合 log-prob 只描述原始动作，同时让 solver 获得完整矩阵。
-        """
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """校验节点级 MultiBinary trigger；PPO 不直接生成配置内容。"""
 
         if not isinstance(action, Mapping):
             raise TypeError("step(action)中的action必须是映射。")
         cache_trigger_value = action.get("cache_triggers", action.get("cache_trigger"))
-        cache_score_value = action.get("cache_scores", action.get("cache_score"))
         uav_trigger_value = action.get("uav_triggers", action.get("uav_trigger"))
-        displacement_value = action.get(
-            "uav_displacements",
-            action.get("raw_uav_displacements", action.get("uav_displacement")),
-        )
-        if (
-            cache_trigger_value is None
-            or cache_score_value is None
-            or uav_trigger_value is None
-            or displacement_value is None
-        ):
-            raise ValueError(
-                "action必须包含cache_triggers、cache_scores、uav_triggers和uav_displacements。"
-            )
+        if cache_trigger_value is None or uav_trigger_value is None:
+            raise ValueError("action必须包含cache_triggers和uav_triggers。")
         cache_triggers = _binary_vector(
             cache_trigger_value, "action.cache_triggers"
         ).astype(bool)
         uav_triggers = _binary_vector(uav_trigger_value, "action.uav_triggers").astype(bool)
         node_count = self._cache.shape[0]
-        service_count = self._service_sizes.size
         if cache_triggers.shape != (node_count,):
             raise ValueError("action.cache_triggers形状必须是(M,)。")
         if uav_triggers.shape != (len(self._uav_service_indices),):
             raise ValueError("action.uav_triggers形状必须是(U,)。")
-        raw_scores = np.asarray(cache_score_value, dtype=float)
-        if raw_scores.shape != (node_count, service_count):
-            raise ValueError("action.cache_scores形状必须是(M,F)。")
-        cache_scores = raw_scores.copy()
-        for node_index, triggered in enumerate(cache_triggers):
-            if triggered:
-                row = cache_scores[node_index]
-                if not np.all(np.isfinite(row)) or np.any((row <= 0.0) | (row >= 1.0)):
-                    raise ValueError("被触发缓存节点的评分必须全部位于(0,1)。")
-            else:
-                # 未触发节点的评分没有采样、没有进入联合动作；只在送入
-                # solver时填充占位值，不修改调用方传入的action对象。
-                cache_scores[node_index] = 0.5
-        displacements = np.asarray(displacement_value, dtype=float)
-        if displacements.shape != (len(self._uav_service_indices), 2):
-            raise ValueError("action.uav_displacements形状必须是(U,2)。")
-        if not np.all(np.isfinite(displacements)):
-            raise ValueError("action.uav_displacements必须是有限数组。")
-        return cache_triggers, cache_scores, uav_triggers, displacements.copy()
+        return cache_triggers, uav_triggers
 
     def _resolve_kkt_epsilons(
         self,
@@ -1693,8 +1624,6 @@ class MECEnvironment:
         self._last_node_prediction = {}
         self._service_vehicle_replacement_rows = np.empty(0, dtype=bool)
         self._last_actual_states = {}
-        self._cache_age_slots = 0
-        self._demand_shift = 0.0
         self._prediction_origin_slot = None
         self._data = self._load_rollout_data(data_source)
         data_config = self._data.get("config")
@@ -1931,7 +1860,6 @@ class MECEnvironment:
         *,
         epsilon_compute: Real | None = None,
         epsilon_bandwidth: Real | None = None,
-        cache_controller_action: int | None = None,
     ) -> tuple[dict[str, np.ndarray], float, bool, dict[str, Any]]:
         """执行一个基础时隙并返回 ``next_state, reward, done, info``。
 
@@ -1952,15 +1880,6 @@ class MECEnvironment:
             raise RuntimeError("episode已经结束，请先调用reset()。")
         current_slot = int(self._slot_index)
         mode = self.cache_controller_mode
-        if mode == "ppo":
-            if cache_controller_action not in (0, 1):
-                raise ValueError(
-                    "cache_controller.mode=ppo时必须提供0(KEEP)或1(UPDATE)动作。"
-                )
-        elif cache_controller_action is not None:
-            raise ValueError(
-                "cache_controller.mode=reference时不能提供PPO缓存控制动作。"
-            )
         try:
             from .data import get_slot_data, step as step_sumo
             from .solver import solve_slot
@@ -1969,7 +1888,7 @@ class MECEnvironment:
             from solver import solve_slot
 
         # 先校验/转换 policy 的原始动作，再读取当前 slot 的真实车辆位置。
-        cache_triggers, cache_scores, uav_triggers, displacements = self._parse_action(action)
+        cache_triggers, uav_triggers = self._parse_action(action)
         slot = get_slot_data(self._data, current_slot) if self._data is not None else None
         if slot is None:
             raise RuntimeError("环境数据尚未初始化。")
@@ -2004,12 +1923,10 @@ class MECEnvironment:
         result = solve_slot(
             previous_cache=self._cache.copy(),
             cache_triggers=cache_triggers.copy(),
-            cache_scores=cache_scores.copy(),
             service_sizes=self._service_sizes.copy(),
             cache_capacities=self._cache_capacities.copy(),
             previous_uav_positions=previous_uav_positions.copy(),
             uav_triggers=uav_triggers.copy(),
-            raw_uav_displacements=displacements.copy(),
             task_arrivals=np.asarray(slot["task_arrivals"], dtype=bool),
             task_service_types=np.asarray(slot["task_service_types"], dtype=int),
             task_vehicle_cache=self._local_cache.copy(),
@@ -2027,7 +1944,6 @@ class MECEnvironment:
             decision_interval_s=float(_section(self.config, "simulation")["decision_interval_s"]),
             epsilon_compute=epsilon_c,
             epsilon_bandwidth=epsilon_b,
-            cache_control_action=cache_controller_action,
         )
 
         # 只对已到达任务统计执行节点；未到达任务必须保持零时延、零能耗、无分配。
@@ -2080,10 +1996,6 @@ class MECEnvironment:
             np.asarray(result.final_cache, dtype=float) != previous_cache_state,
             axis=1,
         )
-        if np.any(cache_state_changed):
-            self._cache_age_slots = 0
-        else:
-            self._cache_age_slots += 1
         # 当前请求必须在当前 slot 的 prediction/solver 完成后登记，避免 request(t)
         # 进入 prediction(t)。下一 slot 的预测才可以读取这次历史。
         self._observe_current_requests(current_slot)
@@ -2129,23 +2041,6 @@ class MECEnvironment:
         candidate_changed = bool(
             np.any(np.asarray(result.candidate_cache, dtype=float) != previous_cache_state)
         )
-        actual_cache_changed = bool(np.any(cache_state_changed))
-        ppo_update_noop = bool(
-            mode == "ppo"
-            and int(cache_controller_action) == 1
-            and not candidate_changed
-        )
-        ppo_action_mismatch = int(
-            mode == "ppo"
-            and (
-                (int(cache_controller_action) == 0 and actual_cache_changed)
-                or (
-                    int(cache_controller_action) == 1
-                    and candidate_changed
-                    and not actual_cache_changed
-                )
-            )
-        )
 
         info: dict[str, Any] = {
             "slot_index": current_slot,
@@ -2168,33 +2063,13 @@ class MECEnvironment:
             "cache_state_before": previous_cache_state.copy(),
             "cache_state_changed": np.asarray(cache_state_changed, dtype=bool).copy(),
             "cache_controller_mode": mode,
-            "ppo_action": (
-                None if mode != "ppo" else int(cache_controller_action)
-            ),
-            # effective 表示高层分组确实被执行；UPDATE 候选与旧缓存相同时，
-            # 另用 ppo_update_noop 标记合法 no-op，而不是把动作误报为 mismatch。
-            "ppo_action_effective": (
-                None if mode != "ppo" else int(cache_controller_action)
-            ),
-            "ppo_update_noop": ppo_update_noop,
-            "ppo_action_mismatch": ppo_action_mismatch,
+            "action_layout": self.action_layout,
             "ppo_candidate_changed": candidate_changed,
-            "cache_gain": np.asarray(result.cache_gain, dtype=float).copy(),
-            "cache_switch_cost": np.asarray(
-                result.cache_switch_cost, dtype=float
-            ).copy(),
-            "keep_predicted_utility": np.asarray(
-                result.keep_predicted_utility, dtype=float
-            ).copy(),
-            "candidate_predicted_utility": np.asarray(
-                result.candidate_predicted_utility, dtype=float
-            ).copy(),
             "cooperative_candidate_utility": float(
                 result.cooperative_candidate_utility
             ),
             "cache_duplicate_count": int(result.cache_duplicate_count),
             "cache_unique_services": int(result.cache_unique_services),
-            "cache_local_swap_count": int(result.cache_local_swap_count),
             "services_changed": tuple(result.services_changed),
             "cache_update_count": int(np.sum(result.cache_changed)),
             "cache_candidate_changed_slots": int(
@@ -2219,12 +2094,6 @@ class MECEnvironment:
             ),
             "requested_uav_triggers": uav_triggers.copy(),
             "actual_uav_movement": np.asarray(result.actual_uav_movement, dtype=bool).copy(),
-            "uav_candidate_movement": np.asarray(
-                result.uav_candidate_movement, dtype=bool
-            ).copy(),
-            "uav_candidate_move_slots": int(
-                bool(np.any(result.uav_candidate_movement))
-            ),
             "uav_moved_slots": int(bool(np.any(result.actual_uav_movement))),
             "uav_nodes_moved": int(np.sum(result.actual_uav_movement)),
             "uav_move_distance": float(
@@ -2236,14 +2105,8 @@ class MECEnvironment:
             ),
             "uav_candidate_count": int(result.uav_candidate_count),
             "uav_ground_service_gap": float(result.ground_service_gap),
-            "uav_selected_action": str(result.uav_selected_action),
-            "J_keep": float(result.uav_J_keep),
-            "J_cache_only": float(result.uav_J_cache_only),
-            "J_uav_only": float(result.uav_J_uav_only),
-            "J_joint": float(result.uav_J_joint),
             "cache_cost": float(result.system_utility["cache_update_cost"]),
             "uav_move_cost": float(result.system_utility["uav_update_cost"]),
-            "uav_candidate_move_cost": float(result.uav_candidate_move_cost),
             "assignment": np.asarray(result.assignment, dtype=float).copy(),
             "execution_nodes": tuple(result.execution_nodes),
             "matching_migration_count": int(result.matching_migration_count),

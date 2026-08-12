@@ -2,11 +2,9 @@
 
 本模块把一个时隙的“策略辅助动作”转换为论文定义的实际执行结果，主流程为：
 
-1. ``solve_cooperative_cache``：对所有缓存节点统一执行边际收益贪心和 1-swap，
-   生成 C_cand；``solve_cache`` 仅作为明确的 legacy baseline 保留；
-2. ``decide_adaptive_cache_update``：比较 C_old/C_cand 后生成 C_exec；
-3. ``select_demand_aware_uav_cache_state``：根据未来需求和地面服务缺口生成少量
-   UAV 候选点，在速度、区域和安全距离约束下比较 A/B/C/D 联合状态；
+1. ``select_triggered_uav_positions``：只为被触发 UAV 比较少量因果预测候选；
+2. ``solve_cooperative_cache``：按 SV→RSU→UAV 稳定顺序，对被触发节点执行
+   一次完整严格 0-1 knapsack；
 4. ``build_feasible_nodes``：依据 C_exec 生成每个到达任务的可行节点集合，并
    始终加入 Cloud fallback；
 5. ``transfer_exchange_matching``：以 Cloud 初始匹配，反复评价单任务迁移和
@@ -56,38 +54,23 @@ class SolverResult:
     final_cache: np.ndarray
     # C_exec 相对 C_old 是否真的发生了缓存变化，形状为 (M,)。
     actual_cache_update: np.ndarray
-    # 自适应缓存判断的逐节点诊断字段。
+    # PPO trigger 只是配置许可；actual update 始终由 old/final 差分得到。
     cache_candidate_changed: np.ndarray
     cache_trigger: np.ndarray
     cache_changed: np.ndarray
-    cache_gain: np.ndarray
-    cache_switch_cost: np.ndarray
-    keep_predicted_utility: np.ndarray
-    candidate_predicted_utility: np.ndarray
     cooperative_candidate_utility: float
     cache_duplicate_count: int
     cache_unique_services: int
-    cache_local_swap_count: int
     services_changed: tuple[tuple[int, ...], ...]
     cache_check: bool
     # 经过 UAV 可行化后的二维水平位置，形状为 (U,2)。
     final_uav_positions: np.ndarray
     # 每个 UAV 是否真的移动，形状为 (U,)。
     actual_uav_movement: np.ndarray
-    # 需求感知候选相对旧位置是否发生候选移动，形状为 (U,)。
-    uav_candidate_movement: np.ndarray
-    # 本时隙是否进行 UAV 候选检查及最终 A/B/C/D 选择。
+    requested_uav_triggers: np.ndarray
     uav_check: bool
-    uav_selected_action: str
-    uav_J_keep: float
-    uav_J_cache_only: float
-    uav_J_uav_only: float
-    uav_J_joint: float
     uav_candidate_count: int
-    uav_candidate_move_cost: float
     ground_service_gap: float
-    # 保留字段名用于兼容旧诊断；正式路径不再调用 SCA。
-    uav_fallback: bool
     # 每个任务的可行执行列集合。
     feasible_nodes: tuple[tuple[int, ...], ...]
     # 任务到执行列的 0/1 assignment 矩阵。
@@ -219,7 +202,7 @@ def _validate_layout(
 
 
 # ---------------------------------------------------------------------------
-# Cache: legacy baseline 与统一协同候选
+# Cache: strict 0-1 knapsack and sequential cooperative reconfiguration
 # ---------------------------------------------------------------------------
 
 
@@ -342,74 +325,6 @@ def _solve_knapsack_dp(
     if best is not None:
         result[[index for index in range(scores.size) if best[1] & (1 << index)]] = 1.0
     return result
-
-
-def solve_cache(
-    previous_cache: Sequence[Sequence[Real]] | np.ndarray,
-    requested_triggers: Sequence[bool | Real] | np.ndarray,
-    cache_scores: Sequence[Sequence[Real]] | np.ndarray,
-    service_sizes: Sequence[Real] | np.ndarray,
-    cache_capacities: Real | Sequence[Real] | np.ndarray,
-    *,
-    integer_scale: int | None = None,
-    tolerance: float = _DEFAULT_TOLERANCE,
-) -> dict[str, Any]:
-    """执行原有逐节点严格 0-1 knapsack，作为 Old/legacy baseline 返回 C_cand。
-
-    正式 ``solve_slot`` 不再调用本函数。保留它是为了 Old vs New 对照和回归
-    验证；requested_triggers 是 PPO 的辅助请求，本函数不决定是否执行候选，
-    也不计算缓存成本。
-    """
-
-    if tolerance < 0.0 or not math.isfinite(float(tolerance)):
-        raise ValueError("tolerance必须是有限非负数。")
-    previous = _binary_array(previous_cache, "previous_cache", ndim=2)
-    scores = np.asarray(cache_scores, dtype=float)
-    if scores.ndim != 2:
-        raise ValueError("cache_scores必须是二维数组。")
-    if scores.shape != previous.shape:
-        raise ValueError("cache_scores必须与previous_cache形状相同。")
-    node_count, service_count = previous.shape
-    requested = _bool_vector(requested_triggers, "requested_triggers", length=node_count)
-    sizes = _positive_array(service_sizes, "service_sizes", ndim=1)
-    if sizes.shape != (service_count,):
-        raise ValueError(f"service_sizes形状必须为({service_count},)。")
-    capacities = _vector(cache_capacities, "cache_capacities", node_count)
-    sizes_int, capacities_int, _ = _integerize_cache_weights(
-        sizes,
-        capacities,
-        integer_scale,
-    )
-
-    final = previous.copy()
-    for node in range(node_count):
-        if not requested[node]:
-            continue
-        # cache_scores 只对触发节点有动作语义；DP 的 value 是服务评分之和，
-        # weight/capacity 使用同一整数化后的 MB 单位，禁止浮点四舍五入。
-        row = scores[node]
-        if not np.all(np.isfinite(row)):
-            raise ValueError("触发缓存节点的cache_scores不能包含NaN或Inf。")
-        if np.any(row <= 0.0) or np.any(row >= 1.0):
-            raise ValueError("触发缓存节点的cache_scores必须全部位于开区间(0,1)。")
-        final[node] = _solve_knapsack_dp(
-            row,
-            sizes_int,
-            int(capacities_int[node]),
-            tolerance=float(tolerance),
-        )
-
-    final_usage = np.sum(final * sizes[np.newaxis, :], axis=1)
-    if np.any(final_usage > capacities + tolerance):
-        raise ValueError("最终缓存违反容量约束。")
-    # 实际更新由最终矩阵差分得到，不能直接使用 requested trigger 代替。
-    actual_update = np.any(final != previous, axis=1)
-    return {
-        "final_cache": _readonly(final),
-        "candidate_cache": _readonly(final),
-        "actual_cache_update": _readonly(actual_update, dtype=bool),
-        "requested_triggers": _readonly(requested, dtype=bool),
-    }
 
 
 def _prediction_demand(
@@ -746,7 +661,6 @@ def _cache_replication_stats(cache: np.ndarray) -> tuple[int, int]:
 def solve_cooperative_cache(
     previous_cache: Sequence[Sequence[Real]] | np.ndarray,
     requested_triggers: Sequence[bool | Real] | np.ndarray,
-    cache_scores: Sequence[Sequence[Real]] | np.ndarray | None,
     service_sizes: Sequence[Real] | np.ndarray,
     cache_capacities: Real | Sequence[Real] | np.ndarray,
     *,
@@ -755,34 +669,20 @@ def solve_cooperative_cache(
     environment: MECEnvironment,
     integer_scale: int | None = None,
     tolerance: float = _DEFAULT_TOLERANCE,
-    max_local_swaps: int = 1,
 ) -> dict[str, Any]:
-    """统一生成 SV/RSU/UAV 的协同缓存候选 ``C_cand``。
+    """一轮顺序协同缓存重配置。
 
-    该实现保留 policy 的 cache trigger 作为一次全局候选检查开关，但不再对
-    每个节点分别求热门服务。只要有节点请求检查，就在统一缓存矩阵上执行：
-
-    1. 从当前缓存出发，在每个节点的真实容量内选择最大正边际收益/服务大小；
-    2. 贪心结束后尝试最多 ``max_local_swaps`` 次 1-swap，允许删除低价值服务
-       后装入更高价值服务；
-    3. 边际收益由 ``predicted_cache_utility`` 统一计算，重叠覆盖只计最佳节点，
-       空间分离的重复副本仍可分别产生收益。
-
-    ``cache_scores`` 仅为兼容旧 policy 接口保留，不参与正式协同效用排序；
-    ``solve_cache`` 保留为明确的 legacy baseline，不再由 ``solve_slot`` 调用。
+    PPO 只决定哪些节点允许重配。每个触发节点都把自己的旧缓存行完整清空后，
+    基于其它节点当前已提供的服务计算逐服务边际价值，并复用严格 0-1 knapsack
+    DP 一次求出完整新配置。固定顺序为 SV→RSU→UAV、同类型按既有稳定行号；
+    只执行一轮，不做 Cache/UAV alternating，也不声称获得 P0 联合全局最优。
     """
 
     if tolerance < 0.0 or not math.isfinite(float(tolerance)):
         raise ValueError("tolerance必须是有限非负数。")
-    if int(max_local_swaps) < 0:
-        raise ValueError("max_local_swaps不能为负数。")
     previous = _binary_array(previous_cache, "previous_cache", ndim=2)
     node_count, service_count = previous.shape
     requested = _bool_vector(requested_triggers, "requested_triggers", length=node_count)
-    if cache_scores is not None:
-        scores = np.asarray(cache_scores, dtype=float)
-        if scores.shape != previous.shape:
-            raise ValueError("cache_scores必须与previous_cache形状相同。")
     sizes = _positive_array(service_sizes, "service_sizes", ndim=1)
     if sizes.shape != (service_count,):
         raise ValueError(f"service_sizes形状必须为({service_count},)。")
@@ -795,30 +695,10 @@ def solve_cooperative_cache(
         capacities,
         integer_scale,
     )
-    current_usage = np.sum(previous * sizes[np.newaxis, :], axis=1)
-    if np.any(current_usage > capacities + tolerance):
+    if np.any(np.sum(previous * sizes[np.newaxis, :], axis=1) > capacities + tolerance):
         raise ValueError("previous_cache违反节点缓存容量约束。")
 
     candidate = previous.copy()
-    duplicate_count, unique_services = _cache_replication_stats(candidate)
-    if not np.any(requested):
-        # 没有候选检查请求时不建立 utility oracle，保持第四阶段“候选相同
-        # 直接短路”的因果语义，并且不把 policy 的空动作改写成缓存更新。
-        return {
-            "candidate_cache": _readonly(candidate),
-            "final_cache": _readonly(candidate),
-            "actual_cache_update": _readonly(
-                np.zeros(node_count, dtype=bool), dtype=bool
-            ),
-            "cooperative_candidate_utility": 0.0,
-            "cache_duplicate_count": duplicate_count,
-            "cache_unique_services": unique_services,
-            "cache_local_swap_count": 0,
-            "requested_triggers": _readonly(requested, dtype=bool),
-        }
-
-    # 触发是全局协同检查开关；一旦进入候选生成，所有节点共享同一个
-    # marginal-gain oracle，避免“只有被触发节点才能看到协同替代关系”。
     evaluator = _prepare_predicted_cache_utility(
         cache_prediction=cache_prediction,
         node_types=kinds,
@@ -826,80 +706,32 @@ def solve_cooperative_cache(
         node_count=node_count,
         service_count=service_count,
     )
-    usage_int = np.sum(candidate * sizes_int[np.newaxis, :], axis=1).astype(np.int64)
-    current_utility = float(evaluator(candidate))
-    addition_count = 0
-
-    def best_addition() -> tuple[float, float, int, int, np.ndarray] | None:
-        best: tuple[float, float, int, int, np.ndarray] | None = None
-        for node_index in range(node_count):
-            for service_index in range(service_count):
-                if candidate[node_index, service_index] > 0.0:
-                    continue
-                if usage_int[node_index] + sizes_int[service_index] > capacities_int[node_index]:
-                    continue
-                trial = candidate.copy()
-                trial[node_index, service_index] = 1.0
-                gain = float(evaluator(trial) - current_utility)
-                if gain <= tolerance:
-                    continue
-                density = gain / float(sizes[service_index])
-                key = (density, gain, -node_index, -service_index)
-                if best is None or key > (best[0], best[1], -best[2], -best[3]):
-                    best = (density, gain, node_index, service_index, trial)
-        return best
-
-    while True:
-        selected = best_addition()
-        if selected is None:
-            break
-        _, gain, node_index, service_index, candidate = selected
-        usage_int[node_index] += sizes_int[service_index]
-        current_utility += float(gain)
-        addition_count += 1
-
-    swap_count = 0
-    for _ in range(int(max_local_swaps)):
-        best: tuple[float, float, int, int, int, np.ndarray] | None = None
-        for node_index in range(node_count):
-            cached_services = np.flatnonzero(candidate[node_index] > 0.0)
-            missing_services = np.flatnonzero(candidate[node_index] <= 0.0)
-            for remove_index in cached_services:
-                for add_index in missing_services:
-                    new_usage = (
-                        usage_int[node_index]
-                        - sizes_int[remove_index]
-                        + sizes_int[add_index]
-                    )
-                    if new_usage > capacities_int[node_index]:
-                        continue
-                    trial = candidate.copy()
-                    trial[node_index, remove_index] = 0.0
-                    trial[node_index, add_index] = 1.0
-                    gain = float(evaluator(trial) - current_utility)
-                    if gain <= tolerance:
-                        continue
-                    density = gain / float(sizes[add_index])
-                    key = (density, gain, -node_index, -remove_index, -add_index)
-                    if best is None or key > (
-                        best[0], best[1], -best[2], -best[3], -best[4]
-                    ):
-                        best = (
-                            density,
-                            gain,
-                            node_index,
-                            int(remove_index),
-                            int(add_index),
-                            trial,
-                        )
-        if best is None:
-            break
-        _, gain, node_index, remove_index, add_index, candidate = best
-        usage_int[node_index] = (
-            usage_int[node_index] - sizes_int[remove_index] + sizes_int[add_index]
+    type_order = {
+        NodeType.SERVICE_VEHICLE: 0,
+        NodeType.RSU: 1,
+        NodeType.UAV: 2,
+    }
+    ordered_nodes = sorted(range(node_count), key=lambda index: (type_order[kinds[index]], index))
+    for node_index in ordered_nodes:
+        if not requested[node_index]:
+            continue
+        # 其它节点保持当前一轮已经确定的配置；当前行先清空，再独立评价每件服务
+        # 的系统边际价值。重叠区域已有良好服务时，oracle 的 max-over-node 会自然
+        # 降低该服务价值；空间分离覆盖仍允许相同服务出现在不同节点。
+        base = candidate.copy()
+        base[node_index] = 0.0
+        base_utility = float(evaluator(base))
+        values = np.zeros(service_count, dtype=float)
+        for service_index in range(service_count):
+            trial = base.copy()
+            trial[node_index, service_index] = 1.0
+            values[service_index] = max(0.0, float(evaluator(trial) - base_utility))
+        candidate[node_index] = _solve_knapsack_dp(
+            values,
+            sizes_int,
+            int(capacities_int[node_index]),
+            tolerance=float(tolerance),
         )
-        current_utility += float(gain)
-        swap_count += 1
 
     final_usage = np.sum(candidate * sizes[np.newaxis, :], axis=1)
     if np.any(final_usage > capacities + tolerance):
@@ -914,132 +746,7 @@ def solve_cooperative_cache(
         "cooperative_candidate_utility": float(evaluator(candidate)),
         "cache_duplicate_count": duplicate_count,
         "cache_unique_services": unique_services,
-        "cache_local_swap_count": int(swap_count),
-        "cache_addition_count": int(addition_count),
         "requested_triggers": _readonly(requested, dtype=bool),
-    }
-
-
-def decide_adaptive_cache_update(
-    old_cache: Sequence[Sequence[Real]] | np.ndarray,
-    candidate_cache: Sequence[Sequence[Real]] | np.ndarray,
-    *,
-    cache_prediction: Mapping[str, Any] | None,
-    service_sizes: Sequence[Real] | np.ndarray,
-    node_types: Sequence[NodeType | str],
-    environment: MECEnvironment,
-    tolerance: float = _DEFAULT_TOLERANCE,
-) -> dict[str, Any]:
-    """比较 C_old/C_cand，并决定最终执行缓存 C_exec。
-
-    候选和触发共用 ``predicted_cache_utility``，因此同一个协同效用同时回答
-    “候选如何排序”和“候选是否值得执行”。预测效用不包含切换成本，使用：
-    ``G_cache = U_candidate - U_keep - C_switch``。真实 reward 仍只对
-    ``C_old -> C_exec`` 调用一次已有缓存成本函数。
-    """
-
-    if tolerance < 0.0 or not math.isfinite(float(tolerance)):
-        raise ValueError("tolerance必须是有限非负数。")
-    old = _binary_array(old_cache, "old_cache", ndim=2)
-    candidate = _binary_array(candidate_cache, "candidate_cache", ndim=2)
-    if candidate.shape != old.shape:
-        raise ValueError("old_cache和candidate_cache形状必须相同。")
-    node_count, service_count = old.shape
-    kinds = tuple(_node_kind(item) for item in node_types)
-    if len(kinds) != node_count:
-        raise ValueError("node_types数量必须等于缓存节点数量。")
-    sizes = _positive_array(service_sizes, "service_sizes", ndim=1)
-    if sizes.shape != (service_count,):
-        raise ValueError("service_sizes长度必须等于服务数量。")
-    candidate_changed = np.any(candidate != old, axis=1)
-    switch_cost = np.zeros(node_count, dtype=float)
-    services_changed: list[tuple[int, ...]] = []
-
-    # 候选和当前相同是严格短路条件：不再计算更新收益，也不产生切换成本。
-    if not np.any(candidate_changed):
-        services_changed = [tuple() for _ in range(node_count)]
-        return {
-            "old_cache": _readonly(old),
-            "candidate_cache": _readonly(candidate),
-            "exec_cache": _readonly(old.copy()),
-            "cache_candidate_changed": _readonly(candidate_changed, dtype=bool),
-            "cache_trigger": _readonly(np.zeros(node_count, dtype=bool), dtype=bool),
-            "cache_changed": _readonly(np.zeros(node_count, dtype=bool), dtype=bool),
-            "cache_gain": _readonly(np.zeros(node_count, dtype=float)),
-            "cache_switch_cost": _readonly(switch_cost),
-            "keep_predicted_utility": _readonly(np.zeros(node_count, dtype=float)),
-            "candidate_predicted_utility": _readonly(
-                np.zeros(node_count, dtype=float)
-            ),
-            "cooperative_candidate_utility": 0.0,
-            "cache_duplicate_count": _cache_replication_stats(candidate)[0],
-            "cache_unique_services": _cache_replication_stats(candidate)[1],
-            "cache_local_swap_count": 0,
-            "services_changed": tuple(services_changed),
-            "cache_check": True,
-        }
-
-    for node_index, kind in enumerate(kinds):
-        changed_services = tuple(
-            int(index)
-            for index in np.flatnonzero(candidate[node_index] != old[node_index])
-        )
-        services_changed.append(changed_services)
-        if changed_services:
-            switch_cost[node_index] = float(
-                environment.cache_update_cost(
-                    old[node_index],
-                    candidate[node_index],
-                    node_type=kind,
-                    service_sizes=sizes,
-                )["total_cost"]
-            )
-    evaluator = _prepare_predicted_cache_utility(
-        cache_prediction=cache_prediction,
-        node_types=kinds,
-        environment=environment,
-        node_count=node_count,
-        service_count=service_count,
-    )
-    keep_total = float(evaluator(old))
-    candidate_total = float(evaluator(candidate))
-    total_switch_cost = float(np.sum(switch_cost))
-    total_gain = candidate_total - keep_total - total_switch_cost
-    if not all(
-        math.isfinite(value)
-        for value in (keep_total, candidate_total, total_switch_cost, total_gain)
-    ):
-        raise ValueError("缓存预测收益或切换成本包含NaN/Inf。")
-    # 协同候选是一个整体：正的全局净收益时同时执行所有候选变化，避免
-    # 按节点拆开后破坏“重叠节点去重/分离节点允许重复”的边际收益判断。
-    trigger = candidate_changed & (total_gain > 0.0)
-    exec_cache = old.copy()
-    exec_cache[trigger] = candidate[trigger]
-    changed = np.any(exec_cache != old, axis=1)
-    # 任何实际变化都必须来自正净收益触发，防止“更新但没有 trigger”。
-    if np.any(changed & ~trigger):  # pragma: no cover - defensive invariant
-        raise RuntimeError("cache_changed必须蕴含cache_trigger。")
-    gain = np.where(candidate_changed, total_gain, 0.0)
-    keep_utility = np.full(node_count, keep_total, dtype=float)
-    candidate_utility = np.full(node_count, candidate_total, dtype=float)
-    duplicate_count, unique_services = _cache_replication_stats(candidate)
-    return {
-        "old_cache": _readonly(old),
-        "candidate_cache": _readonly(candidate),
-        "exec_cache": _readonly(exec_cache),
-        "cache_candidate_changed": _readonly(candidate_changed, dtype=bool),
-        "cache_trigger": _readonly(trigger, dtype=bool),
-        "cache_changed": _readonly(changed, dtype=bool),
-        "cache_gain": _readonly(gain),
-        "cache_switch_cost": _readonly(switch_cost),
-        "keep_predicted_utility": _readonly(keep_utility),
-        "candidate_predicted_utility": _readonly(candidate_utility),
-        "cooperative_candidate_utility": candidate_total,
-        "cache_duplicate_count": duplicate_count,
-        "cache_unique_services": unique_services,
-        "cache_local_swap_count": 0,
-        "services_changed": tuple(services_changed),
-        "cache_check": True,
     }
 
 
@@ -1101,35 +808,8 @@ def _uav_original_constraints(
 
 
 # ---------------------------------------------------------------------------
-# Demand-aware finite UAV candidates and one-shot cache/UAV comparison
+# Demand-aware finite UAV candidates
 # ---------------------------------------------------------------------------
-
-
-def _cache_state_cost(
-    old_cache: np.ndarray,
-    current_cache: np.ndarray,
-    *,
-    service_sizes: Sequence[Real] | np.ndarray,
-    node_types: Sequence[NodeType | str],
-    environment: MECEnvironment,
-) -> float:
-    """计算一个候选状态的真实缓存切换成本，不把预测效用与成本混合。"""
-
-    total = 0.0
-    for index, kind in enumerate(node_types):
-        if np.array_equal(old_cache[index], current_cache[index]):
-            continue
-        total += float(
-            environment.cache_update_cost(
-                old_cache[index],
-                current_cache[index],
-                node_type=_node_kind(kind),
-                service_sizes=service_sizes,
-            )["total_cost"]
-        )
-    if not math.isfinite(total) or total < 0.0:
-        raise ValueError("缓存状态切换成本必须是有限非负数。")
-    return total
 
 
 def _uav_state_cost(
@@ -1289,6 +969,34 @@ def _ground_service_gap_hotspots(
     return hotspot_weights, tuple(unique[: max(0, int(max_hotspots) + 1)])
 
 
+def _predicted_demand_hotspot(
+    cache_prediction: Mapping[str, Any] | None,
+) -> np.ndarray | None:
+    """返回全部预测车辆需求的轻量几何热点，不读取当前真实任务。"""
+
+    if not isinstance(cache_prediction, Mapping):
+        return None
+    raw_positions = cache_prediction.get("vehicle_positions_m")
+    if raw_positions is None:
+        return None
+    positions = np.asarray(raw_positions, dtype=float)
+    if positions.ndim != 3 or positions.shape[2] != 2 or not np.all(np.isfinite(positions)):
+        return None
+    horizon = positions.shape[1]
+    raw_weights = cache_prediction.get("horizon_weights")
+    weights = (
+        np.ones(horizon, dtype=float)
+        if raw_weights is None
+        else np.asarray(raw_weights, dtype=float)
+    )
+    if weights.shape != (horizon,) or not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        return None
+    tiled = np.broadcast_to(weights[np.newaxis, :], positions.shape[:2]).reshape(-1)
+    if float(np.sum(tiled)) <= 0.0:
+        return None
+    return np.average(positions.reshape(-1, 2), axis=0, weights=tiled).astype(float)
+
+
 def _project_uav_target(
     previous: np.ndarray,
     target: np.ndarray,
@@ -1322,12 +1030,20 @@ def _demand_uav_candidate_sets(
 ) -> tuple[float, tuple[tuple[np.ndarray, ...], ...]]:
     """为每个 UAV 生成 current + 少量需求缺口热点候选。"""
 
-    gap, hotspots = _ground_service_gap_hotspots(
+    gap, gap_hotspots = _ground_service_gap_hotspots(
         current_cache,
         cache_prediction,
         node_types,
         max_hotspots=max_hotspots,
     )
+    hotspots: list[np.ndarray] = []
+    demand_hotspot = _predicted_demand_hotspot(cache_prediction)
+    if demand_hotspot is not None:
+        hotspots.append(demand_hotspot)
+    for point in gap_hotspots:
+        if not any(np.linalg.norm(point - old) <= 1.0e-6 for old in hotspots):
+            hotspots.append(point)
+    hotspots = hotspots[: max(0, int(max_hotspots))]
     maximum_displacement = float(max_speed_mps) * float(slot_duration_s)
     candidate_sets: list[tuple[np.ndarray, ...]] = []
     for previous_position in previous_positions:
@@ -1345,107 +1061,11 @@ def _demand_uav_candidate_sets(
     return gap, tuple(candidate_sets)
 
 
-def _evaluate_uav_cache_state(
-    candidate_positions: np.ndarray,
-    *,
-    previous_cache: np.ndarray,
-    requested_cache_triggers: Sequence[bool | Real] | np.ndarray,
-    cache_scores: Sequence[Sequence[Real]] | np.ndarray | None,
-    service_sizes: Sequence[Real] | np.ndarray,
-    cache_capacities: Real | Sequence[Real] | np.ndarray,
-    cache_prediction: Mapping[str, Any] | None,
-    node_types: Sequence[NodeType | str],
-    uav_service_indices: Sequence[int],
-    environment: MECEnvironment,
-    integer_scale: int | None,
-) -> dict[str, Any]:
-    """在临时 UAV 位置上重算轻量协同缓存状态，不修改真实环境。"""
-
-    prediction = _prediction_at_uav_positions(
-        cache_prediction,
-        candidate_positions,
-        uav_service_indices,
-        environment=environment,
-    )
-    cache_result = solve_cooperative_cache(
-        previous_cache,
-        requested_cache_triggers,
-        cache_scores,
-        service_sizes,
-        cache_capacities,
-        cache_prediction=prediction,
-        node_types=node_types,
-        environment=environment,
-        integer_scale=integer_scale,
-    )
-    candidate_cache = np.asarray(cache_result["candidate_cache"], dtype=float)
-    adaptive = decide_adaptive_cache_update(
-        previous_cache,
-        candidate_cache,
-        cache_prediction=prediction,
-        service_sizes=service_sizes,
-        node_types=node_types,
-        environment=environment,
-    )
-    adaptive["cache_local_swap_count"] = int(cache_result.get("cache_local_swap_count", 0))
-    adaptive["cache_duplicate_count"] = int(cache_result.get("cache_duplicate_count", 0))
-    adaptive["cache_unique_services"] = int(cache_result.get("cache_unique_services", 0))
-    final_cache = np.asarray(adaptive["exec_cache"], dtype=float)
-    cache_cost = _cache_state_cost(
-        previous_cache,
-        final_cache,
-        service_sizes=service_sizes,
-        node_types=node_types,
-        environment=environment,
-    )
-    keep_utility = predicted_cache_utility(
-        previous_cache,
-        cache_prediction=prediction,
-        node_types=node_types,
-        environment=environment,
-    )
-    exec_utility = predicted_cache_utility(
-        final_cache,
-        cache_prediction=prediction,
-        node_types=node_types,
-        environment=environment,
-    )
-    # PPO 的 UPDATE 分支必须能够接受候选，即使候选的短视净收益没有超过
-    # C_old；因此同时保留“候选本身”的效用和实际切换成本，供高层动作分组使用。
-    candidate_cache_cost = _cache_state_cost(
-        previous_cache,
-        candidate_cache,
-        service_sizes=service_sizes,
-        node_types=node_types,
-        environment=environment,
-    )
-    candidate_utility = predicted_cache_utility(
-        candidate_cache,
-        cache_prediction=prediction,
-        node_types=node_types,
-        environment=environment,
-    )
-    return {
-        "prediction": prediction,
-        "candidate_cache": candidate_cache,
-        "final_cache": final_cache,
-        "adaptive": adaptive,
-        "cache_cost": float(cache_cost),
-        "keep_utility": float(keep_utility),
-        "exec_utility": float(exec_utility),
-        "candidate_cache_cost": float(candidate_cache_cost),
-        "candidate_utility": float(candidate_utility),
-    }
-
-
-def select_demand_aware_uav_cache_state(
+def select_triggered_uav_positions(
     previous_positions: Sequence[Sequence[Real]] | np.ndarray,
     *,
     previous_cache: Sequence[Sequence[Real]] | np.ndarray,
-    requested_cache_triggers: Sequence[bool | Real] | np.ndarray,
-    cache_scores: Sequence[Sequence[Real]] | np.ndarray | None,
-    service_sizes: Sequence[Real] | np.ndarray,
-    cache_capacities: Real | Sequence[Real] | np.ndarray,
+    requested_uav_triggers: Sequence[bool | Real] | np.ndarray,
     cache_prediction: Mapping[str, Any] | None,
     node_types: Sequence[NodeType | str],
     uav_service_indices: Sequence[int],
@@ -1456,23 +1076,21 @@ def select_demand_aware_uav_cache_state(
     minimum_separation_m: Real,
     position_epsilon_m: Real = _DEFAULT_POSITION_EPSILON,
     max_hotspots: int = 3,
-    integer_scale: int | None = None,
-    cache_control_action: int | None = None,
 ) -> dict[str, Any]:
-    """一次有限候选 A/B/C/D 联合比较，返回最终 UAV 位置和缓存状态。
+    """按 trigger 对 UAV 执行一次有限候选定位。
 
-    A=保持(C_old,Q_old)，B=只更新缓存，C=只移动 UAV，D=移动 UAV 后重新
-    生成协同缓存。所有状态共用 ``predicted_cache_utility``；候选评价只使用
-    临时数组和预测结果，不写入环境、不执行 Matching/KKT，也不调用 SCA。
+    未触发 UAV 严格保持原位；触发 UAV 只比较当前位置和既有需求/地面覆盖缺口
+    热点，并以因果预测缓存效用减真实 UAV 移动成本评价。该过程是第四章有限
+    候选近似，不使用当前真实任务，也不是连续位置全局优化。
     """
-
-    if cache_control_action not in (None, 0, 1):
-        raise ValueError("cache_control_action只能是None、0(KEEP)或1(UPDATE)。")
     previous = _finite_array(previous_positions, "previous_positions", ndim=2)
     old_cache = _binary_array(previous_cache, "previous_cache", ndim=2)
     if previous.shape[1:] != (2,):
         raise ValueError("previous_positions必须形状为(U,2)。")
     uav_count = previous.shape[0]
+    requested = _bool_vector(
+        requested_uav_triggers, "requested_uav_triggers", length=uav_count
+    )
     kinds = tuple(_node_kind(item) for item in node_types)
     if len(kinds) != old_cache.shape[0]:
         raise ValueError("node_types数量必须等于缓存节点数量。")
@@ -1507,27 +1125,6 @@ def select_demand_aware_uav_cache_state(
     ):
         raise ValueError("previous_positions必须满足已有UAV区域、速度和安全距离约束。")
 
-    state_cache: dict[bytes, dict[str, Any]] = {}
-
-    def evaluate(positions: np.ndarray) -> dict[str, Any]:
-        checked = _finite_array(positions, "candidate_positions", ndim=2)
-        key = checked.tobytes()
-        if key not in state_cache:
-            state_cache[key] = _evaluate_uav_cache_state(
-                checked,
-                previous_cache=old_cache,
-                requested_cache_triggers=requested_cache_triggers,
-                cache_scores=cache_scores,
-                service_sizes=service_sizes,
-                cache_capacities=cache_capacities,
-                cache_prediction=cache_prediction,
-                node_types=kinds,
-                uav_service_indices=uav_indices,
-                environment=environment,
-                integer_scale=integer_scale,
-            )
-        return state_cache[key]
-
     gap, candidate_sets = _demand_uav_candidate_sets(
         previous,
         old_cache,
@@ -1538,231 +1135,58 @@ def select_demand_aware_uav_cache_state(
         region=region_values,
         max_hotspots=max_hotspots,
     )
-    base_state = evaluate(previous)
-    keep_utility = float(base_state["keep_utility"])
-    cache_only_utility = float(base_state["exec_utility"])
-    cache_only_cost = float(base_state["cache_cost"])
-    J_keep = keep_utility
-    # 这是不经过 G_cache 决策的候选效用，专供 PPO UPDATE 组使用；Reference
-    # 模式仍继续使用下方原有的自适应 exec_cache 结果，保证 baseline 不变。
-    forced_cache_only_utility = (
-        float(base_state["candidate_utility"])
-        - float(base_state["candidate_cache_cost"])
-    )
-
     working = previous.copy()
     for uav_order, candidates in enumerate(candidate_sets):
+        if not requested[uav_order]:
+            continue
         best_positions = working.copy()
-        best_state = evaluate(best_positions)
-        best_move_cost = _uav_state_cost(
-            previous,
-            best_positions,
-            environment=environment,
-            movement_epsilon_m=epsilon,
-        )
-        best_keep_score = predicted_cache_utility(
-            old_cache,
-            cache_prediction=best_state["prediction"],
-            node_types=kinds,
-            environment=environment,
-        ) - best_move_cost
-        best_joint_score = (
-            best_state["exec_utility"] - best_state["cache_cost"] - best_move_cost
-        )
-        forced_best_joint_score = (
-            best_state["candidate_utility"]
-            - best_state["candidate_cache_cost"]
-            - best_move_cost
-        )
-        if cache_control_action is None:
-            best_score = float(max(best_keep_score, best_joint_score))
-        elif cache_control_action == 0:
-            best_score = float(best_keep_score)
-        else:
-            best_score = float(forced_best_joint_score)
+        best_score = -math.inf
         for candidate in candidates:
             trial = working.copy()
             trial[uav_order] = candidate
             if not _uav_original_constraints(
                 trial,
                 previous,
-                np.ones(uav_count, dtype=bool),
+                requested,
                 maximum_displacement,
                 region_values,
                 minimum_separation,
                 max(epsilon, _DEFAULT_TOLERANCE),
             ):
                 continue
-            trial_state = evaluate(trial)
+            trial_prediction = _prediction_at_uav_positions(
+                cache_prediction,
+                trial,
+                uav_indices,
+                environment=environment,
+            )
             trial_move_cost = _uav_state_cost(
                 previous,
                 trial,
                 environment=environment,
                 movement_epsilon_m=epsilon,
             )
-            trial_keep_score = predicted_cache_utility(
+            trial_score = predicted_cache_utility(
                 old_cache,
-                cache_prediction=trial_state["prediction"],
+                cache_prediction=trial_prediction,
                 node_types=kinds,
                 environment=environment,
             ) - trial_move_cost
-            trial_joint_score = (
-                trial_state["exec_utility"]
-                - trial_state["cache_cost"]
-                - trial_move_cost
-            )
-            forced_trial_joint_score = (
-                trial_state["candidate_utility"]
-                - trial_state["candidate_cache_cost"]
-                - trial_move_cost
-            )
-            if cache_control_action is None:
-                trial_score = float(max(trial_keep_score, trial_joint_score))
-            elif cache_control_action == 0:
-                trial_score = float(trial_keep_score)
-            else:
-                trial_score = float(forced_trial_joint_score)
             if trial_score > best_score + _DEFAULT_TOLERANCE:
-                best_score = trial_score
+                best_score = float(trial_score)
                 best_positions = trial
-                best_state = trial_state
         working = best_positions
-
-    candidate_positions = working
-    candidate_state = evaluate(candidate_positions)
-    candidate_move_cost = _uav_state_cost(
-        previous,
-        candidate_positions,
-        environment=environment,
-        movement_epsilon_m=epsilon,
-    )
-    candidate_prediction = candidate_state["prediction"]
-    J_uav_only = predicted_cache_utility(
-        old_cache,
-        cache_prediction=candidate_prediction,
-        node_types=kinds,
-        environment=environment,
-    ) - candidate_move_cost
-    reference_J_joint = float(
-        candidate_state["exec_utility"]
-        - candidate_state["cache_cost"]
-        - candidate_move_cost
-    )
-    forced_J_joint = float(
-        candidate_state["candidate_utility"]
-        - candidate_state["candidate_cache_cost"]
-        - candidate_move_cost
-    )
-    if cache_control_action is None:
-        J_cache_only = cache_only_utility - cache_only_cost
-        J_joint = reference_J_joint
-    else:
-        J_cache_only = forced_cache_only_utility
-        J_joint = forced_J_joint
-    values = np.asarray([J_keep, J_cache_only, J_uav_only, J_joint], dtype=float)
-    if not np.all(np.isfinite(values)):
-        raise ValueError("UAV A/B/C/D 评价不能包含NaN/Inf。")
-    if cache_control_action is None:
-        selected_index = int(np.argmax(values))
-    elif cache_control_action == 0:
-        selected_index = 0 if J_keep >= J_uav_only else 2
-    else:
-        selected_index = 1 if J_cache_only >= J_joint else 3
-    labels = ("A_keep", "B_cache_only", "C_uav_only", "D_joint")
-    selected_action = labels[selected_index]
-    if selected_index == 0:
-        selected_positions = previous.copy()
-        selected_state = base_state
-        selected_cache = old_cache.copy()
-    elif selected_index == 1:
-        selected_positions = previous.copy()
-        selected_state = base_state
-        selected_cache = np.asarray(
-            base_state["candidate_cache"] if cache_control_action == 1 else base_state["final_cache"],
-            dtype=float,
-        ).copy()
-    elif selected_index == 2:
-        selected_positions = candidate_positions.copy()
-        selected_state = candidate_state
-        selected_cache = old_cache.copy()
-    else:
-        selected_positions = candidate_positions.copy()
-        selected_state = candidate_state
-        selected_cache = np.asarray(
-            candidate_state["candidate_cache"] if cache_control_action == 1 else candidate_state["final_cache"],
-            dtype=float,
-        ).copy()
-
-    actual_movement = np.linalg.norm(selected_positions - previous, axis=1) > epsilon
-    candidate_movement = np.linalg.norm(candidate_positions - previous, axis=1) > epsilon
-    selected_adaptive = selected_state["adaptive"]
-    if selected_index in {0, 2}:
-        # A/C 明确保持缓存；在正常净收益规则下，若 B/D 候选真的值得执行，
-        # 对应 J_B/J_D 会严格高于 A/C，因此这里不会丢失一个正收益缓存更新。
-        selected_adaptive = dict(selected_adaptive)
-        selected_adaptive["exec_cache"] = _readonly(selected_cache)
-        selected_adaptive["cache_changed"] = _readonly(
-            np.zeros(old_cache.shape[0], dtype=bool), dtype=bool
-        )
-        selected_adaptive["cache_trigger"] = _readonly(
-            np.zeros(old_cache.shape[0], dtype=bool), dtype=bool
-        )
-    elif cache_control_action == 1:
-        # PPO UPDATE 已经决定接受 C_cand；这里不能再用 G_cache 把动作改回 KEEP。
-        # 候选相同的 slot 仍自然成为 no-op，实际成本由 old/final 差分得到0。
-        selected_adaptive = dict(selected_adaptive)
-        forced_changed = np.any(selected_cache != old_cache, axis=1)
-        selected_adaptive["exec_cache"] = _readonly(selected_cache)
-        selected_adaptive["cache_trigger"] = _readonly(forced_changed, dtype=bool)
-        selected_adaptive["cache_changed"] = _readonly(forced_changed, dtype=bool)
-
-    update_state = base_state if forced_cache_only_utility >= forced_J_joint else candidate_state
-    update_candidate_cache = np.asarray(update_state["candidate_cache"], dtype=float)
-    update_changed_units = int(np.sum(update_candidate_cache != old_cache))
-    update_total_units = max(1, int(old_cache.size))
-    selected_cache_cost = _cache_state_cost(
-        old_cache,
-        selected_cache,
-        service_sizes=service_sizes,
-        node_types=kinds,
-        environment=environment,
-    )
-    selected_uav_cost = _uav_state_cost(
-        previous,
-        selected_positions,
-        environment=environment,
-        movement_epsilon_m=epsilon,
-    )
+    actual_movement = np.linalg.norm(working - previous, axis=1) > epsilon
     return {
-        "candidate_cache": np.asarray(selected_state["candidate_cache"], dtype=float),
-        "final_cache": selected_cache,
-        "adaptive_cache": selected_adaptive,
-        "final_positions": _readonly(selected_positions),
-        "candidate_positions": _readonly(candidate_positions),
+        "final_positions": _readonly(working),
         "actual_movement": _readonly(actual_movement, dtype=bool),
-        "candidate_movement": _readonly(candidate_movement, dtype=bool),
-        "uav_check": True,
-        "uav_selected_action": selected_action,
-        "uav_J_keep": float(J_keep),
-        "uav_J_cache_only": float(J_cache_only),
-        "uav_J_uav_only": float(J_uav_only),
-        "uav_J_joint": float(J_joint),
-        "ppo_J_keep": float(max(J_keep, J_uav_only)),
-        "ppo_J_update": float(max(forced_cache_only_utility, forced_J_joint)),
-        "ppo_delta_predicted_utility": float(
-            max(forced_cache_only_utility, forced_J_joint)
-            - max(J_keep, J_uav_only)
+        "requested_triggers": _readonly(requested, dtype=bool),
+        "prediction": _prediction_at_uav_positions(
+            cache_prediction, working, uav_indices, environment=environment
         ),
-        "ppo_candidate_cache_cost": float(update_state["candidate_cache_cost"]),
-        "ppo_changed_service_ratio": float(update_changed_units / update_total_units),
-        "ppo_candidate_cache": _readonly(update_candidate_cache),
+        "uav_check": bool(np.any(requested)),
         "uav_candidate_count": int(sum(len(items) for items in candidate_sets)),
-        "uav_candidate_move_cost": float(candidate_move_cost),
-        "uav_actual_move_cost": float(selected_uav_cost),
-        "cache_actual_cost": float(selected_cache_cost),
         "ground_service_gap": float(gap),
-        "cache_control_action": cache_control_action,
-        "fallback_applied": False,
     }
 
 
@@ -2582,12 +2006,10 @@ def solve_slot(
     *,
     previous_cache: Sequence[Sequence[Real]] | np.ndarray,
     cache_triggers: Sequence[bool | Real] | np.ndarray,
-    cache_scores: Sequence[Sequence[Real]] | np.ndarray,
     service_sizes: Sequence[Real] | np.ndarray,
     cache_capacities: Real | Sequence[Real] | np.ndarray,
     previous_uav_positions: Sequence[Sequence[Real]] | np.ndarray,
     uav_triggers: Sequence[bool | Real] | np.ndarray,
-    raw_uav_displacements: Sequence[Sequence[Real]] | np.ndarray,
     task_arrivals: Sequence[bool | Real] | np.ndarray,
     task_service_types: Sequence[int] | np.ndarray,
     task_vehicle_cache: Sequence[Sequence[Real]] | np.ndarray,
@@ -2619,7 +2041,6 @@ def solve_slot(
     multiplier_tolerance: float = _DEFAULT_MULTIPLIER_TOLERANCE,
     max_kkt_iterations: int = 100,
     max_matching_updates: int | None = None,
-    cache_control_action: int | None = None,
 ) -> SolverResult:
     """按论文顺序完成一个时隙的配置、matching、KKT 和最终执行评价。
 
@@ -2686,17 +2107,12 @@ def solve_slot(
     config = env.config
     uav_config = config["uav"]
     simulation_config = config["simulation"]
-    # 第六阶段：根据未来车辆需求和地面服务缺口生成少量候选位置，
-    # 再用同一个 predicted_cache_utility 一次比较 A/B/C/D。raw displacement
-    # 仍保留在 solver 接口中以兼容策略输出，但不再驱动 UAV 的正式位置决策。
-    del uav_triggers, raw_uav_displacements
-    joint_state = select_demand_aware_uav_cache_state(
+    # 配置阶段固定先确定 UAV 覆盖关系，再基于更新后的预测覆盖做一次缓存重配；
+    # 这样避免 Cache/UAV 多轮交替，同时保持第四章在线近似的复杂度可控。
+    uav_result = select_triggered_uav_positions(
         previous_uav,
         previous_cache=previous,
-        requested_cache_triggers=cache_triggers,
-        cache_scores=cache_scores,
-        service_sizes=service_sizes,
-        cache_capacities=cache_capacities,
+        requested_uav_triggers=uav_triggers,
         cache_prediction=cache_prediction,
         node_types=kinds,
         uav_service_indices=uav_indices,
@@ -2718,13 +2134,25 @@ def solve_slot(
             else uav_config["minimum_safety_distance_m"]
         ),
         position_epsilon_m=position_epsilon_m,
-        integer_scale=integer_scale,
-        cache_control_action=cache_control_action,
     )
-    candidate_cache = np.asarray(joint_state["candidate_cache"], dtype=float)
-    adaptive_cache = dict(joint_state["adaptive_cache"])
-    final_cache = np.asarray(joint_state["final_cache"], dtype=float)
-    uav_result = joint_state
+    cache_result = solve_cooperative_cache(
+        previous,
+        cache_triggers,
+        service_sizes,
+        cache_capacities,
+        cache_prediction=uav_result["prediction"],
+        node_types=kinds,
+        environment=env,
+        integer_scale=integer_scale,
+    )
+    candidate_cache = np.asarray(cache_result["candidate_cache"], dtype=float)
+    # PPO trigger 与实际更新严格分离：背包结果相同即 actual update=0、成本=0。
+    final_cache = candidate_cache.copy()
+    cache_changed = np.any(final_cache != previous, axis=1)
+    services_changed = tuple(
+        tuple(int(item) for item in np.flatnonzero(final_cache[index] != previous[index]))
+        for index in range(service_count)
+    )
 
     final_edge_positions = edge_positions.copy()
     for uav_order, service_index in enumerate(uav_indices):
@@ -2890,41 +2318,21 @@ def solve_slot(
     return SolverResult(
         candidate_cache=_readonly(candidate_cache),
         final_cache=_readonly(final_cache),
-        actual_cache_update=_readonly(adaptive_cache["cache_changed"], dtype=bool),
-        cache_candidate_changed=_readonly(
-            adaptive_cache["cache_candidate_changed"], dtype=bool
-        ),
-        cache_trigger=_readonly(adaptive_cache["cache_trigger"], dtype=bool),
-        cache_changed=_readonly(adaptive_cache["cache_changed"], dtype=bool),
-        cache_gain=_readonly(adaptive_cache["cache_gain"]),
-        cache_switch_cost=_readonly(adaptive_cache["cache_switch_cost"]),
-        keep_predicted_utility=_readonly(adaptive_cache["keep_predicted_utility"]),
-        candidate_predicted_utility=_readonly(
-            adaptive_cache["candidate_predicted_utility"]
-        ),
-        cooperative_candidate_utility=float(
-            adaptive_cache["cooperative_candidate_utility"]
-        ),
-        cache_duplicate_count=int(adaptive_cache["cache_duplicate_count"]),
-        cache_unique_services=int(adaptive_cache["cache_unique_services"]),
-        cache_local_swap_count=int(adaptive_cache["cache_local_swap_count"]),
-        services_changed=tuple(adaptive_cache["services_changed"]),
-        cache_check=bool(adaptive_cache["cache_check"]),
+        actual_cache_update=_readonly(cache_changed, dtype=bool),
+        cache_candidate_changed=_readonly(cache_changed, dtype=bool),
+        cache_trigger=_readonly(cache_triggers, dtype=bool),
+        cache_changed=_readonly(cache_changed, dtype=bool),
+        cooperative_candidate_utility=float(cache_result["cooperative_candidate_utility"]),
+        cache_duplicate_count=int(cache_result["cache_duplicate_count"]),
+        cache_unique_services=int(cache_result["cache_unique_services"]),
+        services_changed=services_changed,
+        cache_check=bool(np.any(np.asarray(cache_triggers, dtype=bool))),
         final_uav_positions=_readonly(uav_result["final_positions"]),
         actual_uav_movement=_readonly(uav_result["actual_movement"], dtype=bool),
-        uav_candidate_movement=_readonly(
-            uav_result["candidate_movement"], dtype=bool
-        ),
+        requested_uav_triggers=_readonly(uav_result["requested_triggers"], dtype=bool),
         uav_check=bool(uav_result["uav_check"]),
-        uav_selected_action=str(uav_result["uav_selected_action"]),
-        uav_J_keep=float(uav_result["uav_J_keep"]),
-        uav_J_cache_only=float(uav_result["uav_J_cache_only"]),
-        uav_J_uav_only=float(uav_result["uav_J_uav_only"]),
-        uav_J_joint=float(uav_result["uav_J_joint"]),
         uav_candidate_count=int(uav_result["uav_candidate_count"]),
-        uav_candidate_move_cost=float(uav_result["uav_candidate_move_cost"]),
         ground_service_gap=float(uav_result["ground_service_gap"]),
-        uav_fallback=bool(uav_result["fallback_applied"]),
         feasible_nodes=feasible,
         assignment=_readonly(matching["assignment"]),
         execution_nodes=tuple(matching["execution_nodes"]),
@@ -2943,14 +2351,12 @@ def solve_slot(
 __all__ = [
     "SolverResult",
     "build_feasible_nodes",
-    "decide_adaptive_cache_update",
     "predicted_cache_utility",
     "solve_bandwidth_allocation",
-    "solve_cache",
     "solve_cooperative_cache",
     "solve_compute_allocation",
     "solve_resources",
     "solve_slot",
-    "select_demand_aware_uav_cache_state",
+    "select_triggered_uav_positions",
     "transfer_exchange_matching",
 ]
