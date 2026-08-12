@@ -209,6 +209,10 @@ class AdaptiveCachePPOEnv(_EnvBase):
                 "ppo_raw_observation": observation.copy(),
                 "ppo_action": action_array.copy(),
                 "action_layout": self.environment.action_layout,
+                # 训练/验证记录使用当前 step 对应的 seed；DummyVecEnv 在
+                # terminal 后会立即 reset，因此不能在 callback 中事后读取
+                # last_episode_seed 来推断刚刚结束的 episode。
+                "episode_seed": self._last_episode_seed,
                 "requested_cache_trigger_count": int(np.sum(cache_triggers)),
                 "requested_uav_trigger_count": int(np.sum(uav_triggers)),
             }

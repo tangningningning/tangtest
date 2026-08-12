@@ -2088,12 +2088,24 @@ class MECEnvironment:
             "uav_check_slots": int(bool(result.uav_check)),
             "requested_cache_triggers": cache_triggers.copy(),
             "actual_cache_update": np.asarray(result.cache_changed, dtype=bool).copy(),
+            # requested trigger 与实际更新严格分离；trigger=1 且最终行未变化时，
+            # 这是显式 noop，不产生缓存更新成本。
+            "cache_noop_trigger": (
+                np.asarray(cache_triggers, dtype=bool)
+                & ~np.asarray(result.cache_changed, dtype=bool)
+            ).copy(),
             "service_vehicle_replacement_rows": self._service_vehicle_replacement_rows.copy(),
             "service_vehicle_replacement_count": int(
                 np.sum(self._service_vehicle_replacement_rows)
             ),
             "requested_uav_triggers": uav_triggers.copy(),
             "actual_uav_movement": np.asarray(result.actual_uav_movement, dtype=bool).copy(),
+            # UAV trigger=1 但候选最优位置仍为当前位置时，同样记录为 noop，
+            # 不产生 UAV movement cost。
+            "uav_noop_movement": (
+                np.asarray(uav_triggers, dtype=bool)
+                & ~np.asarray(result.actual_uav_movement, dtype=bool)
+            ).copy(),
             "uav_moved_slots": int(bool(np.any(result.actual_uav_movement))),
             "uav_nodes_moved": int(np.sum(result.actual_uav_movement)),
             "uav_move_distance": float(

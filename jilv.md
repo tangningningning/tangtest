@@ -1751,6 +1751,26 @@ model.learn calls = 0
 formal Stage15 restarted = NO
 ```
 
+## 统一训练结果主图风格（2026-08-12）
+
+只修改 `plot_results.py` 和 `train_ppo.py` 的绘图/结果汇总输出，不涉及算法、
+PPO、reward、cache、UAV、Matching、KKT、预测器或训练参数；本轮未启动训练。
+
+新增/统一正式主图：
+
+1. `reward_convergence.png/.pdf`：`Average Reward per Slot`，显示
+   `Raw Average Reward` 与 `MA10`；累计 reward 按 episode steps 转换，不使用
+   update mean。未完成的 terminal 后 partial episode 不作为 convergence 点。
+2. `final_execution_rate.png/.pdf`：`Final Execution Rate`，固定五类
+   `Local / Service Vehicle / RSU / UAV / Cloud`，分母为五类 completed task
+   总数，柱顶标注百分比，右上角显示 `Completed` 和 `Failed`。completed=0 时
+   五类比例均安全显示为 0.0%。
+
+learning-check 结束时自动优先生成上述两张主图，原有 `execution_rates.png`、
+`trigger_actual_rates.png` 等诊断图保留；Stage15/legacy 已保存结果可通过
+`plot_results.py --result-dir <result_dir>` 后处理。控制台首先打印两张主图的
+PNG/PDF路径。本轮未启动训练。
+
 ## 2026-08-12 第四章 P0 求解主链重构
 
 任务：将第四章正式工程求解器从旧全局 `Discrete(2)` KEEP/UPDATE 重构为
@@ -1993,4 +2013,199 @@ Stage16B = PASS
 scale/accounting conclusion = A correct accounting and scale
 model.learn calls = 0
 formal Stage15 restarted = NO
+```
+
+## MultiBinary PPO 5120-step learning-effectiveness check preparation（2026-08-12）
+
+本轮只为当前第四章 MultiBinary 自适应 Cache/UAV 框架增加短训练有效性验证入口，
+不改动第三章 P0、C1-C16、reward、cache solver、UAV solver、Matching、KKT、
+预测算法、PPO action/state 或现有 PPO 超参数；Codex 本轮不调用 `model.learn`，
+也不启动 Stage15 正式训练。
+
+### 代码修改
+
+`train_ppo.py` 新增 `--learning-check` 独立入口，固定 `total_timesteps=5120`、
+`n_steps=256`，因此预期 20 个 PPO updates。其余 PPO 参数继续从 `config.yaml`
+读取，使用现有 SB3 PPO、VecNormalize 和单环境链路。训练输出写入独立的
+`outputs/ppo_learning_check/<run_id>/`，不会覆盖 Stage15 输出。
+
+入口记录：
+
+```text
+config_snapshot.json
+training_updates.csv
+training_episodes.csv
+action_trigger_rates.csv
+validation_results.csv
+learning_summary.json
+model.zip
+vecnormalize.pkl
+```
+
+训练 episode 和每个 PPO update 同时记录原始 `G=Q-C_cache-C_uav`、`Q`、缓存/UAV
+成本、时延、车辆能耗、Local/SV/RSU/UAV/Cloud/Failed 计数与比率；动作统计从
+`environment.action_layout` 读取，包含每个 MultiBinary bit 的 requested trigger
+count/rate、每个 cache node 的 effective update/no-op/services changed，以及每个
+UAV 的 requested trigger、actual movement/no-op。这里的 `cache_service_availability`
+定义为当前到达请求中由 SV/RSU/UAV 边缘缓存执行的比例，不加入 reward。
+
+每个 update 还记录 `approx_kl`、`clip_fraction`、`entropy_loss`、
+`policy_gradient_loss`、`value_loss`、`explained_variance`，并输出 Early(1--10)、
+Late(11--20) 与 `Late-Early` 的 `G/Q/cache cost/UAV cost/delay/energy`、执行率和
+动作率。验证阶段使用当前模型的 deterministic policy，只使用
+`validation_seeds=[20271811,...,20271815]`，每个 seed 输出逐 seed 指标并给出
+mean/std；正式 test seeds 不进入验证路径。
+
+训练和验证累计检查 future request/trajectory/mobility leakage、cache capacity、
+compute、bandwidth、UAV speed/region/safety、invalid node/service、NaN/Inf 与 KKT
+failure；任一非零时 `learning_check_status=FAIL`，不会由脚本自动修改算法或成本。
+
+```text
+training seed mode = sequential
+validation seed mode = fixed
+test seeds accessed = NO
+model.learn calls in preparation = 0
+formal Stage15 restarted = NO
+```
+
+## 正式冻结论文基础场景为 8 任务车辆 + 2 服务车辆 + 10 类服务（2026-08-12）
+
+本轮只完成基础参数定稿和最小一致性检查，没有修改 P0、C1-C16、PPO
+state/action、reward、缓存、UAV、Matching、KKT、预测器或服务车辆替换逻辑，
+也没有调用 `model.learn`。`config.yaml` 的 `vehicle_roles.num_task_vehicles`
+由 10 改为 8，`num_service_vehicles=2`、`services.count=10` 及其余冻结参数保持不变。
+
+### 冻结场景与动态维度
+
+```text
+research vehicles = 10
+task vehicles = 8
+service vehicles = 2
+RSUs = 2
+UAVs = 2
+services = 10
+cache nodes = 6
+action = MultiBinary(8)       # 6 cache trigger bits + 2 UAV position trigger bits
+observation = 95              # 60 + 4 + 20 + 10 + 1，代码动态计算
+edge cache shape = (6, 10)
+local task cache shape = (8, 10)
+predicted vehicle position shape = (10, 2)
+predicted popularity shape = (10,)
+```
+
+### 角色、Trace 与 workload 兼容性
+
+正式 SUMO route 集合共包含 70 个车辆 ID；Trace 文件保存完整车辆真值，
+不是旧配置下固定的 `10 task + 2 service` 角色子集。当前 `VehicleRoleManager`
+仍按当前时隙状态动态形成 Task/SV/Background 三个互斥集合，全部 272 个 Trace
+均可提供至少 10 辆有效车辆，逐 slot 角色数量检查通过：
+
+```text
+Task/SV overlap = 0
+Task/Background overlap = 0
+SV/Background overlap = 0
+role count = 8 task + 2 service = PASS
+existing trace compatible = YES
+trace regeneration required = NO
+trace files checked = 272
+trace schema/shape errors = 0
+```
+
+工作负载由当前配置动态生成，四个任务数组均为 `(100, 8)`，到达任务服务 ID
+范围为 `[0, 9]`；本次 100-slot 轻量生成得到 405 个请求，符合
+`8 × 100 × 0.5` 的统计期望，不固定请求总数。单 slot deterministic smoke
+通过：`future request leakage=0`、`future trajectory leakage=0`、缓存容量违规、
+UAV违规和 NaN/Inf 均为 0。未重新生成任何 mobility trace。
+
+```text
+Base configuration freeze = PASS
+frozen parameter check = PASS
+algorithm changed = NO
+reward changed = NO
+PPO parameters changed = NO
+model.learn calls = 0
+training restarted = NO
+```
+
+## Proposed 分层联合求解正式实现（2026-08-12）
+
+本轮正式确认并补齐“预测辅助的自适应 Cache/UAV 配置触发 + 确定性配置优化
++ Matching/KKT”主链。第三章 P0、`G(t)`、C1-C16、通信/计算模型、缓存成本、
+UAV 移动成本、reward 和 PPO 超参数均未修改；本轮没有调用 `model.learn`。
+
+### 理论与主链
+
+`paper_spec.md` 新增第四章 Proposed 的 A-H 结构：问题分解、因果移动/需求预测、
+PPO 自适应 trigger、需求感知 UAV 候选、顺序协同缓存重配置、transfer-exchange
+Matching、KKT 资源分配和复杂度。明确当前方法是 state-driven adaptive
+configuration，不使用参考论文的 fixed-period cache/UAV 更新，也不声称 P0 全局最优。
+
+正式每 slot 顺序保持：
+
+```text
+history/prediction -> PPO MultiBinary trigger -> UAV candidates
+-> SV/RSU/UAV sequential 0-1 knapsack -> C(t), q_U(t)
+-> current task -> feasible nodes -> Matching -> KKT
+-> execution -> Q(t) -> G(t)=Q(t)-C_cache-C_UAV
+```
+
+现有 `solver.py` 的确定性实现继续复用：UAV 候选只包含当前位置、预测需求热点
+和地面覆盖缺口热点；缓存使用严格 0-1 knapsack DP，按 `SV -> RSU -> UAV` 只做
+一轮协同；Matching、KKT 和 Cloud fallback 未替换。
+
+### 输出契约补齐
+
+- `environment.step()` 显式保存 `requested_cache_triggers`、`actual_cache_update`、
+  `cache_noop_trigger`，以及对应的 UAV requested/actual/noop 向量。
+- episode/update 汇总增加 `non_cloud_rate`；原始 `G`、`Q`、实际缓存成本、实际
+  UAV 成本、执行计数、节点级 requested/actual/noop/services changed 和硬约束诊断
+  继续由 `train_ppo.py` 记录。
+- Proposed 结果图进入独立目录：`figures/` 保存两张主图，
+  `figures/diagnostics/` 保存附加诊断图；结果同时写入兼容的
+  `learning_summary.json` 和 `final_summary.json`。
+
+### 基础场景与验证
+
+```text
+Task = 8
+Service Vehicle = 2
+Research vehicles = 10
+RSU = 2
+UAV = 2
+F = 10
+cache nodes = 6
+action = MultiBinary(8)
+observation = 95
+```
+
+```text
+SB3 check_env = PASS
+model construction/predict = PASS
+all-zero exact cache/UAV keep = PASS
+all-zero cache cost = 0
+all-zero UAV cost = 0
+one-cache-trigger isolation = PASS
+one-UAV-trigger isolation = PASS
+actual update/movement separated from requested trigger = PASS
+10-slot formula residual max = 0.0
+future request leakage = 0
+future trajectory leakage = 0
+capacity violations = 0
+UAV speed/region/safety violations = 0
+compute violations = 0
+bandwidth violations = 0
+KKT failures = 0
+NaN/Inf = 0
+```
+
+人工合法 episode 绘图 smoke 已生成并检查：
+
+```text
+reward_convergence.png/.pdf = PASS
+final_execution_rate.png/.pdf = PASS
+MA10 with fewer than 10 episodes = PASS
+fixed five-class percentage denominator = completed tasks
+temporary test outputs removed = YES
+model.learn calls = 0
+formal training restarted = NO
 ```

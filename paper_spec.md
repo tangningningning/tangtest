@@ -282,7 +282,15 @@ Source: 11.pdf p.4-5
 
 Source: 11.pdf p.10-11
 
-## 4. 当前实现求解流程（current implementation solver）
+## 4. 第四章 Proposed：预测辅助的自适应配置触发与分层联合求解方法
+
+本章是第三章 P0 的在线分层近似求解器，不改变 P0、`G(t)`、C1-C16、通信、
+计算、缓存成本或 UAV 移动成本定义，也不声称得到 P0 的全局最优解。参考论文
+采用固定周期的大时间尺度缓存和小时间尺度 Off-RA；当前方法不设置固定的
+`cache_decision_freq` 或 `uav_decision_freq`，而是由每个基础时隙的预测状态驱动
+Cache/UAV 是否重新配置。
+
+### A. 问题分解与总体框架
 
 每个时隙固定执行：
 
@@ -304,6 +312,53 @@ Source: 11.pdf p.10-11
 PPO 只决定哪些缓存节点允许重配置、哪些 UAV 允许调整位置；被触发后的“配置成
 什么”由确定性近似算法决定。UAV 先确定，以便缓存价值使用最终预测覆盖关系；
 Cache/UAV 不来回迭代。
+
+### B. 移动性和服务需求预测
+
+配置状态只使用截至 `t-1` 的历史车辆状态和请求历史，得到因果预测位置
+`qhat_V(t)`、预测需求/流行度 `rhohat(t)` 以及节点覆盖关系。当前时隙真实请求、
+真实位置和即时信道只在配置完成后的任务执行阶段使用。
+
+### C. 基于 PPO 的自适应配置触发
+
+标准 SB3 PPO 的 `MultiBinary(M+U)` 动作只表示配置许可：cache trigger=0
+严格保持对应缓存行，cache trigger=1 允许一次完整重配置；UAV trigger=0
+严格保持位置，UAV trigger=1 允许一次有限候选位置搜索。请求 trigger 与实际
+更新变量分开记录，trigger=1 也可以得到 noop。
+
+### D. 需求感知 UAV 位置自适应调整
+
+对每个被触发 UAV 比较当前位置、预测需求热点和地面边缘覆盖缺口热点；候选经
+最大移动距离、区域和 UAV 安全距离约束筛选，并以预测服务收益减第三章已有
+UAV 移动成本评分。没有更优可行候选时保持原位，不输出连续 PPO 位移。
+
+### E. 预测驱动的协同服务缓存重配置
+
+在 UAV 位置确定后，按 `SV -> RSU -> UAV` 的稳定顺序，对被触发节点计算预测
+边际服务价值并执行一次完整严格 0-1 knapsack。节点之间通过已覆盖服务降低
+重复边际价值；这是 `Sequential Cooperative Cache Reconfiguration` 协同近似，
+允许空间分离区域保留合理副本，不进行联合 MILP 或多轮 Cache-UAV 交替。
+
+### F. 基于迁移—交换匹配的执行节点选择
+
+固定最终 `C(t)` 和 `q_U(t)` 后，用当前真实任务、真实位置和真实信道构造可行
+执行节点；以 Cloud 可行初始化为基础，复用 transfer-exchange Matching 选择
+Local/SV/RSU/UAV/Cloud 执行节点。
+
+### G. 基于 KKT 的通信与计算资源分配
+
+对 Matching 固定的边缘任务复用 C13-C16 对应的计算比例和共享带宽 KKT；本地
+和 Cloud 继续使用第三章固定资源模型，不新增 GA、Hungarian、Cloud 后处理或
+其它资源分配器。
+
+### H. 总体算法与复杂度
+
+每个时隙只执行一次 `预测 -> PPO trigger -> UAV 候选 -> 顺序 knapsack ->
+feasible nodes -> Matching -> KKT -> execution -> G`。若 `M` 为缓存节点数、
+`F` 为服务数、`K_m` 为整数化缓存容量、`H` 为预测时域，缓存 DP 的主开销为
+各触发节点的 `O(F K_m)`，UAV 候选比较为有限候选数乘以预测效用评价，Matching
+和 KKT 沿用现有确定性实现。整体是状态驱动的在线分层近似，而不是固定周期
+双时间尺度全局优化。
 
 ## 5. 当前 PPO observation
 

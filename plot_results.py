@@ -1,20 +1,19 @@
-"""论文基础结果绘图入口。
+"""训练/评估结果后处理绘图入口。
 
-本文件只读取 episode-level ``metrics.csv``，不重新执行 environment、solver、
-matching、KKT 或 PPO。所有图表都使用论文定义的最终量：
-
-* Figure 1：``phase=train`` 的 100-slot ``episode_reward_mean`` 及其移动平均；
-* Figure 2：只读取 ``phase=final_eval`` 的最终 Local/SV/RSU/UAV/Cloud 计数。
+本文件只读取已经保存的 CSV/JSON，不重新执行 environment、solver、matching、
+KKT 或 PPO。默认正式主图统一为 ``reward_convergence`` 和
+``final_execution_rate``；旧 Stage15 对照图和 learning-check 诊断图继续保留。
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 MPL_CONFIG_DIR = PROJECT_ROOT / ".mplconfig"
@@ -66,11 +65,22 @@ STAGE15_EXECUTION_KEYS = (
 )
 STAGE15_EXECUTION_LABELS = (
     "Local",
-    "SV",
+    "Service Vehicle",
     "RSU",
     "UAV",
     "Cloud",
     "Failed",
+)
+
+MAIN_REWARD_RAW_COLOR = "#78B4D4"
+MAIN_REWARD_MA_COLOR = "#F28E2B"
+MAIN_EXECUTION_BAR_COLOR = "#5B9BD5"
+MAIN_EXECUTION_LABELS = (
+    "Local",
+    "Service Vehicle",
+    "RSU",
+    "UAV",
+    "Cloud",
 )
 
 
@@ -175,6 +185,159 @@ def _train_reward_series(
     return episodes, rewards
 
 
+def _read_csv_rows(
+    csv_file: str | Path,
+    *,
+    required_fields: Sequence[str],
+    description: str,
+) -> tuple[Path, list[dict[str, str]]]:
+    """读取绘图 CSV，并对缺失列给出明确错误。"""
+
+    path = Path(csv_file).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"{description}不存在：{path}")
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        fields = set(reader.fieldnames or ())
+        missing = sorted(set(required_fields).difference(fields))
+        if missing:
+            raise ValueError(
+                f"{description}缺少列：{missing}；当前列为：{sorted(fields)}"
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{description}没有数据行：{path}")
+    return path, rows
+
+
+def _learning_check_training_series(
+    training_episodes_file: str | Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """读取 learning-check episode CSV 的 reward sum/steps。"""
+
+    path, rows = _read_csv_rows(
+        training_episodes_file,
+        required_fields=("episode", "sum_raw_G", "steps"),
+        description="training_episodes.csv",
+    )
+    episodes: list[int] = []
+    rewards: list[float] = []
+    steps: list[int] = []
+    for index, row in enumerate(rows, start=2):
+        # SB3 terminal后的最后一个未完成片段只用于审计，不作为正式
+        # episode convergence 点，避免短片段把曲线末端人为拉高/拉低。
+        if str(row.get("completed", "true")).strip().lower() in {
+            "false",
+            "0",
+            "no",
+        }:
+            continue
+        try:
+            episode = int(row["episode"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{path}第{index}行episode不是整数。") from error
+        episodes.append(episode)
+        rewards.append(_as_float(row, "sum_raw_G", index))
+        steps.append(_as_nonnegative_int(row, "steps", index))
+        if steps[-1] <= 0:
+            raise ValueError(f"{path}第{index}行steps必须为正整数。")
+    episode_array = np.asarray(episodes, dtype=np.int64)
+    reward_array = np.asarray(rewards, dtype=np.float64)
+    step_array = np.asarray(steps, dtype=np.int64)
+    order = np.argsort(episode_array, kind="stable")
+    episode_array = episode_array[order]
+    reward_array = reward_array[order]
+    step_array = step_array[order]
+    if np.any(np.diff(episode_array) <= 0):
+        raise ValueError(f"{path}的episode必须严格递增且不能重复。")
+    _reward_per_slot_series(episode_array, reward_array, step_array)
+    return episode_array, reward_array, step_array
+
+
+def _find_count_field(
+    fields: set[str], aliases: Sequence[str], *, label: str, csv_file: Path
+) -> str:
+    for alias in aliases:
+        if alias in fields:
+            return alias
+    raise ValueError(
+        f"{csv_file}缺少{label}列；候选列为：{list(aliases)}；"
+        f"当前列为：{sorted(fields)}"
+    )
+
+
+def _learning_check_execution_counts(
+    validation_results_file: str | Path,
+) -> dict[str, int]:
+    """聚合 validation seeds 的五类 completed 与 Failed 计数。"""
+
+    path, rows = _read_csv_rows(
+        validation_results_file,
+        required_fields=(),
+        description="validation_results.csv",
+    )
+    fields = set(rows[0].keys())
+    aliases = {
+        "local": ("Local_count", "local_count", "local_tasks"),
+        "service_vehicle": (
+            "SV_count",
+            "sv_count",
+            "service_vehicle_count",
+            "service_vehicle_tasks",
+        ),
+        "rsu": ("RSU_count", "rsu_count", "rsu_tasks"),
+        "uav": ("UAV_count", "uav_count", "uav_tasks"),
+        "cloud": ("Cloud_count", "cloud_count", "cloud_tasks"),
+        "failed": ("Failed_count", "failed_count", "failed_tasks"),
+    }
+    columns = {
+        key: _find_count_field(fields, names, label=key, csv_file=path)
+        for key, names in aliases.items()
+    }
+    totals = {key: 0 for key in aliases}
+    for row_index, row in enumerate(rows, start=2):
+        for key, column in columns.items():
+            totals[key] += _as_nonnegative_int(row, column, row_index)
+    return totals
+
+
+def plot_learning_check_run(
+    training_episodes_file: str | Path,
+    validation_results_file: str | Path,
+    output_dir: str | Path,
+    *,
+    moving_average_window: int = 10,
+) -> dict[str, tuple[Path, Path]]:
+    """从 learning-check 已保存 CSV 生成两张正式主图。"""
+
+    episodes, raw_rewards, steps = _learning_check_training_series(
+        training_episodes_file
+    )
+    reward_paths = plot_training_reward_curve(
+        episodes,
+        raw_rewards,
+        steps,
+        output_dir,
+        moving_average_window=moving_average_window,
+        file_stem="reward_convergence",
+    )
+    counts = _learning_check_execution_counts(validation_results_file)
+    execution_paths = plot_final_execution_rate(
+        counts["local"],
+        counts["service_vehicle"],
+        counts["rsu"],
+        counts["uav"],
+        counts["cloud"],
+        counts["failed"],
+        output_dir,
+        file_stem="final_execution_rate",
+    )
+    return {
+        "reward_convergence": reward_paths,
+        "final_execution_rate": execution_paths,
+    }
+
+
 def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
     """实现 rolling mean，使用 min_periods=1 处理 episode 少于 window 的情况。"""
 
@@ -186,6 +349,182 @@ def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
         start = max(0, index - int(window) + 1)
         result[index] = float(np.mean(values[start : index + 1]))
     return result
+
+
+def _save_main_figure(
+    figure: Any,
+    output_dir: str | Path,
+    file_stem: str,
+    *,
+    dpi: int = 300,
+) -> tuple[Path, Path]:
+    """以统一的 PNG/PDF 命名保存正式展示图。"""
+
+    destination = Path(output_dir).expanduser()
+    destination.mkdir(parents=True, exist_ok=True)
+    png_path = destination / f"{file_stem}.png"
+    pdf_path = destination / f"{file_stem}.pdf"
+    try:
+        figure.tight_layout()
+        figure.savefig(png_path, dpi=int(dpi), bbox_inches="tight")
+        figure.savefig(pdf_path, bbox_inches="tight")
+    finally:
+        plt.close(figure)
+    return png_path, pdf_path
+
+
+def _reward_per_slot_series(
+    episodes: Sequence[Any],
+    raw_rewards: Sequence[Any],
+    steps: Sequence[Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """把 episode 原始 reward sum 严格转换成每 slot 平均 reward。"""
+
+    episode_array = np.asarray(episodes, dtype=np.int64).reshape(-1)
+    reward_array = np.asarray(raw_rewards, dtype=np.float64).reshape(-1)
+    step_array = np.asarray(steps, dtype=np.float64).reshape(-1)
+    if not (episode_array.size == reward_array.size == step_array.size):
+        raise ValueError(
+            "训练奖励绘图输入长度不一致：episodes、raw_rewards、steps必须逐episode对应。"
+        )
+    if episode_array.size == 0:
+        raise ValueError("训练奖励绘图没有episode记录。")
+    if np.any(~np.isfinite(reward_array)) or np.any(~np.isfinite(step_array)):
+        raise ValueError("训练奖励绘图输入不能包含NaN/Inf。")
+    if np.any(step_array <= 0.0) or np.any(step_array != np.floor(step_array)):
+        raise ValueError("训练奖励绘图的steps必须是正整数。")
+    order = np.argsort(episode_array, kind="stable")
+    episode_array = episode_array[order]
+    reward_array = reward_array[order]
+    step_array = step_array[order]
+    if np.any(np.diff(episode_array) <= 0):
+        raise ValueError("训练奖励绘图的episode必须严格递增且不能重复。")
+    return episode_array, reward_array / step_array
+
+
+def plot_training_reward_curve(
+    episodes: Sequence[Any],
+    raw_rewards: Sequence[Any],
+    steps: Sequence[Any],
+    output_dir: str | Path,
+    *,
+    moving_average_window: int = 10,
+    file_stem: str = "reward_convergence",
+) -> tuple[Path, Path]:
+    """绘制统一主图：Average Reward per Slot 与 Raw/MA10。"""
+
+    episode_array, rewards_per_slot = _reward_per_slot_series(
+        episodes,
+        raw_rewards,
+        steps,
+    )
+    moving_average = _moving_average(rewards_per_slot, moving_average_window)
+    figure, axis = plt.subplots(figsize=(7.2, 4.6))
+    axis.plot(
+        episode_array,
+        rewards_per_slot,
+        color=MAIN_REWARD_RAW_COLOR,
+        linewidth=1.2,
+        alpha=0.85,
+        label="Raw Average Reward",
+    )
+    axis.plot(
+        episode_array,
+        moving_average,
+        color=MAIN_REWARD_MA_COLOR,
+        linewidth=2.2,
+        label=f"MA{int(moving_average_window)}",
+    )
+    axis.set_title("Average Reward per Slot")
+    axis.set_xlabel("Episode")
+    axis.set_ylabel("Average Reward per Slot")
+    axis.grid(True, alpha=0.25)
+    axis.set_axisbelow(True)
+    axis.legend(loc="upper right")
+    return _save_main_figure(figure, output_dir, file_stem)
+
+
+def _nonnegative_count(value: Any, name: str) -> int:
+    """验证绘图使用的执行计数是非负整数。"""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name}必须是非负整数。") from error
+    if not np.isfinite(numeric) or numeric < 0.0 or numeric != float(int(numeric)):
+        raise ValueError(f"{name}必须是非负整数。")
+    return int(numeric)
+
+
+def plot_final_execution_rate(
+    local_count: Any,
+    service_vehicle_count: Any,
+    rsu_count: Any,
+    uav_count: Any,
+    cloud_count: Any,
+    failed_count: Any,
+    output_dir: str | Path,
+    *,
+    file_stem: str = "final_execution_rate",
+) -> tuple[Path, Path]:
+    """绘制五类最终执行率；Failed只显示在右上角，不占柱子。"""
+
+    counts = np.asarray(
+        [
+            _nonnegative_count(local_count, "local_count"),
+            _nonnegative_count(service_vehicle_count, "service_vehicle_count"),
+            _nonnegative_count(rsu_count, "rsu_count"),
+            _nonnegative_count(uav_count, "uav_count"),
+            _nonnegative_count(cloud_count, "cloud_count"),
+        ],
+        dtype=np.int64,
+    )
+    failed = _nonnegative_count(failed_count, "failed_count")
+    completed = int(np.sum(counts))
+    rates = (
+        np.zeros(5, dtype=np.float64)
+        if completed == 0
+        else 100.0 * counts.astype(np.float64) / float(completed)
+    )
+    if completed > 0 and not np.isclose(
+        float(np.sum(rates)), 100.0, rtol=0.0, atol=1.0e-10
+    ):
+        raise RuntimeError("五类最终 execution rate 未归一到100%。")
+
+    positions = np.arange(len(MAIN_EXECUTION_LABELS), dtype=np.float64)
+    figure, axis = plt.subplots(figsize=(7.2, 4.6))
+    bars = axis.bar(
+        positions,
+        rates,
+        color=MAIN_EXECUTION_BAR_COLOR,
+        width=0.62,
+    )
+    axis.set_title("Final Execution Rate")
+    axis.set_xlabel("Execution Node")
+    axis.set_ylabel("Execution Rate (%)")
+    axis.set_xticks(positions)
+    axis.set_xticklabels(MAIN_EXECUTION_LABELS)
+    axis.set_ylim(0.0, max(100.0, float(np.max(rates)) + 12.0))
+    axis.grid(axis="y", alpha=0.25)
+    axis.set_axisbelow(True)
+    axis.text(
+        0.98,
+        0.97,
+        f"Completed={completed}\nFailed={failed}",
+        transform=axis.transAxes,
+        ha="right",
+        va="top",
+    )
+    label_offset = max(1.0, float(np.max(rates)) * 0.015)
+    for bar, rate in zip(bars, rates):
+        axis.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            float(rate) + label_offset,
+            f"{rate:.1f}%",
+            ha="center",
+            va="bottom",
+        )
+    return _save_main_figure(figure, output_dir, file_stem)
 
 
 def _stage15_finite_float(value: Any, name: str) -> float:
@@ -227,6 +566,45 @@ def _stage15_raw_episode_series(
     return (
         np.asarray(episodes, dtype=np.int64),
         np.asarray(rewards, dtype=np.float64),
+    )
+
+
+def _stage15_training_series(
+    summary: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """读取 Stage15 的原始 reward sum 和 episode steps。"""
+
+    records = summary.get("training_episodes", [])
+    if not isinstance(records, list) or not records:
+        raise ValueError("training_summary 缺少 training_episodes 原始序列")
+    episodes: list[int] = []
+    rewards: list[float] = []
+    steps: list[int] = []
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, Mapping):
+            raise ValueError(f"training_episodes[{index - 1}] 不是对象")
+        raw_value = record.get("system_reward")
+        if raw_value is None:
+            raw_value = record.get("raw_reward", record.get("reward"))
+        if raw_value is None:
+            raise ValueError(f"training_episodes[{index - 1}] 缺少原始 reward 列")
+        step_value = record.get("steps")
+        if step_value is None:
+            raise ValueError(
+                f"training_episodes[{index - 1}] 缺少 steps；"
+                "Average Reward per Slot不能由累计reward替代。"
+            )
+        episodes.append(index)
+        rewards.append(
+            _stage15_finite_float(raw_value, f"training_episodes[{index - 1}].raw_reward")
+        )
+        steps.append(_nonnegative_count(step_value, f"training_episodes[{index - 1}].steps"))
+        if steps[-1] <= 0:
+            raise ValueError(f"training_episodes[{index - 1}].steps必须为正整数")
+    return (
+        np.asarray(episodes, dtype=np.int64),
+        np.asarray(rewards, dtype=np.float64),
+        np.asarray(steps, dtype=np.int64),
     )
 
 
@@ -396,27 +774,36 @@ def plot_stage15_reward_convergence(
     *,
     moving_average_window: int = 10,
 ) -> tuple[Path, Path]:
-    """绘制 Stage15 episode 原始 system reward 与 MA10。"""
+    """兼容旧 Stage15 API，但输出统一的正式主图名称。"""
 
-    episodes, rewards = _stage15_raw_episode_series(summary)
-    moving_average = _moving_average(rewards, moving_average_window)
-    figure, axis = plt.subplots(figsize=(7.2, 4.6))
-    axis.plot(episodes, rewards, linewidth=1.0, alpha=0.55, label="Raw System Reward")
-    axis.plot(
+    episodes, rewards, steps = _stage15_training_series(summary)
+    return plot_training_reward_curve(
         episodes,
-        moving_average,
-        linewidth=2.0,
-        label=f"Moving Average ({int(moving_average_window)})",
+        rewards,
+        steps,
+        output_dir,
+        moving_average_window=moving_average_window,
+        file_stem="reward_convergence",
     )
-    axis.set_xlabel("Episode")
-    axis.set_ylabel("Raw System Reward")
-    axis.set_title("Stage15 PPO Reward Convergence")
-    axis.grid(True, alpha=0.25)
-    axis.legend()
-    return _save_stage15_figure(
-        figure,
-        Path(output_dir).expanduser(),
-        "stage15_reward_convergence",
+
+
+def plot_stage15_final_execution_rate(
+    summary: Mapping[str, Any],
+    output_dir: str | Path,
+) -> tuple[Path, Path]:
+    """从 Stage15 最终 test summary 的 PPO 结果生成五柱正式主图。"""
+
+    data = stage15_execution_rate_data(summary)
+    counts = data["ppo"]["counts"]
+    return plot_final_execution_rate(
+        counts["local"],
+        counts["service_vehicle"],
+        counts["rsu"],
+        counts["uav"],
+        counts["cloud"],
+        counts["failed"],
+        output_dir,
+        file_stem="final_execution_rate",
     )
 
 
@@ -489,13 +876,17 @@ def plot_stage15_run(
     *,
     moving_average_window: int = 10,
 ) -> dict[str, tuple[Path, Path]]:
-    """只用已保存 Stage15 summary 后处理三张核心论文图。"""
+    """后处理 Stage15 主图和保留的 validation/Reference 对照诊断图。"""
 
     return {
         "reward_convergence": plot_stage15_reward_convergence(
             summary,
             output_dir,
             moving_average_window=moving_average_window,
+        ),
+        "final_execution_rate": plot_stage15_final_execution_rate(
+            summary,
+            output_dir,
         ),
         "validation_reward": plot_stage15_validation_reward(summary, output_dir),
         "execution_rate": plot_stage15_execution_rate(summary, output_dir),
@@ -508,52 +899,33 @@ def plot_reward_convergence(
     *,
     moving_average_window: int = 10,
 ) -> tuple[Path, Path]:
-    """绘制 Figure 1：train slot 平均 reward 原始曲线和移动平均。"""
+    """兼容 legacy metrics.csv 的统一 reward 主图入口。"""
 
     rows = _read_metrics(metrics_file)
-    episodes, rewards = _train_reward_series(rows)
-    moving_average = _moving_average(rewards, moving_average_window)
-
-    destination = Path(output_dir).expanduser()
-    destination.mkdir(parents=True, exist_ok=True)
-    png_path = destination / "figure1_reward_convergence.png"
-    pdf_path = destination / "figure1_reward_convergence.pdf"
-
-    figure, axis = plt.subplots(figsize=(7.2, 4.6))
-    axis.plot(
+    train_rows = [row for row in rows if str(row.get("phase", "")).strip() == "train"]
+    if not train_rows:
+        raise ValueError("metrics.csv中没有phase=train记录，无法生成reward_convergence。")
+    episodes: list[int] = []
+    raw_rewards: list[float] = []
+    steps: list[int] = []
+    for row_index, row in enumerate(train_rows, start=2):
+        episodes.append(int(row["episode"]))
+        if "episode_reward_sum" in row and "episode_steps" in row:
+            raw_rewards.append(_as_float(row, "episode_reward_sum", row_index))
+            steps.append(_as_nonnegative_int(row, "episode_steps", row_index))
+        else:
+            # legacy metrics 的 episode_reward_mean 已经是每 slot平均值；
+            # 用 steps=1 传入统一绘图器，不把它误当累计 reward。
+            raw_rewards.append(_as_float(row, "episode_reward_mean", row_index))
+            steps.append(1)
+    return plot_training_reward_curve(
         episodes,
-        rewards,
-        linewidth=1.0,
-        alpha=0.55,
-        label="Raw Average Reward",
+        raw_rewards,
+        steps,
+        output_dir,
+        moving_average_window=moving_average_window,
+        file_stem="reward_convergence",
     )
-    axis.plot(
-        episodes,
-        moving_average,
-        linewidth=2.0,
-        label=f"MA{int(moving_average_window)}",
-    )
-    axis.set_xlabel("Episode")
-    axis.set_ylabel("Average Reward per Slot")
-    axis.grid(True, alpha=0.25)
-    axis.legend()
-    figure.tight_layout()
-    figure.savefig(png_path, dpi=300)
-    figure.savefig(pdf_path)
-    plt.close(figure)
-    return png_path, pdf_path
-
-
-def _nonnegative_count(value: Any, name: str) -> int:
-    """验证最终执行计数是非负整数。"""
-
-    try:
-        numeric = int(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{name} 必须是非负整数。") from error
-    if numeric < 0 or numeric != float(value):
-        raise ValueError(f"{name} 必须是非负整数。")
-    return numeric
 
 
 def plot_execution_rate(
@@ -565,59 +937,18 @@ def plot_execution_rate(
     failed_tasks: int,
     output_dir: str | Path,
 ) -> tuple[Path, Path]:
-    """绘制 Figure 2：最终实际 assignment 的五类执行节点比例。
+    """兼容 legacy 参数名的统一最终执行率主图入口。"""
 
-    ``failed_tasks`` 只参与输入校验和结果语义记录，不绘制为第六根柱子；
-    分母严格为五类 completed task 计数之和。
-    """
-
-    counts = {
-        "local": _nonnegative_count(local_tasks, "local_tasks"),
-        "service_vehicle": _nonnegative_count(sv_tasks, "sv_tasks"),
-        "rsu": _nonnegative_count(rsu_tasks, "rsu_tasks"),
-        "uav": _nonnegative_count(uav_tasks, "uav_tasks"),
-        "cloud": _nonnegative_count(cloud_tasks, "cloud_tasks"),
-    }
-    failed = _nonnegative_count(failed_tasks, "failed_tasks")
-    completed = sum(counts.values())
-    if completed <= 0:
-        raise ValueError("最终 evaluation 没有 completed task，无法计算执行率。")
-
-    rates = np.asarray(
-        [100.0 * counts[key] / completed for key in EXECUTION_COUNT_KEYS],
-        dtype=np.float64,
+    return plot_final_execution_rate(
+        local_tasks,
+        sv_tasks,
+        rsu_tasks,
+        uav_tasks,
+        cloud_tasks,
+        failed_tasks,
+        output_dir,
+        file_stem="final_execution_rate",
     )
-    if not np.isclose(float(np.sum(rates)), 100.0, rtol=0.0, atol=1e-10):
-        raise RuntimeError("五类最终 execution rate 未归一到 100%。")
-
-    destination = Path(output_dir).expanduser()
-    destination.mkdir(parents=True, exist_ok=True)
-    png_path = destination / "figure2_execution_rate.png"
-    pdf_path = destination / "figure2_execution_rate.pdf"
-
-    labels = ("Local", "Service Vehicle", "RSU", "UAV", "Cloud")
-    figure, axis = plt.subplots(figsize=(7.2, 4.6))
-    axis.bar(labels, rates)
-    axis.set_title("Final Execution Rate")
-    axis.set_xlabel("Execution Node")
-    axis.set_ylabel("Execution Rate (%)")
-    axis.set_ylim(0.0, max(100.0, float(np.max(rates)) + 10.0))
-    axis.grid(axis="y", alpha=0.25)
-    axis.text(
-        0.99,
-        0.98,
-        f"Completed={completed}\nFailed={failed}",
-        transform=axis.transAxes,
-        ha="right",
-        va="top",
-    )
-    for index, rate in enumerate(rates):
-        axis.text(index, float(rate) + 1.0, f"{rate:.1f}%", ha="center", va="bottom")
-    figure.tight_layout()
-    figure.savefig(png_path, dpi=180)
-    figure.savefig(pdf_path)
-    plt.close(figure)
-    return png_path, pdf_path
 
 
 def plot_run(
@@ -631,12 +962,12 @@ def plot_run(
     rows = _read_metrics(metrics_file)
     execution_counts = _final_eval_execution_counts(rows)
     return {
-        "reward": plot_reward_convergence(
+        "reward_convergence": plot_reward_convergence(
             metrics_file,
             output_dir,
             moving_average_window=moving_average_window,
         ),
-        "execution_rate": plot_execution_rate(
+        "final_execution_rate": plot_execution_rate(
             execution_counts["local"],
             execution_counts["service_vehicle"],
             execution_counts["rsu"],
@@ -648,11 +979,80 @@ def plot_run(
     }
 
 
+def plot_saved_result_directory(
+    result_dir: str | Path,
+    *,
+    moving_average_window: int = 10,
+) -> dict[str, tuple[Path, Path]]:
+    """按已有结果文件自动选择 learning-check、Stage15 或 legacy 后处理。"""
+
+    directory = Path(result_dir).expanduser()
+    learning_episodes = directory / "training_episodes.csv"
+    learning_validation = directory / "validation_results.csv"
+    if learning_episodes.is_file() or learning_validation.is_file():
+        return plot_learning_check_run(
+            learning_episodes,
+            learning_validation,
+            directory / "figures",
+            moving_average_window=moving_average_window,
+        )
+
+    training_summary = directory / "training_summary.json"
+    if training_summary.is_file():
+        with training_summary.open("r", encoding="utf-8") as stream:
+            summary = json.load(stream)
+        return plot_stage15_run(
+            summary,
+            directory / "figures",
+            moving_average_window=moving_average_window,
+        )
+
+    metrics_file = directory / "metrics.csv"
+    if metrics_file.is_file():
+        return plot_run(
+            metrics_file,
+            directory / "figures",
+            moving_average_window=moving_average_window,
+        )
+    raise FileNotFoundError(
+        f"{directory}中没有可识别的结果文件：training_episodes.csv、"
+        "training_summary.json或metrics.csv。"
+    )
+
+
+def _print_generated_figures(result: Mapping[str, Any]) -> None:
+    """按用户要求优先打印两张正式主图，再打印附加诊断图。"""
+
+    ordered_names = ("reward_convergence", "final_execution_rate")
+    printed: set[str] = set()
+    print("Generated main figures:")
+    for name in ordered_names:
+        if name in printed or name not in result:
+            continue
+        paths = result[name]
+        if isinstance(paths, (tuple, list)):
+            for path in paths:
+                print(f"- {Path(path)}")
+        else:
+            print(f"- {Path(paths)}")
+        printed.add(name)
+    diagnostic_names = tuple(str(key) for key in result if key not in printed)
+    if diagnostic_names:
+        print("Generated diagnostic figures:")
+        for name in diagnostic_names:
+            paths = result[name]
+            if isinstance(paths, (tuple, list)):
+                for path in paths:
+                    print(f"- {Path(path)}")
+            else:
+                print(f"- {Path(paths)}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    """构造只从正式 metrics 生成 Figure 1/2 的最小命令行接口。"""
+    """构造结果后处理命令行接口，不执行训练或环境。"""
 
     project_root = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="从正式 metrics 绘制论文 Figure 1/2")
+    parser = argparse.ArgumentParser(description="从已保存训练/评估结果生成统一主图")
     parser.add_argument(
         "--metrics",
         "--metrics-file",
@@ -662,6 +1062,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, default=project_root / "outputs")
     parser.add_argument(
+        "--result-dir",
+        type=Path,
+        default=None,
+        help="自动识别 learning-check、Stage15 或 legacy 结果目录。",
+    )
+    parser.add_argument(
         "--figure2-only",
         action="store_true",
         help="只从 phase=final_eval 生成 Figure 2。",
@@ -670,14 +1076,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """从 phase=train/final_eval 的正式 metrics 生成两张论文图。"""
+    """只读取已保存结果生成主图，不启动训练。"""
 
     args = _build_parser().parse_args()
-    if args.figure2_only:
+    if args.result_dir is not None:
+        result = plot_saved_result_directory(args.result_dir, moving_average_window=10)
+    elif args.figure2_only:
         rows = _read_metrics(args.metrics_file)
         counts = _final_eval_execution_counts(rows)
         result = {
-            "execution_rate": plot_execution_rate(
+            "final_execution_rate": plot_execution_rate(
                 counts["local"],
                 counts["service_vehicle"],
                 counts["rsu"],
@@ -693,9 +1101,7 @@ def main() -> None:
             args.output_dir,
             moving_average_window=10,
         )
-    for name, paths in result.items():
-        label = "Figure 1" if name == "reward" else "Figure 2"
-        print(f"{label}: {paths[0]}")
+    _print_generated_figures(result)
 
 
 if __name__ == "__main__":

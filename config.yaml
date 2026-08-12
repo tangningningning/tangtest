@@ -1,7 +1,8 @@
 # adaptive_cache_mec 单一配置文件。
 #
 # 这里的参数服务于论文仿真；论文理论以同目录 11.pdf 和 paper_spec.md 为准。
-# 当前配置为 F=10 最终系统模型及 Reference Solver/SB3 PPO 接口准备配置。
+# 当前配置为 8辆任务车辆 + 2辆服务车辆 + F=10 的最终基础场景，
+# 用于 Reference Solver/SB3 PPO 接口；SUMO背景交通车辆不计入研究车辆数量。
 # 系统模型、资源分配、Cache/UAV 成本和策略初始化已完成定版。
 # Reference 模式默认独立运行；本阶段不加载 checkpoint，也不启动 PPO 训练。
 
@@ -45,8 +46,9 @@ mobility:
   schema_version: 1
 
 vehicle_roles:
-  # 角色数量只由配置控制，车辆身份始终使用SUMO原始vehicle_id。
-  num_task_vehicles: 10
+  # 基础论文场景：研究车辆总数10辆，其中8辆任务车辆、2辆服务车辆；
+  # SUMO背景交通车辆不计入研究车辆数量。角色身份仍使用SUMO原始vehicle_id。
+  num_task_vehicles: 8
   num_service_vehicles: 2
   # 服务车辆仅使用当前状态计算驻留和覆盖评分；后续可替换评分实现。
   service_score_alpha: 0.5
@@ -149,7 +151,7 @@ cloud:
   # Cloud无线接入等效上传速率，单位 Mbps；loader 读取后转换为内部 bit/s。
   upload_rate_mbps: 50.0
   # Cloud传输时延扩展系数 psi_c，仅用于等效回传/核心网附加时延。
-  delay_expansion_psi: 7.0
+  delay_expansion_psi: 10.0
 
 cache:
   # 各类节点的缓存容量，统一使用MB；字段名已包含单位，knapsack直接使用同一语义。
