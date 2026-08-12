@@ -38,11 +38,166 @@ except ImportError:  # pragma: no cover
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+FORMAL_BASE_SCENARIO = {
+    "task_vehicles": 8,
+    "service_vehicles": 2,
+    "rsus": 2,
+    "uavs": 2,
+    "services": 10,
+    "cache_nodes": 6,
+    "action_dimension": 8,
+    "observation_dimension": 95,
+    "episode_horizon": 100,
+}
 
 
 def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     value = config.get(name, {})
     return value if isinstance(value, Mapping) else {}
+
+
+def validate_formal_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """冻结正式论文入口的基础场景和已验收 PPO 参数。"""
+
+    roles = _section(config, "vehicle_roles")
+    services = _section(config, "services")
+    rsu = _section(config, "rsu")
+    uav = _section(config, "uav")
+    mobility = _section(config, "mobility")
+    ppo = _section(config, "ppo")
+    cloud = _section(config, "cloud")
+    simulation = _section(config, "simulation")
+    task_count = int(roles.get("num_task_vehicles", -1))
+    service_vehicle_count = int(roles.get("num_service_vehicles", -1))
+    service_count = int(services.get("count", -1))
+    rsu_count = len(rsu.get("positions_m", ()))
+    uav_count = len(uav.get("initial_positions_m", ()))
+    cache_nodes = service_vehicle_count + rsu_count + uav_count
+    action_dimension = cache_nodes + uav_count
+    research_vehicle_count = task_count + service_vehicle_count
+    observation_dimension = (
+        cache_nodes * service_count
+        + 2 * uav_count
+        + 2 * research_vehicle_count
+        + service_count
+        + 1
+    )
+    actual = {
+        "task_vehicles": task_count,
+        "service_vehicles": service_vehicle_count,
+        "rsus": rsu_count,
+        "uavs": uav_count,
+        "services": service_count,
+        "cache_nodes": cache_nodes,
+        "action_dimension": action_dimension,
+        "observation_dimension": observation_dimension,
+        "episode_horizon": int(simulation.get("slot_count", -1)),
+    }
+    errors = [
+        f"{name}={actual[name]}, expected {expected}"
+        for name, expected in FORMAL_BASE_SCENARIO.items()
+        if actual[name] != expected
+    ]
+    expected_task_ids = tuple(f"tv_{index:03d}" for index in range(8))
+    expected_service_ids = ("sv_000", "sv_001")
+    if str(roles.get("role_update_mode", "")).strip().lower() != "fixed_episode":
+        errors.append("vehicle_roles.role_update_mode must be fixed_episode")
+    if tuple(str(item) for item in roles.get("task_vehicle_ids", ())) != expected_task_ids:
+        errors.append("vehicle_roles.task_vehicle_ids do not match tv_000..tv_007")
+    if tuple(str(item) for item in roles.get("service_vehicle_ids", ())) != expected_service_ids:
+        errors.append("vehicle_roles.service_vehicle_ids do not match sv_000,sv_001")
+    if str(mobility.get("source", "")).strip().lower() != "trace":
+        errors.append("mobility.source must be trace")
+    if ppo.get("enabled") is not True:
+        errors.append("ppo.enabled must be true for the default formal entrypoint")
+    exact_ppo = {
+        "n_steps": 256,
+        "batch_size": 64,
+        "n_epochs": 10,
+        "total_timesteps": 25600,
+        "eval_freq": 5120,
+    }
+    for name, expected in exact_ppo.items():
+        if int(ppo.get(name, -1)) != expected:
+            errors.append(f"ppo.{name}={ppo.get(name)!r}, expected {expected}")
+    float_ppo = {
+        "learning_rate": 3.0e-4,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_range": 0.2,
+        "ent_coef": 0.0,
+        "vf_coef": 0.5,
+        "max_grad_norm": 0.5,
+    }
+    for name, expected in float_ppo.items():
+        try:
+            value = float(ppo[name])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"ppo.{name} is missing or invalid")
+            continue
+        if not math.isclose(value, expected, rel_tol=0.0, abs_tol=1.0e-12):
+            errors.append(f"ppo.{name}={value}, expected {expected}")
+    if ppo.get("norm_obs") is not True:
+        errors.append("ppo.norm_obs must remain true")
+    if ppo.get("norm_reward") is not True:
+        errors.append("ppo.norm_reward must remain true")
+    if not math.isclose(
+        float(ppo.get("clip_obs", float("nan"))),
+        10.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        errors.append("ppo.clip_obs must remain 10.0")
+    if str(ppo.get("device", "")).strip().lower() != "cpu":
+        errors.append("ppo.device must remain cpu")
+    if int(ppo.get("seed", -1)) != 20260811:
+        errors.append("ppo.seed must remain 20260811")
+    if int(ppo.get("train_seed_base", -1)) != 20260811:
+        errors.append("ppo.train_seed_base must remain 20260811")
+    if str(ppo.get("best_model_criterion", "")) != (
+        "mean_original_validation_system_reward"
+    ):
+        errors.append("ppo.best_model_criterion is not the formal criterion")
+    if ppo.get("test_after_best_only") is not True:
+        errors.append("ppo.test_after_best_only must be true")
+    try:
+        hard_stop_keys = set(_configured_hard_stop_keys(config))
+    except ValueError as error:
+        errors.append(str(error))
+    else:
+        required_hard_stops = {
+            "future_request_leakage",
+            "future_trajectory_leakage",
+            "future_mobility_leakage",
+            "capacity_violations",
+            "compute_violations",
+            "bandwidth_violations",
+            "uav_violations",
+            "invalid_service_ids",
+            "invalid_node_ids",
+            "nan_inf_count",
+            "kkt_failure_count",
+        }
+        missing_hard_stops = sorted(required_hard_stops.difference(hard_stop_keys))
+        if missing_hard_stops:
+            errors.append(
+                f"ppo.hard_stop_on is missing formal diagnostics: {missing_hard_stops}"
+            )
+    if not math.isclose(
+        float(cloud.get("delay_expansion_psi", float("nan"))),
+        10.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        errors.append("cloud.delay_expansion_psi must remain 10.0")
+    if errors:
+        raise ValueError("formal configuration drift: " + "; ".join(errors))
+    return {
+        **actual,
+        "role_update_mode": "fixed_episode",
+        "mobility_source": "trace",
+        "parameter_drift": 0,
+    }
 
 
 def prepare_ppo_config(
@@ -320,18 +475,8 @@ def run_semantic_smoke(
     )
     formula_residuals: list[float] = []
     reward_components = {"Q": 0.0, "cache_cost": 0.0, "uav_cost": 0.0, "reward": 0.0}
-    totals = {
-        "future_request_leakage": 0,
-        "future_trajectory_leakage": 0,
-        "capacity_violations": 0,
-        "compute_violations": 0,
-        "bandwidth_violations": 0,
-        "uav_speed_violations": 0,
-        "uav_region_violations": 0,
-        "uav_safety_violations": 0,
-        "nan_inf_count": 0,
-        "kkt_failure_count": 0,
-    }
+    # 与正式训练使用同一份诊断键，避免冒烟测试遗漏新增的因果/ID 约束。
+    totals = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
     try:
         smoke_environment.reset(seed=int(seed))
         for slot in range(10):
@@ -405,6 +550,7 @@ LEARNING_CHECK_HARD_KEYS = (
     "uav_speed_violations",
     "uav_region_violations",
     "uav_safety_violations",
+    "uav_violations",
     "invalid_service_ids",
     "invalid_node_ids",
     "nan_inf_count",
@@ -417,6 +563,45 @@ LEARNING_CHECK_EXECUTION_KEYS = (
     ("uav", "UAV"),
     ("cloud", "Cloud"),
 )
+
+
+def _configured_hard_stop_keys(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """读取并校验正式训练必须立即停止的运行时诊断项。"""
+
+    values = _section(config, "ppo").get("hard_stop_on")
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError("ppo.hard_stop_on must be a non-empty list")
+    keys = tuple(str(item) for item in values)
+    duplicates = sorted({item for item in keys if keys.count(item) > 1})
+    unknown = sorted(set(keys).difference(LEARNING_CHECK_HARD_KEYS))
+    if duplicates:
+        raise ValueError(f"ppo.hard_stop_on contains duplicates: {duplicates}")
+    if unknown:
+        raise ValueError(f"ppo.hard_stop_on contains unknown diagnostics: {unknown}")
+    return keys
+
+
+def _hard_stop_violations(
+    info: Mapping[str, Any], config: Mapping[str, Any]
+) -> dict[str, int]:
+    """返回当前 slot 中配置为 hard-stop 且大于零的诊断项。"""
+
+    return {
+        key: max(0, int(info.get(key, 0)))
+        for key in _configured_hard_stop_keys(config)
+        if max(0, int(info.get(key, 0))) > 0
+    }
+
+
+def _raise_on_hard_stop(
+    info: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    phase: str,
+) -> None:
+    violations = _hard_stop_violations(info, config)
+    if violations:
+        raise RuntimeError(f"{phase} hard-stop diagnostics: {violations}")
 
 
 def _json_safe(value: Any) -> Any:
@@ -1040,6 +1225,13 @@ class FormalTrainingCallback(LearningCheckCallback):
         self.best_model_path: Path | None = None
         self.best_vecnormalize_path: Path | None = None
 
+    def _on_step(self) -> bool:
+        keep_training = super()._on_step()
+        infos = self.locals.get("infos", [])
+        info = infos[0]
+        _raise_on_hard_stop(info, self.config, phase="formal training")
+        return keep_training
+
     def _evaluate_checkpoint(self, timesteps: int) -> None:
         step = int(timesteps)
         if step <= 0 or step in self.evaluated_timesteps:
@@ -1182,13 +1374,26 @@ def _formal_training_trace_seeds(
     }
 
 
-def preflight_training_traces(
+def _fixed_research_vehicle_ids(config: Mapping[str, Any]) -> tuple[str, ...]:
+    roles = _section(config, "vehicle_roles")
+    service_ids = tuple(str(item) for item in roles.get("service_vehicle_ids", ()))
+    task_ids = tuple(str(item) for item in roles.get("task_vehicle_ids", ()))
+    fixed_ids = service_ids + task_ids
+    if not fixed_ids:
+        raise RuntimeError("fixed_episode preflight requires explicit research vehicle IDs")
+    return fixed_ids
+
+
+def _preflight_trace_categories(
     config: Mapping[str, Any],
     *,
-    total_timesteps: int | None = None,
-    raise_on_error: bool = True,
+    categories: Mapping[str, Sequence[int]],
+    horizon: int,
+    fixed_ids: Sequence[str],
+    raise_on_error: bool,
+    phase: str,
 ) -> dict[str, Any]:
-    """只检查离线 trace 的覆盖、schema、slot 数和固定研究车辆角色。"""
+    """校验调用方明确给出的 trace 分区，不隐式读取其他 seed 列表。"""
 
     mobility = _section(config, "mobility")
     if str(mobility.get("source", "sumo")).strip().lower() != "trace":
@@ -1198,21 +1403,6 @@ def preflight_training_traces(
     except ImportError:  # pragma: no cover
         from mobility import TraceMobilityProvider, trace_path
 
-    roles = _section(config, "vehicle_roles")
-    service_ids = tuple(str(item) for item in roles.get("service_vehicle_ids", ()))
-    task_ids = tuple(str(item) for item in roles.get("task_vehicle_ids", ()))
-    fixed_ids = service_ids + task_ids
-    if not fixed_ids:
-        raise RuntimeError("fixed_episode preflight requires explicit research vehicle IDs")
-    trace_plan = _formal_training_trace_seeds(config, total_timesteps)
-    validation_seeds = _formal_validation_seeds(config)
-    test_seeds = _formal_test_seeds(config)
-    categories = {
-        "training": list(trace_plan["training_trace_seeds"]),
-        "validation": validation_seeds,
-        "test": test_seeds,
-    }
-    horizon = int(trace_plan["episode_horizon"])
     coverage: dict[str, Any] = {}
     missing: dict[str, list[int]] = {key: [] for key in categories}
     invalid: list[dict[str, Any]] = []
@@ -1257,10 +1447,6 @@ def preflight_training_traces(
     if invalid:
         print(f"Trace preflight invalid traces: {invalid}")
     result = {
-        **trace_plan,
-        "formal_training_traces": len(categories["training"]),
-        "validation_traces": len(validation_seeds),
-        "test_traces": len(test_seeds),
         "total_required": sum(len(values) for values in categories.values()),
         "coverage": coverage,
         "missing": missing,
@@ -1268,15 +1454,72 @@ def preflight_training_traces(
             seed for values in missing.values() for seed in values
         ),
         "invalid": invalid,
-        "fixed_role_ids": fixed_ids,
+        "fixed_role_ids": tuple(str(item) for item in fixed_ids),
         "passed": not missing_flat and not invalid,
     }
     if raise_on_error and not result["passed"]:
         raise RuntimeError(
-            "formal training trace preflight failed: "
+            f"{phase} trace preflight failed: "
             f"missing={missing_flat}, invalid={invalid}"
         )
     return result
+
+
+def preflight_training_traces(
+    config: Mapping[str, Any],
+    *,
+    total_timesteps: int | None = None,
+    raise_on_error: bool = True,
+) -> dict[str, Any]:
+    """只预检 training/validation；test trace 必须等 best checkpoint 后再访问。"""
+
+    trace_plan = _formal_training_trace_seeds(config, total_timesteps)
+    validation_seeds = _formal_validation_seeds(config)
+    categories = {
+        "training": list(trace_plan["training_trace_seeds"]),
+        "validation": validation_seeds,
+    }
+    checked = _preflight_trace_categories(
+        config,
+        categories=categories,
+        horizon=int(trace_plan["episode_horizon"]),
+        fixed_ids=_fixed_research_vehicle_ids(config),
+        raise_on_error=raise_on_error,
+        phase="formal training/validation",
+    )
+    return {
+        **trace_plan,
+        **checked,
+        "formal_training_traces": len(categories["training"]),
+        "validation_traces": len(validation_seeds),
+        "test_traces": 0,
+        "test_deferred_until_best": True,
+    }
+
+
+def preflight_test_traces(
+    config: Mapping[str, Any],
+    *,
+    raise_on_error: bool = True,
+) -> dict[str, Any]:
+    """best checkpoint 已确定后，才解析并检查固定 test traces。"""
+
+    test_seeds = _formal_test_seeds(config)
+    horizon = int(_section(config, "simulation").get("slot_count", 100))
+    checked = _preflight_trace_categories(
+        config,
+        categories={"test": test_seeds},
+        horizon=horizon,
+        fixed_ids=_fixed_research_vehicle_ids(config),
+        raise_on_error=raise_on_error,
+        phase="formal test",
+    )
+    return {
+        **checked,
+        "test_traces": len(test_seeds),
+        "test_seeds": test_seeds,
+        "accessed_after_best": True,
+    }
 
 
 def _formal_startup_checks(
@@ -1377,6 +1620,7 @@ def _run_deterministic_validation(
     training_vector: Any,
     action_layout: Mapping[str, Any],
     seeds: Sequence[int] | None = None,
+    phase: str = "validation",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     results: list[dict[str, Any]] = []
     diagnostics = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
@@ -1406,6 +1650,11 @@ def _run_deterministic_validation(
                 metrics.add(info)
                 for key in LEARNING_CHECK_HARD_KEYS:
                     diagnostics[key] += max(0, int(info.get(key, 0)))
+                _raise_on_hard_stop(
+                    info,
+                    config,
+                    phase=f"{phase} seed {seed}",
+                )
                 if bool(np.asarray(dones, dtype=bool).reshape(-1)[0]):
                     terminated = True
                     break
@@ -1895,6 +2144,60 @@ def _formal_plot_outputs(
     }
 
 
+def _assert_zero_formal_diagnostics(
+    diagnostics: Mapping[str, Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> None:
+    """最终 PASS 前再次确认所有配置的 hard-stop 诊断均为零。"""
+
+    violations: dict[str, dict[str, int]] = {}
+    keys = _configured_hard_stop_keys(config)
+    for phase, values in diagnostics.items():
+        current = {
+            key: max(0, int(values.get(key, 0)))
+            for key in keys
+            if max(0, int(values.get(key, 0))) > 0
+        }
+        if current:
+            violations[str(phase)] = current
+    if violations:
+        raise RuntimeError(f"formal hard-stop diagnostics are non-zero: {violations}")
+
+
+def _validate_nonempty_artifacts(
+    output_dir: Path,
+    artifacts: Mapping[str, Path],
+) -> dict[str, Any]:
+    """防止文件缺失时仍把正式 run 标记为 PASS。"""
+
+    root = output_dir.resolve()
+    missing: list[str] = []
+    empty: list[str] = []
+    checked: dict[str, str] = {}
+    for name, raw_path in artifacts.items():
+        path = Path(raw_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise RuntimeError(
+                f"formal artifact escaped output directory: {name}={path}"
+            ) from error
+        checked[str(name)] = str(path)
+        if not path.is_file():
+            missing.append(str(name))
+        elif path.stat().st_size <= 0:
+            empty.append(str(name))
+    if missing or empty:
+        raise RuntimeError(
+            f"formal artifact validation failed: missing={missing}, empty={empty}"
+        )
+    return {
+        "passed": True,
+        "checked_count": len(checked),
+        "files": checked,
+    }
+
+
 def run_training(
     config: Mapping[str, Any] | str | Path | None = None,
     *,
@@ -1904,6 +2207,7 @@ def run_training(
     """正式 PPO 入口：trace 预检、validation 选优、best checkpoint 后 test。"""
 
     prepared = prepare_ppo_config(config)
+    formal_config = validate_formal_config(prepared)
     ppo = _section(prepared, "ppo")
     requested_steps = int(
         ppo.get("total_timesteps", 25600)
@@ -1924,6 +2228,10 @@ def run_training(
     expected_updates = int(trace_preflight["effective_env_steps"] // n_steps)
     target = _formal_output_dir(prepared, output_dir)
     snapshot = copy.deepcopy(prepared)
+    # test seed 只在 best checkpoint 已产生后解析；启动快照显式记录该隔离状态。
+    snapshot_ppo = snapshot.get("ppo")
+    if isinstance(snapshot_ppo, dict) and "test_seeds" in snapshot_ppo:
+        snapshot_ppo["test_seeds"] = "DEFERRED_UNTIL_BEST_CHECKPOINT"
     _write_json(
         target / "config_snapshot.json",
         {
@@ -1936,6 +2244,7 @@ def run_training(
                 "training_seed_mode": "sequential",
                 "validation_seed_mode": "fixed",
                 "test_after_best_only": True,
+                "formal_config": formal_config,
                 "preflight": trace_preflight,
                 "startup": startup,
             },
@@ -1963,9 +2272,26 @@ def run_training(
         callback.write_outputs()
         if callback.best_model_path is None or callback.best_vecnormalize_path is None:
             raise RuntimeError("formal training did not produce a best model/VecNormalize pair")
+        best_model_file = callback.best_model_path.with_suffix(".zip")
+        if not best_model_file.is_file() or not callback.best_vecnormalize_path.is_file():
+            raise RuntimeError("formal training best model/VecNormalize artifact is missing")
+        if callback.logged_updates != expected_updates:
+            raise RuntimeError(
+                "formal training update count mismatch: "
+                f"logged={callback.logged_updates}, expected={expected_updates}"
+            )
+        if callback.completed_episodes != int(
+            trace_preflight["formal_training_episodes"]
+        ):
+            raise RuntimeError(
+                "formal completed episode count mismatch: "
+                f"completed={callback.completed_episodes}, "
+                f"expected={trace_preflight['formal_training_episodes']}"
+            )
 
         # 只有在 best validation checkpoint 已确定后，才读取并评估 test seeds。
-        test_seeds = _formal_test_seeds(prepared)
+        test_preflight = preflight_test_traces(prepared)
+        test_seeds = list(test_preflight["test_seeds"])
         best_vector = _build_loaded_vecnormalize(
             prepared,
             seed=int(test_seeds[0]),
@@ -1982,28 +2308,54 @@ def run_training(
             training_vector=best_vector,
             action_layout=startup["action_layout"],
             seeds=test_seeds,
+            phase="test",
         )
         _write_csv(target / "test_results.csv", test_rows)
         figures = _formal_plot_outputs(target, callback.episode_rows, test_rows)
-        diagnostics = {
+        runtime_diagnostics = {
             "training": callback.hard_diagnostics,
             "validation": callback.validation_diagnostics,
             "test": test_diagnostics,
-            "preflight": trace_preflight,
+        }
+        _assert_zero_formal_diagnostics(runtime_diagnostics, prepared)
+        diagnostics = {
+            **runtime_diagnostics,
+            "training_validation_preflight": trace_preflight,
+            "test_preflight": test_preflight,
         }
         diagnostics_dir = target / "figures" / "diagnostics"
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
         _write_json(diagnostics_dir / "formal_diagnostics.json", diagnostics)
         test_aggregate = _validation_aggregate(test_rows)
+        artifact_validation = _validate_nonempty_artifacts(
+            target,
+            {
+                "config_snapshot": target / "config_snapshot.json",
+                "training_episodes": target / "training_episodes.csv",
+                "training_updates": target / "training_updates.csv",
+                "action_trigger_rates": target / "action_trigger_rates.csv",
+                "validation_results": target / "validation_results.csv",
+                "validation_history": target / "validation_history.csv",
+                "test_results": target / "test_results.csv",
+                "best_model": best_model_file,
+                "best_vecnormalize": callback.best_vecnormalize_path,
+                "formal_diagnostics": diagnostics_dir / "formal_diagnostics.json",
+                "reward_convergence_png": target / "figures" / "reward_convergence.png",
+                "reward_convergence_pdf": target / "figures" / "reward_convergence.pdf",
+                "final_execution_rate_png": target / "figures" / "final_execution_rate.png",
+                "final_execution_rate_pdf": target / "figures" / "final_execution_rate.pdf",
+            },
+        )
         summary = {
             "status": "PASS",
+            "formal_config": formal_config,
             "requested_timesteps": requested_steps,
             "effective_env_steps": trace_preflight["effective_env_steps"],
             "n_steps": n_steps,
             "eval_freq": eval_freq,
             "expected_updates": expected_updates,
             "logged_updates": callback.logged_updates,
-            "best_criterion": "mean_original_validation_system_reward",
+            "best_criterion": str(ppo["best_model_criterion"]),
             "best_score": callback.best_score,
             "best_timesteps": callback.best_timesteps,
             "best_update": callback.best_update,
@@ -2020,10 +2372,17 @@ def run_training(
                 "mean_raw_G": float(test_aggregate["mean"].get("mean_raw_G", 0.0)),
                 "std_raw_G": float(test_aggregate["std"].get("mean_raw_G", 0.0)),
             },
+            "trace_preflight": {
+                "training_validation": trace_preflight,
+                "test_after_best": test_preflight,
+                "total_required": int(trace_preflight["total_required"])
+                + int(test_preflight["total_required"]),
+            },
             "action_layout": startup["action_layout"],
             "observation_dimension": startup["observation_dimension"],
             "hard_constraints": diagnostics,
             "figures": figures,
+            "artifact_validation": artifact_validation,
             "artifacts": {
                 "config_snapshot": "config_snapshot.json",
                 "training_episodes": "training_episodes.csv",
@@ -2033,10 +2392,15 @@ def run_training(
                 "test_results": "test_results.csv",
                 "best_model": "best_model.zip",
                 "best_vecnormalize": "best_vecnormalize.pkl",
+                "formal_diagnostics": "figures/diagnostics/formal_diagnostics.json",
                 "figures": "figures",
             },
         }
         _write_json(target / "final_summary.json", summary)
+        _validate_nonempty_artifacts(
+            target,
+            {"final_summary": target / "final_summary.json"},
+        )
         return {"output_dir": str(target), **summary}
     finally:
         if best_vector is not None:
@@ -2046,7 +2410,14 @@ def run_training(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """统一 CLI 入口；无参数与 ``--train`` 都进入正式论文训练。"""
+
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config-check",
+        action="store_true",
+        help="只解析并检查 config.yaml，不启动任何训练。",
+    )
     parser.add_argument("--interface-smoke", action="store_true")
     parser.add_argument("--learning-check", action="store_true")
     parser.add_argument("--learning-check-output", default=None)
@@ -2054,20 +2425,60 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--total-timesteps", type=int, default=None)
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args(argv)
-    if args.learning_check and args.train:
-        parser.error("--learning-check与--train不能同时使用。")
+
+    mode_flags = {
+        "--config-check": bool(args.config_check),
+        "--interface-smoke": bool(args.interface_smoke),
+        "--learning-check": bool(args.learning_check),
+        "--train": bool(args.train),
+    }
+    selected_modes = [name for name, selected in mode_flags.items() if selected]
+    if len(selected_modes) > 1:
+        parser.error(
+            "运行模式互斥，不能同时使用：" + ", ".join(selected_modes)
+        )
+
+    if args.learning_check_output is not None and not args.learning_check:
+        parser.error("--learning-check-output只能与--learning-check一起使用。")
+    if args.learning_check and (
+        args.total_timesteps is not None or args.output_dir is not None
+    ):
+        parser.error("--learning-check不能与--total-timesteps或--output-dir一起使用。")
+    if args.interface_smoke and (
+        args.total_timesteps is not None or args.output_dir is not None
+    ):
+        parser.error("--interface-smoke不能与--total-timesteps或--output-dir一起使用。")
+    if args.config_check and (
+        args.total_timesteps is not None or args.output_dir is not None
+    ):
+        parser.error("--config-check不能与--total-timesteps或--output-dir一起使用。")
+
+    if args.config_check:
+        # 配置检查是唯一的显式“只检查不训练”入口；默认入口不能走这里。
+        formal_config = validate_formal_config(prepare_ppo_config())
+        print(
+            json.dumps(
+                {
+                    "config_parse": "PASS",
+                    "formal_config": formal_config,
+                    "training_started": False,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
     if args.learning_check:
         result = run_learning_check(output_dir=args.learning_check_output)
         print(json.dumps(_json_safe(result), ensure_ascii=False, indent=2))
         return
-    if args.train:
-        run_training(total_timesteps=args.total_timesteps, output_dir=args.output_dir)
+    if args.interface_smoke:
+        print(json.dumps(_json_safe(run_interface_smoke()), ensure_ascii=False, indent=2))
         return
-    result = run_interface_smoke() if args.interface_smoke else {
-        "config_parse": "PASS",
-        "training_started": False,
-    }
-    print(result)
+
+    # 无参数和显式 --train 共用唯一正式论文训练实现；默认读取 config.yaml
+    # 中的 total_timesteps/eval_freq，并在 pipeline 内完成 preflight、validation、
+    # best model + VecNormalize 保存、final test 和正式主图生成。
+    run_training(total_timesteps=args.total_timesteps, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":
@@ -2078,11 +2489,13 @@ __all__ = [
     "build_ppo_environment",
     "build_sb3_ppo",
     "build_vecnormalize_environment",
+    "validate_formal_config",
     "prepare_ppo_config",
     "run_interface_smoke",
     "run_semantic_smoke",
     "run_learning_check",
     "preflight_training_traces",
+    "preflight_test_traces",
     "FormalTrainingCallback",
     "run_training",
 ]

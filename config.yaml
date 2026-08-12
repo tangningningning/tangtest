@@ -264,8 +264,8 @@ reward:
   energy_weight: 0.5
 
 ppo:
-  # 默认不自动训练；当前正式策略为标准SB3 PPO + MultiBinary配置触发。
-  enabled: false
+  # 无参数运行 train_ppo.py 即进入正式训练；该开关作为正式配置一致性断言。
+  enabled: true
   seed: 20260811
   train_seed_base: 20260811
   # observation维度由M、U、V、F动态构造，仍复用VecNormalize。
@@ -279,7 +279,7 @@ ppo:
   test_seeds: [20281811, 20281812, 20281813, 20281814, 20281815, 20281816, 20281817, 20281818, 20281819, 20281820]
   eval_freq: 5120
   best_model_criterion: mean_original_validation_system_reward
-  hard_stop_on: [future_request_leakage, future_trajectory_leakage, capacity_violations, compute_violations, bandwidth_violations, uav_violations, invalid_service_ids, invalid_node_ids, nan_inf_count, kkt_failure_count]
+  hard_stop_on: [future_request_leakage, future_trajectory_leakage, future_mobility_leakage, capacity_violations, compute_violations, bandwidth_violations, uav_violations, invalid_service_ids, invalid_node_ids, nan_inf_count, kkt_failure_count]
   test_after_best_only: true
   # 已验证的标准SB3 PPO参数，本轮不把它们作为研究变量。
   gamma: 0.99
@@ -292,7 +292,7 @@ ppo:
   ent_coef: 0.0
   vf_coef: 0.5
   max_grad_norm: 0.5
-  # 25600仅保留为历史默认训练预算；本轮重构不调用learn。
+  # 正式论文训练默认预算；Codex轻量验收不得调用learn。
   total_timesteps: 25600
   # 第一轮环境计算成本主要来自 SUMO/Matching/KKT，固定先用 CPU。
   device: cpu

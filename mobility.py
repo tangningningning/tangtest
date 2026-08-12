@@ -298,6 +298,7 @@ class TraceMobilityProvider(MobilityProvider):
         self._columns = {vehicle_id: index for index, vehicle_id in enumerate(self.vehicle_ids)}
         self._current_slot = -1
         self._requested_slots = 0
+        self._future_access_count = 0
 
     def _load_archive(self) -> None:
         try:
@@ -383,6 +384,7 @@ class TraceMobilityProvider(MobilityProvider):
             )
         self._current_slot = -1
         self._requested_slots = 0
+        self._future_access_count = 0
         return self._states_from_arrays(None)
 
     @staticmethod
@@ -480,6 +482,8 @@ class TraceMobilityProvider(MobilityProvider):
         index = int(slot_index)
         same_slot = index == self._current_slot
         if self._current_slot < 0 and index != 0:
+            if index > 0:
+                self._future_access_count += 1
             raise RuntimeError("causal trace replay must start at slot 0")
         if self._current_slot >= 0 and index not in {
             self._current_slot,
@@ -487,6 +491,7 @@ class TraceMobilityProvider(MobilityProvider):
         }:
             if index < self._current_slot:
                 raise RuntimeError("trace mobility slots cannot move backwards")
+            self._future_access_count += 1
             raise RuntimeError(
                 "causal trace replay cannot skip a slot; "
                 f"requested {index} after {self._current_slot}"
@@ -506,7 +511,7 @@ class TraceMobilityProvider(MobilityProvider):
             "trace_file": str(self.path),
             "trace_seed": self.seed,
             "trace_schema_version": TRACE_SCHEMA_VERSION,
-            "future_access_count": 0,
+            "future_access_count": int(self._future_access_count),
             "requested_slots": int(self._requested_slots),
             "last_slot": int(self._current_slot),
             "sumo_start_count": 0,

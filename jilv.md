@@ -2300,3 +2300,94 @@ base HEAD = 3dcf672
 implementation commit SHA = `5d3494cff3b076a899462c21804bf091047dda0c`
 push origin main = PASS
 origin/main SHA = `5d3494cff3b076a899462c21804bf091047dda0c`
+
+## 2026-08-12：默认正式训练入口修正
+
+`train_ppo.py` 的 CLI 现在只有显式 `--config-check` 才执行配置检查后退出。
+无参数运行与 `--train` 统一调用同一个 `run_training()` 正式论文训练 pipeline，
+继续使用 config.yaml 中的 25600 steps、5120 eval frequency、validation 选优、
+best model + VecNormalize、best 后 final test 和四张正式主图输出。
+
+`--interface-smoke` 和 `--learning-check` 保留原入口；各运行模式互斥，非法组合统一
+通过 `parser.error` 拒绝。CLI monkeypatch dispatch、冲突参数、py_compile 和实际
+`--config-check` 均通过，本轮 `model.learn` 调用次数为 0。
+
+## 2026-08-13：正式训练契约与因果诊断审计修复
+
+本轮根据正式训练前项目审计修复实现一致性问题，不修改第三章 P0、reward、PPO
+超参数、通信公式、Cache/UAV/Matching/KKT 算法，也未调用 `model.learn`。
+
+### 冻结配置与正式入口
+
+`config.yaml` 恢复并冻结论文基础场景：
+
+```text
+Task = 8
+SV = 2
+RSU = 2
+UAV = 2
+F = 10
+cache nodes = 6
+action dimension = 8
+observation dimension = 95
+parameter drift = 0
+```
+
+新增正式配置契约检查。无参数正式入口和 `--train` 在进入 trace preflight 前都会检查
+场景维度、固定车辆 ID、trace mobility、已验收 PPO 参数、best criterion、
+`test_after_best_only`、Cloud `psi=10` 以及完整 `hard_stop_on`；`--config-check` 使用同一
+检查函数。任何漂移均在训练前抛错，不再仅验证 YAML 能否解析。
+
+### 因果诊断、hard-stop 与 test 隔离
+
+`TraceMobilityProvider.future_access_count` 现在由真实非法未来 slot 访问累计，并在
+episode reset 时清零，不再固定返回 0。语义 smoke 与正式指标统一覆盖：
+
+```text
+future request/trajectory/mobility leakage
+capacity/compute/bandwidth violations
+UAV speed/region/safety/aggregate violations
+invalid service/node IDs
+NaN/Inf
+KKT failures
+```
+
+训练 callback、validation 和 final test 已真正执行 `ppo.hard_stop_on`：任一配置项
+非零立即抛错，最终写 `PASS` 前再做聚合零值检查。
+
+正式启动阶段只读取：
+
+```text
+training traces = 257（256 formal + 1 reset reserve）
+validation traces = 5
+pre-best total = 262
+test traces accessed = 0
+```
+
+只有 best model 与匹配的 best VecNormalize 文件都已实际生成后，才解析和预检 10 条
+test traces，再执行 final test；完整数据集总量仍为 272。启动快照把 test seeds 标记为
+`DEFERRED_UNTIL_BEST_CHECKPOINT`，避免误认为 test 已参与训练前检查。
+
+### 产物、依赖与回归测试
+
+正式 run 只有在 update 数、完成 episode 数、hard diagnostics 和全部必需文件均通过
+检查后才写 `status=PASS`。检查范围包括 best model、best VecNormalize、训练/验证/测试
+CSV、诊断 JSON 与四个 PNG/PDF 主图，防止缺少模型文件的 run 被误标为通过。历史输出
+保持只读，未删除、补写或伪造历史 checkpoint。
+
+新增 `environment.yml` 固定当前 `adaptive_cache_mec` 环境的核心依赖版本，并新增 8 项
+`unittest` 回归测试，覆盖配置漂移、因果 trace 计数、test seed 延迟访问、hard-stop、
+产物缺失拒绝及 CLI 单一正式训练函数。
+
+```text
+py_compile = PASS
+--config-check = PASS
+unittest = 8/8 PASS
+SB3 interface/check_env smoke = PASS
+training/validation trace preflight = PASS
+10-slot semantic smoke = PASS
+formula residual max = 0.0
+all hard diagnostics = 0
+model.learn calls = 0
+formal training restarted = NO
+```
