@@ -2391,3 +2391,115 @@ all hard diagnostics = 0
 model.learn calls = 0
 formal training restarted = NO
 ```
+
+## 2026-08-13：第一阶段求解算法数学一致性修复
+
+本轮保持 PPO Trigger、有限 UAV 候选、0-1 knapsack、transfer/exchange Matching、
+KKT 和 environment 物理层主体不变，仅修复其与最新有限时域 P0 的关键目标漂移：
+
+```text
+PPO gamma = 1.0
+training/validation VecNormalize gamma = 1.0
+gae_lambda = 0.95（不变）
+reward = Q - cache cost - UAV cost（不变）
+```
+
+`task_utility` 的 delay/energy reference 支持 scalar 或逐任务 vector；Matching 最终
+assignment 的 Q 显式复用 KKT 同一组 reference 和权重。Cache item score 只减通过
+environment 单一 helper 得到的 `0->1` loading cost，fixed update cost 不按服务扣除；
+完整 candidate 再以预测服务效用减 environment 实际 cache update cost 决定接受或
+noop。Local cache 通过显式 vehicle ID 对齐进入 `max(Local, Cloud)` baseline。
+
+每个 UAV trial position 现在先更新预测，再调用同一个 cache solver，并以预测服务效用
+减实际 cache update cost 和 UAV movement cost 作为 configuration surrogate；它不等于
+真实当前 slot G。Matching 主算法未改，候选评价使用稳定 reason code 聚合 resource、
+physical、numerical 等拒绝；hard-stop `kkt_failure_count` 只表示最终 accepted assignment。
+删除了没有独立硬约束来源的 `latency_constraint` 假诊断。
+
+```text
+model.learn calls = 0
+formal training restarted = NO
+Matching guarantee = transfer/exchange neighborhood local stability only
+P0 global optimum claimed = NO
+py_compile = PASS
+targeted unittest = 14/14 PASS
+one-slot interface smoke = PASS
+```
+
+## 2026-08-13：第二阶段 Matching vs Exact 小规模精确解 Benchmark
+
+本轮未修改 transfer/exchange Matching 的搜索策略，也未把穷举求解接入正式
+`environment.step()`。`solver.evaluate_fixed_assignment()` 只是生产
+`_evaluate_assignment()` 的公开薄封装；Exact 对每个 Cartesian assignment 都通过
+同一 `solve_resources -> KKT -> environment.execute_task -> task_utility` 链重新评价。
+未到达任务始终保持 `-1`；资源、物理或数值不可行候选按 machine-readable
+`reason_code` 跳过；同一 tolerance 内按完整 assignment tuple 字典序确定性打破平局。
+
+真实 benchmark 使用 training trace `seed=20260811`，不读取 formal test seeds。
+每个案例由生产时隙先固定最终 Cache/UAV，再让 Matching 与 Exact 共享完全相同的
+调度输入。Exact 安全上限为 active tasks 不超过 5、Cartesian combinations 不超过
+100000；本次最大实际组合数为 144。
+
+```text
+completed cases = 20
+skipped cases = 0
+active task 2/3/4/5 cases = 5/5/5/5
+mean/median/max absolute gap = 0/0/0
+mean/median/max relative gap = 0/0/0
+optimal hit rate = 1.0
+mean matching runtime = 0.008878369999956703 s
+mean exact runtime = 0.015726025000003575 s
+oracle consistency failures = 0
+py_compile = PASS
+benchmark unittest = 4/4 PASS
+formal contract unittest = 14/14 PASS
+model.learn calls = 0
+```
+
+该结果只说明这 20 个小规模固定配置实例中的 assignment optimality gap；不能证明
+Matching 在任意规模全局最优，也不能证明 PPO 或完整 P0 全局最优。
+
+## 2026-08-13：第三阶段 PPO 5120-step 短程学习有效性检查
+
+本轮复用正式 `build_vecnormalize_environment()` 与 `build_sb3_ppo()`，不修改 PPO
+超参数、环境、reward、Matching/KKT、action 或 observation。Learning-check 私有
+checkpoint 为 0/1280/2560/3840/5120；每次使用同一组 5 个 fixed validation seeds，
+validation VecNormalize 关闭 training/reward normalization，并复制当时 training
+`obs_rms`。额外用相同 seeds 运行全零 trigger baseline。正式 test seeds 未访问。
+
+```text
+run = outputs/ppo_learning_check/20260813_111534
+environment steps = 5120
+PPO updates = 20
+model.learn calls = 1
+gamma = 1.0
+training seed mode = sequential
+validation seed mode = fixed
+test seed access count = 0
+
+early mean raw G = 3.8778273392469265
+late mean raw G = 3.8576068926355793
+late - early = -0.020220446611347143
+
+initial validation G = 3.8921756630712885
+best validation G = 3.8928148499694037 @ 1280
+final validation G = 3.891630314635145 @ 5120
+best delta vs initial = 0.0006391868981152626
+final delta vs initial = -0.0005453484361432892
+
+zero-trigger G = 3.866029407444357
+best vs zero = 0.026785442525046665
+final vs zero = 0.025600907190788114
+
+exact zero-trigger collapse = false
+exact one-trigger collapse = false
+near-degenerate bits = []
+no-op policy warning = false
+all hard diagnostics = 0
+max reward identity residual = 0.0
+learning signal status = LEARNING_SIGNAL_PRESENT
+```
+
+训练 Early/Late 使用不同 sequential seeds，只作为趋势诊断；客观学习信号来自固定
+validation 的 Step-0 对比。最佳点有小幅正提升，但最终点略低于初始化，说明信号较弱且
+非单调。本检查不是正式收敛实验，不替代 25600-step training 或独立 test evaluation。

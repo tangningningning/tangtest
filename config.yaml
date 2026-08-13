@@ -1,6 +1,6 @@
 # adaptive_cache_mec 单一配置文件。
 #
-# 这里的参数服务于论文仿真；论文理论以同目录 11.pdf 和 paper_spec.md 为准。
+# 这里的参数服务于论文仿真；数学契约以项目当前最新系统模型规范为准。
 # 当前配置为 8辆任务车辆 + 2辆服务车辆 + F=10 的最终基础场景，
 # 用于 Reference Solver/SB3 PPO 接口；SUMO背景交通车辆不计入研究车辆数量。
 # 系统模型、资源分配、Cache/UAV 成本和策略初始化已完成定版。
@@ -279,10 +279,11 @@ ppo:
   test_seeds: [20281811, 20281812, 20281813, 20281814, 20281815, 20281816, 20281817, 20281818, 20281819, 20281820]
   eval_freq: 5120
   best_model_criterion: mean_original_validation_system_reward
+  # kkt_failure_count只表示最终accepted assignment失败；候选拒绝另记搜索诊断。
   hard_stop_on: [future_request_leakage, future_trajectory_leakage, future_mobility_leakage, capacity_violations, compute_violations, bandwidth_violations, uav_violations, invalid_service_ids, invalid_node_ids, nan_inf_count, kkt_failure_count]
   test_after_best_only: true
   # 已验证的标准SB3 PPO参数，本轮不把它们作为研究变量。
-  gamma: 0.99
+  gamma: 1.0
   gae_lambda: 0.95
   learning_rate: 0.0003
   n_steps: 256

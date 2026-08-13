@@ -488,14 +488,19 @@ def cache_update_cost(
     if sizes.shape != previous.shape or np.any(sizes <= 0.0):
         raise ValueError("service_sizes_bits必须是与缓存相同形状的正向量。")
     fixed = _nonnegative(fixed_cost_per_update, "fixed_cost_per_update")
-    loading_per_bit = _nonnegative(loading_energy_per_bit, "loading_energy_per_bit")
-    loading_weight = _nonnegative(loading_cost_weight, "loading_cost_weight")
     delta = current - previous
     added = tuple(int(index) for index in np.flatnonzero(delta > 0.0))
     removed = tuple(int(index) for index in np.flatnonzero(delta < 0.0))
     changed = bool(added or removed)
-    loading_energy = loading_per_bit * float(sizes[list(added)].sum()) if added else 0.0
-    weighted_loading_cost = loading_weight * loading_energy if changed else 0.0
+    loading = cache_loading_cost_for_added_services(
+        previous,
+        current,
+        sizes,
+        loading_energy_per_bit=loading_energy_per_bit,
+        loading_cost_weight=loading_cost_weight,
+    )
+    loading_energy = float(loading["loading_energy_j"])
+    weighted_loading_cost = float(loading["weighted_loading_cost"])
     fixed_cost = fixed if changed else 0.0
     total_cost = fixed_cost + weighted_loading_cost
     if not all(math.isfinite(value) for value in (loading_energy, total_cost)):
@@ -508,6 +513,37 @@ def cache_update_cost(
         "fixed_cost": float(fixed_cost),
         "weighted_loading_cost": float(weighted_loading_cost),
         "total_cost": float(total_cost),
+    }
+
+
+def cache_loading_cost_for_added_services(
+    previous_cache: Sequence[Real] | np.ndarray,
+    current_cache: Sequence[Real] | np.ndarray,
+    service_sizes_bits: Sequence[Real] | np.ndarray,
+    *,
+    loading_energy_per_bit: Real,
+    loading_cost_weight: Real,
+) -> dict[str, Any]:
+    """返回 ``0->1`` 服务的加载成本，不包含节点级固定更新成本。"""
+
+    previous = _binary_vector(previous_cache, "previous_cache")
+    current = _binary_vector(current_cache, "current_cache")
+    if previous.shape != current.shape:
+        raise ValueError("previous_cache和current_cache形状必须相同。")
+    sizes = _finite_vector(service_sizes_bits, "service_sizes_bits")
+    if sizes.shape != previous.shape or np.any(sizes <= 0.0):
+        raise ValueError("service_sizes_bits必须是与缓存相同形状的正向量。")
+    loading_per_bit = _nonnegative(loading_energy_per_bit, "loading_energy_per_bit")
+    loading_weight = _nonnegative(loading_cost_weight, "loading_cost_weight")
+    added = tuple(int(index) for index in np.flatnonzero(current > previous))
+    loading_energy = loading_per_bit * float(sizes[list(added)].sum()) if added else 0.0
+    weighted_loading_cost = loading_weight * loading_energy
+    if not all(math.isfinite(value) for value in (loading_energy, weighted_loading_cost)):
+        raise ValueError("缓存加载成本不是有限值。")
+    return {
+        "added_services": added,
+        "loading_energy_j": float(loading_energy),
+        "weighted_loading_cost": float(weighted_loading_cost),
     }
 
 
@@ -570,8 +606,8 @@ def task_utility(
     *,
     delay_weight: Real,
     energy_weight: Real,
-    delay_reference_s: Real,
-    energy_reference_j: Real,
+    delay_reference_s: Real | Sequence[Real] | np.ndarray,
+    energy_reference_j: Real | Sequence[Real] | np.ndarray,
 ) -> dict[str, Any]:
     """计算论文任务服务效用，不裁剪自然产生的负效用。
 
@@ -598,8 +634,20 @@ def task_utility(
     energy_w = _probability(energy_weight, "energy_weight")
     if not math.isclose(delay_w + energy_w, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
         raise ValueError("delay_weight与energy_weight之和必须为1。")
-    delay_ref = _positive(delay_reference_s, "delay_reference_s")
-    energy_ref = _positive(energy_reference_j, "energy_reference_j")
+    def reference_vector(value: Any, name: str) -> np.ndarray:
+        reference = np.asarray(value, dtype=float)
+        if reference.ndim == 0:
+            reference = np.full(arrivals.shape, float(reference), dtype=float)
+        elif reference.shape != arrivals.shape:
+            raise ValueError(
+                f"{name}必须是标量或形状{arrivals.shape}，实际为{reference.shape}。"
+            )
+        if not np.all(np.isfinite(reference)) or np.any(reference <= 0.0):
+            raise ValueError(f"{name}必须是有限正数。")
+        return reference
+
+    delay_ref = reference_vector(delay_reference_s, "delay_reference_s")
+    energy_ref = reference_vector(energy_reference_j, "energy_reference_j")
     per_task = arrivals * (
         delay_w * (1.0 - delays / delay_ref) + energy_w * (1.0 - energies / energy_ref)
     )
@@ -2109,6 +2157,7 @@ class MECEnvironment:
             task_arrivals=np.asarray(slot["task_arrivals"], dtype=bool),
             task_service_types=np.asarray(slot["task_service_types"], dtype=int),
             task_vehicle_cache=self._local_cache.copy(),
+            task_vehicle_ids=tuple(self._task_vehicle_ids),
             task_input_bits=np.asarray(slot["task_input_size_bits"], dtype=float),
             task_cpu_cycles=np.asarray(slot["task_cpu_cycles"], dtype=float),
             task_vehicle_positions=task_positions,
@@ -2322,7 +2371,11 @@ class MECEnvironment:
             "execution_nodes": tuple(result.execution_nodes),
             "matching_migration_count": int(result.matching_migration_count),
             "matching_swap_count": int(result.matching_swap_count),
+            "final_kkt_failure_count": int(result.final_kkt_failure_count),
             "kkt_failure_count": int(result.kkt_failure_count),
+            "matching_candidate_diagnostics": dict(
+                result.matching_candidate_diagnostics
+            ),
             "failure_reason_counts": dict(result.failure_reason_counts),
             "compute_allocations": np.asarray(result.compute_allocations, dtype=float).copy(),
             "bandwidth_allocations": np.asarray(
@@ -2581,6 +2634,27 @@ class MECEnvironment:
             loading_cost_weight=cache["energy_cost_weight"],
         )
 
+    def cache_loading_cost_for_added_services(
+        self,
+        previous_cache: Sequence[Real] | np.ndarray,
+        current_cache: Sequence[Real] | np.ndarray,
+        *,
+        node_type: NodeType | str,
+        service_sizes: Sequence[Real] | np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """按正式节点参数返回新增服务加载成本，不计节点级 fixed cost。"""
+
+        kind = _node_type(node_type)
+        key = self._cache_node_key(kind)
+        cache = _section(self.config, "cache")
+        return cache_loading_cost_for_added_services(
+            previous_cache,
+            current_cache,
+            self._service_sizes_bits(service_sizes),
+            loading_energy_per_bit=_section(cache, "load_energy_j_per_bit")[key],
+            loading_cost_weight=cache["energy_cost_weight"],
+        )
+
     def uav_movement_cost(
         self,
         previous_position: Sequence[Real] | np.ndarray,
@@ -2605,16 +2679,31 @@ class MECEnvironment:
         arrived: Sequence[bool | Real] | np.ndarray,
         completion_delay_s: Sequence[Real] | np.ndarray,
         vehicle_energy_j: Sequence[Real] | np.ndarray,
+        *,
+        delay_reference_s: Real | Sequence[Real] | np.ndarray | None = None,
+        energy_reference_j: Real | Sequence[Real] | np.ndarray | None = None,
+        delay_weight: Real | None = None,
+        energy_weight: Real | None = None,
     ) -> dict[str, Any]:
+        """计算 Q；显式 override 供 KKT 与最终 assignment 共用同一参数。"""
+
         reward = _section(self.config, "reward")
         return task_utility(
             arrived,
             completion_delay_s,
             vehicle_energy_j,
-            delay_weight=reward["delay_weight"],
-            energy_weight=reward["energy_weight"],
-            delay_reference_s=reward["reference_delay_s"],
-            energy_reference_j=reward["reference_energy_j"],
+            delay_weight=(reward["delay_weight"] if delay_weight is None else delay_weight),
+            energy_weight=(reward["energy_weight"] if energy_weight is None else energy_weight),
+            delay_reference_s=(
+                reward["reference_delay_s"]
+                if delay_reference_s is None
+                else delay_reference_s
+            ),
+            energy_reference_j=(
+                reward["reference_energy_j"]
+                if energy_reference_j is None
+                else energy_reference_j
+            ),
         )
 
     def system_utility(
@@ -2647,6 +2736,7 @@ class MECEnvironment:
 __all__ = [
     "MECEnvironment",
     "NodeType",
+    "cache_loading_cost_for_added_services",
     "cache_update_cost",
     "edge_upload_rate",
     "execute_task",

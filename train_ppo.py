@@ -14,7 +14,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -122,7 +122,7 @@ def validate_formal_config(config: Mapping[str, Any]) -> dict[str, Any]:
             errors.append(f"ppo.{name}={ppo.get(name)!r}, expected {expected}")
     float_ppo = {
         "learning_rate": 3.0e-4,
-        "gamma": 0.99,
+        "gamma": 1.0,
         "gae_lambda": 0.95,
         "clip_range": 0.2,
         "ent_coef": 0.0,
@@ -232,7 +232,12 @@ def build_ppo_environment(
     )
 
 
-def build_sb3_ppo(environment: Any, config: Mapping[str, Any] | None = None) -> Any:
+def build_sb3_ppo(
+    environment: Any,
+    config: Mapping[str, Any] | None = None,
+    *,
+    seed_override: int | None = None,
+) -> Any:
     """构造官方 MlpPolicy PPO；MultiBinary 使用 SB3 原生 Bernoulli 分布。"""
 
     try:
@@ -249,13 +254,17 @@ def build_sb3_ppo(environment: Any, config: Mapping[str, Any] | None = None) -> 
         n_steps=int(ppo.get("n_steps", 256)),
         batch_size=int(ppo.get("batch_size", 64)),
         n_epochs=int(ppo.get("n_epochs", 10)),
-        gamma=float(ppo.get("gamma", 0.99)),
+        gamma=float(ppo.get("gamma", 1.0)),
         gae_lambda=float(ppo.get("gae_lambda", 0.95)),
         clip_range=float(ppo.get("clip_range", 0.2)),
         ent_coef=float(ppo.get("ent_coef", 0.0)),
         vf_coef=float(ppo.get("vf_coef", 0.5)),
         max_grad_norm=float(ppo.get("max_grad_norm", 0.5)),
-        seed=int(ppo.get("seed", project.get("seed", 0))),
+        seed=(
+            int(seed_override)
+            if seed_override is not None
+            else int(ppo.get("seed", project.get("seed", 0)))
+        ),
         device=str(ppo.get("device", "cpu")),
         verbose=0,
     )
@@ -284,6 +293,7 @@ def build_vecnormalize_environment(
         norm_obs=bool(ppo.get("norm_obs", True)),
         norm_reward=bool(ppo.get("norm_reward", True)),
         clip_obs=float(ppo.get("clip_obs", 10.0)),
+        gamma=float(ppo.get("gamma", 1.0)),
     )
 
 
@@ -421,6 +431,8 @@ def run_semantic_smoke(
             cache_prediction=physical._last_node_prediction,
             node_types=physical._service_node_types,
             environment=physical,
+            task_vehicle_cache=physical._local_cache,
+            task_vehicle_ids=physical._task_vehicle_ids,
             integer_scale=1,
         )
         candidate = np.asarray(first["candidate_cache"], dtype=float)
@@ -432,6 +444,8 @@ def run_semantic_smoke(
             cache_prediction=physical._last_node_prediction,
             node_types=physical._service_node_types,
             environment=physical,
+            task_vehicle_cache=physical._local_cache,
+            task_vehicle_ids=physical._task_vehicle_ids,
             integer_scale=1,
         )
         second_cache = np.asarray(second["candidate_cache"], dtype=float)
@@ -449,8 +463,13 @@ def run_semantic_smoke(
         uav_noop_result = select_triggered_uav_positions(
             physical._uav_positions,
             previous_cache=physical._cache,
+            cache_triggers=np.zeros(physical._cache.shape[0], dtype=bool),
+            service_sizes=physical._service_sizes,
+            cache_capacities=physical._cache_capacities,
+            task_vehicle_cache=physical._local_cache,
+            task_vehicle_ids=physical._task_vehicle_ids,
             requested_uav_triggers=uav_trigger,
-            cache_prediction=None,
+            cache_prediction=physical._last_node_prediction,
             node_types=physical._service_node_types,
             uav_service_indices=physical._uav_service_indices,
             environment=physical,
@@ -458,6 +477,7 @@ def run_semantic_smoke(
             slot_duration_s=physical.config["simulation"]["decision_interval_s"],
             region=physical.config["uav"]["region"],
             minimum_separation_m=physical.config["uav"]["minimum_safety_distance_m"],
+            integer_scale=1,
         )
         uav_noop = not bool(np.any(uav_noop_result["actual_movement"]))
         uav_noop_cost = float(
@@ -540,6 +560,8 @@ def run_semantic_smoke(
 
 LEARNING_CHECK_TIMESTEPS = 5120
 LEARNING_CHECK_EXPECTED_UPDATES = 20
+LEARNING_CHECK_VALIDATION_TIMESTEPS = (0, 1280, 2560, 3840, 5120)
+LEARNING_CHECK_REWARD_TOLERANCE = 1.0e-9
 LEARNING_CHECK_HARD_KEYS = (
     "future_request_leakage",
     "future_trajectory_leakage",
@@ -718,6 +740,7 @@ class _MetricAccumulator:
     def reset(self) -> None:
         self.steps = 0
         self.raw_g_sum = 0.0
+        self.normalized_reward_sum = 0.0
         self.q_sum = 0.0
         self.cache_cost_sum = 0.0
         self.uav_cost_sum = 0.0
@@ -736,18 +759,32 @@ class _MetricAccumulator:
         self.uav_movement = np.zeros(self.uav_count, dtype=np.int64)
         self.uav_noop = np.zeros(self.uav_count, dtype=np.int64)
         self.diagnostics = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
+        self.max_abs_reward_formula_residual = 0.0
 
-    def add(self, info: Mapping[str, Any]) -> None:
+    def add(
+        self,
+        info: Mapping[str, Any],
+        *,
+        normalized_reward: float | None = None,
+    ) -> None:
         utility = info.get("system_utility", {})
         if not isinstance(utility, Mapping):
             utility = {}
         raw_g = _finite_float(info.get("ppo_raw_reward", utility.get("reward", 0.0)))
         q_value = _finite_float(utility.get("task_service_utility", 0.0))
+        cache_cost = _finite_float(info.get("cache_cost", 0.0))
+        uav_cost = _finite_float(info.get("uav_move_cost", 0.0))
+        reward_residual = raw_g - (q_value - cache_cost - uav_cost)
         self.steps += 1
         self.raw_g_sum += raw_g
+        if normalized_reward is not None:
+            self.normalized_reward_sum += _finite_float(normalized_reward)
         self.q_sum += q_value
-        self.cache_cost_sum += _finite_float(info.get("cache_cost", 0.0))
-        self.uav_cost_sum += _finite_float(info.get("uav_move_cost", 0.0))
+        self.cache_cost_sum += cache_cost
+        self.uav_cost_sum += uav_cost
+        self.max_abs_reward_formula_residual = max(
+            self.max_abs_reward_formula_residual, abs(float(reward_residual))
+        )
         self.delay_sum += _finite_float(info.get("total_delay", 0.0))
         self.energy_sum += _finite_float(info.get("total_energy", 0.0))
 
@@ -829,10 +866,15 @@ class _MetricAccumulator:
             "steps": int(self.steps),
             "sum_raw_G": float(self.raw_g_sum),
             "mean_raw_G": float(self.raw_g_sum / max(1, self.steps)),
+            "mean_training_normalized_reward": float(
+                self.normalized_reward_sum / max(1, self.steps)
+            ),
             "sum_Q": float(self.q_sum),
             "mean_Q": float(self.q_sum / max(1, self.steps)),
             "cache_cost": float(self.cache_cost_sum / cost_divisor),
             "uav_cost": float(self.uav_cost_sum / cost_divisor),
+            "mean_cache_cost": float(self.cache_cost_sum / max(1, self.steps)),
+            "mean_uav_cost": float(self.uav_cost_sum / max(1, self.steps)),
             "sum_cache_cost": float(self.cache_cost_sum),
             "sum_uav_cost": float(self.uav_cost_sum),
             "mean_delay": float(self.delay_sum / completed_divisor),
@@ -862,6 +904,9 @@ class _MetricAccumulator:
                 )
                 / float(completed_divisor)
             ),
+            "max_abs_reward_formula_residual": float(
+                self.max_abs_reward_formula_residual
+            ),
         }
         for key, label in LEARNING_CHECK_EXECUTION_KEYS:
             count = int(self.execution_counts[key])
@@ -882,6 +927,13 @@ class _MetricAccumulator:
                 self.cache_effective_update[index] / float(max(1, self.steps))
             )
             row[f"{prefix}_noop_trigger_count"] = int(self.cache_noop[index])
+            row[f"{prefix}_noop_trigger_rate"] = float(
+                self.cache_noop[index] / float(max(1, self.steps))
+            )
+            row[f"{prefix}_effective_given_requested_rate"] = float(
+                self.cache_effective_update[index]
+                / float(max(1, self.cache_requested[index]))
+            )
             row[f"{prefix}_services_changed_count"] = int(
                 self.cache_services_changed[index]
             )
@@ -901,6 +953,12 @@ class _MetricAccumulator:
                 self.uav_movement[index] / float(max(1, self.steps))
             )
             row[f"{prefix}_noop_trigger_count"] = int(self.uav_noop[index])
+            row[f"{prefix}_noop_trigger_rate"] = float(
+                self.uav_noop[index] / float(max(1, self.steps))
+            )
+            row[f"{prefix}_effective_given_requested_rate"] = float(
+                self.uav_movement[index] / float(max(1, self.uav_requested[index]))
+            )
             row[f"bit_{bit}_requested_trigger_count"] = int(self.uav_requested[index])
             row[f"bit_{bit}_requested_trigger_rate"] = float(
                 self.uav_requested[index] / float(max(1, self.steps))
@@ -938,6 +996,8 @@ class LearningCheckCallback(BaseCallback):
         output_dir: Path,
         action_layout: Mapping[str, Any] | None,
         expected_updates: int = LEARNING_CHECK_EXPECTED_UPDATES,
+        config: Mapping[str, Any] | None = None,
+        validation_seeds: Sequence[int] = (),
     ) -> None:
         super().__init__(verbose=0)
         self.output_dir = Path(output_dir)
@@ -947,9 +1007,12 @@ class LearningCheckCallback(BaseCallback):
             None if action_layout is None else _layout_copy(action_layout)
         )
         self.expected_updates = int(expected_updates)
+        self.config = None if config is None else config
+        self.validation_seeds = tuple(int(seed) for seed in validation_seeds)
         self.episode_rows: list[dict[str, Any]] = []
         self.update_rows: list[dict[str, Any]] = []
         self.action_rows: list[dict[str, Any]] = []
+        self.validation_rows: list[dict[str, Any]] = []
         self._episode_metrics: _MetricAccumulator | None = None
         self._rollout_metrics: _MetricAccumulator | None = None
         self._pending_rollout: _MetricAccumulator | None = None
@@ -957,6 +1020,8 @@ class LearningCheckCallback(BaseCallback):
         self._completed_episodes = 0
         self._logged_updates = 0
         self.hard_diagnostics = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
+        self.validation_diagnostics = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
+        self.max_abs_reward_formula_residual = 0.0
 
     def _on_training_start(self) -> None:
         # reset 已由 SB3 在 callback.on_training_start 前完成；这里重新读取
@@ -999,10 +1064,22 @@ class LearningCheckCallback(BaseCallback):
             self._current_episode_seed = None if seed is None else int(seed)
         if self._episode_metrics is None or self._rollout_metrics is None:
             raise RuntimeError("learning-check callback尚未完成training start初始化。")
-        self._episode_metrics.add(info)
-        self._rollout_metrics.add(info)
+        rewards = np.asarray(self.locals.get("rewards", [float("nan")]), dtype=float).reshape(-1)
+        normalized_reward = float(rewards[0]) if rewards.size else None
+        self._episode_metrics.add(info, normalized_reward=normalized_reward)
+        self._rollout_metrics.add(info, normalized_reward=normalized_reward)
+        residual = float(self._rollout_metrics.max_abs_reward_formula_residual)
+        self.max_abs_reward_formula_residual = max(
+            self.max_abs_reward_formula_residual, residual
+        )
+        if residual > LEARNING_CHECK_REWARD_TOLERANCE:
+            raise RuntimeError(
+                f"training reward identity residual超限: {residual}"
+            )
         for key in LEARNING_CHECK_HARD_KEYS:
             self.hard_diagnostics[key] += max(0, int(info.get(key, 0)))
+        if self.config is not None:
+            _raise_on_hard_stop(info, self.config, phase="learning-check training")
         dones = np.asarray(self.locals.get("dones", [False]), dtype=bool).reshape(-1)
         if bool(dones[0]):
             self._finish_episode(completed=True)
@@ -1037,6 +1114,7 @@ class LearningCheckCallback(BaseCallback):
                 {
                     "update": int(update),
                     "timesteps": int(timesteps),
+                    "phase": "training",
                     "scope": "cache",
                     "action_index": int(self.layout["cache_trigger_indices"][index]),
                     "node_id": node_id,
@@ -1050,6 +1128,13 @@ class LearningCheckCallback(BaseCallback):
                         metrics.cache_effective_update[index] / float(max(1, metrics.steps))
                     ),
                     "noop_trigger_count": int(metrics.cache_noop[index]),
+                    "noop_trigger_rate": float(
+                        metrics.cache_noop[index] / float(max(1, metrics.steps))
+                    ),
+                    "effective_given_requested_rate": float(
+                        metrics.cache_effective_update[index]
+                        / float(max(1, metrics.cache_requested[index]))
+                    ),
                     "services_changed_count": int(metrics.cache_services_changed[index]),
                     "actual_movement_count": 0,
                     "actual_movement_rate": 0.0,
@@ -1060,6 +1145,7 @@ class LearningCheckCallback(BaseCallback):
                 {
                     "update": int(update),
                     "timesteps": int(timesteps),
+                    "phase": "training",
                     "scope": "uav",
                     "action_index": int(
                         self.layout["uav_position_trigger_indices"][index]
@@ -1073,6 +1159,13 @@ class LearningCheckCallback(BaseCallback):
                     "effective_update_count": 0,
                     "effective_update_rate": 0.0,
                     "noop_trigger_count": int(metrics.uav_noop[index]),
+                    "noop_trigger_rate": float(
+                        metrics.uav_noop[index] / float(max(1, metrics.steps))
+                    ),
+                    "effective_given_requested_rate": float(
+                        metrics.uav_movement[index]
+                        / float(max(1, metrics.uav_requested[index]))
+                    ),
                     "services_changed_count": 0,
                     "actual_movement_count": int(metrics.uav_movement[index]),
                     "actual_movement_rate": float(
@@ -1111,6 +1204,34 @@ class LearningCheckCallback(BaseCallback):
         )
         self.update_rows.append(row)
         self._append_action_rows(update=update, timesteps=timesteps, metrics=metrics)
+        if timesteps in LEARNING_CHECK_VALIDATION_TIMESTEPS[1:] and self.validation_seeds:
+            if self.config is None:
+                raise RuntimeError("learning-check checkpoint validation配置缺失。")
+            checkpoint_rows, diagnostics = _run_deterministic_validation(
+                self.model,
+                self.config,
+                training_vector=self.training_env,
+                action_layout=self.layout,
+                seeds=self.validation_seeds,
+                phase=f"learning-check checkpoint {timesteps}",
+            )
+            for checkpoint_row in checkpoint_rows:
+                checkpoint_row.update(timesteps=timesteps, update=update, policy="ppo")
+                self.validation_rows.append(checkpoint_row)
+                self.max_abs_reward_formula_residual = max(
+                    self.max_abs_reward_formula_residual,
+                    float(checkpoint_row["max_abs_reward_formula_residual"]),
+                )
+            self.action_rows.extend(
+                _validation_action_rows(
+                    checkpoint_rows,
+                    self.layout,
+                    timesteps=timesteps,
+                    update=update,
+                )
+            )
+            for key in LEARNING_CHECK_HARD_KEYS:
+                self.validation_diagnostics[key] += int(diagnostics[key])
         cache_rate = ", ".join(
             f"{node_id}={metrics.cache_effective_update[index] / max(1, metrics.steps):.3f}"
             for index, node_id in enumerate(self.layout["cache_node_ids"])
@@ -1605,6 +1726,7 @@ def _build_validation_vector(
         norm_obs=bool(ppo.get("norm_obs", True)),
         norm_reward=False,
         clip_obs=float(ppo.get("clip_obs", 10.0)),
+        gamma=float(ppo.get("gamma", 1.0)),
     )
     if bool(ppo.get("norm_obs", True)) and getattr(training_vector, "obs_rms", None) is not None:
         evaluation.obs_rms = copy.deepcopy(training_vector.obs_rms)
@@ -1613,14 +1735,84 @@ def _build_validation_vector(
     return evaluation
 
 
+def _zero_trigger_action(action_layout: Mapping[str, Any], n_envs: int = 1) -> np.ndarray:
+    """构造合法 MultiBinary 全零动作；不读取或复制任何环境评价公式。"""
+
+    action_length = int(action_layout["action_length"])
+    if action_length <= 0 or int(n_envs) <= 0:
+        raise ValueError("zero-trigger action维度必须为正。")
+    return np.zeros((int(n_envs), action_length), dtype=np.int8)
+
+
+def _all_one_trigger_action(action_layout: Mapping[str, Any], n_envs: int = 1) -> np.ndarray:
+    """构造合法 MultiBinary 全一动作，供离线 attribution baseline 使用。"""
+
+    action_length = int(action_layout["action_length"])
+    if action_length <= 0 or int(n_envs) <= 0:
+        raise ValueError("all-one action维度必须为正。")
+    return np.ones((int(n_envs), action_length), dtype=np.int8)
+
+
+def _random_trigger_action(
+    action_layout: Mapping[str, Any], rng: np.random.Generator, *, probability: Any
+) -> np.ndarray:
+    """用独立 RNG 生成固定边际概率的 state-independent MultiBinary 动作。"""
+
+    action_length = int(action_layout["action_length"])
+    probabilities = np.asarray(probability, dtype=float)
+    if probabilities.ndim == 0:
+        probabilities = np.full(action_length, float(probabilities), dtype=float)
+    probabilities = probabilities.reshape(-1)
+    if probabilities.shape != (action_length,) or not np.all(
+        np.isfinite(probabilities)
+    ) or np.any((probabilities < 0.0) | (probabilities > 1.0)):
+        raise ValueError("random trigger probability必须匹配action维度并位于[0,1]。")
+    return (rng.random(action_length) < probabilities).astype(np.int8)[None, :]
+
+
+def _training_action_probabilities(
+    update_rows: Sequence[Mapping[str, Any]], action_layout: Mapping[str, Any]
+) -> np.ndarray:
+    """只从 training rollout 的 requested rate 提取 rate-matched 概率。"""
+
+    if not update_rows:
+        raise ValueError("rate-matched random需要非空training rollout统计。")
+    probabilities: list[float] = []
+    for index in range(len(action_layout["cache_node_ids"])):
+        probabilities.append(
+            float(
+                np.mean(
+                    [
+                        float(row[f"cache_node_{index}_requested_trigger_rate"])
+                        for row in update_rows
+                    ]
+                )
+            )
+        )
+    for index in range(len(action_layout["uav_ids"])):
+        probabilities.append(
+            float(
+                np.mean(
+                    [
+                        float(row[f"uav_node_{index}_requested_move_trigger_rate"])
+                        for row in update_rows
+                    ]
+                )
+            )
+        )
+    return np.asarray(probabilities, dtype=float)
+
+
 def _run_deterministic_validation(
-    model: Any,
+    model: Any | None,
     config: Mapping[str, Any],
     *,
     training_vector: Any,
     action_layout: Mapping[str, Any],
     seeds: Sequence[int] | None = None,
     phase: str = "validation",
+    zero_trigger: bool = False,
+    action_provider: Callable[[np.ndarray, int], np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     results: list[dict[str, Any]] = []
     diagnostics = {key: 0 for key in LEARNING_CHECK_HARD_KEYS}
@@ -1642,12 +1834,29 @@ def _run_deterministic_validation(
             # 工作负载长度由当前 trace 决定；10000 只是防止验证入口在
             # 意外的 done 语义错误下无限循环，不改变 episode horizon。
             for _step in range(10000):
-                action, _state = model.predict(observation, deterministic=True)
+                if zero_trigger:
+                    action = _zero_trigger_action(action_layout)
+                elif action_provider is not None:
+                    action = np.asarray(
+                        action_provider(observation, int(_step)), dtype=np.int8
+                    )
+                else:
+                    if model is None:
+                        raise ValueError("deterministic PPO validation需要model。")
+                    action, _state = model.predict(observation, deterministic=True)
                 observation, _reward, dones, infos = vector.step(action)
                 info = infos[0]
                 if not isinstance(info, Mapping):
                     raise RuntimeError("validation step info不是mapping。")
                 metrics.add(info)
+                if (
+                    metrics.max_abs_reward_formula_residual
+                    > LEARNING_CHECK_REWARD_TOLERANCE
+                ):
+                    raise RuntimeError(
+                        f"{phase} seed {seed} reward identity residual超限: "
+                        f"{metrics.max_abs_reward_formula_residual}"
+                    )
                 for key in LEARNING_CHECK_HARD_KEYS:
                     diagnostics[key] += max(0, int(info.get(key, 0)))
                 _raise_on_hard_stop(
@@ -1665,6 +1874,29 @@ def _run_deterministic_validation(
         row = metrics.validation_row(int(seed))
         results.append(row)
     return results, diagnostics
+
+
+def _learning_check_schedule(n_steps: int) -> tuple[int, ...]:
+    if int(n_steps) != 256:
+        raise ValueError("learning-check要求n_steps=256。")
+    schedule = tuple(range(0, LEARNING_CHECK_TIMESTEPS + 1, 5 * int(n_steps)))
+    if schedule != LEARNING_CHECK_VALIDATION_TIMESTEPS:
+        raise RuntimeError("learning-check validation checkpoint schedule漂移。")
+    return schedule
+
+
+def _classify_learning_signal(
+    *,
+    initial_mean_raw_g: float,
+    best_mean_raw_g: float,
+    hard_diagnostics: Mapping[str, int],
+    tolerance: float = LEARNING_CHECK_REWARD_TOLERANCE,
+) -> str:
+    if any(int(value) > 0 for value in hard_diagnostics.values()):
+        return "INVALID_RUN"
+    if float(best_mean_raw_g) > float(initial_mean_raw_g) + float(tolerance):
+        return "LEARNING_SIGNAL_PRESENT"
+    return "LEARNING_SIGNAL_NOT_DEMONSTRATED"
 
 
 def _validation_aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1696,6 +1928,101 @@ def _validation_aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         mean[key] = float(np.mean(values))
         std[key] = float(np.std(values))
     return {"mean": mean, "std": std}
+
+
+def _validation_summary_row(
+    rows: Sequence[Mapping[str, Any]], *, timesteps: int, update: int, policy: str
+) -> dict[str, Any]:
+    aggregate = _validation_aggregate(rows)
+    mean = aggregate["mean"]
+    return {
+        "timesteps": int(timesteps),
+        "update": int(update),
+        "policy": str(policy),
+        "validation_seed_count": len(rows),
+        "mean_raw_G": float(mean["mean_raw_G"]),
+        "mean_Q": float(mean["mean_Q"]),
+        "mean_cache_cost": float(mean["mean_cache_cost"]),
+        "mean_uav_cost": float(mean["mean_uav_cost"]),
+        "mean_delay": float(mean["mean_delay"]),
+        "mean_vehicle_energy": float(mean["mean_vehicle_energy"]),
+        "edge_cache_availability_rate": float(mean["edge_cache_availability_rate"]),
+        "edge_execution_rate": float(mean["edge_execution_rate"]),
+        "max_abs_reward_formula_residual": max(
+            float(row["max_abs_reward_formula_residual"]) for row in rows
+        ),
+    }
+
+
+def _validation_action_rows(
+    rows: Sequence[Mapping[str, Any]],
+    action_layout: Mapping[str, Any],
+    *,
+    timesteps: int,
+    update: int,
+) -> list[dict[str, Any]]:
+    total_steps = sum(int(row["steps"]) for row in rows)
+    result: list[dict[str, Any]] = []
+    for scope, ids, indices, prefix in (
+        (
+            "cache",
+            action_layout["cache_node_ids"],
+            action_layout["cache_trigger_indices"],
+            "cache_node",
+        ),
+        (
+            "uav",
+            action_layout["uav_ids"],
+            action_layout["uav_position_trigger_indices"],
+            "uav_node",
+        ),
+    ):
+        for index, node_id in enumerate(ids):
+            requested_key = (
+                f"{prefix}_{index}_requested_trigger_count"
+                if scope == "cache"
+                else f"{prefix}_{index}_requested_move_trigger_count"
+            )
+            effective_key = (
+                f"{prefix}_{index}_effective_update_count"
+                if scope == "cache"
+                else f"{prefix}_{index}_actual_movement_count"
+            )
+            noop_key = f"{prefix}_{index}_noop_trigger_count"
+            requested = sum(int(row[requested_key]) for row in rows)
+            effective = sum(int(row[effective_key]) for row in rows)
+            noop = sum(int(row[noop_key]) for row in rows)
+            result.append(
+                {
+                    "update": int(update),
+                    "timesteps": int(timesteps),
+                    "phase": "validation",
+                    "scope": scope,
+                    "action_index": int(indices[index]),
+                    "node_id": str(node_id),
+                    "node_type": (
+                        str(action_layout["cache_node_types"][index])
+                        if scope == "cache"
+                        else "uav"
+                    ),
+                    "requested_trigger_count": requested,
+                    "requested_trigger_rate": requested / float(max(1, total_steps)),
+                    "effective_update_count": effective if scope == "cache" else 0,
+                    "effective_update_rate": (
+                        effective / float(max(1, total_steps)) if scope == "cache" else 0.0
+                    ),
+                    "actual_movement_count": effective if scope == "uav" else 0,
+                    "actual_movement_rate": (
+                        effective / float(max(1, total_steps)) if scope == "uav" else 0.0
+                    ),
+                    "noop_trigger_count": noop,
+                    "noop_trigger_rate": noop / float(max(1, total_steps)),
+                    "effective_given_requested_rate": effective
+                    / float(max(1, requested)),
+                    "services_changed_count": 0,
+                }
+            )
+    return result
 
 
 def _mean_update_field(rows: Sequence[Mapping[str, Any]], field: str) -> float | None:
@@ -1910,43 +2237,192 @@ def run_learning_check(
     *,
     output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """运行时入口：5120 steps + validation；正式长训练由用户显式启动。"""
+    """运行一次严格受控的 5120-step 学习信号检查。"""
 
     prepared = prepare_ppo_config(config)
     ppo = _section(prepared, "ppo")
     n_steps = int(ppo.get("n_steps", 256))
-    if n_steps != 256:
-        raise ValueError(f"learning-check要求n_steps=256，当前为{n_steps}。")
-    if LEARNING_CHECK_TIMESTEPS % n_steps != 0:
-        raise ValueError("5120必须能被n_steps=256整除，才能得到20个PPO updates。")
+    checkpoints = _learning_check_schedule(n_steps)
     expected_updates = LEARNING_CHECK_TIMESTEPS // n_steps
     if expected_updates != LEARNING_CHECK_EXPECTED_UPDATES:
         raise RuntimeError("learning-check预期update数量计算错误。")
+    gamma = float(ppo.get("gamma", 1.0))
+    if not math.isclose(gamma, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError("learning-check必须保持正式finite-horizon gamma=1.0。")
     validation_seeds = _learning_check_validation_seeds(prepared)
     target = _learning_check_output_dir(prepared, output_dir)
+    train_seed_base = int(ppo.get("train_seed_base", ppo.get("seed", 0)))
+
+    print("mode = PPO_LEARNING_CHECK")
+    print(f"total_timesteps = {LEARNING_CHECK_TIMESTEPS}")
+    print(f"n_steps = {n_steps}")
+    print(f"expected_updates = {expected_updates}")
+    print(f"gamma = {gamma}")
+    print("training seed mode = sequential")
+    print("validation seed mode = fixed")
+    print("test seeds accessed = false")
+    print("formal training = false")
 
     vector = None
-    model = None
-    callback = None
+    layout_environment = None
     try:
+        # 单独用首个 validation seed 解析布局，避免预先 reset sequential training env。
+        layout_environment = build_ppo_environment(
+            prepared, seed_mode="fixed", fixed_seed=int(validation_seeds[0])
+        )
+        layout_environment.reset(seed=int(validation_seeds[0]))
+        action_layout = _layout_copy(layout_environment.action_layout)
+        layout_environment.close()
+        layout_environment = None
+
         vector = build_vecnormalize_environment(
-            prepared,
-            episode_seed_base=int(ppo.get("train_seed_base", ppo.get("seed", 0))),
+            prepared, episode_seed_base=train_seed_base
         )
         model = build_sb3_ppo(vector, prepared)
+
+        initial_rows, initial_diagnostics = _run_deterministic_validation(
+            model,
+            prepared,
+            training_vector=vector,
+            action_layout=action_layout,
+            seeds=validation_seeds,
+            phase="learning-check checkpoint 0",
+        )
+        for row in initial_rows:
+            row.update(timesteps=0, update=0, policy="ppo")
+        zero_rows, zero_diagnostics = _run_deterministic_validation(
+            None,
+            prepared,
+            training_vector=vector,
+            action_layout=action_layout,
+            seeds=validation_seeds,
+            phase="learning-check zero-trigger baseline",
+            zero_trigger=True,
+        )
+        for row in zero_rows:
+            row.update(timesteps=0, update=0, policy="zero_trigger")
+
         callback = LearningCheckCallback(
             output_dir=target,
-            action_layout=None,
+            action_layout=action_layout,
             expected_updates=expected_updates,
+            config=prepared,
+            validation_seeds=validation_seeds,
         )
-        # 这是本入口唯一的 learn 调用；Codex 的本轮 smoke 不调用本函数。
+        callback.validation_rows.extend(initial_rows)
+        for key in LEARNING_CHECK_HARD_KEYS:
+            callback.validation_diagnostics[key] += int(initial_diagnostics[key])
+        callback.action_rows.extend(
+            _validation_action_rows(initial_rows, action_layout, timesteps=0, update=0)
+        )
+
+        # 本函数以及整个 learning-check 正常路径唯一一次 model.learn 调用。
         model.learn(total_timesteps=LEARNING_CHECK_TIMESTEPS, callback=callback)
-        if callback.layout is None:
-            raise RuntimeError("learning-check训练结束后未获得environment.action_layout。")
-        action_layout = callback.layout
+        actual_steps = int(model.num_timesteps)
+        if actual_steps != LEARNING_CHECK_TIMESTEPS:
+            raise RuntimeError(
+                f"learning-check environment steps漂移: {actual_steps}"
+            )
+        if callback.logged_updates != expected_updates:
+            raise RuntimeError(
+                f"learning-check PPO updates漂移: {callback.logged_updates}"
+            )
+        if sorted({int(row["timesteps"]) for row in callback.validation_rows}) != list(
+            checkpoints
+        ):
+            raise RuntimeError("learning-check validation checkpoints不完整。")
+
+        callback.write_outputs()
+        validation_summaries = [
+            _validation_summary_row(
+                [
+                    row
+                    for row in callback.validation_rows
+                    if int(row["timesteps"]) == timestep
+                ],
+                timesteps=timestep,
+                update=timestep // n_steps,
+                policy="ppo",
+            )
+            for timestep in checkpoints
+        ]
+        zero_summary = _validation_summary_row(
+            zero_rows, timesteps=0, update=0, policy="zero_trigger"
+        )
+        _write_csv(target / "validation_checkpoints.csv", callback.validation_rows)
+        _write_csv(target / "validation_summary.csv", validation_summaries)
+        _write_csv(target / "zero_trigger_baseline.csv", zero_rows)
+
+        early_late = _early_late_summary(callback.update_rows, action_layout)
+        initial_g = float(validation_summaries[0]["mean_raw_G"])
+        final_g = float(validation_summaries[-1]["mean_raw_G"])
+        best_validation = max(
+            validation_summaries,
+            key=lambda row: (float(row["mean_raw_G"]), -int(row["timesteps"])),
+        )
+        best_g = float(best_validation["mean_raw_G"])
+        zero_g = float(zero_summary["mean_raw_G"])
+
+        hard_diagnostics = {
+            key: int(
+                callback.hard_diagnostics[key]
+                + callback.validation_diagnostics[key]
+                + zero_diagnostics[key]
+            )
+            for key in LEARNING_CHECK_HARD_KEYS
+        }
+        final_rows = [
+            row
+            for row in callback.validation_rows
+            if int(row["timesteps"]) == LEARNING_CHECK_TIMESTEPS
+        ]
+        total_final_steps = sum(int(row["steps"]) for row in final_rows)
+        requested_by_bit: list[int] = []
+        for index in range(len(action_layout["cache_node_ids"])):
+            requested_by_bit.append(
+                sum(
+                    int(row[f"cache_node_{index}_requested_trigger_count"])
+                    for row in final_rows
+                )
+            )
+        for index in range(len(action_layout["uav_ids"])):
+            requested_by_bit.append(
+                sum(
+                    int(row[f"uav_node_{index}_requested_move_trigger_count"])
+                    for row in final_rows
+                )
+            )
+        exact_zero_collapse = all(value == 0 for value in requested_by_bit)
+        exact_one_collapse = all(value == total_final_steps for value in requested_by_bit)
+        late = early_late["late"]
+        near_degenerate_bits: list[int] = []
+        for index, bit in enumerate(action_layout["cache_trigger_indices"]):
+            rate = late[f"cache_node_{index}_requested_trigger_rate"]
+            if rate is not None and (rate <= 0.02 or rate >= 0.98):
+                near_degenerate_bits.append(int(bit))
+        for index, bit in enumerate(action_layout["uav_position_trigger_indices"]):
+            rate = late[f"uav_node_{index}_requested_move_trigger_rate"]
+            if rate is not None and (rate <= 0.02 or rate >= 0.98):
+                near_degenerate_bits.append(int(bit))
+
+        max_residual = max(
+            callback.max_abs_reward_formula_residual,
+            zero_summary["max_abs_reward_formula_residual"],
+        )
+        if max_residual > LEARNING_CHECK_REWARD_TOLERANCE:
+            raise RuntimeError(f"learning-check reward identity residual超限: {max_residual}")
+        learning_signal_status = _classify_learning_signal(
+            initial_mean_raw_g=initial_g,
+            best_mean_raw_g=best_g,
+            hard_diagnostics=hard_diagnostics,
+        )
+        no_op_warning = bool(
+            exact_zero_collapse
+            and abs(final_g - zero_g) <= LEARNING_CHECK_REWARD_TOLERANCE
+        )
+
         snapshot_config = copy.deepcopy(prepared)
         snapshot_ppo = dict(_section(snapshot_config, "ppo"))
-        # 记录配置但不读取/枚举正式 test seed；运行路径只有 training 与 validation。
         snapshot_ppo["test_seeds"] = "NOT_ACCESSED"
         snapshot_config["ppo"] = snapshot_ppo
         _write_json(
@@ -1954,110 +2430,80 @@ def run_learning_check(
             {
                 "config": snapshot_config,
                 "action_layout": action_layout,
-                "learning_check": {
-                    "total_timesteps": LEARNING_CHECK_TIMESTEPS,
-                    "n_steps": n_steps,
-                    "expected_updates": expected_updates,
-                    "training_seed_mode": "sequential",
-                    "training_seed_base": int(
-                        ppo.get("train_seed_base", ppo.get("seed", 0))
-                    ),
-                    "validation_seed_mode": "fixed",
-                    "validation_seeds": validation_seeds,
-                    "test_seeds_accessed": False,
-                },
+                "validation_checkpoints": checkpoints,
             },
         )
-        callback.write_outputs()
-        model.save(target / "model")
-        vector.save(target / "vecnormalize.pkl")
-
-        validation_rows, validation_diagnostics = _run_deterministic_validation(
-            model,
-            prepared,
-            training_vector=vector,
-            action_layout=action_layout,
-        )
-        _write_csv(target / "validation_results.csv", validation_rows)
-        figures = _write_learning_check_figures(
-            target,
-            callback.episode_rows,
-            callback.update_rows,
-            callback.action_rows,
-            action_layout,
-        )
-        hard_diagnostics = {
-            key: int(callback.hard_diagnostics[key] + validation_diagnostics[key])
-            for key in LEARNING_CHECK_HARD_KEYS
-        }
-        delta = _early_late_summary(callback.update_rows, action_layout)[
-            "late_minus_early"
-        ]
-        delta_g = delta.get("mean_raw_G")
-        delta_q = delta.get("mean_Q")
-        delta_cache_cost = delta.get("cache_cost")
-        delta_uav_cost = delta.get("uav_cost")
         summary = {
-            "learning_check_status": "PASS"
-            if callback.logged_updates == expected_updates
-            and all(value == 0 for value in hard_diagnostics.values())
-            else "FAIL",
             "total_timesteps": LEARNING_CHECK_TIMESTEPS,
+            "actual_environment_steps": actual_steps,
             "n_steps": n_steps,
             "expected_updates": expected_updates,
-            "logged_updates": callback.logged_updates,
+            "actual_updates": callback.logged_updates,
+            "gamma": gamma,
             "model_learn_calls": 1,
-            "formal_training_restarted": False,
-            "action_layout": action_layout,
-            "observation_dimension": int(vector.observation_space.shape[0]),
+            "formal_training": False,
             "training_seed_mode": "sequential",
-            "training_seed_base": int(
-                ppo.get("train_seed_base", ppo.get("seed", 0))
-            ),
+            "training_seed_base": train_seed_base,
             "validation_seed_mode": "fixed",
-            "validation_seeds": validation_seeds,
-            "test_seeds_accessed": False,
-            "completed_training_episodes": callback.completed_episodes,
-            "training_episode_rows": len(callback.episode_rows),
-            "hard_constraints": hard_diagnostics,
-            "hard_constraints_pass": all(
-                value == 0 for value in hard_diagnostics.values()
+            "validation_seed_count": len(validation_seeds),
+            "validation_checkpoints": list(checkpoints),
+            "test_seed_access_count": 0,
+            "early_late": early_late,
+            "initial_mean_raw_G": initial_g,
+            "final_mean_raw_G": final_g,
+            "best_mean_raw_G": best_g,
+            "best_validation_timestep": int(best_validation["timesteps"]),
+            "best_delta_G": best_g - initial_g,
+            "final_delta_G": final_g - initial_g,
+            "validation_improvement_observed": bool(
+                best_g > initial_g + LEARNING_CHECK_REWARD_TOLERANCE
             ),
-            "early_late": _early_late_summary(callback.update_rows, action_layout),
-            "diagnostic_deltas": {
-                "Delta_Q": delta_q,
-                "Delta_cache_cost": delta_cache_cost,
-                "Delta_UAV_cost": delta_uav_cost,
-                "Delta_G": delta_g,
-            },
-            "learning_effectiveness_interpretation": (
-                "Delta_G > 0"
-                if delta_g is not None and delta_g > 0.0
-                else "Delta_G <= 0; inspect trigger policy and cost trade-off"
-            ),
-            "validation": {
-                "results": validation_rows,
-                "aggregate": _validation_aggregate(validation_rows),
-            },
-            "figures": figures,
+            "zero_trigger_mean_raw_G": zero_g,
+            "best_vs_zero_G": best_g - zero_g,
+            "final_vs_zero_G": final_g - zero_g,
+            "exact_zero_trigger_collapse": exact_zero_collapse,
+            "exact_one_trigger_collapse": exact_one_collapse,
+            "near_degenerate_bits": near_degenerate_bits,
+            "no_op_policy_warning": no_op_warning,
+            "hard_diagnostics": hard_diagnostics,
+            "max_abs_reward_formula_residual": float(max_residual),
+            "learning_signal_status": learning_signal_status,
+            "validation_summary": validation_summaries,
+            "zero_trigger_summary": zero_summary,
             "artifacts": {
-                "config_snapshot": "config_snapshot.json",
                 "training_updates": "training_updates.csv",
-                "training_episodes": "training_episodes.csv",
+                "validation_checkpoints": "validation_checkpoints.csv",
+                "validation_summary": "validation_summary.csv",
                 "action_trigger_rates": "action_trigger_rates.csv",
-                "validation_results": "validation_results.csv",
-                "learning_summary": "learning_summary.json",
-                "final_summary": "final_summary.json",
-                "model": "model.zip",
-                "vecnormalize": "vecnormalize.pkl",
+                "zero_trigger_baseline": "zero_trigger_baseline.csv",
+                "summary": "summary.json",
             },
         }
-        _write_json(target / "learning_summary.json", summary)
-        # Proposed 结果目录的通用最终汇总名称；保留 learning_summary.json 兼容
-        # 既有 learning-check 后处理入口。
-        _write_json(target / "final_summary.json", summary)
+        _write_json(target / "summary.json", summary)
+
+        print("Training:")
+        print(
+            f"early mean raw G={early_late['early']['mean_raw_G']} "
+            f"late mean raw G={early_late['late']['mean_raw_G']} "
+            f"delta={early_late['late_minus_early']['mean_raw_G']}"
+        )
+        print("Validation:")
+        for row in validation_summaries:
+            print(f"step {row['timesteps']} mean raw G={row['mean_raw_G']}")
+        print(f"best validation mean raw G={best_g} at {best_validation['timesteps']}")
+        print(f"Zero-trigger mean raw G={zero_g}")
+        print(f"best vs initial={best_g - initial_g} best vs zero={best_g - zero_g}")
+        print(f"hard diagnostics={hard_diagnostics}")
+        print(
+            f"zero-trigger collapse={exact_zero_collapse} "
+            f"one-trigger collapse={exact_one_collapse} "
+            f"near-degenerate bits={near_degenerate_bits}"
+        )
+        print(f"learning_signal_status={learning_signal_status}")
         return {"output_dir": str(target), **summary}
     finally:
+        if layout_environment is not None:
+            layout_environment.close()
         if vector is not None:
             vector.close()
 

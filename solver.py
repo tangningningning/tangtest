@@ -92,7 +92,11 @@ class SolverResult:
     # Matching 实际接受的单任务迁移和双任务交换次数。
     matching_migration_count: int
     matching_swap_count: int
-    # 最终时隙结果中的 KKT 失败次数和任务失败原因计数。
+    # Matching 搜索中候选评价/拒绝统计；正常候选拒绝不触发 hard stop。
+    matching_candidate_diagnostics: Mapping[str, int]
+    # final_kkt_failure_count 是最终 accepted assignment 语义；旧字段保留给
+    # hard-stop/日志兼容，二者不包含正常 candidate rejection。
+    final_kkt_failure_count: int
     kkt_failure_count: int
     failure_reason_counts: Mapping[str, int]
 
@@ -473,7 +477,7 @@ def _build_physical_predicted_edge_benefit(
     environment: MECEnvironment,
     input_bits: float,
     cpu_cycles: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float, float]:
     """用正式通信/执行物理模型计算预测边缘收益和可达性。
 
     预测阶段只使用代表性任务规模与未来位置，不读取未来真实请求；SV、RSU、UAV
@@ -487,22 +491,34 @@ def _build_physical_predicted_edge_benefit(
     physically_available = np.zeros(
         (node_count, vehicle_count, horizon), dtype=bool
     )
-    try:
-        cloud_execution = environment.execute_task(
-            NodeType.CLOUD,
-            arrived=True,
-            input_bits=input_bits,
-            cpu_cycles=cpu_cycles,
-        )
-        cloud_utility = float(
-            environment.task_utility(
-                np.asarray([True]),
-                np.asarray([cloud_execution["completion_delay_s"]]),
-                np.asarray([cloud_execution["vehicle_energy_j"]]),
-            )["total_task_utility"]
-        )
-    except (ValueError, FloatingPointError, KeyError):
-        cloud_utility = 0.0
+    cloud_execution = environment.execute_task(
+        NodeType.CLOUD,
+        arrived=True,
+        input_bits=input_bits,
+        cpu_cycles=cpu_cycles,
+    )
+    local_execution = environment.execute_task(
+        NodeType.LOCAL,
+        arrived=True,
+        input_bits=input_bits,
+        cpu_cycles=cpu_cycles,
+    )
+    cloud_utility = float(
+        environment.task_utility(
+            np.asarray([True]),
+            np.asarray([cloud_execution["completion_delay_s"]]),
+            np.asarray([cloud_execution["vehicle_energy_j"]]),
+        )["total_task_utility"]
+    )
+    local_utility = float(
+        environment.task_utility(
+            np.asarray([True]),
+            np.asarray([local_execution["completion_delay_s"]]),
+            np.asarray([local_execution["vehicle_energy_j"]]),
+        )["total_task_utility"]
+    )
+    if not all(math.isfinite(value) for value in (cloud_utility, local_utility)):
+        raise ValueError("代表性 Local/Cloud utility 必须是有限值。")
 
     for node_index, kind in enumerate(kinds):
         for vehicle_index in range(vehicle_count):
@@ -551,7 +567,34 @@ def _build_physical_predicted_edge_benefit(
                     )
                 except (ValueError, FloatingPointError, KeyError):
                     continue
-    return edge_benefit, physically_available
+    return edge_benefit, physically_available, cloud_utility, local_utility
+
+
+def _aligned_task_vehicle_cache(
+    cache_prediction: Mapping[str, Any],
+    task_vehicle_cache: Sequence[Sequence[Real]] | np.ndarray,
+    task_vehicle_ids: Sequence[str],
+    *,
+    service_count: int,
+    vehicle_count: int,
+) -> np.ndarray:
+    """按显式 vehicle ID 将固定 Local cache 对齐到预测车辆轴。"""
+
+    cache = _binary_array(task_vehicle_cache, "task_vehicle_cache", ndim=2)
+    source_ids = tuple(str(item) for item in task_vehicle_ids)
+    prediction_ids = tuple(str(item) for item in cache_prediction.get("vehicle_ids", ()))
+    if cache.shape != (len(source_ids), service_count):
+        raise ValueError("task_vehicle_cache行必须与task_vehicle_ids一一对应。")
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("task_vehicle_ids不能重复。")
+    if len(prediction_ids) != vehicle_count or len(set(prediction_ids)) != vehicle_count:
+        raise ValueError("cache_prediction.vehicle_ids必须完整、唯一并匹配预测车辆轴。")
+    if set(source_ids) != set(prediction_ids):
+        raise ValueError(
+            "task_vehicle_cache与cache_prediction车辆ID集合不一致，禁止猜测行顺序。"
+        )
+    row_by_id = {vehicle_id: index for index, vehicle_id in enumerate(source_ids)}
+    return cache[[row_by_id[vehicle_id] for vehicle_id in prediction_ids]].copy()
 
 
 def _prepare_predicted_cache_utility(
@@ -561,6 +604,8 @@ def _prepare_predicted_cache_utility(
     environment: MECEnvironment,
     node_count: int,
     service_count: int,
+    task_vehicle_cache: Sequence[Sequence[Real]] | np.ndarray | None = None,
+    task_vehicle_ids: Sequence[str] | None = None,
 ) -> Callable[[np.ndarray], float]:
     """建立统一的预测缓存效用 oracle，供候选生成和触发判断共同调用。
 
@@ -606,6 +651,17 @@ def _prepare_predicted_cache_utility(
 
     vehicle_count = int(coverage.shape[1])
     horizon = int(coverage.shape[2])
+    if task_vehicle_cache is None or task_vehicle_ids is None:
+        raise ValueError(
+            "正式覆盖预测必须提供task_vehicle_cache和task_vehicle_ids以计算Local baseline。"
+        )
+    aligned_local_cache = _aligned_task_vehicle_cache(
+        cache_prediction,
+        task_vehicle_cache,
+        task_vehicle_ids,
+        service_count=service_count,
+        vehicle_count=vehicle_count,
+    )
     preferences = _prediction_preferences(cache_prediction, vehicle_count, service_count)
     raw_weights = (
         None
@@ -651,16 +707,23 @@ def _prepare_predicted_cache_utility(
         and np.all(np.isfinite(node_positions))
         and np.all(np.isfinite(vehicle_positions))
     )
+    if not have_positions:
+        raise ValueError(
+            "正式Local baseline需要与predicted_coverage一致的node/vehicle positions元数据。"
+        )
     if have_positions:
         input_bits, cpu_cycles = _representative_workload(environment)
-        edge_benefit, physical_available = _build_physical_predicted_edge_benefit(
-            node_positions=node_positions,
-            vehicle_positions=vehicle_positions,
-            node_types=kinds,
-            environment=environment,
-            input_bits=input_bits,
-            cpu_cycles=cpu_cycles,
+        edge_benefit, physical_available, cloud_utility, local_utility = (
+            _build_physical_predicted_edge_benefit(
+                node_positions=node_positions,
+                vehicle_positions=vehicle_positions,
+                node_types=kinds,
+                environment=environment,
+                input_bits=input_bits,
+                cpu_cycles=cpu_cycles,
+            )
         )
+        local_advantage = max(0.0, local_utility - cloud_utility)
 
     def evaluate(cache: np.ndarray) -> float:
         # shape: node × vehicle × service × horizon; max over nodes models the
@@ -677,6 +740,13 @@ def _prepare_predicted_cache_utility(
             0.0,
         )
         best_benefit = np.max(covered_benefit, axis=0)
+        # Edge 相对 max(Local, Cloud) 的真实预测增量；Local cache 是配置前
+        # 已知且时域内固定的状态，不读取当前真实请求。
+        best_benefit = np.maximum(
+            0.0,
+            best_benefit
+            - local_advantage * aligned_local_cache[:, :, np.newaxis],
+        )
         weighted = best_benefit * preferences[:, :, np.newaxis]
         weighted *= horizon_weights[np.newaxis, np.newaxis, :]
         total = float(np.sum(weighted))
@@ -693,6 +763,8 @@ def predicted_cache_utility(
     cache_prediction: Mapping[str, Any] | None,
     node_types: Sequence[NodeType | str],
     environment: MECEnvironment,
+    task_vehicle_cache: Sequence[Sequence[Real]] | np.ndarray,
+    task_vehicle_ids: Sequence[str],
 ) -> float:
     """计算协同缓存的预测系统效用，候选和第四阶段 trigger 共用此函数。"""
 
@@ -703,6 +775,8 @@ def predicted_cache_utility(
         environment=environment,
         node_count=checked.shape[0],
         service_count=checked.shape[1],
+        task_vehicle_cache=task_vehicle_cache,
+        task_vehicle_ids=task_vehicle_ids,
     )
     return float(evaluator(checked))
 
@@ -716,6 +790,34 @@ def _cache_replication_stats(cache: np.ndarray) -> tuple[int, int]:
     return duplicate_count, unique_services
 
 
+def _predicted_configuration_net_score(
+    cache: np.ndarray,
+    *,
+    previous_cache: np.ndarray,
+    evaluator: Callable[[np.ndarray], float],
+    node_types: Sequence[NodeType],
+    environment: MECEnvironment,
+    service_sizes: np.ndarray,
+) -> tuple[float, float, float]:
+    """返回预测服务效用减正式实际 cache update cost 的 surrogate。"""
+
+    predicted_utility = float(evaluator(cache))
+    cache_cost = 0.0
+    for node_index, kind in enumerate(node_types):
+        cache_cost += float(
+            environment.cache_update_cost(
+                previous_cache[node_index],
+                cache[node_index],
+                node_type=kind,
+                service_sizes=service_sizes,
+            )["total_cost"]
+        )
+    score = predicted_utility - cache_cost
+    if not all(math.isfinite(value) for value in (predicted_utility, cache_cost, score)):
+        raise ValueError("预测配置净分数不能包含NaN/Inf。")
+    return score, predicted_utility, cache_cost
+
+
 def solve_cooperative_cache(
     previous_cache: Sequence[Sequence[Real]] | np.ndarray,
     requested_triggers: Sequence[bool | Real] | np.ndarray,
@@ -725,6 +827,8 @@ def solve_cooperative_cache(
     cache_prediction: Mapping[str, Any] | None,
     node_types: Sequence[NodeType | str],
     environment: MECEnvironment,
+    task_vehicle_cache: Sequence[Sequence[Real]] | np.ndarray,
+    task_vehicle_ids: Sequence[str],
     integer_scale: int | None = None,
     tolerance: float = _DEFAULT_TOLERANCE,
 ) -> dict[str, Any]:
@@ -763,6 +867,8 @@ def solve_cooperative_cache(
         environment=environment,
         node_count=node_count,
         service_count=service_count,
+        task_vehicle_cache=task_vehicle_cache,
+        task_vehicle_ids=task_vehicle_ids,
     )
     type_order = {
         NodeType.SERVICE_VEHICLE: 0,
@@ -783,25 +889,65 @@ def solve_cooperative_cache(
         for service_index in range(service_count):
             trial = base.copy()
             trial[node_index, service_index] = 1.0
-            values[service_index] = max(0.0, float(evaluator(trial) - base_utility))
-        candidate[node_index] = _solve_knapsack_dp(
+            marginal_benefit = float(evaluator(trial) - base_utility)
+            # item 只减 0->1 loading cost；节点 fixed cost 留到完整候选比较时
+            # 一次性计算，绝不按服务重复扣除。
+            loading_cost = float(
+                environment.cache_loading_cost_for_added_services(
+                    previous[node_index],
+                    trial[node_index],
+                    node_type=kinds[node_index],
+                    service_sizes=sizes,
+                )["weighted_loading_cost"]
+            )
+            values[service_index] = max(0.0, marginal_benefit - loading_cost)
+        proposed = candidate.copy()
+        proposed[node_index] = _solve_knapsack_dp(
             values,
             sizes_int,
             int(capacities_int[node_index]),
             tolerance=float(tolerance),
         )
+        keep_score, _, _ = _predicted_configuration_net_score(
+            candidate,
+            previous_cache=previous,
+            evaluator=evaluator,
+            node_types=kinds,
+            environment=environment,
+            service_sizes=sizes,
+        )
+        proposed_score, _, _ = _predicted_configuration_net_score(
+            proposed,
+            previous_cache=previous,
+            evaluator=evaluator,
+            node_types=kinds,
+            environment=environment,
+            service_sizes=sizes,
+        )
+        if proposed_score > keep_score + tolerance:
+            candidate = proposed
 
     final_usage = np.sum(candidate * sizes[np.newaxis, :], axis=1)
     if np.any(final_usage > capacities + tolerance):
         raise ValueError("协同缓存候选违反容量约束。")
     duplicate_count, unique_services = _cache_replication_stats(candidate)
+    net_score, predicted_utility, predicted_cache_cost = _predicted_configuration_net_score(
+        candidate,
+        previous_cache=previous,
+        evaluator=evaluator,
+        node_types=kinds,
+        environment=environment,
+        service_sizes=sizes,
+    )
     return {
         "candidate_cache": _readonly(candidate),
         "final_cache": _readonly(candidate),
         "actual_cache_update": _readonly(
             np.any(candidate != previous, axis=1), dtype=bool
         ),
-        "cooperative_candidate_utility": float(evaluator(candidate)),
+        "cooperative_candidate_utility": predicted_utility,
+        "predicted_cache_update_cost": predicted_cache_cost,
+        "predicted_configuration_net_score": net_score,
         "cache_duplicate_count": duplicate_count,
         "cache_unique_services": unique_services,
         "requested_triggers": _readonly(requested, dtype=bool),
@@ -1008,7 +1154,7 @@ def _ground_service_gap_hotspots(
         and np.all(np.isfinite(vehicle_positions))
     ):
         input_bits, cpu_cycles = _representative_workload(environment)
-        _, physical_available = _build_physical_predicted_edge_benefit(
+        _, physical_available, _, _ = _build_physical_predicted_edge_benefit(
             node_positions=node_positions,
             vehicle_positions=vehicle_positions,
             node_types=node_types,
@@ -1151,6 +1297,11 @@ def select_triggered_uav_positions(
     previous_positions: Sequence[Sequence[Real]] | np.ndarray,
     *,
     previous_cache: Sequence[Sequence[Real]] | np.ndarray,
+    cache_triggers: Sequence[bool | Real] | np.ndarray,
+    service_sizes: Sequence[Real] | np.ndarray,
+    cache_capacities: Real | Sequence[Real] | np.ndarray,
+    task_vehicle_cache: Sequence[Sequence[Real]] | np.ndarray,
+    task_vehicle_ids: Sequence[str],
     requested_uav_triggers: Sequence[bool | Real] | np.ndarray,
     cache_prediction: Mapping[str, Any] | None,
     node_types: Sequence[NodeType | str],
@@ -1160,17 +1311,25 @@ def select_triggered_uav_positions(
     slot_duration_s: Real,
     region: Mapping[str, Real] | Sequence[Real],
     minimum_separation_m: Real,
+    integer_scale: int | None = None,
     position_epsilon_m: Real = _DEFAULT_POSITION_EPSILON,
     max_hotspots: int = 3,
 ) -> dict[str, Any]:
     """按 trigger 对 UAV 执行一次有限候选定位。
 
     未触发 UAV 严格保持原位；触发 UAV 只比较当前位置和既有需求/地面覆盖缺口
-    热点，并以因果预测缓存效用减真实 UAV 移动成本评价。该过程是第四章有限
-    候选近似，不使用当前真实任务，也不是连续位置全局优化。
+    热点。每个 trial position 都在对应预测下调用同一个确定性 cache solver，
+    再以预测服务效用减实际 cache update cost 和 UAV movement cost 评价。这是
+    configuration surrogate，不等于尚未发生 Matching/KKT 的真实当前时隙 G。
     """
     previous = _finite_array(previous_positions, "previous_positions", ndim=2)
     old_cache = _binary_array(previous_cache, "previous_cache", ndim=2)
+    cache_requested = _bool_vector(
+        cache_triggers, "cache_triggers", length=old_cache.shape[0]
+    )
+    sizes = _positive_array(service_sizes, "service_sizes", ndim=1)
+    if sizes.shape != (old_cache.shape[1],):
+        raise ValueError("service_sizes长度必须等于缓存服务数。")
     if previous.shape[1:] != (2,):
         raise ValueError("previous_positions必须形状为(U,2)。")
     uav_count = previous.shape[0]
@@ -1253,12 +1412,33 @@ def select_triggered_uav_positions(
                 environment=environment,
                 movement_epsilon_m=epsilon,
             )
-            trial_score = predicted_cache_utility(
+            trial_cache_result = solve_cooperative_cache(
                 old_cache,
+                cache_requested,
+                sizes,
+                cache_capacities,
                 cache_prediction=trial_prediction,
                 node_types=kinds,
                 environment=environment,
-            ) - trial_move_cost
+                task_vehicle_cache=task_vehicle_cache,
+                task_vehicle_ids=task_vehicle_ids,
+                integer_scale=integer_scale,
+            )
+            trial_cache = np.asarray(
+                trial_cache_result["candidate_cache"], dtype=float
+            )
+            trial_service_utility = predicted_cache_utility(
+                trial_cache,
+                cache_prediction=trial_prediction,
+                node_types=kinds,
+                environment=environment,
+                task_vehicle_cache=task_vehicle_cache,
+                task_vehicle_ids=task_vehicle_ids,
+            )
+            trial_cache_cost = float(
+                trial_cache_result["predicted_cache_update_cost"]
+            )
+            trial_score = trial_service_utility - trial_cache_cost - trial_move_cost
             if trial_score > best_score + _DEFAULT_TOLERANCE:
                 best_score = float(trial_score)
                 best_positions = trial
@@ -1760,11 +1940,15 @@ def _evaluate_assignment(
     multiplier_tolerance: float,
     max_kkt_iterations: int,
 ) -> dict[str, Any]:
-    """评价一个完整 assignment：可行性、KKT、物理结果和总任务效用。"""
+    """评价完整 assignment，并返回稳定的 machine-readable reason_code。"""
 
     for task in np.flatnonzero(task_arrivals):
         if int(vector[task]) not in feasible_nodes[task]:
-            return {"feasible": False, "reason": f"任务{task}的候选节点不在N_v^fea中。"}
+            return {
+                "feasible": False,
+                "reason_code": "INFEASIBLE_NODE",
+                "reason": f"任务{task}的候选节点不在N_v^fea中。",
+            }
     # 每个 matching 候选都重新求 KKT，不能复用上一个 assignment 的资源比例，
     # 否则交换任务后共享节点的资源约束和 utility 会失真。
     resources = solve_resources(
@@ -1787,7 +1971,11 @@ def _evaluate_assignment(
         max_iterations=max_kkt_iterations,
     )
     if not resources["feasible"]:
-        return {"feasible": False, "reason": resources["reason"]}
+        return {
+            "feasible": False,
+            "reason_code": "RESOURCE_INFEASIBLE",
+            "reason": resources["reason"],
+        }
 
     delays = np.zeros(task_arrivals.size, dtype=float)
     energies = np.zeros(task_arrivals.size, dtype=float)
@@ -1843,17 +2031,53 @@ def _evaluate_assignment(
                     cpu_cycles=float(task_cpu_cycles[task]),
                 )
             else:
-                return {"feasible": False, "reason": f"任务{task}的执行节点列无效。"}
-        except (ValueError, FloatingPointError) as error:
-            return {"feasible": False, "reason": f"任务{task}的environment物理评价失败：{error}"}
+                return {
+                    "feasible": False,
+                    "reason_code": "INFEASIBLE_NODE",
+                    "reason": f"任务{task}的执行节点列无效。",
+                }
+        except FloatingPointError as error:
+            return {
+                "feasible": False,
+                "reason_code": "NUMERICAL_FAILURE",
+                "reason": f"任务{task}的数值评价失败：{error}",
+            }
+        except (ValueError, KeyError) as error:
+            return {
+                "feasible": False,
+                "reason_code": "PHYSICAL_FAILURE",
+                "reason": f"任务{task}的environment物理评价失败：{error}",
+            }
         delays[task] = float(result["completion_delay_s"])
         energies[task] = float(result["vehicle_energy_j"])
         execution_nodes[task] = kind.value
         task_results.append(result)
 
-    utility = environment.task_utility(task_arrivals, delays, energies)
+    if not np.all(np.isfinite(delays)) or not np.all(np.isfinite(energies)):
+        return {
+            "feasible": False,
+            "reason_code": "NUMERICAL_FAILURE",
+            "reason": "assignment物理评价产生NaN/Inf。",
+        }
+    try:
+        utility = environment.task_utility(
+            task_arrivals,
+            delays,
+            energies,
+            delay_reference_s=reference_delays_s,
+            energy_reference_j=reference_energies_j,
+            delay_weight=omega_time,
+            energy_weight=omega_energy,
+        )
+    except (ValueError, FloatingPointError) as error:
+        return {
+            "feasible": False,
+            "reason_code": "NUMERICAL_FAILURE",
+            "reason": f"assignment utility数值评价失败：{error}",
+        }
     return {
         "feasible": True,
+        "reason_code": "OK",
         "reason": "匹配候选通过KKT和environment物理评价。",
         "assignment_vector": vector.copy(),
         "assignment": _assignment_matrix(
@@ -1868,6 +2092,24 @@ def _evaluate_assignment(
         "task_utility": utility,
         "total_task_utility": float(utility["total_task_utility"]),
     }
+
+
+def evaluate_fixed_assignment(
+    assignment_vector: Sequence[int] | np.ndarray,
+    **evaluation_inputs: Any,
+) -> dict[str, Any]:
+    """用生产 Matching 的唯一评价链评价一个固定 assignment。
+
+    该公开接口只供离线一致性测试与小规模 Exact benchmark 使用。它不实现
+    任何物理公式，也不改变 assignment；每次调用仍由 ``_evaluate_assignment``
+    重新执行 KKT、environment task execution 与统一 task utility 计算。
+    """
+
+    vector = np.asarray(assignment_vector, dtype=int)
+    if vector.ndim != 1:
+        raise ValueError("assignment_vector必须是一维向量。")
+    evaluation_inputs.setdefault("tolerance", _DEFAULT_TOLERANCE)
+    return _evaluate_assignment(vector, **evaluation_inputs)
 
 
 def transfer_exchange_matching(
@@ -1902,7 +2144,8 @@ def transfer_exchange_matching(
     初始状态把所有到达任务放到 Cloud，保证 assignment 有完整起点；随后每轮
     枚举“单任务迁移”和“两个任务交换”，每个候选都经过完整 KKT 与 environment
     物理评价。只接受超过 ``improvement_tolerance`` 的最大 utility 改进，同分时
-    用确定性的操作类型/任务编号/节点编号字典序打破平局。
+    用确定性的操作类型/任务编号/节点编号字典序打破平局。``matching_stable``
+    只表示当前 transfer/exchange 邻域内没有正改进，不代表全局最优。
     """
 
     arrivals = _bool_vector(task_arrivals, "task_arrivals")
@@ -1954,8 +2197,22 @@ def transfer_exchange_matching(
             raise ValueError("Cloud必须出现在每个已到达任务的可行节点集合中。")
         current[task] = cloud
 
+    candidate_diagnostics = {
+        "candidate_evaluation_count": 0,
+        "candidate_infeasible_node_count": 0,
+        "candidate_resource_infeasible_count": 0,
+        "candidate_physical_failure_count": 0,
+        "candidate_numerical_failure_count": 0,
+    }
+    reason_counter_keys = {
+        "INFEASIBLE_NODE": "candidate_infeasible_node_count",
+        "RESOURCE_INFEASIBLE": "candidate_resource_infeasible_count",
+        "PHYSICAL_FAILURE": "candidate_physical_failure_count",
+        "NUMERICAL_FAILURE": "candidate_numerical_failure_count",
+    }
+
     def evaluate(candidate: np.ndarray) -> dict[str, Any]:
-        return _evaluate_assignment(
+        result = _evaluate_assignment(
             candidate,
             feasible_nodes=feasible_nodes,
             environment=environment,
@@ -1981,6 +2238,14 @@ def transfer_exchange_matching(
             multiplier_tolerance=float(multiplier_tolerance),
             max_kkt_iterations=int(max_kkt_iterations),
         )
+        candidate_diagnostics["candidate_evaluation_count"] += 1
+        if not result["feasible"]:
+            reason_code = str(result.get("reason_code", ""))
+            key = reason_counter_keys.get(reason_code)
+            if key is None:
+                raise RuntimeError(f"未知matching candidate reason_code: {reason_code!r}")
+            candidate_diagnostics[key] += 1
+        return result
 
     current_evaluation = evaluate(current)
     if not current_evaluation["feasible"]:
@@ -2067,8 +2332,10 @@ def transfer_exchange_matching(
         "updates": int(updates),
         "migration_count": int(migration_count),
         "swap_count": int(swap_count),
-        # 当前 matching 的初始 Cloud 解和最终解都经过 KKT；若最终解可行，
-        # 则不存在需要报告的最终 KKT 失败。候选失败会被直接拒绝，不写入执行结果。
+        "candidate_diagnostics": dict(candidate_diagnostics),
+        # hard-stop 字段只描述最终 accepted assignment；候选 KKT 不可行属于
+        # 局部搜索的正常拒绝，单独记录在 candidate_diagnostics。
+        "final_kkt_failure_count": 0,
         "kkt_failure_count": 0,
     }
 
@@ -2100,6 +2367,7 @@ def solve_slot(
     task_arrivals: Sequence[bool | Real] | np.ndarray,
     task_service_types: Sequence[int] | np.ndarray,
     task_vehicle_cache: Sequence[Sequence[Real]] | np.ndarray,
+    task_vehicle_ids: Sequence[str],
     task_input_bits: Sequence[Real] | np.ndarray,
     task_cpu_cycles: Sequence[Real] | np.ndarray,
     task_vehicle_positions: Sequence[Sequence[Real]] | np.ndarray,
@@ -2147,6 +2415,9 @@ def solve_slot(
     arrivals = _bool_vector(task_arrivals, "task_arrivals", length=task_cache.shape[0])
     service_count, service_number = previous.shape
     task_count = task_cache.shape[0]
+    task_ids = tuple(str(item) for item in task_vehicle_ids)
+    if len(task_ids) != task_count or len(set(task_ids)) != task_count:
+        raise ValueError("task_vehicle_ids必须与task_vehicle_cache行一一对应且不重复。")
     if task_cache.shape[1] != service_number:
         raise ValueError("task_vehicle_cache服务维度必须等于previous_cache服务维度。")
     if np.asarray(service_sizes).shape != (service_number,):
@@ -2199,6 +2470,11 @@ def solve_slot(
     uav_result = select_triggered_uav_positions(
         previous_uav,
         previous_cache=previous,
+        cache_triggers=cache_triggers,
+        service_sizes=service_sizes,
+        cache_capacities=cache_capacities,
+        task_vehicle_cache=task_cache,
+        task_vehicle_ids=task_ids,
         requested_uav_triggers=uav_triggers,
         cache_prediction=cache_prediction,
         node_types=kinds,
@@ -2220,6 +2496,7 @@ def solve_slot(
             if minimum_safety_distance_m is not None
             else uav_config["minimum_safety_distance_m"]
         ),
+        integer_scale=integer_scale,
         position_epsilon_m=position_epsilon_m,
     )
     cache_result = solve_cooperative_cache(
@@ -2230,6 +2507,8 @@ def solve_slot(
         cache_prediction=uav_result["prediction"],
         node_types=kinds,
         environment=env,
+        task_vehicle_cache=task_cache,
+        task_vehicle_ids=task_ids,
         integer_scale=integer_scale,
     )
     candidate_cache = np.asarray(cache_result["candidate_cache"], dtype=float)
@@ -2402,13 +2681,9 @@ def solve_slot(
         cache_cost,
         uav_cost,
     )
-    failure_reason_counts = {
-        "no_feasible_node": 0,
-        "resource_infeasible": 0,
-        "latency_constraint": 0,
-        "communication_unavailable": 0,
-        "numerical_failure": 0,
-    }
+    # 只保留具有真实任务级统计来源的失败项；候选 KKT/物理拒绝属于搜索诊断，
+    # 不伪装成最终任务失败或不存在的 hard latency constraint。
+    failure_reason_counts = {"no_feasible_node": 0}
     for task in np.flatnonzero(arrivals):
         if matching["execution_nodes"][int(task)] is None:
             failure_reason_counts["no_feasible_node"] += 1
@@ -2441,7 +2716,9 @@ def solve_slot(
         matching_stable=bool(matching["matching_stable"]),
         matching_migration_count=int(matching["migration_count"]),
         matching_swap_count=int(matching["swap_count"]),
-        kkt_failure_count=int(matching.get("kkt_failure_count", 0)),
+        matching_candidate_diagnostics=dict(matching["candidate_diagnostics"]),
+        final_kkt_failure_count=int(matching["final_kkt_failure_count"]),
+        kkt_failure_count=int(matching["final_kkt_failure_count"]),
         failure_reason_counts=failure_reason_counts,
     )
 
@@ -2449,6 +2726,7 @@ def solve_slot(
 __all__ = [
     "SolverResult",
     "build_feasible_nodes",
+    "evaluate_fixed_assignment",
     "predicted_cache_utility",
     "solve_bandwidth_allocation",
     "solve_cooperative_cache",
