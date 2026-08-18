@@ -3,10 +3,9 @@
 无线信道模型。
 
 当前实现：
-1. TV -> SV：V2V 大尺度信道；
-2. TV -> UAV：概率 LoS / NLoS 平均空地信道。
-
-暂未实现：TV -> RSU。
+1. TV -> SV：当前地面大尺度信道；
+2. TV -> RSU：当前地面链路实现；
+3. TV -> UAV：概率 LoS / NLoS 平均空地信道。
 所有参数统一从 config.py 读取。
 """
 
@@ -46,6 +45,48 @@ def sv_full_rate_bps(distance_m: float) -> float:
     if not sv_link_eligible(distance_m):
         raise ValueError(
             f"SV 链路距离 {distance_m:.3f} m 超过 "
+            f"{config.V2V_MAX_DISTANCE_M:.3f} m"
+        )
+
+    d_eff = max(distance_m, config.V2V_DISTANCE_FLOOR_M)
+    pl_db = (
+        config.V2V_PL0_DB
+        + 10.0 * config.V2V_PATHLOSS_EXPONENT * math.log10(d_eff)
+    )
+    gain = 10 ** (-pl_db / 10.0)
+    snr = config.TX_POWER_W * gain / NOISE_POWER_W
+    return config.BANDWIDTH_HZ * math.log2(1.0 + snr)
+
+
+
+# =============================================================================
+# TV -> RSU
+# =============================================================================
+
+def rsu_link_eligible(distance_m: float) -> bool:
+    """
+    当前 RSU 主线集成使用与 SV 相同的地面链路有效范围。
+
+    注意：
+    这是当前统一地面链路 pilot 的实现选择，
+    最终实验参数校准时应再单独检查 RSU/V2I 参数。
+    """
+    return distance_m <= config.V2V_MAX_DISTANCE_M
+
+
+def rsu_full_rate_bps(distance_m: float) -> float:
+    """
+    TV -> RSU 在 b=1 时的基础速率 R_bar。
+
+    当前复用已有地面路径损耗表达式：
+        PL(d) = PL0 + 10*alpha*log10(d)
+
+    这里只复用数学/数值实现，
+    不把当前 V2V 实测有效性结论扩展成新的 RSU 实测结论。
+    """
+    if not rsu_link_eligible(distance_m):
+        raise ValueError(
+            f"RSU 链路距离 {distance_m:.3f} m 超过当前 pilot 地面范围 "
             f"{config.V2V_MAX_DISTANCE_M:.3f} m"
         )
 
@@ -144,6 +185,8 @@ def full_rate_bps(node_type: str, distance_m: float) -> float:
         return uav_full_rate_bps(distance_m)
 
     if node_type == "RSU":
-        raise NotImplementedError("RSU 信道模型尚未正式接入。")
+        return rsu_full_rate_bps(
+            distance_m
+        )
 
     raise ValueError(f"未知节点类型: {node_type}")

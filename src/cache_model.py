@@ -10,9 +10,9 @@
 5. 保存初始缓存状态。
 
 当前正式接入：
-    SV / UAV
+    SV / RSU / UAV
 
-RSU 的缓存容量参数尚未冻结，因此暂不在这里凭空设值。
+RSU 当前使用独立配置入口，集成阶段比例暂与 SV pilot 相同。
 """
 
 from __future__ import annotations
@@ -81,6 +81,20 @@ def uav_cache_capacity_mb(
     )
 
 
+
+def rsu_cache_capacity_mb(
+    service_sizes_mb: dict[int, float],
+) -> float:
+    """
+    RSU 当前 pilot 缓存容量：
+        C_r = RSU_CACHE_CAPACITY_RATIO * sum_f s_f
+    """
+    return (
+        config.RSU_CACHE_CAPACITY_RATIO
+        * sum(service_sizes_mb.values())
+    )
+
+
 def node_cache_capacity_mb(
     node_type: str,
     service_sizes_mb: dict[int, float],
@@ -90,9 +104,8 @@ def node_cache_capacity_mb(
 
     当前：
         SV  -> SV_CACHE_CAPACITY_RATIO
+        RSU -> RSU_CACHE_CAPACITY_RATIO
         UAV -> UAV_CACHE_CAPACITY_RATIO
-
-    RSU 参数未冻结时明确报错，不伪造容量。
     """
     node_type = node_type.upper()
 
@@ -107,8 +120,8 @@ def node_cache_capacity_mb(
         )
 
     if node_type == "RSU":
-        raise NotImplementedError(
-            "RSU 缓存容量尚未正式配置。"
+        return rsu_cache_capacity_mb(
+            service_sizes_mb
         )
 
     raise ValueError(
@@ -128,7 +141,7 @@ def build_initial_cache_state(
     - 按随机顺序逐个放入；
     - 严格满足该节点自己的物理缓存容量。
 
-    该函数现在同时支持 SV 和 UAV。
+    该函数现在同时支持 SV、RSU 和 UAV。
     """
     service_sizes = (
         load_service_sizes_mb()

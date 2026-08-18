@@ -143,7 +143,7 @@ CLOUD_RATE_BPS = 100e6
 CLOUD_CPU_HZ = 20e9
 
 # Cloud 传输时间缩放因子
-CLOUD_PSI = 1.0
+CLOUD_PSI = 14.0
 
 
 # =============================================================================
@@ -183,11 +183,11 @@ if abs(OMEGA_T + OMEGA_E - 1.0) > 1e-12:
 
 # 以下参数尚未正式冻结，先集中保留接口
 
-CACHE_FIXED_SWITCH_COST = 0.0
+CACHE_FIXED_SWITCH_COST = 0.005
 CACHE_SIZE_COST_COEF = 0.0
 
 UAV_FIXED_SWITCH_COST = 0.0
-UAV_MOVE_COST_COEF = 0.0
+UAV_MOVE_COST_COEF = 1.0e-5
 
 # 配置更新时的严格改善容差
 CFG_IMPROVEMENT_EPS = 1e-9
@@ -281,3 +281,29 @@ NUM_UAV = 1
 # UAV ?????????????????
 # ????? P2 ??????????????
 UAV_CACHE_CAPACITY_RATIO = 0.30
+
+
+# =============================================================================
+# RSU 当前开发基线
+# =============================================================================
+
+# 当前实际部署的固定 RSU。
+# 这两个位置来自已经存在的项目配置，并且都属于当前 SUMO 地图
+# 提取出的 traffic_light 候选点。
+RSU_SELECTED_NODE_IDS = (
+    "rsu_cluster_6796414843_6796414847",
+    "rsu_cluster_6796414892_6796414902",
+)
+
+RSU_DEPLOYMENT_FILE = (
+    DATA_DIR
+    / "rsu"
+    / "rsu_deployment.csv"
+)
+
+# 当前仅用于完成 RSU 主线集成。
+# 不新引入独立数值，暂与 SV pilot 缓存比例相同。
+# 最终参数实验时再单独校准。
+RSU_CACHE_CAPACITY_RATIO = (
+    SV_CACHE_CAPACITY_RATIO
+)

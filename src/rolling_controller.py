@@ -9,8 +9,10 @@ P1 + P2 + Pjoint 滚动在线控制器。
     P3      任务卸载与资源分配
     Async   基于净收益的逐节点异步更新记录
 
-暂未加入：
-    RSU 正式接入
+当前边缘节点：
+    SV / RSU / UAV
+
+暂未完成：
     最终参数校准
 
 每个时隙严格遵循：
@@ -297,6 +299,7 @@ def write_summary(
         "task_count",
         "edge_eligible_tasks",
         "sv_tasks",
+        "rsu_tasks",
         "uav_tasks",
         "cloud_tasks",
         "actual_total_cost",
@@ -1003,6 +1006,13 @@ def run_rolling(
                         "mode_counts"
                     ].get(
                         "SV",
+                        0,
+                    ),
+                "rsu_tasks":
+                    actual[
+                        "mode_counts"
+                    ].get(
+                        "RSU",
                         0,
                     ),
                 "uav_tasks":

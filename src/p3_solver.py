@@ -42,6 +42,7 @@ from scipy.optimize import minimize
 import config
 import channel
 import cache_model
+import rsu_state
 
 
 # =============================================================================
@@ -175,15 +176,22 @@ def build_uav_nodes(
 
 
 def build_edge_nodes(
-    uav_positions: dict[str, tuple[float, float]] | None = None,
+    uav_positions:
+        dict[str, tuple[float, float]]
+        | None = None,
 ) -> list[dict]:
-    """构造 P3 的 SV + 可选 UAV 边缘节点集合。"""
+    """
+    构造当前完整动态缓存/边缘计算节点集合：
+        M = V_S ∪ R ∪ U
+    """
     nodes = build_current_sv_nodes()
+    nodes.extend(rsu_state.load_rsu_nodes())
 
     if uav_positions:
         nodes.extend(build_uav_nodes(uav_positions))
 
     return nodes
+
 
 def build_all_service_cache_state(
     edge_nodes: list[dict],
@@ -283,9 +291,9 @@ def _node_position(
     """
     获取边缘节点二维水平位置。
 
-    SV 从 SUMO/预测位置字典读取；
-    UAV 从当前候选配置 Q^U 中读取 node["position"]。
-    UAV 固定高度在 channel.py 中统一加入。
+    SV：从实际/预测车辆位置字典读取；
+    RSU：使用固定 position；
+    UAV：使用当前候选 Q^U 中的 position。
     """
     node_type = node["node_type"].upper()
 
@@ -295,10 +303,15 @@ def _node_position(
             raise RuntimeError(f"缺少 SV 位置: {key}")
         return positions[key]
 
-    if node_type == "UAV":
+    if node_type in {"RSU", "UAV"}:
         if "position" not in node:
-            raise RuntimeError(f"UAV {node['node_id']} 缺少 position。")
-        return (float(node["position"][0]), float(node["position"][1]))
+            raise RuntimeError(
+                f"{node_type} {node['node_id']} 缺少 position。"
+            )
+        return (
+            float(node["position"][0]),
+            float(node["position"][1]),
+        )
 
     raise NotImplementedError(f"{node_type} 位置接口尚未接入。")
 
@@ -348,22 +361,29 @@ def make_edge_candidate(
     )
 
     # TV 到节点投影点的二维水平距离。
-    horizontal_distance_m = math.hypot(tx - nx, ty - ny)
+    horizontal_distance_m = math.hypot(
+        tx - nx,
+        ty - ny,
+    )
 
     if node_type == "SV":
         if not channel.sv_link_eligible(horizontal_distance_m):
             return None
         link_distance_m = horizontal_distance_m
 
+    elif node_type == "RSU":
+        if not channel.rsu_link_eligible(horizontal_distance_m):
+            return None
+        link_distance_m = horizontal_distance_m
+
     elif node_type == "UAV":
-        # UAV 的真实无线链路长度是三维距离。
-        # 信道函数输入水平距离，并在内部加入固定高度 H。
         link_distance_m = math.sqrt(
-            horizontal_distance_m ** 2 + config.UAV_HEIGHT_M ** 2
+            horizontal_distance_m ** 2
+            + config.UAV_HEIGHT_M ** 2
         )
 
     else:
-        link_distance_m = horizontal_distance_m
+        raise ValueError(f"未知边缘节点类型：{node_type}")
 
     # ---------- 3. 满资源基础速率 ----------
     rbar_bps = channel.full_rate_bps(
@@ -1005,6 +1025,7 @@ def main():
         config.MOBILITY_FILE,
         config.ROLE_POOL_FILE,
         config.TASK_FILE,
+        config.RSU_DEPLOYMENT_FILE,
     ]
 
     for file in required_files:
@@ -1014,7 +1035,7 @@ def main():
     positions = load_positions()
     tasks = load_tasks()
 
-    edge_nodes = build_current_sv_nodes()
+    edge_nodes = build_edge_nodes()
 
     cache_state = cache_model.build_initial_cache_state(
         edge_nodes
@@ -1047,10 +1068,14 @@ def main():
     print("=" * 72)
     print("正式 P3 核心模块运行完成")
     print("=" * 72)
-    print("执行模式            : SV + Cloud")
+    print("执行模式            : SV + RSU + Cloud")
     print("本地执行            : 已删除")
     print(f"任务数              : {summary['tasks']}")
     print(f"SV 数量             : {config.NUM_SV}")
+    print(
+        f"RSU 数量            : "
+        f"{sum(1 for n in edge_nodes if n['node_type'] == 'RSU')}"
+    )
     print(
         "缓存状态            : "
         "当前临时全服务可用，P1 接入后替换"
