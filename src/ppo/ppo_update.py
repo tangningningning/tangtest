@@ -21,12 +21,10 @@ from typing import Any
 
 import numpy as np
 
-import cache_configuration
-import ppo_rollout
-import ppo_trigger_policy
-import project_config
-import task_scenario
-import uav_configuration
+from common import project_config
+from decision import cache_configuration, uav_configuration
+from ppo import ppo_rollout, ppo_trigger_policy
+from scenario import task_scenario
 
 try:
     import torch

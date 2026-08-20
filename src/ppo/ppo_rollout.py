@@ -22,13 +22,10 @@ from typing import Any
 
 import numpy as np
 
-import cache_configuration
-import kkt_resource_allocation as kkt
-import ppo_trigger_policy
-import project_config
-import slot_environment
-import task_scenario
-import uav_configuration
+from common import project_config
+from decision import cache_configuration, task_allocation, slot_environment, uav_configuration
+from ppo import ppo_trigger_policy
+from scenario import task_scenario
 
 
 @dataclass(frozen=True)
@@ -41,7 +38,7 @@ class AlignedRolloutStep:
     scenario_slice: dict[str, Any]
     predicted_vehicle_positions: dict[str, np.ndarray]
     predicted_service_popularity: dict[int, float]
-    actual_tasks: list[kkt.Task]
+    actual_tasks: list[task_allocation.Task]
     actual_vehicle_positions: dict[str, np.ndarray]
 
 
@@ -471,10 +468,10 @@ def prepare_aligned_rollout_steps(
         if not math.isclose(sum(predicted_popularity.values()), 1.0, rel_tol=1e-5, abs_tol=1e-5):
             raise ValueError(f"slot={slot} popularity rho_pred 未归一化。")
 
-        actual_tasks = kkt.load_actual_tasks(tasks_file, slot)
+        actual_tasks = task_allocation.load_actual_tasks(tasks_file, slot)
         sv_ids = {str(value) for value in scenario["service_vehicle_ids"].tolist()}
         tv_ids = {task.vehicle_id for task in actual_tasks}
-        actual_positions = kkt.load_vehicle_positions(
+        actual_positions = task_allocation.load_vehicle_positions(
             trajectory_file,
             time_s,
             sv_ids | tv_ids,

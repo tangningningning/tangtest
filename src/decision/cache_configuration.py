@@ -19,8 +19,7 @@ from typing import Any
 
 import numpy as np
 
-import project_config
-import system_model
+from common import project_config, system_model
 
 
 # ============================================================================
@@ -188,7 +187,7 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
 
 
 def find_project_root() -> Path:
-    candidates = (Path(__file__).resolve().parents[1], Path.cwd().resolve())
+    candidates = (Path(__file__).resolve().parents[2], Path.cwd().resolve())
     for candidate in candidates:
         if (candidate / "data").is_dir() and (candidate / "src").is_dir():
             return candidate

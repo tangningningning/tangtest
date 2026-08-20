@@ -30,7 +30,7 @@ except ModuleNotFoundError:  # pragma: no cover - 当前运行环境可能未安
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
 
-import project_config
+from common import project_config
 
 
 @dataclass(frozen=True)

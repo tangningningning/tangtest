@@ -22,7 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover - only for Python < 3.11
 
 
 def find_project_root() -> Path:
-    candidates = (Path(__file__).resolve().parents[1], Path.cwd().resolve())
+    candidates = (Path(__file__).resolve().parents[2], Path.cwd().resolve())
     for candidate in candidates:
         if (candidate / "system_config.toml").is_file() and (candidate / "data").is_dir():
             return candidate

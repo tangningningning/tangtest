@@ -24,9 +24,9 @@ from typing import Any
 import numpy as np
 import torch
 
-import popularity_prediction as pop
-import vehicle_prediction as veh
-from task_scenario import TaskConfig, catalog_by_id, load_json
+from scenario import popularity_prediction as pop
+from scenario import vehicle_prediction as veh
+from scenario.task_scenario import TaskConfig, catalog_by_id, load_json
 
 
 # ============================================================================
@@ -66,7 +66,7 @@ DEFAULT_CONFIG = ScenarioConfig()
 
 
 def find_project_root() -> Path:
-    candidates = (Path(__file__).resolve().parents[1], Path.cwd().resolve())
+    candidates = (Path(__file__).resolve().parents[2], Path.cwd().resolve())
     for candidate in candidates:
         if (candidate / "data").is_dir() and (candidate / "src").is_dir():
             return candidate

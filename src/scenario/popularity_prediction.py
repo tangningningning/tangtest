@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from task_scenario import (
+from scenario.task_scenario import (
     DEFAULT_CONFIG as TASK_DEFAULT_CONFIG,
     TaskConfig,
     generate_tasks,
@@ -119,7 +119,7 @@ PREDICTION_FIELDS = (
 
 
 def find_project_root() -> Path:
-    candidates = (Path(__file__).resolve().parents[1], Path.cwd().resolve())
+    candidates = (Path(__file__).resolve().parents[2], Path.cwd().resolve())
     for candidate in candidates:
         if (candidate / "data").is_dir() and (candidate / "src").is_dir():
             return candidate

@@ -152,7 +152,7 @@ class TrafficSource:
 def find_project_root() -> Path:
     """从脚本位置或当前工作目录找到包含 data/ 的项目根目录。"""
     candidates = (
-        Path(__file__).resolve().parents[1],
+        Path(__file__).resolve().parents[2],
         Path.cwd().resolve(),
     )
     for candidate in candidates:

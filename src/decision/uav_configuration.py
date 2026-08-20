@@ -32,9 +32,8 @@ from typing import Any
 
 import numpy as np
 
-import cache_configuration
-import project_config
-import system_model
+from common import project_config, system_model
+from decision import cache_configuration
 
 
 @dataclass(frozen=True)

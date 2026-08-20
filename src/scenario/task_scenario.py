@@ -139,7 +139,7 @@ TASK_FIELDS = (
 
 def find_project_root() -> Path:
     candidates = (
-        Path(__file__).resolve().parents[1],
+        Path(__file__).resolve().parents[2],
         Path.cwd().resolve(),
     )
     for candidate in candidates:

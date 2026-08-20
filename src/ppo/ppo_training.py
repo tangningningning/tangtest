@@ -31,15 +31,10 @@ from typing import Any
 
 import numpy as np
 
-import cache_configuration
-import kkt_resource_allocation as kkt
-import ppo_rollout
-import ppo_trigger_policy
-import ppo_update
-import project_config
-import slot_environment
-import task_scenario
-import uav_configuration
+from common import project_config
+from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
+from ppo import ppo_rollout, ppo_trigger_policy, ppo_update
+from scenario import task_scenario
 
 try:
     import torch
@@ -1703,7 +1698,7 @@ def evaluate_formal_episode(
 
                 if task.task_id not in result.matching:
                     raise ValueError(f"最终Matching缺少 task_id={task.task_id}。")
-                if result.matching[task.task_id] == kkt.CLOUD:
+                if result.matching[task.task_id] == task_allocation.CLOUD:
                     cloud_execution_task_count += 1
 
             if not math.isclose(reward, actual_q - cache_cost - movement_cost, rel_tol=1e-12, abs_tol=1e-12):
