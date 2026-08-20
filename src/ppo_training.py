@@ -21,7 +21,11 @@ import argparse
 import json
 import inspect
 import math
-from dataclasses import dataclass
+import os
+import random
+import tempfile
+import warnings
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +51,61 @@ SANITY_MAX_ROLLOUTS = 2
 SANITY_MAX_STEPS_PER_ROLLOUT = 8
 SANITY_MAX_TOTAL_ENV_STEPS = 16
 SANITY_MAX_OPTIMIZER_STEPS = 2
+
+# 正式训练持久化版本。checkpoint/history只在caller显式传入run_dir且
+# execute=True时写入；不会写入data/generated或固定results目录。
+CHECKPOINT_VERSION = 1
+TRAINING_HISTORY_SCHEMA_VERSION = 1
+LATEST_CHECKPOINT_FILENAME = "latest_checkpoint.pt"
+TRAINING_HISTORY_FILENAME = "training_history.json"
+
+
+def summary_to_builtin(value: Any) -> Any:
+    """递归将正式summary转换为可安全JSON序列化的Python builtin。
+
+    该函数只用于reporting层，不修改输入对象，也不改变训练核心返回的
+    dataclass、numpy数组或Tensor。非finite数值明确报错，避免掩盖数值异常。
+    """
+
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: summary_to_builtin(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            summary_to_builtin(key): summary_to_builtin(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [summary_to_builtin(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return summary_to_builtin(value.tolist())
+    if isinstance(value, np.generic):
+        return summary_to_builtin(value.item())
+    if torch is not None and isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        if tensor.ndim == 0:
+            return summary_to_builtin(tensor.item())
+        return summary_to_builtin(tensor.tolist())
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("summary中包含非finite Python float，拒绝静默序列化。")
+        return value
+    raise TypeError(f"summary包含不支持的类型：{type(value).__name__}")
+
+
+def format_training_summary(value: Any) -> str:
+    """将正式summary转换并格式化为console JSON字符串，不写入文件。"""
+
+    return json.dumps(
+        summary_to_builtin(value),
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -187,6 +246,27 @@ class FormalTrainingDryRunResult:
 
 
 @dataclass(frozen=True)
+class PPOEpochSummary:
+    """单个PPO epoch的轻量诊断摘要，不保存transition或tensor。"""
+
+    epoch_index: int
+    policy_loss_mean: float
+    value_loss_mean: float
+    entropy_mean: float
+    total_loss_mean: float
+    approx_kl_mean: float
+    clip_fraction_mean: float
+    ratio_mean: float
+    ratio_min: float
+    ratio_max: float
+    pre_clipping_grad_norm_mean: float
+    pre_clipping_grad_norm_max: float
+    minibatch_count: int
+    transition_count: int
+    optimizer_steps_cumulative: int
+
+
+@dataclass(frozen=True)
 class FormalPPOUpdateSummary:
     """单个完整 rollout 的正式 PPO update 汇总。
 
@@ -209,6 +289,7 @@ class FormalPPOUpdateSummary:
     advantages_frozen: bool
     returns_frozen: bool
     each_transition_once_per_epoch: bool
+    epoch_summaries: tuple[PPOEpochSummary, ...]
 
 
 @dataclass(frozen=True)
@@ -220,6 +301,9 @@ class TrainingEpisodeSummary:
     policy_version_after: int
     rollout_reward_sum: float
     rollout_reward_mean: float
+    # 训练batch仍保持float32；以下字段只诊断float32累计和raw累计的差异。
+    batch_reward_sum_float32: float
+    batch_vs_raw_reward_sum_error: float
     actual_q_sum: float
     cache_cost_sum: float
     movement_cost_sum: float
@@ -259,6 +343,11 @@ class FormalTrainingRunResult:
     episode_summaries: list[TrainingEpisodeSummary]
     final_policy_version: int
     optimizer_step_count: int
+    # 本次调用新完成的episode仍放在episode_summaries；以下字段用于明确
+    # resume后的全局状态，不保存RolloutBatch等大对象。
+    completed_episodes: int = 0
+    training_history: dict[str, Any] | None = None
+    resumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -281,6 +370,537 @@ class DeterministicEvaluationSummary:
     all_steps_feasible: bool
     reward_identity_error: float
     evaluation_semantics: str
+
+
+def _empty_training_history() -> dict[str, Any]:
+    """创建新的、只包含轻量summary的训练历史。"""
+
+    return {
+        "schema_version": TRAINING_HISTORY_SCHEMA_VERSION,
+        "completed_episodes": 0,
+        "policy_version": 0,
+        "optimizer_step_count": 0,
+        "episodes": [],
+    }
+
+
+def _training_episode_history_record(
+    episode_summary: TrainingEpisodeSummary,
+    update_summary: FormalPPOUpdateSummary,
+) -> dict[str, Any]:
+    """把一个完整episode的两个正式summary转换为轻量builtin记录。"""
+
+    if int(episode_summary.episode_index) < 0:
+        raise ValueError("TrainingEpisodeSummary.episode_index 不能为负。")
+    return {
+        "episode_index": int(episode_summary.episode_index),
+        "training_episode_summary": summary_to_builtin(episode_summary),
+        "ppo_update_summary": summary_to_builtin(update_summary),
+    }
+
+
+def _build_training_history(
+    records: list[dict[str, Any]],
+    policy_version: int,
+    optimizer_step_count: int,
+) -> dict[str, Any]:
+    """构造checkpoint和JSON共用的canonical training history。"""
+
+    history = {
+        "schema_version": TRAINING_HISTORY_SCHEMA_VERSION,
+        "completed_episodes": int(len(records)),
+        "policy_version": int(policy_version),
+        "optimizer_step_count": int(optimizer_step_count),
+        "episodes": records,
+    }
+    return summary_to_builtin(history)
+
+
+def _as_mapping(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} 必须是object/dict。")
+    return value
+
+
+def _training_episode_summary_from_builtin(value: Any) -> TrainingEpisodeSummary:
+    """从JSON/checkpoint builtin重建TrainingEpisodeSummary。"""
+
+    item = _as_mapping(value, "training_episode_summary")
+    integer_fields = {
+        "episode_index",
+        "policy_version_before",
+        "policy_version_after",
+        "optimizer_steps",
+    }
+    kwargs: dict[str, Any] = {}
+    for field in fields(TrainingEpisodeSummary):
+        if field.name not in item:
+            raise ValueError(f"training_episode_summary 缺少字段：{field.name}")
+        raw = item[field.name]
+        kwargs[field.name] = int(raw) if field.name in integer_fields else float(raw)
+    return TrainingEpisodeSummary(**kwargs)
+
+
+def _ppo_epoch_summary_from_builtin(value: Any) -> PPOEpochSummary:
+    item = _as_mapping(value, "ppo_epoch_summary")
+    integer_fields = {"epoch_index", "minibatch_count", "transition_count", "optimizer_steps_cumulative"}
+    kwargs: dict[str, Any] = {}
+    for field in fields(PPOEpochSummary):
+        if field.name not in item:
+            raise ValueError(f"ppo_epoch_summary 缺少字段：{field.name}")
+        raw = item[field.name]
+        kwargs[field.name] = int(raw) if field.name in integer_fields else float(raw)
+    return PPOEpochSummary(**kwargs)
+
+
+def _formal_update_summary_from_builtin(value: Any) -> FormalPPOUpdateSummary:
+    """从JSON/checkpoint builtin重建FormalPPOUpdateSummary。"""
+
+    item = _as_mapping(value, "ppo_update_summary")
+    required = {
+        field.name
+        for field in fields(FormalPPOUpdateSummary)
+        if field.name != "epoch_summaries"
+    }
+    missing = sorted(required - set(item))
+    if missing:
+        raise ValueError(f"ppo_update_summary 缺少字段：{missing}")
+    epoch_values = item.get("epoch_summaries")
+    if not isinstance(epoch_values, list):
+        raise ValueError("ppo_update_summary.epoch_summaries 必须是数组。")
+    return FormalPPOUpdateSummary(
+        update_epochs=int(item["update_epochs"]),
+        num_minibatches=int(item["num_minibatches"]),
+        minibatch_size=int(item["minibatch_size"]),
+        optimizer_steps=int(item["optimizer_steps"]),
+        policy_loss_mean=float(item["policy_loss_mean"]),
+        value_loss_mean=float(item["value_loss_mean"]),
+        entropy_mean=float(item["entropy_mean"]),
+        approx_kl_mean=float(item["approx_kl_mean"]),
+        clip_fraction_mean=float(item["clip_fraction_mean"]),
+        gradient_norm_mean=float(item["gradient_norm_mean"]),
+        gradient_finite=bool(item["gradient_finite"]),
+        old_log_probs_frozen=bool(item["old_log_probs_frozen"]),
+        old_values_frozen=bool(item["old_values_frozen"]),
+        advantages_frozen=bool(item["advantages_frozen"]),
+        returns_frozen=bool(item["returns_frozen"]),
+        each_transition_once_per_epoch=bool(item["each_transition_once_per_epoch"]),
+        epoch_summaries=tuple(_ppo_epoch_summary_from_builtin(entry) for entry in epoch_values),
+    )
+
+
+def _canonical_training_history(value: Any) -> dict[str, Any]:
+    """严格校验并规范化history，避免JSON mirror成为resume权威。"""
+
+    source = _as_mapping(value, "training_history")
+    if int(source.get("schema_version", -1)) != TRAINING_HISTORY_SCHEMA_VERSION:
+        raise ValueError("training_history schema_version 不兼容。")
+    raw_episodes = source.get("episodes")
+    if not isinstance(raw_episodes, list):
+        raise ValueError("training_history.episodes 必须是数组。")
+
+    records: list[dict[str, Any]] = []
+    for expected_index, raw_record in enumerate(raw_episodes):
+        record = _as_mapping(raw_record, f"training_history.episodes[{expected_index}]")
+        episode_summary = _training_episode_summary_from_builtin(record.get("training_episode_summary"))
+        update_summary = _formal_update_summary_from_builtin(record.get("ppo_update_summary"))
+        record_index = int(record.get("episode_index", episode_summary.episode_index))
+        if record_index != expected_index or episode_summary.episode_index != expected_index:
+            raise ValueError("training_history episode_index 必须从0连续递增。")
+        records.append(_training_episode_history_record(episode_summary, update_summary))
+
+    completed_episodes = int(source.get("completed_episodes", -1))
+    policy_version = int(source.get("policy_version", -1))
+    optimizer_step_count = int(source.get("optimizer_step_count", -1))
+    if completed_episodes != len(records):
+        raise ValueError("training_history.completed_episodes 与episodes数量不一致。")
+    if completed_episodes < 0 or policy_version < 0 or optimizer_step_count < 0:
+        raise ValueError("training_history counters 不能为负。")
+    return _build_training_history(records, policy_version, optimizer_step_count)
+
+
+def _history_episode_summaries(history: dict[str, Any]) -> tuple[TrainingEpisodeSummary, ...]:
+    """从canonical history提取Figure 1可直接消费的summary序列。"""
+
+    return tuple(
+        _training_episode_summary_from_builtin(record["training_episode_summary"])
+        for record in history["episodes"]
+    )
+
+
+def load_training_episode_summaries(run_dir: str | Path) -> tuple[TrainingEpisodeSummary, ...]:
+    """读取training_history.json并返回Figure 1可直接消费的summary。"""
+
+    history_path = Path(run_dir) / TRAINING_HISTORY_FILENAME
+    if not history_path.exists():
+        raise FileNotFoundError(f"训练历史文件不存在：{history_path}")
+    try:
+        with history_path.open("r", encoding="utf-8") as stream:
+            raw_history = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取训练历史文件：{history_path}") from exc
+    history = _canonical_training_history(raw_history)
+    return _history_episode_summaries(history)
+
+
+def _run_dir_paths(run_dir: str | Path) -> tuple[Path, Path, Path]:
+    path = Path(run_dir)
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"run_dir 不是目录：{path}")
+    return path, path / LATEST_CHECKPOINT_FILENAME, path / TRAINING_HISTORY_FILENAME
+
+
+def _prepare_formal_run_dir(run_dir: str | Path, resume: bool) -> tuple[Path, Path, Path]:
+    """准备显式run_dir；resume=False不覆盖已有正式run。"""
+
+    path, checkpoint_path, history_path = _run_dir_paths(run_dir)
+    if resume:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"resume=True 但权威checkpoint不存在：{checkpoint_path}"
+            )
+        return path, checkpoint_path, history_path
+    if checkpoint_path.exists() or history_path.exists():
+        raise FileExistsError(
+            "RUN_DIRECTORY_NOT_EMPTY: run_dir 已包含latest_checkpoint.pt或training_history.json，"
+            "请使用resume=True或更换run_dir。"
+        )
+    path.mkdir(parents=True, exist_ok=True)
+    return path, checkpoint_path, history_path
+
+
+def _atomic_torch_save(payload: dict[str, Any], final_path: Path) -> None:
+    """在同目录临时文件完成torch.save后再原子替换。"""
+
+    _require_torch()
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{final_path.name}.",
+        suffix=".tmp",
+        dir=str(final_path.parent),
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, final_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _atomic_json_save(payload: dict[str, Any], final_path: Path) -> None:
+    """在同目录临时JSON完成flush/fsync后再原子替换。"""
+
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{final_path.name}.",
+        suffix=".tmp",
+        dir=str(final_path.parent),
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            descriptor = -1
+            json.dump(
+                summary_to_builtin(payload),
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, final_path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _synchronize_training_history_json(
+    history_path: Path,
+    checkpoint_history: dict[str, Any],
+) -> None:
+    """以checkpoint history为准，必要时重写JSON mirror。"""
+
+    rewrite = not history_path.exists()
+    if history_path.exists():
+        try:
+            with history_path.open("r", encoding="utf-8") as stream:
+                json_history = json.load(stream)
+            rewrite = json_history != checkpoint_history
+            if rewrite:
+                warnings.warn(
+                    "TRAINING_HISTORY_JSON_INCONSISTENT: 以checkpoint history为准并重新同步JSON。",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        except (OSError, json.JSONDecodeError, ValueError):
+            rewrite = True
+            warnings.warn(
+                "TRAINING_HISTORY_JSON_INVALID: 以checkpoint history为准并重新生成JSON。",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    if rewrite:
+        _atomic_json_save(checkpoint_history, history_path)
+
+
+def _policy_device(policy: Any) -> Any:
+    _require_torch()
+    try:
+        return next(policy.parameters()).device
+    except StopIteration as exc:
+        raise ValueError("policy 必须包含至少一个参数。") from exc
+
+
+def _capture_rng_states(policy: Any, rng_generator: Any) -> dict[str, Any]:
+    """保存正式训练实际会用到的Python/NumPy/torch RNG状态。"""
+
+    _require_torch()
+    states: dict[str, Any] = {
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_cpu_rng_state": torch.get_rng_state().clone(),
+        "torch_generator_state": None,
+        "torch_generator_device": None,
+        "torch_cuda_rng_state_all": None,
+    }
+    if rng_generator is not None:
+        if not hasattr(rng_generator, "get_state") or not hasattr(rng_generator, "set_state"):
+            raise TypeError("rng_generator 必须是支持get_state/set_state的torch.Generator。")
+        states["torch_generator_state"] = rng_generator.get_state().clone()
+        states["torch_generator_device"] = str(getattr(rng_generator, "device", "cpu"))
+
+    device = _policy_device(policy)
+    if getattr(device, "type", str(device)) == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("policy位于CUDA但当前torch.cuda不可用，无法保存CUDA RNG。")
+        states["torch_cuda_rng_state_all"] = [state.clone() for state in torch.cuda.get_rng_state_all()]
+    return states
+
+
+def _restore_rng_states(policy: Any, rng_generator: Any, states: dict[str, Any]) -> None:
+    """在policy/optimizer加载完成后恢复RNG，之后才允许采样或shuffle。"""
+
+    _require_torch()
+    required = {"python_random_state", "numpy_random_state", "torch_cpu_rng_state"}
+    missing = sorted(required - set(states))
+    if missing:
+        raise RuntimeError(f"CHECKPOINT_COMPATIBILITY_ERROR: checkpoint缺少RNG字段：{missing}")
+    random.setstate(states["python_random_state"])
+    np.random.set_state(states["numpy_random_state"])
+    torch.set_rng_state(states["torch_cpu_rng_state"])
+
+    cuda_states = states.get("torch_cuda_rng_state_all")
+    device = _policy_device(policy)
+    if cuda_states is not None and getattr(device, "type", str(device)) == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: checkpoint需要CUDA RNG但当前不可用。")
+        torch.cuda.set_rng_state_all(cuda_states)
+
+    generator_state = states.get("torch_generator_state")
+    if generator_state is not None:
+        if rng_generator is None or not hasattr(rng_generator, "set_state"):
+            raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: checkpoint需要恢复torch Generator。")
+        rng_generator.set_state(generator_state)
+
+
+def _seed_new_formal_run(seed: int, rng_generator: Any) -> None:
+    """新run自动构造policy时使用配置seed；不在模块import时改全局RNG。"""
+
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    ppo_trigger_policy.set_torch_seed(int(seed))
+    rng_generator.manual_seed(int(seed))
+
+
+def _build_formal_policy_and_optimizer(ctx: TrainingSanityContext) -> tuple[Any, Any]:
+    """按当前config构造policy和Adam；不加载checkpoint、不执行step。"""
+
+    _require_torch()
+    training_cfg = ppo_update.ppo_training_config_status(ctx.cfg)
+    if not training_cfg.can_run_optimizer_step or training_cfg.learning_rate is None:
+        raise RuntimeError(f"PPO update超参数缺失：{training_cfg.missing_required_for_step}")
+    policy = ppo_trigger_policy.ConditionalTriggerActorCritic(
+        ctx.observation_spec.observation_dim,
+        ctx.action_spec,
+        **ppo_trigger_policy.ppo_network_config_from_project(ctx.cfg),
+    )
+    optimizer = torch.optim.Adam(policy.parameters(), lr=float(training_cfg.learning_rate))
+    return policy, optimizer
+
+
+def _formal_compatibility_metadata(
+    ctx: TrainingSanityContext,
+    protocol: FormalTrainingProtocol,
+    policy: Any,
+) -> dict[str, Any]:
+    """构造最小但足够阻止错误resume的结构兼容metadata。"""
+
+    ppo_cfg = ppo_update.ppo_training_config_status(ctx.cfg)
+    if not ppo_cfg.can_run_optimizer_step or ppo_cfg.max_grad_norm is None:
+        raise RuntimeError(f"PPO update超参数缺失：{ppo_cfg.missing_required_for_step}")
+    network_cfg = ppo_trigger_policy.ppo_network_config_from_project(ctx.cfg)
+    return {
+        "action": {
+            "labels": list(ctx.action_spec.labels),
+            "action_dim": int(ctx.action_spec.action_dim),
+            "cache_node_ids": list(ctx.action_spec.cache_node_ids),
+            "uav_ids": list(ctx.action_spec.uav_ids),
+            "ordering": "cache_triggers_then_uav_movement_triggers",
+        },
+        "observation": {
+            "observation_dim": int(ctx.observation_spec.observation_dim),
+            "cache_node_ids": list(ctx.observation_spec.cache_node_ids),
+            "service_ids": list(ctx.observation_spec.service_ids),
+            "uav_ids": list(ctx.observation_spec.uav_ids),
+            "vehicle_ids": list(ctx.observation_spec.vehicle_ids),
+        },
+        "formal_protocol": {
+            "steps_per_episode": int(protocol.steps_per_episode),
+            "first_origin": int(protocol.episode_origin_indices[0]),
+            "last_origin": int(protocol.episode_origin_indices[-1]),
+            "first_slot": int(protocol.episode_slots[0]),
+            "last_slot": int(protocol.episode_slots[-1]),
+            "first_time_s": float(protocol.episode_times_s[0]),
+            "last_time_s": float(protocol.episode_times_s[-1]),
+            "update_epochs": int(protocol.update_epochs),
+            "num_minibatches": int(protocol.num_minibatches),
+            "minibatch_size": int(protocol.minibatch_size),
+        },
+        "ppo_hyperparameters": {
+            "gamma": float(ctx.gamma),
+            "gae_lambda": float(ctx.gae_lambda),
+            "clip_epsilon": float(ppo_cfg.clip_epsilon),
+            "learning_rate": float(ppo_cfg.learning_rate),
+            "value_loss_coefficient": float(ppo_cfg.value_loss_coefficient),
+            "entropy_coefficient": float(ppo_cfg.entropy_coefficient),
+            "max_grad_norm": float(ppo_cfg.max_grad_norm),
+            "update_epochs": int(protocol.update_epochs),
+            "num_minibatches": int(protocol.num_minibatches),
+        },
+        "experiment_seed": int(project_config.get_config_value(ctx.cfg, "experiment.seed")),
+        "policy_network": {
+            "class": type(policy).__name__,
+            "observation_dim": int(getattr(policy, "observation_dim")),
+            "action_dim": int(getattr(policy, "action_dim")),
+            "hidden_sizes": [int(value) for value in network_cfg["hidden_sizes"]],
+            "autoregressive_hidden_size": int(network_cfg["autoregressive_hidden_size"]),
+        },
+    }
+
+
+def _metadata_mismatch(expected: Any, actual: Any, path: str = "metadata") -> str | None:
+    """返回第一个兼容性差异；浮点参数使用极小容差比较。"""
+
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        if set(expected) != set(actual):
+            return f"{path} keys不一致：expected={sorted(expected)}, actual={sorted(actual)}"
+        for key in expected:
+            mismatch = _metadata_mismatch(expected[key], actual[key], f"{path}.{key}")
+            if mismatch:
+                return mismatch
+        return None
+    if isinstance(expected, (list, tuple)) and isinstance(actual, (list, tuple)):
+        if len(expected) != len(actual):
+            return f"{path}长度不一致：expected={len(expected)}, actual={len(actual)}"
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            mismatch = _metadata_mismatch(left, right, f"{path}[{index}]")
+            if mismatch:
+                return mismatch
+        return None
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool) and isinstance(actual, (int, float)) and not isinstance(actual, bool):
+        if not math.isclose(float(expected), float(actual), rel_tol=0.0, abs_tol=1e-12):
+            return f"{path}不一致：expected={expected}, actual={actual}"
+        return None
+    if expected != actual:
+        return f"{path}不一致：expected={expected}, actual={actual}"
+    return None
+
+
+def _checkpoint_payload(
+    policy: Any,
+    optimizer: Any,
+    policy_version: int,
+    optimizer_step_count: int,
+    history: dict[str, Any],
+    compatibility: dict[str, Any],
+    rng_states: dict[str, Any],
+) -> dict[str, Any]:
+    """构造不含RolloutBatch/梯度/候选trace的权威checkpoint。"""
+
+    return {
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "policy_state_dict": policy.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "policy_version": int(policy_version),
+        "optimizer_step_count": int(optimizer_step_count),
+        "completed_episodes": int(history["completed_episodes"]),
+        "training_history": summary_to_builtin(history),
+        "compatibility": summary_to_builtin(compatibility),
+        "rng_states": rng_states,
+    }
+
+
+def _load_formal_checkpoint(
+    checkpoint_path: Path,
+    policy: Any,
+    optimizer: Any,
+    rng_generator: Any,
+    expected_compatibility: dict[str, Any],
+) -> tuple[dict[str, Any], int, int]:
+    """按policy/optimizer构造完成后加载checkpoint并恢复RNG。"""
+
+    _require_torch()
+    try:
+        try:
+            payload = torch.load(
+                checkpoint_path,
+                map_location=_policy_device(policy),
+                weights_only=False,
+            )
+        except TypeError:  # 兼容较旧PyTorch的torch.load签名
+            payload = torch.load(checkpoint_path, map_location=_policy_device(policy))
+    except Exception as exc:
+        raise RuntimeError(f"无法读取checkpoint：{checkpoint_path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: checkpoint顶层必须是dict。")
+    if int(payload.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
+        raise RuntimeError(
+            "CHECKPOINT_COMPATIBILITY_ERROR: checkpoint_version不支持。"
+        )
+    mismatch = _metadata_mismatch(expected_compatibility, payload.get("compatibility"))
+    if mismatch:
+        raise RuntimeError(f"CHECKPOINT_COMPATIBILITY_ERROR: {mismatch}")
+
+    try:
+        history = _canonical_training_history(payload.get("training_history"))
+    except (TypeError, ValueError, KeyError) as exc:
+        raise RuntimeError(f"CHECKPOINT_COMPATIBILITY_ERROR: training_history无效：{exc}") from exc
+    policy_version = int(payload.get("policy_version", -1))
+    optimizer_step_count = int(payload.get("optimizer_step_count", -1))
+    completed_episodes = int(payload.get("completed_episodes", -1))
+    if (
+        policy_version != int(history["policy_version"])
+        or optimizer_step_count != int(history["optimizer_step_count"])
+        or completed_episodes != int(history["completed_episodes"])
+    ):
+        raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: checkpoint counters与training_history不一致。")
+
+    try:
+        policy.load_state_dict(payload["policy_state_dict"])
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+    except Exception as exc:
+        raise RuntimeError(f"CHECKPOINT_COMPATIBILITY_ERROR: policy/optimizer state不兼容：{exc}") from exc
+    rng_states = payload.get("rng_states")
+    if not isinstance(rng_states, dict):
+        raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: rng_states缺失或类型错误。")
+    _restore_rng_states(policy, rng_generator, rng_states)
+    return history, policy_version, optimizer_step_count
 
 
 def _require_torch() -> None:
@@ -523,6 +1143,47 @@ def collect_formal_episode_rollout(
     return batch
 
 
+def _formal_raw_rollout_statistics(batch: ppo_rollout.RolloutBatch) -> dict[str, float]:
+    """从原始 Python float transition 统计正式 episode summary 并校验恒等式。
+
+    ``RolloutBatch.rewards`` 必须继续是 float32，供后续 GAE/PPO 使用；正式
+    episode 的累计 G/Q/cost 则从 transition 的原始 Python float 读取，避免
+    长序列 float32 累计误差决定 episode invariant。该函数不重新定义 reward。
+    """
+
+    transitions = batch.transitions
+    if not transitions:
+        raise ValueError("正式 rollout 不能为空。")
+    raw_reward_sum = math.fsum(float(item.reward) for item in transitions)
+    raw_actual_q_sum = math.fsum(float(item.actual_task_utility) for item in transitions)
+    raw_cache_cost_sum = math.fsum(float(item.cache_cost) for item in transitions)
+    raw_movement_cost_sum = math.fsum(float(item.movement_cost) for item in transitions)
+    expected_reward_sum = raw_actual_q_sum - raw_cache_cost_sum - raw_movement_cost_sum
+    if not math.isclose(
+        raw_reward_sum,
+        expected_reward_sum,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise AssertionError(
+            "formal episode raw G identity failed: "
+            f"sum_G={raw_reward_sum}, expected={expected_reward_sum}, "
+            f"error={raw_reward_sum - expected_reward_sum}"
+        )
+
+    # 仅作mixed-precision诊断；不能参与正式episode PASS/FAIL判定。
+    batch_reward_sum_float32 = float(np.sum(batch.rewards, dtype=np.float32))
+    return {
+        "raw_reward_sum": float(raw_reward_sum),
+        "raw_reward_mean": float(raw_reward_sum / len(transitions)),
+        "raw_actual_q_sum": float(raw_actual_q_sum),
+        "raw_cache_cost_sum": float(raw_cache_cost_sum),
+        "raw_movement_cost_sum": float(raw_movement_cost_sum),
+        "batch_reward_sum_float32": batch_reward_sum_float32,
+        "batch_vs_raw_reward_sum_error": float(batch_reward_sum_float32 - raw_reward_sum),
+    }
+
+
 def _slice_rollout_batch(
     batch: ppo_rollout.RolloutBatch,
     indices: np.ndarray,
@@ -555,6 +1216,68 @@ def _torch_randperm_numpy(size: int, rng_generator: Any) -> np.ndarray:
     else:
         perm = torch.randperm(size, generator=rng_generator)
     return perm.detach().cpu().numpy().astype(np.int64)
+
+
+def _aggregate_epoch_diagnostics(
+    epoch_index: int,
+    minibatch_diagnostics: list[dict[str, float | int]],
+    pre_clipping_grad_norms: list[float],
+    optimizer_steps_cumulative: int,
+) -> PPOEpochSummary:
+    """仅用当前epoch已产生的scalar诊断值构造摘要。"""
+
+    if not minibatch_diagnostics:
+        raise ValueError("epoch诊断不能为空。")
+    if len(minibatch_diagnostics) != len(pre_clipping_grad_norms):
+        raise ValueError("epoch minibatch诊断与gradient norm数量不一致。")
+
+    transition_count = sum(int(item["transition_count"]) for item in minibatch_diagnostics)
+    if transition_count <= 0:
+        raise ValueError("epoch transition_count必须大于0。")
+
+    def weighted_mean(field: str) -> float:
+        return float(
+            math.fsum(
+                float(item[field]) * int(item["transition_count"])
+                for item in minibatch_diagnostics
+            )
+            / transition_count
+        )
+
+    for item in minibatch_diagnostics:
+        for field in (
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "total_loss",
+            "approx_kl",
+            "clip_fraction",
+            "ratio_mean",
+            "ratio_min",
+            "ratio_max",
+        ):
+            if not math.isfinite(float(item[field])):
+                raise ValueError(f"epoch诊断字段 {field} 出现非finite值。")
+    if not all(math.isfinite(float(value)) for value in pre_clipping_grad_norms):
+        raise ValueError("epoch pre-clipping gradient norm出现非finite值。")
+
+    return PPOEpochSummary(
+        epoch_index=int(epoch_index),
+        policy_loss_mean=weighted_mean("policy_loss"),
+        value_loss_mean=weighted_mean("value_loss"),
+        entropy_mean=weighted_mean("entropy"),
+        total_loss_mean=weighted_mean("total_loss"),
+        approx_kl_mean=weighted_mean("approx_kl"),
+        clip_fraction_mean=weighted_mean("clip_fraction"),
+        ratio_mean=weighted_mean("ratio_mean"),
+        ratio_min=float(min(float(item["ratio_min"]) for item in minibatch_diagnostics)),
+        ratio_max=float(max(float(item["ratio_max"]) for item in minibatch_diagnostics)),
+        pre_clipping_grad_norm_mean=float(math.fsum(pre_clipping_grad_norms) / len(pre_clipping_grad_norms)),
+        pre_clipping_grad_norm_max=float(max(pre_clipping_grad_norms)),
+        minibatch_count=int(len(minibatch_diagnostics)),
+        transition_count=int(transition_count),
+        optimizer_steps_cumulative=int(optimizer_steps_cumulative),
+    )
 
 
 def update_policy_on_rollout(
@@ -604,6 +1327,7 @@ def update_policy_on_rollout(
     approx_kls: list[float] = []
     clip_fractions: list[float] = []
     gradient_norms: list[float] = []
+    epoch_summaries: list[PPOEpochSummary] = []
     gradient_finite_all = True
     each_transition_once_per_epoch = True
     optimizer_steps = 0
@@ -614,6 +1338,8 @@ def update_policy_on_rollout(
         each_transition_once_per_epoch = each_transition_once_per_epoch and bool(
             np.array_equal(np.sort(shuffled), all_indices)
         )
+        epoch_minibatch_diagnostics: list[dict[str, float | int]] = []
+        epoch_pre_clipping_grad_norms: list[float] = []
         for start in range(0, batch_size, minibatch_size):
             minibatch_indices = shuffled[start : start + minibatch_size]
             if len(minibatch_indices) != minibatch_size:
@@ -636,14 +1362,37 @@ def update_policy_on_rollout(
             if not gradient_finite:
                 raise FloatingPointError("gradient 出现 NaN/Inf。")
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), float(training_cfg.max_grad_norm))
-            gradient_norms.append(float(grad_norm.detach().cpu()))
+            pre_clipping_grad_norm = float(grad_norm.detach().cpu())
+            epoch_pre_clipping_grad_norms.append(pre_clipping_grad_norm)
+            gradient_norms.append(pre_clipping_grad_norm)
+            minibatch_diagnostics = {
+                "transition_count": int(len(minibatch_indices)),
+                "policy_loss": float(loss.policy_loss.detach().cpu()),
+                "value_loss": float(loss.value_loss.detach().cpu()),
+                "entropy": float(loss.entropy.detach().cpu()),
+                "total_loss": float(loss.total_loss.detach().cpu()),
+                "approx_kl": float(loss.approx_kl),
+                "clip_fraction": float(loss.clip_fraction),
+                "ratio_mean": float(loss.ratio_mean),
+                "ratio_min": float(loss.ratio_min),
+                "ratio_max": float(loss.ratio_max),
+            }
+            epoch_minibatch_diagnostics.append(minibatch_diagnostics)
             optimizer.step()
             optimizer_steps += 1
-            policy_losses.append(float(loss.policy_loss.detach().cpu()))
-            value_losses.append(float(loss.value_loss.detach().cpu()))
-            entropies.append(float(loss.entropy.detach().cpu()))
-            approx_kls.append(float(loss.approx_kl))
-            clip_fractions.append(float(loss.clip_fraction))
+            policy_losses.append(minibatch_diagnostics["policy_loss"])
+            value_losses.append(minibatch_diagnostics["value_loss"])
+            entropies.append(minibatch_diagnostics["entropy"])
+            approx_kls.append(minibatch_diagnostics["approx_kl"])
+            clip_fractions.append(minibatch_diagnostics["clip_fraction"])
+        epoch_summaries.append(
+            _aggregate_epoch_diagnostics(
+                epoch_index=_epoch + 1,
+                minibatch_diagnostics=epoch_minibatch_diagnostics,
+                pre_clipping_grad_norms=epoch_pre_clipping_grad_norms,
+                optimizer_steps_cumulative=optimizer_steps,
+            )
+        )
 
     old_log_probs_frozen = bool(np.array_equal(rollout_batch.old_log_probs, frozen_old_log_probs))
     old_values_frozen = bool(np.array_equal(rollout_batch.old_values, frozen_old_values))
@@ -670,6 +1419,7 @@ def update_policy_on_rollout(
         advantages_frozen=advantages_frozen,
         returns_frozen=returns_frozen,
         each_transition_once_per_epoch=each_transition_once_per_epoch,
+        epoch_summaries=tuple(epoch_summaries),
     )
 
 
@@ -705,13 +1455,22 @@ def run_formal_ppo_training(
     optimizer: Any | None = None,
     rng_generator: Any | None = None,
     execute: bool = False,
+    run_dir: str | Path | None = None,
+    resume: bool = False,
 ) -> FormalTrainingRunPlan | FormalTrainingRunResult:
     """正式PPO训练run入口。
 
     默认 execute=False：只构造并返回计划，不执行environment、不backward、不optimizer.step。
-    若未来显式 execute=True，caller必须传入已创建好的policy和optimizer；optimizer state
-    跨episode/rollout/epoch/minibatch保持，不在本函数内部重新创建Adam。
+    execute=True时，run_dir必须由caller显式提供；每个完整episode完成后才保存checkpoint。
+    resume=True时，num_episodes表示该run希望达到的总完成episode数，而不是额外episode数。
+    若未由caller传入policy/optimizer，本函数按当前config构造它们；resume加载顺序仍为：
+    构造policy/optimizer -> load state_dict -> 恢复RNG -> 才开始下一episode。
     """
+
+    if execute and run_dir is None:
+        raise ValueError("execute=True 时必须显式提供 run_dir；不会默认写入data/generated或当前目录。")
+    if resume and not execute:
+        raise ValueError("resume=True 只允许用于 execute=True 的正式训练run。")
 
     ctx = _build_context(config_path)
     protocol = build_formal_training_protocol(ctx.scenarios, ctx.cfg)
@@ -720,42 +1479,113 @@ def run_formal_ppo_training(
     if not execute:
         return plan
     _require_torch()
-    if policy is None or optimizer is None:
-        raise ValueError("execute=True 时必须由caller显式传入 policy 和 optimizer。")
 
+    _formal_run_dir, checkpoint_path, history_path = _prepare_formal_run_dir(run_dir, resume)
+    seed = int(project_config.get_config_value(ctx.cfg, "experiment.seed"))
+
+    if (policy is None) != (optimizer is None):
+        raise ValueError("execute=True 时 policy 和 optimizer 必须同时提供或同时省略。")
+
+    if rng_generator is None:
+        rng_generator = torch.Generator()
+        if not resume:
+            rng_generator.manual_seed(seed)
+    elif not hasattr(rng_generator, "get_state") or not hasattr(rng_generator, "set_state"):
+        raise TypeError("rng_generator 必须是支持get_state/set_state的torch.Generator。")
+
+    if policy is None and optimizer is None:
+        # 初始化可能消耗RNG；resume时此后会先load state_dict，最后再恢复checkpoint RNG。
+        _seed_new_formal_run(seed, rng_generator)
+        policy, optimizer = _build_formal_policy_and_optimizer(ctx)
+
+    compatibility = _formal_compatibility_metadata(ctx, protocol, policy)
+    resumed = bool(resume)
+    if resume:
+        history, policy_version, optimizer_step_count = _load_formal_checkpoint(
+            checkpoint_path,
+            policy,
+            optimizer,
+            rng_generator,
+            compatibility,
+        )
+        # JSON只是人类可读mirror；无论它落后、缺失还是声称更新，都以checkpoint为准。
+        _synchronize_training_history_json(history_path, history)
+    else:
+        history = _empty_training_history()
+        policy_version = 0
+        optimizer_step_count = 0
+
+    records = list(history["episodes"])
+    completed_episodes = int(history["completed_episodes"])
     episode_summaries: list[TrainingEpisodeSummary] = []
-    policy_version = 0
-    optimizer_step_count = 0
-    for episode_index in range(num_episodes):
+    for episode_index in range(completed_episodes, num_episodes):
         batch = collect_formal_episode_rollout(policy, ctx, protocol)
+        raw_stats = _formal_raw_rollout_statistics(batch)
         update = update_policy_on_rollout(policy, optimizer, batch, ctx.cfg, rng_generator)
+        if update.optimizer_steps != int(protocol.expected_optimizer_steps_per_rollout):
+            raise RuntimeError(
+                "完整episode的PPO optimizer steps不符合FormalTrainingProtocol，"
+                "不得写入completed history。"
+            )
+        if len(update.epoch_summaries) != int(protocol.update_epochs):
+            raise RuntimeError(
+                "FormalPPOUpdateSummary epoch_summaries不完整，不得写入completed history。"
+            )
         policy_version_before = policy_version
         policy_version += 1
         optimizer_step_count += update.optimizer_steps
-        episode_summaries.append(
-            TrainingEpisodeSummary(
-                episode_index=episode_index,
-                policy_version_before=policy_version_before,
-                policy_version_after=policy_version,
-                rollout_reward_sum=float(np.sum(batch.rewards)),
-                rollout_reward_mean=float(np.mean(batch.rewards)),
-                actual_q_sum=float(sum(item.actual_task_utility for item in batch.transitions)),
-                cache_cost_sum=float(sum(item.cache_cost for item in batch.transitions)),
-                movement_cost_sum=float(sum(item.movement_cost for item in batch.transitions)),
-                policy_loss_mean=update.policy_loss_mean,
-                value_loss_mean=update.value_loss_mean,
-                entropy_mean=update.entropy_mean,
-                approx_kl_mean=update.approx_kl_mean,
-                clip_fraction_mean=update.clip_fraction_mean,
-                gradient_norm_mean=update.gradient_norm_mean,
-                optimizer_steps=update.optimizer_steps,
-            )
+        episode_summary = TrainingEpisodeSummary(
+            episode_index=episode_index,
+            policy_version_before=policy_version_before,
+            policy_version_after=policy_version,
+            rollout_reward_sum=raw_stats["raw_reward_sum"],
+            rollout_reward_mean=raw_stats["raw_reward_mean"],
+            batch_reward_sum_float32=raw_stats["batch_reward_sum_float32"],
+            batch_vs_raw_reward_sum_error=raw_stats["batch_vs_raw_reward_sum_error"],
+            actual_q_sum=raw_stats["raw_actual_q_sum"],
+            cache_cost_sum=raw_stats["raw_cache_cost_sum"],
+            movement_cost_sum=raw_stats["raw_movement_cost_sum"],
+            policy_loss_mean=update.policy_loss_mean,
+            value_loss_mean=update.value_loss_mean,
+            entropy_mean=update.entropy_mean,
+            approx_kl_mean=update.approx_kl_mean,
+            clip_fraction_mean=update.clip_fraction_mean,
+            gradient_norm_mean=update.gradient_norm_mean,
+            optimizer_steps=update.optimizer_steps,
         )
+        episode_summaries.append(episode_summary)
+
+        # 只有完整episode、完整PPO update和summary全部成功后才进入history。
+        records.append(_training_episode_history_record(episode_summary, update))
+        history = _build_training_history(records, policy_version, optimizer_step_count)
+        payload = _checkpoint_payload(
+            policy,
+            optimizer,
+            policy_version,
+            optimizer_step_count,
+            history,
+            compatibility,
+            _capture_rng_states(policy, rng_generator),
+        )
+        # checkpoint先写；JSON mirror失败时旧checkpoint/新checkpoint都仍是权威源。
+        _atomic_torch_save(payload, checkpoint_path)
+        try:
+            _atomic_json_save(history, history_path)
+        except Exception as exc:  # checkpoint已经成功，保留其权威性供下次resume同步
+            warnings.warn(
+                f"TRAINING_HISTORY_JSON_MIRROR_WRITE_FAILED: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     return FormalTrainingRunResult(
         plan=plan,
         episode_summaries=episode_summaries,
         final_policy_version=policy_version,
         optimizer_step_count=optimizer_step_count,
+        completed_episodes=int(history["completed_episodes"]),
+        training_history=history,
+        resumed=resumed,
     )
 
 
@@ -783,9 +1613,9 @@ def evaluate_formal_episode(
     cache_trigger_counts = {label: 0 for label in ctx.action_spec.labels[: len(ctx.action_spec.cache_node_ids)]}
     uav_trigger_counts = {label: 0 for label in ctx.action_spec.labels[len(ctx.action_spec.cache_node_ids) :]}
     rewards: list[float] = []
-    actual_q_sum = 0.0
-    cache_cost_sum = 0.0
-    movement_cost_sum = 0.0
+    actual_q_values: list[float] = []
+    cache_cost_values: list[float] = []
+    movement_cost_values: list[float] = []
     arrived_task_count = 0
     cache_service_available_task_count = 0
     cloud_execution_task_count = 0
@@ -879,9 +1709,9 @@ def evaluate_formal_episode(
             if not math.isclose(reward, actual_q - cache_cost - movement_cost, rel_tol=1e-12, abs_tol=1e-12):
                 raise AssertionError("evaluation reward identity G=Q_actual-C_ca-C_q 失败。")
             rewards.append(reward)
-            actual_q_sum += actual_q
-            cache_cost_sum += cache_cost
-            movement_cost_sum += movement_cost
+            actual_q_values.append(actual_q)
+            cache_cost_values.append(cache_cost)
+            movement_cost_values.append(movement_cost)
             for index, trigger in enumerate(sample.cache_triggers.astype(int).tolist()):
                 cache_trigger_counts[ctx.action_spec.labels[index]] += int(trigger)
             cache_count = len(ctx.action_spec.cache_node_ids)
@@ -890,10 +1720,23 @@ def evaluate_formal_episode(
             previous_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
             previous_uav = dict(result.next_uav_positions or {})
 
-    cumulative_g = float(np.sum(rewards))
-    identity_error = abs(cumulative_g - (actual_q_sum - cache_cost_sum - movement_cost_sum))
-    if identity_error > 1e-9:
-        raise AssertionError("evaluation episode级 G 恒等式失败。")
+    cumulative_g = float(math.fsum(rewards))
+    actual_q_sum = float(math.fsum(actual_q_values))
+    cache_cost_sum = float(math.fsum(cache_cost_values))
+    movement_cost_sum = float(math.fsum(movement_cost_values))
+    expected_cumulative_g = actual_q_sum - cache_cost_sum - movement_cost_sum
+    identity_error = abs(cumulative_g - expected_cumulative_g)
+    if not math.isclose(
+        cumulative_g,
+        expected_cumulative_g,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise AssertionError(
+            "evaluation episode级 G 恒等式失败："
+            f"sum_G={cumulative_g}, expected={expected_cumulative_g}, "
+            f"error={cumulative_g - expected_cumulative_g}"
+        )
     if not 0 <= cache_service_available_task_count <= arrived_task_count:
         raise AssertionError("cache_service_available_task_count 超出 arrived_task_count。")
     if not 0 <= cloud_execution_task_count <= arrived_task_count:
@@ -911,7 +1754,7 @@ def evaluate_formal_episode(
     return DeterministicEvaluationSummary(
         num_steps=len(rewards),
         cumulative_system_utility=cumulative_g,
-        mean_system_utility=float(np.mean(rewards)),
+        mean_system_utility=float(cumulative_g / len(rewards)),
         cumulative_actual_task_utility=float(actual_q_sum),
         cumulative_cache_cost=float(cache_cost_sum),
         cumulative_movement_cost=float(movement_cost_sum),
@@ -971,6 +1814,7 @@ def _collect_rollout(
     )
     transitions = batch.transitions
     rewards = [float(item.reward) for item in transitions]
+    raw_stats = _formal_raw_rollout_statistics(batch)
     summary = RolloutSanitySummary(
         rollout_index=rollout_index,
         collected_with_policy_version=policy_version,
@@ -979,11 +1823,11 @@ def _collect_rollout(
         times_s=[float(item.time_s) for item in transitions],
         actions=[item.action_vector.astype(int).tolist() for item in transitions],
         rewards=rewards,
-        reward_sum=float(np.sum(rewards)),
-        reward_mean=float(np.mean(rewards)),
-        actual_q_sum=float(sum(item.actual_task_utility for item in transitions)),
-        cache_cost_sum=float(sum(item.cache_cost for item in transitions)),
-        movement_cost_sum=float(sum(item.movement_cost for item in transitions)),
+        reward_sum=raw_stats["raw_reward_sum"],
+        reward_mean=raw_stats["raw_reward_mean"],
+        actual_q_sum=raw_stats["raw_actual_q_sum"],
+        cache_cost_sum=raw_stats["raw_cache_cost_sum"],
+        movement_cost_sum=raw_stats["raw_movement_cost_sum"],
         step_count=len(transitions),
         final_cache_state=transitions[-1].next_cache_state.copy(),
         final_uav_positions=dict(transitions[-1].next_uav_positions),
