@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "seed": 4401,
+    "capacity_mb": 2000.0,
+    "generation_rule": "uniform_one_service_per_tv",
+    "service_count": 10,
+    "service_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "tv_count": 9,
+    "tv_ids": [
+      "12",
+      "30",
+      "40",
+      "42",
+      "59",
+      "66",
+      "70",
+      "78",
+      "96"
+    ],
+    "fixed_over_episode": true,
+    "uses_future_requests": false,
+    "parameter_basis": "system-scale experimental baseline derived from current service catalog",
+    "service_size_sanity": {
+      "service_count": 10,
+      "min_service": {
+        "service_id": 1,
+        "size_mb": 1244.2733515029472
+      },
+      "second_min_service": {
+        "service_id": 8,
+        "size_mb": 1322.8042118988528
+      },
+      "min_service_size_mb": 1244.2733515029472,
+      "max_service_size_mb": 1890.4713524956487,
+      "min_two_service_sum_mb": 2567.0775634018,
+      "total_service_size_mb": 15851.373045559802,
+      "single_services_fit_count": 10,
+      "all_pairs_exceed_capacity": true
+    }
+  },
+  "vehicles": {
+    "12": {
+      "cached_service_ids": [
+        3
+      ],
+      "used_capacity_mb": 1890.4713524956487
+    },
+    "30": {
+      "cached_service_ids": [
+        3
+      ],
+      "used_capacity_mb": 1890.4713524956487
+    },
+    "40": {
+      "cached_service_ids": [
+        8
+      ],
+      "used_capacity_mb": 1322.8042118988528
+    },
+    "42": {
+      "cached_service_ids": [
+        4
+      ],
+      "used_capacity_mb": 1469.15311654154
+    },
+    "59": {
+      "cached_service_ids": [
+        4
+      ],
+      "used_capacity_mb": 1469.15311654154
+    },
+    "66": {
+      "cached_service_ids": [
+        9
+      ],
+      "used_capacity_mb": 1618.283314976964
+    },
+    "70": {
+      "cached_service_ids": [
+        0
+      ],
+      "used_capacity_mb": 1810.2205499074307
+    },
+    "78": {
+      "cached_service_ids": [
+        2
+      ],
+      "used_capacity_mb": 1528.4271939162288
+    },
+    "96": {
+      "cached_service_ids": [
+        3
+      ],
+      "used_capacity_mb": 1890.4713524956487
+    }
+  }
+}

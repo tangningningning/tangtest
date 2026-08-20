@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Trigger-conditioned Cache + UAV configuration optimizer.
+
+本模块只实现冻结框架中的 Trigger-conditioned Configuration Optimization：
+
+给定外部 cache trigger ``Z_ca(t)``、UAV trigger ``Z_q(t)``、上一时隙真实
+reference state ``C_prev, Q_prev`` 和同一个 prediction scenario slice，求当前
+时隙 configuration ``C(t), Q^U(t)``。
+
+它不决定 trigger，不做 Matching/KKT/PPO，不重新实现 cache/UAV/channel/rate
+公式；只用 block-coordinate 方式交替调用已有 Cache solver 和 UAV solver。
+
+关键约束：reference state 永远是 ``C_prev, Q_prev``，外层搜索中产生的
+``C_current, Q_current`` 只是 candidate state。所有 cache loading cost、
+UAV movement cost、trigger different 检查和最大位移约束都必须相对 reference
+state，而不是相对上一轮 candidate。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+import cache_configuration
+import project_config
+import uav_configuration
+
+
+@dataclass(frozen=True)
+class JointConfigurationResult:
+    previous_cache_state: np.ndarray
+    final_cache_state: np.ndarray
+    previous_uav_positions: dict[str, tuple[float, float]]
+    final_uav_positions: dict[str, tuple[float, float]]
+    cache_triggers: list[int]
+    uav_triggers: dict[str, int]
+    trigger_feasible: bool
+    infeasible_reason: str
+    predictive_utility: float
+    cache_cost: float
+    movement_energy: float
+    movement_cost: float
+    objective_value: float
+    initial_objective: float
+    objective_history: list[float]
+    outer_rounds: int
+    accepted_cache_updates: int
+    accepted_uav_updates: int
+    stop_reason: str
+    cache_result_summary: dict[str, Any]
+    uav_result_summary: dict[str, Any]
+
+
+def _configuration_algorithm_config(project_cfg: dict[str, Any]) -> tuple[int, float]:
+    get = project_config.get_config_value
+    return (
+        int(get(project_cfg, "algorithm.configuration.max_outer_rounds")),
+        float(get(project_cfg, "algorithm.configuration.objective_tolerance")),
+    )
+
+
+def _position_tuples(positions: dict[str, np.ndarray]) -> dict[str, tuple[float, float]]:
+    return {uav_id: (float(xy[0]), float(xy[1])) for uav_id, xy in positions.items()}
+
+
+def _position_arrays(positions: dict[str, Any]) -> dict[str, np.ndarray]:
+    return {
+        str(uav_id): np.asarray(xy, dtype=np.float64).copy()
+        for uav_id, xy in positions.items()
+    }
+
+
+def _cache_cost(
+    previous_cache_state: np.ndarray,
+    cache_state: np.ndarray,
+    cache_triggers: np.ndarray,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+) -> tuple[float, np.ndarray]:
+    """Cache cost 始终由 C_prev -> C_candidate 一次性计算。"""
+
+    return cache_configuration.cache_update_cost(
+        previous_cache_state,
+        cache_state,
+        cache_triggers,
+        service_catalog["service_sizes_mb"],
+        cache_nodes,
+        cache_config,
+    )
+
+
+def _movement_cost(
+    previous_uav_positions: dict[str, np.ndarray],
+    uav_positions: dict[str, np.ndarray],
+    uav_triggers: dict[str, int],
+    scenario_slice: dict[str, Any],
+    cache_state: np.ndarray,
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+) -> dict[str, Any]:
+    """Movement cost 始终由 Q_prev -> Q_candidate 一次性计算。"""
+
+    search_cfg = uav_configuration.uav_search_config_from_project(project_cfg)
+    return uav_configuration.evaluate_uav_configuration(
+        uav_positions,
+        previous_uav_positions,
+        uav_triggers,
+        scenario_slice,
+        cache_state,
+        cache_nodes,
+        cache_config,
+        search_cfg,
+        cache_cost_constant=0.0,
+    )
+
+
+def evaluate_joint_configuration(
+    cache_state: np.ndarray,
+    uav_positions: dict[str, Any],
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    cache_triggers: np.ndarray,
+    uav_triggers: dict[str, int],
+    scenario_slice: dict[str, Any],
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    project_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """唯一 joint evaluator：J = Q_hat - C_ca - C_q。
+
+    Q_hat 通过 cache_configuration.evaluate_fixed_configuration() 计算，以保证
+    Local/SV/RSU/UAV/Cloud surrogate 口径一致。C_ca 和 C_q 都只扣一次，并且
+    始终相对上一时隙真实 reference state。
+    """
+
+    cache_state = np.asarray(cache_state, dtype=np.int8)
+    previous_cache_state = np.asarray(previous_cache_state, dtype=np.int8)
+    uav_pos = _position_arrays(uav_positions)
+    uav_prev = _position_arrays(previous_uav_positions)
+    nodes = uav_configuration.cache_nodes_with_uav_positions(cache_nodes, uav_pos)
+    predictive_utility = cache_configuration.evaluate_fixed_configuration(
+        cache_state,
+        scenario_slice,
+        nodes,
+        cache_config,
+    )["predicted_utility"]
+    cache_cost, cache_energy = _cache_cost(
+        previous_cache_state,
+        cache_state,
+        cache_triggers,
+        service_catalog,
+        cache_nodes,
+        cache_config,
+    )
+    movement_eval = _movement_cost(
+        uav_prev,
+        uav_pos,
+        uav_triggers,
+        scenario_slice,
+        cache_state,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+    )
+    movement_cost = float(movement_eval["movement_cost"])
+    objective = float(predictive_utility - cache_cost - movement_cost)
+    if not math.isfinite(objective):
+        raise AssertionError("joint objective 非 finite。")
+    return {
+        "predictive_utility": float(predictive_utility),
+        "cache_cost": float(cache_cost),
+        "cache_update_energy": cache_energy,
+        "movement_energy": float(movement_eval["movement_energy"]),
+        "movement_cost": movement_cost,
+        "objective_value": objective,
+        "per_uav_displacement_m": movement_eval["per_uav_displacement_m"],
+        "per_uav_movement_cost": movement_eval["per_uav_movement_cost"],
+    }
+
+
+def _cache_summary(result: dict[str, Any]) -> dict[str, Any]:
+    stats = result.get("statistics", {})
+    return {
+        "trigger_feasible": bool(result.get("trigger_feasible", False)),
+        "cache_update_cost": float(result.get("cache_update_cost", 0.0)),
+        "predicted_utility": float(result.get("predicted_utility", 0.0)),
+        "objective": float(result.get("objective", 0.0)),
+        "coordinate_rounds": int(stats.get("num_coordinate_rounds", 0)),
+        "accepted_moves": int(stats.get("num_accepted_moves", 0)),
+        "converged_by_no_improvement": bool(stats.get("converged_by_no_improvement", False)),
+        "hit_max_rounds": bool(stats.get("hit_max_rounds", False)),
+    }
+
+
+def _uav_summary(result: uav_configuration.UavOptimizationResult) -> dict[str, Any]:
+    return {
+        "trigger_feasible": result.trigger_feasible,
+        "movement_energy": result.movement_energy,
+        "movement_cost": result.movement_cost,
+        "objective": result.objective_value,
+        "search_rounds": result.search_rounds,
+        "accepted_improvements": result.accepted_improvements,
+        "stop_reason": result.stop_reason,
+    }
+
+
+def _infeasible_result(
+    previous_cache_state: np.ndarray,
+    current_cache: np.ndarray,
+    previous_uav_positions: dict[str, np.ndarray],
+    current_uav_positions: dict[str, np.ndarray],
+    cache_triggers: np.ndarray,
+    uav_triggers: dict[str, int],
+    reason: str,
+    cache_summary: dict[str, Any] | None = None,
+    uav_summary: dict[str, Any] | None = None,
+) -> JointConfigurationResult:
+    return JointConfigurationResult(
+        previous_cache_state=previous_cache_state.copy(),
+        final_cache_state=current_cache.copy(),
+        previous_uav_positions=_position_tuples(previous_uav_positions),
+        final_uav_positions=_position_tuples(current_uav_positions),
+        cache_triggers=cache_triggers.astype(int).tolist(),
+        uav_triggers=dict(uav_triggers),
+        trigger_feasible=False,
+        infeasible_reason=reason,
+        predictive_utility=float("-inf"),
+        cache_cost=float("inf"),
+        movement_energy=float("inf"),
+        movement_cost=float("inf"),
+        objective_value=float("-inf"),
+        initial_objective=float("-inf"),
+        objective_history=[],
+        outer_rounds=0,
+        accepted_cache_updates=0,
+        accepted_uav_updates=0,
+        stop_reason="infeasible_trigger",
+        cache_result_summary=cache_summary or {},
+        uav_result_summary=uav_summary or {},
+    )
+
+
+def optimize_joint_configuration(
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    cache_triggers: np.ndarray,
+    uav_triggers: dict[str, int],
+    scenario_slice: dict[str, Any],
+    service_catalog: dict[str, Any],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    flight_boundary: tuple[float, float, float, float],
+) -> JointConfigurationResult:
+    """外层 Cache ↔ UAV block-coordinate configuration optimizer."""
+
+    max_outer_rounds, outer_tol = _configuration_algorithm_config(project_cfg)
+    previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
+    cache_trigger = np.asarray(cache_triggers, dtype=np.int8).copy()
+    q_prev = _position_arrays(previous_uav_positions)
+    q_current = {uav_id: xy.copy() for uav_id, xy in q_prev.items()}
+    c_current = previous_cache.copy()
+
+    # Case A 快路径：没有任何 trigger 时，不做无意义搜索。
+    if int(cache_trigger.sum()) == 0 and not any(int(value) == 1 for value in uav_triggers.values()):
+        evaluation = evaluate_joint_configuration(
+            c_current,
+            q_current,
+            previous_cache,
+            q_prev,
+            cache_trigger,
+            uav_triggers,
+            scenario_slice,
+            service_catalog,
+            cache_nodes,
+            cache_config,
+            project_cfg,
+        )
+        return JointConfigurationResult(
+            previous_cache_state=previous_cache.copy(),
+            final_cache_state=c_current.copy(),
+            previous_uav_positions=_position_tuples(q_prev),
+            final_uav_positions=_position_tuples(q_current),
+            cache_triggers=cache_trigger.astype(int).tolist(),
+            uav_triggers=dict(uav_triggers),
+            trigger_feasible=True,
+            infeasible_reason="",
+            predictive_utility=evaluation["predictive_utility"],
+            cache_cost=evaluation["cache_cost"],
+            movement_energy=evaluation["movement_energy"],
+            movement_cost=evaluation["movement_cost"],
+            objective_value=evaluation["objective_value"],
+            initial_objective=evaluation["objective_value"],
+            objective_history=[evaluation["objective_value"]],
+            outer_rounds=0,
+            accepted_cache_updates=0,
+            accepted_uav_updates=0,
+            stop_reason="no_trigger_no_search",
+            cache_result_summary={},
+            uav_result_summary={},
+        )
+
+    # Trigger-conditioned initialization: Cache block first, fixed Q=Q_prev.
+    cache_nodes_at_q_prev = uav_configuration.cache_nodes_with_uav_positions(cache_nodes, q_prev)
+    cache_init = cache_configuration.optimize_cache(
+        previous_cache,
+        cache_trigger,
+        scenario_slice,
+        service_catalog,
+        cache_nodes_at_q_prev,
+        cache_config,
+    )
+    if not bool(cache_init["trigger_feasible"]):
+        return _infeasible_result(
+            previous_cache,
+            c_current,
+            q_prev,
+            q_current,
+            cache_trigger,
+            uav_triggers,
+            "cache trigger infeasible",
+            cache_summary=_cache_summary(cache_init),
+        )
+    c_current = np.asarray(cache_init["new_cache"], dtype=np.int8).copy()
+
+    # Trigger-conditioned initialization: UAV block second, fixed C=C_init.
+    current_cache_cost, _ = _cache_cost(
+        previous_cache,
+        c_current,
+        cache_trigger,
+        service_catalog,
+        cache_nodes,
+        cache_config,
+    )
+    uav_init = uav_configuration.optimize_uav_configuration(
+        q_prev,
+        uav_triggers,
+        scenario_slice,
+        c_current,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+        flight_boundary,
+        cache_cost_constant=current_cache_cost,
+    )
+    if not uav_init.trigger_feasible:
+        return _infeasible_result(
+            previous_cache,
+            c_current,
+            q_prev,
+            q_current,
+            cache_trigger,
+            uav_triggers,
+            f"uav trigger infeasible: {uav_init.reason}",
+            cache_summary=_cache_summary(cache_init),
+            uav_summary=_uav_summary(uav_init),
+        )
+    q_current = _position_arrays(uav_init.final_positions)
+
+    evaluation = evaluate_joint_configuration(
+        c_current,
+        q_current,
+        previous_cache,
+        q_prev,
+        cache_trigger,
+        uav_triggers,
+        scenario_slice,
+        service_catalog,
+        cache_nodes,
+        cache_config,
+        project_cfg,
+    )
+    current_objective = float(evaluation["objective_value"])
+    initial_objective = current_objective
+    history = [current_objective]
+    accepted_cache = 0
+    accepted_uav = 0
+    completed_rounds = 0
+    stop_reason = "stopped_by_max_rounds"
+    last_cache_summary = _cache_summary(cache_init)
+    last_uav_summary = _uav_summary(uav_init)
+
+    for round_index in range(1, max_outer_rounds + 1):
+        completed_rounds = round_index
+        round_improved = False
+
+        # Cache refinement: search starts at C_current, but costs and trigger semantics reference C_prev.
+        cache_nodes_at_current_q = uav_configuration.cache_nodes_with_uav_positions(
+            cache_nodes,
+            q_current,
+        )
+        cache_candidate = cache_configuration.optimize_cache(
+            previous_cache,
+            cache_trigger,
+            scenario_slice,
+            service_catalog,
+            cache_nodes_at_current_q,
+            cache_config,
+            initial_cache_state=c_current,
+        )
+        last_cache_summary = _cache_summary(cache_candidate)
+        if not bool(cache_candidate["trigger_feasible"]):
+            return _infeasible_result(
+                previous_cache,
+                c_current,
+                q_prev,
+                q_current,
+                cache_trigger,
+                uav_triggers,
+                "cache refinement returned infeasible",
+                cache_summary=last_cache_summary,
+                uav_summary=last_uav_summary,
+            )
+        c_candidate = np.asarray(cache_candidate["new_cache"], dtype=np.int8)
+        candidate_eval = evaluate_joint_configuration(
+            c_candidate,
+            q_current,
+            previous_cache,
+            q_prev,
+            cache_trigger,
+            uav_triggers,
+            scenario_slice,
+            service_catalog,
+            cache_nodes,
+            cache_config,
+            project_cfg,
+        )
+        if candidate_eval["objective_value"] > current_objective + outer_tol:
+            c_current = c_candidate.copy()
+            current_objective = float(candidate_eval["objective_value"])
+            evaluation = candidate_eval
+            history.append(current_objective)
+            accepted_cache += 1
+            round_improved = True
+
+        # UAV refinement: search starts at Q_current, but movement/cost/constraint reference Q_prev.
+        current_cache_cost, _ = _cache_cost(
+            previous_cache,
+            c_current,
+            cache_trigger,
+            service_catalog,
+            cache_nodes,
+            cache_config,
+        )
+        uav_candidate = uav_configuration.optimize_uav_configuration(
+            q_prev,
+            uav_triggers,
+            scenario_slice,
+            c_current,
+            project_cfg,
+            cache_nodes,
+            cache_config,
+            flight_boundary,
+            cache_cost_constant=current_cache_cost,
+            initial_candidate_positions=q_current,
+        )
+        last_uav_summary = _uav_summary(uav_candidate)
+        if not uav_candidate.trigger_feasible:
+            return _infeasible_result(
+                previous_cache,
+                c_current,
+                q_prev,
+                q_current,
+                cache_trigger,
+                uav_triggers,
+                f"uav refinement returned infeasible: {uav_candidate.reason}",
+                cache_summary=last_cache_summary,
+                uav_summary=last_uav_summary,
+            )
+        q_candidate = _position_arrays(uav_candidate.final_positions)
+        candidate_eval = evaluate_joint_configuration(
+            c_current,
+            q_candidate,
+            previous_cache,
+            q_prev,
+            cache_trigger,
+            uav_triggers,
+            scenario_slice,
+            service_catalog,
+            cache_nodes,
+            cache_config,
+            project_cfg,
+        )
+        if candidate_eval["objective_value"] > current_objective + outer_tol:
+            q_current = q_candidate
+            current_objective = float(candidate_eval["objective_value"])
+            evaluation = candidate_eval
+            history.append(current_objective)
+            accepted_uav += 1
+            round_improved = True
+
+        if not round_improved:
+            stop_reason = "converged_by_no_improvement"
+            break
+
+    return JointConfigurationResult(
+        previous_cache_state=previous_cache.copy(),
+        final_cache_state=c_current.copy(),
+        previous_uav_positions=_position_tuples(q_prev),
+        final_uav_positions=_position_tuples(q_current),
+        cache_triggers=cache_trigger.astype(int).tolist(),
+        uav_triggers=dict(uav_triggers),
+        trigger_feasible=True,
+        infeasible_reason="",
+        predictive_utility=float(evaluation["predictive_utility"]),
+        cache_cost=float(evaluation["cache_cost"]),
+        movement_energy=float(evaluation["movement_energy"]),
+        movement_cost=float(evaluation["movement_cost"]),
+        objective_value=float(evaluation["objective_value"]),
+        initial_objective=initial_objective,
+        objective_history=history,
+        outer_rounds=completed_rounds,
+        accepted_cache_updates=accepted_cache,
+        accepted_uav_updates=accepted_uav,
+        stop_reason=stop_reason,
+        cache_result_summary=last_cache_summary,
+        uav_result_summary=last_uav_summary,
+    )
+
+
+def _changed_cache_nodes(previous: np.ndarray, final: np.ndarray) -> list[int]:
+    return [
+        int(index)
+        for index in range(previous.shape[0])
+        if not np.array_equal(previous[index], final[index])
+    ]
+
+
+def _changed_uavs(
+    previous: dict[str, tuple[float, float]],
+    final: dict[str, tuple[float, float]],
+    tol: float = 1.0e-6,
+) -> list[str]:
+    changed = []
+    for uav_id, xy in previous.items():
+        if float(np.linalg.norm(np.asarray(final[uav_id]) - np.asarray(xy))) > tol:
+            changed.append(uav_id)
+    return changed
+
+
+def validate_joint_optimizer_once(
+    origin_scenario: dict[str, Any],
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+) -> dict[str, JointConfigurationResult]:
+    previous_cache = cache_configuration.deterministic_initial_cache(
+        origin_scenario,
+        service_catalog,
+        cache_nodes,
+        cache_config,
+    )
+    previous_uav_positions = uav_configuration.initial_uav_positions_from_project(project_cfg)
+    uav_ids = uav_configuration.uav_ids_from_project(project_cfg)
+    num_nodes = previous_cache.shape[0]
+    node_roles = cache_nodes["node_roles"]
+    first_sv = node_roles.index("SV")
+    first_rsu_or_uav = next(
+        index for index, role in enumerate(node_roles) if role in {"RSU", "UAV"}
+    )
+    cases: dict[str, tuple[np.ndarray, dict[str, int]]] = {}
+    cases["A"] = (np.zeros(num_nodes, dtype=np.int8), {uav_id: 0 for uav_id in uav_ids})
+    z_b = np.zeros(num_nodes, dtype=np.int8)
+    z_b[first_sv] = 1
+    cases["B"] = (z_b, {uav_id: 0 for uav_id in uav_ids})
+    cases["C"] = (np.zeros(num_nodes, dtype=np.int8), {uav_id: int(i == 0) for i, uav_id in enumerate(uav_ids)})
+    z_d = np.zeros(num_nodes, dtype=np.int8)
+    z_d[first_sv] = 1
+    cases["D"] = (z_d, {uav_id: int(i == 0) for i, uav_id in enumerate(uav_ids)})
+    z_e = np.zeros(num_nodes, dtype=np.int8)
+    z_e[first_rsu_or_uav] = 1
+    cases["E"] = (z_e, {uav_id: 1 for uav_id in uav_ids})
+
+    results: dict[str, JointConfigurationResult] = {}
+    for label, (cache_trigger, uav_trigger) in cases.items():
+        result = optimize_joint_configuration(
+            previous_cache,
+            previous_uav_positions,
+            cache_trigger,
+            uav_trigger,
+            origin_scenario,
+            service_catalog,
+            project_cfg,
+            cache_nodes,
+            cache_config,
+            flight_boundary,
+        )
+        results[label] = result
+        if not result.trigger_feasible:
+            raise AssertionError(f"Case {label} unexpectedly infeasible: {result.infeasible_reason}")
+        if any(
+            result.objective_history[i + 1] <= result.objective_history[i]
+            + project_config.get_config_value(project_cfg, "algorithm.configuration.objective_tolerance")
+            for i in range(len(result.objective_history) - 1)
+        ):
+            raise AssertionError(f"Case {label} accepted objective history 非严格提升。")
+        direct = evaluate_joint_configuration(
+            result.final_cache_state,
+            result.final_uav_positions,
+            previous_cache,
+            previous_uav_positions,
+            cache_trigger,
+            uav_trigger,
+            origin_scenario,
+            service_catalog,
+            cache_nodes,
+            cache_config,
+            project_cfg,
+        )
+        if not math.isclose(
+            direct["objective_value"],
+            result.objective_value,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise AssertionError(f"Case {label} final objective 直接复算不一致。")
+        changed_nodes = _changed_cache_nodes(previous_cache, result.final_cache_state)
+        changed_uav = _changed_uavs(result.previous_uav_positions, result.final_uav_positions)
+        for node_index, trigger in enumerate(cache_trigger.tolist()):
+            if trigger == 0 and node_index in changed_nodes:
+                raise AssertionError(f"Case {label} z_ca=0 cache node changed。")
+            if trigger == 1 and node_index not in changed_nodes:
+                raise AssertionError(f"Case {label} z_ca=1 cache node unchanged。")
+        for uav_id, trigger in uav_trigger.items():
+            if trigger == 0 and uav_id in changed_uav:
+                raise AssertionError(f"Case {label} z_q=0 UAV moved。")
+            if trigger == 1 and uav_id not in changed_uav:
+                raise AssertionError(f"Case {label} z_q=1 UAV unchanged。")
+    repeat = optimize_joint_configuration(
+        previous_cache,
+        previous_uav_positions,
+        cases["D"][0],
+        cases["D"][1],
+        origin_scenario,
+        service_catalog,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+        flight_boundary,
+    )
+    if not np.array_equal(results["D"].final_cache_state, repeat.final_cache_state):
+        raise AssertionError("Case D repeated-run cache 不确定。")
+    if results["D"].final_uav_positions != repeat.final_uav_positions:
+        raise AssertionError("Case D repeated-run UAV 不确定。")
+    return results
+
+
+def _result_summary(result: JointConfigurationResult) -> dict[str, Any]:
+    return {
+        "trigger_feasible": result.trigger_feasible,
+        "cache_trigger": result.cache_triggers,
+        "uav_trigger": result.uav_triggers,
+        "changed_cache_nodes": _changed_cache_nodes(
+            result.previous_cache_state,
+            result.final_cache_state,
+        ),
+        "changed_uavs": _changed_uavs(result.previous_uav_positions, result.final_uav_positions),
+        "predictive_utility": result.predictive_utility,
+        "cache_cost": result.cache_cost,
+        "movement_energy": result.movement_energy,
+        "movement_cost": result.movement_cost,
+        "objective": result.objective_value,
+        "initial_objective": result.initial_objective,
+        "objective_history": result.objective_history,
+        "outer_rounds": result.outer_rounds,
+        "accepted_cache_updates": result.accepted_cache_updates,
+        "accepted_uav_updates": result.accepted_uav_updates,
+        "stop_reason": result.stop_reason,
+        "final_uav_positions": result.final_uav_positions,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Cache + UAV trigger-conditioned configuration optimizer.")
+    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--origin-index", type=int, default=0)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    cfg = project_config.load_config(args.config)
+    project_config.validate_config(cfg)
+    project_config.validate_for_formal_experiment(cfg)
+    project_root = Path(cfg["_meta"]["project_root"])
+    cache_cfg = cache_configuration.cache_config_from_project(cfg)
+    scenarios = cache_configuration.load_prediction_scenarios(
+        cache_configuration.resolve_path(
+            project_root,
+            project_config.get_config_value(cfg, "paths.prediction_scenarios"),
+        )
+    )
+    origin = cache_configuration.scenario_at_origin(scenarios, args.origin_index)
+    service_catalog = cache_configuration.load_service_catalog(
+        cache_configuration.resolve_path(
+            project_root,
+            project_config.get_config_value(cfg, "paths.service_catalog"),
+        )
+    )
+    cache_nodes = cache_configuration.build_cache_nodes(origin, cache_cfg)
+    boundary = uav_configuration.boundary_from_project(cfg)
+    results = validate_joint_optimizer_once(
+        origin,
+        service_catalog,
+        cache_nodes,
+        cache_cfg,
+        cfg,
+        boundary,
+    )
+    print("Joint configuration minimal validation PASS")
+    print(f"origin_index={args.origin_index}, origin_slot={origin['origin_slot']}, origin_time_s={origin['origin_time_s']}")
+    for label, result in results.items():
+        print(f"Case {label}: {json.dumps(_result_summary(result), ensure_ascii=False)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

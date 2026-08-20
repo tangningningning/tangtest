@@ -1,0 +1,626 @@
+# adaptive_cache_mec 统一系统配置入口
+#
+# 本文件是后续所有模块的唯一系统参数入口。场景生成、任务生成、车辆预测、
+# 流行度预测、预测场景生成、缓存配置、UAV 优化、Matching、KKT、PPO
+# 和对比实验都应优先读取这里，避免不同模块各自维护 CPU、带宽、缓存容量、
+# UAV 参数、通信参数和 cost 参数。
+#
+# 数据依赖说明：
+# 【仅修改以下参数通常不需要重新跑 SUMO】
+# cache capacity、CPU、bandwidth、cache cost、UAV 算法参数、PPO 参数。
+#
+# 【修改以下参数需要重新生成 task 数据】
+# service.count、task.arrival_probability、task.popularity_zeta、
+# task.popularity_epoch_length、service generation 参数、D/L 扰动参数。
+#
+# 【修改以下参数需要重新运行 vehicle prediction】
+# simulation.dt_s、prediction.vehicle.sigma_position_m、
+# prediction.vehicle.sigma_speed_mps、prediction.vehicle.horizon。
+#
+# 【修改以下参数需要重新训练 GRU】
+# service.count、popularity 过程、prediction.popularity.beta_rho、
+# prediction.popularity.alpha_rho、prediction.popularity.history_length、
+# prediction.vehicle.horizon / prediction.popularity.horizon。
+#
+# 【修改 H_p】
+# 必须重新生成 residual_blocks、GRU checkpoint 和 prediction_scenarios。
+#
+# 【修改 S】
+# 只需要重新生成 prediction_scenarios，不需要重新运行 SUMO/Kalman/GRU 训练。
+
+[experiment]
+# 实验名称。用于后续结果 metadata 和配置快照引用；修改它不需要重新生成数据。
+name = "main"
+# 算法方法名。对比实验只应改变 algorithm / experiment 相关 section，不能偷偷改变物理参数。
+method = "proposed"
+# 主实验随机种子。当前沿用已有正式数据中的主 seed；修改后若用于生成任务/预测场景，需要重跑对应上游模块。
+seed = 4401
+# 重复实验编号。只用于后续批量实验标识，不改变系统物理模型。
+repeat_index = 0
+# 输出标签。用于后续 result 文件命名；修改它不需要重新生成上游数据。
+output_tag = "main"
+
+[paths]
+# 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
+# 不在本 TOML 中复制 10 个具体服务，避免两份 service catalog 不一致。
+service_catalog = "data/generated/service_catalog.json"
+# 车辆角色文件。SV/TV 真实 ID 从这里读取，system_config 不写死 46/29/80。
+vehicle_roles = "data/generated/vehicle_roles.json"
+# 当前预测场景文件。cache optimizer 只能读取该预测输入，不能读取未来真实任务。
+prediction_scenarios = "data/generated/prediction_scenarios.npz"
+# SUMO 路网文件。用于后续 map_stratified 初始化、车辆预测和道路约束。
+sumo_net = "data/sumo/map/osm.net.xml.gz"
+# 残差库。修改 H_p、sigma 或车辆预测参数后需要重新生成。
+residual_bank = "data/generated/residual_blocks.npz"
+# GRU checkpoint。修改 popularity 预测训练参数后需要重新训练。
+popularity_gru = "data/generated/popularity_gru.pt"
+# TV 固定本地缓存初始状态。Matching 只能读取该 artifact，
+# 不得在slot内动态生成或更新TV本地缓存。
+tv_local_cache = "data/generated/tv_local_cache.json"
+
+[simulation]
+# SUMO 基础时间步，同时也是 MEC 基础 slot，单位 s。当前实际值来自已生成数据。
+dt_s = 1.0
+# warm-up 时间，单位 s。只用于建立历史状态，不计入正式系统效用。
+warmup_time_s = 100.0
+# 正式优化 episode 长度，单位 s。当前正式数据覆盖 300 个 slot。
+episode_time_s = 300.0
+# 研究车辆数量。当前已确定数据值；修改需要重新筛选车辆与生成任务/预测链。
+num_research_vehicles = 12
+# TV 数量。当前已确定数据值；TV ID 从 vehicle_roles.json 读取。
+num_task_vehicles = 9
+# SV 数量。当前已确定数据值；SV ID 从 vehicle_roles.json 读取。
+num_service_vehicles = 3
+# SUMO / 角色筛选主 seed。当前实际值来自已有 vehicle_roles.json。
+sumo_seed = 4401
+# 交通需求 seed。当前项目未单独冻结 traffic_seed，先沿用 sumo_seed；如后续拆分需重新生成 SUMO 轨迹。
+traffic_seed = 4401
+
+[service]
+# 服务总数 F。当前已确定数据值；修改后必须重新运行 task_scenario.py，
+# 生成新的 service_catalog.json、popularity.csv、tasks.csv，并重跑依赖链。
+count = 10
+# 实际服务实例目录。缓存模块读取 s_f 时必须使用此 JSON。
+catalog_path = "data/generated/service_catalog.json"
+# PROVISIONAL：服务生成范围来自当前 task_scenario.py，不是论文最终校准值。
+# 每个 class range 定义 program_size(MB)、mean_input_size(Mbit) 和 cycles_per_bit 的采样范围。
+
+[[service.class_ranges]]
+workload_class = "data_intensive"
+program_size_min_mb = 1200.0
+program_size_max_mb = 2000.0
+mean_input_size_min_mbit = 1.0
+mean_input_size_max_mbit = 1.5
+cycles_per_bit_min = 200.0
+cycles_per_bit_max = 500.0
+
+[[service.class_ranges]]
+workload_class = "compute_intensive"
+program_size_min_mb = 1000.0
+program_size_max_mb = 1800.0
+mean_input_size_min_mbit = 0.5
+mean_input_size_max_mbit = 1.0
+cycles_per_bit_min = 700.0
+cycles_per_bit_max = 1000.0
+
+[[service.class_ranges]]
+workload_class = "balanced"
+program_size_min_mb = 1000.0
+program_size_max_mb = 1900.0
+mean_input_size_min_mbit = 0.75
+mean_input_size_max_mbit = 1.25
+cycles_per_bit_min = 450.0
+cycles_per_bit_max = 750.0
+
+[task]
+# Bernoulli 任务到达概率 lambda。当前实际值来自 task_scenario.py；修改需要重生成任务。
+arrival_probability = 0.5
+# Zipf 指数 zeta。当前实际值；修改会改变真实 rho_star，需要重生成 popularity/tasks。
+popularity_zeta = 0.8
+# popularity epoch 长度，单位 slot。当前实际值 20。
+popularity_epoch_length = 20
+# 每个 epoch 的局部 rank 变化次数。当前实际值 1。
+popularity_changes_per_epoch = 1
+# 输入数据 D 的相对扰动范围，当前为 ±20%。修改需要重生成 tasks.csv。
+input_relative_jitter = 0.20
+# 计算负载 L 的相对扰动范围，当前为 ±10%。修改需要重生成 tasks.csv。
+load_relative_jitter = 0.10
+# 任务生成主 seed。当前实际值与正式数据一致。
+master_seed = 4401
+
+[nodes.vehicle]
+# TV 本地 CPU 总计算能力，单位 cycle/s。
+# VEC 仿真中车辆本地 CPU 常设置在 0.5~1GHz 量级，当前主实验取 1GHz。
+# 这是文献校准实验基线，不代表硬件实测数据。
+local_cpu_cycles_per_s = 1.0e9
+# TV 固定本地缓存容量，单位 MB。
+# 当前实验设计基线：2000MB 位于当前最大单服务大小与最小两服务大小之和之间，
+# 因此每辆任务车辆最多缓存一个完整服务，同时所有服务均可单独缓存。
+# 该值由当前正式 service_catalog 推导得到，不是文献直接硬件参数。
+local_cache_capacity_mb = 2000.0
+# 文献校准基线。
+# 本地计算能耗模型：E = kappa * L * F^2。
+# L 单位 cycle，F 单位 cycle/s，E 单位 J。
+# 参考 VEC 文献 Energy-Efficient Task Offloading for Vehicular Edge Computing:
+# Joint Optimization of Offloading and Bit Allocation 中相同模型采用的
+# effective switched capacitance 1e-28。
+# 后续敏感性实验可以改变，但主实验基线采用 1e-28；
+# 这是文献校准实验基线，不代表硬件实测值。
+kappa = 1.0e-28
+# 车辆上传发射功率，单位 W。
+# VEC 地面通信基线采用 23 dBm，换算为 0.1995262315 W。
+# 注意：system_model.py 的 Shannon 公式只使用 W 线性单位，不直接使用 dBm。
+# 这是文献校准实验基线，不代表硬件实测数据。
+transmit_power_w = 0.1995262315
+
+[nodes.sv]
+# 参数状态：系统尺度校准实验基线。
+# SV 公共缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
+# 当前值依据本项目 10 种 service 的实际 program_size 设置，
+# 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
+# 后续通过 cache capacity sensitivity 实验验证。
+cache_capacity_mb = 4500.0
+# SV 总 CPU 能力，单位 cycle/s。
+# 已有区分 Task Vehicle 和 Service Vehicle 的 VEC 研究使用 [3,5]GHz；
+# 当前主实验取下界 3GHz，保持 F_vehicle < F_SV。
+# 这是文献校准实验基线，不代表硬件实测数据。
+cpu_cycles_per_s = 3.0e9
+# SV 链路带宽，单位 Hz。
+# 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
+# 这是文献校准实验基线，不代表硬件实测数据。
+bandwidth_hz = 10.0e6
+# 参数状态：系统尺度校准实验基线。
+# SV 触发固定配置成本 eta_ca；不是文献直接物理常数。
+# 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定控制成本。
+eta_ca = 0.20
+# 参数状态：系统尺度校准实验基线。
+# SV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
+# 当前项目不把 xi_ca 解释为严格 Joule/MB。
+xi_ca = 1.0e-3
+# 仅用于配置阶段轻量 surrogate 的候选节点筛选。
+# 不替代 ground/air channel model，也不代表最终 Matching/KKT 中的物理硬覆盖半径。
+range_m = 100.0
+
+[nodes.rsu]
+# RSU 数量。当前已有代码只有 1 个 RSU，因此保持 1，不擅自增加。
+count = 1
+# 参数状态：系统尺度校准实验基线。
+# RSU 公共缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
+# 当前值依据本项目 10 种 service 的实际 program_size 设置，
+# 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
+# 后续通过 cache capacity sensitivity 实验验证。
+cache_capacity_mb = 8000.0
+# RSU 总 CPU 能力，单位 cycle/s。
+# SUMO+NS3 VEC 仿真研究将 MEC server computation rate 设置为 8GHz；
+# 当前 RSU 部署 MEC 计算资源，因此主实验基线采用 8GHz。
+# 这是文献校准实验基线，不代表硬件实测数据。
+cpu_cycles_per_s = 8.0e9
+# RSU 带宽，单位 Hz。
+# 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
+# 这是文献校准实验基线，不代表硬件实测数据。
+bandwidth_hz = 10.0e6
+# 参数状态：系统尺度校准实验基线。
+# RSU 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数。
+eta_ca = 0.10
+# 参数状态：系统尺度校准实验基线。
+# RSU 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
+# 当前项目不把 xi_ca 解释为严格 Joule/MB。
+xi_ca = 0.7e-3
+# 仅用于配置阶段轻量 surrogate 的候选节点筛选。
+# 不替代 ground/air channel model，也不代表最终 Matching/KKT 中的物理硬覆盖半径。
+range_m = 250.0
+
+[[nodes.rsu.instances]]
+# PROVISIONAL：RSU_0 位置由当前 SUMO map boundary 的中心确定，不是论文部署结论。
+id = "RSU_0"
+x_m = 4121.86
+y_m = 986.375
+
+[nodes.uav]
+# UAV 数量。当前系统正式要求 UAV 数量至少为 2；project_config.py 会强制校验。
+count = 2
+# UAV 初始水平位置生成规则说明。map_stratified 表示根据 SUMO 地图合法边界
+# 将初始点均匀分散到地图内部；这是 UAV 优化算法的初始可行位置生成规则，
+# 不是未来真实轨迹，也不是论文固定部署结论。后续 UAV 位置仍由优化算法调整。
+initialization_mode = "map_stratified"
+# 参数状态：文献校准实验基线。
+# UAV 固定飞行高度，单位 m。
+# 文献来源：Li et al., Collaborative offloading for UAV-enabled time-sensitive MEC networks,
+# EURASIP Journal on Wireless Communications and Networking 2021:1,
+# DOI 10.1186/s13638-020-01861-8，Table 1 采用 UAV altitude H = 100m。
+# 本文只优化 UAV 二维水平位置，不优化高度；该值是仿真基线，不代表唯一硬件/法规参数。
+altitude_m = 100.0
+# 参数状态：系统尺度校准实验基线。
+# UAV 缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
+# 当前值依据本项目 10 种 service 的实际 program_size 设置，
+# 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
+# 后续通过 cache capacity sensitivity 实验验证。
+cache_capacity_mb = 6000.0
+# UAV 总 CPU 能力，单位 cycle/s。
+# 文献来源：Li et al., Collaborative offloading for UAV-enabled time-sensitive MEC networks,
+# EURASIP Journal on Wireless Communications and Networking 2021:1,
+# DOI 10.1186/s13638-020-01861-8，Table 1 给出 Maximal CPU frequency of UAV = 5 GHz。
+# 当前系统公式中 UAV compute delay 使用 L/F_uav，因此 5 GHz 直接换算为 5.0e9 cycle/s。
+# 这是文献校准实验基线，不代表硬件实测值。
+cpu_cycles_per_s = 5.0e9
+# UAV 链路带宽，单位 Hz。
+# 文献来源同上，Table 1 给出 Total bandwidth B = 10 MHz；
+# 当前系统将 UAV bandwidth_hz 作为空地 uplink_rate() 的系统带宽输入，
+# 因此 10 MHz 直接换算为 10.0e6 Hz。
+# 这是文献校准实验基线，不代表硬件实测值。
+bandwidth_hz = 10.0e6
+# 参数状态：系统尺度校准实验基线。
+# UAV 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数。
+eta_ca = 0.30
+# 参数状态：系统尺度校准实验基线。
+# UAV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
+# 当前项目不把 xi_ca 解释为严格 Joule/MB。
+xi_ca = 1.2e-3
+# 仅用于配置阶段轻量 surrogate 的候选节点筛选。
+# 不替代 ground/air channel model，也不代表最终 Matching/KKT 中的物理硬覆盖半径。
+range_m = 300.0
+# 参数状态：文献校准实验基线。
+# UAV 最大水平飞行速度，单位 m/s。
+# 文献来源同 Li et al., DOI 10.1186/s13638-020-01861-8，Table 1 采用最大 UAV 速度 15m/s。
+max_horizontal_speed_mps = 15.0
+
+[nodes.uav.movement]
+# 参数状态：文献旋翼模型等效校准 baseline。
+# 等效单位水平移动距离能耗，单位 J/m。
+# Li et al., DOI 10.1186/s13638-020-01861-8，Table 1 给出旋翼 UAV 功率模型参数，
+# 但论文并未直接给出“15 J/m”作为物理常数。
+# 当前项目沿用 11.pdf 的线性移动能耗 E_mov = xi_mov * distance，
+# 因此在代表速度 V_ref=15m/s 处按 Li et al. 旋翼功率模型计算
+# P(15)/15 ≈ 14.73 J/m，并取整为 15 J/m 作为线性等效系数。
+movement_energy_coefficient_j_per_m = 15.0
+# 参数状态：系统尺度校准基线。
+# UAV 移动固定成本 eta_q。
+# 该参数不是文献直接给出的物理常数。
+# 它依据当前真实任务数据、已校准 T_ref/E_ref、
+# normal-slot aggregate utility 尺度进行定标。
+# 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
+# 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
+movement_fixed_cost = 0.2
+
+[[nodes.uav.instances]]
+# 根据 map_stratified 和当前 SUMO map boundary [3027.76,226.37,5215.96,1746.38]
+# 确定性生成的第一个 UAV 初始水平位置；不使用未来任务或系统效用。
+id = "UAV_0"
+initial_x_m = 3757.16
+initial_y_m = 986.375
+
+[[nodes.uav.instances]]
+# 根据相同 map_stratified 规则生成的第二个 UAV 初始水平位置；与 UAV_0 不重合。
+id = "UAV_1"
+initial_x_m = 4486.56
+initial_y_m = 986.375
+
+[nodes.cloud]
+# Cloud 总 CPU 能力 F_c，单位 cycle/s。
+# 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c。
+# 文献来源：Al-Shareeda et al., Novel DT-assisted Vehicular Task Offloading for Cloud,
+# Edge, and Hybrid Deployments, IEEE Transactions on Vehicular Technology 75(4):6565-6581, 2026,
+# DOI 10.1109/TVT.2025.3620810。
+# 本项目 F_c 表示单任务使用的固定等效 Cloud 计算频率，
+# 而参考文献中 20GHz 表示 Cloud 总容量，不能直接映射。
+# 参考文献对单任务动态分配的 Cloud 计算资源为 U[2,4]GHz。
+# 本项目由于不显式优化 Cloud 内部资源分配，
+# 采用其均值 3GHz 作为固定等效单任务计算能力。
+# 这是“文献参数到当前简化模型的等效映射”，
+# 不是论文直接给出的固定 3GHz Cloud CPU。
+cpu_cycles_per_s = 3.0e9
+# Cloud uplink rate R_c，单位 bps。
+# 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c，E_vc_vehicle = p_v * D_v / R_c。
+# 文献来源同上，Table IV 给出 T_up_iC = 200 Mbps，语义为 Avg. uplink rate to cloud。
+# 该语义与当前 D_v/R_c 的 vehicle-to-cloud 上传链路相容；
+# 200 Mbps 直接换算为 200.0e6 bit/s。
+# 这是文献校准实验基线，不代表硬件实测值。
+uplink_rate_bps = 200.0e6
+# Cloud 传输扩展系数 psi_c，当前系统公式中作为 D_v/R_c 的乘法因子。
+# 系统模型要求 psi_c >= 1。
+# psi_c 用于将远程 Cloud 的回传/核心网附加传输时延
+# 等效吸收到 psi_c * D/R_c 中。
+# 参考 Cloud 文献采用 1000km Cloud 距离并显式计算往返传播时延 2D_C/s。
+# 当前项目没有单独传播时延项，因此以当前真实任务 median input_size 为参考，
+# 将该传播时延映射为固定乘法系数 psi_c。
+# median D=1025623.812 bit，R_c=200Mbps，D_C=1000km，s=3e8m/s，
+# psi_c = 1 + (2*1000e3/3e8)/(D_median/R_c) ≈ 2.3000218。
+# 该值属于“文献物理参数 + 当前模型结构”的等效校准值，
+# 不是参考论文直接给出的 psi 参数。
+# 如果以后任务输入规模发生明显变化，该等效 psi 需要重新检查。
+cloud_delay_factor = 2.30
+
+[communication]
+# 本 section 集中通信模型参数，后续 Cache surrogate、Matching、KKT 必须共用。
+
+[communication.ground]
+# 地面链路参考信道增益，数学符号可对应 g_0，单位为无量纲功率增益。
+# VEC 地面通信基线采用 PL(1m)=47.86dB，换算 beta_g=10^(-47.86/10)≈1.6368e-5。
+# 这是文献校准实验基线，不代表硬件实测数据。
+channel_gain_at_1m = 1.6368e-5
+# 地面链路路径损耗指数 alpha，用于 V2V/V2I。
+# VEC 地面通信基线采用 alpha_g=2.75。
+# 这是文献校准实验基线，不代表硬件实测数据。
+pathloss_exponent = 2.75
+# 地面链路带宽，单位 Hz，用于 SV/RSU surrogate。
+# 当前第一版地面 V2V/V2I 统一采用 10MHz 系统带宽。
+# 这是文献校准实验基线，不代表硬件实测数据。
+bandwidth_hz = 10.0e6
+
+[communication.air]
+# 空地链路参数。最终物理通信质量由 LoS/NLoS 平均信道增益 + Shannon 速率计算。
+# Urban 环境 LoS 概率参数：
+# P_LoS = 1 / (1 + eta1 * exp(-eta2 * (theta - eta1)))，theta 使用 degree。
+# 该 S 型概率形式来自 Al-Hourani et al., IEEE Wireless Communications Letters 2014,
+# DOI 10.1109/LWC.2014.2342736。eta1=9.61、eta2=0.16 采用后续公开文献
+# 中常用的 Urban 仿真 baseline；不声称这是 Al-Hourani 原文直接表格值。
+eta1 = 9.61
+eta2 = 0.16
+# 载波频率，单位 Hz；用于构造 1m 参考自由空间信道增益。
+# 2GHz 是空地信道公开仿真常用频点，也与 Al-Hourani 空地 pathloss 示例中的 2000MHz 一致。
+carrier_frequency_hz = 2.0e9
+# LoS 状态参考信道功率增益。
+# beta0=(c/(4*pi*f_c))^2≈1.4228584e-4；叠加 Urban LoS 额外损耗 1dB 后
+# beta_los=beta0*10^(-1/10)≈1.1302166e-4。
+beta_los = 1.1302166e-4
+# NLoS 状态参考信道功率增益。
+# 叠加 Urban NLoS 额外损耗 20dB 后 beta_nlos=beta0*10^(-20/10)≈1.4228584e-6。
+beta_nlos = 1.4228584e-6
+# 自由空间 FSPL 的距离功率项对应 d^-2，因此 LoS/NLoS 参考实现均使用 alpha=2。
+alpha_los = 2.0
+alpha_nlos = 2.0
+
+[communication.noise]
+# 接收噪声总功率，单位 W。
+# VEC 地面通信基线采用 -95 dBm，换算为 10^((-95-30)/10)=3.16227766e-13 W。
+# 注意：system_model.py 的 Shannon 公式只使用 W 线性单位，不直接使用 dBm。
+# 这是文献校准实验基线，不代表硬件实测数据。
+noise_power_w = 3.16227766e-13
+
+[communication.cloud]
+# Cloud 链路上传速率，单位 bps。与 nodes.cloud.uplink_rate_bps 保持一致。
+uplink_rate_bps = 200.0e6
+
+[cache]
+# cache surrogate 的 horizon 折扣 beta。PROVISIONAL。
+discount_beta = 0.95
+# local search strict improvement 容差。只接受 J(new) > J(old) + tolerance。
+local_search_tolerance = 1.0e-9
+# coordinate optimization 最大轮数，避免无限循环。
+max_coordinate_rounds = 20
+# Knapsack 只用于初始化，不是最终 cache solver。
+knapsack_initialization = "enumeration"
+
+[objective]
+# 主实验采用时延和车辆能耗等权重。
+# 该值属于实验设计基线，不是硬件物理常数。
+# 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
+omega_delay = 0.5
+# 主实验采用时延和车辆能耗等权重。
+# 该值属于实验设计基线，不是硬件物理常数。
+# 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
+omega_energy = 0.5
+# 参数状态：系统尺度校准基线。
+# Cache 配置成本权重 lambda_cache，是系统目标函数中唯一的 lambda^ca 入口。
+# 该参数不是文献直接给出的物理常数。
+# 它依据当前真实任务数据、已校准 T_ref/E_ref、
+# normal-slot aggregate utility 尺度进行定标。
+# 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
+# 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
+lambda_cache = 0.1
+# 参数状态：系统尺度校准基线。
+# UAV movement 配置成本权重 lambda_movement。
+# 该参数不是文献直接给出的物理常数。
+# 它依据当前真实任务数据、已校准 T_ref/E_ref、
+# normal-slot aggregate utility 尺度进行定标。
+# 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
+# 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
+lambda_movement = 0.002
+# T_ref/E_ref 采用当前任务工作负载下 Local execution 的 P95 尺度，并做轻微取整。
+# 这样参考值主要由任务工作负载和车辆本地计算能力决定，
+# 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
+# 因此适合作为不同算法统一使用的归一化基准。
+# T_ref=0.65s 来源于当前 Local delay p95≈0.65463s。
+T_ref = 0.65
+# T_ref/E_ref 采用当前任务工作负载下 Local execution 的 P95 尺度，并做轻微取整。
+# 这样参考值主要由任务工作负载和车辆本地计算能力决定，
+# 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
+# 因此适合作为不同算法统一使用的归一化基准。
+# E_ref=0.065J 来源于当前 Local energy p95≈0.06546J。
+E_ref = 0.065
+
+[prediction.vehicle]
+# 车辆预测 horizon H_p。当前实际值 5；修改需重跑车辆预测、GRU、scenario。
+horizon = 5
+# 模拟位置观测噪声 sigma_q，单位 m。当前实际值来自 vehicle_prediction.py。
+sigma_position_m = 3.0
+# 模拟速度观测噪声 sigma_u，单位 m/s。当前实际值。
+sigma_speed_mps = 1.0
+# 观测噪声 seed。当前实际值 9101。
+observation_noise_seed = 9101
+
+[prediction.popularity]
+# GRU 输入历史长度 L_rho，单位 slot。当前实际值 20；修改需重新训练 GRU。
+history_length = 20
+# GRU hidden size。训练参数，修改需重新训练 GRU。
+hidden_size = 32
+# EWMA beta_rho。在线推理和训练必须一致；修改需重新训练/重生成预测。
+beta_rho = 0.9
+# EWMA alpha_rho。在线推理和训练必须一致。
+alpha_rho = 0.1
+# 以下为训练参数，在线推理只读取 checkpoint，不应临时改变。
+learning_rate = 1.0e-3
+batch_size = 64
+max_epochs = 60
+patience = 8
+
+[scenario]
+# 预测场景数 S。当前实际值 20；修改只需重新生成 prediction_scenarios。
+num_scenarios = 20
+# 预测场景主 seed。当前实际值来自 scenario_generator.py。
+master_seed = 20260820
+# residual block 最大重采样次数。PROVISIONAL。
+max_resample_attempts = 20
+# 跨车辆 residual 采样假设。当前第一版为 independent。
+cross_vehicle_residual_sampling = "independent"
+# residual bank 和 GRU checkpoint 路径。
+residual_bank_path = "data/generated/residual_blocks.npz"
+gru_checkpoint_path = "data/generated/popularity_gru.pt"
+
+[algorithm.cache]
+# 当前 cache 模块启用，并使用 knapsack initialization + Add/Delete/Swap local search。
+enabled = true
+method = "knapsack_local_search"
+max_coordinate_rounds = 20
+tolerance = 1.0e-9
+
+[algorithm.uav]
+# Trigger-conditioned UAV 位置配置优化。本模块只解决 WHERE，不决定 WHEN。
+# Trigger z_u^q(t) 由未来 PPO 外部给定；这里不实现 trigger policy。
+enabled = true
+method = "coarse_to_fine_coordinate"
+# 以下均为算法超参数，不是物理系统参数，不加入 FORMAL_SYSTEM_PARAMETER_KEYS。
+coarse_num_angles = 16
+coarse_radius_fractions = [0.25, 0.5, 0.75, 1.0]
+refine_rounds = 2
+refine_num_angles = 12
+refine_radius_shrink = 0.5
+max_coordinate_rounds = 10
+position_tolerance_m = 1.0e-6
+objective_tolerance = 1.0e-9
+
+[algorithm.configuration]
+# Trigger-conditioned Cache + UAV 外层 block-coordinate configuration optimizer。
+# 本模块只交替调用已有 Cache/UAV solver，不实现 Matching/KKT/PPO。
+enabled = true
+method = "cache_uav_coordinate"
+max_outer_rounds = 10
+objective_tolerance = 1.0e-9
+
+[algorithm.kkt]
+# 数值实现保护常数，不是物理参数，也不是文献硬件参数。
+# 对应 11.pdf 中的 epsilon_w / epsilon_b，仅用于避免分母为0。
+# 当前每slot最多9个TV任务，因此 1e-6 不会形成实际资源瓶颈。
+min_cpu_fraction = 1.0e-6
+min_bandwidth_fraction = 1.0e-6
+bisection_tolerance = 1.0e-12
+max_bisection_iterations = 100
+
+[algorithm.matching]
+# Transfer-Exchange Matching算法/数值停止参数，不是物理系统参数。
+# max_updates仅作为有限运行保护；若因无严格改进操作停止，
+# 才称为transfer-exchange stable；若因max_updates停止，只保证当前matching可行。
+enabled = true
+method = "transfer_exchange"
+max_updates = 100
+objective_tolerance = 1.0e-9
+
+[algorithm.ppo]
+# Trigger-only PPO Actor-Critic 结构入口。本阶段只实现网络结构与采样/evaluate接口，
+# 以及 on-policy rollout/GAE；不训练 PPO，不定义 loss/optimizer/minibatch update。
+enabled = false
+method = "trigger_actor_critic"
+hidden_sizes = [128, 128]
+autoregressive_hidden_size = 64
+# PPO算法超参数：仅用于discount return / GAE，不属于系统物理参数，
+# 不进入 FORMAL_SYSTEM_PARAMETER_KEYS。
+gamma = 0.99
+gae_lambda = 0.95
+# PPO算法实验baseline。
+# 第一版采用OpenAI Baselines PPO2经典默认量级，用于建立可复现训练基线。
+# 不是系统物理参数，也不声称为本任务最优值。
+# 后续正式实验如需要，仅通过有限敏感性实验评估，当前不进行超参数搜索。
+clip_epsilon = 0.2
+learning_rate = 3.0e-4
+value_loss_coefficient = 0.5
+entropy_coefficient = 0.0
+max_grad_norm = 0.5
+# PPO更新算法baseline。
+# 第一版采用每批on-policy数据4个optimization epochs、
+# 每epoch划分4个minibatches。
+# 参考经典OpenAI Baselines PPO2实现的默认训练结构。
+# 不是系统物理参数，也不声称为当前任务最优值。
+# 后续实验如需要再进行有限敏感性分析。
+update_epochs = 4
+num_minibatches = 4
+
+[parameter_status]
+# 参数状态只使用三类：
+# CONFIRMED_DATA：由当前真实生成数据或明确软件设置确定。
+# PROVISIONAL_IMPLEMENTATION：当前为了代码连通性验证而设置，正式实验前必须校准。
+# TODO_LITERATURE_CALIBRATION：当前没有可靠依据，正式实验前必须补充文献/模型依据。
+"simulation.dt_s" = "CONFIRMED_DATA"
+"simulation.warmup_time_s" = "CONFIRMED_DATA"
+"simulation.episode_time_s" = "CONFIRMED_DATA"
+"simulation.num_research_vehicles" = "CONFIRMED_DATA"
+"simulation.num_task_vehicles" = "CONFIRMED_DATA"
+"simulation.num_service_vehicles" = "CONFIRMED_DATA"
+"service.count" = "CONFIRMED_DATA"
+"service.catalog_path" = "CONFIRMED_DATA"
+"task.arrival_probability" = "CONFIRMED_DATA"
+"task.popularity_zeta" = "CONFIRMED_DATA"
+"task.popularity_epoch_length" = "CONFIRMED_DATA"
+"task.popularity_changes_per_epoch" = "CONFIRMED_DATA"
+"task.input_relative_jitter" = "CONFIRMED_DATA"
+"task.load_relative_jitter" = "CONFIRMED_DATA"
+"prediction.vehicle.horizon" = "CONFIRMED_DATA"
+"prediction.vehicle.sigma_position_m" = "CONFIRMED_DATA"
+"prediction.vehicle.sigma_speed_mps" = "CONFIRMED_DATA"
+"prediction.vehicle.observation_noise_seed" = "CONFIRMED_DATA"
+"prediction.popularity.history_length" = "CONFIRMED_DATA"
+"prediction.popularity.hidden_size" = "CONFIRMED_DATA"
+"prediction.popularity.beta_rho" = "CONFIRMED_DATA"
+"prediction.popularity.alpha_rho" = "CONFIRMED_DATA"
+"scenario.num_scenarios" = "CONFIRMED_DATA"
+"scenario.cross_vehicle_residual_sampling" = "CONFIRMED_DATA"
+"nodes.uav.count" = "CONFIRMED_DATA"
+"nodes.sv.cache_capacity_mb" = "CONFIRMED_DATA"
+"nodes.rsu.cache_capacity_mb" = "CONFIRMED_DATA"
+"nodes.uav.cache_capacity_mb" = "CONFIRMED_DATA"
+"nodes.sv.eta_ca" = "CONFIRMED_DATA"
+"nodes.rsu.eta_ca" = "CONFIRMED_DATA"
+"nodes.uav.eta_ca" = "CONFIRMED_DATA"
+"nodes.sv.xi_ca" = "CONFIRMED_DATA"
+"nodes.rsu.xi_ca" = "CONFIRMED_DATA"
+"nodes.uav.xi_ca" = "CONFIRMED_DATA"
+"cache.discount_beta" = "PROVISIONAL_IMPLEMENTATION"
+"cache.local_search_tolerance" = "PROVISIONAL_IMPLEMENTATION"
+"cache.max_coordinate_rounds" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.vehicle.local_cpu_cycles_per_s" = "CONFIRMED_DATA"
+"nodes.vehicle.local_cache_capacity_mb" = "CONFIRMED_DATA"
+"nodes.vehicle.kappa" = "CONFIRMED_DATA"
+"nodes.vehicle.transmit_power_w" = "CONFIRMED_DATA"
+"nodes.sv.cpu_cycles_per_s" = "CONFIRMED_DATA"
+"nodes.rsu.cpu_cycles_per_s" = "CONFIRMED_DATA"
+"nodes.uav.cpu_cycles_per_s" = "CONFIRMED_DATA"
+"nodes.cloud.cpu_cycles_per_s" = "CONFIRMED_DATA"
+"nodes.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
+"nodes.cloud.cloud_delay_factor" = "CONFIRMED_DATA"
+"nodes.sv.bandwidth_hz" = "CONFIRMED_DATA"
+"nodes.rsu.bandwidth_hz" = "CONFIRMED_DATA"
+"nodes.uav.bandwidth_hz" = "CONFIRMED_DATA"
+"nodes.sv.range_m" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.rsu.range_m" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.uav.range_m" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.uav.altitude_m" = "CONFIRMED_DATA"
+"nodes.uav.max_horizontal_speed_mps" = "CONFIRMED_DATA"
+"nodes.uav.movement.movement_energy_coefficient_j_per_m" = "CONFIRMED_DATA"
+"nodes.uav.movement.movement_fixed_cost" = "CONFIRMED_DATA"
+"communication.ground.channel_gain_at_1m" = "CONFIRMED_DATA"
+"communication.ground.pathloss_exponent" = "CONFIRMED_DATA"
+"communication.ground.bandwidth_hz" = "CONFIRMED_DATA"
+"communication.noise.noise_power_w" = "CONFIRMED_DATA"
+"communication.air.eta1" = "CONFIRMED_DATA"
+"communication.air.eta2" = "CONFIRMED_DATA"
+"communication.air.carrier_frequency_hz" = "CONFIRMED_DATA"
+"communication.air.beta_los" = "CONFIRMED_DATA"
+"communication.air.beta_nlos" = "CONFIRMED_DATA"
+"communication.air.alpha_los" = "CONFIRMED_DATA"
+"communication.air.alpha_nlos" = "CONFIRMED_DATA"
+"communication.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
+"objective.omega_delay" = "CONFIRMED_DATA"
+"objective.omega_energy" = "CONFIRMED_DATA"
+"objective.lambda_cache" = "CONFIRMED_DATA"
+"objective.lambda_movement" = "CONFIRMED_DATA"
+"objective.T_ref" = "CONFIRMED_DATA"
+"objective.E_ref" = "CONFIRMED_DATA"
