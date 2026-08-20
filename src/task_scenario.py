@@ -577,6 +577,159 @@ def json_canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _stable_id_key(value: str) -> tuple[int, int | str]:
+    text = str(value)
+    return (0, int(text)) if text.isdigit() else (1, text)
+
+
+def service_size_by_id(service_catalog: dict[str, Any]) -> dict[int, float]:
+    """从正式 service_catalog.json 读取 service_id -> program_size(MB)。"""
+
+    services = service_catalog.get("services")
+    if not isinstance(services, list) or not services:
+        raise ValueError("service_catalog.json 缺少非空 services。")
+    result: dict[int, float] = {}
+    for row in services:
+        service_id = int(row["service_id"])
+        size = float(row["program_size"])
+        if size <= 0.0:
+            raise ValueError("service program_size 必须大于 0。")
+        if service_id in result:
+            raise ValueError(f"重复 service_id：{service_id}")
+        result[service_id] = size
+    return result
+
+
+def service_size_sanity(
+    service_sizes_mb: dict[int, float],
+    local_cache_capacity_mb: float,
+) -> dict[str, Any]:
+    """验证 2000MB 是否位于 max single 和 min two-service sum 之间。"""
+
+    if local_cache_capacity_mb <= 0.0:
+        raise ValueError("TV local cache capacity 必须大于 0。")
+    ordered = sorted(service_sizes_mb.items(), key=lambda item: (item[1], item[0]))
+    if len(ordered) < 2:
+        raise ValueError("至少需要两个 service 才能验证 min_two_service_sum。")
+    max_single = max(service_sizes_mb.values())
+    min_two = ordered[0][1] + ordered[1][1]
+    if not (max_single < local_cache_capacity_mb < min_two):
+        raise ValueError(
+            "TV local cache capacity 必须满足 "
+            "max_single_service < capacity < min_two_service_sum。"
+        )
+    return {
+        "service_count": len(service_sizes_mb),
+        "min_service": {"service_id": ordered[0][0], "size_mb": ordered[0][1]},
+        "second_min_service": {"service_id": ordered[1][0], "size_mb": ordered[1][1]},
+        "min_service_size_mb": ordered[0][1],
+        "max_service_size_mb": max_single,
+        "min_two_service_sum_mb": min_two,
+        "total_service_size_mb": float(sum(service_sizes_mb.values())),
+        "single_services_fit_count": int(
+            sum(1 for size in service_sizes_mb.values() if size <= local_cache_capacity_mb)
+        ),
+        "all_pairs_exceed_capacity": True,
+    }
+
+
+def generate_tv_local_cache(
+    task_vehicle_ids: list[str],
+    service_catalog: dict[str, Any],
+    local_cache_capacity_mb: float,
+    seed: int,
+) -> dict[str, Any]:
+    """为每个TV生成实验前固定的本地缓存初始状态。
+
+    生成规则严格为 uniform one-service-per-TV，不读取 tasks.csv/popularity/future
+    request，因此不泄漏未来ground truth。相同 TV 集合、service catalog 和 seed
+    会得到完全相同 artifact。
+    """
+
+    service_sizes = service_size_by_id(service_catalog)
+    sanity = service_size_sanity(service_sizes, local_cache_capacity_mb)
+    tv_ids = sorted([str(vehicle_id) for vehicle_id in task_vehicle_ids], key=_stable_id_key)
+    if len(tv_ids) != len(set(tv_ids)):
+        raise ValueError("task_vehicle_ids 存在重复。")
+    service_ids = sorted(service_sizes)
+    rng = np.random.default_rng(int(seed))
+    vehicles: dict[str, dict[str, Any]] = {}
+    for tv_id in tv_ids:
+        service_id = int(rng.choice(service_ids))
+        used = float(service_sizes[service_id])
+        if used > local_cache_capacity_mb:
+            raise AssertionError("抽中的单个service超过TV local cache容量。")
+        vehicles[tv_id] = {
+            "cached_service_ids": [service_id],
+            "used_capacity_mb": used,
+        }
+    return {
+        "schema_version": 1,
+        "metadata": {
+            "seed": int(seed),
+            "capacity_mb": float(local_cache_capacity_mb),
+            "generation_rule": "uniform_one_service_per_tv",
+            "service_count": len(service_ids),
+            "service_ids": service_ids,
+            "tv_count": len(tv_ids),
+            "tv_ids": tv_ids,
+            "fixed_over_episode": True,
+            "uses_future_requests": False,
+            "parameter_basis": "system-scale experimental baseline derived from current service catalog",
+            "service_size_sanity": sanity,
+        },
+        "vehicles": vehicles,
+    }
+
+
+def validate_tv_local_cache(
+    tv_local_cache: dict[str, Any],
+    task_vehicle_ids: list[str],
+    service_catalog: dict[str, Any],
+    local_cache_capacity_mb: float,
+) -> dict[str, Any]:
+    service_sizes = service_size_by_id(service_catalog)
+    valid_services = set(service_sizes)
+    expected_tv = {str(vehicle_id) for vehicle_id in task_vehicle_ids}
+    vehicles = tv_local_cache.get("vehicles")
+    if not isinstance(vehicles, dict):
+        raise ValueError("tv_local_cache.json 缺少 vehicles object。")
+    actual_tv = set(str(vehicle_id) for vehicle_id in vehicles)
+    if actual_tv != expected_tv:
+        raise ValueError("tv_local_cache TV集合与vehicle_roles task_vehicles不一致。")
+    for tv_id, row in vehicles.items():
+        cached = [int(service_id) for service_id in row.get("cached_service_ids", [])]
+        if len(cached) != 1:
+            raise ValueError(f"TV {tv_id} 必须恰好缓存1个service。")
+        if cached[0] not in valid_services:
+            raise ValueError(f"TV {tv_id} 缓存了非法service_id。")
+        used = sum(float(service_sizes[service_id]) for service_id in cached)
+        if used > local_cache_capacity_mb + 1e-9:
+            raise ValueError(f"TV {tv_id} used_capacity 超过容量。")
+        if not math.isclose(float(row["used_capacity_mb"]), used, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(f"TV {tv_id} used_capacity_mb 与service size不一致。")
+    return {
+        "tv_count": len(actual_tv),
+        "service_count": len(valid_services),
+        "all_tv_exactly_once": True,
+        "all_cached_services_valid": True,
+        "all_used_capacity_within_limit": True,
+    }
+
+
+def load_tv_local_cache(path: Path) -> dict[str, set[int]]:
+    """为后续Matching提供轻量读取接口：TV ID -> cached service set。"""
+
+    raw = load_json(path)
+    vehicles = raw.get("vehicles")
+    if not isinstance(vehicles, dict):
+        raise ValueError("tv_local_cache.json 缺少 vehicles object。")
+    return {
+        str(tv_id): {int(service_id) for service_id in row.get("cached_service_ids", [])}
+        for tv_id, row in vehicles.items()
+    }
+
+
 def build_artifacts(
     task_vehicles: list[str],
     dt_s: float,
