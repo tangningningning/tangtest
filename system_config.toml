@@ -263,6 +263,17 @@ range_m = 300.0
 # UAV 最大水平飞行速度，单位 m/s。
 # 文献来源同 Li et al., DOI 10.1186/s13638-020-01861-8，Table 1 采用最大 UAV 速度 15m/s。
 max_horizontal_speed_mps = 15.0
+# 系统模型 C8：任意两个 UAV 在同一时隙满足
+# ||q_u(t) - q_u'(t)||_2 >= d_U_min，单位 m。
+# 主实验采用 d_U_min = 10m，作为文献校准实验 baseline；
+# 该值不是航空法规强制值、硬件实测值或通用安全标准。
+# 文献依据1：Xiang et al., "Towards Power-Efficient Aerial Communications via
+# Dynamic Multi-UAV Cooperation," IEEE WCNC 2020, DOI: 10.1109/WCNC45663.2020.9120587；
+# 该文多 UAV 空中通信仿真采用 d_min = 10m。
+# 文献依据2：Peng and Zhang, "Efficient dynamic cooperative deployment and task
+# scheduling in multi-UAV-assisted MEC for dense dynamic environments," Scientific Reports,
+# 2026, DOI: 10.1038/s41598-026-59305-0；该 multi-UAV-assisted MEC 场景采用 d_safe = 10m。
+min_safety_distance_m = 10.0
 
 [nodes.uav.movement]
 # 参数状态：文献旋翼模型等效校准 baseline。
@@ -604,6 +615,7 @@ num_minibatches = 4
 "nodes.uav.range_m" = "PROVISIONAL_IMPLEMENTATION"
 "nodes.uav.altitude_m" = "CONFIRMED_DATA"
 "nodes.uav.max_horizontal_speed_mps" = "CONFIRMED_DATA"
+"nodes.uav.min_safety_distance_m" = "CONFIRMED_DATA"
 "nodes.uav.movement.movement_energy_coefficient_j_per_m" = "CONFIRMED_DATA"
 "nodes.uav.movement.movement_fixed_cost" = "CONFIRMED_DATA"
 "communication.ground.channel_gain_at_1m" = "CONFIRMED_DATA"

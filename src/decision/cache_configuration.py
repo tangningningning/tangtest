@@ -382,6 +382,17 @@ def role_bandwidth_hz(role: str, config: CacheOptimizationConfig) -> float:
     raise AssertionError("未知 role。")
 
 
+def _local_services_for_tv(
+    local_cache_state: dict[str, set[int]],
+    tv_id: str,
+) -> set[int]:
+    """读取显式传入的 TV fixed local cache，不在核心 optimizer 内读文件。"""
+
+    if tv_id not in local_cache_state:
+        raise ValueError(f"local_cache_state 缺少 TV：{tv_id}")
+    return {int(service_id) for service_id in local_cache_state[tv_id]}
+
+
 def best_task_surrogate(
     cache: np.ndarray,
     origin_scenario: dict[str, Any],
@@ -390,24 +401,28 @@ def best_task_surrogate(
     input_bits: float,
     cpu_cycles: float,
     tv_id: str,
+    local_cache_state: dict[str, set[int]],
     scenario_index: int,
     horizon: int,
     config: CacheOptimizationConfig,
 ) -> float:
-    # Local fallback：不需要缓存。
-    local = system_model.local_execution(
-        cpu_cycles,
-        config.local_cpu_cycles_per_s,
-        config.local_energy_per_cycle_j,
-    )
-    best = system_model.task_utility(
-        local["delay_s"],
-        local["vehicle_energy_j"],
-        config.time_ref_s,
-        config.energy_ref_j,
-        config.omega_t,
-        config.omega_e,
-    )
+    best = -float("inf")
+
+    # Local 只有在该 TV 的 fixed local cache 中包含 service 时才可用。
+    if service_id in _local_services_for_tv(local_cache_state, tv_id):
+        local = system_model.local_execution(
+            cpu_cycles,
+            config.local_cpu_cycles_per_s,
+            config.local_energy_per_cycle_j,
+        )
+        best = system_model.task_utility(
+            local["delay_s"],
+            local["vehicle_energy_j"],
+            config.time_ref_s,
+            config.energy_ref_j,
+            config.omega_t,
+            config.omega_e,
+        )
 
     # Cloud fallback：不需要缓存。
     cloud = system_model.cloud_execution(
@@ -489,6 +504,7 @@ def best_task_surrogate(
 def predicted_service_utility(
     cache: np.ndarray,
     origin_scenario: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> float:
@@ -516,6 +532,7 @@ def predicted_service_utility(
                     float(input_size[scenario_index, horizon, tv_index]),
                     float(cpu_cycles[scenario_index, horizon, tv_index]),
                     tv_ids[tv_index],
+                    local_cache_state,
                     scenario_index,
                     horizon,
                     config,
@@ -567,10 +584,17 @@ def objective(
     cache_trigger: np.ndarray,
     origin_scenario: dict[str, Any],
     service_catalog: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> float:
-    utility = predicted_service_utility(cache, origin_scenario, cache_nodes, config)
+    utility = predicted_service_utility(
+        cache,
+        origin_scenario,
+        local_cache_state,
+        cache_nodes,
+        config,
+    )
     update_cost, _ = cache_update_cost(
         previous_cache,
         cache,
@@ -585,6 +609,7 @@ def objective(
 def evaluate_fixed_configuration(
     cache: np.ndarray,
     origin_scenario: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> dict[str, float]:
@@ -595,7 +620,13 @@ def evaluate_fixed_configuration(
     需要在不同 UAV fixed_positions 下复用同一套 surrogate 口径。
     """
 
-    utility = predicted_service_utility(cache, origin_scenario, cache_nodes, config)
+    utility = predicted_service_utility(
+        cache,
+        origin_scenario,
+        local_cache_state,
+        cache_nodes,
+        config,
+    )
     if not math.isfinite(utility):
         raise AssertionError("fixed configuration predicted utility 非 finite。")
     return {"predicted_utility": float(utility)}
@@ -719,6 +750,7 @@ def best_distinct_neighbor(
     cache_trigger: np.ndarray,
     origin_scenario: dict[str, Any],
     service_catalog: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> tuple[str, np.ndarray, float] | None:
@@ -736,6 +768,7 @@ def best_distinct_neighbor(
             cache_trigger,
             origin_scenario,
             service_catalog,
+            local_cache_state,
             cache_nodes,
             config,
         )
@@ -749,6 +782,7 @@ def initialize_cache_for_triggers(
     cache_trigger: np.ndarray,
     origin_scenario: dict[str, Any],
     service_catalog: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -774,6 +808,7 @@ def initialize_cache_for_triggers(
             cache_trigger,
             origin_scenario,
             service_catalog,
+            local_cache_state,
             cache_nodes,
             config,
         )
@@ -799,6 +834,7 @@ def optimize_cache(
     cache_trigger: np.ndarray,
     predicted_scenarios: dict[str, Any],
     service_catalog: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig | None = None,
     initial_cache_state: np.ndarray | None = None,
@@ -825,7 +861,13 @@ def optimize_cache(
 
     if int(cache_trigger.sum()) == 0:
         unchanged = previous_cache.copy()
-        utility = predicted_service_utility(unchanged, predicted_scenarios, cache_nodes, config)
+        utility = predicted_service_utility(
+            unchanged,
+            predicted_scenarios,
+            local_cache_state,
+            cache_nodes,
+            config,
+        )
         update_cost, energy = cache_update_cost(
             previous_cache,
             unchanged,
@@ -862,6 +904,7 @@ def optimize_cache(
             cache_trigger,
             predicted_scenarios,
             service_catalog,
+            local_cache_state,
             cache_nodes,
             config,
         )
@@ -908,6 +951,7 @@ def optimize_cache(
             "predicted_utility": predicted_service_utility(
                 previous_cache,
                 predicted_scenarios,
+                local_cache_state,
                 cache_nodes,
                 config,
             ),
@@ -933,6 +977,7 @@ def optimize_cache(
         cache_trigger,
         predicted_scenarios,
         service_catalog,
+        local_cache_state,
         cache_nodes,
         config,
     )
@@ -965,6 +1010,7 @@ def optimize_cache(
                     cache_trigger,
                     predicted_scenarios,
                     service_catalog,
+                    local_cache_state,
                     cache_nodes,
                     config,
                 )
@@ -994,6 +1040,7 @@ def optimize_cache(
                 cache_trigger,
                 predicted_scenarios,
                 service_catalog,
+                local_cache_state,
                 cache_nodes,
                 config,
             )
@@ -1007,6 +1054,7 @@ def optimize_cache(
                     cache_trigger,
                     predicted_scenarios,
                     service_catalog,
+                    local_cache_state,
                     cache_nodes,
                     config,
                 )
@@ -1024,6 +1072,7 @@ def optimize_cache(
     predicted_utility = predicted_service_utility(
         current_cache,
         predicted_scenarios,
+        local_cache_state,
         cache_nodes,
         config,
     )
@@ -1087,6 +1136,50 @@ def deterministic_initial_cache(
     return cache
 
 
+def random_feasible_initial_cache(
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+    seed: int | None = None,
+) -> np.ndarray:
+    """生成正式 episode 的固定 seed 随机可行初始动态缓存 C(0)。
+
+    该函数只访问 service catalog、节点容量和显式 seed；不读取 prediction
+    scenarios、future tasks、popularity，也不调用任何 utility/objective。
+    ``default_rng`` 是局部 RNG，不改变全局随机状态。正式 caller 应只在
+    context 构造阶段调用一次，并在每个 episode reset 时复制返回状态。
+    """
+
+    config.validate()
+    num_services = int(service_catalog["num_services"])
+    service_sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
+    if service_sizes.shape != (num_services,) or np.any(~np.isfinite(service_sizes)):
+        raise ValueError("service_catalog service_sizes_mb 形状或数值非法。")
+    if np.any(service_sizes < 0.0):
+        raise ValueError("service_sizes_mb 不能为负。")
+    if len(cache_nodes["node_ids"]) != len(cache_nodes["capacities_mb"]):
+        raise ValueError("cache_nodes node_ids/capacities_mb 长度不一致。")
+
+    rng = np.random.default_rng(
+        int(config.initial_cache_seed if seed is None else seed)
+    )
+    cache = np.zeros(
+        (len(cache_nodes["node_ids"]), num_services),
+        dtype=np.int8,
+    )
+    for node_index, capacity in enumerate(cache_nodes["capacities_mb"]):
+        remaining = float(capacity)
+        service_order = rng.permutation(num_services)
+        for service_id in service_order.tolist():
+            size = float(service_sizes[service_id])
+            if size <= remaining + 1.0e-9 and int(rng.integers(0, 2)) == 1:
+                cache[node_index, service_id] = 1
+                remaining -= size
+
+    validate_cache_shape_and_capacity(cache, service_catalog, cache_nodes)
+    return cache
+
+
 # ============================================================================
 # Minimal validation
 # ============================================================================
@@ -1097,6 +1190,7 @@ def validate_optimizer_once(
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    local_cache_state: dict[str, set[int]],
 ) -> dict[str, Any]:
     previous_cache = deterministic_initial_cache(
         origin_scenario,
@@ -1110,6 +1204,7 @@ def validate_optimizer_once(
         z0,
         origin_scenario,
         service_catalog,
+        local_cache_state,
         cache_nodes,
         config,
     )
@@ -1123,6 +1218,7 @@ def validate_optimizer_once(
         z1,
         origin_scenario,
         service_catalog,
+        local_cache_state,
         cache_nodes,
         config,
     )
@@ -1140,6 +1236,7 @@ def validate_optimizer_once(
         zmulti,
         origin_scenario,
         service_catalog,
+        local_cache_state,
         cache_nodes,
         config,
     )
@@ -1158,6 +1255,7 @@ def validate_optimizer_once(
         zmulti,
         origin_scenario,
         service_catalog,
+        local_cache_state,
         cache_nodes,
         config,
     )
@@ -1235,11 +1333,20 @@ def main(argv: list[str] | None = None) -> int:
         origin_scenario = scenario_at_origin(scenarios, args.origin_index)
         service_catalog = load_service_catalog(resolve_path(project_root, catalog_path_value))
         cache_nodes = build_cache_nodes(origin_scenario, config)
+        from scenario import task_scenario
+
+        local_cache_state = task_scenario.load_tv_local_cache(
+            resolve_path(
+                project_root,
+                project_config.get_config_value(system_config, "paths.tv_local_cache"),
+            )
+        )
         validation = validate_optimizer_once(
             origin_scenario,
             service_catalog,
             cache_nodes,
             config,
+            local_cache_state,
         )
         multi = validation["multi"]
         print("缓存配置优化最小验证完成：")

@@ -50,6 +50,7 @@ class UavSearchConfig:
     objective_tolerance: float
     dt_s: float
     max_horizontal_speed_mps: float
+    min_safety_distance_m: float
     movement_energy_coefficient_j_per_m: float
     movement_fixed_cost: float
     lambda_movement: float
@@ -97,6 +98,7 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         objective_tolerance=float(get(config, "algorithm.uav.objective_tolerance")),
         dt_s=float(get(config, "simulation.dt_s")),
         max_horizontal_speed_mps=float(get(config, "nodes.uav.max_horizontal_speed_mps")),
+        min_safety_distance_m=float(get(config, "nodes.uav.min_safety_distance_m")),
         movement_energy_coefficient_j_per_m=float(
             get(config, "nodes.uav.movement.movement_energy_coefficient_j_per_m")
         ),
@@ -209,18 +211,19 @@ def _inside_boundary(xy: np.ndarray, boundary: tuple[float, float, float, float]
     return bool(x_min <= xy[0] <= x_max and y_min <= xy[1] <= y_max)
 
 
-def _no_exact_overlap(
+def _satisfies_min_safety_distance(
     uav_id: str,
     xy: np.ndarray,
     positions: dict[str, np.ndarray],
-    tolerance_m: float,
+    search_config: UavSearchConfig,
 ) -> bool:
-    """当前没有统一 safety-distance 数值；至少禁止两个 UAV 完全重合。"""
+    """检查 candidate 与当前 trial_positions 中其他 UAV 的物理安全距离。"""
 
     for other_id, other_xy in positions.items():
         if other_id == uav_id:
             continue
-        if _same_position(xy, other_xy, tolerance_m):
+        distance = float(np.linalg.norm(xy - other_xy))
+        if distance + search_config.position_tolerance_m < search_config.min_safety_distance_m:
             return False
     return True
 
@@ -244,9 +247,52 @@ def _candidate_is_feasible(
         return False
     if triggers[uav_id] == 1 and _same_position(candidate, old_xy, search_config.position_tolerance_m):
         return False
-    if not _no_exact_overlap(uav_id, candidate, trial_positions, search_config.position_tolerance_m):
+    if not _satisfies_min_safety_distance(uav_id, candidate, trial_positions, search_config):
         return False
     return True
+
+
+def has_feasible_trigger_assignment(
+    current_positions: dict[str, Any],
+    uav_triggers: dict[str, int],
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+) -> bool:
+    """只按几何/移动约束判断 trigger 是否存在可行候选。
+
+    对已经触发的 UAV，按现有 coarse initialization candidate 集合做动态回溯；
+    未触发 UAV 保持旧位置。该函数不调用预测 utility 或配置 objective，也不
+    硬编码 UAV 数量。最终 objective 导致的 candidate 选择差异仍由正式
+    optimizer 的 blocker 负责发现。
+    """
+
+    uav_ids = uav_ids_from_project(project_cfg)
+    search_config = uav_search_config_from_project(project_cfg)
+    old_positions = _as_position_dict(current_positions, uav_ids)
+    triggers = _trigger_dict(uav_triggers, uav_ids)
+    trial_positions = {uav_id: xy.copy() for uav_id, xy in old_positions.items()}
+    triggered_ids = [uav_id for uav_id in uav_ids if triggers[uav_id] == 1]
+
+    def backtrack(index: int) -> bool:
+        if index >= len(triggered_ids):
+            return True
+        uav_id = triggered_ids[index]
+        for candidate in initialization_candidates(old_positions[uav_id], search_config):
+            trial_positions[uav_id] = candidate
+            if _candidate_is_feasible(
+                uav_id,
+                candidate,
+                old_positions,
+                trial_positions,
+                triggers,
+                flight_boundary,
+                search_config,
+            ) and backtrack(index + 1):
+                return True
+            trial_positions[uav_id] = old_positions[uav_id]
+        return False
+
+    return backtrack(0)
 
 
 def _polar_candidates(
@@ -335,6 +381,7 @@ def evaluate_uav_configuration(
     triggers: dict[str, int],
     scenario_slice: dict[str, Any],
     cache_state: np.ndarray,
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     search_config: UavSearchConfig,
@@ -352,6 +399,7 @@ def evaluate_uav_configuration(
     utility = cache_configuration.evaluate_fixed_configuration(
         cache_state,
         scenario_slice,
+        local_cache_state,
         nodes,
         cache_config,
     )["predicted_utility"]
@@ -381,6 +429,7 @@ def _result_from_positions(
     triggers: dict[str, int],
     scenario_slice: dict[str, Any],
     cache_state: np.ndarray,
+    local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     search_config: UavSearchConfig,
@@ -398,6 +447,7 @@ def _result_from_positions(
         triggers,
         scenario_slice,
         cache_state,
+        local_cache_state,
         cache_nodes,
         cache_config,
         search_config,
@@ -429,6 +479,7 @@ def optimize_uav_configuration(
     uav_triggers: dict[str, int],
     scenario_slice: dict[str, Any],
     cache_state: np.ndarray,
+    local_cache_state: dict[str, set[int]],
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
@@ -471,6 +522,7 @@ def optimize_uav_configuration(
             triggers,
             scenario_slice,
             cache_state,
+            local_cache_state,
             cache_nodes,
             cache_config,
             search_config,
@@ -507,6 +559,7 @@ def optimize_uav_configuration(
                     triggers,
                     scenario_slice,
                     cache_state,
+                    local_cache_state,
                     cache_nodes,
                     cache_config,
                     search_config,
@@ -523,6 +576,7 @@ def optimize_uav_configuration(
                     triggers,
                     scenario_slice,
                     cache_state,
+                    local_cache_state,
                     cache_nodes,
                     cache_config,
                     search_config,
@@ -562,6 +616,7 @@ def optimize_uav_configuration(
                 triggers,
                 scenario_slice,
                 cache_state,
+                local_cache_state,
                 cache_nodes,
                 cache_config,
                 search_config,
@@ -580,6 +635,7 @@ def optimize_uav_configuration(
         triggers,
         scenario_slice,
         cache_state,
+        local_cache_state,
         cache_nodes,
         cache_config,
         search_config,
@@ -619,6 +675,7 @@ def optimize_uav_configuration(
                         triggers,
                         scenario_slice,
                         cache_state,
+                        local_cache_state,
                         cache_nodes,
                         cache_config,
                         search_config,
@@ -640,6 +697,7 @@ def optimize_uav_configuration(
                 triggers,
                 scenario_slice,
                 cache_state,
+                local_cache_state,
                 cache_nodes,
                 cache_config,
                 search_config,
@@ -658,6 +716,7 @@ def optimize_uav_configuration(
         triggers,
         scenario_slice,
         cache_state,
+        local_cache_state,
         cache_nodes,
         cache_config,
         search_config,
@@ -696,6 +755,7 @@ def validate_uav_optimizer_once(
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    local_cache_state: dict[str, set[int]],
     project_cfg: dict[str, Any],
     flight_boundary: tuple[float, float, float, float],
 ) -> dict[str, UavOptimizationResult]:
@@ -723,6 +783,7 @@ def validate_uav_optimizer_once(
             trigger,
             origin_scenario,
             previous_cache,
+            local_cache_state,
             project_cfg,
             cache_nodes,
             cache_config,
@@ -773,6 +834,7 @@ def validate_uav_optimizer_once(
             trigger,
             origin_scenario,
             previous_cache,
+            local_cache_state,
             project_cfg,
             cache_nodes,
             cache_config,
@@ -787,6 +849,7 @@ def validate_uav_optimizer_once(
             trigger,
             origin_scenario,
             previous_cache,
+            local_cache_state,
             cache_nodes,
             cache_config,
             search_config,
@@ -799,7 +862,7 @@ def validate_uav_optimizer_once(
         ):
             raise AssertionError(f"trigger={label} direct evaluator objective 不一致。")
 
-    # 当前没有统一 safety-distance 数值，因此只检查 UAV 不完全重合。
+    # C8：所有最终 UAV pair 都必须满足物理最小安全距离。
     for label, result in results.items():
         final_np = {
             uav_id: np.asarray(result.final_positions[uav_id], dtype=np.float64)
@@ -807,12 +870,12 @@ def validate_uav_optimizer_once(
         }
         for index, left_id in enumerate(uav_ids):
             for right_id in uav_ids[index + 1 :]:
-                if _same_position(
-                    final_np[left_id],
-                    final_np[right_id],
-                    search_config.position_tolerance_m,
-                ):
-                    raise AssertionError(f"trigger={label} 中 UAV 最终位置重合。")
+                distance = float(np.linalg.norm(final_np[left_id] - final_np[right_id]))
+                if distance + search_config.position_tolerance_m < search_config.min_safety_distance_m:
+                    raise AssertionError(
+                        f"trigger={label} 中 UAV pair 距离 {distance:.12g} 小于"
+                        f" min_safety_distance_m={search_config.min_safety_distance_m:.12g}。"
+                    )
     return results
 
 
@@ -842,12 +905,21 @@ def main(argv: list[str] | None = None) -> int:
     origin_scenario = cache_configuration.scenario_at_origin(scenarios, args.origin_index)
     service_catalog = cache_configuration.load_service_catalog(catalog_path)
     cache_nodes = cache_configuration.build_cache_nodes(origin_scenario, cache_cfg)
+    from scenario import task_scenario
+
+    local_cache_state = task_scenario.load_tv_local_cache(
+        cache_configuration.resolve_path(
+            project_root,
+            project_config.get_config_value(cfg, "paths.tv_local_cache"),
+        )
+    )
     boundary = boundary_from_project(cfg)
     results = validate_uav_optimizer_once(
         origin_scenario,
         service_catalog,
         cache_nodes,
         cache_cfg,
+        local_cache_state,
         cfg,
         boundary,
     )

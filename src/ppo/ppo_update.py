@@ -153,7 +153,11 @@ def compute_ppo_loss(
     advantages = torch.as_tensor(rollout_batch.advantages, dtype=torch.float32).detach()
     returns = torch.as_tensor(rollout_batch.returns, dtype=torch.float32).detach()
 
-    evaluation = policy.evaluate_actions(observations, actions)
+    evaluation = policy.evaluate_actions(
+        observations,
+        actions,
+        action_masks=rollout_batch.action_masks,
+    )
     new_log_probs = evaluation.joint_log_prob
     new_values = evaluation.value
     entropy_per_sample = evaluation.entropy
@@ -204,7 +208,11 @@ def _artificial_clipping_sanity() -> float:
 
 def _pre_update_ratio_diagnostics(policy: Any, rollout_batch: ppo_rollout.RolloutBatch) -> dict[str, float]:
     _require_torch()
-    evaluation = policy.evaluate_actions(rollout_batch.observations, rollout_batch.actions)
+    evaluation = policy.evaluate_actions(
+        rollout_batch.observations,
+        rollout_batch.actions,
+        action_masks=rollout_batch.action_masks,
+    )
     old_log_probs = torch.as_tensor(rollout_batch.old_log_probs, dtype=torch.float32)
     ratios = torch.exp(evaluation.joint_log_prob - old_log_probs)
     approx_kl = torch.mean(old_log_probs - evaluation.joint_log_prob)

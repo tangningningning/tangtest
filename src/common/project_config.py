@@ -194,6 +194,7 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "nodes.uav.bandwidth_hz",
     "nodes.uav.altitude_m",
     "nodes.uav.max_horizontal_speed_mps",
+    "nodes.uav.min_safety_distance_m",
     "nodes.uav.movement.movement_energy_coefficient_j_per_m",
     "nodes.uav.movement.movement_fixed_cost",
     "communication.ground.channel_gain_at_1m",
@@ -296,12 +297,22 @@ def validate_config(config: dict[str, Any]) -> None:
     if actual_uav_ids != expected_uav_ids:
         raise ValueError("UAV ID 必须按 UAV_0, UAV_1, ... 连续命名。")
 
-    for left, right in zip(uav_instances, uav_instances[1:]):
-        if (
-            float(left["initial_x_m"]) == float(right["initial_x_m"])
-            and float(left["initial_y_m"]) == float(right["initial_y_m"])
-        ):
-            raise ValueError("两个UAV初始水平位置不能完全重合。")
+    min_safety_distance_m = float(
+        get_config_value(config, "nodes.uav.min_safety_distance_m")
+    )
+    if min_safety_distance_m <= 0.0:
+        raise ValueError("nodes.uav.min_safety_distance_m 必须大于 0。")
+    for left_index, left in enumerate(uav_instances):
+        for right in uav_instances[left_index + 1 :]:
+            distance = math.hypot(
+                float(left["initial_x_m"]) - float(right["initial_x_m"]),
+                float(left["initial_y_m"]) - float(right["initial_y_m"]),
+            )
+            if distance + 1.0e-12 < min_safety_distance_m:
+                raise ValueError(
+                    "UAV 初始位置违反 nodes.uav.min_safety_distance_m："
+                    f"distance={distance:.12g}, required={min_safety_distance_m:.12g}。"
+                )
 
     roles_path = resolve_path(project_root, get_config_value(config, "paths.vehicle_roles"))
     with roles_path.open("r", encoding="utf-8") as stream:
@@ -423,6 +434,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "nodes.cloud.cpu_cycles_per_s",
         "nodes.uav.altitude_m",
         "nodes.uav.max_horizontal_speed_mps",
+        "nodes.uav.min_safety_distance_m",
         "nodes.uav.movement.movement_energy_coefficient_j_per_m",
         "nodes.sv.bandwidth_hz",
         "nodes.rsu.bandwidth_hz",

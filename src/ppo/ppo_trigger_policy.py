@@ -12,14 +12,14 @@ prediction_scenarios.npz、tasks.csv、trajectory.csv 等文件。上游负责�
 
 PyTorch 部分仅使用官方成熟 API，没有复制 PyTorch 源码：
 https://docs.pytorch.org/docs/stable/generated/torch.nn.GRUCell.html
-https://docs.pytorch.org/docs/stable/distributions.html#bernoulli
+https://docs.pytorch.org/docs/stable/distributions.html#categorical
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -181,6 +181,7 @@ class TriggerActionSample:
     value: float
     per_action_probabilities: np.ndarray
     per_action_logits: np.ndarray
+    per_action_masks: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,53 @@ def _validate_binary_vector(value: Any, expected_length: int, name: str) -> np.n
     if not np.all(np.isin(vector, [0, 1])):
         raise ValueError(f"{name} 必须是 0/1 向量。")
     return vector
+
+
+def _normalize_action_masks(
+    action_masks: Any,
+    batch_size: int,
+    action_dim: int,
+    device: Any,
+) -> Any:
+    """规范化为 ``[B, action_dim, 2]`` 的有效 binary action mask。"""
+
+    if action_masks is None:
+        return torch.ones(
+            (batch_size, action_dim, 2),
+            dtype=torch.bool,
+            device=device,
+        )
+    masks = torch.as_tensor(action_masks, dtype=torch.bool, device=device)
+    if masks.ndim == 2:
+        masks = masks.unsqueeze(0)
+    if masks.shape != (batch_size, action_dim, 2):
+        raise ValueError(
+            f"action_masks shape={tuple(masks.shape)}，期望 "
+            f"{(batch_size, action_dim, 2)}。"
+        )
+    if not bool(torch.all(torch.any(masks, dim=-1)).item()):
+        raise ValueError("action_masks 不能把某个 binary action 的 0/1 两个值同时屏蔽。")
+    return masks
+
+
+def _resolve_sampling_mask(
+    action_mask: Any,
+    action_index: int,
+    prefix_actions: np.ndarray,
+    action_dim: int,
+) -> np.ndarray:
+    if action_mask is None:
+        return np.ones(2, dtype=bool)
+    if callable(action_mask):
+        raw = action_mask(int(action_index), prefix_actions.copy())
+    else:
+        raw = np.asarray(action_mask)
+        if raw.shape == (action_dim, 2):
+            raw = raw[action_index]
+    mask = np.asarray(raw, dtype=bool).reshape(-1)
+    if mask.shape != (2,) or not np.any(mask):
+        raise ValueError(f"action mask[{action_index}] 必须是至少允许一个值的 [2] mask。")
+    return mask
 
 
 def _normalize_xy(xy: Any, boundary: tuple[float, float, float, float], label: str) -> np.ndarray:
@@ -349,7 +397,7 @@ def set_torch_seed(seed: int) -> None:
 
 
 class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
-    """Shared MLP encoder + autoregressive GRUCell Bernoulli actor + scalar critic."""
+    """Shared MLP encoder + autoregressive GRUCell binary actor + scalar critic."""
 
     def __init__(
         self,
@@ -448,8 +496,17 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             previous_action = actions[:, action_index].long()
         return torch.stack(logits, dim=1), value
 
-    def evaluate_actions(self, observations: Any, action_vectors: Any) -> TriggerEvaluation:
-        """Teacher-forced 复算 ``log π(a|s)``，原生支持 single/batch。"""
+    def evaluate_actions(
+        self,
+        observations: Any,
+        action_vectors: Any,
+        action_masks: Any = None,
+    ) -> TriggerEvaluation:
+        """Teacher-forced 复算 masked ``log π(a|s)``，原生支持 single/batch。
+
+        ``action_masks`` 必须来自同一个状态和 autoregressive prefix；rollout
+        会把采样时的 mask 保存到 ``RolloutBatch``，供 PPO update 原样复用。
+        """
 
         logits, value = self._teacher_forced_logits(observations, action_vectors)
         actions = torch.as_tensor(action_vectors, dtype=torch.float32, device=logits.device)
@@ -457,10 +514,31 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         if actions.ndim == 1:
             actions = actions.unsqueeze(0)
             single_action = True
-        dist = torch.distributions.Bernoulli(logits=logits)
-        joint_log_prob = dist.log_prob(actions).sum(dim=1)
-        entropy = dist.entropy().sum(dim=1)
-        probabilities = torch.sigmoid(logits)
+        masks = _normalize_action_masks(
+            action_masks,
+            int(actions.shape[0]),
+            self.action_dim,
+            logits.device,
+        )
+        categorical_logits = torch.stack(
+            [torch.zeros_like(logits), logits],
+            dim=-1,
+        )
+        categorical_logits = categorical_logits.masked_fill(~masks, -float("inf"))
+        dist = torch.distributions.Categorical(logits=categorical_logits)
+        action_indices = actions.long()
+        action_is_valid = masks.gather(-1, action_indices.unsqueeze(-1)).squeeze(-1)
+        if not bool(torch.all(action_is_valid).item()):
+            raise ValueError("action_vectors 包含被 action mask 屏蔽的 binary action。")
+        joint_log_prob = dist.log_prob(action_indices).sum(dim=1)
+        entropy_per_action = dist.entropy()
+        entropy_per_action = torch.where(
+            masks.sum(dim=-1) == 1,
+            torch.zeros_like(entropy_per_action),
+            entropy_per_action,
+        )
+        entropy = entropy_per_action.sum(dim=1)
+        probabilities = dist.probs[..., 1]
         if single_action:
             joint_log_prob = joint_log_prob.squeeze(0)
             entropy = entropy.squeeze(0)
@@ -475,8 +553,17 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             per_action_probabilities=probabilities,
         )
 
-    def sample_action(self, observation: Any, deterministic: bool = False) -> TriggerActionSample:
-        """按固定 action 顺序自回归采样一个 trigger vector。"""
+    def sample_action(
+        self,
+        observation: Any,
+        deterministic: bool = False,
+        action_mask: Callable[[int, np.ndarray], Any] | Any = None,
+    ) -> TriggerActionSample:
+        """按固定 action 顺序自回归采样一个 masked trigger vector。
+
+        callable mask 接收 ``(action_index, prefix_actions)``，因此后续 UAV
+        trigger 可以依据前面已采样的 trigger 和当前几何约束动态决定。
+        """
 
         obs, single = self._as_observation_batch(observation)
         if not single or obs.shape[0] != 1:
@@ -490,6 +577,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         probs = []
         log_probs = []
         entropies = []
+        masks = []
         for action_index in range(self.action_dim):
             index_tensor = torch.full((1,), action_index, dtype=torch.long, device=obs.device)
             step_input = torch.cat(
@@ -502,16 +590,32 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             )
             hidden = self.gru_cell(step_input, hidden)
             logit = self.logit_head(hidden).squeeze(-1)
-            dist = torch.distributions.Bernoulli(logits=logit)
+            mask = _resolve_sampling_mask(
+                action_mask,
+                action_index,
+                np.asarray(
+                    [int(item.detach().cpu().item()) for item in actions],
+                    dtype=np.int8,
+                ),
+                self.action_dim,
+            )
+            mask_tensor = torch.as_tensor(mask, dtype=torch.bool, device=obs.device)
+            categorical_logits = torch.stack(
+                [torch.zeros_like(logit), logit],
+                dim=-1,
+            ).masked_fill(~mask_tensor, -float("inf"))
+            dist = torch.distributions.Categorical(logits=categorical_logits)
             if deterministic:
-                action = (torch.sigmoid(logit) >= 0.5).to(torch.float32)
+                action = torch.argmax(dist.probs, dim=-1).to(torch.float32)
             else:
-                action = dist.sample()
+                action = dist.sample().to(torch.float32)
             actions.append(action)
             logits.append(logit)
-            probs.append(torch.sigmoid(logit))
-            log_probs.append(dist.log_prob(action))
-            entropies.append(dist.entropy())
+            probs.append(dist.probs[..., 1])
+            log_probs.append(dist.log_prob(action.long()))
+            entropy = dist.entropy()
+            entropies.append(torch.where(mask_tensor.sum() == 1, torch.zeros_like(entropy), entropy))
+            masks.append(mask)
             previous_action = action.long()
 
         action_tensor = torch.stack(actions, dim=1).to(torch.int64).squeeze(0)
@@ -528,4 +632,5 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             value=float(value.squeeze(0).detach().cpu()),
             per_action_probabilities=prob_tensor.detach().cpu().numpy().astype(np.float64),
             per_action_logits=logit_tensor.detach().cpu().numpy().astype(np.float64),
+            per_action_masks=np.asarray(masks, dtype=bool),
         )

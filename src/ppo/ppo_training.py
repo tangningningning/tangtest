@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import inspect
 import math
@@ -779,6 +780,13 @@ def _formal_compatibility_metadata(
             "num_minibatches": int(protocol.num_minibatches),
         },
         "experiment_seed": int(project_config.get_config_value(ctx.cfg, "experiment.seed")),
+        "initial_cache": {
+            "source": protocol.initial_cache_source,
+            "seed": int(ctx.cache_cfg.initial_cache_seed),
+            "sha256": hashlib.sha256(
+                np.asarray(ctx.initial_cache, dtype=np.int8).tobytes()
+            ).hexdigest(),
+        },
         "policy_network": {
             "class": type(policy).__name__,
             "observation_dim": int(getattr(policy, "observation_dim")),
@@ -936,11 +944,11 @@ def _build_context(config_path: str) -> TrainingSanityContext:
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
     )
     gamma, gae_lambda = ppo_rollout.ppo_gae_config_from_project(cfg)
-    initial_cache = cache_configuration.deterministic_initial_cache(
-        first_origin,
+    initial_cache = cache_configuration.random_feasible_initial_cache(
         service_catalog,
         cache_nodes,
         cache_cfg,
+        seed=int(project_config.get_config_value(cfg, "experiment.seed")),
     )
     initial_uav = uav_configuration.initial_uav_positions_from_project(cfg)
     return TrainingSanityContext(
@@ -999,8 +1007,8 @@ def build_formal_training_protocol(
         true_terminal_time_s=float(times[-1]),
         single_trace_training=True,
         initial_cache_source=(
-            "cache_configuration.deterministic_initial_cache(first_origin, service_catalog, "
-            "cache_nodes, cache_cfg)"
+            "cache_configuration.random_feasible_initial_cache(service_catalog, cache_nodes, "
+            "cache_cfg, seed=experiment.seed); fixed once per formal run"
         ),
         initial_uav_source="uav_configuration.initial_uav_positions_from_project(system_config)",
         tv_local_cache_source=str(project_config.get_config_value(project_cfg, "paths.tv_local_cache")),
@@ -1108,7 +1116,8 @@ def collect_formal_episode_rollout(
     2. 从 FormalTrainingProtocol 第一个 origin 连续执行到最后一个 origin；
     3. episode内部 C(t)、Q^U(t) 逐slot传播，不逐slot reset；
     4. 最后一个origin为true terminal，因此GAE bootstrap=0；
-    5. policy动作不mask、不repair、不resample；不可行动作向上抛出 InfeasibleActionBlocker。
+    5. policy 使用可行动作 mask；不做 sampling 后 repair/resample；mask 无法提前
+       判断的 residual infeasibility 仍向上抛出 InfeasibleActionBlocker。
 
     注意：这是正式执行器。本阶段CLI dry-run不会调用该函数。
     """
@@ -1189,6 +1198,7 @@ def _slice_rollout_batch(
     return ppo_rollout.RolloutBatch(
         observations=batch.observations[idx].copy(),
         actions=batch.actions[idx].copy(),
+        action_masks=batch.action_masks[idx].copy(),
         old_log_probs=batch.old_log_probs[idx].copy(),
         old_values=batch.old_values[idx].copy(),
         rewards=batch.rewards[idx].copy(),
@@ -1632,7 +1642,20 @@ def evaluate_formal_episode(
                 ctx.observation_spec,
                 ctx.flight_boundary,
             )
-            sample = policy.sample_action(observation, deterministic=True)
+            action_mask_provider = ppo_rollout.build_trigger_action_mask_provider(
+                previous_cache,
+                previous_uav,
+                ctx.service_catalog,
+                ctx.cfg,
+                ctx.cache_nodes,
+                ctx.flight_boundary,
+                ctx.action_spec,
+            )
+            sample = policy.sample_action(
+                observation,
+                deterministic=True,
+                action_mask=action_mask_provider,
+            )
             result = slot_environment.execute_slot(
                 previous_cache,
                 previous_uav,

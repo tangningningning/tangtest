@@ -132,6 +132,7 @@ def execute_slot(
         cache_trigger,
         dict(uav_triggers),
         scenario_slice,
+        local_cache_state,
         service_catalog,
         project_cfg,
         cache_nodes,
@@ -489,6 +490,7 @@ def _movement_cost(
     uav_triggers: dict[str, int],
     scenario_slice: dict[str, Any],
     cache_state: np.ndarray,
+    local_cache_state: dict[str, set[int]],
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
@@ -502,6 +504,7 @@ def _movement_cost(
         uav_triggers,
         scenario_slice,
         cache_state,
+        local_cache_state,
         cache_nodes,
         cache_config,
         search_cfg,
@@ -517,6 +520,7 @@ def evaluate_joint_configuration(
     cache_triggers: np.ndarray,
     uav_triggers: dict[str, int],
     scenario_slice: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
@@ -537,6 +541,7 @@ def evaluate_joint_configuration(
     predictive_utility = cache_configuration.evaluate_fixed_configuration(
         cache_state,
         scenario_slice,
+        local_cache_state,
         nodes,
         cache_config,
     )["predicted_utility"]
@@ -554,6 +559,7 @@ def evaluate_joint_configuration(
         uav_triggers,
         scenario_slice,
         cache_state,
+        local_cache_state,
         project_cfg,
         cache_nodes,
         cache_config,
@@ -642,6 +648,7 @@ def optimize_joint_configuration(
     cache_triggers: np.ndarray,
     uav_triggers: dict[str, int],
     scenario_slice: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
     service_catalog: dict[str, Any],
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
@@ -667,6 +674,7 @@ def optimize_joint_configuration(
             cache_trigger,
             uav_triggers,
             scenario_slice,
+            local_cache_state,
             service_catalog,
             cache_nodes,
             cache_config,
@@ -703,6 +711,7 @@ def optimize_joint_configuration(
         cache_trigger,
         scenario_slice,
         service_catalog,
+        local_cache_state,
         cache_nodes_at_q_prev,
         cache_config,
     )
@@ -733,6 +742,7 @@ def optimize_joint_configuration(
         uav_triggers,
         scenario_slice,
         c_current,
+        local_cache_state,
         project_cfg,
         cache_nodes,
         cache_config,
@@ -761,6 +771,7 @@ def optimize_joint_configuration(
         cache_trigger,
         uav_triggers,
         scenario_slice,
+        local_cache_state,
         service_catalog,
         cache_nodes,
         cache_config,
@@ -790,6 +801,7 @@ def optimize_joint_configuration(
             cache_trigger,
             scenario_slice,
             service_catalog,
+            local_cache_state,
             cache_nodes_at_current_q,
             cache_config,
             initial_cache_state=c_current,
@@ -816,6 +828,7 @@ def optimize_joint_configuration(
             cache_trigger,
             uav_triggers,
             scenario_slice,
+            local_cache_state,
             service_catalog,
             cache_nodes,
             cache_config,
@@ -843,6 +856,7 @@ def optimize_joint_configuration(
             uav_triggers,
             scenario_slice,
             c_current,
+            local_cache_state,
             project_cfg,
             cache_nodes,
             cache_config,
@@ -872,6 +886,7 @@ def optimize_joint_configuration(
             cache_trigger,
             uav_triggers,
             scenario_slice,
+            local_cache_state,
             service_catalog,
             cache_nodes,
             cache_config,
@@ -943,6 +958,7 @@ def validate_joint_optimizer_once(
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    local_cache_state: dict[str, set[int]],
     project_cfg: dict[str, Any],
     flight_boundary: tuple[float, float, float, float],
 ) -> dict[str, JointConfigurationResult]:
@@ -981,6 +997,7 @@ def validate_joint_optimizer_once(
             cache_trigger,
             uav_trigger,
             origin_scenario,
+            local_cache_state,
             service_catalog,
             project_cfg,
             cache_nodes,
@@ -1004,6 +1021,7 @@ def validate_joint_optimizer_once(
             cache_trigger,
             uav_trigger,
             origin_scenario,
+            local_cache_state,
             service_catalog,
             cache_nodes,
             cache_config,
@@ -1034,6 +1052,7 @@ def validate_joint_optimizer_once(
         cases["D"][0],
         cases["D"][1],
         origin_scenario,
+        local_cache_state,
         service_catalog,
         project_cfg,
         cache_nodes,
@@ -1100,12 +1119,19 @@ def configuration_main(argv: list[str] | None = None) -> int:
         )
     )
     cache_nodes = cache_configuration.build_cache_nodes(origin, cache_cfg)
+    local_cache_state = task_scenario.load_tv_local_cache(
+        cache_configuration.resolve_path(
+            project_root,
+            project_config.get_config_value(cfg, "paths.tv_local_cache"),
+        )
+    )
     boundary = uav_configuration.boundary_from_project(cfg)
     results = validate_joint_optimizer_once(
         origin,
         service_catalog,
         cache_nodes,
         cache_cfg,
+        local_cache_state,
         cfg,
         boundary,
     )

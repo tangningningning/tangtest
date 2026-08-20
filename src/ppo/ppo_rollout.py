@@ -18,7 +18,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -68,6 +68,7 @@ class RolloutTransition:
 class RolloutBatch:
     observations: np.ndarray
     actions: np.ndarray
+    action_masks: np.ndarray
     old_log_probs: np.ndarray
     old_values: np.ndarray
     rewards: np.ndarray
@@ -87,6 +88,8 @@ class InfeasibleActionBlocker(RuntimeError):
 
 
 def ppo_gae_config_from_project(project_cfg: dict[str, Any]) -> tuple[float, float]:
+    """读取 PPO discounted training/GAE 参数；正式性能另以 raw G 累计评价。"""
+
     return (
         float(project_config.get_config_value(project_cfg, "algorithm.ppo.gamma")),
         float(project_config.get_config_value(project_cfg, "algorithm.ppo.gae_lambda")),
@@ -185,6 +188,83 @@ def _make_observation(
     )
 
 
+def build_trigger_action_mask_provider(
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    service_catalog: dict[str, Any],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+    action_spec: ppo_trigger_policy.TriggerActionSpec,
+) -> Callable[[int, np.ndarray], np.ndarray]:
+    """构造当前状态下的 autoregressive binary trigger mask。
+
+    Cache trigger 的 distinct feasibility 只依赖本节点上一状态和容量；UAV
+    trigger 则按 policy 当前的 UAV 顺序逐步检查几何 candidate assignment。
+    这里不调用 objective，因此 objective 选择造成的 residual infeasibility
+    仍由 InfeasibleActionBlocker 负责暴露。
+    """
+
+    previous_cache = np.asarray(previous_cache_state, dtype=np.int8)
+    cache_node_ids = [str(value) for value in cache_nodes["node_ids"]]
+    if tuple(cache_node_ids) != tuple(action_spec.cache_node_ids):
+        raise ValueError("action_spec.cache_node_ids 与 cache_nodes 不一致。")
+    if previous_cache.shape != (
+        len(cache_node_ids),
+        int(service_catalog["num_services"]),
+    ):
+        raise ValueError("previous_cache_state shape 与 cache_nodes/service catalog 不一致。")
+    if not np.all(np.isin(previous_cache, [0, 1])):
+        raise ValueError("previous_cache_state 必须是 0/1。")
+
+    cache_trigger_allowed = np.ones(len(cache_node_ids), dtype=bool)
+    service_sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
+    for node_index in range(len(cache_node_ids)):
+        neighbors = cache_configuration.generate_node_neighbors(
+            previous_cache[node_index],
+            service_sizes,
+            float(cache_nodes["capacities_mb"][node_index]),
+        )
+        cache_trigger_allowed[node_index] = any(
+            not np.array_equal(candidate, previous_cache[node_index])
+            for _, candidate in neighbors
+        )
+
+    previous_uav = {
+        str(uav_id): np.asarray(xy, dtype=np.float64).copy()
+        for uav_id, xy in previous_uav_positions.items()
+    }
+    cache_count = len(action_spec.cache_node_ids)
+
+    def provider(action_index: int, prefix_actions: np.ndarray) -> np.ndarray:
+        index = int(action_index)
+        prefix = np.asarray(prefix_actions, dtype=np.int8).reshape(-1)
+        if index < 0 or index >= action_spec.action_dim or len(prefix) != index:
+            raise ValueError("action mask provider 收到非法 action index/prefix。")
+        if not np.all(np.isin(prefix, [0, 1])):
+            raise ValueError("action mask prefix 必须是 0/1。")
+        if index < cache_count:
+            return np.asarray([True, bool(cache_trigger_allowed[index])], dtype=bool)
+
+        uav_index = index - cache_count
+        triggers = {uav_id: 0 for uav_id in action_spec.uav_ids}
+        for prior_index in range(uav_index):
+            triggers[action_spec.uav_ids[prior_index]] = int(
+                prefix[cache_count + prior_index]
+            )
+        current_uav_id = action_spec.uav_ids[uav_index]
+        triggers[current_uav_id] = 1
+        can_trigger = uav_configuration.has_feasible_trigger_assignment(
+            previous_uav,
+            triggers,
+            project_cfg,
+            flight_boundary,
+        )
+        return np.asarray([True, bool(can_trigger)], dtype=bool)
+
+    return provider
+
+
 def collect_on_policy_rollout(
     policy: Any,
     initial_cache_state: np.ndarray,
@@ -212,6 +292,7 @@ def collect_on_policy_rollout(
         for uav_id, xy in initial_uav_positions.items()
     }
     transitions: list[RolloutTransition] = []
+    action_masks: list[np.ndarray] = []
     state_propagation_ok = True
 
     # aligned_steps 可包含最后一个只用于 truncation bootstrap 的 next step。
@@ -246,7 +327,20 @@ def collect_on_policy_rollout(
             observation_spec,
             flight_boundary,
         )
-        sample = policy.sample_action(observation, deterministic=False)
+        action_mask_provider = build_trigger_action_mask_provider(
+            previous_cache,
+            previous_uav,
+            service_catalog,
+            project_cfg,
+            cache_nodes,
+            flight_boundary,
+            action_spec,
+        )
+        sample = policy.sample_action(
+            observation,
+            deterministic=False,
+            action_mask=action_mask_provider,
+        )
         result = slot_environment.execute_slot(
             previous_cache,
             previous_uav,
@@ -305,6 +399,7 @@ def collect_on_policy_rollout(
             next_uav_positions=dict(result.next_uav_positions or {}),
         )
         transitions.append(transition)
+        action_masks.append(sample.per_action_masks.copy())
         previous_cache = transition.next_cache_state.copy()
         previous_uav = dict(transition.next_uav_positions)
         if done:
@@ -345,6 +440,7 @@ def collect_on_policy_rollout(
     return RolloutBatch(
         observations=observations,
         actions=actions,
+        action_masks=np.stack(action_masks).astype(bool),
         old_log_probs=old_log_probs,
         old_values=old_values,
         rewards=rewards,
@@ -515,7 +611,11 @@ def _manual_gae_sanity() -> float:
 
 
 def _batch_consistency(policy: Any, batch: RolloutBatch) -> tuple[float, float]:
-    evaluation = policy.evaluate_actions(batch.observations, batch.actions)
+    evaluation = policy.evaluate_actions(
+        batch.observations,
+        batch.actions,
+        action_masks=batch.action_masks,
+    )
     log_probs = evaluation.joint_log_prob.detach().cpu().numpy()
     values = evaluation.value.detach().cpu().numpy()
     return (
