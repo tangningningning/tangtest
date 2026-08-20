@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 
 import cache_configuration
+import kkt_resource_allocation as kkt
 import ppo_rollout
 import ppo_trigger_policy
 import ppo_update
@@ -272,6 +273,11 @@ class DeterministicEvaluationSummary:
     cumulative_movement_cost: float
     cache_trigger_counts: dict[str, int]
     uav_movement_trigger_counts: dict[str, int]
+    arrived_task_count: int
+    cache_service_available_task_count: int
+    cache_service_availability_rate: float | None
+    cloud_execution_task_count: int
+    cloud_execution_ratio: float | None
     all_steps_feasible: bool
     reward_identity_error: float
     evaluation_semantics: str
@@ -780,7 +786,16 @@ def evaluate_formal_episode(
     actual_q_sum = 0.0
     cache_cost_sum = 0.0
     movement_cost_sum = 0.0
+    arrived_task_count = 0
+    cache_service_available_task_count = 0
+    cloud_execution_task_count = 0
     all_steps_feasible = True
+    edge_node_mask = np.asarray(
+        [str(role) in {"SV", "RSU", "UAV"} for role in ctx.cache_nodes["node_roles"]],
+        dtype=bool,
+    )
+    if not np.any(edge_node_mask):
+        raise ValueError("evaluation 缺少 SV/RSU/UAV edge cache node。")
 
     with torch.no_grad():
         for step in steps:
@@ -832,6 +847,35 @@ def evaluate_formal_episode(
             actual_q = float(result.actual_task_utility)
             cache_cost = float(result.cache_cost)
             movement_cost = float(result.movement_cost)
+            final_cache_state = np.asarray(result.final_cache_state, dtype=np.int8)
+            expected_cache_shape = (
+                len(ctx.cache_nodes["node_ids"]),
+                int(ctx.service_catalog["num_services"]),
+            )
+            if final_cache_state.shape != expected_cache_shape:
+                raise ValueError(
+                    "evaluation final_cache_state shape="
+                    f"{final_cache_state.shape}，期望 {expected_cache_shape}。"
+                )
+            if not np.all(np.isin(final_cache_state, [0, 1])):
+                raise ValueError("evaluation final_cache_state 必须只包含0/1。")
+
+            # 图5的可用率只统计当前已到达任务；local cache 必须属于任务车辆自身。
+            edge_cache_by_service = np.any(final_cache_state[edge_node_mask] == 1, axis=0)
+            arrived_task_count += len(step.actual_tasks)
+            for task in step.actual_tasks:
+                service_id = int(task.service_id)
+                if not 0 <= service_id < expected_cache_shape[1]:
+                    raise ValueError(f"task {task.task_id} 的 service_id 非法：{service_id}")
+                own_local_cache = ctx.local_cache.get(str(task.vehicle_id), set())
+                if service_id in own_local_cache or bool(edge_cache_by_service[service_id]):
+                    cache_service_available_task_count += 1
+
+                if task.task_id not in result.matching:
+                    raise ValueError(f"最终Matching缺少 task_id={task.task_id}。")
+                if result.matching[task.task_id] == kkt.CLOUD:
+                    cloud_execution_task_count += 1
+
             if not math.isclose(reward, actual_q - cache_cost - movement_cost, rel_tol=1e-12, abs_tol=1e-12):
                 raise AssertionError("evaluation reward identity G=Q_actual-C_ca-C_q 失败。")
             rewards.append(reward)
@@ -850,6 +894,20 @@ def evaluate_formal_episode(
     identity_error = abs(cumulative_g - (actual_q_sum - cache_cost_sum - movement_cost_sum))
     if identity_error > 1e-9:
         raise AssertionError("evaluation episode级 G 恒等式失败。")
+    if not 0 <= cache_service_available_task_count <= arrived_task_count:
+        raise AssertionError("cache_service_available_task_count 超出 arrived_task_count。")
+    if not 0 <= cloud_execution_task_count <= arrived_task_count:
+        raise AssertionError("cloud_execution_task_count 超出 arrived_task_count。")
+    cache_service_availability_rate = (
+        None
+        if arrived_task_count == 0
+        else float(cache_service_available_task_count / arrived_task_count)
+    )
+    cloud_execution_ratio = (
+        None
+        if arrived_task_count == 0
+        else float(cloud_execution_task_count / arrived_task_count)
+    )
     return DeterministicEvaluationSummary(
         num_steps=len(rewards),
         cumulative_system_utility=cumulative_g,
@@ -859,6 +917,11 @@ def evaluate_formal_episode(
         cumulative_movement_cost=float(movement_cost_sum),
         cache_trigger_counts=cache_trigger_counts,
         uav_movement_trigger_counts=uav_trigger_counts,
+        arrived_task_count=int(arrived_task_count),
+        cache_service_available_task_count=int(cache_service_available_task_count),
+        cache_service_availability_rate=cache_service_availability_rate,
+        cloud_execution_task_count=int(cloud_execution_task_count),
+        cloud_execution_ratio=cloud_execution_ratio,
         all_steps_feasible=all_steps_feasible,
         reward_identity_error=float(identity_error),
         evaluation_semantics="in-trace deterministic evaluation",
