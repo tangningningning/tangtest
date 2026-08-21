@@ -2206,20 +2206,76 @@ def _dry_run_summary(result: FormalTrainingDryRunResult) -> dict[str, Any]:
     }
 
 
+def _positive_episode_count(value: str) -> int:
+    """解析正式训练 episode 数，拒绝非正整数。"""
+
+    try:
+        episodes = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--episodes 必须是整数。") from exc
+    if episodes <= 0:
+        raise argparse.ArgumentTypeError("--episodes 必须大于 0。")
+    return episodes
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="PPO training protocol dry-run; not a long training entrypoint.")
+    parser = argparse.ArgumentParser(description="PPO training protocol and explicit formal training entrypoint.")
     parser.add_argument("--config", default="system_config.toml")
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--bounded-sanity",
         action="store_true",
         help="Run the existing 2-rollout/2-update development sanity instead of dry-run.",
+    )
+    mode_group.add_argument(
+        "--formal-train",
+        action="store_true",
+        help="Execute formal PPO training; requires --episodes and --run-dir.",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=_positive_episode_count,
+        help="Target total number of completed formal training episodes.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        help="Explicit directory for formal training checkpoint and history files.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume formal training from --run-dir; --episodes is the target total episode count.",
     )
     parser.add_argument("--skip-repeat-check", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.formal_train:
+        if args.episodes is None:
+            parser.error("--formal-train 必须同时提供 --episodes N，且 N > 0。")
+        if not args.run_dir:
+            parser.error("--formal-train 必须同时提供 --run-dir PATH。")
+        if args.skip_repeat_check:
+            parser.error("--skip-repeat-check 仅适用于 --bounded-sanity。")
+        result = run_formal_ppo_training(
+            num_episodes=args.episodes,
+            config_path=args.config,
+            execute=True,
+            run_dir=args.run_dir,
+            resume=args.resume,
+        )
+        print(format_training_summary(result))
+        return 0
+
+    if args.resume:
+        parser.error("--resume 仅适用于 --formal-train。")
+    if args.episodes is not None:
+        parser.error("--episodes 仅适用于 --formal-train。")
+    if args.run_dir:
+        parser.error("--run-dir 仅适用于 --formal-train。")
     if args.bounded_sanity:
         result = run_bounded_training_sanity(args.config, repeat_check=not args.skip_repeat_check)
         print(json.dumps(_summary(result), ensure_ascii=False, indent=2))

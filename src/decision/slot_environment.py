@@ -494,6 +494,7 @@ def _movement_cost(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
 ) -> dict[str, Any]:
     """Movement cost 始终由 Q_prev -> Q_candidate 一次性计算。"""
 
@@ -509,6 +510,7 @@ def _movement_cost(
         cache_config,
         search_cfg,
         cache_cost_constant=0.0,
+        evaluation_context=evaluation_context,
     )
 
 
@@ -525,6 +527,7 @@ def evaluate_joint_configuration(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     project_cfg: dict[str, Any],
+    evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
 ) -> dict[str, Any]:
     """唯一 joint evaluator：J = Q_hat - C_ca - C_q。
 
@@ -538,12 +541,20 @@ def evaluate_joint_configuration(
     uav_pos = _position_arrays(uav_positions)
     uav_prev = _position_arrays(previous_uav_positions)
     nodes = uav_configuration.cache_nodes_with_uav_positions(cache_nodes, uav_pos)
+    if evaluation_context is None:
+        evaluation_context = cache_configuration.build_surrogate_evaluation_context(
+            scenario_slice,
+            local_cache_state,
+            cache_nodes,
+            cache_config,
+        )
     predictive_utility = cache_configuration.evaluate_fixed_configuration(
         cache_state,
         scenario_slice,
         local_cache_state,
         nodes,
         cache_config,
+        evaluation_context=evaluation_context,
     )["predicted_utility"]
     cache_cost, cache_energy = _cache_cost(
         previous_cache_state,
@@ -563,6 +574,7 @@ def evaluate_joint_configuration(
         project_cfg,
         cache_nodes,
         cache_config,
+        evaluation_context=evaluation_context,
     )
     movement_cost = float(movement_eval["movement_cost"])
     objective = float(predictive_utility - cache_cost - movement_cost)
@@ -654,6 +666,7 @@ def optimize_joint_configuration(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     flight_boundary: tuple[float, float, float, float],
+    evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
 ) -> JointConfigurationResult:
     """外层 Cache ↔ UAV block-coordinate configuration optimizer."""
 
@@ -663,6 +676,13 @@ def optimize_joint_configuration(
     q_prev = _position_arrays(previous_uav_positions)
     q_current = {uav_id: xy.copy() for uav_id, xy in q_prev.items()}
     c_current = previous_cache.copy()
+    if evaluation_context is None:
+        evaluation_context = cache_configuration.build_surrogate_evaluation_context(
+            scenario_slice,
+            local_cache_state,
+            cache_nodes,
+            cache_config,
+        )
 
     # Case A 快路径：没有任何 trigger 时，不做无意义搜索。
     if int(cache_trigger.sum()) == 0 and not any(int(value) == 1 for value in uav_triggers.values()):
@@ -679,6 +699,7 @@ def optimize_joint_configuration(
             cache_nodes,
             cache_config,
             project_cfg,
+            evaluation_context=evaluation_context,
         )
         return JointConfigurationResult(
             previous_cache_state=previous_cache.copy(),
@@ -714,6 +735,7 @@ def optimize_joint_configuration(
         local_cache_state,
         cache_nodes_at_q_prev,
         cache_config,
+        evaluation_context=evaluation_context,
     )
     if not bool(cache_init["trigger_feasible"]):
         return _infeasible_result(
@@ -748,6 +770,7 @@ def optimize_joint_configuration(
         cache_config,
         flight_boundary,
         cache_cost_constant=current_cache_cost,
+        evaluation_context=evaluation_context,
     )
     if not uav_init.trigger_feasible:
         return _infeasible_result(
@@ -776,6 +799,7 @@ def optimize_joint_configuration(
         cache_nodes,
         cache_config,
         project_cfg,
+        evaluation_context=evaluation_context,
     )
     current_objective = float(evaluation["objective_value"])
     initial_objective = current_objective
@@ -805,6 +829,7 @@ def optimize_joint_configuration(
             cache_nodes_at_current_q,
             cache_config,
             initial_cache_state=c_current,
+            evaluation_context=evaluation_context,
         )
         last_cache_summary = _cache_summary(cache_candidate)
         if not bool(cache_candidate["trigger_feasible"]):
@@ -833,6 +858,7 @@ def optimize_joint_configuration(
             cache_nodes,
             cache_config,
             project_cfg,
+            evaluation_context=evaluation_context,
         )
         if candidate_eval["objective_value"] > current_objective + outer_tol:
             c_current = c_candidate.copy()
@@ -863,6 +889,7 @@ def optimize_joint_configuration(
             flight_boundary,
             cache_cost_constant=current_cache_cost,
             initial_candidate_positions=q_current,
+            evaluation_context=evaluation_context,
         )
         last_uav_summary = _uav_summary(uav_candidate)
         if not uav_candidate.trigger_feasible:
@@ -891,6 +918,7 @@ def optimize_joint_configuration(
             cache_nodes,
             cache_config,
             project_cfg,
+            evaluation_context=evaluation_context,
         )
         if candidate_eval["objective_value"] > current_objective + outer_tol:
             q_current = q_candidate

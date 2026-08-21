@@ -13,7 +13,7 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -352,6 +352,308 @@ def tv_position(
 # ============================================================================
 
 
+@dataclass(frozen=True)
+class SurrogateEvent:
+    """当前 configuration slot 中一个 arrival=1 的预测任务事件。"""
+
+    scenario_index: int
+    horizon: int
+    tv_index: int
+    tv_id: str
+    service_id: int
+    input_bits: float
+    cpu_cycles: float
+    discount: float
+    num_scenarios: int
+    predicted_tv_position: np.ndarray
+
+
+@dataclass
+class SurrogateEvaluationContext:
+    """slot-scoped surrogate 预计算结果和 UAV lazy position cache。
+
+    该对象只由当前 scenario slice 生命周期内的调用显式传递，不使用
+    module global cache。ground_edge_utility 对 SV/RSU 固定部分预计算一次，
+    UAV 部分按 ``(uav_id, exact_x, exact_y)`` 惰性缓存。
+    """
+
+    events: tuple[SurrogateEvent, ...]
+    num_scenarios: int
+    node_roles: tuple[str, ...]
+    node_ids: tuple[str, ...]
+    uav_node_indices: dict[str, int]
+    base_utility: np.ndarray
+    ground_edge_utility: np.ndarray
+    uav_utility_cache: dict[tuple[str, float, float], np.ndarray] = field(default_factory=dict)
+
+
+def _task_utility_from_execution(
+    execution: dict[str, float],
+    config: CacheOptimizationConfig,
+) -> float:
+    """只负责复用统一 system_model.task_utility，不重写物理公式。"""
+
+    return float(
+        system_model.task_utility(
+            execution["total_delay_s"],
+            execution["vehicle_energy_j"],
+            config.time_ref_s,
+            config.energy_ref_j,
+            config.omega_t,
+            config.omega_e,
+        )
+    )
+
+
+def _local_task_utility(
+    event: SurrogateEvent,
+    config: CacheOptimizationConfig,
+) -> float:
+    execution = system_model.local_execution(
+        event.cpu_cycles,
+        config.local_cpu_cycles_per_s,
+        config.local_energy_per_cycle_j,
+    )
+    return float(
+        system_model.task_utility(
+            execution["delay_s"],
+            execution["vehicle_energy_j"],
+            config.time_ref_s,
+            config.energy_ref_j,
+            config.omega_t,
+            config.omega_e,
+        )
+    )
+
+
+def _cloud_task_utility(
+    event: SurrogateEvent,
+    config: CacheOptimizationConfig,
+) -> float:
+    execution = system_model.cloud_execution(
+        event.input_bits,
+        event.cpu_cycles,
+        config.cloud_uplink_rate_bps,
+        config.cloud_cpu_cycles_per_s,
+        config.cloud_delay_factor,
+        config.tx_power_w,
+    )
+    return _task_utility_from_execution(
+        {
+            "total_delay_s": execution["total_delay_s"],
+            "vehicle_energy_j": execution["vehicle_energy_j"],
+        },
+        config,
+    )
+
+
+def _ground_edge_task_utility(
+    event: SurrogateEvent,
+    role: str,
+    distance: float,
+    config: CacheOptimizationConfig,
+) -> float:
+    gain = system_model.ground_channel_gain(
+        max(distance, 1e-9),
+        config.channel_gain_at_1m,
+        config.pathloss_exponent,
+    )
+    execution = system_model.edge_execution(
+        event.input_bits,
+        event.cpu_cycles,
+        role_bandwidth_hz(role, config),
+        bandwidth_fraction=1.0,
+        transmit_power_w=config.tx_power_w,
+        channel_gain=gain,
+        noise_power_w=config.noise_power_w,
+        node_cpu_cycles_per_s=role_cpu_cycles_per_s(role, config),
+        cpu_fraction=1.0,
+    )
+    return _task_utility_from_execution(execution, config)
+
+
+def build_surrogate_evaluation_context(
+    origin_scenario: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+) -> SurrogateEvaluationContext:
+    """为一个 scenario slice 预计算不随 cache/UAV candidate 改变的量。"""
+
+    arrival = origin_scenario["arrival"]
+    service_id = origin_scenario["service_id"]
+    input_size = origin_scenario["input_size"]
+    cpu_cycles = origin_scenario["cpu_cycles"]
+    tv_ids = [str(value) for value in origin_scenario["task_vehicle_ids"].tolist()]
+    num_scenarios, horizon_steps, num_tv = arrival.shape
+    local_services = {
+        tv_id: _local_services_for_tv(local_cache_state, tv_id)
+        for tv_id in tv_ids
+    }
+    events: list[SurrogateEvent] = []
+    for scenario_index in range(num_scenarios):
+        for horizon in range(horizon_steps):
+            discount = config.beta_discount ** horizon
+            for tv_index in range(num_tv):
+                if int(arrival[scenario_index, horizon, tv_index]) == 0:
+                    continue
+                service = int(service_id[scenario_index, horizon, tv_index])
+                if service < 0:
+                    raise ValueError("arrival=1 时 service_id 无效。")
+                events.append(
+                    SurrogateEvent(
+                        scenario_index=scenario_index,
+                        horizon=horizon,
+                        tv_index=tv_index,
+                        tv_id=tv_ids[tv_index],
+                        service_id=service,
+                        input_bits=float(input_size[scenario_index, horizon, tv_index]),
+                        cpu_cycles=float(cpu_cycles[scenario_index, horizon, tv_index]),
+                        discount=float(discount),
+                        num_scenarios=int(num_scenarios),
+                        predicted_tv_position=np.asarray(
+                            tv_position(
+                                origin_scenario,
+                                tv_ids[tv_index],
+                                scenario_index,
+                                horizon,
+                            ),
+                            dtype=np.float64,
+                        ).copy(),
+                    )
+                )
+
+    event_count = len(events)
+    node_roles = tuple(str(role) for role in cache_nodes["node_roles"])
+    node_ids = tuple(str(node_id) for node_id in cache_nodes["node_ids"])
+    base_utility = np.full(event_count, -float("inf"), dtype=np.float64)
+    ground_edge_utility = np.full(
+        (event_count, len(node_roles)),
+        -float("inf"),
+        dtype=np.float64,
+    )
+    for event_index, event in enumerate(events):
+        local = -float("inf")
+        if event.service_id in local_services[event.tv_id]:
+            local = _local_task_utility(event, config)
+        cloud = _cloud_task_utility(event, config)
+        base_utility[event_index] = max(local, cloud)
+
+        for node_index, role in enumerate(node_roles):
+            if role == "UAV":
+                continue
+            node_xy = node_position(
+                origin_scenario,
+                cache_nodes,
+                node_index,
+                event.scenario_index,
+                event.horizon,
+            )
+            distance = float(np.linalg.norm(event.predicted_tv_position - node_xy))
+            if distance > role_range_m(role, config):
+                continue
+            ground_edge_utility[event_index, node_index] = _ground_edge_task_utility(
+                event,
+                role,
+                distance,
+                config,
+            )
+
+    return SurrogateEvaluationContext(
+        events=tuple(events),
+        num_scenarios=int(num_scenarios),
+        node_roles=node_roles,
+        node_ids=node_ids,
+        uav_node_indices={
+            node_id: index
+            for index, (node_id, role) in enumerate(zip(node_ids, node_roles))
+            if role == "UAV"
+        },
+        base_utility=base_utility,
+        ground_edge_utility=ground_edge_utility,
+    )
+
+
+def _uav_edge_utility_vector(
+    context: SurrogateEvaluationContext,
+    uav_id: str,
+    position: Any,
+    config: CacheOptimizationConfig,
+) -> np.ndarray:
+    xy = np.asarray(position, dtype=np.float64)
+    if xy.shape != (2,) or not np.all(np.isfinite(xy)):
+        raise ValueError(f"UAV 位置必须是 finite 二维坐标：{uav_id}")
+    key = (str(uav_id), float(xy[0]), float(xy[1]))
+    cached = context.uav_utility_cache.get(key)
+    if cached is not None:
+        return cached
+
+    values = np.full(len(context.events), -float("inf"), dtype=np.float64)
+    for event_index, event in enumerate(context.events):
+        distance = float(np.linalg.norm(event.predicted_tv_position - xy))
+        if distance > config.uav_range_m:
+            continue
+        gain = system_model.air_channel_gain(
+            distance,
+            config.uav_altitude_m,
+            config.air_eta1,
+            config.air_eta2,
+            config.air_beta_los,
+            config.air_beta_nlos,
+            config.air_alpha_los,
+            config.air_alpha_nlos,
+        )["channel_gain"]
+        execution = system_model.edge_execution(
+            event.input_bits,
+            event.cpu_cycles,
+            config.uav_bandwidth_hz,
+            bandwidth_fraction=1.0,
+            transmit_power_w=config.tx_power_w,
+            channel_gain=gain,
+            noise_power_w=config.noise_power_w,
+            node_cpu_cycles_per_s=config.uav_cpu_cycles_per_s,
+            cpu_fraction=1.0,
+        )
+        values[event_index] = _task_utility_from_execution(execution, config)
+    context.uav_utility_cache[key] = values
+    return values
+
+
+def evaluate_surrogate_context(
+    cache: np.ndarray,
+    context: SurrogateEvaluationContext,
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+) -> float:
+    """按旧 scenario→horizon→tv、node 顺序累计预计算 surrogate。"""
+
+    uav_positions = {
+        uav_id: cache_nodes["fixed_positions"][uav_id]
+        for uav_id in context.uav_node_indices
+    }
+    total = 0.0
+    for event_index, event in enumerate(context.events):
+        best = float(context.base_utility[event_index])
+        for node_index, role in enumerate(context.node_roles):
+            if cache[node_index, event.service_id] == 0:
+                continue
+            if role == "UAV":
+                edge = _uav_edge_utility_vector(
+                    context,
+                    context.node_ids[node_index],
+                    uav_positions[context.node_ids[node_index]],
+                    config,
+                )
+            else:
+                edge = float(context.ground_edge_utility[event_index, node_index])
+            if isinstance(edge, np.ndarray):
+                edge = float(edge[event_index])
+            if edge > best:
+                best = edge
+        total += event.discount * best
+    return float(total / max(context.num_scenarios, 1))
+
+
 def role_range_m(role: str, config: CacheOptimizationConfig) -> float:
     if role == "SV":
         return config.sv_range_m
@@ -507,37 +809,17 @@ def predicted_service_utility(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    evaluation_context: SurrogateEvaluationContext | None = None,
 ) -> float:
-    arrival = origin_scenario["arrival"]
-    service_id = origin_scenario["service_id"]
-    input_size = origin_scenario["input_size"]
-    cpu_cycles = origin_scenario["cpu_cycles"]
-    tv_ids = [str(value) for value in origin_scenario["task_vehicle_ids"].tolist()]
-    num_scenarios, horizon_steps, num_tv = arrival.shape
-    total = 0.0
-    for scenario_index in range(num_scenarios):
-        for horizon in range(horizon_steps):
-            discount = config.beta_discount ** horizon
-            for tv_index in range(num_tv):
-                if int(arrival[scenario_index, horizon, tv_index]) == 0:
-                    continue
-                service = int(service_id[scenario_index, horizon, tv_index])
-                if service < 0:
-                    raise ValueError("arrival=1 时 service_id 无效。")
-                total += discount * best_task_surrogate(
-                    cache,
-                    origin_scenario,
-                    cache_nodes,
-                    service,
-                    float(input_size[scenario_index, horizon, tv_index]),
-                    float(cpu_cycles[scenario_index, horizon, tv_index]),
-                    tv_ids[tv_index],
-                    local_cache_state,
-                    scenario_index,
-                    horizon,
-                    config,
-                )
-    return float(total / max(num_scenarios, 1))
+    context = evaluation_context
+    if context is None:
+        context = build_surrogate_evaluation_context(
+            origin_scenario,
+            local_cache_state,
+            cache_nodes,
+            config,
+        )
+    return evaluate_surrogate_context(cache, context, cache_nodes, config)
 
 
 def cache_update_energy(
@@ -587,6 +869,7 @@ def objective(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    evaluation_context: SurrogateEvaluationContext | None = None,
 ) -> float:
     utility = predicted_service_utility(
         cache,
@@ -594,6 +877,7 @@ def objective(
         local_cache_state,
         cache_nodes,
         config,
+        evaluation_context=evaluation_context,
     )
     update_cost, _ = cache_update_cost(
         previous_cache,
@@ -612,6 +896,7 @@ def evaluate_fixed_configuration(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    evaluation_context: SurrogateEvaluationContext | None = None,
 ) -> dict[str, float]:
     """评估给定 cache + 节点位置下的预测 utility。
 
@@ -626,6 +911,7 @@ def evaluate_fixed_configuration(
         local_cache_state,
         cache_nodes,
         config,
+        evaluation_context=evaluation_context,
     )
     if not math.isfinite(utility):
         raise AssertionError("fixed configuration predicted utility 非 finite。")
@@ -753,7 +1039,15 @@ def best_distinct_neighbor(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    evaluation_context: SurrogateEvaluationContext | None = None,
 ) -> tuple[str, np.ndarray, float] | None:
+    if evaluation_context is None:
+        evaluation_context = build_surrogate_evaluation_context(
+            origin_scenario,
+            local_cache_state,
+            cache_nodes,
+            config,
+        )
     best: tuple[str, np.ndarray, float] | None = None
     for move, node_candidate in generate_node_neighbors(
         previous_cache[node_index],
@@ -771,6 +1065,7 @@ def best_distinct_neighbor(
             local_cache_state,
             cache_nodes,
             config,
+            evaluation_context=evaluation_context,
         )
         if best is None or value > best[2] + 1e-12:
             best = (move, node_candidate, value)
@@ -785,7 +1080,15 @@ def initialize_cache_for_triggers(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    evaluation_context: SurrogateEvaluationContext | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    if evaluation_context is None:
+        evaluation_context = build_surrogate_evaluation_context(
+            origin_scenario,
+            local_cache_state,
+            cache_nodes,
+            config,
+        )
     values = service_values_from_scenarios(origin_scenario, config)
     cache = previous_cache.copy()
     trigger_feasible = np.ones(len(cache_trigger), dtype=bool)
@@ -811,6 +1114,7 @@ def initialize_cache_for_triggers(
             local_cache_state,
             cache_nodes,
             config,
+            evaluation_context=evaluation_context,
         )
         if distinct is None:
             trigger_feasible[node_index] = False
@@ -838,6 +1142,7 @@ def optimize_cache(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig | None = None,
     initial_cache_state: np.ndarray | None = None,
+    evaluation_context: SurrogateEvaluationContext | None = None,
 ) -> dict[str, Any]:
     """Optimize cache configuration under a fixed trigger vector.
 
@@ -858,6 +1163,13 @@ def optimize_cache(
         raise ValueError("cache_trigger shape 错误。")
     if not np.all(np.isin(cache_trigger, [0, 1])):
         raise ValueError("cache_trigger 必须是 0/1 向量。")
+    if evaluation_context is None:
+        evaluation_context = build_surrogate_evaluation_context(
+            predicted_scenarios,
+            local_cache_state,
+            cache_nodes,
+            config,
+        )
 
     if int(cache_trigger.sum()) == 0:
         unchanged = previous_cache.copy()
@@ -867,6 +1179,7 @@ def optimize_cache(
             local_cache_state,
             cache_nodes,
             config,
+            evaluation_context=evaluation_context,
         )
         update_cost, energy = cache_update_cost(
             previous_cache,
@@ -907,6 +1220,7 @@ def optimize_cache(
             local_cache_state,
             cache_nodes,
             config,
+            evaluation_context=evaluation_context,
         )
         trigger_feasible_by_node = init_info["trigger_feasible_by_node"]
     else:
@@ -954,6 +1268,7 @@ def optimize_cache(
                 local_cache_state,
                 cache_nodes,
                 config,
+                evaluation_context=evaluation_context,
             ),
             "cache_update_energy": energy,
             "cache_update_cost": update_cost,
@@ -980,6 +1295,7 @@ def optimize_cache(
         local_cache_state,
         cache_nodes,
         config,
+        evaluation_context=evaluation_context,
     )
     current_objective = initial_objective
     counts = {"add": 0, "delete": 0, "swap": 0}
@@ -1013,6 +1329,7 @@ def optimize_cache(
                     local_cache_state,
                     cache_nodes,
                     config,
+                    evaluation_context=evaluation_context,
                 )
                 if value > current_objective + config.tolerance and (
                     best_move is None or value > best_move[2] + config.tolerance
@@ -1043,6 +1360,7 @@ def optimize_cache(
                 local_cache_state,
                 cache_nodes,
                 config,
+                evaluation_context=evaluation_context,
             )
             if distinct is None:
                 trigger_feasible_by_node[node_index] = False
@@ -1057,6 +1375,7 @@ def optimize_cache(
                     local_cache_state,
                     cache_nodes,
                     config,
+                    evaluation_context=evaluation_context,
                 )
 
     validate_cache_shape_and_capacity(current_cache, service_catalog, cache_nodes)
@@ -1075,6 +1394,7 @@ def optimize_cache(
         local_cache_state,
         cache_nodes,
         config,
+        evaluation_context=evaluation_context,
     )
     update_cost, energy = cache_update_cost(
         previous_cache,

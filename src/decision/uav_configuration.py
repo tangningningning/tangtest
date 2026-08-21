@@ -386,6 +386,7 @@ def evaluate_uav_configuration(
     cache_config: cache_configuration.CacheOptimizationConfig,
     search_config: UavSearchConfig,
     cache_cost_constant: float = 0.0,
+    evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
 ) -> dict[str, Any]:
     """评估固定 UAV configuration 的预测目标。
 
@@ -402,6 +403,7 @@ def evaluate_uav_configuration(
         local_cache_state,
         nodes,
         cache_config,
+        evaluation_context=evaluation_context,
     )["predicted_utility"]
     energy, move_cost, displacement, energy_by_uav, cost_by_uav = movement_summary(
         old_positions,
@@ -440,6 +442,7 @@ def _result_from_positions(
     converged: bool,
     stop_reason: str,
     cache_cost_constant: float,
+    evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
 ) -> UavOptimizationResult:
     evaluated = evaluate_uav_configuration(
         positions,
@@ -452,6 +455,7 @@ def _result_from_positions(
         cache_config,
         search_config,
         cache_cost_constant,
+        evaluation_context=evaluation_context,
     )
     return UavOptimizationResult(
         final_positions={
@@ -486,6 +490,7 @@ def optimize_uav_configuration(
     flight_boundary: tuple[float, float, float, float],
     cache_cost_constant: float = 0.0,
     initial_candidate_positions: dict[str, Any] | None = None,
+    evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
 ) -> UavOptimizationResult:
     """给定 trigger 后优化 UAV 当前时隙二维位置配置。
 
@@ -514,6 +519,13 @@ def optimize_uav_configuration(
         final_positions = _as_position_dict(initial_candidate_positions, uav_ids)
     feasible_by_uav = {uav_id: True for uav_id in uav_ids}
     triggered_ids = [uav_id for uav_id in uav_ids if triggers[uav_id] == 1]
+    if evaluation_context is None:
+        evaluation_context = cache_configuration.build_surrogate_evaluation_context(
+            scenario_slice,
+            local_cache_state,
+            cache_nodes,
+            cache_config,
+        )
 
     if not triggered_ids:
         return _result_from_positions(
@@ -533,6 +545,7 @@ def optimize_uav_configuration(
             True,
             "no_trigger_no_search",
             cache_cost_constant,
+            evaluation_context=evaluation_context,
         )
 
     if initial_candidate_positions is None:
@@ -564,6 +577,7 @@ def optimize_uav_configuration(
                     cache_config,
                     search_config,
                     cache_cost_constant,
+                    evaluation_context=evaluation_context,
                 )["objective_value"]
                 if value > best_objective + search_config.objective_tolerance:
                     best_objective = float(value)
@@ -587,6 +601,7 @@ def optimize_uav_configuration(
                     False,
                     "infeasible_trigger",
                     cache_cost_constant,
+                    evaluation_context=evaluation_context,
                 )
             final_positions[uav_id] = best_position
     else:
@@ -627,6 +642,7 @@ def optimize_uav_configuration(
                 False,
                 "infeasible_initial_candidate",
                 cache_cost_constant,
+                evaluation_context=evaluation_context,
             )
 
     current_eval = evaluate_uav_configuration(
@@ -640,6 +656,7 @@ def optimize_uav_configuration(
         cache_config,
         search_config,
         cache_cost_constant,
+        evaluation_context=evaluation_context,
     )
     current_objective = float(current_eval["objective_value"])
     accepted = 0
@@ -680,6 +697,7 @@ def optimize_uav_configuration(
                         cache_config,
                         search_config,
                         cache_cost_constant,
+                        evaluation_context=evaluation_context,
                     )["objective_value"]
                 )
                 if value > best_objective + search_config.objective_tolerance:
@@ -708,6 +726,7 @@ def optimize_uav_configuration(
                 True,
                 "converged_by_no_improvement",
                 cache_cost_constant,
+                evaluation_context=evaluation_context,
             )
 
     return _result_from_positions(
@@ -727,6 +746,7 @@ def optimize_uav_configuration(
         False,
         "stopped_by_max_rounds",
         cache_cost_constant,
+        evaluation_context=evaluation_context,
     )
 
 
