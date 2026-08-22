@@ -378,10 +378,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.matching.max_updates 必须 >= 1。")
     if float(get_config_value(config, "algorithm.matching.objective_tolerance")) < 0.0:
         raise ValueError("algorithm.matching.objective_tolerance 不能为负。")
-    if get_config_value(config, "algorithm.ppo.method", "trigger_actor_critic") != (
-        "trigger_actor_critic"
-    ):
-        raise ValueError("algorithm.ppo.method 当前只支持 trigger_actor_critic。")
+    if get_config_value(config, "algorithm.ppo.method", "trigger_actor_critic") not in {
+        "trigger_actor_critic",
+        "proposed_per_trigger_q",
+    }:
+        raise ValueError(
+            "algorithm.ppo.method 当前只支持 trigger_actor_critic 或 proposed_per_trigger_q。"
+        )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
         raise ValueError("algorithm.ppo.hidden_sizes 必须是非空列表。")

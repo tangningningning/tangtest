@@ -52,6 +52,8 @@ class RolloutTransition:
     cache_triggers: np.ndarray
     uav_triggers: dict[str, int]
     old_log_prob: float
+    old_per_action_log_probs: np.ndarray
+    old_per_action_probability_table: np.ndarray
     old_value: float
     reward: float
     done: bool
@@ -70,11 +72,15 @@ class RolloutBatch:
     actions: np.ndarray
     action_masks: np.ndarray
     old_log_probs: np.ndarray
+    old_per_action_log_probs: np.ndarray
+    old_per_action_probabilities: np.ndarray
+    actor_valid_mask: np.ndarray
     old_values: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
     advantages: np.ndarray
     returns: np.ndarray
+    monte_carlo_returns: np.ndarray
     slots: np.ndarray
     origin_indices: np.ndarray
     final_bootstrap_value: float
@@ -128,6 +134,40 @@ def compute_gae(
         next_value = values_a[index]
     returns = advantages + values_a
     return advantages.astype(np.float32), returns.astype(np.float32)
+
+
+def compute_monte_carlo_returns(
+    rewards: Any,
+    dones: Any,
+    gamma: float,
+) -> np.ndarray:
+    """计算已经收集的 on-policy reward sequence 的 suffix Monte-Carlo return。
+
+    该函数只读取 rollout 内已有 rewards/dones，不访问未来场景或环境状态。
+    terminal transition 的 return 就是其自身 reward；多段数据若出现 done，
+    done 之后的 transition 不会泄漏到 done 之前的 episode。
+    """
+
+    rewards_a = np.asarray(rewards, dtype=np.float64).reshape(-1)
+    dones_a = np.asarray(dones, dtype=np.float64).reshape(-1)
+    if rewards_a.shape != dones_a.shape:
+        raise ValueError("rewards/dones shape 必须一致。")
+    if not 0.0 <= float(gamma) <= 1.0:
+        raise ValueError("gamma 必须位于 [0,1]。")
+    if not np.all(np.isfinite(rewards_a)):
+        raise ValueError("rewards 包含 NaN/Inf。")
+    if not np.all(np.isin(dones_a, [0.0, 1.0])):
+        raise ValueError("dones 必须是 0/1。")
+    returns = np.zeros_like(rewards_a, dtype=np.float64)
+    next_return = 0.0
+    for index in range(len(rewards_a) - 1, -1, -1):
+        if dones_a[index] == 1.0:
+            next_return = 0.0
+        returns[index] = rewards_a[index] + float(gamma) * next_return
+        next_return = returns[index]
+    if not np.all(np.isfinite(returns)):
+        raise ValueError("Monte-Carlo returns 包含 NaN/Inf。")
+    return returns.astype(np.float32)
 
 
 def _value_only(policy: Any, observation: np.ndarray) -> float:
@@ -293,6 +333,8 @@ def collect_on_policy_rollout(
     }
     transitions: list[RolloutTransition] = []
     action_masks: list[np.ndarray] = []
+    old_per_action_log_probs: list[np.ndarray] = []
+    old_per_action_probability_tables: list[np.ndarray] = []
     state_propagation_ok = True
 
     # aligned_steps 可包含最后一个只用于 truncation bootstrap 的 next step。
@@ -387,6 +429,14 @@ def collect_on_policy_rollout(
             cache_triggers=sample.cache_triggers.astype(np.int8).copy(),
             uav_triggers=dict(sample.uav_triggers),
             old_log_prob=float(sample.joint_log_prob),
+            old_per_action_log_probs=np.asarray(
+                sample.per_action_log_probs,
+                dtype=np.float32,
+            ).copy(),
+            old_per_action_probability_table=np.asarray(
+                sample.per_action_probability_table,
+                dtype=np.float32,
+            ).copy(),
             old_value=float(sample.value),
             reward=reward,
             done=done,
@@ -400,6 +450,8 @@ def collect_on_policy_rollout(
         )
         transitions.append(transition)
         action_masks.append(sample.per_action_masks.copy())
+        old_per_action_log_probs.append(transition.old_per_action_log_probs.copy())
+        old_per_action_probability_tables.append(transition.old_per_action_probability_table.copy())
         previous_cache = transition.next_cache_state.copy()
         previous_uav = dict(transition.next_uav_positions)
         if done:
@@ -426,6 +478,29 @@ def collect_on_policy_rollout(
     observations = np.stack([item.observation for item in transitions]).astype(np.float32)
     actions = np.stack([item.action_vector for item in transitions]).astype(np.int8)
     old_log_probs = np.asarray([item.old_log_prob for item in transitions], dtype=np.float32)
+    old_per_action_log_probs_array = np.stack(old_per_action_log_probs).astype(np.float32)
+    old_per_action_probabilities = np.stack(old_per_action_probability_tables).astype(np.float32)
+    action_masks_array = np.stack(action_masks).astype(bool)
+    actor_valid_mask = np.logical_and(
+        action_masks_array[..., 0],
+        action_masks_array[..., 1],
+    )
+    if not np.allclose(
+        np.sum(old_per_action_log_probs_array, axis=1),
+        old_log_probs,
+        rtol=1e-5,
+        atol=1e-6,
+    ):
+        raise AssertionError("per-action chosen log-prob之和与joint old_log_prob不一致。")
+    if not np.all(np.isfinite(old_per_action_probabilities)):
+        raise ValueError("rollout per-action probability table 包含 NaN/Inf。")
+    if not np.allclose(
+        np.sum(old_per_action_probabilities, axis=-1),
+        1.0,
+        rtol=1e-5,
+        atol=1e-6,
+    ):
+        raise AssertionError("rollout per-action probability table 未归一化。")
     old_values = np.asarray([item.old_value for item in transitions], dtype=np.float32)
     rewards = np.asarray([item.reward for item in transitions], dtype=np.float32)
     dones = np.asarray([float(item.done) for item in transitions], dtype=np.float32)
@@ -437,16 +512,21 @@ def collect_on_policy_rollout(
         gamma,
         gae_lambda,
     )
+    monte_carlo_returns = compute_monte_carlo_returns(rewards, dones, gamma)
     return RolloutBatch(
         observations=observations,
         actions=actions,
-        action_masks=np.stack(action_masks).astype(bool),
+        action_masks=action_masks_array,
         old_log_probs=old_log_probs,
+        old_per_action_log_probs=old_per_action_log_probs_array,
+        old_per_action_probabilities=old_per_action_probabilities,
+        actor_valid_mask=actor_valid_mask.astype(bool),
         old_values=old_values,
         rewards=rewards,
         dones=dones,
         advantages=advantages,
         returns=returns,
+        monte_carlo_returns=monte_carlo_returns,
         slots=np.asarray([item.slot for item in transitions], dtype=np.int64),
         origin_indices=np.asarray([item.origin_index for item in transitions], dtype=np.int64),
         final_bootstrap_value=float(bootstrap_value),
@@ -456,6 +536,8 @@ def collect_on_policy_rollout(
             "true_terminal": true_terminal,
             "state_propagation_ok": state_propagation_ok,
             "reward_invariant_ok": True,
+            "old_per_action_log_prob_consistency_ok": True,
+            "actor_valid_trigger_count": int(np.sum(actor_valid_mask)),
         },
     )
 

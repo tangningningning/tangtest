@@ -25,6 +25,7 @@ import math
 import os
 import random
 import tempfile
+import time
 import warnings
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
@@ -52,8 +53,11 @@ SANITY_MAX_OPTIMIZER_STEPS = 2
 # execute=True时写入；不会写入data/generated或固定results目录。
 CHECKPOINT_VERSION = 1
 TRAINING_HISTORY_SCHEMA_VERSION = 1
+COUNTERFACTUAL_CHECKPOINT_VERSION = 2
+COUNTERFACTUAL_TRAINING_HISTORY_SCHEMA_VERSION = 2
 LATEST_CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 TRAINING_HISTORY_FILENAME = "training_history.json"
+EXECUTION_LOCATION_ORDER = ("Local", "SV", "RSU", "UAV", "Cloud")
 
 
 def summary_to_builtin(value: Any) -> Any:
@@ -239,6 +243,9 @@ class FormalTrainingDryRunResult:
     backward_calls_executed: int
     optimizer_steps_executed: int
     blocker: str
+    credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT
+    planned_q_optimizer_steps: int = 0
+    q_optimizer_instances_planned: int = 0
 
 
 @dataclass(frozen=True)
@@ -286,6 +293,15 @@ class FormalPPOUpdateSummary:
     returns_frozen: bool
     each_transition_once_per_epoch: bool
     epoch_summaries: tuple[PPOEpochSummary, ...]
+    # per-trigger Q mode 的独立 critic diagnostics；legacy mode 保持 None/0。
+    q_loss_mean: float | None = None
+    q_gradient_norm_mean: float | None = None
+    q_gradient_finite: bool | None = None
+    counterfactual_advantage_mean: float | None = None
+    counterfactual_advantage_std: float | None = None
+    counterfactual_advantage_abs_mean: float | None = None
+    free_trigger_decision_count: int | None = None
+    q_optimizer_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -329,6 +345,10 @@ class FormalTrainingRunPlan:
     execute: bool
     single_trace_training: bool
     no_default_long_training_budget: bool
+    credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT
+    planned_q_optimizer_steps: int = 0
+    planned_q_backward_calls: int = 0
+    q_optimizer_instances_planned: int = 0
 
 
 @dataclass(frozen=True)
@@ -344,6 +364,7 @@ class FormalTrainingRunResult:
     completed_episodes: int = 0
     training_history: dict[str, Any] | None = None
     resumed: bool = False
+    q_optimizer_step_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -363,14 +384,35 @@ class DeterministicEvaluationSummary:
     cache_service_availability_rate: float | None
     cloud_execution_task_count: int
     cloud_execution_ratio: float | None
+    execution_location_task_counts: dict[str, int]
+    execution_location_ratios: dict[str, float]
     all_steps_feasible: bool
     reward_identity_error: float
     evaluation_semantics: str
 
 
-def _empty_training_history() -> dict[str, Any]:
-    """创建新的、只包含轻量summary的训练历史。"""
+def _is_counterfactual_mode(project_cfg: dict[str, Any]) -> bool:
+    return ppo_update.credit_assignment_from_project(project_cfg) == (
+        ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT
+    )
 
+
+def _empty_training_history(credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT) -> dict[str, Any]:
+    """创建与算法 mode 对应的轻量训练历史。"""
+
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        return {
+            "schema_version": COUNTERFACTUAL_TRAINING_HISTORY_SCHEMA_VERSION,
+            "credit_assignment": credit_assignment,
+            "q_target": ppo_update.MONTE_CARLO_Q_TARGET,
+            "completed_episodes": 0,
+            "policy_version": 0,
+            "optimizer_step_count": 0,
+            "q_optimizer_step_count": 0,
+            "episodes": [],
+        }
+    if credit_assignment != ppo_update.LEGACY_CREDIT_ASSIGNMENT:
+        raise ValueError(f"未知 credit_assignment：{credit_assignment}")
     return {
         "schema_version": TRAINING_HISTORY_SCHEMA_VERSION,
         "completed_episodes": 0,
@@ -383,15 +425,31 @@ def _empty_training_history() -> dict[str, Any]:
 def _training_episode_history_record(
     episode_summary: TrainingEpisodeSummary,
     update_summary: FormalPPOUpdateSummary,
+    credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT,
 ) -> dict[str, Any]:
     """把一个完整episode的两个正式summary转换为轻量builtin记录。"""
 
     if int(episode_summary.episode_index) < 0:
         raise ValueError("TrainingEpisodeSummary.episode_index 不能为负。")
+    update_builtin = summary_to_builtin(update_summary)
+    if credit_assignment == ppo_update.LEGACY_CREDIT_ASSIGNMENT:
+        for key in (
+            "q_loss_mean",
+            "q_gradient_norm_mean",
+            "q_gradient_finite",
+            "counterfactual_advantage_mean",
+            "counterfactual_advantage_std",
+            "counterfactual_advantage_abs_mean",
+            "free_trigger_decision_count",
+            "q_optimizer_steps",
+        ):
+            update_builtin.pop(key, None)
+    elif credit_assignment != ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        raise ValueError(f"未知 credit_assignment：{credit_assignment}")
     return {
         "episode_index": int(episode_summary.episode_index),
         "training_episode_summary": summary_to_builtin(episode_summary),
-        "ppo_update_summary": summary_to_builtin(update_summary),
+        "ppo_update_summary": update_builtin,
     }
 
 
@@ -399,16 +457,32 @@ def _build_training_history(
     records: list[dict[str, Any]],
     policy_version: int,
     optimizer_step_count: int,
+    credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT,
+    q_optimizer_step_count: int = 0,
 ) -> dict[str, Any]:
     """构造checkpoint和JSON共用的canonical training history。"""
 
-    history = {
-        "schema_version": TRAINING_HISTORY_SCHEMA_VERSION,
-        "completed_episodes": int(len(records)),
-        "policy_version": int(policy_version),
-        "optimizer_step_count": int(optimizer_step_count),
-        "episodes": records,
-    }
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        history = {
+            "schema_version": COUNTERFACTUAL_TRAINING_HISTORY_SCHEMA_VERSION,
+            "credit_assignment": credit_assignment,
+            "q_target": ppo_update.MONTE_CARLO_Q_TARGET,
+            "completed_episodes": int(len(records)),
+            "policy_version": int(policy_version),
+            "optimizer_step_count": int(optimizer_step_count),
+            "q_optimizer_step_count": int(q_optimizer_step_count),
+            "episodes": records,
+        }
+    elif credit_assignment == ppo_update.LEGACY_CREDIT_ASSIGNMENT:
+        history = {
+            "schema_version": TRAINING_HISTORY_SCHEMA_VERSION,
+            "completed_episodes": int(len(records)),
+            "policy_version": int(policy_version),
+            "optimizer_step_count": int(optimizer_step_count),
+            "episodes": records,
+        }
+    else:
+        raise ValueError(f"未知 credit_assignment：{credit_assignment}")
     return summary_to_builtin(history)
 
 
@@ -456,7 +530,17 @@ def _formal_update_summary_from_builtin(value: Any) -> FormalPPOUpdateSummary:
     required = {
         field.name
         for field in fields(FormalPPOUpdateSummary)
-        if field.name != "epoch_summaries"
+        if field.name not in {
+            "epoch_summaries",
+            "q_loss_mean",
+            "q_gradient_norm_mean",
+            "q_gradient_finite",
+            "counterfactual_advantage_mean",
+            "counterfactual_advantage_std",
+            "counterfactual_advantage_abs_mean",
+            "free_trigger_decision_count",
+            "q_optimizer_steps",
+        }
     }
     missing = sorted(required - set(item))
     if missing:
@@ -482,6 +566,34 @@ def _formal_update_summary_from_builtin(value: Any) -> FormalPPOUpdateSummary:
         returns_frozen=bool(item["returns_frozen"]),
         each_transition_once_per_epoch=bool(item["each_transition_once_per_epoch"]),
         epoch_summaries=tuple(_ppo_epoch_summary_from_builtin(entry) for entry in epoch_values),
+        q_loss_mean=None if item.get("q_loss_mean") is None else float(item["q_loss_mean"]),
+        q_gradient_norm_mean=(
+            None if item.get("q_gradient_norm_mean") is None else float(item["q_gradient_norm_mean"])
+        ),
+        q_gradient_finite=(
+            None if item.get("q_gradient_finite") is None else bool(item["q_gradient_finite"])
+        ),
+        counterfactual_advantage_mean=(
+            None
+            if item.get("counterfactual_advantage_mean") is None
+            else float(item["counterfactual_advantage_mean"])
+        ),
+        counterfactual_advantage_std=(
+            None
+            if item.get("counterfactual_advantage_std") is None
+            else float(item["counterfactual_advantage_std"])
+        ),
+        counterfactual_advantage_abs_mean=(
+            None
+            if item.get("counterfactual_advantage_abs_mean") is None
+            else float(item["counterfactual_advantage_abs_mean"])
+        ),
+        free_trigger_decision_count=(
+            None
+            if item.get("free_trigger_decision_count") is None
+            else int(item["free_trigger_decision_count"])
+        ),
+        q_optimizer_steps=int(item.get("q_optimizer_steps", 0)),
     )
 
 
@@ -489,8 +601,27 @@ def _canonical_training_history(value: Any) -> dict[str, Any]:
     """严格校验并规范化history，避免JSON mirror成为resume权威。"""
 
     source = _as_mapping(value, "training_history")
-    if int(source.get("schema_version", -1)) != TRAINING_HISTORY_SCHEMA_VERSION:
+    schema_version = int(source.get("schema_version", -1))
+    credit_assignment = str(
+        source.get("credit_assignment", ppo_update.LEGACY_CREDIT_ASSIGNMENT)
+    )
+    expected_schema = (
+        COUNTERFACTUAL_TRAINING_HISTORY_SCHEMA_VERSION
+        if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT
+        else TRAINING_HISTORY_SCHEMA_VERSION
+    )
+    if schema_version != expected_schema:
         raise ValueError("training_history schema_version 不兼容。")
+    if credit_assignment not in {
+        ppo_update.LEGACY_CREDIT_ASSIGNMENT,
+        ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT,
+    }:
+        raise ValueError(f"training_history credit_assignment 不支持：{credit_assignment}")
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        if str(source.get("q_target")) != ppo_update.MONTE_CARLO_Q_TARGET:
+            raise ValueError("counterfactual training_history q_target 不兼容。")
+        if int(source.get("q_optimizer_step_count", -1)) < 0:
+            raise ValueError("counterfactual training_history q_optimizer_step_count 非法。")
     raw_episodes = source.get("episodes")
     if not isinstance(raw_episodes, list):
         raise ValueError("training_history.episodes 必须是数组。")
@@ -503,7 +634,13 @@ def _canonical_training_history(value: Any) -> dict[str, Any]:
         record_index = int(record.get("episode_index", episode_summary.episode_index))
         if record_index != expected_index or episode_summary.episode_index != expected_index:
             raise ValueError("training_history episode_index 必须从0连续递增。")
-        records.append(_training_episode_history_record(episode_summary, update_summary))
+        records.append(
+            _training_episode_history_record(
+                episode_summary,
+                update_summary,
+                credit_assignment,
+            )
+        )
 
     completed_episodes = int(source.get("completed_episodes", -1))
     policy_version = int(source.get("policy_version", -1))
@@ -512,7 +649,13 @@ def _canonical_training_history(value: Any) -> dict[str, Any]:
         raise ValueError("training_history.completed_episodes 与episodes数量不一致。")
     if completed_episodes < 0 or policy_version < 0 or optimizer_step_count < 0:
         raise ValueError("training_history counters 不能为负。")
-    return _build_training_history(records, policy_version, optimizer_step_count)
+    return _build_training_history(
+        records,
+        policy_version,
+        optimizer_step_count,
+        credit_assignment,
+        int(source.get("q_optimizer_step_count", 0)),
+    )
 
 
 def _history_episode_summaries(history: dict[str, Any]) -> tuple[TrainingEpisodeSummary, ...]:
@@ -537,6 +680,36 @@ def load_training_episode_summaries(run_dir: str | Path) -> tuple[TrainingEpisod
         raise ValueError(f"无法读取训练历史文件：{history_path}") from exc
     history = _canonical_training_history(raw_history)
     return _history_episode_summaries(history)
+
+
+def _plot_training_convergence_after_persistence(
+    run_dir: Path,
+    history: dict[str, Any],
+) -> None:
+    """在history已成功进入正式持久化链路后更新Figure 1。
+
+    绘图只消费canonical history中的episode summary，不重新执行environment、
+    policy forward、sampling或optimizer。绘图失败只发出warning，不影响已经
+    成功保存的checkpoint/history。
+    """
+
+    try:
+        from experiment_plotting import plot_training_convergence
+
+        summaries = _history_episode_summaries(history)
+        if not summaries:
+            raise ValueError("training history中没有可绘制的episode。")
+        plot_training_convergence(
+            summaries,
+            run_dir / "figures" / "01_training_convergence.png",
+            moving_average_window=10,
+        )
+    except Exception as exc:  # reporting故障不能回滚正式训练持久化结果
+        warnings.warn(
+            f"PPO_TRAINING_CONVERGENCE_PLOT_FAILED: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _run_dir_paths(run_dir: str | Path) -> tuple[Path, Path, Path]:
@@ -714,8 +887,10 @@ def _seed_new_formal_run(seed: int, rng_generator: Any) -> None:
     rng_generator.manual_seed(int(seed))
 
 
-def _build_formal_policy_and_optimizer(ctx: TrainingSanityContext) -> tuple[Any, Any]:
-    """按当前config构造policy和Adam；不加载checkpoint、不执行step。"""
+def _build_formal_training_components(
+    ctx: TrainingSanityContext,
+) -> tuple[Any, Any, Any | None, Any | None]:
+    """按当前 mode 构造 Actor/scalar-V 与独立 Q optimizer。"""
 
     _require_torch()
     training_cfg = ppo_update.ppo_training_config_status(ctx.cfg)
@@ -726,7 +901,22 @@ def _build_formal_policy_and_optimizer(ctx: TrainingSanityContext) -> tuple[Any,
         ctx.action_spec,
         **ppo_trigger_policy.ppo_network_config_from_project(ctx.cfg),
     )
-    optimizer = torch.optim.Adam(policy.parameters(), lr=float(training_cfg.learning_rate))
+    actor_optimizer = torch.optim.Adam(policy.parameters(), lr=float(training_cfg.learning_rate))
+    if not _is_counterfactual_mode(ctx.cfg):
+        return policy, actor_optimizer, None, None
+    q_critic = ppo_trigger_policy.build_per_trigger_q_critic_preserving_rng(
+        ctx.action_spec.action_dim,
+        int(getattr(policy, "autoregressive_hidden_size")),
+        device=next(policy.parameters()).device,
+    )
+    q_optimizer = torch.optim.Adam(q_critic.parameters(), lr=float(training_cfg.learning_rate))
+    return policy, actor_optimizer, q_critic, q_optimizer
+
+
+def _build_formal_policy_and_optimizer(ctx: TrainingSanityContext) -> tuple[Any, Any]:
+    """legacy兼容wrapper：只返回 Actor/scalar-V policy 和 optimizer。"""
+
+    policy, optimizer, _, _ = _build_formal_training_components(ctx)
     return policy, optimizer
 
 
@@ -741,7 +931,7 @@ def _formal_compatibility_metadata(
     if not ppo_cfg.can_run_optimizer_step or ppo_cfg.max_grad_norm is None:
         raise RuntimeError(f"PPO update超参数缺失：{ppo_cfg.missing_required_for_step}")
     network_cfg = ppo_trigger_policy.ppo_network_config_from_project(ctx.cfg)
-    return {
+    compatibility = {
         "action": {
             "labels": list(ctx.action_spec.labels),
             "action_dim": int(ctx.action_spec.action_dim),
@@ -795,6 +985,21 @@ def _formal_compatibility_metadata(
             "autoregressive_hidden_size": int(network_cfg["autoregressive_hidden_size"]),
         },
     }
+    if _is_counterfactual_mode(ctx.cfg):
+        q_target = ppo_update.q_target_from_project(ctx.cfg)
+        if q_target != ppo_update.MONTE_CARLO_Q_TARGET:
+            raise ValueError(
+                "per_trigger_q 模式第一版只支持 algorithm.ppo.q_target=monte_carlo。"
+            )
+        compatibility["algorithm"] = {
+            "method_label": "proposed_per_trigger_q",
+            "credit_assignment": ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT,
+            "q_target": ppo_update.MONTE_CARLO_Q_TARGET,
+            "q_critic_schema": "per_trigger_q_v1",
+            "gradient_isolation": "detach_conditional_hidden",
+            "actor_loss": "per_trigger_conditional_ppo",
+        }
+    return compatibility
 
 
 def _metadata_mismatch(expected: Any, actual: Any, path: str = "metadata") -> str | None:
@@ -833,9 +1038,33 @@ def _checkpoint_payload(
     history: dict[str, Any],
     compatibility: dict[str, Any],
     rng_states: dict[str, Any],
+    credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT,
+    q_critic: Any | None = None,
+    q_optimizer: Any | None = None,
+    q_optimizer_step_count: int = 0,
 ) -> dict[str, Any]:
     """构造不含RolloutBatch/梯度/候选trace的权威checkpoint。"""
 
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        if q_critic is None or q_optimizer is None:
+            raise ValueError("per_trigger_q checkpoint 缺少 q_critic/q_optimizer。")
+        return {
+            "checkpoint_version": COUNTERFACTUAL_CHECKPOINT_VERSION,
+            "algorithm_schema": "proposed_per_trigger_q_v1",
+            "policy_state_dict": policy.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "q_critic_state_dict": q_critic.state_dict(),
+            "q_optimizer_state_dict": q_optimizer.state_dict(),
+            "policy_version": int(policy_version),
+            "optimizer_step_count": int(optimizer_step_count),
+            "q_optimizer_step_count": int(q_optimizer_step_count),
+            "completed_episodes": int(history["completed_episodes"]),
+            "training_history": summary_to_builtin(history),
+            "compatibility": summary_to_builtin(compatibility),
+            "rng_states": rng_states,
+        }
+    if credit_assignment != ppo_update.LEGACY_CREDIT_ASSIGNMENT:
+        raise ValueError(f"未知 credit_assignment：{credit_assignment}")
     return {
         "checkpoint_version": CHECKPOINT_VERSION,
         "policy_state_dict": policy.state_dict(),
@@ -855,7 +1084,10 @@ def _load_formal_checkpoint(
     optimizer: Any,
     rng_generator: Any,
     expected_compatibility: dict[str, Any],
-) -> tuple[dict[str, Any], int, int]:
+    credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT,
+    q_critic: Any | None = None,
+    q_optimizer: Any | None = None,
+) -> tuple[dict[str, Any], int, int, int]:
     """按policy/optimizer构造完成后加载checkpoint并恢复RNG。"""
 
     _require_torch()
@@ -872,10 +1104,22 @@ def _load_formal_checkpoint(
         raise RuntimeError(f"无法读取checkpoint：{checkpoint_path}") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: checkpoint顶层必须是dict。")
-    if int(payload.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
+    expected_checkpoint_version = (
+        COUNTERFACTUAL_CHECKPOINT_VERSION
+        if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT
+        else CHECKPOINT_VERSION
+    )
+    if int(payload.get("checkpoint_version", -1)) != expected_checkpoint_version:
         raise RuntimeError(
-            "CHECKPOINT_COMPATIBILITY_ERROR: checkpoint_version不支持。"
+            "CHECKPOINT_COMPATIBILITY_ERROR: checkpoint与当前credit_assignment/schema不兼容。"
         )
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        if payload.get("algorithm_schema") != "proposed_per_trigger_q_v1":
+            raise RuntimeError(
+                "CHECKPOINT_COMPATIBILITY_ERROR: 缺少proposed_per_trigger_q_v1 schema。"
+            )
+        if q_critic is None or q_optimizer is None:
+            raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: 当前模式缺少Q critic/optimizer。")
     mismatch = _metadata_mismatch(expected_compatibility, payload.get("compatibility"))
     if mismatch:
         raise RuntimeError(f"CHECKPOINT_COMPATIBILITY_ERROR: {mismatch}")
@@ -893,17 +1137,26 @@ def _load_formal_checkpoint(
         or completed_episodes != int(history["completed_episodes"])
     ):
         raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: checkpoint counters与training_history不一致。")
+    q_optimizer_step_count = int(payload.get("q_optimizer_step_count", 0))
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        if q_optimizer_step_count != int(history.get("q_optimizer_step_count", -1)):
+            raise RuntimeError(
+                "CHECKPOINT_COMPATIBILITY_ERROR: q_optimizer_step_count与training_history不一致。"
+            )
 
     try:
         policy.load_state_dict(payload["policy_state_dict"])
         optimizer.load_state_dict(payload["optimizer_state_dict"])
+        if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+            q_critic.load_state_dict(payload["q_critic_state_dict"])
+            q_optimizer.load_state_dict(payload["q_optimizer_state_dict"])
     except Exception as exc:
         raise RuntimeError(f"CHECKPOINT_COMPATIBILITY_ERROR: policy/optimizer state不兼容：{exc}") from exc
     rng_states = payload.get("rng_states")
     if not isinstance(rng_states, dict):
         raise RuntimeError("CHECKPOINT_COMPATIBILITY_ERROR: rng_states缺失或类型错误。")
     _restore_rng_states(policy, rng_generator, rng_states)
-    return history, policy_version, optimizer_step_count
+    return history, policy_version, optimizer_step_count, q_optimizer_step_count
 
 
 def _require_torch() -> None:
@@ -1052,7 +1305,13 @@ def run_training_dry_run(config_path: str = "system_config.toml") -> FormalTrain
     ctx = _build_context(config_path)
     protocol = build_formal_training_protocol(ctx.scenarios, ctx.cfg)
     checks = validate_formal_training_protocol(protocol)
+    credit_assignment = ppo_update.credit_assignment_from_project(ctx.cfg)
     sample_num_episodes = 3
+    planned_q_optimizer_steps = (
+        sample_num_episodes * protocol.expected_optimizer_steps_per_rollout
+        if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT
+        else 0
+    )
     return FormalTrainingDryRunResult(
         protocol=protocol,
         origins_contiguous=checks["origins_contiguous"],
@@ -1068,13 +1327,16 @@ def run_training_dry_run(config_path: str = "system_config.toml") -> FormalTrain
         planned_environment_steps=sample_num_episodes * protocol.steps_per_episode,
         planned_optimizer_steps=sample_num_episodes * protocol.expected_optimizer_steps_per_rollout,
         planned_backward_calls=sample_num_episodes * protocol.expected_optimizer_steps_per_rollout,
-        optimizer_instances_planned=1,
+        optimizer_instances_planned=(2 if planned_q_optimizer_steps > 0 else 1),
         executor_dry_run_only=True,
         formal_validation=True,
         environment_steps_executed=0,
         backward_calls_executed=0,
         optimizer_steps_executed=0,
         blocker="",
+        credit_assignment=credit_assignment,
+        planned_q_optimizer_steps=planned_q_optimizer_steps,
+        q_optimizer_instances_planned=(1 if planned_q_optimizer_steps > 0 else 0),
     )
 
 
@@ -1200,11 +1462,15 @@ def _slice_rollout_batch(
         actions=batch.actions[idx].copy(),
         action_masks=batch.action_masks[idx].copy(),
         old_log_probs=batch.old_log_probs[idx].copy(),
+        old_per_action_log_probs=batch.old_per_action_log_probs[idx].copy(),
+        old_per_action_probabilities=batch.old_per_action_probabilities[idx].copy(),
+        actor_valid_mask=batch.actor_valid_mask[idx].copy(),
         old_values=batch.old_values[idx].copy(),
         rewards=batch.rewards[idx].copy(),
         dones=batch.dones[idx].copy(),
         advantages=batch.advantages[idx].copy(),
         returns=batch.returns[idx].copy(),
+        monte_carlo_returns=batch.monte_carlo_returns[idx].copy(),
         slots=batch.slots[idx].copy(),
         origin_indices=batch.origin_indices[idx].copy(),
         final_bootstrap_value=float(batch.final_bootstrap_value),
@@ -1285,12 +1551,269 @@ def _aggregate_epoch_diagnostics(
     )
 
 
+def _update_policy_on_rollout_per_trigger_q(
+    policy: Any,
+    optimizer: Any,
+    q_critic: Any,
+    q_optimizer: Any,
+    rollout_batch: ppo_rollout.RolloutBatch,
+    project_cfg: dict[str, Any],
+    rng_generator: Any,
+) -> FormalPPOUpdateSummary:
+    """执行第一版 per-trigger Q + counterfactual PPO update。
+
+    更新顺序固定为：
+    1. 用更新前 Actor/Q 计算并冻结 Q_old、baseline_cf、A_cf；
+    2. 用 full terminal Monte-Carlo return 独立更新 Q critic；
+    3. 用冻结 A_cf、old per-action log-prob 和真实 action prefix 更新
+       Actor/scalar-V。Q 参数不进入 Actor optimizer 或 Actor gradient clip。
+    """
+
+    _require_torch()
+    training_cfg = ppo_update.ppo_training_config_status(project_cfg)
+    if not training_cfg.can_run_optimizer_step:
+        raise RuntimeError(f"PPO update超参数缺失：{training_cfg.missing_required_for_step}")
+    if training_cfg.max_grad_norm is None or training_cfg.learning_rate is None:
+        raise RuntimeError("per_trigger_q update 缺少 max_grad_norm/learning_rate。")
+    if ppo_update.q_target_from_project(project_cfg) != ppo_update.MONTE_CARLO_Q_TARGET:
+        raise RuntimeError("per_trigger_q 第一版必须使用 q_target=monte_carlo。")
+    if rollout_batch.monte_carlo_returns.shape != rollout_batch.rewards.shape:
+        raise ValueError("monte_carlo_returns shape 必须与 rewards 一致。")
+    if not bool(rollout_batch.metadata.get("true_terminal", False)):
+        raise RuntimeError("per_trigger_q 的 full MC target 要求 true-terminal rollout。")
+
+    update_epochs = int(project_config.get_config_value(project_cfg, "algorithm.ppo.update_epochs"))
+    num_minibatches = int(project_config.get_config_value(project_cfg, "algorithm.ppo.num_minibatches"))
+    batch_size = int(rollout_batch.observations.shape[0])
+    if batch_size <= 0 or batch_size % num_minibatches != 0:
+        raise ValueError("rollout batch size 必须为正且可被 num_minibatches 整除。")
+    minibatch_size = batch_size // num_minibatches
+
+    targets = ppo_update.prepare_counterfactual_targets(policy, q_critic, rollout_batch)
+    frozen_counterfactual_advantages = targets.advantages.detach().clone()
+    frozen_actor_valid_mask = targets.actor_valid_mask.detach().clone()
+    free_advantages = frozen_counterfactual_advantages[frozen_actor_valid_mask]
+    if int(free_advantages.numel()) > 0:
+        cf_adv_mean = float(torch.mean(free_advantages).detach().cpu())
+        cf_adv_std = float(torch.std(free_advantages, unbiased=False).detach().cpu())
+        cf_adv_abs_mean = float(torch.mean(torch.abs(free_advantages)).detach().cpu())
+    else:
+        cf_adv_mean = 0.0
+        cf_adv_std = 0.0
+        cf_adv_abs_mean = 0.0
+
+    # 每个 epoch 只抽一次 permutation，并复用于 Q/Actor 两阶段，避免为新 Q
+    # optimizer 无意义地增加一套 RNG 语义；旧 legacy mode 的 shuffle 路径不变。
+    epoch_shuffles = [
+        _torch_randperm_numpy(batch_size, rng_generator)
+        for _ in range(update_epochs)
+    ]
+
+    q_losses: list[float] = []
+    q_gradient_norms: list[float] = []
+    q_gradient_finite_all = True
+    q_optimizer_steps = 0
+
+    for shuffled in epoch_shuffles:
+        for start in range(0, batch_size, minibatch_size):
+            minibatch_indices = shuffled[start : start + minibatch_size]
+            if len(minibatch_indices) != minibatch_size:
+                raise RuntimeError("Q critic minibatch划分不完整。")
+            indices_t = torch.as_tensor(
+                minibatch_indices,
+                dtype=torch.long,
+                device=targets.conditional_hidden_states.device,
+            )
+            hidden_mb = targets.conditional_hidden_states.index_select(0, indices_t)
+            actions_mb = rollout_batch.actions[minibatch_indices]
+            mc_returns_mb = rollout_batch.monte_carlo_returns[minibatch_indices]
+            actor_valid_mb = rollout_batch.actor_valid_mask[minibatch_indices]
+            q_optimizer.zero_grad(set_to_none=True)
+            q_loss_result = ppo_update.compute_per_trigger_q_loss(
+                q_critic,
+                hidden_mb,
+                actions_mb,
+                mc_returns_mb,
+                actor_valid_mb,
+            )
+            if not torch.isfinite(q_loss_result.q_loss):
+                raise FloatingPointError("Q critic loss 非finite。")
+            q_loss_result.q_loss.backward()
+            q_grads = [
+                parameter.grad.detach()
+                for parameter in q_critic.parameters()
+                if parameter.grad is not None
+            ]
+            q_gradient_finite = bool(q_grads) and bool(
+                all(torch.isfinite(grad).all().item() for grad in q_grads)
+            )
+            q_gradient_finite_all = q_gradient_finite_all and q_gradient_finite
+            if not q_gradient_finite:
+                raise FloatingPointError("Q critic gradient 出现 NaN/Inf。")
+            q_grad_norm = torch.nn.utils.clip_grad_norm_(
+                q_critic.parameters(),
+                float(training_cfg.max_grad_norm),
+            )
+            q_gradient_norms.append(float(q_grad_norm.detach().cpu()))
+            q_losses.append(float(q_loss_result.q_loss.detach().cpu()))
+            q_optimizer.step()
+            q_optimizer_steps += 1
+
+    # 清除 Q optimizer 上一阶段的梯度，确保后续 Actor backward 不会误留下
+    # Q gradient；Q 参数从未加入 Actor optimizer。
+    q_optimizer.zero_grad(set_to_none=True)
+
+    frozen_old_log_probs = rollout_batch.old_log_probs.copy()
+    frozen_old_per_action_log_probs = rollout_batch.old_per_action_log_probs.copy()
+    frozen_old_per_action_probabilities = rollout_batch.old_per_action_probabilities.copy()
+    frozen_old_values = rollout_batch.old_values.copy()
+    frozen_returns = rollout_batch.returns.copy()
+    frozen_mc_returns = rollout_batch.monte_carlo_returns.copy()
+    frozen_actions = rollout_batch.actions.copy()
+    frozen_masks = rollout_batch.action_masks.copy()
+
+    policy_losses: list[float] = []
+    value_losses: list[float] = []
+    entropies: list[float] = []
+    approx_kls: list[float] = []
+    clip_fractions: list[float] = []
+    gradient_norms: list[float] = []
+    epoch_summaries: list[PPOEpochSummary] = []
+    gradient_finite_all = True
+    each_transition_once_per_epoch = True
+    optimizer_steps = 0
+
+    all_indices = np.arange(batch_size, dtype=np.int64)
+    for epoch_index, shuffled in enumerate(epoch_shuffles, start=1):
+        each_transition_once_per_epoch = each_transition_once_per_epoch and bool(
+            np.array_equal(np.sort(shuffled), all_indices)
+        )
+        epoch_minibatch_diagnostics: list[dict[str, float | int]] = []
+        epoch_pre_clipping_grad_norms: list[float] = []
+        for start in range(0, batch_size, minibatch_size):
+            minibatch_indices = shuffled[start : start + minibatch_size]
+            if len(minibatch_indices) != minibatch_size:
+                raise RuntimeError("Actor minibatch划分不完整。")
+            minibatch = _slice_rollout_batch(rollout_batch, minibatch_indices)
+            frozen_advantage_mb = frozen_counterfactual_advantages[minibatch_indices]
+            optimizer.zero_grad(set_to_none=True)
+            loss = ppo_update.compute_per_trigger_ppo_loss(
+                policy,
+                minibatch,
+                frozen_advantage_mb,
+                float(training_cfg.clip_epsilon),
+                float(training_cfg.value_loss_coefficient),
+                float(training_cfg.entropy_coefficient),
+            )
+            if not torch.isfinite(loss.total_loss):
+                raise FloatingPointError("per-trigger PPO total loss 非finite。")
+            loss.total_loss.backward()
+            grads = [
+                parameter.grad.detach()
+                for parameter in policy.parameters()
+                if parameter.grad is not None
+            ]
+            gradient_finite = bool(grads) and bool(
+                all(torch.isfinite(grad).all().item() for grad in grads)
+            )
+            gradient_finite_all = gradient_finite_all and gradient_finite
+            if not gradient_finite:
+                raise FloatingPointError("Actor/scalar-V gradient 出现 NaN/Inf。")
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(),
+                float(training_cfg.max_grad_norm),
+            )
+            pre_clipping_grad_norm = float(grad_norm.detach().cpu())
+            epoch_pre_clipping_grad_norms.append(pre_clipping_grad_norm)
+            gradient_norms.append(pre_clipping_grad_norm)
+            minibatch_diagnostics = {
+                "transition_count": int(len(minibatch_indices)),
+                "policy_loss": float(loss.policy_loss.detach().cpu()),
+                "value_loss": float(loss.value_loss.detach().cpu()),
+                "entropy": float(loss.entropy.detach().cpu()),
+                "total_loss": float(loss.total_loss.detach().cpu()),
+                "approx_kl": float(loss.approx_kl),
+                "clip_fraction": float(loss.clip_fraction),
+                "ratio_mean": float(loss.ratio_mean),
+                "ratio_min": float(loss.ratio_min),
+                "ratio_max": float(loss.ratio_max),
+            }
+            epoch_minibatch_diagnostics.append(minibatch_diagnostics)
+            optimizer.step()
+            optimizer_steps += 1
+            policy_losses.append(minibatch_diagnostics["policy_loss"])
+            value_losses.append(minibatch_diagnostics["value_loss"])
+            entropies.append(minibatch_diagnostics["entropy"])
+            approx_kls.append(minibatch_diagnostics["approx_kl"])
+            clip_fractions.append(minibatch_diagnostics["clip_fraction"])
+        epoch_summaries.append(
+            _aggregate_epoch_diagnostics(
+                epoch_index=epoch_index,
+                minibatch_diagnostics=epoch_minibatch_diagnostics,
+                pre_clipping_grad_norms=epoch_pre_clipping_grad_norms,
+                optimizer_steps_cumulative=optimizer_steps,
+            )
+        )
+
+    if not np.array_equal(rollout_batch.old_log_probs, frozen_old_log_probs):
+        raise AssertionError("joint old_log_probs 在per-trigger update期间被修改。")
+    if not np.array_equal(rollout_batch.old_per_action_log_probs, frozen_old_per_action_log_probs):
+        raise AssertionError("old per-action log-probs 在update期间被修改。")
+    if not np.array_equal(rollout_batch.old_per_action_probabilities, frozen_old_per_action_probabilities):
+        raise AssertionError("old per-action probabilities 在update期间被修改。")
+    if not np.array_equal(rollout_batch.old_values, frozen_old_values):
+        raise AssertionError("old_values 在per-trigger update期间被修改。")
+    if not np.array_equal(rollout_batch.returns, frozen_returns):
+        raise AssertionError("GAE returns 在per-trigger update期间被修改。")
+    if not np.array_equal(rollout_batch.monte_carlo_returns, frozen_mc_returns):
+        raise AssertionError("Monte-Carlo returns 在per-trigger update期间被修改。")
+    if not np.array_equal(rollout_batch.actions, frozen_actions):
+        raise AssertionError("rollout actions 在per-trigger update期间被修改。")
+    if not np.array_equal(rollout_batch.action_masks, frozen_masks):
+        raise AssertionError("rollout action masks 在per-trigger update期间被修改。")
+    if not torch.equal(targets.advantages, frozen_counterfactual_advantages):
+        raise AssertionError("counterfactual advantages 在PPO multi-epoch期间被修改。")
+    if not torch.equal(targets.actor_valid_mask, frozen_actor_valid_mask):
+        raise AssertionError("actor_valid_mask 在PPO multi-epoch期间被修改。")
+
+    update_summary = FormalPPOUpdateSummary(
+        update_epochs=update_epochs,
+        num_minibatches=num_minibatches,
+        minibatch_size=minibatch_size,
+        optimizer_steps=optimizer_steps,
+        policy_loss_mean=float(np.mean(policy_losses)),
+        value_loss_mean=float(np.mean(value_losses)),
+        entropy_mean=float(np.mean(entropies)),
+        approx_kl_mean=float(np.mean(approx_kls)),
+        clip_fraction_mean=float(np.mean(clip_fractions)),
+        gradient_norm_mean=float(np.mean(gradient_norms)),
+        gradient_finite=gradient_finite_all,
+        old_log_probs_frozen=True,
+        old_values_frozen=True,
+        advantages_frozen=True,
+        returns_frozen=True,
+        each_transition_once_per_epoch=each_transition_once_per_epoch,
+        epoch_summaries=tuple(epoch_summaries),
+        q_loss_mean=float(np.mean(q_losses)),
+        q_gradient_norm_mean=float(np.mean(q_gradient_norms)),
+        q_gradient_finite=q_gradient_finite_all,
+        counterfactual_advantage_mean=cf_adv_mean,
+        counterfactual_advantage_std=cf_adv_std,
+        counterfactual_advantage_abs_mean=cf_adv_abs_mean,
+        free_trigger_decision_count=int(frozen_actor_valid_mask.sum().detach().cpu()),
+        q_optimizer_steps=q_optimizer_steps,
+    )
+    return update_summary
+
+
 def update_policy_on_rollout(
     policy: Any,
     optimizer: Any,
     rollout_batch: ppo_rollout.RolloutBatch,
     project_cfg: dict[str, Any],
     rng_generator: Any,
+    q_critic: Any | None = None,
+    q_optimizer: Any | None = None,
 ) -> FormalPPOUpdateSummary:
     """对一个完整on-policy rollout执行正式PPO更新。
 
@@ -1307,6 +1830,21 @@ def update_policy_on_rollout(
     """
 
     _require_torch()
+    credit_assignment = ppo_update.credit_assignment_from_project(project_cfg)
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        if q_critic is None or q_optimizer is None:
+            raise ValueError("per_trigger_q update 必须显式提供独立 q_critic/q_optimizer。")
+        return _update_policy_on_rollout_per_trigger_q(
+            policy,
+            optimizer,
+            q_critic,
+            q_optimizer,
+            rollout_batch,
+            project_cfg,
+            rng_generator,
+        )
+    if q_critic is not None or q_optimizer is not None:
+        raise ValueError("legacy_scalar update 不接受 q_critic/q_optimizer。")
     training_cfg = ppo_update.ppo_training_config_status(project_cfg)
     if not training_cfg.can_run_optimizer_step:
         raise RuntimeError(f"PPO update超参数缺失：{training_cfg.missing_required_for_step}")
@@ -1432,9 +1970,20 @@ def _build_formal_training_plan(
     protocol: FormalTrainingProtocol,
     num_episodes: int,
     execute: bool,
+    credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT,
 ) -> FormalTrainingRunPlan:
     if num_episodes <= 0:
         raise ValueError("num_episodes 必须由caller显式传入正整数。")
+    if credit_assignment not in {
+        ppo_update.LEGACY_CREDIT_ASSIGNMENT,
+        ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT,
+    }:
+        raise ValueError(f"未知 credit_assignment：{credit_assignment}")
+    q_steps = (
+        int(num_episodes * protocol.expected_optimizer_steps_per_rollout)
+        if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT
+        else 0
+    )
     return FormalTrainingRunPlan(
         num_episodes=int(num_episodes),
         steps_per_episode=int(protocol.steps_per_episode),
@@ -1445,10 +1994,14 @@ def _build_formal_training_plan(
         expected_optimizer_steps_per_episode=int(protocol.expected_optimizer_steps_per_rollout),
         planned_optimizer_steps=int(num_episodes * protocol.expected_optimizer_steps_per_rollout),
         planned_backward_calls=int(num_episodes * protocol.expected_optimizer_steps_per_rollout),
-        optimizer_instances_planned=1,
+        optimizer_instances_planned=(2 if q_steps > 0 else 1),
         execute=bool(execute),
         single_trace_training=bool(protocol.single_trace_training),
         no_default_long_training_budget=True,
+        credit_assignment=credit_assignment,
+        planned_q_optimizer_steps=q_steps,
+        planned_q_backward_calls=q_steps,
+        q_optimizer_instances_planned=(1 if q_steps > 0 else 0),
     )
 
 
@@ -1458,6 +2011,8 @@ def run_formal_ppo_training(
     config_path: str = "system_config.toml",
     policy: Any | None = None,
     optimizer: Any | None = None,
+    q_critic: Any | None = None,
+    q_optimizer: Any | None = None,
     rng_generator: Any | None = None,
     execute: bool = False,
     run_dir: str | Path | None = None,
@@ -1468,8 +2023,9 @@ def run_formal_ppo_training(
     默认 execute=False：只构造并返回计划，不执行environment、不backward、不optimizer.step。
     execute=True时，run_dir必须由caller显式提供；每个完整episode完成后才保存checkpoint。
     resume=True时，num_episodes表示该run希望达到的总完成episode数，而不是额外episode数。
-    若未由caller传入policy/optimizer，本函数按当前config构造它们；resume加载顺序仍为：
-    构造policy/optimizer -> load state_dict -> 恢复RNG -> 才开始下一episode。
+    若未由caller传入policy/optimizer，本函数按当前config构造它们；per_trigger_q
+    模式同时构造独立 Q critic/optimizer。resume加载顺序仍为：构造全部网络/optimizer
+    -> load state_dict -> 恢复RNG -> 才开始下一episode。
     """
 
     if execute and run_dir is None:
@@ -1480,7 +2036,8 @@ def run_formal_ppo_training(
     ctx = _build_context(config_path)
     protocol = build_formal_training_protocol(ctx.scenarios, ctx.cfg)
     validate_formal_training_protocol(protocol)
-    plan = _build_formal_training_plan(protocol, num_episodes, execute)
+    credit_assignment = ppo_update.credit_assignment_from_project(ctx.cfg)
+    plan = _build_formal_training_plan(protocol, num_episodes, execute, credit_assignment)
     if not execute:
         return plan
     _require_torch()
@@ -1490,6 +2047,8 @@ def run_formal_ppo_training(
 
     if (policy is None) != (optimizer is None):
         raise ValueError("execute=True 时 policy 和 optimizer 必须同时提供或同时省略。")
+    if (q_critic is None) != (q_optimizer is None):
+        raise ValueError("q_critic 和 q_optimizer 必须同时提供或同时省略。")
 
     if rng_generator is None:
         rng_generator = torch.Generator()
@@ -1501,32 +2060,55 @@ def run_formal_ppo_training(
     if policy is None and optimizer is None:
         # 初始化可能消耗RNG；resume时此后会先load state_dict，最后再恢复checkpoint RNG。
         _seed_new_formal_run(seed, rng_generator)
-        policy, optimizer = _build_formal_policy_and_optimizer(ctx)
+        policy, optimizer, q_critic, q_optimizer = _build_formal_training_components(ctx)
+    elif credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        if q_critic is None or q_optimizer is None:
+            raise ValueError("per_trigger_q execute 必须提供独立 q_critic/q_optimizer。")
+    elif q_critic is not None or q_optimizer is not None:
+        raise ValueError("legacy_scalar execute 不接受 q_critic/q_optimizer。")
 
     compatibility = _formal_compatibility_metadata(ctx, protocol, policy)
     resumed = bool(resume)
     if resume:
-        history, policy_version, optimizer_step_count = _load_formal_checkpoint(
+        history, policy_version, optimizer_step_count, q_optimizer_step_count = _load_formal_checkpoint(
             checkpoint_path,
             policy,
             optimizer,
             rng_generator,
             compatibility,
+            credit_assignment,
+            q_critic,
+            q_optimizer,
         )
         # JSON只是人类可读mirror；无论它落后、缺失还是声称更新，都以checkpoint为准。
         _synchronize_training_history_json(history_path, history)
     else:
-        history = _empty_training_history()
+        history = _empty_training_history(credit_assignment)
         policy_version = 0
         optimizer_step_count = 0
+        q_optimizer_step_count = 0
 
     records = list(history["episodes"])
     completed_episodes = int(history["completed_episodes"])
     episode_summaries: list[TrainingEpisodeSummary] = []
+    print(
+        f"[PPO] {'resume' if resume else 'training'}: episodes "
+        f"{completed_episodes} -> {num_episodes}, run_dir={_formal_run_dir}",
+        flush=True,
+    )
     for episode_index in range(completed_episodes, num_episodes):
+        episode_start_time = time.perf_counter()
         batch = collect_formal_episode_rollout(policy, ctx, protocol)
         raw_stats = _formal_raw_rollout_statistics(batch)
-        update = update_policy_on_rollout(policy, optimizer, batch, ctx.cfg, rng_generator)
+        update = update_policy_on_rollout(
+            policy,
+            optimizer,
+            batch,
+            ctx.cfg,
+            rng_generator,
+            q_critic,
+            q_optimizer,
+        )
         if update.optimizer_steps != int(protocol.expected_optimizer_steps_per_rollout):
             raise RuntimeError(
                 "完整episode的PPO optimizer steps不符合FormalTrainingProtocol，"
@@ -1539,6 +2121,7 @@ def run_formal_ppo_training(
         policy_version_before = policy_version
         policy_version += 1
         optimizer_step_count += update.optimizer_steps
+        q_optimizer_step_count += int(update.q_optimizer_steps)
         episode_summary = TrainingEpisodeSummary(
             episode_index=episode_index,
             policy_version_before=policy_version_before,
@@ -1561,8 +2144,20 @@ def run_formal_ppo_training(
         episode_summaries.append(episode_summary)
 
         # 只有完整episode、完整PPO update和summary全部成功后才进入history。
-        records.append(_training_episode_history_record(episode_summary, update))
-        history = _build_training_history(records, policy_version, optimizer_step_count)
+        records.append(
+            _training_episode_history_record(
+                episode_summary,
+                update,
+                credit_assignment,
+            )
+        )
+        history = _build_training_history(
+            records,
+            policy_version,
+            optimizer_step_count,
+            credit_assignment,
+            q_optimizer_step_count,
+        )
         payload = _checkpoint_payload(
             policy,
             optimizer,
@@ -1571,6 +2166,10 @@ def run_formal_ppo_training(
             history,
             compatibility,
             _capture_rng_states(policy, rng_generator),
+            credit_assignment,
+            q_critic,
+            q_optimizer,
+            q_optimizer_step_count,
         )
         # checkpoint先写；JSON mirror失败时旧checkpoint/新checkpoint都仍是权威源。
         _atomic_torch_save(payload, checkpoint_path)
@@ -1582,6 +2181,27 @@ def run_formal_ppo_training(
                 RuntimeWarning,
                 stacklevel=2,
             )
+        print(
+            f"[PPO] episode {episode_index + 1}/{num_episodes} | "
+            f"mean_G={episode_summary.rollout_reward_mean:.4f} | "
+            f"Q={episode_summary.actual_q_sum:.4f} | "
+            f"cache={episode_summary.cache_cost_sum:.4f} | "
+            f"uav={episode_summary.movement_cost_sum:.4f} | "
+            f"entropy={episode_summary.entropy_mean:.4f} | "
+            f"value_loss={episode_summary.value_loss_mean:.4f} | "
+            f"grad_norm={episode_summary.gradient_norm_mean:.4f} | "
+            f"kl={episode_summary.approx_kl_mean:.4f} | "
+            f"clip={episode_summary.clip_fraction_mean:.4f} | "
+            f"time={time.perf_counter() - episode_start_time:.1f}s",
+            flush=True,
+        )
+
+    # 所有本次调用目标episode完成且history已逐episode持久化后，只更新一次Figure 1。
+    _plot_training_convergence_after_persistence(_formal_run_dir, history)
+    print(
+        f"[PPO] training complete: {int(history['completed_episodes'])}/{num_episodes} episodes",
+        flush=True,
+    )
 
     return FormalTrainingRunResult(
         plan=plan,
@@ -1591,7 +2211,67 @@ def run_formal_ppo_training(
         completed_episodes=int(history["completed_episodes"]),
         training_history=history,
         resumed=resumed,
+        q_optimizer_step_count=q_optimizer_step_count,
     )
+
+
+def _execution_location_for_matching_target(
+    target: Any,
+    cache_nodes: dict[str, Any],
+) -> str:
+    """按最终Matching target和cache node role归并执行位置类别。"""
+
+    target_id = str(target)
+    if target_id == task_allocation.LOCAL or target_id.startswith(task_allocation.LOCAL_PREFIX):
+        return "Local"
+    if target_id == task_allocation.CLOUD:
+        return "Cloud"
+
+    node_ids = [str(value) for value in cache_nodes["node_ids"]]
+    if target_id not in node_ids:
+        raise ValueError(f"最终Matching包含未知执行节点：{target_id}")
+    node_index = node_ids.index(target_id)
+    role = str(cache_nodes["node_roles"][node_index])
+    if role not in {"SV", "RSU", "UAV"}:
+        raise ValueError(f"最终Matching包含未知edge node role：{role}")
+    return role
+
+
+def _execution_location_statistics(
+    counts: dict[str, int],
+    arrived_task_count: int,
+) -> tuple[dict[str, int], dict[str, float]]:
+    """校验五类最终执行位置计数，并计算原始[0,1]比例。"""
+
+    if tuple(counts) != EXECUTION_LOCATION_ORDER:
+        raise AssertionError(
+            "execution location类别顺序/集合必须严格为 "
+            f"{list(EXECUTION_LOCATION_ORDER)}，实际为 {list(counts)}"
+        )
+    if any(int(value) < 0 for value in counts.values()):
+        raise AssertionError("execution location task count不能为负。")
+    if sum(int(value) for value in counts.values()) != int(arrived_task_count):
+        raise AssertionError(
+            "execution_location_task_counts之和不等于arrived_task_count："
+            f"{sum(counts.values())} != {arrived_task_count}"
+        )
+
+    if arrived_task_count <= 0:
+        raise ValueError(
+            "arrived_task_count必须大于0才能定义execution_location_ratios；"
+            "不会静默返回未归一化比例。"
+        )
+
+    ratios = {
+        location: float(int(counts[location]) / int(arrived_task_count))
+        for location in EXECUTION_LOCATION_ORDER
+    }
+    if not math.isclose(math.fsum(ratios.values()), 1.0, rel_tol=1e-12, abs_tol=1e-12):
+        raise AssertionError(
+            "execution_location_ratios之和不接近1.0："
+            f"sum={math.fsum(ratios.values())}"
+        )
+    return dict(counts), ratios
 
 
 def evaluate_formal_episode(
@@ -1624,6 +2304,9 @@ def evaluate_formal_episode(
     arrived_task_count = 0
     cache_service_available_task_count = 0
     cloud_execution_task_count = 0
+    execution_location_task_counts = {
+        location: 0 for location in EXECUTION_LOCATION_ORDER
+    }
     all_steps_feasible = True
     edge_node_mask = np.asarray(
         [str(role) in {"SV", "RSU", "UAV"} for role in ctx.cache_nodes["node_roles"]],
@@ -1721,7 +2404,12 @@ def evaluate_formal_episode(
 
                 if task.task_id not in result.matching:
                     raise ValueError(f"最终Matching缺少 task_id={task.task_id}。")
-                if result.matching[task.task_id] == task_allocation.CLOUD:
+                execution_location = _execution_location_for_matching_target(
+                    result.matching[task.task_id],
+                    ctx.cache_nodes,
+                )
+                execution_location_task_counts[execution_location] += 1
+                if execution_location == "Cloud":
                     cloud_execution_task_count += 1
 
             if not math.isclose(reward, actual_q - cache_cost - movement_cost, rel_tol=1e-12, abs_tol=1e-12):
@@ -1769,6 +2457,14 @@ def evaluate_formal_episode(
         if arrived_task_count == 0
         else float(cloud_execution_task_count / arrived_task_count)
     )
+    if execution_location_task_counts["Cloud"] != cloud_execution_task_count:
+        raise AssertionError(
+            "Cloud execution count与execution_location_task_counts不一致。"
+        )
+    execution_location_task_counts, execution_location_ratios = _execution_location_statistics(
+        execution_location_task_counts,
+        arrived_task_count,
+    )
     return DeterministicEvaluationSummary(
         num_steps=len(rewards),
         cumulative_system_utility=cumulative_g,
@@ -1783,10 +2479,151 @@ def evaluate_formal_episode(
         cache_service_availability_rate=cache_service_availability_rate,
         cloud_execution_task_count=int(cloud_execution_task_count),
         cloud_execution_ratio=cloud_execution_ratio,
+        execution_location_task_counts=execution_location_task_counts,
+        execution_location_ratios=execution_location_ratios,
         all_steps_feasible=all_steps_feasible,
         reward_identity_error=float(identity_error),
         evaluation_semantics="in-trace deterministic evaluation",
     )
+
+
+def save_deterministic_evaluation_report(
+    summary: DeterministicEvaluationSummary,
+    output_path: str | Path,
+    figure_output_path: str | Path | None = None,
+) -> Path:
+    """保存deterministic evaluation JSON，并在JSON成功后生成Figure 2。
+
+    该函数只消费已经完成的evaluation summary；不会加载checkpoint、执行环境、
+    采样动作或修改policy。绘图失败只发出warning，已保存的evaluation JSON
+    仍然有效。
+    """
+
+    output = Path(output_path)
+    if output.suffix.lower() != ".json":
+        raise ValueError("deterministic evaluation report必须输出为.json。")
+    expected_counts, expected_ratios = _execution_location_statistics(
+        summary.execution_location_task_counts,
+        summary.arrived_task_count,
+    )
+    if expected_counts != summary.execution_location_task_counts or any(
+        not math.isclose(
+            expected_ratios[location],
+            float(summary.execution_location_ratios[location]),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        for location in EXECUTION_LOCATION_ORDER
+    ):
+        raise ValueError("deterministic evaluation execution location reporting不一致。")
+    _atomic_json_save(summary_to_builtin(summary), output)
+
+    figure_path = (
+        Path(figure_output_path)
+        if figure_output_path is not None
+        else output.parent / "figures" / "02_execution_location_ratio.png"
+    )
+    try:
+        from experiment_plotting import plot_execution_location_ratios
+
+        plot_execution_location_ratios(summary.execution_location_ratios, figure_path)
+    except Exception as exc:  # JSON已落盘，reporting故障不回滚evaluation
+        warnings.warn(
+            f"DETERMINISTIC_EXECUTION_LOCATION_PLOT_FAILED: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return output
+
+
+def evaluate_formal_episode_with_trigger_diagnostics(
+    policy: Any,
+    ctx: TrainingSanityContext,
+    protocol: FormalTrainingProtocol,
+) -> tuple[DeterministicEvaluationSummary, list[dict[str, Any]]]:
+    """在原始deterministic evaluation上附加轻量Trigger概率记录。
+
+    该reporting wrapper不复制evaluation loop，也不改变policy action、action mask、
+    environment执行或状态传播；它只记录原``sample_action()``返回的概率、logit、
+    deterministic action和mask，随后仍由``evaluate_formal_episode()``完成正式执行。
+    """
+
+    steps = _formal_aligned_steps(ctx, protocol)
+    captured_samples: list[dict[str, Any]] = []
+
+    class _TriggerSampleCapture:
+        def __init__(self, wrapped_policy: Any) -> None:
+            self.wrapped_policy = wrapped_policy
+
+        def sample_action(self, *args: Any, **kwargs: Any) -> Any:
+            if not bool(kwargs.get("deterministic", False)):
+                raise AssertionError("trigger probability diagnostic 必须使用 deterministic=True。")
+            if kwargs.get("action_mask") is None:
+                raise AssertionError("trigger probability diagnostic 不允许缺少 action_mask。")
+            sample = self.wrapped_policy.sample_action(*args, **kwargs)
+            captured_samples.append(
+                {
+                    "action_vector": np.asarray(sample.action_vector, dtype=np.int8).astype(int).tolist(),
+                    "per_action_probabilities": np.asarray(
+                        sample.per_action_probabilities, dtype=np.float64
+                    ).tolist(),
+                    "per_action_logits": np.asarray(sample.per_action_logits, dtype=np.float64).tolist(),
+                    "per_action_masks": np.asarray(sample.per_action_masks, dtype=bool).tolist(),
+                }
+            )
+            return sample
+
+    summary = evaluate_formal_episode(_TriggerSampleCapture(policy), ctx, protocol)
+    if len(captured_samples) != len(steps):
+        raise RuntimeError(
+            "trigger probability diagnostic 记录数量与formal deterministic steps不一致："
+            f"{len(captured_samples)} != {len(steps)}"
+        )
+
+    trajectory: list[dict[str, Any]] = []
+    for step, captured in zip(steps, captured_samples):
+        action_vector = captured["action_vector"]
+        probabilities = captured["per_action_probabilities"]
+        logits = captured["per_action_logits"]
+        masks = captured["per_action_masks"]
+        if not (
+            len(action_vector) == len(ctx.action_spec.labels)
+            and len(probabilities) == len(ctx.action_spec.labels)
+            and len(logits) == len(ctx.action_spec.labels)
+            and len(masks) == len(ctx.action_spec.labels)
+        ):
+            raise RuntimeError("trigger probability diagnostic action维度与TriggerActionSpec不一致。")
+        trigger_records: list[dict[str, Any]] = []
+        for index, label in enumerate(ctx.action_spec.labels):
+            mask = [bool(value) for value in masks[index]]
+            if len(mask) != 2 or not any(mask):
+                raise RuntimeError(f"Trigger {label} 收到非法action mask：{mask}")
+            p_action1 = float(probabilities[index])
+            trigger_records.append(
+                {
+                    "label": label,
+                    "deterministic_action": int(action_vector[index]),
+                    "p_action0": float(1.0 - p_action1),
+                    "p_action1": p_action1,
+                    "logit": float(logits[index]),
+                    "mask_action0_allowed": mask[0],
+                    "mask_action1_allowed": mask[1],
+                    "mask_forced": (
+                        "zero" if mask == [True, False] else
+                        "one" if mask == [False, True] else
+                        None
+                    ),
+                }
+            )
+        trajectory.append(
+            {
+                "origin_index": int(step.origin_index),
+                "slot": int(step.slot),
+                "time_s": float(step.time_s),
+                "triggers": trigger_records,
+            }
+        )
+    return summary, trajectory
 
 
 def _aligned_steps(ctx: TrainingSanityContext, origin_start_index: int) -> list[ppo_rollout.AlignedRolloutStep]:
@@ -2174,6 +3011,9 @@ def _dry_run_summary(result: FormalTrainingDryRunResult) -> dict[str, Any]:
         "planned_optimizer_steps": result.planned_optimizer_steps,
         "planned_backward_calls": result.planned_backward_calls,
         "optimizer_instances_planned": result.optimizer_instances_planned,
+        "credit_assignment": result.credit_assignment,
+        "planned_q_optimizer_steps": result.planned_q_optimizer_steps,
+        "q_optimizer_instances_planned": result.q_optimizer_instances_planned,
         "executor_dry_run_only": result.executor_dry_run_only,
         "episode_origin_count": int(protocol.steps_per_episode),
         "first_origin": int(protocol.episode_origin_indices[0]),

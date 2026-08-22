@@ -180,6 +180,8 @@ class TriggerActionSample:
     conditional_entropy: float
     value: float
     per_action_probabilities: np.ndarray
+    per_action_probability_table: np.ndarray
+    per_action_log_probs: np.ndarray
     per_action_logits: np.ndarray
     per_action_masks: np.ndarray
 
@@ -191,6 +193,9 @@ class TriggerEvaluation:
     value: Any
     per_action_logits: Any
     per_action_probabilities: Any
+    per_action_probability_table: Any
+    per_action_log_probs: Any
+    per_action_entropy: Any
 
 
 def _require_torch() -> None:
@@ -396,6 +401,63 @@ def set_torch_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 
+class PerTriggerQCritic(nn.Module if nn is not None else object):
+    """独立的 per-trigger conditional Q critic。
+
+    Q critic 只接收已经由 caller detach 的 autoregressive conditional hidden。
+    因此本模块的参数不会天然把梯度传回 Actor；正式 update 仍会显式检查
+    ``h_i.detach()``。未采样 action 没有直接环境监督，第一版只对 sampled
+    action 的 Monte-Carlo suffix return 做监督，另一 action 的 Q 依赖跨样本
+    泛化，不能宣称是真实 counterfactual replay Q。
+    """
+
+    def __init__(self, action_dim: int, hidden_size: int) -> None:
+        _require_torch()
+        super().__init__()
+        if int(action_dim) <= 0 or int(hidden_size) <= 0:
+            raise ValueError("PerTriggerQCritic 的 action_dim/hidden_size 必须大于0。")
+        self.action_dim = int(action_dim)
+        self.hidden_size = int(hidden_size)
+        self.q_head = nn.Linear(self.hidden_size, 2)
+
+    def forward(self, conditional_hidden_states: Any) -> Any:
+        hidden = torch.as_tensor(conditional_hidden_states, dtype=torch.float32)
+        if hidden.ndim != 3 or tuple(hidden.shape[1:]) != (self.action_dim, self.hidden_size):
+            raise ValueError(
+                "conditional_hidden_states shape="
+                f"{tuple(hidden.shape)}，期望 [B,{self.action_dim},{self.hidden_size}]。"
+            )
+        if not torch.all(torch.isfinite(hidden)):
+            raise ValueError("conditional_hidden_states 包含 NaN/Inf。")
+        return self.q_head(hidden)
+
+
+def build_per_trigger_q_critic_preserving_rng(
+    action_dim: int,
+    hidden_size: int,
+    device: Any | None = None,
+) -> PerTriggerQCritic:
+    """初始化 Q critic，同时恢复初始化前的 global torch RNG。
+
+    新增 Q 层不能改变旧 Actor/scalar-V 的 Episode 1 sampling trajectory。
+    这里使用官方 torch RNG state API 保护 CPU/CUDA 状态；Q critic 参数本身
+    仍使用 PyTorch 默认初始化方式，不引入新的超参数或自定义初始化算法。
+    """
+
+    _require_torch()
+    cpu_state = torch.get_rng_state().clone()
+    cuda_states = None
+    if torch.cuda.is_available():
+        cuda_states = [state.clone() for state in torch.cuda.get_rng_state_all()]
+    critic = PerTriggerQCritic(action_dim, hidden_size)
+    if device is not None:
+        critic = critic.to(device)
+    torch.set_rng_state(cpu_state)
+    if cuda_states is not None:
+        torch.cuda.set_rng_state_all(cuda_states)
+    return critic
+
+
 class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
     """Shared MLP encoder + autoregressive GRUCell binary actor + scalar critic."""
 
@@ -457,7 +519,11 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         value = self.value_head(latent).squeeze(-1)
         return latent, value
 
-    def _teacher_forced_logits(self, observations: Any, action_vectors: Any) -> tuple[Any, Any]:
+    def _teacher_forced_outputs(
+        self,
+        observations: Any,
+        action_vectors: Any,
+    ) -> tuple[Any, Any, Any]:
         obs, _ = self._as_observation_batch(observations)
         actions = torch.as_tensor(action_vectors, dtype=torch.float32, device=obs.device)
         if actions.ndim == 1:
@@ -476,6 +542,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             device=obs.device,
         )
         logits = []
+        conditional_hidden_states = []
         for action_index in range(self.action_dim):
             index_tensor = torch.full(
                 (obs.shape[0],),
@@ -492,9 +559,30 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
                 dim=-1,
             )
             hidden = self.gru_cell(step_input, hidden)
+            # 这是读取当前 a_i 之前、已经条件于真实 prefix a_<i 的 hidden。
+            conditional_hidden_states.append(hidden)
             logits.append(self.logit_head(hidden).squeeze(-1))
             previous_action = actions[:, action_index].long()
-        return torch.stack(logits, dim=1), value
+        return (
+            torch.stack(logits, dim=1),
+            value,
+            torch.stack(conditional_hidden_states, dim=1),
+        )
+
+    def _teacher_forced_logits(self, observations: Any, action_vectors: Any) -> tuple[Any, Any]:
+        logits, value, _ = self._teacher_forced_outputs(observations, action_vectors)
+        return logits, value
+
+    def conditional_hidden_states(self, observations: Any, action_vectors: Any) -> Any:
+        """返回每个 trigger 当前 action 决策前的 teacher-forced hidden。
+
+        返回形状固定为 ``[B, action_dim, autoregressive_hidden_size]``。
+        hidden 在输入 Q critic 前必须由 caller 显式 ``detach``；该 API 本身
+        保留计算图，便于 synthetic gradient-isolation 验证发现错误连接。
+        """
+
+        _, _, hidden_states = self._teacher_forced_outputs(observations, action_vectors)
+        return hidden_states
 
     def evaluate_actions(
         self,
@@ -508,7 +596,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         会把采样时的 mask 保存到 ``RolloutBatch``，供 PPO update 原样复用。
         """
 
-        logits, value = self._teacher_forced_logits(observations, action_vectors)
+        logits, value, _ = self._teacher_forced_outputs(observations, action_vectors)
         actions = torch.as_tensor(action_vectors, dtype=torch.float32, device=logits.device)
         single_action = False
         if actions.ndim == 1:
@@ -530,7 +618,8 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         action_is_valid = masks.gather(-1, action_indices.unsqueeze(-1)).squeeze(-1)
         if not bool(torch.all(action_is_valid).item()):
             raise ValueError("action_vectors 包含被 action mask 屏蔽的 binary action。")
-        joint_log_prob = dist.log_prob(action_indices).sum(dim=1)
+        per_action_log_probs = dist.log_prob(action_indices)
+        joint_log_prob = per_action_log_probs.sum(dim=1)
         entropy_per_action = dist.entropy()
         entropy_per_action = torch.where(
             masks.sum(dim=-1) == 1,
@@ -539,18 +628,25 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         )
         entropy = entropy_per_action.sum(dim=1)
         probabilities = dist.probs[..., 1]
+        probability_table = dist.probs
         if single_action:
             joint_log_prob = joint_log_prob.squeeze(0)
             entropy = entropy.squeeze(0)
             value = value.squeeze(0)
             logits = logits.squeeze(0)
             probabilities = probabilities.squeeze(0)
+            probability_table = probability_table.squeeze(0)
+            per_action_log_probs = per_action_log_probs.squeeze(0)
+            entropy_per_action = entropy_per_action.squeeze(0)
         return TriggerEvaluation(
             joint_log_prob=joint_log_prob,
             entropy=entropy,
             value=value,
             per_action_logits=logits,
             per_action_probabilities=probabilities,
+            per_action_probability_table=probability_table,
+            per_action_log_probs=per_action_log_probs,
+            per_action_entropy=entropy_per_action,
         )
 
     def sample_action(
@@ -575,6 +671,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         actions = []
         logits = []
         probs = []
+        probability_tables = []
         log_probs = []
         entropies = []
         masks = []
@@ -612,6 +709,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             actions.append(action)
             logits.append(logit)
             probs.append(dist.probs[..., 1])
+            probability_tables.append(dist.probs)
             log_probs.append(dist.log_prob(action.long()))
             entropy = dist.entropy()
             entropies.append(torch.where(mask_tensor.sum() == 1, torch.zeros_like(entropy), entropy))
@@ -621,6 +719,8 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         action_tensor = torch.stack(actions, dim=1).to(torch.int64).squeeze(0)
         logit_tensor = torch.stack(logits, dim=1).squeeze(0)
         prob_tensor = torch.stack(probs, dim=1).squeeze(0)
+        probability_table_tensor = torch.stack(probability_tables, dim=1).squeeze(0)
+        log_prob_tensor = torch.stack(log_probs, dim=1).squeeze(0)
         action_vector = action_tensor.detach().cpu().numpy().astype(np.int8)
         cache_triggers, uav_triggers = self.action_spec.action_vector_to_triggers(action_vector)
         return TriggerActionSample(
@@ -631,6 +731,8 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             conditional_entropy=float(torch.stack(entropies).sum().detach().cpu()),
             value=float(value.squeeze(0).detach().cpu()),
             per_action_probabilities=prob_tensor.detach().cpu().numpy().astype(np.float64),
+            per_action_probability_table=probability_table_tensor.detach().cpu().numpy().astype(np.float64),
+            per_action_log_probs=log_prob_tensor.detach().cpu().numpy().astype(np.float64),
             per_action_logits=logit_tensor.detach().cpu().numpy().astype(np.float64),
             per_action_masks=np.asarray(masks, dtype=bool),
         )

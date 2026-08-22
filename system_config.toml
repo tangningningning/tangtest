@@ -527,18 +527,21 @@ max_updates = 100
 objective_tolerance = 1.0e-9
 
 [algorithm.ppo]
-# Trigger-only PPO Actor-Critic 结构入口。本阶段只实现网络结构与采样/evaluate接口，
-# 以及 on-policy rollout/GAE；不训练 PPO，不定义 loss/optimizer/minibatch update。
+# Trigger-only PPO Actor-Critic 结构入口；credit_assignment 选择正式 Actor
+# credit 语义。旧配置缺少 credit_assignment 时仍按 legacy scalar PPO 解析。
 enabled = false
-method = "trigger_actor_critic"
+method = "proposed_per_trigger_q"
+credit_assignment = "per_trigger_q"
+q_target = "monte_carlo"
 hidden_sizes = [128, 128]
 autoregressive_hidden_size = 64
 # PPO算法超参数：仅用于discount return / GAE，不属于系统物理参数，
 # 不进入 FORMAL_SYSTEM_PARAMETER_KEYS。
-gamma = 0.99
+gamma = 1.0
 gae_lambda = 0.95
-# PPO算法实验baseline。
-# 第一版采用OpenAI Baselines PPO2经典默认量级，用于建立可复现训练基线。
+# 第一版 per-trigger Q 正式训练 baseline：gamma=1、lambda=.95、cV=.5。
+# scalar value critic 继续使用 lambda=.95 GAE return；per-trigger Q 使用 full
+# terminal Monte-Carlo suffix return，不把两类 target 混用。
 # 不是系统物理参数，也不声称为本任务最优值。
 # 后续正式实验如需要，仅通过有限敏感性实验评估，当前不进行超参数搜索。
 clip_epsilon = 0.2
