@@ -378,12 +378,47 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.matching.max_updates 必须 >= 1。")
     if float(get_config_value(config, "algorithm.matching.objective_tolerance")) < 0.0:
         raise ValueError("algorithm.matching.objective_tolerance 不能为负。")
-    if get_config_value(config, "algorithm.ppo.method", "trigger_actor_critic") not in {
+    ppo_method = str(get_config_value(config, "algorithm.ppo.method", "trigger_actor_critic"))
+    if ppo_method not in {
         "trigger_actor_critic",
         "proposed_per_trigger_q",
+        "proposed_centralized_cf_q",
+        "proposed_sparse_direct_cf_ppo",
+        "proposed_sparse_direct_cf_frozen_policy_batch",
+        "proposed_sparse_direct_cf_frozen_policy_batch_refdrift",
+        "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift",
     }:
         raise ValueError(
-            "algorithm.ppo.method 当前只支持 trigger_actor_critic 或 proposed_per_trigger_q。"
+            "algorithm.ppo.method 当前只支持 trigger_actor_critic、"
+            "proposed_per_trigger_q、proposed_centralized_cf_q 或 "
+            "proposed_sparse_direct_cf_ppo、proposed_sparse_direct_cf_frozen_policy_batch 或 "
+            "proposed_sparse_direct_cf_frozen_policy_batch_refdrift 或 "
+            "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift。"
+        )
+    credit_assignment = get_config_value(config, "algorithm.ppo.credit_assignment")
+    if credit_assignment is not None and str(credit_assignment) not in {
+        "legacy_scalar",
+        "per_trigger_q",
+        "centralized_counterfactual_q",
+        "sparse_direct_cf",
+        "hierarchical_gate_direct_cf",
+    }:
+        raise ValueError(
+            "algorithm.ppo.credit_assignment 必须是 legacy_scalar、per_trigger_q "
+            "centralized_counterfactual_q、sparse_direct_cf 或 "
+            "hierarchical_gate_direct_cf。"
+        )
+    if ppo_method == "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift" and (
+        credit_assignment is not None
+        and str(credit_assignment) != "hierarchical_gate_direct_cf"
+    ):
+        raise ValueError(
+            "hierarchical Gate method 必须使用 credit_assignment=hierarchical_gate_direct_cf。"
+        )
+    credit_phase = get_config_value(config, "algorithm.ppo.credit_phase")
+    if credit_phase is not None and str(credit_phase) not in {"critic_warmup", "joint_training"}:
+        raise ValueError(
+            "algorithm.ppo.credit_phase 必须是 critic_warmup 或 joint_training。"
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
@@ -392,6 +427,23 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.ppo.hidden_sizes 必须全部为正整数。")
     if int(get_config_value(config, "algorithm.ppo.autoregressive_hidden_size")) <= 0:
         raise ValueError("algorithm.ppo.autoregressive_hidden_size 必须大于 0。")
+    actor_architecture = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.actor_architecture",
+            "v3_shared_logit_head",
+        )
+    )
+    if actor_architecture not in {
+        "v3_shared_logit_head",
+        "v3_encoder_trigger_heads_frozen_ar_v1",
+        "v3_full_shared_actor_frozen_policy_batch_v1",
+    }:
+        raise ValueError(
+            "algorithm.ppo.actor_architecture 必须是 v3_shared_logit_head、"
+            "v3_encoder_trigger_heads_frozen_ar_v1 或 "
+            "v3_full_shared_actor_frozen_policy_batch_v1。"
+        )
     ppo_gamma = float(get_config_value(config, "algorithm.ppo.gamma"))
     ppo_gae_lambda = float(get_config_value(config, "algorithm.ppo.gae_lambda"))
     if not 0.0 <= ppo_gamma <= 1.0:
@@ -419,6 +471,45 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.ppo.update_epochs 必须 >= 1。")
     if ppo_num_minibatches < 1:
         raise ValueError("algorithm.ppo.num_minibatches 必须 >= 1。")
+    cf_samples_per_episode = get_config_value(config, "algorithm.ppo.cf_samples_per_episode")
+    if cf_samples_per_episode is not None:
+        if isinstance(cf_samples_per_episode, bool) or int(cf_samples_per_episode) != cf_samples_per_episode:
+            raise ValueError("algorithm.ppo.cf_samples_per_episode 必须是正整数。")
+        if int(cf_samples_per_episode) <= 0:
+            raise ValueError("algorithm.ppo.cf_samples_per_episode 必须是正整数。")
+    cf_batch_episodes = get_config_value(config, "algorithm.ppo.cf_batch_episodes", 1)
+    if isinstance(cf_batch_episodes, bool) or int(cf_batch_episodes) != cf_batch_episodes:
+        raise ValueError("algorithm.ppo.cf_batch_episodes 必须是正整数。")
+    if int(cf_batch_episodes) <= 0:
+        raise ValueError("algorithm.ppo.cf_batch_episodes 必须是正整数。")
+    reference_drift_cap = get_config_value(config, "algorithm.ppo.reference_probability_drift_cap")
+    if ppo_method in {
+        "proposed_sparse_direct_cf_frozen_policy_batch_refdrift",
+        "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift",
+    } and reference_drift_cap is None:
+        raise ValueError(
+            "refdrift正式实现必须显式设置algorithm.ppo.reference_probability_drift_cap=0.005。"
+        )
+    if reference_drift_cap is not None:
+        cap = float(reference_drift_cap)
+        if not 0.0 < cap <= 1.0:
+            raise ValueError(
+                "algorithm.ppo.reference_probability_drift_cap 必须位于 (0,1]。"
+            )
+        if ppo_method in {
+            "proposed_sparse_direct_cf_frozen_policy_batch_refdrift",
+            "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift",
+        } and cap != 0.005:
+            raise ValueError(
+                "refdrift正式实现固定使用reference_probability_drift_cap=0.005。"
+            )
+    cf_sampling_strategy = str(
+        get_config_value(config, "algorithm.ppo.cf_sampling_strategy", "uniform")
+    )
+    if cf_sampling_strategy not in {"uniform", "trigger_stratified"}:
+        raise ValueError(
+            "algorithm.ppo.cf_sampling_strategy 必须是 uniform 或 trigger_stratified。"
+        )
     arrival = float(get_config_value(config, "task.arrival_probability"))
     if not 0.0 <= arrival <= 1.0:
         raise ValueError("task.arrival_probability 必须位于 [0,1]。")

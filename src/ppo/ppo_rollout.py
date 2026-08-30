@@ -13,9 +13,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -26,6 +28,20 @@ from common import project_config
 from decision import cache_configuration, task_allocation, slot_environment, uav_configuration
 from ppo import ppo_trigger_policy
 from scenario import task_scenario
+
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+
+
+def _sample_action_without_grad(policy: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call rollout sampling in inference mode without changing RNG semantics."""
+
+    if torch is None:
+        return policy.sample_action(*args, **kwargs)
+    with torch.no_grad():
+        return policy.sample_action(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -64,6 +80,12 @@ class RolloutTransition:
     movement_cost: float
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
+    # Hierarchical WHEN-policy fields.  They are optional so historical
+    # trigger-only rollout fixtures keep their exact schema/constructor.
+    gate_action: int | None = None
+    old_gate_probability: float | None = None
+    old_gate_log_prob: float | None = None
+    subpolicy_action_vector: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -86,7 +108,648 @@ class RolloutBatch:
     final_bootstrap_value: float
     truncated: bool
     transitions: list[RolloutTransition]
+    reference_decisions: tuple["ReferenceStateRecord", ...]
     metadata: dict[str, Any]
+    # Present only for the hierarchical Gate formal path.
+    gate_actions: np.ndarray | None = None
+    old_gate_log_probs: np.ndarray | None = None
+    old_gate_probabilities: np.ndarray | None = None
+    subpolicy_actions: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class ReferenceStateRecord:
+    """最小的 frozen-policy conditional reference state。
+
+    不保存 environment object、cache/UAV solver state 或完整 transition；这些
+    字段足以在同一个 Actor 上重算 masked conditional p(action=1)。
+    """
+
+    decision_id: str
+    episode_index: int
+    step_index: int
+    slot: int
+    origin_index: int
+    trigger_index: int
+    trigger_label: str
+    observation: np.ndarray
+    action_prefix: np.ndarray
+    action_vector: np.ndarray
+    action_mask: np.ndarray
+    p_old: float
+    collection_policy_version: int
+    selected_for_direct_cf: bool = False
+
+
+@dataclass(frozen=True)
+class DirectCFDecisionSnapshot:
+    """reservoir 中保存的单个 FREE decision pre-action snapshot。"""
+
+    step_index: int
+    slot: int
+    origin_index: int
+    trigger_index: int
+    trigger_label: str
+    decision_id: str
+    previous_cache_state: np.ndarray
+    previous_uav_positions: dict[str, tuple[float, float]]
+    observation: np.ndarray
+    action_vector: np.ndarray
+    action_prefix: np.ndarray
+    old_p1: float
+    old_chosen_log_prob: float
+    action_mask: np.ndarray
+    baseline_rng_before: dict[str, Any]
+    baseline_rng_after_slot: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DirectCFCreditSample:
+    """一次 paired branch 完成后供 V3 Actor 使用的轻量样本。"""
+
+    slot: int
+    origin_index: int
+    trigger_index: int
+    trigger_label: str
+    decision_id: str
+    observation: np.ndarray
+    action_vector: np.ndarray
+    action_prefix: np.ndarray
+    action_mask: np.ndarray
+    actual_action: int
+    old_p1: float
+    old_chosen_log_prob: float
+    delta_g: float
+    delta_q: float
+    delta_cache: float
+    delta_uav: float
+    a_cf: float
+    baseline_suffix_g: float
+    branch_suffix_g: float
+    branch_environment_steps: int
+    crn_target_step_rng_aligned: bool
+    # 分层采样的无偏估计权重；uniform模式为每个已选样本的1/K。
+    sampling_weight: float = 0.0
+    trigger_free_count: int = 0
+    # Frozen-policy batch runtime guard；旧单episode样本默认属于version 0。
+    collection_policy_version: int = 0
+    # Persisted causal artifacts need the originating formal episode explicitly.
+    # The default preserves compatibility with older recovered sample fixtures.
+    episode_index: int = 0
+    # Optional recovery-artifact field.  Formal collection fills this with the
+    # selected-sample ordinal; older raw fixtures may omit it and load as 0.
+    sample_index_in_episode: int = 0
+    # Direct-CF branch origin within the aligned episode; older fixtures may
+    # omit it because origin_index/slot were historically sufficient for loss.
+    step_index: int = 0
+
+
+@dataclass(frozen=True)
+class GateDecisionSnapshot:
+    """Pre-slot snapshot used by the uniform Gate-CF slot reservoir."""
+
+    step_index: int
+    slot: int
+    origin_index: int
+    decision_id: str
+    previous_cache_state: np.ndarray
+    previous_uav_positions: dict[str, tuple[float, float]]
+    observation: np.ndarray
+    gate_action: int
+    old_gate_probability: float
+    old_gate_log_prob: float
+    final_action_vector: np.ndarray
+    baseline_rng_before: dict[str, Any]
+    baseline_rng_after_slot: dict[str, Any]
+
+
+class GateCFReservoir:
+    """Uniform sparse reservoir over legal formal slots.
+
+    Every formal slot is legal for the Gate decision: NULL is represented by
+    the strict all-zero action and CONFIG is sampled from the frozen WHAT
+    policy under that slot's mask.  The independent NumPy generator is saved
+    by the formal checkpoint so resume does not alter slot selection.
+    """
+
+    sampling_strategy = "uniform_slots"
+
+    def __init__(self, capacity: int, sampling_rng: Any) -> None:
+        if isinstance(capacity, bool) or int(capacity) <= 0:
+            raise ValueError("GateCFReservoir capacity 必须是正整数。")
+        if not isinstance(sampling_rng, np.random.Generator):
+            raise TypeError("GateCFReservoir 必须使用独立 np.random.Generator。")
+        self.capacity = int(capacity)
+        self.sampling_rng = sampling_rng
+        self.items: list[GateDecisionSnapshot] = []
+        self.total_seen = 0
+
+    def consider(self, snapshot: GateDecisionSnapshot) -> None:
+        if not isinstance(snapshot, GateDecisionSnapshot):
+            raise TypeError("GateCFReservoir 只能接收 GateDecisionSnapshot。")
+        self.total_seen += 1
+        if len(self.items) < self.capacity:
+            self.items.append(snapshot)
+            return
+        replacement_index = int(self.sampling_rng.integers(0, self.total_seen))
+        if replacement_index < self.capacity:
+            self.items[replacement_index] = snapshot
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.items)
+
+    def rng_state(self) -> dict[str, Any]:
+        return copy.deepcopy(self.sampling_rng.bit_generator.state)
+
+
+def reference_state_to_checkpoint_dict(record: ReferenceStateRecord) -> dict[str, Any]:
+    """Serialize only the conditional-input fields needed by refdrift resume."""
+
+    return {
+        "decision_id": str(record.decision_id),
+        "episode_index": int(record.episode_index),
+        "step_index": int(record.step_index),
+        "slot": int(record.slot),
+        "origin_index": int(record.origin_index),
+        "trigger_index": int(record.trigger_index),
+        "trigger_label": str(record.trigger_label),
+        "observation": np.asarray(record.observation, dtype=np.float32).tolist(),
+        "action_prefix": np.asarray(record.action_prefix, dtype=np.int8).tolist(),
+        "action_vector": np.asarray(record.action_vector, dtype=np.int8).tolist(),
+        "action_mask": np.asarray(record.action_mask, dtype=bool).tolist(),
+        "p_old": float(record.p_old),
+        "collection_policy_version": int(record.collection_policy_version),
+        "selected_for_direct_cf": bool(record.selected_for_direct_cf),
+    }
+
+
+def reference_state_from_checkpoint_dict(value: dict[str, Any]) -> ReferenceStateRecord:
+    """Restore one compact reference state with strict shape/value checks."""
+
+    observation = np.asarray(value["observation"], dtype=np.float32)
+    action_prefix = np.asarray(value["action_prefix"], dtype=np.int8)
+    action_vector = np.asarray(value["action_vector"], dtype=np.int8)
+    action_mask = np.asarray(value["action_mask"], dtype=bool)
+    if observation.ndim != 1 or action_vector.ndim != 1 or action_prefix.ndim != 1:
+        raise ValueError("reference checkpoint observation/action必须是一维。")
+    if action_mask.ndim != 2 or action_mask.shape != (action_vector.shape[0], 2):
+        raise ValueError("reference checkpoint action_mask shape非法。")
+    if action_prefix.shape[0] > action_vector.shape[0]:
+        raise ValueError("reference checkpoint action_prefix长度非法。")
+    if not np.all(np.isin(action_vector, [0, 1])) or not np.all(np.isin(action_prefix, [0, 1])):
+        raise ValueError("reference checkpoint action必须是0/1。")
+    p_old = float(value["p_old"])
+    if not math.isfinite(p_old) or not 0.0 <= p_old <= 1.0:
+        raise ValueError("reference checkpoint p_old非法。")
+    return ReferenceStateRecord(
+        decision_id=str(value["decision_id"]),
+        episode_index=int(value["episode_index"]),
+        step_index=int(value["step_index"]),
+        slot=int(value["slot"]),
+        origin_index=int(value["origin_index"]),
+        trigger_index=int(value["trigger_index"]),
+        trigger_label=str(value["trigger_label"]),
+        observation=observation.copy(),
+        action_prefix=action_prefix.copy(),
+        action_vector=action_vector.copy(),
+        action_mask=action_mask.copy(),
+        p_old=p_old,
+        collection_policy_version=int(value["collection_policy_version"]),
+        selected_for_direct_cf=bool(value.get("selected_for_direct_cf", False)),
+    )
+
+
+def direct_cf_sample_to_checkpoint_dict(sample: DirectCFCreditSample) -> dict[str, Any]:
+    """Serialize a pending Direct-CF sample without environment state."""
+
+    return {
+        "episode": int(sample.episode_index),
+        "episode_index": int(sample.episode_index),
+        "sample_index_in_episode": int(sample.sample_index_in_episode),
+        "step_index": int(sample.step_index),
+        "slot": int(sample.slot),
+        "origin_index": int(sample.origin_index),
+        "trigger_index": int(sample.trigger_index),
+        "trigger_label": str(sample.trigger_label),
+        "decision_id": str(sample.decision_id),
+        "observation": np.asarray(sample.observation, dtype=np.float32).tolist(),
+        "action_vector": np.asarray(sample.action_vector, dtype=np.int8).tolist(),
+        "action_prefix": np.asarray(sample.action_prefix, dtype=np.int8).tolist(),
+        "action_mask": np.asarray(sample.action_mask, dtype=bool).tolist(),
+        "actual_action": int(sample.actual_action),
+        "old_p1": float(sample.old_p1),
+        "old_chosen_log_prob": float(sample.old_chosen_log_prob),
+        "delta_g": float(sample.delta_g),
+        "delta_q": float(sample.delta_q),
+        "delta_cache": float(sample.delta_cache),
+        "delta_uav": float(sample.delta_uav),
+        "a_cf": float(sample.a_cf),
+        "baseline_suffix_g": float(sample.baseline_suffix_g),
+        "branch_suffix_g": float(sample.branch_suffix_g),
+        "branch_environment_steps": int(sample.branch_environment_steps),
+        "crn_target_step_rng_aligned": bool(sample.crn_target_step_rng_aligned),
+        "sampling_weight": float(sample.sampling_weight),
+        "trigger_free_count": int(sample.trigger_free_count),
+        "collection_policy_version": int(sample.collection_policy_version),
+    }
+
+
+def direct_cf_sample_from_checkpoint_dict(value: dict[str, Any]) -> DirectCFCreditSample:
+    """Restore one pending Direct-CF sample with finite scalar validation."""
+
+    float_fields = (
+        "old_p1",
+        "old_chosen_log_prob",
+        "delta_g",
+        "delta_q",
+        "delta_cache",
+        "delta_uav",
+        "a_cf",
+        "baseline_suffix_g",
+        "branch_suffix_g",
+        "sampling_weight",
+    )
+    scalars = {name: float(value[name]) for name in float_fields}
+    if not all(math.isfinite(item) for item in scalars.values()):
+        raise ValueError("pending Direct-CF sample包含NaN/Inf。")
+    observation = np.asarray(value["observation"], dtype=np.float32)
+    action_vector = np.asarray(value["action_vector"], dtype=np.int8)
+    action_prefix = np.asarray(value["action_prefix"], dtype=np.int8)
+    action_mask = np.asarray(value["action_mask"], dtype=bool)
+    if observation.ndim != 1 or action_vector.ndim != 1 or action_prefix.ndim != 1:
+        raise ValueError("pending Direct-CF sample observation/action必须是一维。")
+    if action_mask.ndim != 2 or action_mask.shape != (action_vector.shape[0], 2):
+        raise ValueError("pending Direct-CF sample action_mask shape非法。")
+    if action_prefix.shape[0] > action_vector.shape[0]:
+        raise ValueError("pending Direct-CF sample action_prefix长度非法。")
+    if not np.all(np.isin(action_vector, [0, 1])) or not np.all(np.isin(action_prefix, [0, 1])):
+        raise ValueError("pending Direct-CF sample action必须是0/1。")
+    trigger_index = int(value["trigger_index"])
+    if trigger_index < 0 or trigger_index >= action_vector.shape[0]:
+        raise ValueError("pending Direct-CF sample trigger_index非法。")
+    actual_action = int(value["actual_action"])
+    if actual_action not in {0, 1} or actual_action != int(action_vector[trigger_index]):
+        raise ValueError("pending Direct-CF sample actual_action与action_vector不一致。")
+    episode_index = int(value.get("episode_index", value.get("episode", 0)))
+    if episode_index < 0:
+        raise ValueError("pending Direct-CF sample episode_index不能为负。")
+    branch_steps = int(value["branch_environment_steps"])
+    if branch_steps < 0:
+        raise ValueError("pending Direct-CF sample branch_environment_steps不能为负。")
+    sampling_weight = scalars["sampling_weight"]
+    trigger_free_count = int(value["trigger_free_count"])
+    collection_policy_version = int(value["collection_policy_version"])
+    if sampling_weight < 0.0 or trigger_free_count < 0 or collection_policy_version < 0:
+        raise ValueError("pending Direct-CF sample count/version/weight非法。")
+    decision_id = value.get("decision_id")
+    if decision_id is None:
+        # The first recovered Update2 raw-sample fixture predates persisted
+        # decision IDs.  Reconstruct the exact ID format used by collection;
+        # this is metadata only and does not enter the Direct-CF loss.
+        decision_id = (
+            f"policy{collection_policy_version}:episode{episode_index}:"
+            f"origin{int(value['origin_index'])}:slot{int(value['slot'])}:"
+            f"trigger{trigger_index}"
+        )
+    sample_index_in_episode = int(value.get("sample_index_in_episode", 0))
+    if sample_index_in_episode < 0:
+        raise ValueError("pending Direct-CF sample sample_index_in_episode不能为负。")
+    step_index = int(value.get("step_index", 0))
+    if step_index < 0:
+        raise ValueError("pending Direct-CF sample step_index不能为负。")
+    return DirectCFCreditSample(
+        episode_index=episode_index,
+        sample_index_in_episode=sample_index_in_episode,
+        step_index=step_index,
+        slot=int(value["slot"]),
+        origin_index=int(value["origin_index"]),
+        trigger_index=trigger_index,
+        trigger_label=str(value["trigger_label"]),
+        decision_id=str(decision_id),
+        observation=observation.copy(),
+        action_vector=action_vector.copy(),
+        action_prefix=action_prefix.copy(),
+        action_mask=action_mask.copy(),
+        actual_action=actual_action,
+        old_p1=scalars["old_p1"],
+        old_chosen_log_prob=scalars["old_chosen_log_prob"],
+        delta_g=scalars["delta_g"],
+        delta_q=scalars["delta_q"],
+        delta_cache=scalars["delta_cache"],
+        delta_uav=scalars["delta_uav"],
+        a_cf=scalars["a_cf"],
+        baseline_suffix_g=scalars["baseline_suffix_g"],
+        branch_suffix_g=scalars["branch_suffix_g"],
+        branch_environment_steps=branch_steps,
+        crn_target_step_rng_aligned=bool(value["crn_target_step_rng_aligned"]),
+        sampling_weight=sampling_weight,
+        trigger_free_count=trigger_free_count,
+        collection_policy_version=collection_policy_version,
+    )
+
+
+class DirectCFReservoir:
+    """使用独立 Generator 对所有 FREE decisions 做均匀 reservoir sampling。"""
+
+    sampling_strategy = "uniform"
+
+    def __init__(
+        self,
+        capacity: int,
+        sampling_rng: Any,
+        trigger_count: int = 8,
+        trigger_labels: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
+        if isinstance(capacity, bool) or int(capacity) != capacity or int(capacity) <= 0:
+            raise ValueError("DirectCFReservoir capacity 必须是正整数。")
+        if not isinstance(sampling_rng, np.random.Generator):
+            raise TypeError("DirectCFReservoir 必须使用独立 np.random.Generator。")
+        self.capacity = int(capacity)
+        self.sampling_rng = sampling_rng
+        self.items: list[DirectCFDecisionSnapshot] = []
+        self.total_seen = 0
+        self.trigger_count = int(trigger_count)
+        if self.trigger_count <= 0:
+            raise ValueError("DirectCFReservoir trigger_count 必须是正整数。")
+        self.trigger_labels = tuple(
+            str(label) for label in (trigger_labels or tuple(str(i) for i in range(self.trigger_count)))
+        )
+        if len(self.trigger_labels) != self.trigger_count:
+            raise ValueError("DirectCFReservoir trigger_labels长度必须等于trigger_count。")
+        self._trigger_free_counts = [0 for _ in range(self.trigger_count)]
+
+    def consider(self, snapshot: DirectCFDecisionSnapshot) -> None:
+        self.total_seen += 1
+        trigger_index = int(snapshot.trigger_index)
+        if not 0 <= trigger_index < self.trigger_count:
+            raise ValueError("DirectCF snapshot trigger_index超出reservoir范围。")
+        self._trigger_free_counts[trigger_index] += 1
+        if len(self.items) < self.capacity:
+            self.items.append(snapshot)
+            return
+        replacement_index = int(self.sampling_rng.integers(0, self.total_seen))
+        if replacement_index < self.capacity:
+            self.items[replacement_index] = snapshot
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.items)
+
+    @property
+    def trigger_free_counts(self) -> tuple[int, ...]:
+        return tuple(int(value) for value in self._trigger_free_counts)
+
+    @property
+    def trigger_sample_counts(self) -> tuple[int, ...]:
+        counts = [0 for _ in range(self.trigger_count)]
+        for item in self.items:
+            counts[int(item.trigger_index)] += 1
+        return tuple(counts)
+
+    @property
+    def trigger_sampling_weights(self) -> tuple[float, ...]:
+        if self.total_seen <= 0:
+            return tuple(0.0 for _ in range(self.trigger_count))
+        return tuple(float(value / self.total_seen) for value in self._trigger_free_counts)
+
+    def sampling_weight_for(self, trigger_index: int) -> float:
+        """返回单个已选样本用于Actor估计的权重。"""
+
+        if self.sample_count <= 0:
+            raise ValueError("DirectCF reservoir为空，无法计算sampling weight。")
+        if not 0 <= int(trigger_index) < self.trigger_count:
+            raise ValueError("trigger_index超出reservoir范围。")
+        # uniform旧路径保持原来的K样本 arithmetic mean。
+        return float(1.0 / self.sample_count)
+
+    def rng_state(self) -> dict[str, Any]:
+        return copy.deepcopy(self.sampling_rng.bit_generator.state)
+
+
+class TriggerStratifiedDirectCFReservoir(DirectCFReservoir):
+    """每个Trigger独立容量为1的均匀分层reservoir。
+
+    对于每个Trigger的N_i个FREE decision，使用独立Generator执行容量1
+    reservoir sampling，因此最终样本在该Trigger内部严格等概率；不同Trigger
+    之间不做replacement，也不从其他stratum补样本。
+    """
+
+    sampling_strategy = "trigger_stratified"
+
+    def __init__(self, trigger_labels: tuple[str, ...] | list[str], sampling_rng: Any) -> None:
+        labels = tuple(str(label) for label in trigger_labels)
+        if not labels:
+            raise ValueError("TriggerStratifiedDirectCFReservoir 至少需要一个Trigger。")
+        super().__init__(
+            len(labels),
+            sampling_rng,
+            trigger_count=len(labels),
+            trigger_labels=labels,
+        )
+        self._items_by_trigger: list[DirectCFDecisionSnapshot | None] = [
+            None for _ in labels
+        ]
+        self._trigger_seen = [0 for _ in labels]
+        self.items = []
+
+    def consider(self, snapshot: DirectCFDecisionSnapshot) -> None:
+        trigger_index = int(snapshot.trigger_index)
+        if not 0 <= trigger_index < self.trigger_count:
+            raise ValueError("DirectCF snapshot trigger_index超出分层reservoir范围。")
+        self.total_seen += 1
+        self._trigger_seen[trigger_index] += 1
+        self._trigger_free_counts[trigger_index] += 1
+        seen = self._trigger_seen[trigger_index]
+        current = self._items_by_trigger[trigger_index]
+        if current is None or int(self.sampling_rng.integers(0, seen)) == 0:
+            self._items_by_trigger[trigger_index] = snapshot
+        self.items = [item for item in self._items_by_trigger if item is not None]
+
+    @property
+    def sample_count(self) -> int:
+        return int(sum(item is not None for item in self._items_by_trigger))
+
+    @property
+    def trigger_sample_counts(self) -> tuple[int, ...]:
+        return tuple(int(item is not None) for item in self._items_by_trigger)
+
+    def sampling_weight_for(self, trigger_index: int) -> float:
+        if not 0 <= int(trigger_index) < self.trigger_count:
+            raise ValueError("trigger_index超出分层reservoir范围。")
+        if self.total_seen <= 0:
+            raise ValueError("分层reservoir为空，无法计算sampling weight。")
+        return float(self._trigger_free_counts[int(trigger_index)] / self.total_seen)
+
+
+def capture_direct_cf_rng_state() -> dict[str, Any]:
+    """捕获 branch CRN 所需的全局 Python/NumPy/Torch RNG 状态。"""
+
+    state: dict[str, Any] = {
+        "python_random_state": copy.deepcopy(random.getstate()),
+        "numpy_random_state": copy.deepcopy(np.random.get_state()),
+        "torch_cpu_rng_state": None,
+        "torch_cuda_rng_state_all": None,
+    }
+    if torch is not None:
+        state["torch_cpu_rng_state"] = torch.get_rng_state().clone()
+        if torch.cuda.is_available():
+            state["torch_cuda_rng_state_all"] = [
+                item.clone() for item in torch.cuda.get_rng_state_all()
+            ]
+    return state
+
+
+def restore_direct_cf_rng_state(state: dict[str, Any]) -> None:
+    """恢复 Direct-CF branch 的全局 RNG 状态。"""
+
+    random.setstate(state["python_random_state"])
+    np.random.set_state(state["numpy_random_state"])
+    if torch is not None and state.get("torch_cpu_rng_state") is not None:
+        torch.set_rng_state(state["torch_cpu_rng_state"])
+        cuda_states = state.get("torch_cuda_rng_state_all")
+        if cuda_states is not None:
+            if not torch.cuda.is_available():
+                raise RuntimeError("Direct-CF RNG state需要CUDA，但当前CUDA不可用。")
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+def direct_cf_rng_states_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """比较 branch 与 baseline 的 RNG 状态，供 CRN 诊断使用。"""
+
+    if left["python_random_state"] != right["python_random_state"]:
+        return False
+    left_np = left["numpy_random_state"]
+    right_np = right["numpy_random_state"]
+    if left_np[0] != right_np[0] or not np.array_equal(left_np[1], right_np[1]):
+        return False
+    if tuple(left_np[2:]) != tuple(right_np[2:]):
+        return False
+    if torch is None:
+        return True
+    left_torch = left.get("torch_cpu_rng_state")
+    right_torch = right.get("torch_cpu_rng_state")
+    if left_torch is None or right_torch is None:
+        return left_torch is right_torch
+    if not bool(torch.equal(left_torch, right_torch)):
+        return False
+    left_cuda = left.get("torch_cuda_rng_state_all")
+    right_cuda = right.get("torch_cuda_rng_state_all")
+    if left_cuda is None or right_cuda is None:
+        return left_cuda is right_cuda
+    return len(left_cuda) == len(right_cuda) and all(
+        bool(torch.equal(a, b)) for a, b in zip(left_cuda, right_cuda)
+    )
+
+
+# 这是实现边界而非待调优的训练超参数：central critic 最多保留最近两个完整
+# rollout，正式episode长度为276时最多552条 (observation, action, MC return) 样本。
+CRITIC_REPLAY_MAX_ROLLOUTS = 2
+
+
+class CriticReplayBuffer:
+    """只保存完整rollout的 central-critic supervised replay。
+
+    Replay 中不保存 transition、Matching、actor ratio 或 old policy tensor；
+    Actor/scalar-V PPO 永远只使用当前 on-policy rollout。
+    """
+
+    def __init__(self, max_rollouts: int = CRITIC_REPLAY_MAX_ROLLOUTS) -> None:
+        if int(max_rollouts) != CRITIC_REPLAY_MAX_ROLLOUTS:
+            raise ValueError(
+                "CriticReplayBuffer 当前固定保留最近两个完整rollout；"
+                "该实现边界不是可调训练超参数。"
+            )
+        self.max_rollouts = int(max_rollouts)
+        self._rollouts: list[dict[str, np.ndarray]] = []
+
+    def append_rollout(self, rollout_batch: RolloutBatch) -> None:
+        observations = np.asarray(rollout_batch.observations, dtype=np.float32)
+        actions = np.asarray(rollout_batch.actions, dtype=np.int8)
+        targets = np.asarray(rollout_batch.monte_carlo_returns, dtype=np.float32)
+        if observations.ndim != 2 or actions.ndim != 2 or targets.ndim != 1:
+            raise ValueError("critic replay 的 observation/action/target 维度非法。")
+        if observations.shape[0] != actions.shape[0] or targets.shape[0] != observations.shape[0]:
+            raise ValueError("critic replay 的 observation/action/target 样本数必须一致。")
+        if observations.shape[0] <= 0:
+            raise ValueError("critic replay 不接受空 rollout。")
+        if not np.all(np.isin(actions, [0, 1])):
+            raise ValueError("critic replay action 必须是0/1。")
+        self._rollouts.append(
+            {
+                "observations": observations.copy(),
+                "actions": actions.copy(),
+                "monte_carlo_returns": targets.copy(),
+            }
+        )
+        if len(self._rollouts) > self.max_rollouts:
+            self._rollouts = self._rollouts[-self.max_rollouts :]
+
+    @property
+    def rollout_count(self) -> int:
+        return len(self._rollouts)
+
+    @property
+    def sample_count(self) -> int:
+        return int(sum(item["observations"].shape[0] for item in self._rollouts))
+
+    def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self._rollouts:
+            raise ValueError("critic replay 为空。")
+        return (
+            np.concatenate([item["observations"] for item in self._rollouts], axis=0),
+            np.concatenate([item["actions"] for item in self._rollouts], axis=0),
+            np.concatenate([item["monte_carlo_returns"] for item in self._rollouts], axis=0),
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        """返回可直接放入torch checkpoint的轻量数组状态。"""
+
+        return {
+            "max_rollouts": int(self.max_rollouts),
+            "rollouts": [
+                {
+                    "observations": item["observations"].copy(),
+                    "actions": item["actions"].copy(),
+                    "monte_carlo_returns": item["monte_carlo_returns"].copy(),
+                }
+                for item in self._rollouts
+            ],
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("critic replay state 必须是dict。")
+        saved_max = int(state.get("max_rollouts", self.max_rollouts))
+        if saved_max != self.max_rollouts:
+            raise ValueError("critic replay max_rollouts 与当前实现边界不一致。")
+        raw_rollouts = state.get("rollouts")
+        if not isinstance(raw_rollouts, list) or len(raw_rollouts) > self.max_rollouts:
+            raise ValueError("critic replay rollouts 数量非法。")
+        restored: list[dict[str, np.ndarray]] = []
+        for raw in raw_rollouts:
+            if not isinstance(raw, dict):
+                raise ValueError("critic replay rollout item 必须是dict。")
+            observations = np.asarray(raw["observations"], dtype=np.float32)
+            actions = np.asarray(raw["actions"], dtype=np.int8)
+            targets = np.asarray(raw["monte_carlo_returns"], dtype=np.float32)
+            if (
+                observations.ndim != 2
+                or actions.ndim != 2
+                or targets.ndim != 1
+                or observations.shape[0] != actions.shape[0]
+                or targets.shape[0] != observations.shape[0]
+                or not np.all(np.isin(actions, [0, 1]))
+            ):
+                raise ValueError("checkpoint中的critic replay item形状或action非法。")
+            restored.append(
+                {
+                    "observations": observations.copy(),
+                    "actions": actions.copy(),
+                    "monte_carlo_returns": targets.copy(),
+                }
+            )
+        self._rollouts = restored
 
 
 class InfeasibleActionBlocker(RuntimeError):
@@ -321,6 +984,11 @@ def collect_on_policy_rollout(
     gamma: float,
     gae_lambda: float,
     terminal_slot: int,
+    direct_cf_reservoir: DirectCFReservoir | None = None,
+    episode_index: int = 0,
+    collection_policy_version: int = 0,
+    collect_reference_states: bool = False,
+    gate_cf_reservoir: GateCFReservoir | None = None,
 ) -> RolloutBatch:
     """收集连续 on-policy rollout；核心逻辑不读磁盘、不重置 RNG。"""
 
@@ -335,7 +1003,13 @@ def collect_on_policy_rollout(
     action_masks: list[np.ndarray] = []
     old_per_action_log_probs: list[np.ndarray] = []
     old_per_action_probability_tables: list[np.ndarray] = []
+    reference_decisions: list[ReferenceStateRecord] = []
     state_propagation_ok = True
+    if direct_cf_reservoir is not None and not isinstance(direct_cf_reservoir, DirectCFReservoir):
+        raise TypeError("direct_cf_reservoir 必须是 DirectCFReservoir 或 None。")
+    if gate_cf_reservoir is not None and not isinstance(gate_cf_reservoir, GateCFReservoir):
+        raise TypeError("gate_cf_reservoir 必须是 GateCFReservoir 或 None。")
+    hierarchical_rollout = gate_cf_reservoir is not None
 
     # aligned_steps 可包含最后一个只用于 truncation bootstrap 的 next step。
     # 若最后一个 step 已是真正 terminal，则全部可执行；否则保留最后一个不采样动作。
@@ -378,7 +1052,21 @@ def collect_on_policy_rollout(
             flight_boundary,
             action_spec,
         )
-        sample = policy.sample_action(
+        previous_cache_before_action = previous_cache.copy()
+        previous_uav_before_action = {
+            str(uav_id): (
+                float(np.asarray(xy)[0]),
+                float(np.asarray(xy)[1]),
+            )
+            for uav_id, xy in previous_uav.items()
+        }
+        baseline_rng_before = (
+            capture_direct_cf_rng_state()
+            if direct_cf_reservoir is not None or gate_cf_reservoir is not None
+            else None
+        )
+        sample = _sample_action_without_grad(
+            policy,
             observation,
             deterministic=False,
             action_mask=action_mask_provider,
@@ -418,6 +1106,93 @@ def collect_on_policy_rollout(
             )
         _check_reward_invariant(result)
         _check_trigger_semantics(previous_cache, previous_uav, result, action_spec)
+        baseline_rng_after_slot = (
+            capture_direct_cf_rng_state()
+            if direct_cf_reservoir is not None or gate_cf_reservoir is not None
+            else None
+        )
+        if direct_cf_reservoir is not None:
+            if baseline_rng_before is None or baseline_rng_after_slot is None:
+                raise AssertionError("Direct-CF reservoir缺少baseline RNG snapshot。")
+            for action_index in range(action_spec.action_dim):
+                decision_id = (
+                    f"policy{int(collection_policy_version)}:episode{int(episode_index)}:"
+                    f"origin{int(step.origin_index)}:slot{int(step.slot)}:trigger{int(action_index)}"
+                )
+                # A NULL Gate action is not a sampled WHAT decision.  Do not
+                # manufacture an all-zero conditional trigger sample or a
+                # WHAT reference state from it.
+                if collect_reference_states and int(getattr(sample, "gate_action", 1)) == 1:
+                    reference_decisions.append(
+                        ReferenceStateRecord(
+                            decision_id=decision_id,
+                            episode_index=int(episode_index),
+                            step_index=int(step_index),
+                            slot=int(step.slot),
+                            origin_index=int(step.origin_index),
+                            trigger_index=int(action_index),
+                            trigger_label=str(action_spec.labels[action_index]),
+                            observation=np.asarray(observation, dtype=np.float32).copy(),
+                            action_prefix=np.asarray(
+                                sample.action_vector[:action_index], dtype=np.int8
+                            ).copy(),
+                            action_vector=np.asarray(sample.action_vector, dtype=np.int8).copy(),
+                            action_mask=np.asarray(sample.per_action_masks, dtype=bool).copy(),
+                            p_old=float(sample.per_action_probabilities[action_index]),
+                            collection_policy_version=int(collection_policy_version),
+                        )
+                    )
+                if int(getattr(sample, "gate_action", 1)) == 1 and bool(
+                    np.all(sample.per_action_masks[action_index])
+                ):
+                    direct_cf_reservoir.consider(
+                        DirectCFDecisionSnapshot(
+                            step_index=int(step_index),
+                            slot=int(step.slot),
+                            origin_index=int(step.origin_index),
+                            trigger_index=int(action_index),
+                            trigger_label=str(action_spec.labels[action_index]),
+                            decision_id=decision_id,
+                            previous_cache_state=previous_cache_before_action.copy(),
+                            previous_uav_positions=previous_uav_before_action.copy(),
+                            observation=np.asarray(observation, dtype=np.float32).copy(),
+                            action_vector=np.asarray(sample.action_vector, dtype=np.int8).copy(),
+                            action_prefix=np.asarray(
+                                sample.action_vector[:action_index], dtype=np.int8
+                            ).copy(),
+                            old_p1=float(sample.per_action_probabilities[action_index]),
+                            old_chosen_log_prob=float(sample.per_action_log_probs[action_index]),
+                            action_mask=np.asarray(sample.per_action_masks, dtype=bool).copy(),
+                            baseline_rng_before=baseline_rng_before,
+                            baseline_rng_after_slot=baseline_rng_after_slot,
+                        )
+                    )
+        if gate_cf_reservoir is not None:
+            if baseline_rng_before is None or baseline_rng_after_slot is None:
+                raise AssertionError("Gate-CF reservoir缺少baseline RNG snapshot。")
+            if not hasattr(sample, "gate_action"):
+                raise TypeError("gate_cf_reservoir 只能用于Hierarchical Gate policy。")
+            decision_id = (
+                f"gatepolicy{int(collection_policy_version)}:episode{int(episode_index)}:"
+                f"origin{int(step.origin_index)}:slot{int(step.slot)}"
+            )
+            gate_cf_reservoir.consider(
+                GateDecisionSnapshot(
+                    step_index=int(step_index),
+                    slot=int(step.slot),
+                    origin_index=int(step.origin_index),
+                    decision_id=decision_id,
+                    previous_cache_state=previous_cache_before_action.copy(),
+                    previous_uav_positions=previous_uav_before_action.copy(),
+                    observation=np.asarray(observation, dtype=np.float32).copy(),
+                    gate_action=int(sample.gate_action),
+                    old_gate_probability=float(sample.p_old_gate),
+                    old_gate_log_prob=float(sample.gate_old_logprob),
+                    final_action_vector=np.asarray(sample.action_vector, dtype=np.int8).copy(),
+                    baseline_rng_before=baseline_rng_before,
+                    baseline_rng_after_slot=baseline_rng_after_slot,
+                )
+            )
         done = bool(step.slot >= terminal_slot)
         reward = float(result.system_utility)
         transition = RolloutTransition(
@@ -447,6 +1222,20 @@ def collect_on_policy_rollout(
             movement_cost=float(result.movement_cost),
             next_cache_state=np.asarray(result.next_cache_state, dtype=np.int8).copy(),
             next_uav_positions=dict(result.next_uav_positions or {}),
+            gate_action=(
+                None if not hasattr(sample, "gate_action") else int(sample.gate_action)
+            ),
+            old_gate_probability=(
+                None if not hasattr(sample, "p_old_gate") else float(sample.p_old_gate)
+            ),
+            old_gate_log_prob=(
+                None if not hasattr(sample, "gate_old_logprob") else float(sample.gate_old_logprob)
+            ),
+            subpolicy_action_vector=(
+                None
+                if not hasattr(sample, "subpolicy_action_vector")
+                else np.asarray(sample.subpolicy_action_vector, dtype=np.int8).copy()
+            ),
         )
         transitions.append(transition)
         action_masks.append(sample.per_action_masks.copy())
@@ -485,13 +1274,41 @@ def collect_on_policy_rollout(
         action_masks_array[..., 0],
         action_masks_array[..., 1],
     )
-    if not np.allclose(
-        np.sum(old_per_action_log_probs_array, axis=1),
-        old_log_probs,
-        rtol=1e-5,
-        atol=1e-6,
-    ):
-        raise AssertionError("per-action chosen log-prob之和与joint old_log_prob不一致。")
+    if hierarchical_rollout:
+        gate_actions = np.asarray(
+            [int(item.gate_action) for item in transitions], dtype=np.int8
+        )
+        old_gate_log_probs = np.asarray(
+            [float(item.old_gate_log_prob) for item in transitions], dtype=np.float32
+        )
+        old_gate_probabilities = np.asarray(
+            [float(item.old_gate_probability) for item in transitions], dtype=np.float32
+        )
+        if not np.all(np.isin(gate_actions, [0, 1])):
+            raise AssertionError("hierarchical rollout gate_action 必须为0/1。")
+        if not np.all(np.isfinite(old_gate_log_probs)) or not np.all(
+            np.isfinite(old_gate_probabilities)
+        ):
+            raise AssertionError("hierarchical rollout Gate old probability/log-prob必须finite。")
+        if not np.allclose(
+            np.sum(old_per_action_log_probs_array, axis=1) + old_gate_log_probs,
+            old_log_probs,
+            rtol=1e-5,
+            atol=1e-6,
+        ):
+            raise AssertionError("Gate+WHAT chosen log-prob之和与joint old_log_prob不一致。")
+        actor_valid_mask = np.logical_and(actor_valid_mask, gate_actions[:, None].astype(bool))
+    else:
+        gate_actions = None
+        old_gate_log_probs = None
+        old_gate_probabilities = None
+        if not np.allclose(
+            np.sum(old_per_action_log_probs_array, axis=1),
+            old_log_probs,
+            rtol=1e-5,
+            atol=1e-6,
+        ):
+            raise AssertionError("per-action chosen log-prob之和与joint old_log_prob不一致。")
     if not np.all(np.isfinite(old_per_action_probabilities)):
         raise ValueError("rollout per-action probability table 包含 NaN/Inf。")
     if not np.allclose(
@@ -538,8 +1355,540 @@ def collect_on_policy_rollout(
             "reward_invariant_ok": True,
             "old_per_action_log_prob_consistency_ok": True,
             "actor_valid_trigger_count": int(np.sum(actor_valid_mask)),
+            "direct_cf_total_free_decisions": (
+                0 if direct_cf_reservoir is None else int(direct_cf_reservoir.total_seen)
+            ),
+            "direct_cf_sample_count": (
+                0 if direct_cf_reservoir is None else int(direct_cf_reservoir.sample_count)
+            ),
+            "hierarchical_gate_rollout": bool(hierarchical_rollout),
+            "gate_action1_count": (
+                0 if gate_actions is None else int(np.sum(gate_actions == 1))
+            ),
+            "gate_action0_count": (
+                0 if gate_actions is None else int(np.sum(gate_actions == 0))
+            ),
+            "gate_action1_ratio": (
+                None if gate_actions is None else float(np.mean(gate_actions == 1))
+            ),
+            "mean_gate_probability": (
+                None
+                if old_gate_probabilities is None
+                else float(np.mean(old_gate_probabilities))
+            ),
+            "gate_cf_total_legal_slots": (
+                0 if gate_cf_reservoir is None else int(gate_cf_reservoir.total_seen)
+            ),
+            "gate_cf_sample_count": (
+                0 if gate_cf_reservoir is None else int(gate_cf_reservoir.sample_count)
+            ),
+            "direct_cf_reservoir": direct_cf_reservoir,
+            "reference_state_count": int(len(reference_decisions)),
         },
+        reference_decisions=tuple(reference_decisions),
+        gate_actions=None if gate_actions is None else gate_actions.copy(),
+        old_gate_log_probs=(
+            None if old_gate_log_probs is None else old_gate_log_probs.copy()
+        ),
+        old_gate_probabilities=(
+            None if old_gate_probabilities is None else old_gate_probabilities.copy()
+        ),
+        subpolicy_actions=(
+            None
+            if not hierarchical_rollout
+            else np.stack(
+                [
+                    np.asarray(item.subpolicy_action_vector, dtype=np.int8)
+                    for item in transitions
+                ]
+            ).astype(np.int8)
+        ),
     )
+
+
+def run_direct_cf_branches(
+    policy: Any,
+    reservoir: DirectCFReservoir,
+    aligned_steps: list[AlignedRolloutStep],
+    baseline_batch: RolloutBatch,
+    local_cache_state: dict[str, set[int]],
+    service_catalog: dict[str, Any],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    flight_boundary: tuple[float, float, float, float],
+    observation_spec: ppo_trigger_policy.ConfigurationObservationSpec,
+    action_spec: ppo_trigger_policy.TriggerActionSpec,
+    terminal_slot: int,
+    collection_policy_version: int = 0,
+    episode_index: int = 0,
+) -> list[DirectCFCreditSample]:
+    """执行 selected FREE decisions 的 same-state frozen-old-policy continuation。
+
+    baseline 的 actual-action suffix 直接读取 ``baseline_batch.transitions``；每条
+    branch 只从 selected decision 的 pre-action snapshot 开始重放到 true terminal。
+    当前 slot 的 target 前缀固定为 baseline prefix，target action 强制翻转，target
+    后缀及未来 slot 由未更新的 old policy 重新 masked stochastic sampling。每次
+    branch 开始前恢复该 snapshot 的 RNG，完成后恢复调用者 RNG，避免改变正式
+    baseline/update 的随机数语义。
+    """
+
+    if not isinstance(reservoir, DirectCFReservoir):
+        raise TypeError("run_direct_cf_branches 需要 DirectCFReservoir。")
+    if not aligned_steps or len(baseline_batch.transitions) != len(aligned_steps):
+        raise ValueError("Direct-CF branch 需要完整 aligned_steps 与 baseline transitions。")
+    if int(aligned_steps[-1].slot) != int(terminal_slot):
+        raise ValueError("Direct-CF branch 必须运行到 FormalTrainingProtocol true terminal。")
+    collection_policy_version = int(collection_policy_version)
+    if collection_policy_version < 0:
+        raise ValueError("collection_policy_version 不能为负。")
+    episode_index = int(episode_index)
+    if episode_index < 0:
+        raise ValueError("episode_index 不能为负。")
+
+    # Hierarchical Gate collection selects WHAT decisions only from g=1
+    # slots.  Its Direct-CF branch must therefore operate on the frozen WHAT
+    # Actor directly; sampling the outer Gate again would be both semantically
+    # wrong and capable of turning a valid target into NULL/all-zero.
+    what_policy = getattr(policy, "sub_policy", policy)
+
+    caller_rng_state = capture_direct_cf_rng_state()
+    samples: list[DirectCFCreditSample] = []
+
+    def suffix_metric(start: int, field: str) -> float:
+        return float(math.fsum(float(getattr(item, field)) for item in baseline_batch.transitions[start:]))
+
+    try:
+        for sample_index_in_episode, snapshot in enumerate(reservoir.items):
+            if not bool(np.all(snapshot.action_mask[snapshot.trigger_index])):
+                raise ValueError("Direct-CF reservoir target不是FREE decision。")
+            if snapshot.step_index < 0 or snapshot.step_index >= len(aligned_steps):
+                raise ValueError("Direct-CF snapshot step_index越界。")
+
+            restore_direct_cf_rng_state(snapshot.baseline_rng_before)
+            previous_cache = np.asarray(snapshot.previous_cache_state, dtype=np.int8).copy()
+            previous_uav = {
+                str(uav_id): (float(xy[0]), float(xy[1]))
+                for uav_id, xy in snapshot.previous_uav_positions.items()
+            }
+            branch_g: list[float] = []
+            branch_q: list[float] = []
+            branch_cache: list[float] = []
+            branch_uav: list[float] = []
+            target_rng_aligned = False
+            branch_steps = 0
+
+            for step_index in range(snapshot.step_index, len(aligned_steps)):
+                step = aligned_steps[step_index]
+                observation = _make_observation(
+                    previous_cache,
+                    previous_uav,
+                    step,
+                    observation_spec,
+                    flight_boundary,
+                )
+                mask_provider = build_trigger_action_mask_provider(
+                    previous_cache,
+                    previous_uav,
+                    service_catalog,
+                    project_cfg,
+                    cache_nodes,
+                    flight_boundary,
+                    action_spec,
+                )
+                if step_index == snapshot.step_index:
+                    sample = _sample_action_without_grad(
+                        what_policy,
+                        observation,
+                        deterministic=False,
+                        action_mask=mask_provider,
+                        force_action_index=int(snapshot.trigger_index),
+                        force_action_value=1 - int(snapshot.action_vector[snapshot.trigger_index]),
+                        fixed_action_prefix=snapshot.action_prefix,
+                    )
+                else:
+                    sample = _sample_action_without_grad(
+                        what_policy,
+                        observation,
+                        deterministic=False,
+                        action_mask=mask_provider,
+                    )
+                if step_index == snapshot.step_index:
+                    expected_action = 1 - int(snapshot.action_vector[snapshot.trigger_index])
+                    if int(sample.action_vector[snapshot.trigger_index]) != expected_action:
+                        raise RuntimeError("Direct-CF branch target action未按要求翻转。")
+
+                result = slot_environment.execute_slot(
+                    previous_cache,
+                    previous_uav,
+                    sample.cache_triggers,
+                    sample.uav_triggers,
+                    step.scenario_slice,
+                    step.actual_tasks,
+                    step.actual_vehicle_positions,
+                    local_cache_state,
+                    service_catalog,
+                    project_cfg,
+                    cache_nodes,
+                    cache_config,
+                    flight_boundary,
+                    slot_id=step.slot,
+                    time_s=step.time_s,
+                )
+                if not result.step_feasible:
+                    raise InfeasibleActionBlocker(
+                        json.dumps(
+                            {
+                                "message": "INFEASIBLE DIRECT-CF BRANCH",
+                                "slot": int(step.slot),
+                                "origin_index": int(step.origin_index),
+                                "trigger_label": snapshot.trigger_label,
+                                "infeasible_reason": result.infeasible_reason,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                _check_reward_invariant(result)
+                _check_trigger_semantics(previous_cache, previous_uav, result, action_spec)
+                if step_index == snapshot.step_index:
+                    target_rng_aligned = direct_cf_rng_states_equal(
+                        capture_direct_cf_rng_state(),
+                        snapshot.baseline_rng_after_slot,
+                    )
+                branch_g.append(float(result.system_utility))
+                branch_q.append(float(result.actual_task_utility))
+                branch_cache.append(float(result.cache_cost))
+                branch_uav.append(float(result.movement_cost))
+                previous_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
+                previous_uav = {
+                    str(uav_id): (float(xy[0]), float(xy[1]))
+                    for uav_id, xy in (result.next_uav_positions or {}).items()
+                }
+                branch_steps += 1
+                if int(step.slot) >= int(terminal_slot):
+                    break
+
+            if branch_steps != len(aligned_steps) - snapshot.step_index:
+                raise RuntimeError("Direct-CF branch未运行到true terminal。")
+            baseline_suffix_g = suffix_metric(snapshot.step_index, "reward")
+            baseline_suffix_q = suffix_metric(snapshot.step_index, "actual_task_utility")
+            baseline_suffix_cache = suffix_metric(snapshot.step_index, "cache_cost")
+            baseline_suffix_uav = suffix_metric(snapshot.step_index, "movement_cost")
+            branch_suffix_g = float(math.fsum(branch_g))
+            branch_suffix_q = float(math.fsum(branch_q))
+            branch_suffix_cache = float(math.fsum(branch_cache))
+            branch_suffix_uav = float(math.fsum(branch_uav))
+            delta_g = branch_suffix_g - baseline_suffix_g
+            delta_q = branch_suffix_q - baseline_suffix_q
+            delta_cache = branch_suffix_cache - baseline_suffix_cache
+            delta_uav = branch_suffix_uav - baseline_suffix_uav
+            identity_error = delta_g - delta_q + delta_cache + delta_uav
+            if not math.isclose(identity_error, 0.0, rel_tol=1e-9, abs_tol=1e-9):
+                raise AssertionError(
+                    "Direct-CF Delta reward identity failed: "
+                    f"slot={snapshot.slot}, error={identity_error}"
+                )
+            a_cf = (float(snapshot.action_vector[snapshot.trigger_index]) - float(snapshot.old_p1)) * delta_g
+            samples.append(
+                DirectCFCreditSample(
+                    episode_index=episode_index,
+                    sample_index_in_episode=int(sample_index_in_episode),
+                    step_index=int(snapshot.step_index),
+                    slot=int(snapshot.slot),
+                    origin_index=int(snapshot.origin_index),
+                    trigger_index=int(snapshot.trigger_index),
+                    trigger_label=str(snapshot.trigger_label),
+                    decision_id=str(snapshot.decision_id),
+                    observation=snapshot.observation.copy(),
+                    action_vector=snapshot.action_vector.copy(),
+                    action_prefix=snapshot.action_prefix.copy(),
+                    action_mask=snapshot.action_mask.copy(),
+                    actual_action=int(snapshot.action_vector[snapshot.trigger_index]),
+                    old_p1=float(snapshot.old_p1),
+                    old_chosen_log_prob=float(snapshot.old_chosen_log_prob),
+                    delta_g=float(delta_g),
+                    delta_q=float(delta_q),
+                    delta_cache=float(delta_cache),
+                    delta_uav=float(delta_uav),
+                    a_cf=float(a_cf),
+                    baseline_suffix_g=float(baseline_suffix_g),
+                    branch_suffix_g=float(branch_suffix_g),
+                    branch_environment_steps=int(branch_steps),
+                    crn_target_step_rng_aligned=bool(target_rng_aligned),
+                    sampling_weight=float(reservoir.sampling_weight_for(snapshot.trigger_index)),
+                    trigger_free_count=int(reservoir.trigger_free_counts[snapshot.trigger_index]),
+                    collection_policy_version=collection_policy_version,
+                )
+            )
+    finally:
+        restore_direct_cf_rng_state(caller_rng_state)
+    return samples
+
+
+def run_gate_cf_branches(
+    policy: Any,
+    reservoir: GateCFReservoir,
+    aligned_steps: list[AlignedRolloutStep],
+    baseline_batch: RolloutBatch,
+    local_cache_state: dict[str, set[int]],
+    service_catalog: dict[str, Any],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    flight_boundary: tuple[float, float, float, float],
+    observation_spec: ppo_trigger_policy.ConfigurationObservationSpec,
+    action_spec: ppo_trigger_policy.TriggerActionSpec,
+    terminal_slot: int,
+    collection_policy_version: int = 0,
+    episode_index: int = 0,
+) -> list[Any]:
+    """Run the formal Gate Joint-Null paired branches.
+
+    The reservoir contains pre-slot snapshots captured by the real
+    hierarchical rollout.  Each selected slot is replayed twice from the
+    same pre-action state: CONFIG forces ``g=1`` and samples the frozen WHAT
+    policy under the saved dynamic mask; NULL forces ``g=0`` and exposes the
+    strict all-zero action.  Both branches own an isolated local-cache copy,
+    and all policy/environment suffix draws are restored from the snapshot's
+    baseline RNG checkpoint so this helper cannot advance the caller's
+    training RNG.
+    """
+
+    from ppo import hierarchical_reconfiguration_gate
+
+    if not isinstance(reservoir, GateCFReservoir):
+        raise TypeError("run_gate_cf_branches 需要 GateCFReservoir。")
+    if not isinstance(policy, hierarchical_reconfiguration_gate.HierarchicalReconfigurationGatePolicy):
+        raise TypeError("run_gate_cf_branches 需要 HierarchicalReconfigurationGatePolicy。")
+    if not aligned_steps or len(baseline_batch.transitions) != len(aligned_steps):
+        raise ValueError("Gate-CF branch 需要完整 aligned_steps 与 baseline transitions。")
+    if int(aligned_steps[-1].slot) != int(terminal_slot):
+        raise ValueError("Gate-CF branch 必须运行到 FormalTrainingProtocol true terminal。")
+    collection_policy_version = int(collection_policy_version)
+    episode_index = int(episode_index)
+    if collection_policy_version < 0 or episode_index < 0:
+        raise ValueError("Gate-CF collection policy version/episode index不能为负。")
+
+    caller_rng_state = capture_direct_cf_rng_state()
+    samples: list[Any] = []
+
+    def suffix_metric(start: int, field: str) -> float:
+        return float(
+            math.fsum(float(getattr(item, field)) for item in baseline_batch.transitions[start:])
+        )
+
+    def clone_local_cache() -> dict[str, set[int]]:
+        return {
+            str(vehicle_id): {int(service_id) for service_id in services}
+            for vehicle_id, services in local_cache_state.items()
+        }
+
+    try:
+        for sample_index_in_episode, snapshot in enumerate(reservoir.items):
+            if snapshot.step_index < 0 or snapshot.step_index >= len(aligned_steps):
+                raise ValueError("Gate-CF snapshot step_index越界。")
+            target_step = aligned_steps[snapshot.step_index]
+            target_mask_provider = build_trigger_action_mask_provider(
+                snapshot.previous_cache_state,
+                snapshot.previous_uav_positions,
+                service_catalog,
+                project_cfg,
+                cache_nodes,
+                flight_boundary,
+                action_spec,
+            )
+            branch_metrics: dict[str, hierarchical_reconfiguration_gate.GateBranchReturn] = {}
+            target_rng_aligned: dict[str, bool] = {}
+
+            def continuation(
+                branch_name: str,
+                first_sample: Any,
+            ) -> hierarchical_reconfiguration_gate.GateBranchReturn:
+                previous_cache = np.asarray(snapshot.previous_cache_state, dtype=np.int8).copy()
+                previous_uav = {
+                    str(uav_id): (float(xy[0]), float(xy[1]))
+                    for uav_id, xy in snapshot.previous_uav_positions.items()
+                }
+                branch_local_cache = clone_local_cache()
+                branch_g: list[float] = []
+                branch_q: list[float] = []
+                branch_cache: list[float] = []
+                branch_uav: list[float] = []
+                branch_steps = 0
+                for step_index in range(snapshot.step_index, len(aligned_steps)):
+                    step = aligned_steps[step_index]
+                    observation = _make_observation(
+                        previous_cache,
+                        previous_uav,
+                        step,
+                        observation_spec,
+                        flight_boundary,
+                    )
+                    mask_provider = build_trigger_action_mask_provider(
+                        previous_cache,
+                        previous_uav,
+                        service_catalog,
+                        project_cfg,
+                        cache_nodes,
+                        flight_boundary,
+                        action_spec,
+                    )
+                    if step_index == snapshot.step_index:
+                        sample = first_sample
+                        if not np.array_equal(
+                            np.asarray(observation, dtype=np.float32),
+                            np.asarray(snapshot.observation, dtype=np.float32),
+                        ):
+                            raise AssertionError("Gate-CF snapshot observation与branch state不一致。")
+                    else:
+                        sample = _sample_action_without_grad(
+                            policy,
+                            observation,
+                            deterministic=False,
+                            action_mask=mask_provider,
+                            consume_subpolicy_draw_for_null=True,
+                        )
+                    if branch_name == "NULL":
+                        if int(sample.gate_action) != hierarchical_reconfiguration_gate.GATE_ACTION_NULL:
+                            raise AssertionError("NULL Gate-CF branch未强制g=0。")
+                        if not np.array_equal(
+                            np.asarray(sample.action_vector, dtype=np.int8),
+                            np.zeros(int(action_spec.action_dim), dtype=np.int8),
+                        ):
+                            raise AssertionError("NULL Gate-CF branch action不是严格全零。")
+                    else:
+                        if int(sample.gate_action) != hierarchical_reconfiguration_gate.GATE_ACTION_CONFIGURE:
+                            raise AssertionError("CONFIG Gate-CF branch未强制g=1。")
+                    result = slot_environment.execute_slot(
+                        previous_cache,
+                        previous_uav,
+                        sample.cache_triggers,
+                        sample.uav_triggers,
+                        step.scenario_slice,
+                        step.actual_tasks,
+                        step.actual_vehicle_positions,
+                        branch_local_cache,
+                        service_catalog,
+                        project_cfg,
+                        cache_nodes,
+                        cache_config,
+                        flight_boundary,
+                        slot_id=step.slot,
+                        time_s=step.time_s,
+                    )
+                    if not result.step_feasible:
+                        raise InfeasibleActionBlocker(
+                            json.dumps(
+                                {
+                                    "message": "INFEASIBLE GATE-CF BRANCH",
+                                    "branch": branch_name,
+                                    "slot": int(step.slot),
+                                    "origin_index": int(step.origin_index),
+                                    "infeasible_reason": result.infeasible_reason,
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    _check_reward_invariant(result)
+                    _check_trigger_semantics(previous_cache, previous_uav, result, action_spec)
+                    if step_index == snapshot.step_index:
+                        target_rng_aligned[branch_name] = direct_cf_rng_states_equal(
+                            capture_direct_cf_rng_state(),
+                            snapshot.baseline_rng_after_slot,
+                        )
+                    branch_g.append(float(result.system_utility))
+                    branch_q.append(float(result.actual_task_utility))
+                    branch_cache.append(float(result.cache_cost))
+                    branch_uav.append(float(result.movement_cost))
+                    previous_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
+                    previous_uav = {
+                        str(uav_id): (float(xy[0]), float(xy[1]))
+                        for uav_id, xy in (result.next_uav_positions or {}).items()
+                    }
+                    branch_steps += 1
+                    if int(step.slot) >= int(terminal_slot):
+                        break
+                expected_steps = len(aligned_steps) - snapshot.step_index
+                if branch_steps != expected_steps:
+                    raise RuntimeError("Gate-CF branch未运行到true terminal。")
+                return hierarchical_reconfiguration_gate.GateBranchReturn(
+                    branch=branch_name,
+                    return_g=float(math.fsum(branch_g)),
+                    return_q=float(math.fsum(branch_q)),
+                    return_cache=float(math.fsum(branch_cache)),
+                    return_uav=float(math.fsum(branch_uav)),
+                    environment_steps=int(branch_steps),
+                )
+
+            restore_direct_cf_rng_state(snapshot.baseline_rng_before)
+            try:
+                joint = hierarchical_reconfiguration_gate.run_joint_null_branches(
+                    policy,
+                    snapshot.observation,
+                    continuation,
+                    action_mask=target_mask_provider,
+                    crn_metadata={
+                        "decision_id": str(snapshot.decision_id),
+                        "episode_index": int(episode_index),
+                        "step_index": int(snapshot.step_index),
+                        "slot": int(snapshot.slot),
+                        "origin_index": int(snapshot.origin_index),
+                        "baseline_gate_action": int(snapshot.gate_action),
+                        "config_target_step_rng_aligned": bool(
+                            target_rng_aligned.get("CONFIG", False)
+                        ),
+                        "null_target_step_rng_aligned": bool(
+                            target_rng_aligned.get("NULL", False)
+                        ),
+                    },
+                )
+            finally:
+                restore_direct_cf_rng_state(snapshot.baseline_rng_before)
+            config_return = joint.config_return
+            null_return = joint.null_return
+            gate_crn_metadata = copy.deepcopy(joint.crn_metadata)
+            gate_crn_metadata.update(
+                {
+                    "config_branch_environment_steps": int(config_return.environment_steps),
+                    "null_branch_environment_steps": int(null_return.environment_steps),
+                }
+            )
+            delta_q = float(config_return.return_q - null_return.return_q)
+            delta_cache = float(config_return.return_cache - null_return.return_cache)
+            delta_uav = float(config_return.return_uav - null_return.return_uav)
+            delta_gate = float(config_return.return_g - null_return.return_g)
+            if not math.isclose(
+                delta_gate,
+                delta_q - delta_cache - delta_uav,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            ):
+                raise AssertionError("Gate-CF Delta decomposition identity failed。")
+            samples.append(
+                hierarchical_reconfiguration_gate.build_gate_counterfactual_sample(
+                    decision_id=str(snapshot.decision_id),
+                    episode_index=episode_index,
+                    step_index=int(snapshot.step_index),
+                    slot=int(snapshot.slot),
+                    origin_index=int(snapshot.origin_index),
+                    gate_observation=snapshot.observation,
+                    gate_action=int(snapshot.gate_action),
+                    p_old_gate=float(snapshot.old_gate_probability),
+                    gate_old_logprob=float(snapshot.old_gate_log_prob),
+                    config_joint_action=joint.config_sample.action_vector,
+                    null_joint_action=joint.null_sample.action_vector,
+                    return_config=float(config_return.return_g),
+                    return_null=float(null_return.return_g),
+                    crn_metadata=gate_crn_metadata,
+                    collection_policy_version=collection_policy_version,
+                    delta_q=delta_q,
+                    delta_cache=delta_cache,
+                    delta_uav=delta_uav,
+                )
+            )
+    finally:
+        restore_direct_cf_rng_state(caller_rng_state)
+    return samples
 
 
 def _load_vehicle_prediction_h0(path: Path) -> dict[int, dict[str, tuple[float, float, int, float]]]:
@@ -693,10 +2042,15 @@ def _manual_gae_sanity() -> float:
 
 
 def _batch_consistency(policy: Any, batch: RolloutBatch) -> tuple[float, float]:
+    evaluation_kwargs = {
+        "action_masks": batch.action_masks,
+    }
+    if getattr(batch, "gate_actions", None) is not None:
+        evaluation_kwargs["gate_actions"] = batch.gate_actions
     evaluation = policy.evaluate_actions(
         batch.observations,
         batch.actions,
-        action_masks=batch.action_masks,
+        **evaluation_kwargs,
     )
     log_probs = evaluation.joint_log_prob.detach().cpu().numpy()
     values = evaluation.value.detach().cpu().numpy()

@@ -83,6 +83,27 @@ class CounterfactualTargets:
 
 
 @dataclass(frozen=True)
+class CentralizedCounterfactualTargets:
+    """集中式 joint-action Q 生成的 per-trigger frozen actor target。"""
+
+    chosen_q_values: Any
+    q_action_zero: Any
+    q_action_one: Any
+    baseline: Any
+    advantages: Any
+    action_gaps: Any
+    actor_valid_mask: Any
+
+
+@dataclass(frozen=True)
+class CentralizedQLossResult:
+    """central critic 对真实 sampled joint action 的 MC 回归结果。"""
+
+    q_loss: Any
+    q_values: Any
+
+
+@dataclass(frozen=True)
 class SingleUpdateSanityResult:
     training_config: PPOTrainingConfigStatus
     loss_result: PPOLossResult | None
@@ -112,6 +133,15 @@ class SingleUpdateSanityResult:
 def _require_torch() -> None:
     if torch is None:
         raise ImportError("ppo_update.py 需要 PyTorch 才能计算 PPO loss。")
+
+
+def _validate_centralized_return_scale(return_scale: float) -> float:
+    """校验 centralized critic 使用的固定正比例 return scale。"""
+
+    scale = float(return_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("centralized critic return_scale 必须是有限正数。")
+    return scale
 
 
 def ppo_training_config_status(project_cfg: dict[str, Any]) -> PPOTrainingConfigStatus:
@@ -144,6 +174,20 @@ def ppo_training_config_status(project_cfg: dict[str, Any]) -> PPOTrainingConfig
 
 LEGACY_CREDIT_ASSIGNMENT = "legacy_scalar"
 PER_TRIGGER_Q_CREDIT_ASSIGNMENT = "per_trigger_q"
+CENTRALIZED_COUNTERFACTUAL_CREDIT_ASSIGNMENT = "centralized_counterfactual_q"
+SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT = "sparse_direct_cf"
+FROZEN_POLICY_BATCH_METHOD = "proposed_sparse_direct_cf_frozen_policy_batch"
+REFERENCE_DRIFT_FROZEN_POLICY_BATCH_METHOD = (
+    "proposed_sparse_direct_cf_frozen_policy_batch_refdrift"
+)
+REFERENCE_DRIFT_ALGORITHM_SCHEMA = (
+    "proposed_sparse_direct_cf_frozen_policy_batch_refdrift_v1"
+)
+HIERARCHICAL_GATE_METHOD = "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift"
+HIERARCHICAL_GATE_ALGORITHM_SCHEMA = (
+    "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift_v1"
+)
+HIERARCHICAL_GATE_CREDIT_ASSIGNMENT = "hierarchical_gate_direct_cf"
 MONTE_CARLO_Q_TARGET = "monte_carlo"
 
 
@@ -157,17 +201,56 @@ def credit_assignment_from_project(project_cfg: dict[str, Any]) -> str:
             "algorithm.ppo.method",
             "trigger_actor_critic",
         )
+        if method == HIERARCHICAL_GATE_METHOD:
+            return HIERARCHICAL_GATE_CREDIT_ASSIGNMENT
         return (
             PER_TRIGGER_Q_CREDIT_ASSIGNMENT
             if method == "proposed_per_trigger_q"
-            else LEGACY_CREDIT_ASSIGNMENT
+            else (
+                CENTRALIZED_COUNTERFACTUAL_CREDIT_ASSIGNMENT
+                if method == "proposed_centralized_cf_q"
+                else (
+                    SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
+                    if method in {
+                        "proposed_sparse_direct_cf_ppo",
+                        FROZEN_POLICY_BATCH_METHOD,
+                        REFERENCE_DRIFT_FROZEN_POLICY_BATCH_METHOD,
+                    }
+                    else LEGACY_CREDIT_ASSIGNMENT
+                )
+            )
         )
     mode = str(explicit)
-    if mode not in {LEGACY_CREDIT_ASSIGNMENT, PER_TRIGGER_Q_CREDIT_ASSIGNMENT}:
+    if mode not in {
+        LEGACY_CREDIT_ASSIGNMENT,
+        PER_TRIGGER_Q_CREDIT_ASSIGNMENT,
+        CENTRALIZED_COUNTERFACTUAL_CREDIT_ASSIGNMENT,
+        SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT,
+        HIERARCHICAL_GATE_CREDIT_ASSIGNMENT,
+    }:
         raise ValueError(
-            "algorithm.ppo.credit_assignment 必须是 legacy_scalar 或 per_trigger_q。"
+            "algorithm.ppo.credit_assignment 必须是 legacy_scalar、per_trigger_q "
+            "centralized_counterfactual_q、sparse_direct_cf 或 "
+            "hierarchical_gate_direct_cf。"
         )
     return mode
+
+
+def credit_phase_from_project(project_cfg: dict[str, Any]) -> str:
+    """读取 V2 的显式训练阶段；不自动根据episode数切换。"""
+
+    phase = str(
+        project_config.get_config_value(
+            project_cfg,
+            "algorithm.ppo.credit_phase",
+            "critic_warmup",
+        )
+    )
+    if phase not in {"critic_warmup", "joint_training"}:
+        raise ValueError(
+            "algorithm.ppo.credit_phase 必须是 critic_warmup 或 joint_training。"
+        )
+    return phase
 
 
 def q_target_from_project(project_cfg: dict[str, Any]) -> str | None:
@@ -300,6 +383,112 @@ def compute_per_trigger_q_loss(
     )
 
 
+def compute_centralized_q_loss(
+    q_critic: Any,
+    observations: Any,
+    joint_actions: Any,
+    monte_carlo_returns: Any,
+    return_scale: float = 1.0,
+) -> CentralizedQLossResult:
+    """对真实 sampled joint action 做固定尺度 MC 回归。
+
+    与 V1 不同，这里不使用 actor free mask：即使某个 trigger 被环境可行性
+    mask 强制，整个 rollout transition 仍然是 central critic 的监督样本。
+    central V2 的输出和 target 都使用 ``MC / return_scale``；默认值1保留
+    旧调用的显式 raw-unit 语义，正式 V2 caller 必须传入formal horizon scale。
+    """
+
+    _require_torch()
+    scale = _validate_centralized_return_scale(return_scale)
+    try:
+        device = next(q_critic.parameters()).device
+    except StopIteration as exc:
+        raise ValueError("q_critic 必须包含至少一个参数。") from exc
+    observations_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
+    actions_t = torch.as_tensor(joint_actions, dtype=torch.float32, device=device)
+    target_t = torch.as_tensor(monte_carlo_returns, dtype=torch.float32, device=device).reshape(-1)
+    scaled_target_t = target_t / scale
+    q_values = q_critic(observations_t, actions_t)
+    if q_values.ndim != 1 or scaled_target_t.shape != q_values.shape:
+        raise ValueError("central critic Q 与 MC target 必须都是 [T]。")
+    if not torch.all(torch.isfinite(scaled_target_t)):
+        raise ValueError("central critic MC target 包含 NaN/Inf。")
+    q_loss = 0.5 * torch.mean((q_values - scaled_target_t) ** 2)
+    return CentralizedQLossResult(q_loss=q_loss, q_values=q_values)
+
+
+def prepare_centralized_counterfactual_targets(
+    q_critic: Any,
+    rollout_batch: ppo_rollout.RolloutBatch,
+    return_scale: float = 1.0,
+) -> CentralizedCounterfactualTargets:
+    """固定其他7个实际 action，计算每个 trigger 的 two-action Q baseline。
+
+    ``old_per_action_probabilities`` 来自 rollout 时冻结的旧 policy；因此该
+    函数生成的 A_cf 可以在 Actor multi-epoch 更新期间 detach/freeze，而不会
+    把新的 Actor probability 或 critic 梯度混入 surrogate。
+    """
+
+    _require_torch()
+    scale = _validate_centralized_return_scale(return_scale)
+    try:
+        device = next(q_critic.parameters()).device
+    except StopIteration as exc:
+        raise ValueError("q_critic 必须包含至少一个参数。") from exc
+    observations = torch.as_tensor(rollout_batch.observations, dtype=torch.float32, device=device)
+    actions = torch.as_tensor(rollout_batch.actions, dtype=torch.float32, device=device)
+    old_probabilities = torch.as_tensor(
+        rollout_batch.old_per_action_probabilities,
+        dtype=torch.float32,
+        device=device,
+    ).detach()
+    if observations.ndim != 2 or actions.ndim != 2:
+        raise ValueError("centralized counterfactual observation/action 必须是二维。")
+    if old_probabilities.shape != (actions.shape[0], actions.shape[1], 2):
+        raise ValueError("old_per_action_probabilities 必须是 [T,action_dim,2]。")
+    if not torch.allclose(
+        old_probabilities.sum(dim=-1),
+        torch.ones_like(old_probabilities[..., 0]),
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise ValueError("old_per_action_probabilities 最后一维必须归一化。")
+    actor_valid_mask = _free_trigger_mask(rollout_batch, device)
+    with torch.no_grad():
+        chosen_q_values = q_critic(observations, actions).detach()
+        q_action_zero: list[Any] = []
+        q_action_one: list[Any] = []
+        for action_index in range(actions.shape[1]):
+            actions_zero = actions.clone()
+            actions_one = actions.clone()
+            actions_zero[:, action_index] = 0.0
+            actions_one[:, action_index] = 1.0
+            q_action_zero.append(q_critic(observations, actions_zero).detach())
+            q_action_one.append(q_critic(observations, actions_one).detach())
+        q0 = torch.stack(q_action_zero, dim=1)
+        q1 = torch.stack(q_action_one, dim=1)
+        p_one = old_probabilities[..., 1]
+        baseline = (1.0 - p_one) * q0 + p_one * q1
+        advantages_scaled = chosen_q_values.unsqueeze(1) - baseline
+        advantages_scaled = torch.where(
+            actor_valid_mask,
+            advantages_scaled,
+            torch.zeros_like(advantages_scaled),
+        )
+        # Actor 的正式 advantage 仍恢复为原 reward 单位；q/gap本身保持scaled单位。
+        advantages = scale * advantages_scaled
+        action_gaps = q1 - q0
+    return CentralizedCounterfactualTargets(
+        chosen_q_values=chosen_q_values,
+        q_action_zero=q0,
+        q_action_one=q1,
+        baseline=baseline,
+        advantages=advantages.detach(),
+        action_gaps=action_gaps.detach(),
+        actor_valid_mask=actor_valid_mask.detach(),
+    )
+
+
 def compute_per_trigger_ppo_loss(
     policy: Any,
     rollout_batch: ppo_rollout.RolloutBatch,
@@ -391,6 +580,204 @@ def compute_per_trigger_ppo_loss(
     )
 
 
+def compute_sparse_direct_cf_actor_loss(
+    policy: Any,
+    observations: Any,
+    actions: Any,
+    action_masks: Any,
+    target_indices: Any,
+    old_target_log_probs: Any,
+    direct_cf_advantages: Any,
+    clip_epsilon: float,
+    sample_weights: Any | None = None,
+) -> PPOLossResult:
+    """计算 V3 sparse Direct-CF 的 target-only clipped Actor loss。
+
+    ``direct_cf_advantages`` 必须已经是 ``(a-p_old) * Delta_G``。本函数
+    绝不再次乘 ``(a-p)``，也不计算 scalar value loss、GAE loss 或 entropy
+    loss；因此 shared Actor encoder 只接收 Direct-CF gradient。
+    """
+
+    _require_torch()
+    if clip_epsilon < 0.0:
+        raise ValueError("clip_epsilon 不能为负。")
+    device = _policy_device(policy)
+    observations_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
+    actions_t = torch.as_tensor(actions, dtype=torch.float32, device=device)
+    masks_t = torch.as_tensor(action_masks, dtype=torch.bool, device=device)
+    target_t = torch.as_tensor(target_indices, dtype=torch.long, device=device).reshape(-1)
+    old_log_t = torch.as_tensor(old_target_log_probs, dtype=torch.float32, device=device).reshape(-1).detach()
+    advantage_t = torch.as_tensor(direct_cf_advantages, dtype=torch.float32, device=device).reshape(-1).detach()
+    if observations_t.ndim != 2 or actions_t.ndim != 2:
+        raise ValueError("V3 observations/actions 必须是二维。")
+    sample_count = int(observations_t.shape[0])
+    if sample_count <= 0 or actions_t.shape[0] != sample_count:
+        raise ValueError("V3 Actor batch 不能为空且样本数必须一致。")
+    if target_t.shape != (sample_count,) or old_log_t.shape != (sample_count,) or advantage_t.shape != (sample_count,):
+        raise ValueError("V3 target_indices/log_probs/advantages shape 必须是 [K]。")
+    if masks_t.shape != (sample_count, int(actions_t.shape[1]), 2):
+        raise ValueError("V3 action_masks 必须是 [K,action_dim,2]。")
+    if not bool(torch.all((target_t >= 0) & (target_t < actions_t.shape[1])).item()):
+        raise ValueError("V3 target_indices 越界。")
+    target_masks = masks_t[torch.arange(sample_count, device=device), target_t]
+    if not bool(torch.all(target_masks).item()):
+        raise ValueError("V3 Direct-CF target 必须是 FREE decision。")
+    if not torch.all(torch.isfinite(advantage_t)):
+        raise ValueError("V3 Direct-CF advantage 包含 NaN/Inf。")
+
+    evaluation = policy.evaluate_actions(
+        observations_t,
+        actions_t,
+        action_masks=masks_t,
+    )
+    row_indices = torch.arange(sample_count, device=device)
+    new_target_log_probs = evaluation.per_action_log_probs[row_indices, target_t]
+    ratios = torch.exp(new_target_log_probs - old_log_t)
+    clipped_ratios = torch.clamp(ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+    surrogate = torch.minimum(ratios * advantage_t, clipped_ratios * advantage_t)
+    if sample_weights is None:
+        # legacy uniform reservoir：保持原K样本 arithmetic mean语义。
+        policy_loss = -torch.mean(surrogate)
+    else:
+        weights_t = torch.as_tensor(
+            sample_weights,
+            dtype=torch.float32,
+            device=device,
+        ).reshape(-1).detach()
+        if weights_t.shape != (sample_count,):
+            raise ValueError("V3 sample_weights shape 必须是 [K]。")
+        if not torch.all(torch.isfinite(weights_t)) or not torch.all(weights_t >= 0.0):
+            raise ValueError("V3 sample_weights 必须是finite非负数。")
+        if not bool(torch.isclose(
+            torch.sum(weights_t),
+            torch.ones((), dtype=torch.float32, device=device),
+            rtol=1e-5,
+            atol=1e-6,
+        ).item()):
+            raise ValueError("V3 sample_weights之和必须为1。")
+        policy_loss = -torch.sum(weights_t * surrogate)
+    zero = policy_loss.detach() * 0.0
+    with torch.no_grad():
+        approx_kl = torch.mean(old_log_t - new_target_log_probs)
+        clip_fraction = torch.mean(
+            (torch.abs(ratios - 1.0) > clip_epsilon).to(torch.float32)
+        )
+        ratio_mean = torch.mean(ratios)
+        ratio_min = torch.min(ratios)
+        ratio_max = torch.max(ratios)
+    return PPOLossResult(
+        total_loss=policy_loss,
+        policy_loss=policy_loss,
+        value_loss=zero,
+        entropy=zero,
+        ratio_mean=float(ratio_mean.detach().cpu()),
+        ratio_min=float(ratio_min.detach().cpu()),
+        ratio_max=float(ratio_max.detach().cpu()),
+        clip_fraction=float(clip_fraction.detach().cpu()),
+        approx_kl=float(approx_kl.detach().cpu()),
+        new_log_probs=new_target_log_probs,
+        new_values=evaluation.value,
+    )
+
+
+def compute_gate_direct_cf_actor_loss(
+    gate_policy: Any,
+    observations: Any,
+    gate_actions: Any,
+    old_gate_log_probs: Any,
+    old_p_gate: Any,
+    delta_gate: Any,
+    clip_epsilon: float,
+    sample_weights: Any | None = None,
+) -> PPOLossResult:
+    """Compute the independent Gate clipped-PPO Direct-CF loss.
+
+    The frozen target is exactly ``A_gate=(g-p_old_gate)*Delta_gate``.  This
+    function deliberately does not multiply by ``(g-p)`` again: the PPO
+    likelihood ratio is the only policy-gradient factor after the advantage
+    has been formed.  No value or entropy term is added to the Gate loss.
+    """
+
+    _require_torch()
+    if clip_epsilon < 0.0 or clip_epsilon >= 1.0:
+        raise ValueError("Gate clip_epsilon 必须位于[0,1)。")
+    observations_t = torch.as_tensor(observations, dtype=torch.float32)
+    if observations_t.ndim != 2:
+        raise ValueError("Gate observations 必须是二维 [K,D]。")
+    actions_t = torch.as_tensor(gate_actions, dtype=torch.float32).reshape(-1)
+    old_log_t = torch.as_tensor(old_gate_log_probs, dtype=torch.float32).reshape(-1).detach()
+    old_p_t = torch.as_tensor(old_p_gate, dtype=torch.float32).reshape(-1).detach()
+    delta_t = torch.as_tensor(delta_gate, dtype=torch.float32).reshape(-1).detach()
+    sample_count = int(observations_t.shape[0])
+    if sample_count <= 0 or any(
+        tensor.shape != (sample_count,)
+        for tensor in (actions_t, old_log_t, old_p_t, delta_t)
+    ):
+        raise ValueError("Gate observations/actions/old log-prob/p/Delta shape必须一致且非空。")
+    if not bool(torch.all((actions_t == 0.0) | (actions_t == 1.0)).item()):
+        raise ValueError("gate_actions 必须是0/1。")
+    if not bool(torch.all(torch.isfinite(old_p_t)).item()) or not bool(
+        torch.all((old_p_t > 0.0) & (old_p_t < 1.0)).item()
+    ):
+        raise ValueError("old_p_gate 必须是(0,1)内的finite概率。")
+    if not bool(torch.all(torch.isfinite(old_log_t)).item()) or not bool(
+        torch.all(torch.isfinite(delta_t)).item()
+    ):
+        raise ValueError("Gate old log-prob/Delta必须finite。")
+
+    evaluator = getattr(gate_policy, "evaluate_gate_actions", None)
+    if evaluator is None:
+        evaluator = getattr(gate_policy, "evaluate_actions", None)
+    if evaluator is None:
+        raise TypeError("gate_policy 必须提供 evaluate_gate_actions/evaluate_actions。")
+    evaluation = evaluator(observations_t, actions_t.long())
+    new_log_probs = evaluation.chosen_log_prob.reshape(-1)
+    if new_log_probs.shape != (sample_count,):
+        raise ValueError("Gate evaluation chosen_log_prob shape非法。")
+    expected_old_log_probs = torch.where(
+        actions_t == 1.0,
+        torch.log(old_p_t),
+        torch.log1p(-old_p_t),
+    )
+    if not torch.allclose(old_log_t, expected_old_log_probs, rtol=1e-5, atol=1e-6):
+        raise ValueError("Gate old log-prob 与 old_p_gate/gate_action 不一致。")
+    advantages = (actions_t - old_p_t) * delta_t
+    ratios = torch.exp(new_log_probs - old_log_t)
+    clipped_ratios = torch.clamp(ratios, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+    surrogate = torch.minimum(ratios * advantages, clipped_ratios * advantages)
+    if sample_weights is None:
+        policy_loss = -torch.mean(surrogate)
+    else:
+        weights_t = torch.as_tensor(sample_weights, dtype=torch.float32).reshape(-1).detach()
+        if weights_t.shape != (sample_count,) or not bool(torch.all(torch.isfinite(weights_t)).item()):
+            raise ValueError("Gate sample_weights shape/finite性非法。")
+        if not bool(torch.all(weights_t >= 0.0).item()) or not bool(
+            torch.isclose(torch.sum(weights_t), torch.ones((), dtype=torch.float32), atol=1e-6, rtol=1e-5).item()
+        ):
+            raise ValueError("Gate sample_weights 必须是非负且和为1。")
+        policy_loss = -torch.sum(weights_t * surrogate)
+    zero = policy_loss.detach() * 0.0
+    with torch.no_grad():
+        approx_kl = torch.mean(old_log_t - new_log_probs)
+        clip_fraction = torch.mean((torch.abs(ratios - 1.0) > clip_epsilon).to(torch.float32))
+        ratio_mean = torch.mean(ratios)
+        ratio_min = torch.min(ratios)
+        ratio_max = torch.max(ratios)
+    return PPOLossResult(
+        total_loss=policy_loss,
+        policy_loss=policy_loss,
+        value_loss=zero,
+        entropy=zero,
+        ratio_mean=float(ratio_mean.detach().cpu()),
+        ratio_min=float(ratio_min.detach().cpu()),
+        ratio_max=float(ratio_max.detach().cpu()),
+        clip_fraction=float(clip_fraction.detach().cpu()),
+        approx_kl=float(approx_kl.detach().cpu()),
+        new_log_probs=new_log_probs,
+        new_values=torch.zeros_like(new_log_probs),
+    )
+
+
 def compute_ppo_loss(
     policy: Any,
     rollout_batch: ppo_rollout.RolloutBatch,
@@ -409,14 +796,23 @@ def compute_ppo_loss(
     advantages = torch.as_tensor(rollout_batch.advantages, dtype=torch.float32).detach()
     returns = torch.as_tensor(rollout_batch.returns, dtype=torch.float32).detach()
 
+    evaluation_kwargs = {
+        "action_masks": rollout_batch.action_masks,
+    }
+    if getattr(rollout_batch, "gate_actions", None) is not None:
+        evaluation_kwargs["gate_actions"] = rollout_batch.gate_actions
     evaluation = policy.evaluate_actions(
         observations,
         actions,
-        action_masks=rollout_batch.action_masks,
+        **evaluation_kwargs,
     )
     new_log_probs = evaluation.joint_log_prob
     new_values = evaluation.value
-    entropy_per_sample = evaluation.entropy
+    entropy_per_sample = (
+        evaluation.subpolicy.entropy
+        if hasattr(evaluation, "subpolicy")
+        else evaluation.entropy
+    )
     ratios = torch.exp(new_log_probs - old_log_probs)
     surrogate = torch.minimum(
         ratios * advantages,

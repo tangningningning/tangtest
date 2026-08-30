@@ -18,6 +18,7 @@ https://docs.pytorch.org/docs/stable/distributions.html#categorical
 from __future__ import annotations
 
 import math
+import copy
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -31,6 +32,13 @@ except ModuleNotFoundError:  # pragma: no cover - 当前运行环境可能未安
     nn = None  # type: ignore[assignment]
 
 from common import project_config
+
+
+LEGACY_SHARED_HEAD_ARCHITECTURE_ID = "v3_shared_logit_head"
+TRIGGER_HEADS_ARCHITECTURE_ID = "v3_encoder_trigger_heads_frozen_ar_v1"
+TRIGGER_HEADS_ARCHITECTURE_VERSION = 1
+FULL_SHARED_ACTOR_ARCHITECTURE_ID = "v3_full_shared_actor_frozen_policy_batch_v1"
+FULL_SHARED_ACTOR_ARCHITECTURE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -458,8 +466,119 @@ def build_per_trigger_q_critic_preserving_rng(
     return critic
 
 
+class CentralizedJointActionCritic(nn.Module if nn is not None else object):
+    """集中式联合动作 critic：``Q_c(s,a)=V_c(s)+D_c(s,a)``。
+
+    ``V_c`` 只接收 observation，``D_c`` 接收 observation 与完整的8维
+    joint action。两条分支不与 Actor 共享 encoder；action-dependent 分支的
+    最终 head 显式零初始化，因此新 critic 初始时对不同 joint action 给出相同
+    Q 值，避免凭随机初始化制造 counterfactual preference。
+    """
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        _require_torch()
+        super().__init__()
+        if int(observation_dim) <= 0 or int(action_dim) <= 0:
+            raise ValueError("CentralizedJointActionCritic 的维度必须大于0。")
+        if not hidden_sizes or any(int(size) <= 0 for size in hidden_sizes):
+            raise ValueError("CentralizedJointActionCritic hidden_sizes 必须是正整数列表。")
+        self.observation_dim = int(observation_dim)
+        self.action_dim = int(action_dim)
+        sizes = tuple(int(size) for size in hidden_sizes)
+
+        state_layers: list[Any] = []
+        state_last = self.observation_dim
+        for hidden in sizes:
+            state_layers.extend([nn.Linear(state_last, hidden), nn.ReLU()])
+            state_last = hidden
+        self.state_encoder = nn.Sequential(*state_layers)
+        self.value_head = nn.Linear(state_last, 1)
+
+        action_layers: list[Any] = []
+        action_last = self.observation_dim + self.action_dim
+        for hidden in sizes:
+            action_layers.extend([nn.Linear(action_last, hidden), nn.ReLU()])
+            action_last = hidden
+        self.action_encoder = nn.Sequential(*action_layers)
+        self.delta_head = nn.Linear(action_last, 1)
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
+
+    def forward(self, observations: Any, joint_actions: Any) -> Any:
+        _require_torch()
+        device = next(self.parameters()).device
+        observations_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
+        actions_t = torch.as_tensor(joint_actions, dtype=torch.float32, device=device)
+        if observations_t.ndim == 1:
+            observations_t = observations_t.unsqueeze(0)
+        if actions_t.ndim == 1:
+            actions_t = actions_t.unsqueeze(0)
+        expected_obs = (observations_t.shape[0], self.observation_dim)
+        expected_action = (observations_t.shape[0], self.action_dim)
+        if tuple(observations_t.shape) != expected_obs:
+            raise ValueError(
+                f"observations shape={tuple(observations_t.shape)}，期望 [B,{self.observation_dim}]。"
+            )
+        if tuple(actions_t.shape) != expected_action:
+            raise ValueError(
+                f"joint_actions shape={tuple(actions_t.shape)}，期望 [B,{self.action_dim}]。"
+            )
+        if not torch.all((actions_t == 0) | (actions_t == 1)):
+            raise ValueError("joint_actions 必须是0/1。")
+        if not torch.all(torch.isfinite(observations_t)):
+            raise ValueError("observations 包含 NaN/Inf。")
+        state_value = self.value_head(self.state_encoder(observations_t)).squeeze(-1)
+        action_delta = self.delta_head(
+            self.action_encoder(torch.cat([observations_t, actions_t], dim=-1))
+        ).squeeze(-1)
+        return state_value + action_delta
+
+
+def build_centralized_joint_action_critic_preserving_rng(
+    observation_dim: int,
+    action_dim: int,
+    hidden_sizes: tuple[int, ...] = (128, 128),
+    device: Any | None = None,
+) -> CentralizedJointActionCritic:
+    """初始化集中式 critic，同时恢复 Actor 使用的 global torch RNG。
+
+    这是对官方 ``torch.get_rng_state``/``torch.set_rng_state`` API 的轻量封装；
+    目的只是让新增 critic 的参数初始化不改变既有 Actor sampling trajectory。
+    """
+
+    _require_torch()
+    cpu_state = torch.get_rng_state().clone()
+    cuda_states = None
+    if torch.cuda.is_available():
+        cuda_states = [state.clone() for state in torch.cuda.get_rng_state_all()]
+    critic = CentralizedJointActionCritic(observation_dim, action_dim, hidden_sizes)
+    if device is not None:
+        critic = critic.to(device)
+    torch.set_rng_state(cpu_state)
+    if cuda_states is not None:
+        torch.cuda.set_rng_state_all(cuda_states)
+    return critic
+
+
 class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
-    """Shared MLP encoder + autoregressive GRUCell binary actor + scalar critic."""
+    """Shared encoder/AR block + trigger-specific binary heads + scalar critic.
+
+    The eight heads are initialized as exact copies of the historical shared
+    ``logit_head`` initialization.  A temporary single Linear is used only to
+    preserve the old RNG draw order; it is not registered as a model
+    parameter.  The formal V3 sparse Direct-CF optimizer freezes the
+    autoregressive block and value head and trains the encoder plus these
+    trigger-specific heads.
+    """
+
+    architecture_id = TRIGGER_HEADS_ARCHITECTURE_ID
+    architecture_version = TRIGGER_HEADS_ARCHITECTURE_VERSION
+    uses_shared_logit_head = False
 
     def __init__(
         self,
@@ -499,7 +618,17 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             input_size=last_dim + action_embedding_dim + index_embedding_dim,
             hidden_size=self.autoregressive_hidden_size,
         )
-        self.logit_head = nn.Linear(self.autoregressive_hidden_size, 1)
+        if self.uses_shared_logit_head:
+            # This is the historical V3 Full Actor projection.  It consumes
+            # exactly one Linear initialization draw before value_head.
+            self.logit_head = nn.Linear(self.autoregressive_hidden_size, 1)
+        else:
+            # Keep the trigger-head initialization draw exactly once, then
+            # make eight bitwise copies without consuming additional RNG.
+            shared_logit_head = nn.Linear(self.autoregressive_hidden_size, 1)
+            self.trigger_heads = nn.ModuleList(
+                [copy.deepcopy(shared_logit_head) for _ in range(self.action_dim)]
+            )
         self.value_head = nn.Linear(last_dim, 1)
 
     def _as_observation_batch(self, observations: Any) -> tuple[Any, bool]:
@@ -518,6 +647,11 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         latent = self.encoder(observations)
         value = self.value_head(latent).squeeze(-1)
         return latent, value
+
+    def _logit_head_for_action(self, action_index: int) -> Any:
+        if self.uses_shared_logit_head:
+            return self.logit_head
+        return self.trigger_heads[action_index]
 
     def _teacher_forced_outputs(
         self,
@@ -561,7 +695,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             hidden = self.gru_cell(step_input, hidden)
             # 这是读取当前 a_i 之前、已经条件于真实 prefix a_<i 的 hidden。
             conditional_hidden_states.append(hidden)
-            logits.append(self.logit_head(hidden).squeeze(-1))
+            logits.append(self._logit_head_for_action(action_index)(hidden).squeeze(-1))
             previous_action = actions[:, action_index].long()
         return (
             torch.stack(logits, dim=1),
@@ -654,16 +788,40 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
         observation: Any,
         deterministic: bool = False,
         action_mask: Callable[[int, np.ndarray], Any] | Any = None,
+        force_action_index: int | None = None,
+        force_action_value: int | None = None,
+        fixed_action_prefix: Any = None,
     ) -> TriggerActionSample:
         """按固定 action 顺序自回归采样一个 masked trigger vector。
 
         callable mask 接收 ``(action_index, prefix_actions)``，因此后续 UAV
         trigger 可以依据前面已采样的 trigger 和当前几何约束动态决定。
+
+        Direct-CF branch 可以指定一个目标 action。目标位置仍先执行一次
+        stochastic draw，再替换其取值，以保持后续 policy RNG 消费数量与
+        baseline 一致；普通调用不传这两个参数，行为完全不变。
         """
 
         obs, single = self._as_observation_batch(observation)
         if not single or obs.shape[0] != 1:
             raise ValueError("sample_action 当前只接受单个 observation [D]。")
+        if (force_action_index is None) != (force_action_value is None):
+            raise ValueError("force_action_index 和 force_action_value 必须同时提供或同时省略。")
+        if force_action_index is not None:
+            force_action_index = int(force_action_index)
+            force_action_value = int(force_action_value)
+            if not 0 <= force_action_index < self.action_dim:
+                raise ValueError("force_action_index 超出 action_dim。")
+            if force_action_value not in {0, 1}:
+                raise ValueError("force_action_value 必须是0或1。")
+        fixed_prefix = np.asarray(
+            [] if fixed_action_prefix is None else fixed_action_prefix,
+            dtype=np.int8,
+        ).reshape(-1)
+        if not np.all(np.isin(fixed_prefix, [0, 1])):
+            raise ValueError("fixed_action_prefix 必须是0/1向量。")
+        if force_action_index is not None and len(fixed_prefix) > force_action_index:
+            raise ValueError("fixed_action_prefix 不能覆盖 force_action_index。")
         latent, value = self._encode(obs)
         hidden = torch.tanh(self.initial_hidden(latent))
         previous_action = torch.full((1,), 2, dtype=torch.long, device=obs.device)
@@ -686,7 +844,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
                 dim=-1,
             )
             hidden = self.gru_cell(step_input, hidden)
-            logit = self.logit_head(hidden).squeeze(-1)
+            logit = self._logit_head_for_action(action_index)(hidden).squeeze(-1)
             mask = _resolve_sampling_mask(
                 action_mask,
                 action_index,
@@ -705,7 +863,20 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             if deterministic:
                 action = torch.argmax(dist.probs, dim=-1).to(torch.float32)
             else:
-                action = dist.sample().to(torch.float32)
+                # 所有非 deterministic 决策都执行一次 draw。Direct-CF 的固定
+                # prefix/forced target 只替换 draw 的结果，不改变 RNG 消费数量。
+                sampled_action = dist.sample().to(torch.float32)
+                if action_index < len(fixed_prefix):
+                    fixed_value = int(fixed_prefix[action_index])
+                    if not bool(mask_tensor[fixed_value].item()):
+                        raise ValueError("Direct-CF fixed prefix 被当前 action mask 屏蔽。")
+                    action = torch.full_like(sampled_action, float(fixed_value))
+                elif force_action_index is not None and action_index == force_action_index:
+                    if not bool(mask_tensor[force_action_value].item()):
+                        raise ValueError("Direct-CF force action 被当前 action mask 屏蔽。")
+                    action = torch.full_like(sampled_action, float(force_action_value))
+                else:
+                    action = sampled_action
             actions.append(action)
             logits.append(logit)
             probs.append(dist.probs[..., 1])
@@ -736,3 +907,145 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             per_action_logits=logit_tensor.detach().cpu().numpy().astype(np.float64),
             per_action_masks=np.asarray(masks, dtype=bool),
         )
+
+
+class FullSharedActorCritic(ConditionalTriggerActorCritic):
+    """V3 Full Shared Actor used by frozen-policy multi-episode batching.
+
+    The historical shared encoder, autoregressive block and single
+    ``logit_head`` are active.  ``value_head`` remains part of the Actor
+    object for compatibility but is excluded from the Direct-CF optimizer.
+    The trigger-head class above remains available for historical checkpoint
+    loading and read-only diagnostics; it is not this candidate's Actor.
+    """
+
+    architecture_id = FULL_SHARED_ACTOR_ARCHITECTURE_ID
+    architecture_version = FULL_SHARED_ACTOR_ARCHITECTURE_VERSION
+    uses_shared_logit_head = True
+
+
+def actor_architecture_id(policy: Any) -> str:
+    """Return the explicit architecture identifier used by checkpoint metadata."""
+
+    value = getattr(policy, "architecture_id", None)
+    if value is None:
+        return LEGACY_SHARED_HEAD_ARCHITECTURE_ID
+    return str(value)
+
+
+def actor_architecture_metadata(policy: Any) -> dict[str, Any]:
+    """Describe the formal Actor variant without inspecting optimizer state."""
+
+    architecture = actor_architecture_id(policy)
+    if architecture == FULL_SHARED_ACTOR_ARCHITECTURE_ID:
+        trainable_groups = ["encoder", "autoregressive_block", "logit_head"]
+        frozen_groups = ["value_head"]
+    elif architecture == TRIGGER_HEADS_ARCHITECTURE_ID:
+        trainable_groups = ["encoder", "trigger_heads"]
+        frozen_groups = ["autoregressive_block", "value_head"]
+    else:
+        trainable_groups = ["encoder", "autoregressive_block", "logit_head"]
+        frozen_groups = ["value_head"]
+    trigger_heads = getattr(policy, "trigger_heads", None)
+    trigger_head_count = 0 if trigger_heads is None else int(len(trigger_heads))
+    return {
+        "architecture_id": architecture,
+        "architecture_version": int(getattr(policy, "architecture_version", 0)),
+        "class": type(policy).__name__,
+        "action_dim": int(getattr(policy, "action_dim")),
+        "trigger_head_count": trigger_head_count,
+        "trainable_sparse_direct_cf_groups": trainable_groups,
+        "frozen_sparse_direct_cf_groups": frozen_groups,
+    }
+
+
+def configure_sparse_direct_cf_actor_trainability(policy: Any) -> None:
+    """Apply the architecture-specific formal V3 Direct-CF freeze contract."""
+
+    architecture = actor_architecture_id(policy)
+    if architecture not in {
+        TRIGGER_HEADS_ARCHITECTURE_ID,
+        FULL_SHARED_ACTOR_ARCHITECTURE_ID,
+    }:
+        raise RuntimeError(
+            "sparse_direct_cf正式Actor architecture 不受支持："
+            f"{architecture}。"
+        )
+    if architecture == TRIGGER_HEADS_ARCHITECTURE_ID:
+        trainable_prefixes = ("encoder.", "trigger_heads.")
+    else:
+        trainable_prefixes = (
+            "encoder.",
+            "initial_hidden.",
+            "previous_action_embedding.",
+            "action_index_embedding.",
+            "gru_cell.",
+            "logit_head.",
+        )
+    for name, parameter in policy.named_parameters():
+        trainable = name.startswith(trainable_prefixes)
+        parameter.requires_grad_(trainable)
+    trainable_names = [
+        name
+        for name, parameter in policy.named_parameters()
+        if parameter.requires_grad
+    ]
+    if not trainable_names or not all(name.startswith(trainable_prefixes) for name in trainable_names):
+        raise AssertionError("V3 sparse_direct_cf optimizer trainability范围不符合当前Actor architecture。")
+
+
+def sparse_direct_cf_actor_parameters(policy: Any) -> list[Any]:
+    """Return only formal V3 trainable Actor parameters after freeze setup."""
+
+    configure_sparse_direct_cf_actor_trainability(policy)
+    architecture = actor_architecture_id(policy)
+    if architecture == TRIGGER_HEADS_ARCHITECTURE_ID:
+        trainable_prefixes = ("encoder.", "trigger_heads.")
+    elif architecture == FULL_SHARED_ACTOR_ARCHITECTURE_ID:
+        trainable_prefixes = (
+            "encoder.",
+            "initial_hidden.",
+            "previous_action_embedding.",
+            "action_index_embedding.",
+            "gru_cell.",
+            "logit_head.",
+        )
+    else:
+        raise RuntimeError(f"未知 sparse_direct_cf Actor architecture：{architecture}")
+    parameters = [
+        parameter for name, parameter in policy.named_parameters()
+        if name.startswith(trainable_prefixes)
+    ]
+    if not parameters:
+        raise RuntimeError("V3 sparse_direct_cf Actor optimizer参数为空。")
+    return parameters
+
+
+def load_legacy_shared_head_state_dict(
+    policy: Any,
+    legacy_state_dict: dict[str, Any],
+    *,
+    strict: bool = True,
+) -> Any:
+    """Explicitly map a historical shared-head state into all new heads.
+
+    This helper is for read-only historical analysis.  Formal checkpoint
+    loading still requires matching architecture metadata and therefore will
+    not silently resume a legacy shared-head run.
+    """
+
+    if actor_architecture_id(policy) != TRIGGER_HEADS_ARCHITECTURE_ID:
+        raise RuntimeError("legacy shared-head mapping的目标policy不是trigger-head Actor。")
+    source_weight = legacy_state_dict.get("logit_head.weight")
+    source_bias = legacy_state_dict.get("logit_head.bias")
+    if source_weight is None or source_bias is None:
+        raise KeyError("legacy shared-head state_dict缺少logit_head.weight/bias。")
+    mapped = {
+        key: value
+        for key, value in legacy_state_dict.items()
+        if key not in {"logit_head.weight", "logit_head.bias"}
+    }
+    for index in range(int(policy.action_dim)):
+        mapped[f"trigger_heads.{index}.weight"] = copy.deepcopy(source_weight)
+        mapped[f"trigger_heads.{index}.bias"] = copy.deepcopy(source_bias)
+    return policy.load_state_dict(mapped, strict=strict)
