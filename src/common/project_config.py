@@ -170,6 +170,7 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "task.popularity_changes_per_epoch",
     "task.input_relative_jitter",
     "task.load_relative_jitter",
+    "task.master_seed",
     "nodes.sv.cache_capacity_mb",
     "nodes.rsu.cache_capacity_mb",
     "nodes.uav.cache_capacity_mb",
@@ -515,6 +516,38 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("task.arrival_probability 必须位于 [0,1]。")
     if float(get_config_value(config, "task.popularity_zeta")) <= 0.0:
         raise ValueError("task.popularity_zeta 必须大于 0。")
+    dt_s = float(get_config_value(config, "simulation.dt_s"))
+    warmup_s = float(get_config_value(config, "simulation.warmup_time_s"))
+    episode_s = float(get_config_value(config, "simulation.episode_time_s"))
+    if dt_s <= 0.0 or warmup_s < 0.0 or episode_s <= 0.0:
+        raise ValueError("simulation.dt_s/warmup_time_s/episode_time_s 数值范围无效。")
+    for label, duration in (("warmup_time_s", warmup_s), ("episode_time_s", episode_s)):
+        steps = duration / dt_s
+        if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(f"simulation.{label} 必须是 dt_s 的整数倍。")
+    research_count = int(get_config_value(config, "simulation.num_research_vehicles"))
+    service_count = int(get_config_value(config, "simulation.num_service_vehicles"))
+    task_count = int(get_config_value(config, "simulation.num_task_vehicles"))
+    if research_count <= 0 or service_count < 0 or task_count < 0:
+        raise ValueError("simulation 车辆数量范围无效。")
+    if service_count + task_count != research_count:
+        raise ValueError("simulation SV+TV 数量必须等于 research vehicle 数量。")
+    departure_begin = float(
+        get_config_value(config, "simulation.random_trips_departure_begin_s", 0.0)
+    )
+    departure_end = float(
+        get_config_value(config, "simulation.random_trips_departure_end_s", 60.0)
+    )
+    if departure_begin < 0.0 or departure_end <= departure_begin:
+        raise ValueError("randomTrips departure begin/end 配置无效。")
+    if float(get_config_value(config, "simulation.random_trips_period_s", 1.0)) <= 0.0:
+        raise ValueError("simulation.random_trips_period_s 必须大于 0。")
+    if float(get_config_value(config, "simulation.random_trips_min_distance_m", 0.0)) < 0.0:
+        raise ValueError("simulation.random_trips_min_distance_m 不能为负数。")
+    if int(get_config_value(config, "simulation.random_trips_intermediate", 0)) < 0:
+        raise ValueError("simulation.random_trips_intermediate 不能为负数。")
+    if int(get_config_value(config, "simulation.random_trips_maxtries", 1)) <= 0:
+        raise ValueError("simulation.random_trips_maxtries 必须大于 0。")
 
     for key in (
         "nodes.sv.cache_capacity_mb",
@@ -597,7 +630,6 @@ def validate_config(config: dict[str, Any]) -> None:
         "paths.vehicle_roles",
         "paths.prediction_scenarios",
         "paths.sumo_net",
-        "paths.residual_bank",
         "paths.popularity_gru",
         "paths.tv_local_cache",
     ):

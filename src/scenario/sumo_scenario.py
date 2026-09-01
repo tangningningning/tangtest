@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -33,7 +34,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-
 
 # ============================================================================
 # 主场景配置区
@@ -57,10 +57,12 @@ class ScenarioConfig:
     num_service_vehicles: int = 3
     num_task_vehicles: int = 9
     random_seed: int = 4401
+    traffic_seed: int = 4401
 
     # 仅在 data/ 下没有可直接运行的交通需求时使用官方 randomTrips.py。
     random_trips_period_s: float = 1.0
-    random_trips_departure_window_s: float = 60.0
+    random_trips_departure_begin_s: float = 0.0
+    random_trips_departure_end_s: float = 60.0
     random_trips_min_distance_m: float = 4000.0
     random_trips_intermediate: int = 2
     random_trips_maxtries: int = 1000
@@ -106,8 +108,10 @@ class ScenarioConfig:
 
         if self.random_trips_period_s <= 0:
             raise ValueError("randomTrips period 必须大于 0。")
-        if self.random_trips_departure_window_s <= 0:
-            raise ValueError("randomTrips departure window 必须大于 0。")
+        if self.random_trips_departure_begin_s < 0.0:
+            raise ValueError("randomTrips departure begin 不能为负数。")
+        if self.random_trips_departure_end_s <= self.random_trips_departure_begin_s:
+            raise ValueError("randomTrips departure end 必须大于 begin。")
         if self.random_trips_min_distance_m < 0:
             raise ValueError("randomTrips min-distance 不能为负数。")
         if self.random_trips_intermediate < 0:
@@ -178,6 +182,14 @@ def _is_readable_file(path: Path) -> bool:
         return True
     except (OSError, PermissionError):
         return False
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def discover_sumo_files(project_root: Path) -> dict[str, list[Path]]:
@@ -355,6 +367,62 @@ def _source_from_config(config_file: Path) -> TrafficSource | None:
     )
 
 
+def _managed_demand_metadata_path(route_file: Path) -> Path:
+    return route_file.with_name("sumo_demand.meta.json")
+
+
+def _network_metadata_path(project_root: Path, network_file: Path) -> str:
+    return _format_inventory_path(project_root, network_file)
+
+
+def _expected_random_trips_metadata(
+    project_root: Path,
+    network_file: Path,
+    config: ScenarioConfig,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generator": "randomTrips",
+        "network": {
+            "path": _network_metadata_path(project_root, network_file),
+            "sha256": _sha256_file(network_file),
+        },
+        "random_seed": int(config.random_seed),
+        "traffic_seed": int(config.traffic_seed),
+        "period_s": float(config.random_trips_period_s),
+        "departure_begin_s": float(config.random_trips_departure_begin_s),
+        "departure_end_s": float(config.random_trips_departure_end_s),
+        "min_distance_m": float(config.random_trips_min_distance_m),
+        "intermediate": int(config.random_trips_intermediate),
+        "maxtries": int(config.random_trips_maxtries),
+        "vehicle_class": "passenger",
+    }
+
+
+def _load_demand_metadata(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _managed_demand_matches(
+    project_root: Path,
+    route_file: Path,
+    network_file: Path,
+    config: ScenarioConfig,
+) -> bool:
+    if not _is_readable_file(route_file):
+        return False
+    metadata = _load_demand_metadata(_managed_demand_metadata_path(route_file))
+    expected = _expected_random_trips_metadata(project_root, network_file, config)
+    if metadata is None:
+        return False
+    return all(metadata.get(key) == value for key, value in expected.items())
+
+
 def _choose_network(
     project_root: Path,
     inventory: dict[str, list[Path]],
@@ -403,9 +471,12 @@ def _choose_existing_source(
         return TrafficSource(network_file=network, route_files=routes)
 
     # 先尝试已有配置；配置中的相对路径以 .sumocfg 所在目录为基准。
+    managed_route = (
+        project_root / "data" / "generated" / "sumo_demand.rou.xml"
+    ).resolve(strict=False)
     for config_file in inventory["configurations"]:
         source = _source_from_config(config_file)
-        if source is not None:
+        if source is not None and managed_route not in source.route_files:
             return source
 
     network = _choose_network(project_root, inventory, None)
@@ -415,11 +486,11 @@ def _choose_existing_source(
     candidates = [
         path
         for path in inventory["route_files"]
-        if path.parent != generated_dir
+        if path.parent != generated_dir and path != managed_route
     ] + [
         path
         for path in inventory["route_files"]
-        if path.parent == generated_dir
+        if path.parent == generated_dir and path != managed_route
     ]
     for route_file in candidates:
         if _is_readable_file(route_file):
@@ -438,27 +509,23 @@ def generate_random_trips(
     """调用 SUMO 官方 randomTrips.py 生成独立的 .rou.xml 需求文件。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     route_file = (output_dir / "sumo_demand.rou.xml").resolve(strict=False)
+    metadata_file = _managed_demand_metadata_path(route_file)
 
     if route_file.exists():
-        if _is_readable_file(route_file):
+        if not _is_readable_file(route_file):
+            raise PermissionError(f"已有生成需求文件不可读，不覆盖它：{route_file}")
+        if _managed_demand_matches(project_root, route_file, network_file, config):
             print(f"复用本模块之前生成的交通需求：{route_file}")
             return TrafficSource(
                 network_file=network_file,
                 route_files=(route_file,),
                 generated_by_random_trips=True,
             )
-        raise PermissionError(f"已有生成需求文件不可读，不覆盖它：{route_file}")
+        print("已有 randomTrips 需求的 metadata 与当前配置不匹配，将重新生成。")
 
     random_trips = sumo_home / "tools" / "randomTrips.py"
     if not random_trips.is_file():
         raise FileNotFoundError(f"SUMO 官方 randomTrips.py 不存在：{random_trips}")
-
-    # 让至少一批车辆在 warm-up 前后进入路网；后续所有车辆仍由 SUMO 正常运行。
-    departure_end = max(
-        config.warmup_time_s,
-        config.random_trips_departure_window_s,
-        config.dt_s,
-    )
 
     command = [
         sys.executable,
@@ -468,15 +535,15 @@ def generate_random_trips(
         "-o",
         "{trip_file}",
         "-r",
-        str(route_file),
+        "{route_file}",
         "-b",
-        "0",
+        f"{config.random_trips_departure_begin_s:.9g}",
         "-e",
-        f"{departure_end:.9g}",
+        f"{config.random_trips_departure_end_s:.9g}",
         "-p",
         f"{config.random_trips_period_s:.9g}",
         "-s",
-        str(config.random_seed),
+        str(config.traffic_seed),
         "--min-distance",
         f"{config.random_trips_min_distance_m:.9g}",
         "-i",
@@ -493,18 +560,40 @@ def generate_random_trips(
     print("没有可直接运行的可读交通需求，调用 SUMO 官方 randomTrips.py ...")
     with tempfile.TemporaryDirectory(prefix="sumo_randomTrips_") as temporary:
         trip_file = Path(temporary) / "sumo_demand.trips.xml"
-        command = [str(trip_file) if item == "{trip_file}" else item for item in command]
+        generated_route = Path(temporary) / "sumo_demand.rou.xml"
+        command = [
+            str(trip_file)
+            if item == "{trip_file}"
+            else str(generated_route)
+            if item == "{route_file}"
+            else item
+            for item in command
+        ]
         subprocess.run(
             command,
             cwd=project_root,
             env=environment,
             check=True,
         )
+        if not _is_readable_file(generated_route):
+            raise RuntimeError(
+                "randomTrips.py 执行结束但没有生成可读临时路线文件。"
+            )
+        generated_route.replace(route_file)
 
     if not _is_readable_file(route_file):
         raise RuntimeError(
             f"randomTrips.py 执行结束但没有生成可读路线文件：{route_file}"
         )
+
+    metadata = _expected_random_trips_metadata(project_root, network_file, config)
+
+    def write_metadata(path: Path) -> None:
+        with path.open("w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+
+    _atomic_write(metadata_file, write_metadata)
 
     return TrafficSource(
         network_file=network_file,
@@ -653,7 +742,7 @@ def collect_trajectories(
 
 
 # ============================================================================
-# 正式区间完整轨迹筛选和路线分层角色选择
+# 正式区间完整轨迹筛选和固定 seed 随机角色选择
 # ============================================================================
 
 
@@ -702,15 +791,19 @@ def find_complete_vehicles(
     route_cache: dict[str, dict[str, Any]],
     config: ScenarioConfig,
 ) -> tuple[list[str], dict[str, dict[str, Any]], set[int]]:
-    """只保留正式区间每个时隙都有有效记录的车辆。"""
+    """保留正式区间完整且有至少一条 warm-up 历史记录的车辆。"""
     formal_steps = _formal_step_keys(config)
+    formal_start = min(formal_steps)
     rows_by_vehicle: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
+    preformal_by_vehicle: dict[str, set[int]] = defaultdict(set)
 
     for row in rows:
         step = _step_key(float(row["time_s"]), config.dt_s)
+        vehicle_id = str(row["vehicle_id"])
+        if step < formal_start and _valid_trajectory_row(row):
+            preformal_by_vehicle[vehicle_id].add(step)
         if step not in formal_steps:
             continue
-        vehicle_id = str(row["vehicle_id"])
         # 同一车辆同一正式时隙出现重复记录时，视为不完整而不是静默覆盖。
         if step in rows_by_vehicle[vehicle_id]:
             rows_by_vehicle[vehicle_id][step] = {
@@ -731,6 +824,10 @@ def find_complete_vehicles(
             for row in time_rows.values()
         ):
             continue
+        if formal_start > 0 and not preformal_by_vehicle.get(vehicle_id):
+            # origin=0 的 posterior cutoff 是 formal_start-1；没有 warm-up
+            # 观测的车辆不能进入正式 research 集合。
+            continue
 
         complete_ids.append(vehicle_id)
         route = route_cache.get(vehicle_id, {})
@@ -739,29 +836,19 @@ def find_complete_vehicles(
         metadata[vehicle_id] = {
             "route_id": route_id,
             "route_edges": route_edges,
-            "route_group": route_group_key(route_id, route_edges),
             "formal_record_count": len(time_rows),
+            "preformal_record_count": len(preformal_by_vehicle.get(vehicle_id, set())),
         }
 
     return complete_ids, metadata, formal_steps
 
 
-def route_group_key(route_id: str, route_edges: tuple[str, ...]) -> str:
-    """优先按 route_id 分组；缺少 route_id 时按完整 edge sequence 分组。"""
-    if route_id.strip():
-        return f"route_id:{route_id}"
-    if route_edges:
-        return "edges:" + " ".join(route_edges)
-    return "unknown"
-
-
-def stratified_random_choice(
+def fixed_seed_random_choice(
     vehicle_ids: Iterable[str],
-    route_metadata: dict[str, dict[str, Any]],
     count: int,
     seed: int,
 ) -> list[str]:
-    """路线分层、组内固定 seed 随机选择；不读取任何任务或效用信息。"""
+    """从完整候选集合中固定 seed 随机抽样；不读取 route 分组、任务或效用。"""
     candidates = sorted(set(str(vehicle_id) for vehicle_id in vehicle_ids))
     if len(candidates) < count:
         raise ValueError(
@@ -769,28 +856,8 @@ def stratified_random_choice(
         )
     if count == 0:
         return []
-
-    grouped: dict[str, list[str]] = defaultdict(list)
-    for vehicle_id in candidates:
-        group = str(route_metadata.get(vehicle_id, {}).get("route_group", "unknown"))
-        grouped[group].append(vehicle_id)
-
     rng = random.Random(seed)
-    group_keys = sorted(grouped)
-    rng.shuffle(group_keys)
-
-    selected: list[str] = []
-    for group in group_keys[: min(count, len(group_keys))]:
-        members = sorted(grouped[group])
-        selected.append(rng.choice(members))
-
-    if len(selected) < count:
-        selected_set = set(selected)
-        remaining = [vehicle_id for vehicle_id in candidates if vehicle_id not in selected_set]
-        rng.shuffle(remaining)
-        selected.extend(remaining[: count - len(selected)])
-
-    return selected
+    return rng.sample(candidates, count)
 
 
 def build_role_assignments(
@@ -799,33 +866,29 @@ def build_role_assignments(
     seen_vehicle_ids: set[str],
     config: ScenarioConfig,
 ) -> tuple[dict[str, Any], bool]:
-    """先选 12 辆研究车辆，再在其中固定选择 3 辆 SV。"""
-    research = stratified_random_choice(
+    """先从完整候选中固定 seed 抽 research，再从 research 抽 SV。"""
+    research = fixed_seed_random_choice(
         complete_ids,
-        route_metadata,
         config.num_research_vehicles,
         config.random_seed,
     )
 
     # 同一个输入和 seed 重复选择，用于本次最小验证中的可复现性断言。
-    research_repeat = stratified_random_choice(
+    research_repeat = fixed_seed_random_choice(
         complete_ids,
-        route_metadata,
         config.num_research_vehicles,
         config.random_seed,
     )
     if research != research_repeat:
         raise AssertionError("相同 seed 的研究车辆选择不一致。")
 
-    service = stratified_random_choice(
+    service = fixed_seed_random_choice(
         research,
-        route_metadata,
         config.num_service_vehicles,
         config.random_seed + 1,
     )
-    service_repeat = stratified_random_choice(
+    service_repeat = fixed_seed_random_choice(
         research,
-        route_metadata,
         config.num_service_vehicles,
         config.random_seed + 1,
     )
@@ -841,8 +904,8 @@ def build_role_assignments(
         vehicle_id: {
             "route_id": route_metadata[vehicle_id]["route_id"],
             "route_edges": list(route_metadata[vehicle_id]["route_edges"]),
-            "route_group": route_metadata[vehicle_id]["route_group"],
             "formal_record_count": route_metadata[vehicle_id]["formal_record_count"],
+            "preformal_record_count": route_metadata[vehicle_id]["preformal_record_count"],
         }
         for vehicle_id in research
     }
@@ -861,6 +924,10 @@ def build_role_assignments(
         "num_service_vehicles": config.num_service_vehicles,
         "num_task_vehicles": config.num_task_vehicles,
         "formal_time_slot_count": len(_formal_step_keys(config)),
+        "selection_method": "fixed_seed_random_choice",
+        "research_selection_seed": config.random_seed,
+        "service_selection_seed": config.random_seed + 1,
+        "complete_candidate_count": len(complete_ids),
         "planned_routes": planned_routes,
     }
     return roles, True
@@ -919,6 +986,7 @@ def validate_outputs(
         trajectory_ids: set[str] = set()
         row_count = 0
         previous_time = -math.inf
+        formal_rows_by_vehicle: dict[str, dict[int, int]] = defaultdict(dict)
         for row in reader:
             row_count += 1
             vehicle_id = row["vehicle_id"]
@@ -927,6 +995,10 @@ def validate_outputs(
             if current_time < previous_time - 1e-9:
                 raise AssertionError("trajectory.csv 的 time_s 不是单调不减。")
             previous_time = current_time
+            step = _step_key(current_time, config.dt_s)
+            if step in _formal_step_keys(config):
+                per_vehicle = formal_rows_by_vehicle.setdefault(vehicle_id, {})
+                per_vehicle[step] = per_vehicle.get(step, 0) + 1
 
     if row_count == 0:
         raise AssertionError("trajectory.csv 为空。")
@@ -959,6 +1031,15 @@ def validate_outputs(
         raise AssertionError("角色文件没有覆盖 trajectory.csv 中的全部车辆。")
     if not research_set.issubset(set(complete_ids)):
         raise AssertionError("研究车辆中存在正式 episode 轨迹不完整的车辆。")
+    formal_steps = _formal_step_keys(config)
+    for vehicle_id in research:
+        per_vehicle = formal_rows_by_vehicle.get(vehicle_id, {})
+        if set(per_vehicle) != formal_steps or any(
+            count != 1 for count in per_vehicle.values()
+        ):
+            raise AssertionError(
+                f"research vehicle {vehicle_id} 未覆盖正式 slot 0...{len(formal_steps) - 1}。"
+            )
 
     all_role_ids = research_set | background_set
     if not all_role_ids.issubset(trajectory_ids):
@@ -973,6 +1054,12 @@ def validate_outputs(
         "task_vehicle_count": len(task),
         "roles_disjoint": True,
         "seed_selection_reproducible": True,
+        "formal_time_slot_count": len(formal_steps),
+        "research_formal_records_exactly_once": True,
+        "research_has_preformal_history": all(
+            int(roles["planned_routes"][vehicle_id].get("preformal_record_count", 0)) > 0
+            for vehicle_id in research
+        ),
     }
 
 
@@ -985,39 +1072,46 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SUMO 完整交通生成、TraCI 轨迹采集和固定 TV/SV 角色划分。"
     )
-    parser.add_argument("--dt", type=float, default=DEFAULT_CONFIG.dt_s)
+    parser.add_argument("--dt", type=float, default=None)
     parser.add_argument(
         "--warmup-time",
         type=float,
-        default=DEFAULT_CONFIG.warmup_time_s,
+        default=None,
         help="warm-up 时长，单位秒。",
     )
     parser.add_argument(
         "--episode-time",
         type=float,
-        default=DEFAULT_CONFIG.episode_time_s,
+        default=None,
         help="正式 episode 时长，单位秒。",
     )
     parser.add_argument(
         "--num-research-vehicles",
         type=int,
-        default=DEFAULT_CONFIG.num_research_vehicles,
+        default=None,
     )
     parser.add_argument(
         "--num-service-vehicles",
         type=int,
-        default=DEFAULT_CONFIG.num_service_vehicles,
+        default=None,
     )
     parser.add_argument(
         "--num-task-vehicles",
         type=int,
-        default=DEFAULT_CONFIG.num_task_vehicles,
+        default=None,
     )
     parser.add_argument(
         "--random-seed",
         type=int,
-        default=DEFAULT_CONFIG.random_seed,
+        default=None,
     )
+    parser.add_argument("--traffic-seed", type=int, default=None)
+    parser.add_argument("--departure-begin", type=float, default=None)
+    parser.add_argument("--departure-end", type=float, default=None)
+    parser.add_argument("--random-trips-period", type=float, default=None)
+    parser.add_argument("--random-trips-min-distance", type=float, default=None)
+    parser.add_argument("--random-trips-intermediate", type=int, default=None)
+    parser.add_argument("--random-trips-maxtries", type=int, default=None)
     parser.add_argument("--sumo-home", default=None)
     parser.add_argument("--sumo-config", default=None)
     parser.add_argument("--net-file", default=None)
@@ -1027,20 +1121,150 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=[],
         help="显式指定 route/trips 文件；可重复传入。",
     )
-    parser.add_argument("--output-dir", default="data/generated")
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--gui", action="store_true", help="使用 sumo-gui。")
     return parser
 
 
-def config_from_arguments(args: argparse.Namespace) -> ScenarioConfig:
+def config_from_arguments(
+    args: argparse.Namespace,
+    project_config: dict[str, Any] | None = None,
+) -> ScenarioConfig:
+    if project_config is None:
+        base = DEFAULT_CONFIG
+    else:
+        from common import project_config as project_config_module
+
+        get_value = project_config_module.get_config_value
+        base = ScenarioConfig(
+            dt_s=float(get_value(project_config, "simulation.dt_s", DEFAULT_CONFIG.dt_s)),
+            warmup_time_s=float(
+                get_value(
+                    project_config,
+                    "simulation.warmup_time_s",
+                    DEFAULT_CONFIG.warmup_time_s,
+                )
+            ),
+            episode_time_s=float(
+                get_value(
+                    project_config,
+                    "simulation.episode_time_s",
+                    DEFAULT_CONFIG.episode_time_s,
+                )
+            ),
+            num_research_vehicles=int(
+                get_value(
+                    project_config,
+                    "simulation.num_research_vehicles",
+                    DEFAULT_CONFIG.num_research_vehicles,
+                )
+            ),
+            num_service_vehicles=int(
+                get_value(
+                    project_config,
+                    "simulation.num_service_vehicles",
+                    DEFAULT_CONFIG.num_service_vehicles,
+                )
+            ),
+            num_task_vehicles=int(
+                get_value(
+                    project_config,
+                    "simulation.num_task_vehicles",
+                    DEFAULT_CONFIG.num_task_vehicles,
+                )
+            ),
+            random_seed=int(
+                get_value(
+                    project_config,
+                    "simulation.sumo_seed",
+                    DEFAULT_CONFIG.random_seed,
+                )
+            ),
+            traffic_seed=int(
+                get_value(
+                    project_config,
+                    "simulation.traffic_seed",
+                    DEFAULT_CONFIG.traffic_seed,
+                )
+            ),
+            random_trips_period_s=float(
+                get_value(
+                    project_config,
+                    "simulation.random_trips_period_s",
+                    DEFAULT_CONFIG.random_trips_period_s,
+                )
+            ),
+            random_trips_departure_begin_s=float(
+                get_value(
+                    project_config,
+                    "simulation.random_trips_departure_begin_s",
+                    DEFAULT_CONFIG.random_trips_departure_begin_s,
+                )
+            ),
+            random_trips_departure_end_s=float(
+                get_value(
+                    project_config,
+                    "simulation.random_trips_departure_end_s",
+                    DEFAULT_CONFIG.random_trips_departure_end_s,
+                )
+            ),
+            random_trips_min_distance_m=float(
+                get_value(
+                    project_config,
+                    "simulation.random_trips_min_distance_m",
+                    DEFAULT_CONFIG.random_trips_min_distance_m,
+                )
+            ),
+            random_trips_intermediate=int(
+                get_value(
+                    project_config,
+                    "simulation.random_trips_intermediate",
+                    DEFAULT_CONFIG.random_trips_intermediate,
+                )
+            ),
+            random_trips_maxtries=int(
+                get_value(
+                    project_config,
+                    "simulation.random_trips_maxtries",
+                    DEFAULT_CONFIG.random_trips_maxtries,
+                )
+            ),
+        )
+
+    def choose(name: str, value: Any) -> Any:
+        return getattr(base, name) if value is None else value
+
     return ScenarioConfig(
-        dt_s=args.dt,
-        warmup_time_s=args.warmup_time,
-        episode_time_s=args.episode_time,
-        num_research_vehicles=args.num_research_vehicles,
-        num_service_vehicles=args.num_service_vehicles,
-        num_task_vehicles=args.num_task_vehicles,
-        random_seed=args.random_seed,
+        dt_s=choose("dt_s", args.dt),
+        warmup_time_s=choose("warmup_time_s", args.warmup_time),
+        episode_time_s=choose("episode_time_s", args.episode_time),
+        num_research_vehicles=choose(
+            "num_research_vehicles", args.num_research_vehicles
+        ),
+        num_service_vehicles=choose(
+            "num_service_vehicles", args.num_service_vehicles
+        ),
+        num_task_vehicles=choose("num_task_vehicles", args.num_task_vehicles),
+        random_seed=choose("random_seed", args.random_seed),
+        traffic_seed=choose("traffic_seed", args.traffic_seed),
+        random_trips_period_s=choose(
+            "random_trips_period_s", args.random_trips_period
+        ),
+        random_trips_departure_begin_s=choose(
+            "random_trips_departure_begin_s", args.departure_begin
+        ),
+        random_trips_departure_end_s=choose(
+            "random_trips_departure_end_s", args.departure_end
+        ),
+        random_trips_min_distance_m=choose(
+            "random_trips_min_distance_m", args.random_trips_min_distance
+        ),
+        random_trips_intermediate=choose(
+            "random_trips_intermediate", args.random_trips_intermediate
+        ),
+        random_trips_maxtries=choose(
+            "random_trips_maxtries", args.random_trips_maxtries
+        ),
     )
 
 
@@ -1050,7 +1274,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         project_root = find_project_root()
-        config = config_from_arguments(args)
+        from common import project_config as project_config_module
+
+        formal_config = project_config_module.load_config()
+        config = config_from_arguments(args, formal_config)
         config.validate()
 
         inventory = discover_sumo_files(project_root)
@@ -1063,13 +1290,35 @@ def main(argv: list[str] | None = None) -> int:
             project_root=project_root,
             inventory=inventory,
             explicit_config=args.sumo_config,
-            explicit_network=args.net_file,
+            explicit_network=args.net_file
+            or project_config_module.get_config_value(
+                formal_config,
+                "paths.sumo_net",
+            ),
             explicit_routes=args.route_file,
         )
-        output_dir = _resolve_from_project(project_root, args.output_dir)
+        output_dir = _resolve_from_project(
+            project_root,
+            args.output_dir
+            or Path(
+                project_config_module.get_config_value(
+                    formal_config,
+                    "paths.vehicle_roles",
+                    "data/generated/vehicle_roles.json",
+                )
+            ).parent,
+        )
 
         if source is None:
-            network = _choose_network(project_root, inventory, args.net_file)
+            network = _choose_network(
+                project_root,
+                inventory,
+                args.net_file
+                or project_config_module.get_config_value(
+                    formal_config,
+                    "paths.sumo_net",
+                ),
+            )
             source = generate_random_trips(
                 project_root=project_root,
                 sumo_home=sumo_home,

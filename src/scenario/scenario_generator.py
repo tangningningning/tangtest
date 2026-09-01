@@ -24,9 +24,15 @@ from typing import Any
 import numpy as np
 import torch
 
+from common import project_config as project_config_module
 from scenario import popularity_prediction as pop
 from scenario import vehicle_prediction as veh
-from scenario.task_scenario import TaskConfig, catalog_by_id, load_json
+from scenario.task_scenario import (
+    TaskConfig,
+    catalog_by_id,
+    load_json,
+    task_config_from_project_config,
+)
 
 
 # ============================================================================
@@ -97,14 +103,48 @@ def load_residual_bank(path: Path) -> dict[str, Any]:
     loaded = np.load(path, allow_pickle=False)
     try:
         metadata = json.loads(str(loaded["metadata_json"].item()))
+        schema_version = int(metadata.get("schema_version", 0))
+        calibration_scope = str(metadata.get("calibration_scope", ""))
+        if (
+            schema_version < 2
+            or metadata.get("artifact_type") != "vehicle_calibration_residual_bank"
+            or calibration_scope != "independent_calibration_trajectory"
+        ):
+            raise ValueError(
+                "residual bank 不是独立 calibration artifact；"
+                "禁止把 formal episode 单集 residual bank 用于正式场景。"
+            )
+        source_metadata = metadata.get("source")
+        if not isinstance(source_metadata, dict) or not source_metadata.get(
+            "roles_path"
+        ) or not source_metadata.get("trajectory_path"):
+            raise ValueError("独立 residual bank metadata 缺少 calibration source 路径。")
+        residual_blocks = np.asarray(loaded["residual_blocks"], dtype=np.float64)
+        horizon_steps = int(np.asarray(loaded["H_p"]).item())
+        vehicle_ids = np.asarray(loaded["vehicle_ids"]).astype(str)
+        origin_slots = np.asarray(loaded["origin_slots"], dtype=np.int64)
+        q = np.asarray(loaded["Q"], dtype=np.float64)
+        r = np.asarray(loaded["R"], dtype=np.float64)
+        if residual_blocks.ndim != 3 or residual_blocks.shape[2] != 2:
+            raise ValueError("独立 residual bank 的 residual_blocks shape 无效。")
+        if horizon_steps <= 0 or residual_blocks.shape[1] != horizon_steps:
+            raise ValueError("独立 residual bank 的 H_p 与 residual_blocks shape 不一致。")
+        if len(vehicle_ids) != len(residual_blocks) or len(origin_slots) != len(residual_blocks):
+            raise ValueError("独立 residual bank 的 block 元数据长度不一致。")
+        if q.shape != (3, 3) or r.shape != (2, 2):
+            raise ValueError("独立 residual bank 的 Q/R shape 无效。")
+        if not np.all(np.isfinite(residual_blocks)) or not np.all(
+            np.isfinite(q)
+        ) or not np.all(np.isfinite(r)):
+            raise ValueError("独立 residual bank 的 Q/R/residual_blocks 含 NaN/Inf。")
         return {
-            "residual_blocks": np.asarray(loaded["residual_blocks"], dtype=np.float64),
-            "vehicle_ids": np.asarray(loaded["vehicle_ids"]).astype(str),
-            "origin_slots": np.asarray(loaded["origin_slots"], dtype=np.int64),
-            "H_p": int(np.asarray(loaded["H_p"]).item()),
+            "residual_blocks": residual_blocks,
+            "vehicle_ids": vehicle_ids,
+            "origin_slots": origin_slots,
+            "H_p": horizon_steps,
             "dt": float(np.asarray(loaded["dt"]).item()),
-            "Q": np.asarray(loaded["Q"], dtype=np.float64),
-            "R": np.asarray(loaded["R"], dtype=np.float64),
+            "Q": q,
+            "R": r,
             "noise_sigma_q": float(np.asarray(loaded["noise_sigma_q"]).item()),
             "noise_sigma_u": float(np.asarray(loaded["noise_sigma_u"]).item()),
             "observation_noise_seed": int(
@@ -138,6 +178,38 @@ def read_request_counts(path: Path) -> tuple[np.ndarray, list[float]]:
     return counts, times
 
 
+def read_history_request_counts(path: Path) -> tuple[np.ndarray, list[int]]:
+    rows: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = {"history_index", "formal_slot", "service_id", "request_count"}
+        if not required.issubset(reader.fieldnames or ()):
+            raise ValueError("popularity_history.csv 缺少 request_count 所需字段。")
+        rows.extend(reader)
+    history_indices = sorted({int(row["history_index"]) for row in rows})
+    formal_slots = sorted({int(row["formal_slot"]) for row in rows})
+    services = sorted({int(row["service_id"]) for row in rows})
+    if history_indices != list(range(len(history_indices))):
+        raise ValueError("popularity_history.csv 的 history_index 必须从 0 连续编号。")
+    if formal_slots != [index - len(history_indices) for index in history_indices]:
+        raise ValueError("popularity_history.csv 的 formal_slot 与 history_index 不一致。")
+    if services != list(range(len(services))):
+        raise ValueError("popularity_history.csv 的 service_id 必须从 0 连续编号。")
+    counts = np.zeros((len(history_indices), len(services)), dtype=np.float64)
+    seen: set[tuple[int, int]] = set()
+    for row in rows:
+        history_index = int(row["history_index"])
+        service_id = int(row["service_id"])
+        key = (history_index, service_id)
+        if key in seen:
+            raise ValueError("popularity_history.csv 存在重复 history_index/service_id。")
+        seen.add(key)
+        counts[history_index, service_id] = float(row["request_count"])
+    if len(seen) != len(history_indices) * len(services):
+        raise ValueError("popularity_history.csv 没有覆盖完整 history x service 网格。")
+    return counts, formal_slots
+
+
 # ============================================================================
 # 车辆 nominal prediction
 # ============================================================================
@@ -153,6 +225,7 @@ def build_vehicle_nominal_predictions(
     sumo_home_arg: str | None,
     origin_slots: np.ndarray,
     horizon_steps: int,
+    prediction_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, veh.RouteGeometry], dict[str, dict[int, veh.TruthSample]]]:
     dt_s = float(roles.get("dt", residual_bank["dt"]))
     warmup_s = float(roles.get("warmup_time", 100.0))
@@ -201,8 +274,8 @@ def build_vehicle_nominal_predictions(
     tangents = np.zeros_like(nominal_xy)
     warmup_step = int(round(warmup_s / dt_s))
     for origin_index, origin_slot in enumerate(origin_slots.tolist()):
-        if origin_slot + horizon_steps > num_slots:
-            raise ValueError("origin_slot 越界，无法生成完整 H_p。")
+        if origin_slot < 0 or origin_slot >= num_slots:
+            raise ValueError("origin_slot 不在 formal episode 范围内。")
         cutoff_abs_step = warmup_step + origin_slot - 1
         for vehicle_index, vehicle_id in enumerate(research_ids):
             posterior = veh.state_at_cutoff(
@@ -217,6 +290,41 @@ def build_vehicle_nominal_predictions(
                 dt_s,
             )
             for horizon, item in enumerate(nominal):
+                if prediction_rows is not None:
+                    target_slot = int(origin_slot + horizon)
+                    prediction_rows.append(
+                        {
+                            "origin_slot": int(origin_slot),
+                            "origin_time_s": round(
+                                warmup_s + origin_slot * dt_s,
+                                9,
+                            ),
+                            "observation_cutoff_slot": int(origin_slot - 1),
+                            "observation_cutoff_time_s": round(
+                                warmup_s + (origin_slot - 1) * dt_s,
+                                9,
+                            ),
+                            "vehicle_id": vehicle_id,
+                            "horizon": int(horizon),
+                            "target_slot": target_slot,
+                            "target_time_s": round(
+                                warmup_s + target_slot * dt_s,
+                                9,
+                            ),
+                            "s_pred": float(item["s_pred"]),
+                            "x_pred": float(item["x_pred"]),
+                            "y_pred": float(item["y_pred"]),
+                            # 这是供正式执行器读取的 causal prediction
+                            # artifact；不把 formal future truth 写入其中。
+                            "s_true": "",
+                            "x_true": "",
+                            "y_true": "",
+                            "longitudinal_error": "",
+                            "lateral_error": "",
+                            "e_parallel": "",
+                            "e_perp": "",
+                        }
+                    )
                 nominal_xy[origin_index, horizon, vehicle_index] = [
                     float(item["x_pred"]),
                     float(item["y_pred"]),
@@ -398,6 +506,7 @@ def sample_positions(
 
 def predict_rho_hat(
     checkpoint_file: Path,
+    history_request_counts: np.ndarray,
     request_counts: np.ndarray,
     origin_slots: np.ndarray,
     config: ScenarioConfig,
@@ -410,14 +519,14 @@ def predict_rho_hat(
     history_length = int(checkpoint_metadata["L_rho"])
     beta_rho = float(checkpoint_metadata["beta_rho"])
     alpha_rho = float(checkpoint_metadata["alpha_rho"])
-    rho_obs = pop.build_ewma_rho_obs(request_counts, beta_rho, alpha_rho)
-    inputs = np.stack(
-        [
-            rho_obs[origin - history_length : origin]
-            for origin in origin_slots.tolist()
-        ],
-        axis=0,
-    ).astype(np.float32)
+    inputs, _ = pop.build_causal_formal_inputs(
+        history_request_counts,
+        request_counts,
+        history_length,
+        beta_rho,
+        alpha_rho,
+        origin_slots,
+    )
     rho_hat = pop.predict_probabilities(
         model,
         inputs,
@@ -429,7 +538,15 @@ def predict_rho_hat(
     return rho_hat.astype(np.float32), checkpoint_metadata
 
 
-def task_config_from_catalog(catalog_json: dict[str, Any]) -> TaskConfig:
+def task_config_from_catalog(
+    catalog_json: dict[str, Any],
+    project_config: dict[str, Any] | None = None,
+) -> TaskConfig:
+    if project_config is not None:
+        config = task_config_from_project_config(project_config)
+        if int(catalog_json["service_count"]) != config.num_services:
+            raise ValueError("service_catalog.json 的 service_count 与 system_config.toml 不一致。")
+        return config
     generation = catalog_json.get("generation_config", {})
     return TaskConfig(
         num_services=int(catalog_json["service_count"]),
@@ -438,6 +555,9 @@ def task_config_from_catalog(catalog_json: dict[str, Any]) -> TaskConfig:
         popularity_epoch_length=int(generation.get("popularity_epoch_length", 20)),
         popularity_changes_per_epoch=int(
             generation.get("popularity_changes_per_epoch", 1)
+        ),
+        popularity_history_length=int(
+            generation.get("popularity_history_length", 20)
         ),
         input_relative_jitter=float(generation.get("input_relative_jitter", 0.2)),
         load_relative_jitter=float(generation.get("load_relative_jitter", 0.1)),
@@ -546,37 +666,45 @@ def relative_distance_sanity(
                 tv_pred = positions_xy[
                     origin_index, :, horizon, vehicle_index[tv_id], :
                 ].astype(np.float64)
-                tv_true = np.asarray(
-                    [
-                        truth_index[tv_id][target_slot].x_m,
-                        truth_index[tv_id][target_slot].y_m,
-                    ],
-                    dtype=np.float64,
-                )
                 for sv_id in sv_ids:
                     sv_pred = positions_xy[
                         origin_index, :, horizon, vehicle_index[sv_id], :
                     ].astype(np.float64)
-                    sv_true = np.asarray(
-                        [
-                            truth_index[sv_id][target_slot].x_m,
-                            truth_index[sv_id][target_slot].y_m,
-                        ],
-                        dtype=np.float64,
-                    )
                     pred_distances.extend(
                         np.linalg.norm(tv_pred - sv_pred, axis=1).tolist()
                     )
-                    true_distances.append(float(np.linalg.norm(tv_true - sv_true)))
+                    tv_truth = truth_index[tv_id].get(target_slot)
+                    sv_truth = truth_index[sv_id].get(target_slot)
+                    if tv_truth is not None and sv_truth is not None:
+                        tv_true = np.asarray(
+                            [tv_truth.x_m, tv_truth.y_m],
+                            dtype=np.float64,
+                        )
+                        sv_true = np.asarray(
+                            [sv_truth.x_m, sv_truth.y_m],
+                            dtype=np.float64,
+                        )
+                        true_distances.append(
+                            float(np.linalg.norm(tv_true - sv_true))
+                        )
     pred_array = np.asarray(pred_distances, dtype=np.float64)
     true_array = np.asarray(true_distances, dtype=np.float64)
+    if pred_array.size == 0:
+        raise AssertionError("relative distance sanity 没有预测距离样本。")
     return {
         "pred_mean_relative_distance_m": float(np.mean(pred_array)),
         "pred_std_relative_distance_m": float(np.std(pred_array)),
-        "true_mean_relative_distance_m": float(np.mean(true_array)),
-        "true_std_relative_distance_m": float(np.std(true_array)),
+        "true_mean_relative_distance_m": float(np.mean(true_array))
+        if true_array.size
+        else 0.0,
+        "true_std_relative_distance_m": float(np.std(true_array))
+        if true_array.size
+        else 0.0,
         "pred_v2v_reachable_rate": float(np.mean(pred_array <= v2v_range_m)),
-        "true_v2v_reachable_rate": float(np.mean(true_array <= v2v_range_m)),
+        "true_v2v_reachable_rate": float(np.mean(true_array <= v2v_range_m))
+        if true_array.size
+        else 0.0,
+        "true_distance_sample_count": float(true_array.size),
         "v2v_range_m": float(v2v_range_m),
     }
 
@@ -644,108 +772,276 @@ def save_npz(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="生成 S 个未来预测场景 Xi_pred。")
-    parser.add_argument("--roles-file", default="data/generated/vehicle_roles.json")
-    parser.add_argument("--trajectory-file", default="data/generated/trajectory.csv")
-    parser.add_argument("--popularity-file", default="data/generated/popularity.csv")
-    parser.add_argument("--service-catalog-file", default="data/generated/service_catalog.json")
-    parser.add_argument("--residual-file", default="data/generated/residual_blocks.npz")
-    parser.add_argument("--gru-checkpoint", default="data/generated/popularity_gru.pt")
-    parser.add_argument("--output-file", default="data/generated/prediction_scenarios.npz")
+    parser.add_argument("--roles-file", default=None)
+    parser.add_argument("--trajectory-file", default=None)
+    parser.add_argument("--popularity-file", default=None)
+    parser.add_argument("--popularity-history-file", default=None)
+    parser.add_argument("--service-catalog-file", default=None)
+    parser.add_argument("--residual-file", default=None)
+    parser.add_argument("--gru-checkpoint", default=None)
+    parser.add_argument("--output-file", default=None)
+    parser.add_argument("--vehicle-prediction-file", default=None)
     parser.add_argument("--net-file", default=None)
     parser.add_argument("--sumo-home", default=None)
-    parser.add_argument("--horizon", type=int, default=DEFAULT_CONFIG.horizon_steps)
-    parser.add_argument("--num-scenarios", type=int, default=DEFAULT_CONFIG.num_scenarios)
-    parser.add_argument("--scenario-seed", type=int, default=DEFAULT_CONFIG.scenario_seed)
+    parser.add_argument("--horizon", type=int, default=None)
+    parser.add_argument("--num-scenarios", type=int, default=None)
+    parser.add_argument("--scenario-seed", type=int, default=None)
     parser.add_argument(
         "--max-resample-attempts",
         type=int,
-        default=DEFAULT_CONFIG.max_resample_attempts,
+        default=None,
     )
     parser.add_argument(
         "--road-distance-tolerance-m",
         type=float,
-        default=DEFAULT_CONFIG.road_distance_tolerance_m,
+        default=None,
     )
-    parser.add_argument("--v2v-range-m", type=float, default=DEFAULT_CONFIG.v2v_range_m)
-    parser.add_argument("--device", default=DEFAULT_CONFIG.device, choices=("cpu", "cuda"))
+    parser.add_argument("--v2v-range-m", type=float, default=None)
+    parser.add_argument("--device", default=None, choices=("cpu", "cuda"))
     return parser
 
 
-def config_from_args(args: argparse.Namespace) -> ScenarioConfig:
+def config_from_args(
+    args: argparse.Namespace,
+    project_config: dict[str, Any] | None = None,
+) -> ScenarioConfig:
+    if project_config is None:
+        base = DEFAULT_CONFIG
+    else:
+        get_value = project_config_module.get_config_value
+        base = ScenarioConfig(
+            horizon_steps=int(
+                get_value(
+                    project_config,
+                    "prediction.vehicle.horizon",
+                    DEFAULT_CONFIG.horizon_steps,
+                )
+            ),
+            num_scenarios=int(
+                get_value(
+                    project_config,
+                    "scenario.num_scenarios",
+                    DEFAULT_CONFIG.num_scenarios,
+                )
+            ),
+            scenario_seed=int(
+                get_value(
+                    project_config,
+                    "scenario.master_seed",
+                    DEFAULT_CONFIG.scenario_seed,
+                )
+            ),
+            max_resample_attempts=int(
+                get_value(
+                    project_config,
+                    "scenario.max_resample_attempts",
+                    DEFAULT_CONFIG.max_resample_attempts,
+                )
+            ),
+            road_distance_tolerance_m=DEFAULT_CONFIG.road_distance_tolerance_m,
+            v2v_range_m=DEFAULT_CONFIG.v2v_range_m,
+            device=DEFAULT_CONFIG.device,
+        )
+
+    def choose(name: str, value: Any) -> Any:
+        return getattr(base, name) if value is None else value
+
     return ScenarioConfig(
-        horizon_steps=args.horizon,
-        num_scenarios=args.num_scenarios,
-        scenario_seed=args.scenario_seed,
-        max_resample_attempts=args.max_resample_attempts,
-        road_distance_tolerance_m=args.road_distance_tolerance_m,
-        v2v_range_m=args.v2v_range_m,
-        device=args.device,
+        horizon_steps=choose("horizon_steps", args.horizon),
+        num_scenarios=choose("num_scenarios", args.num_scenarios),
+        scenario_seed=choose("scenario_seed", args.scenario_seed),
+        max_resample_attempts=choose("max_resample_attempts", args.max_resample_attempts),
+        road_distance_tolerance_m=choose(
+            "road_distance_tolerance_m", args.road_distance_tolerance_m
+        ),
+        v2v_range_m=choose("v2v_range_m", args.v2v_range_m),
+        device=choose("device", args.device),
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        config = config_from_args(args)
+        project_root = find_project_root()
+        formal_config = project_config_module.load_config()
+        config = config_from_args(args, formal_config)
         config.validate()
         if config.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("请求 CUDA，但当前 PyTorch CUDA 不可用。")
         device = torch.device(config.device)
 
-        project_root = find_project_root()
-        roles_file = resolve_path(project_root, args.roles_file)
-        trajectory_file = resolve_path(project_root, args.trajectory_file)
-        popularity_file = resolve_path(project_root, args.popularity_file)
-        catalog_file = resolve_path(project_root, args.service_catalog_file)
-        residual_file = resolve_path(project_root, args.residual_file)
-        checkpoint_file = resolve_path(project_root, args.gru_checkpoint)
-        output_file = resolve_path(project_root, args.output_file)
+        get_value = project_config_module.get_config_value
+        roles_file = resolve_path(
+            project_root,
+            args.roles_file
+            or get_value(formal_config, "paths.vehicle_roles", "data/generated/vehicle_roles.json"),
+        )
+        trajectory_file = resolve_path(
+            project_root,
+            args.trajectory_file
+            or get_value(
+                formal_config,
+                "paths.trajectory",
+                "data/generated/trajectory.csv",
+            ),
+        )
+        popularity_file = resolve_path(
+            project_root,
+            args.popularity_file
+            or get_value(
+                formal_config,
+                "paths.popularity",
+                "data/generated/popularity.csv",
+            ),
+        )
+        popularity_history_file = resolve_path(
+            project_root,
+            args.popularity_history_file
+            or get_value(
+                formal_config,
+                "paths.popularity_history",
+                "data/generated/popularity_history.csv",
+            ),
+        )
+        catalog_file = resolve_path(
+            project_root,
+            args.service_catalog_file
+            or get_value(formal_config, "paths.service_catalog", "data/generated/service_catalog.json"),
+        )
+        residual_file = resolve_path(
+            project_root,
+            args.residual_file
+            or get_value(
+                formal_config,
+                "paths.vehicle_residual_bank",
+                "data/calibration/residual_blocks.npz",
+            ),
+        )
+        checkpoint_file = resolve_path(
+            project_root,
+            args.gru_checkpoint
+            or get_value(
+                formal_config,
+                "paths.popularity_gru",
+                "data/generated/popularity_gru.pt",
+            ),
+        )
+        output_file = resolve_path(
+            project_root,
+            args.output_file
+            or get_value(
+                formal_config,
+                "paths.prediction_scenarios",
+                "data/generated/prediction_scenarios.npz",
+            ),
+        )
 
         roles, research_ids, sv_ids, tv_ids = load_roles(roles_file)
+        expected_research = int(get_value(formal_config, "simulation.num_research_vehicles"))
+        expected_sv = int(get_value(formal_config, "simulation.num_service_vehicles"))
+        expected_tv = int(get_value(formal_config, "simulation.num_task_vehicles"))
+        if (len(research_ids), len(sv_ids), len(tv_ids)) != (
+            expected_research,
+            expected_sv,
+            expected_tv,
+        ):
+            raise ValueError(
+                "vehicle_roles.json 角色数量与 system_config.toml 的正式数量不一致。"
+            )
+        for role_key, config_key in (
+            ("dt", "simulation.dt_s"),
+            ("warmup_time", "simulation.warmup_time_s"),
+            ("episode_time", "simulation.episode_time_s"),
+        ):
+            configured = float(get_value(formal_config, config_key))
+            if role_key in roles and not math.isclose(
+                float(roles[role_key]), configured, rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    f"vehicle_roles.json 的 {role_key} 与 system_config.toml 不一致。"
+                )
         residual_bank = load_residual_bank(residual_file)
         if int(residual_bank["H_p"]) != config.horizon_steps:
             raise ValueError("residual_blocks H_p 与 scenario H_p 不一致。")
+        configured_dt = float(get_value(formal_config, "simulation.dt_s"))
+        if not math.isclose(
+            float(residual_bank["dt"]), configured_dt, rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise ValueError("calibration residual bank dt 与 system_config.toml 不一致。")
 
         service_catalog = load_json(catalog_file)
-        task_config = task_config_from_catalog(service_catalog)
+        task_config = task_config_from_catalog(service_catalog, formal_config)
         task_config.validate(len(tv_ids))
         request_counts, times = read_request_counts(popularity_file)
-        rho_history_length = int(
-            torch.load(checkpoint_file, map_location="cpu", weights_only=False)[
-                "metadata"
-            ]["L_rho"]
+        history_request_counts, history_formal_slots = read_history_request_counts(
+            popularity_history_file
         )
-        checkpoint_hp = int(
-            torch.load(checkpoint_file, map_location="cpu", weights_only=False)[
-                "metadata"
-            ]["H_p"]
+        checkpoint_payload = torch.load(
+            checkpoint_file,
+            map_location="cpu",
+            weights_only=False,
         )
+        checkpoint_metadata = checkpoint_payload["metadata"]
+        rho_history_length = int(checkpoint_metadata["L_rho"])
+        checkpoint_hp = int(checkpoint_metadata["H_p"])
         if checkpoint_hp != config.horizon_steps:
             raise ValueError("GRU checkpoint H_p 与 scenario H_p 不一致。")
 
         num_slots = request_counts.shape[0]
-        max_origin = num_slots - config.horizon_steps
-        origin_slots = np.arange(rho_history_length, max_origin + 1, dtype=np.int64)
-        if len(origin_slots) <= 0:
-            raise ValueError("没有满足 L_rho 和 H_p 的合法 prediction origin。")
+        if len(history_request_counts) != rho_history_length:
+            raise ValueError("prehistory 长度与 GRU checkpoint L_rho 不一致。")
+        if history_formal_slots != list(range(-rho_history_length, 0)):
+            raise ValueError("prehistory 未覆盖 formal slot -L_rho ... -1。")
+        configured_num_slots = int(
+            round(
+                float(get_value(formal_config, "simulation.episode_time_s"))
+                / float(get_value(formal_config, "simulation.dt_s"))
+            )
+        )
+        if num_slots != configured_num_slots:
+            raise ValueError(
+                f"formal popularity slots={num_slots} 与 system_config.toml={configured_num_slots} 不一致。"
+            )
+        origin_slots = np.arange(num_slots, dtype=np.int64)
         origin_times = np.asarray([times[int(slot)] for slot in origin_slots], dtype=np.float64)
         scenario_ids = np.arange(config.num_scenarios, dtype=np.int64)
         horizons = np.arange(config.horizon_steps, dtype=np.int64)
 
+        formal_vehicle_prediction_file = resolve_path(
+            project_root,
+            args.vehicle_prediction_file
+            or get_value(
+                formal_config,
+                "paths.vehicle_predictions",
+                "data/generated/vehicle_predictions.csv",
+            ),
+        )
+        formal_vehicle_prediction_rows: list[dict[str, Any]] = []
         nominal_xy, tangents, route_geometries, truth_index = build_vehicle_nominal_predictions(
             project_root,
             roles,
             research_ids,
             residual_bank,
             trajectory_file,
-            args.net_file,
+            args.net_file or get_value(formal_config, "paths.sumo_net"),
             args.sumo_home,
             origin_slots,
             config.horizon_steps,
+            formal_vehicle_prediction_rows,
         )
+        expected_vehicle_prediction_rows = (
+            len(origin_slots)
+            * config.horizon_steps
+            * len(research_ids)
+        )
+        if len(formal_vehicle_prediction_rows) != expected_vehicle_prediction_rows:
+            raise AssertionError(
+                "formal vehicle_predictions 行数与 origin×H_p×research 不一致。"
+            )
 
         rho_hat, checkpoint_metadata = predict_rho_hat(
             checkpoint_file,
+            history_request_counts,
             request_counts,
             origin_slots,
             config,
@@ -834,7 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
             dtype="U8",
         )
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "S": config.num_scenarios,
             "H_p": config.horizon_steps,
             "F": int(service_catalog["service_count"]),
@@ -843,7 +1139,17 @@ def main(argv: list[str] | None = None) -> int:
             "research_vehicle_ids": research_ids,
             "scenario_seed": config.scenario_seed,
             "lambda": task_config.arrival_probability,
-            "residual_bank_source": "provisional_single_episode",
+            "residual_bank_source": "independent_calibration_artifact",
+            "formal_time_slot_count": int(num_slots),
+            "formal_origin_count": int(len(origin_slots)),
+            "prediction_tail_origins": [
+                int(origin)
+                for origin in origin_slots
+                if int(origin) + config.horizon_steps > num_slots
+            ],
+            "formal_truth_used_for_diagnostics_only": True,
+            "formal_vehicle_prediction_file": str(formal_vehicle_prediction_file),
+            "calibration_artifact_metadata_reference": residual_bank["metadata"],
             "cross_vehicle_residual_sampling": "independent",
             "residual_block_sampling": "whole_block_per_vehicle_scenario",
             "vehicle_residual_bank_preference": "same_vehicle_first_else_pooled",
@@ -894,6 +1200,10 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(metadata, ensure_ascii=False, allow_nan=False)
             ),
         }
+        veh.write_predictions_csv(
+            formal_vehicle_prediction_file,
+            formal_vehicle_prediction_rows,
+        )
         save_npz(output_file, payload)
 
         print("预测场景生成完成：")

@@ -46,12 +46,25 @@ output_tag = "main"
 service_catalog = "data/generated/service_catalog.json"
 # 车辆角色文件。SV/TV 真实 ID 从这里读取，system_config 不写死 46/29/80。
 vehicle_roles = "data/generated/vehicle_roles.json"
+# 正式 SUMO 轨迹与任务/流行度输入的固定 artifact 路径。
+trajectory = "data/generated/trajectory.csv"
+vehicle_predictions = "data/generated/vehicle_predictions.csv"
+popularity = "data/generated/popularity.csv"
+tasks = "data/generated/tasks.csv"
 # 当前预测场景文件。cache optimizer 只能读取该预测输入，不能读取未来真实任务。
 prediction_scenarios = "data/generated/prediction_scenarios.npz"
 # SUMO 路网文件。用于后续 map_stratified 初始化、车辆预测和道路约束。
 sumo_net = "data/sumo/map/osm.net.xml.gz"
 # 残差库。修改 H_p、sigma 或车辆预测参数后需要重新生成。
+# 该旧路径仅作为 legacy 配置记录，正式流程不读取，也不再要求其存在。
 residual_bank = "data/generated/residual_blocks.npz"
+# 独立车辆 calibration 的角色/轨迹输入，不得指向正式 episode trajectory。
+vehicle_calibration_roles = "data/calibration/vehicle_roles.json"
+vehicle_calibration_trajectory = "data/calibration/trajectory.csv"
+# 由 vehicle_prediction.py 从独立 calibration trajectory 冻结生成的 Q/R/residual bank。
+vehicle_residual_bank = "data/calibration/residual_blocks.npz"
+# 正式任务生成器输出的 L_rho 请求 prehistory。
+popularity_history = "data/generated/popularity_history.csv"
 # GRU checkpoint。修改 popularity 预测训练参数后需要重新训练。
 popularity_gru = "data/generated/popularity_gru.pt"
 # TV 固定本地缓存初始状态。Matching 只能读取该 artifact，
@@ -75,6 +88,13 @@ num_service_vehicles = 3
 sumo_seed = 4401
 # 交通需求 seed。当前项目未单独冻结 traffic_seed，先沿用 sumo_seed；如后续拆分需重新生成 SUMO 轨迹。
 traffic_seed = 4401
+# randomTrips 出发窗口的实际边界，单位 s；metadata 会记录这两个值。
+random_trips_departure_begin_s = 0.0
+random_trips_departure_end_s = 60.0
+random_trips_period_s = 1.0
+random_trips_min_distance_m = 4000.0
+random_trips_intermediate = 2
+random_trips_maxtries = 1000
 
 [service]
 # 服务总数 F。当前已确定数据值；修改后必须重新运行 task_scenario.py，
@@ -475,7 +495,7 @@ max_resample_attempts = 20
 # 跨车辆 residual 采样假设。当前第一版为 independent。
 cross_vehicle_residual_sampling = "independent"
 # residual bank 和 GRU checkpoint 路径。
-residual_bank_path = "data/generated/residual_blocks.npz"
+residual_bank_path = "data/calibration/residual_blocks.npz"
 gru_checkpoint_path = "data/generated/popularity_gru.pt"
 
 [algorithm.cache]

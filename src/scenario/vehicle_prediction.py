@@ -11,8 +11,8 @@
 * https://sumo.dlr.de/pydoc/sumolib/net.html
 
 本项目没有复制 SUMO 源码；上述 API 属于 Eclipse SUMO（EPL-2.0）官方实现。
-本阶段的 Q/R 是基于当前单 episode 的 provisional calibration，不能视为最终
-train/validation/test 参数。
+Q/R 和 residual bank 只能从显式指定的独立 calibration trajectory 生成；
+正式 episode 只读取冻结的 calibration artifact。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import hashlib
 import json
 import math
 import os
@@ -248,6 +249,14 @@ def resolve_path(project_root: Path, value: str | Path) -> Path:
     if not path.is_absolute():
         path = project_root / path
     return path.resolve(strict=False)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def find_network(project_root: Path, explicit: str | None) -> Path:
@@ -697,7 +706,7 @@ def calibrate_q_r(
     dt_s: float,
     covariance_floor: float,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
-    """从当前 episode 的历史真实残差和观测误差估计 provisional Q/R。"""
+    """从独立 calibration trajectory 的真实残差和观测误差估计 Q/R。"""
     transition = state_transition(dt_s)
     process_residuals: list[np.ndarray] = []
     measurement_residuals: list[np.ndarray] = []
@@ -1023,12 +1032,25 @@ def write_residual_npz(
     route_diagnostics: dict[str, float],
     rmse: dict[int, float],
     residual_stats: dict[str, float],
+    source_metadata: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.stem + ".tmp.npz")
     metadata = {
-        "schema_version": 1,
-        "calibration_scope": "current single episode; provisional only",
+        "schema_version": 2,
+        "artifact_schema_version": 2,
+        "artifact_type": "vehicle_calibration_residual_bank",
+        "calibration_scope": "independent_calibration_trajectory",
+        "residual_bank_source": "independent_calibration_trajectory",
+        "source": source_metadata,
+        "calibration_vehicle_ids": sorted({str(vehicle_id) for vehicle_id in vehicle_ids}),
+        "calibration_slot_count": int(
+            max(origin_slots) + horizon_steps if origin_slots else 0
+        ),
+        "dt_s": float(dt_s),
+        "H_p": int(horizon_steps),
+        "Q_matrix": np.asarray(q, dtype=float).tolist(),
+        "R_matrix": np.asarray(r, dtype=float).tolist(),
         "observation_noise": {
             "sigma_position_m": config.sigma_position_m,
             "sigma_speed_mps": config.sigma_speed_mps,
@@ -1041,6 +1063,7 @@ def write_residual_npz(
         "causality": {
             "prediction_origin_uses_cutoff": "origin_slot - 1",
             "future_truth_used_only_in_evaluation": True,
+            "formal_episode_not_used_for_calibration": True,
         },
     }
     try:
@@ -1140,20 +1163,31 @@ def verify_outputs(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="从 SUMO 研究车辆轨迹生成 causal Kalman predictions 和 residual blocks。"
+        description="从独立 calibration SUMO 轨迹生成 causal Kalman predictions 和 residual bank。"
     )
-    parser.add_argument("--roles-file", default="data/generated/vehicle_roles.json")
-    parser.add_argument("--trajectory-file", default="data/generated/trajectory.csv")
-    parser.add_argument("--output-dir", default="data/generated")
+    parser.add_argument(
+        "--roles-file",
+        default=None,
+        help="calibration roles JSON（兼容旧参数名）。",
+    )
+    parser.add_argument("--calibration-roles-file", default=None)
+    parser.add_argument(
+        "--trajectory-file",
+        default=None,
+        help="calibration trajectory CSV（兼容旧参数名）。",
+    )
+    parser.add_argument("--calibration-trajectory-file", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--residual-output", default=None)
     parser.add_argument("--net-file", default=None)
     parser.add_argument("--sumo-home", default=None)
-    parser.add_argument("--horizon", type=int, default=DEFAULT_CONFIG.horizon_steps)
-    parser.add_argument("--sigma-q", type=float, default=DEFAULT_CONFIG.sigma_position_m)
-    parser.add_argument("--sigma-u", type=float, default=DEFAULT_CONFIG.sigma_speed_mps)
+    parser.add_argument("--horizon", type=int, default=None)
+    parser.add_argument("--sigma-q", type=float, default=None)
+    parser.add_argument("--sigma-u", type=float, default=None)
     parser.add_argument(
         "--observation-noise-seed",
         type=int,
-        default=DEFAULT_CONFIG.observation_noise_seed,
+        default=None,
     )
     parser.add_argument("--projection-window-m", type=float, default=DEFAULT_CONFIG.projection_window_m)
     parser.add_argument("--projection-backtrack-m", type=float, default=DEFAULT_CONFIG.projection_backtrack_m)
@@ -1163,14 +1197,74 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def config_from_args(args: argparse.Namespace) -> PredictionConfig:
+def config_from_args(
+    args: argparse.Namespace,
+    project_config: dict[str, Any] | None = None,
+) -> PredictionConfig:
+    if project_config is None:
+        base = DEFAULT_CONFIG
+    else:
+        from common.project_config import get_config_value
+
+        base = PredictionConfig(
+            horizon_steps=int(
+                get_config_value(
+                    project_config,
+                    "prediction.vehicle.horizon",
+                    DEFAULT_CONFIG.horizon_steps,
+                )
+            ),
+            sigma_position_m=float(
+                get_config_value(
+                    project_config,
+                    "prediction.vehicle.sigma_position_m",
+                    DEFAULT_CONFIG.sigma_position_m,
+                )
+            ),
+            sigma_speed_mps=float(
+                get_config_value(
+                    project_config,
+                    "prediction.vehicle.sigma_speed_mps",
+                    DEFAULT_CONFIG.sigma_speed_mps,
+                )
+            ),
+            observation_noise_seed=int(
+                get_config_value(
+                    project_config,
+                    "prediction.vehicle.observation_noise_seed",
+                    DEFAULT_CONFIG.observation_noise_seed,
+                )
+            ),
+        )
     return PredictionConfig(
-        horizon_steps=args.horizon,
-        sigma_position_m=args.sigma_q,
-        sigma_speed_mps=args.sigma_u,
-        observation_noise_seed=args.observation_noise_seed,
-        projection_window_m=args.projection_window_m,
-        projection_backtrack_m=args.projection_backtrack_m,
+        horizon_steps=(
+            base.horizon_steps if args.horizon is None else args.horizon
+        ),
+        sigma_position_m=(
+            base.sigma_position_m
+            if args.sigma_q is None
+            else args.sigma_q
+        ),
+        sigma_speed_mps=(
+            base.sigma_speed_mps
+            if args.sigma_u is None
+            else args.sigma_u
+        ),
+        observation_noise_seed=(
+            base.observation_noise_seed
+            if args.observation_noise_seed is None
+            else args.observation_noise_seed
+        ),
+        projection_window_m=(
+            DEFAULT_CONFIG.projection_window_m
+            if args.projection_window_m is None
+            else args.projection_window_m
+        ),
+        projection_backtrack_m=(
+            DEFAULT_CONFIG.projection_backtrack_m
+            if args.projection_backtrack_m is None
+            else args.projection_backtrack_m
+        ),
     )
 
 
@@ -1178,11 +1272,61 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         project_root = find_project_root()
-        config = config_from_args(args)
+        from common import project_config as project_config_module
+
+        formal_config = project_config_module.load_config()
+        get_value = project_config_module.get_config_value
+        config = config_from_args(args, formal_config)
         config.validate()
-        roles_file = resolve_path(project_root, args.roles_file)
-        trajectory_file = resolve_path(project_root, args.trajectory_file)
-        output_dir = resolve_path(project_root, args.output_dir)
+        roles_file = resolve_path(
+            project_root,
+            args.calibration_roles_file
+            or args.roles_file
+            or get_value(
+                formal_config,
+                "paths.vehicle_calibration_roles",
+                "data/calibration/vehicle_roles.json",
+            ),
+        )
+        trajectory_file = resolve_path(
+            project_root,
+            args.calibration_trajectory_file
+            or args.trajectory_file
+            or get_value(
+                formal_config,
+                "paths.vehicle_calibration_trajectory",
+                "data/calibration/trajectory.csv",
+            ),
+        )
+        residual_default = resolve_path(
+            project_root,
+            get_value(
+                formal_config,
+                "paths.vehicle_residual_bank",
+                "data/calibration/residual_blocks.npz",
+            ),
+        )
+        output_dir = resolve_path(
+            project_root,
+            args.output_dir or residual_default.parent,
+        )
+        residual_file = resolve_path(
+            project_root,
+            args.residual_output or residual_default,
+        )
+        formal_roles_file = resolve_path(
+            project_root,
+            get_value(formal_config, "paths.vehicle_roles", "data/generated/vehicle_roles.json"),
+        )
+        formal_trajectory_file = resolve_path(
+            project_root,
+            get_value(formal_config, "paths.trajectory", "data/generated/trajectory.csv"),
+        )
+        if roles_file == formal_roles_file or trajectory_file == formal_trajectory_file:
+            raise ValueError(
+                "vehicle_prediction.py 只接受独立 calibration roles/trajectory，"
+                "不能把正式 episode artifact 作为 calibration source。"
+            )
 
         with roles_file.open("r", encoding="utf-8") as stream:
             roles = json.load(stream)
@@ -1191,18 +1335,51 @@ def main(argv: list[str] | None = None) -> int:
         service_ids = set(service_id_list)
         task_ids = set(task_id_list)
         # 研究车辆集合由角色文件中的 SV/TV 构成；不读取背景车辆，也不写死 ID。
-        research_ids = list(dict.fromkeys(service_id_list + task_id_list))
-        declared_research_ids = {str(vehicle_id) for vehicle_id in roles.get("research_vehicles", [])}
-        if len(research_ids) != 12 or len(set(research_ids)) != 12:
-            raise ValueError("vehicle_roles.json 当前研究车辆不是 12 辆或存在重复。")
-        if declared_research_ids != set(research_ids):
-            raise ValueError("vehicle_roles.json 的 research_vehicles 与 SV/TV 集合不一致。")
-        if service_ids | task_ids != set(research_ids) or service_ids & task_ids:
-            raise ValueError("vehicle_roles.json 的研究车辆角色集合不一致。")
+        declared_research_ids = [
+            str(vehicle_id)
+            for vehicle_id in roles.get(
+                "calibration_vehicle_ids",
+                roles.get("research_vehicles", []),
+            )
+        ]
+        if len(declared_research_ids) != len(set(declared_research_ids)):
+            raise ValueError("calibration vehicle_roles.json 的 research_vehicles 存在重复。")
+        research_ids = declared_research_ids or service_id_list + task_id_list
+        if len(research_ids) != len(set(research_ids)) or not research_ids:
+            raise ValueError("calibration vehicle_roles.json 的 research_vehicles 为空或存在重复。")
+        if service_ids & task_ids:
+            raise ValueError("calibration vehicle_roles.json 的研究车辆角色集合不一致。")
+        if service_ids or task_ids:
+            if service_ids | task_ids != set(research_ids):
+                raise ValueError("calibration vehicle_roles.json 的研究车辆角色集合不一致。")
 
-        dt_s = float(args.dt if args.dt is not None else roles.get("dt", 1.0))
-        warmup_s = float(args.warmup_time if args.warmup_time is not None else roles.get("warmup_time", 100.0))
-        episode_s = float(args.episode_time if args.episode_time is not None else roles.get("episode_time", 300.0))
+        dt_s = float(
+            args.dt
+            if args.dt is not None
+            else get_value(formal_config, "simulation.dt_s", 1.0)
+        )
+        warmup_s = float(
+            args.warmup_time
+            if args.warmup_time is not None
+            else get_value(formal_config, "simulation.warmup_time_s", 100.0)
+        )
+        episode_s = float(
+            args.episode_time
+            if args.episode_time is not None
+            else get_value(formal_config, "simulation.episode_time_s", 300.0)
+        )
+        for role_key, selected in (
+            ("dt", dt_s),
+            ("warmup_time", warmup_s),
+            ("episode_time", episode_s),
+        ):
+            if role_key in roles and not math.isclose(
+                float(roles[role_key]), selected, rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    f"calibration roles 的 {role_key} 与正式配置不一致；"
+                    "请通过 CLI 显式指定 calibration 时间轴。"
+                )
         for name, value in (("dt", dt_s), ("warmup_time", warmup_s), ("episode_time", episode_s)):
             if value <= 0.0 and name != "warmup_time":
                 raise ValueError(f"{name} 必须大于 0。")
@@ -1218,7 +1395,10 @@ def main(argv: list[str] | None = None) -> int:
 
         sumo_home = find_sumo_home(args.sumo_home)
         sumolib = load_sumolib(sumo_home)
-        network_file = find_network(project_root, args.net_file)
+        network_file = find_network(
+            project_root,
+            args.net_file or get_value(formal_config, "paths.sumo_net"),
+        )
         net = sumolib.net.readNet(str(network_file), withConnections=True, withInternal=True)
         route_geometries = {
             vehicle_id: build_route_geometry(vehicle_id, planned_routes[vehicle_id], net)
@@ -1265,7 +1445,6 @@ def main(argv: list[str] | None = None) -> int:
         rmse = rmse_by_horizon(prediction_rows, config.horizon_steps)
         residual_stats = residual_statistics(residual_blocks)
         prediction_file = output_dir / "vehicle_predictions.csv"
-        residual_file = output_dir / "residual_blocks.npz"
         write_predictions_csv(prediction_file, prediction_rows)
         write_residual_npz(
             residual_file,
@@ -1281,6 +1460,14 @@ def main(argv: list[str] | None = None) -> int:
             route_diagnostics,
             rmse,
             residual_stats,
+            {
+                "roles_path": str(roles_file),
+                "trajectory_path": str(trajectory_file),
+                "roles_sha256": sha256_file(roles_file),
+                "trajectory_sha256": sha256_file(trajectory_file),
+                "network_path": str(network_file),
+                "network_sha256": sha256_file(network_file),
+            },
         )
         output_validation = verify_outputs(
             prediction_file,
@@ -1291,7 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         route_count = sum(len(geometry.segments) for geometry in route_geometries.values())
-        print("车辆预测数据生成完成：")
+        print("独立 calibration 车辆预测/residual bank 生成完成：")
         print(f"  research vehicles={len(research_ids)}，route segments={route_count}")
         print(f"  H_p={config.horizon_steps}，prediction rows={len(prediction_rows)}")
         print(f"  residual_blocks shape={residual_blocks.shape}")

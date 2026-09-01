@@ -34,8 +34,8 @@ import numpy as np
 class TaskConfig:
     """任务环境生成参数。
 
-    数值默认值用于实现和可复现验证，均不是论文最终冻结参数。已有
-    vehicle_roles.json 中的 dt/warmup/episode/seed 会优先覆盖时间和主 seed。
+    数值默认值只用于无 TOML 场景下的函数级验证；正式 entrypoint 从
+    system_config.toml 读取参数，vehicle_roles.json 仅用于检查上游时间轴漂移。
     """
 
     num_services: int = 10
@@ -43,6 +43,7 @@ class TaskConfig:
     zipf_exponent: float = 0.8
     popularity_epoch_length: int = 20
     popularity_changes_per_epoch: int = 1
+    popularity_history_length: int = 20
     input_relative_jitter: float = 0.20
     load_relative_jitter: float = 0.10
 
@@ -88,6 +89,8 @@ class TaskConfig:
             raise ValueError("popularity_epoch_length 必须大于 0。")
         if self.popularity_changes_per_epoch < 0:
             raise ValueError("popularity_changes_per_epoch 不能为负数。")
+        if self.popularity_history_length < 1:
+            raise ValueError("popularity_history_length 必须 >= 1。")
         if not 0.0 <= self.input_relative_jitter < 1.0:
             raise ValueError("input_relative_jitter 必须位于 [0, 1)。")
         if not 0.0 <= self.load_relative_jitter < 1.0:
@@ -111,6 +114,18 @@ SERVICE_CATALOG_FIELDS = (
 POPULARITY_FIELDS = (
     "time_s",
     "slot",
+    "epoch",
+    "service_id",
+    "rank",
+    "rho_star",
+    "request_count",
+    "rho_obs",
+)
+
+POPULARITY_HISTORY_FIELDS = (
+    "history_index",
+    "formal_slot",
+    "time_s",
     "epoch",
     "service_id",
     "rank",
@@ -199,28 +214,66 @@ def resolve_time_metadata(
     roles: dict[str, Any],
     args: argparse.Namespace,
     defaults: TaskConfig,
+    project_config: dict[str, Any] | None = None,
 ) -> tuple[float, float, float, int]:
-    """优先读取角色文件中的时间元数据，CLI 显式值具有最高优先级。"""
+    """读取正式时间轴；TOML 默认值和 CLI 覆盖优先于 artifact 元数据。"""
+    if project_config is not None:
+        from common.project_config import get_config_value
+
+        configured_dt = float(get_config_value(project_config, "simulation.dt_s"))
+        configured_warmup = float(
+            get_config_value(project_config, "simulation.warmup_time_s")
+        )
+        configured_episode = float(
+            get_config_value(project_config, "simulation.episode_time_s")
+        )
+        configured_seed = int(get_config_value(project_config, "task.master_seed"))
+    else:
+        configured_dt = defaults.fallback_dt_s
+        configured_warmup = defaults.fallback_warmup_time_s
+        configured_episode = defaults.fallback_episode_time_s
+        configured_seed = defaults.fallback_master_seed
+
     dt_s = float(
         args.dt
         if args.dt is not None
-        else roles.get("dt", defaults.fallback_dt_s)
+        else configured_dt
     )
     warmup_s = float(
         args.warmup_time
         if args.warmup_time is not None
-        else roles.get("warmup_time", defaults.fallback_warmup_time_s)
+        else configured_warmup
     )
     episode_s = float(
         args.episode_time
         if args.episode_time is not None
-        else roles.get("episode_time", defaults.fallback_episode_time_s)
+        else configured_episode
     )
     master_seed = int(
         args.master_seed
         if args.master_seed is not None
-        else roles.get("seed", defaults.fallback_master_seed)
+        else configured_seed
     )
+
+    # 角色文件是由上游 SUMO 生成的事实记录；它用于发现漂移，不再悄悄
+    # 覆盖 system_config.toml 的正式默认值。
+    if project_config is not None:
+        for label, selected, key in (
+            ("dt", dt_s, "dt"),
+            ("warmup_time", warmup_s, "warmup_time"),
+            ("episode_time", episode_s, "episode_time"),
+        ):
+            if key in roles and not math.isclose(
+                float(roles[key]), selected, rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    f"vehicle_roles.json 的 {label}={roles[key]} 与正式配置 {selected} 不一致。"
+                )
+        if "seed" in roles and int(roles["seed"]) != master_seed:
+            raise ValueError(
+                f"vehicle_roles.json 的 seed={roles['seed']} 与正式 task.master_seed="
+                f"{master_seed} 不一致。"
+            )
 
     if dt_s <= 0.0 or warmup_s < 0.0 or episode_s <= 0.0:
         raise ValueError("dt/warmup_time/episode_time 的数值范围无效。")
@@ -399,61 +452,139 @@ def make_popularity_trace(
     config: TaskConfig,
     rng: np.random.Generator,
 ) -> tuple[list[dict[str, Any]], np.ndarray, dict[str, Any]]:
-    """生成按 epoch 稳定、边界缓慢变化的 rho_star。"""
-    ranking = [int(value) for value in rng.permutation(num_services)]
-    probabilities_by_slot = np.zeros((num_slots, num_services), dtype=float)
-    rows: list[dict[str, Any]] = []
-    schedule_changes: list[dict[str, Any]] = []
-    rankings_by_epoch: list[list[int]] = []
+    """兼容接口：只生成没有 prehistory 的独立序列。"""
+    formal_rows, _, probabilities_by_slot, _, schedule = make_popularity_trace_with_history(
+        num_services,
+        num_slots,
+        0,
+        dt_s,
+        time_origin_s,
+        config,
+        rng,
+    )
+    return formal_rows, probabilities_by_slot, schedule
 
-    for slot in range(num_slots):
-        epoch = slot // config.popularity_epoch_length
-        if slot % config.popularity_epoch_length == 0:
+
+def make_popularity_trace_with_history(
+    num_services: int,
+    num_slots: int,
+    history_slots: int,
+    dt_s: float,
+    time_origin_s: float,
+    config: TaskConfig,
+    rng: np.random.Generator,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    """连续生成 prehistory -> formal 的动态 Zipf 序列。
+
+    ``formal_slot`` 是正式 episode 的坐标，prehistory 使用负值；
+    ``history_index`` 只在 history CSV 中使用，绝不伪装成 formal slot。
+    """
+    if num_slots <= 0 or history_slots < 0:
+        raise ValueError("num_slots 必须大于 0，history_slots 不能为负。")
+    total_slots = history_slots + num_slots
+    ranking = [int(value) for value in rng.permutation(num_services)]
+    combined_probabilities = np.zeros((total_slots, num_services), dtype=float)
+    formal_probabilities = np.zeros((num_slots, num_services), dtype=float)
+    formal_rows: list[dict[str, Any]] = []
+    history_rows: list[dict[str, Any]] = []
+    schedule_changes: list[dict[str, Any]] = []
+    formal_initial_ranking: list[int] | None = None
+
+    for sequence_slot in range(total_slots):
+        formal_slot = sequence_slot - history_slots
+        epoch = formal_slot // config.popularity_epoch_length
+        # epoch 坐标以 formal_slot=0 为基准，而不是以 combined 数组的
+        # history 长度为基准；这样 formal epoch 0...19 内不会因 L_rho
+        # 不是 epoch_length 的整数倍而发生中途 rank 变化。prehistory 仍
+        # 共享同一条 ranking 状态，并在负 formal epoch 边界连续演化。
+        if sequence_slot > 0 and formal_slot % config.popularity_epoch_length == 0:
             previous = list(ranking)
-            if slot > 0:
-                ranking = evolve_ranking(
-                    ranking,
-                    rng,
-                    config.popularity_changes_per_epoch,
-                )
-                schedule_changes.append(
-                    {
-                        "epoch": epoch,
-                        "slot": slot,
-                        "previous_ranking": previous,
-                        "new_ranking": list(ranking),
-                    }
-                )
-            rankings_by_epoch.append(list(ranking))
+            ranking = evolve_ranking(
+                ranking,
+                rng,
+                config.popularity_changes_per_epoch,
+            )
+            schedule_changes.append(
+                {
+                    "epoch": epoch,
+                    "slot": formal_slot,
+                    "formal_slot": formal_slot,
+                    "history_index": (
+                        sequence_slot if formal_slot < 0 else None
+                    ),
+                    "previous_ranking": previous,
+                    "new_ranking": list(ranking),
+                }
+            )
+        if formal_slot == 0:
+            formal_initial_ranking = list(ranking)
 
         probabilities = zipf_probabilities(
             ranking,
             num_services,
             config.zipf_exponent,
         )
-        probabilities_by_slot[slot] = probabilities
+        combined_probabilities[sequence_slot] = probabilities
+        if formal_slot >= 0:
+            formal_probabilities[formal_slot] = probabilities
         rank_by_service = {service_id: rank for rank, service_id in enumerate(ranking, 1)}
-        time_s = round(time_origin_s + slot * dt_s, 9)
+        time_s = round(time_origin_s + formal_slot * dt_s, 9)
         for service_id in range(num_services):
-            rows.append(
-                {
-                    "time_s": time_s,
-                    "slot": slot,
-                    "epoch": epoch,
-                    "service_id": service_id,
-                    "rank": rank_by_service[service_id],
-                    "rho_star": float(probabilities[service_id]),
-                    "request_count": 0,
-                    "rho_obs": "",
-                }
-            )
+            if formal_slot < 0:
+                history_rows.append(
+                    {
+                        "history_index": sequence_slot,
+                        "formal_slot": formal_slot,
+                        "time_s": time_s,
+                        "epoch": epoch,
+                        "service_id": service_id,
+                        "rank": rank_by_service[service_id],
+                        "rho_star": float(probabilities[service_id]),
+                        "request_count": 0,
+                        "rho_obs": "",
+                    }
+                )
+            else:
+                formal_rows.append(
+                    {
+                        "time_s": time_s,
+                        "slot": formal_slot,
+                        "epoch": epoch,
+                        "service_id": service_id,
+                        "rank": rank_by_service[service_id],
+                        "rho_star": float(probabilities[service_id]),
+                        "request_count": 0,
+                        "rho_obs": "",
+                    }
+                )
 
     schedule = {
-        "initial_ranking": rankings_by_epoch[0] if rankings_by_epoch else [],
+        "initial_ranking": formal_initial_ranking or [],
+        "prehistory_initial_ranking": (
+            [int(value) for value in combined_probabilities[0].argsort()[::-1]]
+            if history_slots > 0
+            else formal_initial_ranking or []
+        ),
         "epoch_changes": schedule_changes,
-        "epoch_count": len(rankings_by_epoch),
+        "epoch_count": int(
+            math.ceil(total_slots / config.popularity_epoch_length)
+        ),
+        "history_slots": history_slots,
+        "formal_slots": num_slots,
     }
-    return rows, probabilities_by_slot, schedule
+    return (
+        formal_rows,
+        history_rows,
+        formal_probabilities,
+        combined_probabilities,
+        schedule,
+    )
 
 
 # ============================================================================
@@ -472,25 +603,31 @@ def generate_tasks(
     arrival_rng: np.random.Generator,
     request_rng: np.random.Generator,
     workload_rng: np.random.Generator,
+    slot_offset: int = 0,
 ) -> tuple[list[dict[str, Any]], np.ndarray]:
-    """按 TV×slot 生成一行状态；arrival=0 不构造伪任务。"""
+    """按 TV×slot 生成一行状态；arrival=0 不构造伪任务。
+
+    ``slot_offset`` 仅用于把连续 prehistory 标成负 formal slot；返回的
+    request_counts 仍按本次传入的局部数组顺序排列。
+    """
     by_service = catalog_by_id(catalog)
     request_counts = np.zeros((num_slots, config.num_services), dtype=int)
     rows: list[dict[str, Any]] = []
 
     for slot in range(num_slots):
         probabilities = probabilities_by_slot[slot]
+        formal_slot = slot + slot_offset
         arrivals = arrival_rng.random(len(task_vehicles)) < config.arrival_probability
         for vehicle_index, vehicle_id in enumerate(task_vehicles):
             arrival = int(bool(arrivals[vehicle_index]))
             time_s = round(warmup_s + slot * dt_s, 9)
-            episode_time_s = round(slot * dt_s, 9)
+            episode_time_s = round(formal_slot * dt_s, 9)
 
             if arrival == 0:
                 rows.append(
                     {
                         "time_s": time_s,
-                        "slot": slot,
+                        "slot": formal_slot,
                         "episode_time_s": episode_time_s,
                         "vehicle_id": vehicle_id,
                         "arrival": 0,
@@ -531,7 +668,7 @@ def generate_tasks(
             rows.append(
                 {
                     "time_s": time_s,
-                    "slot": slot,
+                    "slot": formal_slot,
                     "episode_time_s": episode_time_s,
                     "vehicle_id": vehicle_id,
                     "arrival": 1,
@@ -566,6 +703,26 @@ def attach_observed_counts(
     expected_rows = request_counts.shape[0] * num_services
     if len(popularity_rows) != expected_rows:
         raise AssertionError("popularity 行数与 slot×service 数量不一致。")
+
+
+def attach_history_observed_counts(
+    popularity_history_rows: list[dict[str, Any]],
+    request_counts: np.ndarray,
+) -> None:
+    """把 prehistory request_count 写入独立 history CSV 的 observation 字段。"""
+    num_services = request_counts.shape[1]
+    for row in popularity_history_rows:
+        history_index = int(row["history_index"])
+        service_id = int(row["service_id"])
+        if not 0 <= history_index < request_counts.shape[0]:
+            raise AssertionError("history_index 超出 prehistory request_counts。")
+        count = int(request_counts[history_index, service_id])
+        total = int(request_counts[history_index].sum())
+        row["request_count"] = count
+        row["rho_obs"] = float(count / total) if total > 0 else ""
+    expected_rows = request_counts.shape[0] * num_services
+    if len(popularity_history_rows) != expected_rows:
+        raise AssertionError("popularity_history 行数与 history slot×service 数量不一致。")
 
 
 # ============================================================================
@@ -739,39 +896,56 @@ def build_artifacts(
     config: TaskConfig,
 ) -> dict[str, Any]:
     num_slots = int(round(episode_s / dt_s))
+    history_slots = int(config.popularity_history_length)
     rngs, child_seeds = make_rngs(master_seed, config.rng_stream_names)
     catalog = make_service_catalog(config, rngs["service_catalog"])
-    popularity_rows, probabilities, schedule = make_popularity_trace(
+    (
+        popularity_rows,
+        popularity_history_rows,
+        probabilities,
+        combined_probabilities,
+        schedule,
+    ) = make_popularity_trace_with_history(
         config.num_services,
         num_slots,
+        history_slots,
         dt_s,
         warmup_s,
         config,
         rngs["popularity_evolution"],
     )
-    task_rows, request_counts = generate_tasks(
+    combined_task_rows, combined_request_counts = generate_tasks(
         task_vehicles,
         catalog,
-        probabilities,
-        num_slots,
+        combined_probabilities,
+        history_slots + num_slots,
         dt_s,
-        warmup_s,
+        warmup_s - history_slots * dt_s,
         config,
         rngs["task_arrival"],
         rngs["service_request"],
         rngs["workload_variation"],
+        slot_offset=-history_slots,
     )
+    task_rows = [row for row in combined_task_rows if int(row["slot"]) >= 0]
+    history_request_counts = combined_request_counts[:history_slots].copy()
+    request_counts = combined_request_counts[history_slots:].copy()
     attach_observed_counts(popularity_rows, request_counts)
+    attach_history_observed_counts(popularity_history_rows, history_request_counts)
 
     return {
         "catalog": catalog,
         "popularity_rows": popularity_rows,
+        "popularity_history_rows": popularity_history_rows,
         "task_rows": task_rows,
         "probabilities": probabilities,
+        "combined_probabilities": combined_probabilities,
         "request_counts": request_counts,
+        "history_request_counts": history_request_counts,
         "schedule": schedule,
         "child_seeds": child_seeds,
         "num_slots": num_slots,
+        "history_slots": history_slots,
     }
 
 
@@ -786,8 +960,11 @@ def validate_artifacts(
     task_rows = artifacts["task_rows"]
     probabilities = artifacts["probabilities"]
     request_counts = artifacts["request_counts"]
+    popularity_history_rows = artifacts["popularity_history_rows"]
+    history_request_counts = artifacts["history_request_counts"]
     schedule = artifacts["schedule"]
     num_slots = int(artifacts["num_slots"])
+    history_slots = int(artifacts["history_slots"])
 
     if len(catalog) != config.num_services:
         raise AssertionError("service catalog 数量错误。")
@@ -802,6 +979,19 @@ def validate_artifacts(
 
     if len(popularity_rows) != num_slots * config.num_services:
         raise AssertionError("popularity.csv 行数错误。")
+    if len(popularity_history_rows) != history_slots * config.num_services:
+        raise AssertionError("popularity_history.csv 行数错误。")
+    expected_history_slots = list(range(-history_slots, 0))
+    actual_history_slots = sorted(
+        {int(row["formal_slot"]) for row in popularity_history_rows}
+    )
+    if actual_history_slots != expected_history_slots:
+        raise AssertionError("prehistory formal_slot 没有覆盖 -L_rho ... -1。")
+    actual_history_indices = sorted(
+        {int(row["history_index"]) for row in popularity_history_rows}
+    )
+    if actual_history_indices != list(range(history_slots)):
+        raise AssertionError("prehistory history_index 没有从 0 连续编号。")
     for slot in range(num_slots):
         slot_rows = [row for row in popularity_rows if int(row["slot"]) == slot]
         if len(slot_rows) != config.num_services:
@@ -870,6 +1060,10 @@ def validate_artifacts(
 
     if not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-10, rtol=0.0):
         raise AssertionError("rho_star 概率矩阵存在未归一化时隙。")
+    if history_request_counts.shape != (history_slots, config.num_services):
+        raise AssertionError("prehistory request_counts shape 错误。")
+    if request_counts.shape != (num_slots, config.num_services):
+        raise AssertionError("formal request_counts shape 错误。")
 
     # 一个 epoch 内排名必须完全不变；epoch 边界只允许少量 rank 变化。
     epoch_length = config.popularity_epoch_length
@@ -925,6 +1119,8 @@ def validate_artifacts(
         "adjacent_same_probability_fraction": adjacent_same_fraction,
         "service_distribution_correlation": correlation,
         "epoch_count": int(schedule["epoch_count"]),
+        "history_slots": history_slots,
+        "history_request_total": int(history_request_counts.sum()),
     }
 
 
@@ -974,6 +1170,7 @@ def make_service_catalog_output(
             "warmup_time_s": warmup_s,
             "episode_time_s": episode_s,
             "num_slots": artifacts["num_slots"],
+            "popularity_history_length": artifacts["history_slots"],
             "arrival_probability": config.arrival_probability,
             "zipf_exponent": config.zipf_exponent,
             "popularity_epoch_length": config.popularity_epoch_length,
@@ -1014,17 +1211,124 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 def output_artifacts(
     output_dir: Path,
     catalog_output: dict[str, Any],
+    popularity_history_rows: list[dict[str, Any]],
     popularity_rows: list[dict[str, Any]],
     task_rows: list[dict[str, Any]],
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     catalog_file = output_dir / "service_catalog.json"
+    popularity_history_file = output_dir / "popularity_history.csv"
     popularity_file = output_dir / "popularity.csv"
     tasks_file = output_dir / "tasks.csv"
     write_json_atomic(catalog_file, catalog_output)
+    write_csv_atomic(
+        popularity_history_file,
+        POPULARITY_HISTORY_FIELDS,
+        popularity_history_rows,
+    )
     write_csv_atomic(popularity_file, POPULARITY_FIELDS, popularity_rows)
     write_csv_atomic(tasks_file, TASK_FIELDS, task_rows)
-    return catalog_file, popularity_file, tasks_file
+    return catalog_file, popularity_history_file, popularity_file, tasks_file
+
+
+def task_config_from_project_config(
+    project_config: dict[str, Any],
+    fallback: TaskConfig | None = None,
+) -> TaskConfig:
+    """把 system_config.toml 的正式任务参数映射到生成器配置。"""
+    from common.project_config import get_config_value
+
+    base = fallback or DEFAULT_CONFIG
+    class_ranges_raw = get_config_value(project_config, "service.class_ranges", [])
+    class_ranges: list[tuple[str, float, float, float, float, float, float]] = []
+    for row in class_ranges_raw:
+        class_ranges.append(
+            (
+                str(row["workload_class"]),
+                float(row["program_size_min_mb"]),
+                float(row["program_size_max_mb"]),
+                float(row["mean_input_size_min_mbit"]),
+                float(row["mean_input_size_max_mbit"]),
+                float(row["cycles_per_bit_min"]),
+                float(row["cycles_per_bit_max"]),
+            )
+        )
+    return TaskConfig(
+        num_services=int(
+            get_config_value(project_config, "service.count", base.num_services)
+        ),
+        arrival_probability=float(
+            get_config_value(
+                project_config,
+                "task.arrival_probability",
+                base.arrival_probability,
+            )
+        ),
+        zipf_exponent=float(
+            get_config_value(project_config, "task.popularity_zeta", base.zipf_exponent)
+        ),
+        popularity_epoch_length=int(
+            get_config_value(
+                project_config,
+                "task.popularity_epoch_length",
+                base.popularity_epoch_length,
+            )
+        ),
+        popularity_changes_per_epoch=int(
+            get_config_value(
+                project_config,
+                "task.popularity_changes_per_epoch",
+                base.popularity_changes_per_epoch,
+            )
+        ),
+        popularity_history_length=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.history_length",
+                base.popularity_history_length,
+            )
+        ),
+        input_relative_jitter=float(
+            get_config_value(
+                project_config,
+                "task.input_relative_jitter",
+                base.input_relative_jitter,
+            )
+        ),
+        load_relative_jitter=float(
+            get_config_value(
+                project_config,
+                "task.load_relative_jitter",
+                base.load_relative_jitter,
+            )
+        ),
+        fallback_dt_s=float(
+            get_config_value(project_config, "simulation.dt_s", base.fallback_dt_s)
+        ),
+        fallback_warmup_time_s=float(
+            get_config_value(
+                project_config,
+                "simulation.warmup_time_s",
+                base.fallback_warmup_time_s,
+            )
+        ),
+        fallback_episode_time_s=float(
+            get_config_value(
+                project_config,
+                "simulation.episode_time_s",
+                base.fallback_episode_time_s,
+            )
+        ),
+        fallback_master_seed=int(
+            get_config_value(project_config, "task.master_seed", base.fallback_master_seed)
+        ),
+        rng_stream_names=base.rng_stream_names,
+        program_size_unit=base.program_size_unit,
+        input_size_unit=base.input_size_unit,
+        cpu_cycles_unit=base.cpu_cycles_unit,
+        cycles_per_bit_unit=base.cycles_per_bit_unit,
+        class_ranges=tuple(class_ranges) or base.class_ranges,
+    )
 
 
 # ============================================================================
@@ -1036,36 +1340,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="生成真实动态 rho_star、TV 任务到达和服务相关 D/L。"
     )
-    parser.add_argument("--roles-file", default="data/generated/vehicle_roles.json")
-    parser.add_argument("--trajectory-file", default="data/generated/trajectory.csv")
-    parser.add_argument("--output-dir", default="data/generated")
-    parser.add_argument("--num-services", type=int, default=DEFAULT_CONFIG.num_services)
+    parser.add_argument("--roles-file", default=None)
+    parser.add_argument("--trajectory-file", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--num-services", type=int, default=None)
     parser.add_argument(
         "--arrival-probability",
         type=float,
-        default=DEFAULT_CONFIG.arrival_probability,
+        default=None,
     )
-    parser.add_argument("--zipf-exponent", type=float, default=DEFAULT_CONFIG.zipf_exponent)
+    parser.add_argument("--zipf-exponent", type=float, default=None)
     parser.add_argument(
         "--popularity-epoch-length",
         type=int,
-        default=DEFAULT_CONFIG.popularity_epoch_length,
+        default=None,
     )
     parser.add_argument(
         "--popularity-changes-per-epoch",
         type=int,
-        default=DEFAULT_CONFIG.popularity_changes_per_epoch,
+        default=None,
     )
     parser.add_argument(
         "--input-relative-jitter",
         type=float,
-        default=DEFAULT_CONFIG.input_relative_jitter,
+        default=None,
     )
     parser.add_argument(
         "--load-relative-jitter",
         type=float,
-        default=DEFAULT_CONFIG.load_relative_jitter,
+        default=None,
     )
+    parser.add_argument("--popularity-history-length", type=int, default=None)
     parser.add_argument("--dt", type=float, default=None)
     parser.add_argument("--warmup-time", type=float, default=None)
     parser.add_argument("--episode-time", type=float, default=None)
@@ -1073,15 +1378,62 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def config_from_args(args: argparse.Namespace) -> TaskConfig:
+def config_from_args(
+    args: argparse.Namespace,
+    project_config: dict[str, Any] | None = None,
+) -> TaskConfig:
+    base = (
+        task_config_from_project_config(project_config)
+        if project_config is not None
+        else DEFAULT_CONFIG
+    )
     return TaskConfig(
-        num_services=args.num_services,
-        arrival_probability=args.arrival_probability,
-        zipf_exponent=args.zipf_exponent,
-        popularity_epoch_length=args.popularity_epoch_length,
-        popularity_changes_per_epoch=args.popularity_changes_per_epoch,
-        input_relative_jitter=args.input_relative_jitter,
-        load_relative_jitter=args.load_relative_jitter,
+        num_services=(
+            base.num_services if args.num_services is None else args.num_services
+        ),
+        arrival_probability=(
+            base.arrival_probability
+            if args.arrival_probability is None
+            else args.arrival_probability
+        ),
+        zipf_exponent=(
+            base.zipf_exponent if args.zipf_exponent is None else args.zipf_exponent
+        ),
+        popularity_epoch_length=(
+            base.popularity_epoch_length
+            if args.popularity_epoch_length is None
+            else args.popularity_epoch_length
+        ),
+        popularity_changes_per_epoch=(
+            base.popularity_changes_per_epoch
+            if args.popularity_changes_per_epoch is None
+            else args.popularity_changes_per_epoch
+        ),
+        popularity_history_length=(
+            base.popularity_history_length
+            if args.popularity_history_length is None
+            else args.popularity_history_length
+        ),
+        input_relative_jitter=(
+            base.input_relative_jitter
+            if args.input_relative_jitter is None
+            else args.input_relative_jitter
+        ),
+        load_relative_jitter=(
+            base.load_relative_jitter
+            if args.load_relative_jitter is None
+            else args.load_relative_jitter
+        ),
+        fallback_dt_s=base.fallback_dt_s,
+        fallback_warmup_time_s=base.fallback_warmup_time_s,
+        fallback_episode_time_s=base.fallback_episode_time_s,
+        fallback_master_seed=base.fallback_master_seed,
+        rng_stream_names=base.rng_stream_names,
+        program_size_unit=base.program_size_unit,
+        input_size_unit=base.input_size_unit,
+        cpu_cycles_unit=base.cpu_cycles_unit,
+        cycles_per_bit_unit=base.cycles_per_bit_unit,
+        class_ranges=base.class_ranges,
     )
 
 
@@ -1090,17 +1442,65 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         project_root = find_project_root()
-        config = config_from_args(args)
-        roles_file = resolve_path(project_root, args.roles_file)
-        trajectory_file = resolve_path(project_root, args.trajectory_file)
-        output_dir = resolve_path(project_root, args.output_dir)
+        from common import project_config as project_config_module
+
+        formal_config = project_config_module.load_config()
+        config = config_from_args(args, formal_config)
+        roles_file = resolve_path(
+            project_root,
+            args.roles_file or "data/generated/vehicle_roles.json",
+        )
+        if args.roles_file is None:
+            roles_file = project_config_module.resolve_path(
+                project_root,
+                project_config_module.get_config_value(
+                    formal_config, "paths.vehicle_roles"
+                ),
+            )
+        trajectory_file = resolve_path(
+            project_root,
+            args.trajectory_file
+            or project_config_module.get_config_value(
+                formal_config,
+                "paths.trajectory",
+                "data/generated/trajectory.csv",
+            ),
+        )
+        output_dir = resolve_path(
+            project_root,
+            args.output_dir
+            or Path(
+                project_config_module.get_config_value(
+                    formal_config,
+                    "paths.service_catalog",
+                    "data/generated/service_catalog.json",
+                )
+            ).parent,
+        )
 
         roles, task_vehicles, service_vehicles = load_roles_and_tv(roles_file)
+        expected_tv = int(
+            project_config_module.get_config_value(
+                formal_config,
+                "simulation.num_task_vehicles",
+            )
+        )
+        expected_sv = int(
+            project_config_module.get_config_value(
+                formal_config,
+                "simulation.num_service_vehicles",
+            )
+        )
+        if len(task_vehicles) != expected_tv or len(service_vehicles) != expected_sv:
+            raise ValueError(
+                "vehicle_roles.json 的 TV/SV 数量与 system_config.toml 不一致。"
+            )
         config.validate(len(task_vehicles))
         dt_s, warmup_s, episode_s, master_seed = resolve_time_metadata(
             roles,
             args,
             config,
+            formal_config,
         )
         num_slots, _ = read_formal_trajectory_alignment(
             trajectory_file,
@@ -1147,6 +1547,10 @@ def main(argv: list[str] | None = None) -> int:
             raise AssertionError("相同 seed 重复生成的 popularity 不一致。")
         if json_canonical(artifacts["task_rows"]) != json_canonical(repeated["task_rows"]):
             raise AssertionError("相同 seed 重复生成的 tasks 不一致。")
+        if json_canonical(artifacts["popularity_history_rows"]) != json_canonical(
+            repeated["popularity_history_rows"]
+        ):
+            raise AssertionError("相同 seed 重复生成的 popularity history 不一致。")
 
         rngs, child_seeds = make_rngs(master_seed, config.rng_stream_names)
         del rngs
@@ -1164,6 +1568,7 @@ def main(argv: list[str] | None = None) -> int:
         files = output_artifacts(
             output_dir,
             catalog_output,
+            artifacts["popularity_history_rows"],
             artifacts["popularity_rows"],
             artifacts["task_rows"],
         )
@@ -1171,6 +1576,7 @@ def main(argv: list[str] | None = None) -> int:
         print("任务环境生成完成：")
         print(f"  TV={len(task_vehicles)}，SV={len(service_vehicles)}（SV 不生成任务）")
         print(f"  F={config.num_services}，formal slots={num_slots}")
+        print(f"  popularity prehistory slots={artifacts['history_slots']}")
         print(f"  rho_star epoch 数={validation['epoch_count']}")
         print(f"  tasks rows={validation['task_rows']}，arrivals={validation['total_arrivals']}")
         print(f"  empirical lambda={validation['empirical_arrival_rate']:.6f}")
