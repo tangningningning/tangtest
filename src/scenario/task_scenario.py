@@ -762,6 +762,9 @@ def make_popularity_trace_with_history(
                     }
                 )
 
+    formal_epoch_count = int(
+        math.ceil(num_slots / config.popularity_epoch_length)
+    )
     schedule = {
         "initial_ranking": formal_initial_ranking or [],
         "prehistory_initial_ranking": (
@@ -770,9 +773,7 @@ def make_popularity_trace_with_history(
             else formal_initial_ranking or []
         ),
         "epoch_changes": schedule_changes,
-        "epoch_count": int(
-            math.ceil(total_slots / config.popularity_epoch_length)
-        ),
+        "epoch_count": formal_epoch_count,
         "history_slots": history_slots,
         "formal_slots": num_slots,
     }
@@ -1846,7 +1847,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  TV={len(task_vehicles)}，SV={len(service_vehicles)}（SV 不生成任务）")
         print(f"  F={config.num_services}，formal slots={num_slots}")
         print(f"  popularity prehistory slots={artifacts['history_slots']}")
-        print(f"  rho_star epoch 数={validation['epoch_count']}")
+        print(f"  formal rho_star epoch 数={validation['epoch_count']}")
         print(f"  tasks rows={validation['task_rows']}，arrivals={validation['total_arrivals']}")
         print(f"  empirical lambda={validation['empirical_arrival_rate']:.6f}")
         print(
