@@ -529,9 +529,9 @@ objective_tolerance = 1.0e-9
 [algorithm.ppo]
 # Trigger-only PPO 结构入口；当前正式主线为 V3 sparse direct counterfactual PPO。
 # 旧配置缺少 credit_assignment 时仍按 legacy scalar PPO 解析。
-enabled = false
-method = "proposed_sparse_direct_cf_frozen_policy_batch_refdrift"
-credit_assignment = "sparse_direct_cf"
+enabled = true
+method = "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift"
+credit_assignment = "hierarchical_gate_direct_cf"
 # Formal V3 candidate: shared encoder + shared autoregressive block + one
 # shared logit head; value_head remains frozen during Direct-CF updates.
 actor_architecture = "v3_full_shared_actor_frozen_policy_batch_v1"

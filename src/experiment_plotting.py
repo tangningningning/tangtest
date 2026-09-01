@@ -2,9 +2,9 @@
 """正式实验图绘制接口。
 
 本模块只负责把已经存在的 Python 结果对象绘制为 PNG，不读取训练日志，
-也不执行 environment、Matching、KKT 或 PPO。图5的两个比例是独立指标：
-缓存服务可用率表示服务程序是否存在于任务车辆自己的固定 local cache 或
-当前 slot 的 SV/RSU/UAV cache；Cloud execution ratio 则来自最终 Matching。
+也不执行 environment、Matching、KKT 或 PPO。正式结果只包含：
+1. PPO Training Convergence；
+2. Task Execution Ratio by Execution Location。
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ import numpy as np
 __all__ = [
     "plot_training_convergence",
     "plot_execution_location_ratios",
-    "plot_cache_availability_cloud_ratio",
 ]
 
 
@@ -214,83 +213,3 @@ def plot_execution_location_ratios(
         plt.close(figure)
     return output
 
-
-def plot_cache_availability_cloud_ratio(
-    algorithm_results: Sequence[Any],
-    output_path: str | Path,
-) -> Path:
-    """绘制缓存服务可用率与云端执行比例的并列柱状图。
-
-    缓存服务可用率按到达任务统计：任务请求服务若存在于该任务车辆自己
-    的 fixed local cache，或存在于当前最终 configuration 的任一 SV/RSU/UAV
-    cache，则记为可用。该指标不是 cache hit rate，服务可用也不代表最终
-    Matching 一定选择 Local/Edge 执行。Cloud execution ratio 严格读取最终
-    Actual-State Matching 中 target == CLOUD 的任务数。两个比例不互补，
-    因此使用 grouped bar 而不是 stacked bar，并共享 0--100% Y 轴。
-    """
-
-    records = _records(algorithm_results, "algorithm_results")
-    output = _png_path(output_path)
-    names: list[str] = []
-    availability: list[float] = []
-    cloud_ratio: list[float] = []
-    for index, record in enumerate(records):
-        raw_name = _field(record, "algorithm_name", index)
-        if not isinstance(raw_name, str) or not raw_name.strip():
-            raise ValueError(f"第{index}条结果的 algorithm_name 不能为空。")
-        name = raw_name.strip()
-        if name in names:
-            raise ValueError(f"algorithm_name 不能重复：{name}")
-        names.append(name)
-
-        availability_value = _finite_float(
-            _field(record, "cache_service_availability_rate", index),
-            "cache_service_availability_rate",
-            index,
-        )
-        cloud_value = _finite_float(
-            _field(record, "cloud_execution_ratio", index),
-            "cloud_execution_ratio",
-            index,
-        )
-        if not 0.0 <= availability_value <= 1.0:
-            raise ValueError("cache_service_availability_rate 必须位于 [0,1]。")
-        if not 0.0 <= cloud_value <= 1.0:
-            raise ValueError("cloud_execution_ratio 必须位于 [0,1]。")
-        availability.append(availability_value)
-        cloud_ratio.append(cloud_value)
-
-    positions = np.arange(len(names), dtype=np.float64)
-    width = 0.38
-    figure, axis = plt.subplots(figsize=(6.4, 4.2))
-    try:
-        # 两个比例含义不同，不做 stacked bar，也不假设二者和为1。
-        axis.bar(
-            positions - width / 2.0,
-            np.asarray(availability) * 100.0,
-            width,
-            label="Cache Service Availability",
-        )
-        axis.bar(
-            positions + width / 2.0,
-            np.asarray(cloud_ratio) * 100.0,
-            width,
-            label="Cloud Execution",
-        )
-        axis.set_xticks(positions)
-        axis.set_xticklabels(names)
-        axis.set_ylabel("Ratio (%)")
-        axis.set_ylim(0.0, 100.0)
-        axis.grid(axis="y", alpha=0.25)
-        axis.set_axisbelow(True)
-        axis.legend()
-        figure.savefig(
-            output,
-            dpi=300,
-            bbox_inches="tight",
-            facecolor="white",
-            transparent=False,
-        )
-    finally:
-        plt.close(figure)
-    return output

@@ -1733,7 +1733,8 @@ def run_gate_cf_branches(
                         flight_boundary,
                         action_spec,
                     )
-                    if step_index == snapshot.step_index:
+                    is_target_step = step_index == snapshot.step_index
+                    if is_target_step:
                         sample = first_sample
                         if not np.array_equal(
                             np.asarray(observation, dtype=np.float32),
@@ -1748,17 +1749,20 @@ def run_gate_cf_branches(
                             action_mask=mask_provider,
                             consume_subpolicy_draw_for_null=True,
                         )
-                    if branch_name == "NULL":
-                        if int(sample.gate_action) != hierarchical_reconfiguration_gate.GATE_ACTION_NULL:
-                            raise AssertionError("NULL Gate-CF branch未强制g=0。")
-                        if not np.array_equal(
-                            np.asarray(sample.action_vector, dtype=np.int8),
-                            np.zeros(int(action_spec.action_dim), dtype=np.int8),
-                        ):
-                            raise AssertionError("NULL Gate-CF branch action不是严格全零。")
-                    else:
-                        if int(sample.gate_action) != hierarchical_reconfiguration_gate.GATE_ACTION_CONFIGURE:
-                            raise AssertionError("CONFIG Gate-CF branch未强制g=1。")
+                    if is_target_step:
+                        if branch_name == "NULL":
+                            if int(sample.gate_action) != hierarchical_reconfiguration_gate.GATE_ACTION_NULL:
+                                raise AssertionError("NULL Gate-CF branch未强制g=0。")
+                            if not np.array_equal(
+                                np.asarray(sample.action_vector, dtype=np.int8),
+                                np.zeros(int(action_spec.action_dim), dtype=np.int8),
+                            ):
+                                raise AssertionError("NULL Gate-CF branch action不是严格全零。")
+                        elif branch_name == "CONFIG":
+                            if int(sample.gate_action) != hierarchical_reconfiguration_gate.GATE_ACTION_CONFIGURE:
+                                raise AssertionError("CONFIG Gate-CF branch未强制g=1。")
+                        else:
+                            raise ValueError(f"未知 Gate-CF branch：{branch_name}")
                     result = slot_environment.execute_slot(
                         previous_cache,
                         previous_uav,
