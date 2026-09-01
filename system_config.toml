@@ -457,6 +457,11 @@ history_length = 20
 # GRU hidden size。训练参数，修改需重新训练 GRU。
 hidden_size = 32
 # 以下为训练参数，在线推理只读取 checkpoint，不应临时改变。
+training_seed = 20260819
+sequence_seed_base = 880001
+num_train_sequences = 24
+num_val_sequences = 6
+num_test_sequences = 6
 learning_rate = 1.0e-3
 batch_size = 64
 max_epochs = 60

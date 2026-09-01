@@ -70,7 +70,6 @@ class PopularityPredictionConfig:
     batch_size: int = 64
     max_epochs: int = 60
     patience: int = 8
-    canonical_tolerance: float = 1e-5
 
     def validate(self) -> None:
         if self.horizon_steps <= 0:
@@ -500,13 +499,19 @@ def evaluate_loss(
     device: torch.device,
 ) -> float:
     model.eval()
-    losses: list[float] = []
+    total_loss = 0.0
+    total_samples = 0
     with torch.no_grad():
         for xb, yb in iter_batches(x, y, batch_size, None):
             logits = model(torch.from_numpy(xb).to(device))
             target = torch.from_numpy(yb).to(device)
-            losses.append(float(distribution_cross_entropy(logits, target).cpu()))
-    return float(np.mean(losses))
+            batch_loss = float(distribution_cross_entropy(logits, target).cpu())
+            batch_samples = len(xb)
+            total_loss += batch_loss * batch_samples
+            total_samples += batch_samples
+    if total_samples == 0:
+        raise ValueError("评估数据集不能为空。")
+    return float(total_loss / total_samples)
 
 
 def train_model(
@@ -533,7 +538,8 @@ def train_model(
 
     for epoch in range(1, config.max_epochs + 1):
         model.train()
-        batch_losses: list[float] = []
+        train_loss_sum = 0.0
+        train_sample_count = 0
         for xb, yb in iter_batches(
             datasets["train"]["x"],
             datasets["train"]["y"],
@@ -548,9 +554,13 @@ def train_model(
                 raise FloatingPointError("训练 loss 出现 NaN/Inf。")
             loss.backward()
             optimizer.step()
-            batch_losses.append(float(loss.detach().cpu()))
+            batch_samples = len(xb)
+            train_loss_sum += float(loss.detach().cpu()) * batch_samples
+            train_sample_count += batch_samples
 
-        train_loss = float(np.mean(batch_losses))
+        if train_sample_count == 0:
+            raise ValueError("训练数据集不能为空。")
+        train_loss = float(train_loss_sum / train_sample_count)
         val_loss = evaluate_loss(
             model,
             datasets["val"]["x"],
@@ -857,6 +867,34 @@ def config_from_args(
                     project_config,
                     "prediction.popularity.training_seed",
                     DEFAULT_CONFIG.training_seed,
+                )
+            ),
+            sequence_seed_base=int(
+                get_config_value(
+                    project_config,
+                    "prediction.popularity.sequence_seed_base",
+                    DEFAULT_CONFIG.sequence_seed_base,
+                )
+            ),
+            num_train_sequences=int(
+                get_config_value(
+                    project_config,
+                    "prediction.popularity.num_train_sequences",
+                    DEFAULT_CONFIG.num_train_sequences,
+                )
+            ),
+            num_val_sequences=int(
+                get_config_value(
+                    project_config,
+                    "prediction.popularity.num_val_sequences",
+                    DEFAULT_CONFIG.num_val_sequences,
+                )
+            ),
+            num_test_sequences=int(
+                get_config_value(
+                    project_config,
+                    "prediction.popularity.num_test_sequences",
+                    DEFAULT_CONFIG.num_test_sequences,
                 )
             ),
             sequence_length=simulation_steps,
