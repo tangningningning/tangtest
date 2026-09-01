@@ -4,7 +4,7 @@
 
 本模块只实现：
 
-    request_count -> EWMA rho_obs -> GRU supervised training -> H_p rho_star prediction
+    request_count -> observed rho_obs -> GRU supervised training -> H_p rho_star prediction
 
 训练序列使用 ``task_scenario.py`` 中已经实现的动态 Zipf、Bernoulli 到达和
 Categorical 服务请求逻辑生成；当前 ``data/generated/popularity.csv`` 只作为
@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from scenario.task_scenario import (
     DEFAULT_CONFIG as TASK_DEFAULT_CONFIG,
     TaskConfig,
+    build_observed_popularity,
     generate_tasks,
     load_json,
     make_popularity_trace,
@@ -57,8 +58,6 @@ class PopularityPredictionConfig:
     history_length: int = 20
     hidden_size: int = 32
     num_layers: int = 1
-    beta_rho: float = 0.90
-    alpha_rho: float = 0.10
 
     training_seed: int = 20260819
     sequence_seed_base: int = 880001
@@ -80,10 +79,6 @@ class PopularityPredictionConfig:
             raise ValueError("L_rho 必须 >= 1。")
         if self.hidden_size <= 0 or self.num_layers != 1:
             raise ValueError("本阶段只使用单层轻量 GRU，hidden_size 必须大于 0。")
-        if not 0.0 <= self.beta_rho <= 1.0:
-            raise ValueError("beta_rho 必须位于 [0, 1]。")
-        if self.alpha_rho <= 0.0:
-            raise ValueError("alpha_rho 必须大于 0。")
         if min(
             self.num_train_sequences,
             self.num_val_sequences,
@@ -99,6 +94,8 @@ class PopularityPredictionConfig:
 
 
 DEFAULT_CONFIG = PopularityPredictionConfig()
+
+OBSERVATION_DEFINITION = "per_slot_request_share_carry_forward"
 
 PREDICTION_FIELDS = (
     "origin_slot",
@@ -160,12 +157,12 @@ def write_csv_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 # ============================================================================
-# 正式 episode 读取与 EWMA rho_obs 构造
+# 正式 episode 读取与 observed rho_obs 构造
 # ============================================================================
 
 
 def load_popularity_csv(path: Path) -> tuple[np.ndarray, np.ndarray, list[float]]:
-    """读取 canonical rho_star/request_count，忽略旧 rho_obs 定义。"""
+    """读取 canonical rho_star/request_count，rho_obs 由 request_count 重建。"""
     rows: list[dict[str, str]] = []
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -249,34 +246,13 @@ def load_popularity_history_csv(
     return counts, times, formal_slots
 
 
-def build_ewma_rho_obs(
-    request_counts: np.ndarray,
-    beta_rho: float,
-    alpha_rho: float,
-) -> np.ndarray:
-    """因果 EWMA：rho_obs(t) 只使用 <= t 的真实 request_count。"""
-    num_slots, num_services = request_counts.shape
-    counts = np.full(num_services, alpha_rho, dtype=np.float64)
-    rho_obs = np.zeros((num_slots, num_services), dtype=np.float64)
-    for slot in range(num_slots):
-        counts = beta_rho * counts + request_counts[slot]
-        rho_obs[slot] = (counts + alpha_rho) / (
-            float(counts.sum()) + num_services * alpha_rho
-        )
-    if not np.allclose(rho_obs.sum(axis=1), 1.0, atol=1e-10, rtol=0.0):
-        raise AssertionError("EWMA rho_obs 未逐时隙归一化。")
-    return rho_obs
-
-
 def build_causal_formal_inputs(
     history_request_counts: np.ndarray,
     formal_request_counts: np.ndarray,
     history_length: int,
-    beta_rho: float,
-    alpha_rho: float,
     origin_slots: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """为每个 formal origin 构造只含 ``<= origin-1`` 的 EWMA 窗口。
+    """为每个 formal origin 构造只含 ``<= origin-1`` 的 observed 窗口。
 
     返回 ``(inputs, combined_rho_obs)``。history 的最后一个观测对应
     formal slot -1；因此 origin=0 的窗口恰好是全部 prehistory。
@@ -290,7 +266,7 @@ def build_causal_formal_inputs(
     if np.any(history < 0.0) or np.any(formal < 0.0):
         raise ValueError("request_count 不能为负数。")
     combined = np.vstack((history, formal))
-    combined_rho_obs = build_ewma_rho_obs(combined, beta_rho, alpha_rho)
+    combined_rho_obs = build_observed_popularity(combined)
     history_end = len(history)
     inputs: list[np.ndarray] = []
     for origin in np.asarray(origin_slots, dtype=np.int64).tolist():
@@ -440,11 +416,7 @@ def make_split_dataset(
             num_tv,
             pred_config.sequence_length,
         )
-        rho_obs = build_ewma_rho_obs(
-            request_counts,
-            pred_config.beta_rho,
-            pred_config.alpha_rho,
-        )
+        rho_obs = build_observed_popularity(request_counts)
         x, y, _ = build_windows(
             rho_obs,
             rho_star,
@@ -752,7 +724,14 @@ def load_checkpoint_model(
     device: torch.device,
 ) -> tuple[PopularityGRU, dict[str, Any]]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    metadata = checkpoint["metadata"]
+    metadata = checkpoint.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("GRU checkpoint 缺少 metadata。")
+    if metadata.get("observation_definition") != OBSERVATION_DEFINITION:
+        raise ValueError(
+            "old GRU checkpoint uses incompatible popularity observation "
+            "definition; retrain popularity GRU"
+        )
     model = PopularityGRU(
         num_services=int(metadata["F"]),
         hidden_size=int(metadata["hidden_size"]),
@@ -822,8 +801,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--history-length", type=int, default=None)
     parser.add_argument("--hidden-size", type=int, default=None)
-    parser.add_argument("--beta-rho", type=float, default=None)
-    parser.add_argument("--alpha-rho", type=float, default=None)
     parser.add_argument("--training-seed", type=int, default=None)
     parser.add_argument("--sequence-seed-base", type=int, default=None)
     parser.add_argument("--num-train-sequences", type=int, default=None)
@@ -875,20 +852,6 @@ def config_from_args(
                     DEFAULT_CONFIG.hidden_size,
                 )
             ),
-            beta_rho=float(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.beta_rho",
-                    DEFAULT_CONFIG.beta_rho,
-                )
-            ),
-            alpha_rho=float(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.alpha_rho",
-                    DEFAULT_CONFIG.alpha_rho,
-                )
-            ),
             training_seed=int(
                 get_config_value(
                     project_config,
@@ -934,8 +897,6 @@ def config_from_args(
         horizon_steps=choose("horizon_steps", args.horizon),
         history_length=choose("history_length", args.history_length),
         hidden_size=choose("hidden_size", args.hidden_size),
-        beta_rho=choose("beta_rho", args.beta_rho),
-        alpha_rho=choose("alpha_rho", args.alpha_rho),
         training_seed=choose("training_seed", args.training_seed),
         sequence_seed_base=choose("sequence_seed_base", args.sequence_seed_base),
         num_train_sequences=choose("num_train_sequences", args.num_train_sequences),
@@ -1068,8 +1029,6 @@ def main(argv: list[str] | None = None) -> int:
             history_request_counts,
             canonical_request_counts,
             config.history_length,
-            config.beta_rho,
-            config.alpha_rho,
             origin_slots,
         )
         canonical_rho_obs = combined_rho_obs[len(history_request_counts) :]
@@ -1121,14 +1080,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         metadata = {
-            "schema_version": 2,
+            "schema_version": 3,
             "F": task_config.num_services,
             "H_p": config.horizon_steps,
             "L_rho": config.history_length,
             "hidden_size": config.hidden_size,
             "num_layers": config.num_layers,
-            "beta_rho": config.beta_rho,
-            "alpha_rho": config.alpha_rho,
+            "observation_definition": OBSERVATION_DEFINITION,
             "training_seed": config.training_seed,
             "sequence_seed_base": config.sequence_seed_base,
             "train_sequence_seeds": sequence_seeds["train"],

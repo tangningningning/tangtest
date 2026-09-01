@@ -5,7 +5,7 @@
 本模块只生成后续优化器可直接使用的预测输入，不保存未来 ground truth。
 车辆 nominal 预测复用 ``vehicle_prediction.py`` 的 SUMO route geometry、
 noisy observation replay、Kalman replay 和 ``predict_nominal``；服务流行度
-预测复用 ``popularity_prediction.py`` 的 EWMA rho_obs、GRU checkpoint 加载
+预测复用 ``popularity_prediction.py`` 的 observed rho_obs、GRU checkpoint 加载
 和推理；任务负载采样沿用 ``task_scenario.py`` 中的 service catalog 与
 workload jitter 语义。
 """
@@ -517,14 +517,10 @@ def predict_rho_hat(
     if checkpoint_hp != config.horizon_steps:
         raise ValueError("GRU checkpoint H_p 与 scenario H_p 不一致。")
     history_length = int(checkpoint_metadata["L_rho"])
-    beta_rho = float(checkpoint_metadata["beta_rho"])
-    alpha_rho = float(checkpoint_metadata["alpha_rho"])
     inputs, _ = pop.build_causal_formal_inputs(
         history_request_counts,
         request_counts,
         history_length,
-        beta_rho,
-        alpha_rho,
         origin_slots,
     )
     rho_hat = pop.predict_probabilities(
@@ -1163,8 +1159,9 @@ def main(argv: list[str] | None = None) -> int:
                 "H_p": checkpoint_metadata["H_p"],
                 "L_rho": checkpoint_metadata["L_rho"],
                 "hidden_size": checkpoint_metadata["hidden_size"],
-                "beta_rho": checkpoint_metadata["beta_rho"],
-                "alpha_rho": checkpoint_metadata["alpha_rho"],
+                "observation_definition": checkpoint_metadata[
+                    "observation_definition"
+                ],
                 "best_validation_loss": checkpoint_metadata["training_summary"][
                     "best_validation_loss"
                 ],

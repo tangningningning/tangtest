@@ -18,8 +18,7 @@
 # prediction.vehicle.sigma_speed_mps、prediction.vehicle.horizon。
 #
 # 【修改以下参数需要重新训练 GRU】
-# service.count、popularity 过程、prediction.popularity.beta_rho、
-# prediction.popularity.alpha_rho、prediction.popularity.history_length、
+# service.count、popularity 过程、prediction.popularity.history_length、
 # prediction.vehicle.horizon / prediction.popularity.horizon。
 #
 # 【修改 H_p】
@@ -457,10 +456,6 @@ observation_noise_seed = 9101
 history_length = 20
 # GRU hidden size。训练参数，修改需重新训练 GRU。
 hidden_size = 32
-# EWMA beta_rho。在线推理和训练必须一致；修改需重新训练/重生成预测。
-beta_rho = 0.9
-# EWMA alpha_rho。在线推理和训练必须一致。
-alpha_rho = 0.1
 # 以下为训练参数，在线推理只读取 checkpoint，不应临时改变。
 learning_rate = 1.0e-3
 batch_size = 64
@@ -602,8 +597,6 @@ num_minibatches = 4
 "prediction.vehicle.observation_noise_seed" = "CONFIRMED_DATA"
 "prediction.popularity.history_length" = "CONFIRMED_DATA"
 "prediction.popularity.hidden_size" = "CONFIRMED_DATA"
-"prediction.popularity.beta_rho" = "CONFIRMED_DATA"
-"prediction.popularity.alpha_rho" = "CONFIRMED_DATA"
 "scenario.num_scenarios" = "CONFIRMED_DATA"
 "scenario.cross_vehicle_residual_sampling" = "CONFIRMED_DATA"
 "nodes.uav.count" = "CONFIRMED_DATA"

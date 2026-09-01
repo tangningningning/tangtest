@@ -884,19 +884,57 @@ def generate_tasks(
     return rows, request_counts
 
 
+def build_observed_popularity(request_counts: np.ndarray) -> np.ndarray:
+    """把逐时隙请求次数转换为因果 observed popularity。
+
+    有请求的时隙使用当前时隙的请求比例；空时隙沿用上一时隙的比例。
+    连续序列第一个时隙若为空，则从均匀分布初始化。该函数只读取当前
+    及此前的 request_counts，不读取 rho_star 或未来时隙。
+    """
+    counts = np.asarray(request_counts, dtype=np.float64)
+    if counts.ndim != 2 or counts.shape[1] <= 0:
+        raise ValueError("request_counts 必须是 [num_slots, num_services] 的非空二维数组。")
+    if not np.isfinite(counts).all():
+        raise ValueError("request_counts 不能包含 NaN/Inf。")
+    if np.any(counts < 0.0):
+        raise ValueError("request_counts 不能为负数。")
+
+    num_slots, num_services = counts.shape
+    previous = np.full(num_services, 1.0 / num_services, dtype=np.float64)
+    rho_obs = np.zeros((num_slots, num_services), dtype=np.float64)
+    for slot in range(num_slots):
+        total = float(counts[slot].sum())
+        if total > 0.0:
+            previous = counts[slot] / total
+        rho_obs[slot] = previous
+
+    if not np.isfinite(rho_obs).all() or not np.allclose(
+        rho_obs.sum(axis=1),
+        1.0,
+        atol=1e-10,
+        rtol=0.0,
+    ):
+        raise AssertionError("observed popularity 未逐时隙归一化或包含 NaN/Inf。")
+    return rho_obs
+
+
 def attach_observed_counts(
     popularity_rows: list[dict[str, Any]],
     request_counts: np.ndarray,
+    rho_obs: np.ndarray,
 ) -> None:
-    """保存 request_count/rho_obs，但不修改 rho_star。"""
-    num_services = request_counts.shape[1]
+    """把 formal request_count 和已计算的 observed popularity 写入行。"""
+    counts = np.asarray(request_counts, dtype=np.float64)
+    observed = np.asarray(rho_obs, dtype=np.float64)
+    if counts.ndim != 2 or observed.shape != counts.shape:
+        raise ValueError("request_counts 与 rho_obs 的 shape 必须一致。")
+    num_services = counts.shape[1]
     for row in popularity_rows:
         slot = int(row["slot"])
         service_id = int(row["service_id"])
-        count = int(request_counts[slot, service_id])
-        total = int(request_counts[slot].sum())
+        count = int(counts[slot, service_id])
         row["request_count"] = count
-        row["rho_obs"] = float(count / total) if total > 0 else ""
+        row["rho_obs"] = float(observed[slot, service_id])
     expected_rows = request_counts.shape[0] * num_services
     if len(popularity_rows) != expected_rows:
         raise AssertionError("popularity 行数与 slot×service 数量不一致。")
@@ -905,18 +943,22 @@ def attach_observed_counts(
 def attach_history_observed_counts(
     popularity_history_rows: list[dict[str, Any]],
     request_counts: np.ndarray,
+    rho_obs: np.ndarray,
 ) -> None:
-    """把 prehistory request_count 写入独立 history CSV 的 observation 字段。"""
-    num_services = request_counts.shape[1]
+    """把 history request_count 和连续 observed popularity 写入 history 行。"""
+    counts = np.asarray(request_counts, dtype=np.float64)
+    observed = np.asarray(rho_obs, dtype=np.float64)
+    if counts.ndim != 2 or observed.shape != counts.shape:
+        raise ValueError("request_counts 与 rho_obs 的 shape 必须一致。")
+    num_services = counts.shape[1]
     for row in popularity_history_rows:
         history_index = int(row["history_index"])
         service_id = int(row["service_id"])
         if not 0 <= history_index < request_counts.shape[0]:
             raise AssertionError("history_index 超出 prehistory request_counts。")
-        count = int(request_counts[history_index, service_id])
-        total = int(request_counts[history_index].sum())
+        count = int(counts[history_index, service_id])
         row["request_count"] = count
-        row["rho_obs"] = float(count / total) if total > 0 else ""
+        row["rho_obs"] = float(observed[history_index, service_id])
     expected_rows = request_counts.shape[0] * num_services
     if len(popularity_history_rows) != expected_rows:
         raise AssertionError("popularity_history 行数与 history slot×service 数量不一致。")
@@ -1129,8 +1171,17 @@ def build_artifacts(
     task_rows = [row for row in combined_task_rows if int(row["slot"]) >= 0]
     history_request_counts = combined_request_counts[:history_slots].copy()
     request_counts = combined_request_counts[history_slots:].copy()
-    attach_observed_counts(popularity_rows, request_counts)
-    attach_history_observed_counts(popularity_history_rows, history_request_counts)
+    # history 与 formal 必须共享同一条连续 observed popularity；否则 formal
+    # slot 0 的空请求无法正确继承 prehistory slot -1 的观测比例。
+    combined_rho_obs = build_observed_popularity(combined_request_counts)
+    history_rho_obs = combined_rho_obs[:history_slots].copy()
+    rho_obs = combined_rho_obs[history_slots:].copy()
+    attach_observed_counts(popularity_rows, request_counts, rho_obs)
+    attach_history_observed_counts(
+        popularity_history_rows,
+        history_request_counts,
+        history_rho_obs,
+    )
 
     return {
         "catalog": catalog,
@@ -1139,6 +1190,7 @@ def build_artifacts(
         "task_rows": task_rows,
         "probabilities": probabilities,
         "combined_probabilities": combined_probabilities,
+        "combined_rho_obs": combined_rho_obs,
         "request_counts": request_counts,
         "history_request_counts": history_request_counts,
         "schedule": schedule,
