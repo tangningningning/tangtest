@@ -287,6 +287,44 @@ def validate_config(config: dict[str, Any]) -> None:
 
     _walk_numbers(config)
 
+    service_count_value = get_config_value(config, "service.count")
+    if (
+        service_count_value is None
+        or isinstance(service_count_value, bool)
+        or int(service_count_value) != service_count_value
+        or int(service_count_value) <= 0
+    ):
+        raise ValueError("service.count 必须是正整数。")
+    service_generation = get_config_value(config, "service.generation")
+    if not isinstance(service_generation, dict):
+        raise ValueError("缺少 service.generation 配置表。")
+    service_ranges = (
+        ("program_size_min_mb", "program_size_max_mb", "program_size"),
+        (
+            "mean_input_size_min_mbit",
+            "mean_input_size_max_mbit",
+            "mean_input_size",
+        ),
+        ("cycles_per_bit_min", "cycles_per_bit_max", "cycles_per_bit"),
+    )
+    for lower_key, upper_key, label in service_ranges:
+        lower = service_generation.get(lower_key)
+        upper = service_generation.get(upper_key)
+        if lower is None or upper is None:
+            raise ValueError(
+                f"service.generation 缺少 {lower_key}/{upper_key}。"
+            )
+        lower = float(lower)
+        upper = float(upper)
+        if not math.isfinite(lower) or not math.isfinite(upper):
+            raise ValueError(f"service.generation.{label} 范围不能是 NaN/Inf。")
+        if lower <= 0.0:
+            raise ValueError(f"service.generation.{lower_key} 必须大于 0。")
+        if upper < lower:
+            raise ValueError(
+                f"service.generation.{upper_key} 必须大于等于 {lower_key}。"
+            )
+
     uav_count = int(get_config_value(config, "nodes.uav.count"))
     if uav_count < 2:
         raise ValueError("当前系统要求UAV数量至少为2，请检查system_config.toml中的nodes.uav.count。")

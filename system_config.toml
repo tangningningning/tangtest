@@ -102,35 +102,17 @@ random_trips_maxtries = 1000
 count = 10
 # 实际服务实例目录。缓存模块读取 s_f 时必须使用此 JSON。
 catalog_path = "data/generated/service_catalog.json"
-# PROVISIONAL：服务生成范围来自当前 task_scenario.py，不是论文最终校准值。
-# 每个 class range 定义 program_size(MB)、mean_input_size(Mbit) 和 cycles_per_bit 的采样范围。
 
-[[service.class_ranges]]
-workload_class = "data_intensive"
-program_size_min_mb = 1200.0
+[service.generation]
+# PROVISIONAL service heterogeneity envelope.
+# These ranges preserve the existing experiment scale and are not claimed
+# as final literature-calibrated values.
+program_size_min_mb = 1000.0
 program_size_max_mb = 2000.0
-mean_input_size_min_mbit = 1.0
+mean_input_size_min_mbit = 0.5
 mean_input_size_max_mbit = 1.5
 cycles_per_bit_min = 200.0
-cycles_per_bit_max = 500.0
-
-[[service.class_ranges]]
-workload_class = "compute_intensive"
-program_size_min_mb = 1000.0
-program_size_max_mb = 1800.0
-mean_input_size_min_mbit = 0.5
-mean_input_size_max_mbit = 1.0
-cycles_per_bit_min = 700.0
 cycles_per_bit_max = 1000.0
-
-[[service.class_ranges]]
-workload_class = "balanced"
-program_size_min_mb = 1000.0
-program_size_max_mb = 1900.0
-mean_input_size_min_mbit = 0.75
-mean_input_size_max_mbit = 1.25
-cycles_per_bit_min = 450.0
-cycles_per_bit_max = 750.0
 
 [task]
 # Bernoulli 任务到达概率 lambda。当前实际值来自 task_scenario.py；修改需要重生成任务。

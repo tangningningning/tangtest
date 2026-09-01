@@ -62,21 +62,22 @@ class TaskConfig:
         "workload_variation",
     )
 
-    # implementation provisional defaults：参考现有项目历史配置的量纲，
-    # 具体区间仍需结合论文和文献统一校准。
+    # PROVISIONAL service heterogeneity envelope. These ranges preserve the
+    # existing experiment scale and are not claimed as final
+    # literature-calibrated values.
+    program_size_min_mb: float = 1000.0
+    program_size_max_mb: float = 2000.0
+    mean_input_size_min_mbit: float = 0.5
+    mean_input_size_max_mbit: float = 1.5
+    cycles_per_bit_min: float = 200.0
+    cycles_per_bit_max: float = 1000.0
+
+    # implementation provisional defaults：参数范围由 system_config.toml
+    # 正式入口统一读取；以下值只用于无 TOML 的函数级回退。
     program_size_unit: str = "MB"
     input_size_unit: str = "bit"
     cpu_cycles_unit: str = "cycle"
     cycles_per_bit_unit: str = "cycle/bit"
-
-    # 不同 workload_class 的范围只用于构造异质服务标签，不是系统决策变量。
-    class_ranges: tuple[tuple[str, float, float, float, float, float, float], ...] = (
-        # class, program_min_MB, program_max_MB, D_min_Mbit, D_max_Mbit,
-        # cycles_per_bit_min, cycles_per_bit_max
-        ("data_intensive", 1200.0, 2000.0, 1.00, 1.50, 200.0, 500.0),
-        ("compute_intensive", 1000.0, 1800.0, 0.50, 1.00, 700.0, 1000.0),
-        ("balanced", 1000.0, 1900.0, 0.75, 1.25, 450.0, 750.0),
-    )
 
     def validate(self, num_tv: int) -> None:
         if self.num_services <= 0:
@@ -97,8 +98,22 @@ class TaskConfig:
             raise ValueError("load_relative_jitter 必须位于 [0, 1)。")
         if num_tv <= 0:
             raise ValueError("task_vehicles 不能为空。")
-        if not self.class_ranges:
-            raise ValueError("至少需要一个 workload_class 参数范围。")
+        parameter_ranges = (
+            ("program_size", self.program_size_min_mb, self.program_size_max_mb),
+            (
+                "mean_input_size",
+                self.mean_input_size_min_mbit,
+                self.mean_input_size_max_mbit,
+            ),
+            ("cycles_per_bit", self.cycles_per_bit_min, self.cycles_per_bit_max),
+        )
+        for name, lower, upper in parameter_ranges:
+            if not math.isfinite(float(lower)) or not math.isfinite(float(upper)):
+                raise ValueError(f"{name} 参数范围不能是 NaN/Inf。")
+            if float(lower) <= 0.0:
+                raise ValueError(f"{name}_min 必须大于 0。")
+            if float(upper) < float(lower):
+                raise ValueError(f"{name}_max 必须大于等于 {name}_min。")
 
 
 DEFAULT_CONFIG = TaskConfig()
@@ -108,7 +123,6 @@ SERVICE_CATALOG_FIELDS = (
     "program_size",
     "mean_input_size",
     "cycles_per_bit",
-    "workload_class",
 )
 
 POPULARITY_FIELDS = (
@@ -143,8 +157,11 @@ TASK_FIELDS = (
     "service_id",
     "input_size",
     "cpu_cycles",
-    "workload_class",
 )
+
+TASK_TYPE_DEFINITION = "service_id"
+SERVICE_GENERATION_MODE = "stratified_uniform_per_dimension"
+SERVICE_PARAMETER_ASSIGNMENT = "independent_permutation_across_dimensions"
 
 
 # ============================================================================
@@ -360,25 +377,87 @@ def make_rngs(
     return rngs, child_seeds
 
 
+def stratified_uniform_samples(
+    rng: np.random.Generator,
+    count: int,
+    lower: float,
+    upper: float,
+) -> np.ndarray:
+    """在闭区间 ``[lower, upper]`` 的每个等宽 strata 中采样一次。
+
+    返回数组按 stratum 顺序排列；调用方应再使用独立 permutation 将
+    各维度样本随机分配给 service_id。这样每个维度都覆盖整个 provisional
+    envelope，同时不把 stratum 顺序赋予 service_id。
+    """
+    if isinstance(count, (bool, np.bool_)) or int(count) != count:
+        raise ValueError("stratified sampling 的 count 必须是正整数。")
+    count = int(count)
+    if count <= 0:
+        raise ValueError("stratified sampling 的 count 必须大于 0。")
+
+    lower = float(lower)
+    upper = float(upper)
+    if not math.isfinite(lower) or not math.isfinite(upper):
+        raise ValueError("stratified sampling 的上下界不能是 NaN/Inf。")
+    if upper < lower:
+        raise ValueError("stratified sampling 要求 upper >= lower。")
+    if upper == lower:
+        return np.full(count, lower, dtype=np.float64)
+
+    # u_k=(k+r_k)/F，r_k~U(0,1)；NumPy Generator.random 使用半开区间
+    # [0,1)，因此样本不会因 r_k=1 落入下一个 stratum。
+    jitter = rng.random(count)
+    normalized = (np.arange(count, dtype=np.float64) + jitter) / count
+    samples = lower + normalized * (upper - lower)
+    # 仅消除浮点舍入造成的极小越界，不改变 strata 分配语义。
+    return np.clip(samples, lower, upper).astype(np.float64, copy=False)
+
+
 def make_service_catalog(
     config: TaskConfig,
     rng: np.random.Generator,
 ) -> list[dict[str, Any]]:
-    """生成服务异质性参数；workload_class 只是数据标签。"""
+    """生成 service_id 对应的 task type 及其三维服务参数。
+
+    每个参数维度单独分层采样，再由独立 permutation 随机分配给 service
+    identity；因此 service_id 不携带 workload 大小排序语义。
+    """
+    program_samples = stratified_uniform_samples(
+        rng,
+        config.num_services,
+        config.program_size_min_mb,
+        config.program_size_max_mb,
+    )
+    input_samples_mbit = stratified_uniform_samples(
+        rng,
+        config.num_services,
+        config.mean_input_size_min_mbit,
+        config.mean_input_size_max_mbit,
+    )
+    cycle_samples = stratified_uniform_samples(
+        rng,
+        config.num_services,
+        config.cycles_per_bit_min,
+        config.cycles_per_bit_max,
+    )
+
+    # 三次 permutation 都从同一个 service_catalog child RNG 独立抽取；
+    # 这里只共享随机流，不共享维度顺序。
+    program_permutation = rng.permutation(config.num_services)
+    input_permutation = rng.permutation(config.num_services)
+    cycle_permutation = rng.permutation(config.num_services)
+
     catalog: list[dict[str, Any]] = []
     for service_id in range(config.num_services):
-        class_name, p_min, p_max, d_min, d_max, c_min, c_max = config.class_ranges[
-            service_id % len(config.class_ranges)
-        ]
         catalog.append(
             {
                 "service_id": service_id,
-                "program_size": float(rng.uniform(p_min, p_max)),
+                "program_size": float(program_samples[program_permutation[service_id]]),
                 "mean_input_size": float(
-                    rng.uniform(d_min, d_max) * 1_000_000.0
+                    input_samples_mbit[input_permutation[service_id]]
+                    * 1_000_000.0
                 ),
-                "cycles_per_bit": float(rng.uniform(c_min, c_max)),
-                "workload_class": class_name,
+                "cycles_per_bit": float(cycle_samples[cycle_permutation[service_id]]),
             }
         )
     return catalog
@@ -389,6 +468,125 @@ def catalog_by_id(catalog: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     if set(result) != set(range(len(catalog))):
         raise ValueError("service_id 必须覆盖 0 到 F-1。")
     return result
+
+
+def service_parameter_stratum_summary(
+    catalog: list[dict[str, Any]],
+    config: TaskConfig,
+) -> dict[str, Any]:
+    """返回 service catalog 三个参数维度的 stratum 覆盖诊断。
+
+    stratum 只属于生成 metadata/validation，不写入正式 service/task 行。
+    ``mean_input_size`` 在 catalog 中是 bit，因此校验时先还原为 Mbit。
+    """
+    by_id = catalog_by_id(catalog)
+    dimensions = (
+        (
+            "program_size_mb",
+            "program_size",
+            config.program_size_min_mb,
+            config.program_size_max_mb,
+            1.0,
+        ),
+        (
+            "mean_input_size_mbit",
+            "mean_input_size",
+            config.mean_input_size_min_mbit,
+            config.mean_input_size_max_mbit,
+            1.0e-6,
+        ),
+        (
+            "cycles_per_bit",
+            "cycles_per_bit",
+            config.cycles_per_bit_min,
+            config.cycles_per_bit_max,
+            1.0,
+        ),
+    )
+    stratum_vectors: list[np.ndarray] = []
+    parameter_values: dict[str, np.ndarray] = {}
+    summary: dict[str, Any] = {}
+    for label, field, lower, upper, scale in dimensions:
+        values = np.asarray(
+            [float(by_id[index][field]) * scale for index in range(config.num_services)],
+            dtype=np.float64,
+        )
+        parameter_values[label] = values
+        lower = float(lower)
+        upper = float(upper)
+        if np.any(values < lower) or np.any(values > upper):
+            raise AssertionError(f"{label} 超出配置的 service generation envelope。")
+
+        if upper == lower:
+            # 零宽区间无法从数值上区分 strata；TaskConfig 仍允许它作为
+            # 合法的退化范围，常规 provisional envelope 是非退化区间。
+            stratum_indices = np.zeros(config.num_services, dtype=np.int64)
+            counts = np.bincount(
+                stratum_indices,
+                minlength=config.num_services,
+            )
+            covered = config.num_services == 1
+        else:
+            normalized = (values - lower) / (upper - lower)
+            stratum_indices = np.floor(
+                normalized * config.num_services
+            ).astype(np.int64)
+            # upper 端点应归入最后一个 strata；同时防止浮点舍入越界。
+            stratum_indices = np.clip(
+                stratum_indices,
+                0,
+                config.num_services - 1,
+            )
+            counts = np.bincount(
+                stratum_indices,
+                minlength=config.num_services,
+            )
+            covered = bool(np.all(counts == 1))
+        if not covered:
+            raise AssertionError(
+                f"{label} 未做到每个 stratum 恰好一个 service：{counts.tolist()}"
+            )
+        stratum_vectors.append(stratum_indices)
+        summary[label] = {
+            "stratum_count": config.num_services,
+            "stratum_counts": counts.astype(int).tolist(),
+            "stratum_index_by_service_id": stratum_indices.astype(int).tolist(),
+        }
+
+    all_orders_identical = bool(
+        len(stratum_vectors) == 3
+        and np.array_equal(stratum_vectors[0], stratum_vectors[1])
+        and np.array_equal(stratum_vectors[0], stratum_vectors[2])
+    )
+    if config.num_services > 1 and all_orders_identical:
+        raise AssertionError(
+            "三个 service 参数维度的 stratum assignment 不能全部使用同一顺序。"
+        )
+    summary["independent_dimension_orders"] = (
+        not all_orders_identical or config.num_services <= 1
+    )
+
+    def safe_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
+        if left.size < 2 or np.std(left) == 0.0 or np.std(right) == 0.0:
+            return None
+        value = float(np.corrcoef(left, right)[0, 1])
+        return value if math.isfinite(value) else None
+
+    summary["pairwise_correlations"] = {
+        "program_size_vs_mean_input_size": safe_correlation(
+            parameter_values["program_size_mb"],
+            parameter_values["mean_input_size_mbit"],
+        ),
+        "program_size_vs_cycles_per_bit": safe_correlation(
+            parameter_values["program_size_mb"],
+            parameter_values["cycles_per_bit"],
+        ),
+        "mean_input_size_vs_cycles_per_bit": safe_correlation(
+            parameter_values["mean_input_size_mbit"],
+            parameter_values["cycles_per_bit"],
+        ),
+    }
+    return summary
 
 
 # ============================================================================
@@ -634,7 +832,6 @@ def generate_tasks(
                         "service_id": "",
                         "input_size": 0.0,
                         "cpu_cycles": 0.0,
-                        "workload_class": "",
                     }
                 )
                 continue
@@ -675,7 +872,6 @@ def generate_tasks(
                     "service_id": service_id,
                     "input_size": input_size,
                     "cpu_cycles": cpu_cycles,
-                    "workload_class": service["workload_class"],
                 }
             )
 
@@ -976,6 +1172,7 @@ def validate_artifacts(
         for field in ("program_size", "mean_input_size", "cycles_per_bit"):
             if float(row[field]) <= 0.0:
                 raise AssertionError(f"服务参数 {field} 必须大于 0。")
+    catalog_parameter_summary = service_parameter_stratum_summary(catalog, config)
 
     if len(popularity_rows) != num_slots * config.num_services:
         raise AssertionError("popularity.csv 行数错误。")
@@ -1118,6 +1315,7 @@ def validate_artifacts(
         "rho_star_normalized": True,
         "adjacent_same_probability_fraction": adjacent_same_fraction,
         "service_distribution_correlation": correlation,
+        "service_parameter_generation": catalog_parameter_summary,
         "epoch_count": int(schedule["epoch_count"]),
         "history_slots": history_slots,
         "history_request_total": int(history_request_counts.sum()),
@@ -1160,6 +1358,29 @@ def make_service_catalog_output(
             "tasks.cpu_cycles": config.cpu_cycles_unit,
         },
         "provisional_defaults": True,
+        "task_type_definition": TASK_TYPE_DEFINITION,
+        "service_generation_mode": SERVICE_GENERATION_MODE,
+        "parameter_assignment": SERVICE_PARAMETER_ASSIGNMENT,
+        "parameter_ranges": {
+            "program_size_mb": [
+                float(config.program_size_min_mb),
+                float(config.program_size_max_mb),
+            ],
+            "mean_input_size_mbit": [
+                float(config.mean_input_size_min_mbit),
+                float(config.mean_input_size_max_mbit),
+            ],
+            "cycles_per_bit": [
+                float(config.cycles_per_bit_min),
+                float(config.cycles_per_bit_max),
+            ],
+        },
+        "strata_count": config.num_services,
+        "parameter_ranges_status": (
+            "PROVISIONAL service heterogeneity envelope; these ranges preserve "
+            "the existing experiment scale and are not claimed as final "
+            "literature-calibrated values."
+        ),
         "services": artifacts["catalog"],
         "generation_config": {
             "master_seed": master_seed,
@@ -1177,18 +1398,6 @@ def make_service_catalog_output(
             "popularity_changes_per_epoch": config.popularity_changes_per_epoch,
             "input_relative_jitter": config.input_relative_jitter,
             "load_relative_jitter": config.load_relative_jitter,
-            "class_ranges": [
-                {
-                    "workload_class": row[0],
-                    "program_size_min_MB": row[1],
-                    "program_size_max_MB": row[2],
-                    "mean_input_size_min_Mbit": row[3],
-                    "mean_input_size_max_Mbit": row[4],
-                    "cycles_per_bit_min": row[5],
-                    "cycles_per_bit_max": row[6],
-                }
-                for row in config.class_ranges
-            ],
         },
         "popularity_generation": artifacts["schedule"],
         "validation_summary": validation,
@@ -1239,23 +1448,51 @@ def task_config_from_project_config(
     from common.project_config import get_config_value
 
     base = fallback or DEFAULT_CONFIG
-    class_ranges_raw = get_config_value(project_config, "service.class_ranges", [])
-    class_ranges: list[tuple[str, float, float, float, float, float, float]] = []
-    for row in class_ranges_raw:
-        class_ranges.append(
-            (
-                str(row["workload_class"]),
-                float(row["program_size_min_mb"]),
-                float(row["program_size_max_mb"]),
-                float(row["mean_input_size_min_mbit"]),
-                float(row["mean_input_size_max_mbit"]),
-                float(row["cycles_per_bit_min"]),
-                float(row["cycles_per_bit_max"]),
-            )
-        )
     return TaskConfig(
         num_services=int(
             get_config_value(project_config, "service.count", base.num_services)
+        ),
+        program_size_min_mb=float(
+            get_config_value(
+                project_config,
+                "service.generation.program_size_min_mb",
+                base.program_size_min_mb,
+            )
+        ),
+        program_size_max_mb=float(
+            get_config_value(
+                project_config,
+                "service.generation.program_size_max_mb",
+                base.program_size_max_mb,
+            )
+        ),
+        mean_input_size_min_mbit=float(
+            get_config_value(
+                project_config,
+                "service.generation.mean_input_size_min_mbit",
+                base.mean_input_size_min_mbit,
+            )
+        ),
+        mean_input_size_max_mbit=float(
+            get_config_value(
+                project_config,
+                "service.generation.mean_input_size_max_mbit",
+                base.mean_input_size_max_mbit,
+            )
+        ),
+        cycles_per_bit_min=float(
+            get_config_value(
+                project_config,
+                "service.generation.cycles_per_bit_min",
+                base.cycles_per_bit_min,
+            )
+        ),
+        cycles_per_bit_max=float(
+            get_config_value(
+                project_config,
+                "service.generation.cycles_per_bit_max",
+                base.cycles_per_bit_max,
+            )
         ),
         arrival_probability=float(
             get_config_value(
@@ -1327,7 +1564,6 @@ def task_config_from_project_config(
         input_size_unit=base.input_size_unit,
         cpu_cycles_unit=base.cpu_cycles_unit,
         cycles_per_bit_unit=base.cycles_per_bit_unit,
-        class_ranges=tuple(class_ranges) or base.class_ranges,
     )
 
 
@@ -1391,6 +1627,12 @@ def config_from_args(
         num_services=(
             base.num_services if args.num_services is None else args.num_services
         ),
+        program_size_min_mb=base.program_size_min_mb,
+        program_size_max_mb=base.program_size_max_mb,
+        mean_input_size_min_mbit=base.mean_input_size_min_mbit,
+        mean_input_size_max_mbit=base.mean_input_size_max_mbit,
+        cycles_per_bit_min=base.cycles_per_bit_min,
+        cycles_per_bit_max=base.cycles_per_bit_max,
         arrival_probability=(
             base.arrival_probability
             if args.arrival_probability is None
@@ -1433,7 +1675,6 @@ def config_from_args(
         input_size_unit=base.input_size_unit,
         cpu_cycles_unit=base.cpu_cycles_unit,
         cycles_per_bit_unit=base.cycles_per_bit_unit,
-        class_ranges=base.class_ranges,
     )
 
 
