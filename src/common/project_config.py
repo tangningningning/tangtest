@@ -551,8 +551,15 @@ def validate_config(config: dict[str, Any]) -> None:
 
     omega_delay = float(get_config_value(config, "objective.omega_delay"))
     omega_energy = float(get_config_value(config, "objective.omega_energy"))
-    if omega_delay < 0.0 or omega_energy < 0.0 or omega_delay + omega_energy <= 0.0:
-        raise ValueError("objective omega 权重必须非负且总和大于 0。")
+    if not 0.0 <= omega_delay <= 1.0:
+        raise ValueError("objective.omega_delay 必须位于 [0,1]。")
+    if not 0.0 <= omega_energy <= 1.0:
+        raise ValueError("objective.omega_energy 必须位于 [0,1]。")
+    if not math.isclose(omega_delay + omega_energy, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            "objective.omega_delay 和 objective.omega_energy "
+            "必须位于 [0,1] 且总和等于 1。"
+        )
     _require_positive(config, "objective.T_ref")
     _require_positive(config, "objective.E_ref")
     cloud_delay_factor = float(get_config_value(config, "nodes.cloud.cloud_delay_factor"))
