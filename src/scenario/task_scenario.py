@@ -957,7 +957,7 @@ def service_size_sanity(
     service_sizes_mb: dict[int, float],
     local_cache_capacity_mb: float,
 ) -> dict[str, Any]:
-    """验证 2000MB 是否位于 max single 和 min two-service sum 之间。"""
+    """验证 local cache capacity 位于 max single 与 min two-service sum 之间。"""
 
     if local_cache_capacity_mb <= 0.0:
         raise ValueError("TV local cache capacity 必须大于 0。")
@@ -1042,6 +1042,7 @@ def validate_tv_local_cache(
     local_cache_capacity_mb: float,
 ) -> dict[str, Any]:
     service_sizes = service_size_by_id(service_catalog)
+    sanity = service_size_sanity(service_sizes, local_cache_capacity_mb)
     valid_services = set(service_sizes)
     expected_tv = {str(vehicle_id) for vehicle_id in task_vehicle_ids}
     vehicles = tv_local_cache.get("vehicles")
@@ -1067,6 +1068,7 @@ def validate_tv_local_cache(
         "all_tv_exactly_once": True,
         "all_cached_services_valid": True,
         "all_used_capacity_within_limit": True,
+        "service_size_sanity": sanity,
     }
 
 
@@ -1806,6 +1808,32 @@ def main(argv: list[str] | None = None) -> int:
             task_vehicles,
             validation,
         )
+        local_cache_capacity_mb = float(
+            project_config_module.get_config_value(
+                formal_config,
+                "nodes.vehicle.local_cache_capacity_mb",
+            )
+        )
+        tv_local_cache_path = project_config_module.resolve_path(
+            project_root,
+            project_config_module.get_config_value(
+                formal_config,
+                "paths.tv_local_cache",
+            ),
+        )
+        tv_local_cache = generate_tv_local_cache(
+            task_vehicles,
+            catalog_output,
+            local_cache_capacity_mb,
+            master_seed,
+        )
+        tv_local_cache_validation = validate_tv_local_cache(
+            tv_local_cache,
+            task_vehicles,
+            catalog_output,
+            local_cache_capacity_mb,
+        )
+        write_json_atomic(tv_local_cache_path, tv_local_cache)
         files = output_artifacts(
             output_dir,
             catalog_output,
@@ -1826,6 +1854,17 @@ def main(argv: list[str] | None = None) -> int:
             f"same-seed reproducible=True，"
             f"adjacent-same={validation['adjacent_same_probability_fraction']:.6f}"
         )
+        print("  TV local cache generated")
+        print(f"  TV count = {tv_local_cache_validation['tv_count']}")
+        print(
+            "  one service per TV = "
+            f"{tv_local_cache_validation['all_tv_exactly_once']}"
+        )
+        print(
+            "  fixed over episode = "
+            f"{tv_local_cache['metadata']['fixed_over_episode']}"
+        )
+        print(f"  output: {tv_local_cache_path}")
         for path in files:
             print(f"  output: {path}")
         return 0
