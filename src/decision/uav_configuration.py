@@ -347,7 +347,8 @@ def coordinate_candidates(
 ) -> list[np.ndarray]:
     """生成 coarse + refine 候选；最终 feasibility 仍按 q_old 检查真实单 slot 位移。"""
 
-    candidates = initialization_candidates(old_xy, search_config)
+    candidates = [old_xy.copy()]
+    candidates.extend(initialization_candidates(old_xy, search_config))
     radius = search_config.max_move_distance_m
     for _ in range(search_config.refine_rounds):
         radius *= search_config.refine_radius_shrink
@@ -832,6 +833,24 @@ def validate_uav_optimizer_once(
         "01": {uav_id: int(index == 1) for index, uav_id in enumerate(uav_ids)},
         "11": {uav_id: 1 for uav_id in uav_ids},
     }
+    probe_old_xy = np.asarray(current_positions[uav_ids[0]], dtype=np.float64)
+    probe_current_xy = probe_old_xy + np.asarray(
+        [max(2.0 * search_config.position_tolerance_m, 1.0e-6), 0.0],
+        dtype=np.float64,
+    )
+    if np.array_equal(probe_old_xy, probe_current_xy):
+        raise AssertionError("UAV coordinate candidate regression probe 未产生 current_xy != old_xy。")
+    probe_candidates = coordinate_candidates(
+        probe_old_xy,
+        probe_current_xy,
+        search_config,
+    )
+    if not any(
+        float(np.linalg.norm(candidate - probe_old_xy))
+        <= search_config.position_tolerance_m
+        for candidate in probe_candidates
+    ):
+        raise AssertionError("coordinate_candidates() 未包含 q_prev candidate。")
     results: dict[str, UavOptimizationResult] = {}
     for label, trigger in patterns.items():
         result = optimize_uav_configuration(

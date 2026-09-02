@@ -1696,6 +1696,10 @@ def run_minimal_validation(config_path: str = "system_config.toml") -> dict[str,
     project_config.validate_for_formal_experiment(cfg)
     project_root = Path(cfg["_meta"]["project_root"])
     cache_cfg = cache_configuration.cache_config_from_project(cfg)
+    slot = 20
+    warmup_time_s = float(project_config.get_config_value(cfg, "simulation.warmup_time_s"))
+    dt_s = float(project_config.get_config_value(cfg, "simulation.dt_s"))
+    time_s = warmup_time_s + slot * dt_s
     # 只用 configuration 模块的数据读取 helper 生成一个确定性 C(t) 供 KKT actual-state 验证。
     scenarios = cache_configuration.load_prediction_scenarios(
         cache_configuration.resolve_path(
@@ -1703,7 +1707,11 @@ def run_minimal_validation(config_path: str = "system_config.toml") -> dict[str,
             project_config.get_config_value(cfg, "paths.prediction_scenarios"),
         )
     )
-    origin = cache_configuration.scenario_at_origin(scenarios, 0)
+    origin = cache_configuration.scenario_at_origin(scenarios, slot)
+    if int(origin["origin_slot"]) != slot:
+        raise AssertionError(
+            f"prediction origin_slot={origin['origin_slot']} 与 slot={slot} 不一致。"
+        )
     catalog = cache_configuration.load_service_catalog(
         cache_configuration.resolve_path(
             project_root,
@@ -1717,8 +1725,6 @@ def run_minimal_validation(config_path: str = "system_config.toml") -> dict[str,
         cache_nodes,
         cache_cfg,
     )
-    slot = 20
-    time_s = 120.0
     tasks = load_actual_tasks(project_root / "data/generated/tasks.csv", slot)
     roles = cache_configuration.load_json(project_root / "data/generated/vehicle_roles.json")
     sv_ids = {str(value) for value in roles["service_vehicles"]}
