@@ -413,8 +413,8 @@ reference state ``C_prev, Q_prev`` 和同一个 prediction scenario slice，求�
 
 关键约束：reference state 永远是 ``C_prev, Q_prev``，外层搜索中产生的
 ``C_current, Q_current`` 只是 candidate state。所有 cache loading cost、
-UAV movement cost、trigger different 检查和最大位移约束都必须相对 reference
-state，而不是相对上一轮 candidate。
+UAV movement cost、UAV 物理约束和最大位移约束都必须相对 reference state，
+而不是相对上一轮 candidate。
 """
 
 import argparse
@@ -613,6 +613,8 @@ def _cache_summary(result: dict[str, Any]) -> dict[str, Any]:
 def _uav_summary(result: uav_configuration.UavOptimizationResult) -> dict[str, Any]:
     return {
         "trigger_feasible": result.trigger_feasible,
+        "actual_uav_triggers": result.actual_uav_triggers,
+        "per_uav_displacement_m": result.per_uav_displacement_m,
         "movement_energy": result.movement_energy,
         "movement_cost": result.movement_cost,
         "objective": result.objective_value,
@@ -1074,8 +1076,6 @@ def validate_joint_optimizer_once(
         for uav_id, trigger in uav_trigger.items():
             if trigger == 0 and uav_id in changed_uav:
                 raise AssertionError(f"Case {label} z_q=0 UAV moved。")
-            if trigger == 1 and uav_id not in changed_uav:
-                raise AssertionError(f"Case {label} z_q=1 UAV unchanged。")
     repeat = optimize_joint_configuration(
         previous_cache,
         previous_uav_positions,

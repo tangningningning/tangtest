@@ -12,8 +12,7 @@ configuration 和同一批 prediction scenarios，选择当前时隙 UAV 二维�
 - 不决定 trigger/WHEN，不训练 PPO，不调用 Matching/KKT；
 - 不做 UAV 轨迹规划，高度固定且只优化 ``[x, y]``；
 - ``z=0`` 时严格保持原位置；
-- ``z=1`` 时 trigger 已经发生，必须在 feasible-different 候选中选一个位置，
-  即使预测 objective 比旧位置更差；
+- ``z=1`` 时允许重新搜索位置，但如果没有严格更优候选则保持原位置；
 - movement cost 只由最终 ``q_old -> q_final`` 决定，不累计搜索过程访问路径；
 - candidate 在整个 ``H_p`` 预测窗口内保持固定，并复用同一 scenario slice
   进行 common random numbers 比较。
@@ -26,7 +25,7 @@ import gzip
 import json
 import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +78,7 @@ class UavOptimizationResult:
     accepted_improvements: int
     converged: bool
     stop_reason: str
+    actual_uav_triggers: dict[str, int] = field(default_factory=dict)
 
 
 def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
@@ -245,8 +245,6 @@ def _candidate_is_feasible(
     displacement = float(np.linalg.norm(candidate - old_xy))
     if displacement > search_config.max_move_distance_m + search_config.position_tolerance_m:
         return False
-    if triggers[uav_id] == 1 and _same_position(candidate, old_xy, search_config.position_tolerance_m):
-        return False
     if not _satisfies_min_safety_distance(uav_id, candidate, trial_positions, search_config):
         return False
     return True
@@ -260,10 +258,9 @@ def has_feasible_trigger_assignment(
 ) -> bool:
     """只按几何/移动约束判断 trigger 是否存在可行候选。
 
-    对已经触发的 UAV，按现有 coarse initialization candidate 集合做动态回溯；
-    未触发 UAV 保持旧位置。该函数不调用预测 utility 或配置 objective，也不
-    硬编码 UAV 数量。最终 objective 导致的 candidate 选择差异仍由正式
-    optimizer 的 blocker 负责发现。
+    先确认当前 reference configuration 满足物理约束；request=1 可以通过保持
+    旧位置满足 assignment。该函数不调用预测 utility 或配置 objective，也不
+    硬编码 UAV 数量。
     """
 
     uav_ids = uav_ids_from_project(project_cfg)
@@ -273,11 +270,27 @@ def has_feasible_trigger_assignment(
     trial_positions = {uav_id: xy.copy() for uav_id, xy in old_positions.items()}
     triggered_ids = [uav_id for uav_id in uav_ids if triggers[uav_id] == 1]
 
+    for uav_id in uav_ids:
+        if not _candidate_is_feasible(
+            uav_id,
+            old_positions[uav_id],
+            old_positions,
+            trial_positions,
+            triggers,
+            flight_boundary,
+            search_config,
+        ):
+            return False
+
     def backtrack(index: int) -> bool:
         if index >= len(triggered_ids):
             return True
         uav_id = triggered_ids[index]
-        for candidate in initialization_candidates(old_positions[uav_id], search_config):
+        candidates = [
+            old_positions[uav_id],
+            *initialization_candidates(old_positions[uav_id], search_config),
+        ]
+        for candidate in candidates:
             trial_positions[uav_id] = candidate
             if _candidate_is_feasible(
                 uav_id,
@@ -457,11 +470,18 @@ def _result_from_positions(
         cache_cost_constant,
         evaluation_context=evaluation_context,
     )
+    actual_uav_triggers = {
+        uav_id: int(
+            float(np.linalg.norm(positions[uav_id] - old_positions[uav_id]))
+            > search_config.position_tolerance_m
+        )
+        for uav_id in old_positions
+    }
     return UavOptimizationResult(
         final_positions={
             uav_id: (float(xy[0]), float(xy[1])) for uav_id, xy in positions.items()
         },
-        trigger_feasible=bool(all(feasible_by_uav[uav_id] for uav_id, z in triggers.items() if z == 1)),
+        trigger_feasible=bool(all(feasible_by_uav.values())),
         trigger_feasible_by_uav=dict(feasible_by_uav),
         reason=reason,
         predictive_utility=float(evaluated["predictive_utility"]),
@@ -475,6 +495,7 @@ def _result_from_positions(
         accepted_improvements=accepted_improvements,
         converged=converged,
         stop_reason=stop_reason,
+        actual_uav_triggers=actual_uav_triggers,
     )
 
 
@@ -497,16 +518,14 @@ def optimize_uav_configuration(
     核心语义：
 
     1. ``z=0`` 的 UAV 不进入搜索，最终位置必须等于旧位置；
-    2. ``z=1`` 的 UAV 先执行 trigger-conditioned feasible initialization：
-       候选集合不包含旧位置，且即使所有候选 objective 都比旧配置差，也必须选
-       best feasible different candidate；
+    2. ``z=1`` 的 UAV 允许从旧位置开始搜索，只有严格提升 objective 的候选才会被接受；
     3. 初始化完成后才做 coordinate local search，且只接受 strict improvement；
     4. 多 UAV 按固定 ID 顺序逐架更新，不做 Cartesian product 爆炸搜索；
     5. movement constraint 和 energy/cost 均基于最终 ``q_old -> q_final``。
 
     ``current_positions`` 是上一时隙真实 reference positions。外层 joint
     coordinate refinement 可通过 ``initial_candidate_positions`` 指定搜索起点；
-    但所有速度约束、movement cost 和 z=1 different 检查仍相对 reference。
+    但所有速度约束和 movement cost 仍相对 reference。
     """
 
     uav_ids = uav_ids_from_project(project_cfg)
@@ -526,6 +545,78 @@ def optimize_uav_configuration(
             cache_nodes,
             cache_config,
         )
+
+    for uav_id in uav_ids:
+        if not _candidate_is_feasible(
+            uav_id,
+            old_positions[uav_id],
+            old_positions,
+            old_positions,
+            triggers,
+            flight_boundary,
+            search_config,
+        ):
+            feasible_by_uav[uav_id] = False
+    if not bool(all(feasible_by_uav.values())):
+        return _result_from_positions(
+            final_positions,
+            old_positions,
+            triggers,
+            scenario_slice,
+            cache_state,
+            local_cache_state,
+            cache_nodes,
+            cache_config,
+            search_config,
+            feasible_by_uav,
+            "reference UAV positions infeasible",
+            0,
+            0,
+            False,
+            "infeasible_reference_position",
+            cache_cost_constant,
+            evaluation_context=evaluation_context,
+        )
+
+    if initial_candidate_positions is not None:
+        # 外层 refinement 起点只需满足真实物理约束；request=1 可以等于 q_prev。
+        for uav_id in uav_ids:
+            if triggers[uav_id] == 0 and not _same_position(
+                final_positions[uav_id],
+                old_positions[uav_id],
+                search_config.position_tolerance_m,
+            ):
+                raise ValueError("initial_candidate_positions 违反 z=0 reference position 不变语义。")
+            if not _candidate_is_feasible(
+                uav_id,
+                final_positions[uav_id],
+                old_positions,
+                final_positions,
+                triggers,
+                flight_boundary,
+                search_config,
+            ):
+                feasible_by_uav[uav_id] = False
+        if not bool(all(feasible_by_uav.values())):
+            return _result_from_positions(
+                final_positions,
+                old_positions,
+                triggers,
+                scenario_slice,
+                cache_state,
+                local_cache_state,
+                cache_nodes,
+                cache_config,
+                search_config,
+                feasible_by_uav,
+                "initial_candidate_positions infeasible relative to reference",
+                0,
+                0,
+                False,
+                "infeasible_initial_candidate",
+                cache_cost_constant,
+                evaluation_context=evaluation_context,
+            )
 
     if not triggered_ids:
         return _result_from_positions(
@@ -548,103 +639,6 @@ def optimize_uav_configuration(
             evaluation_context=evaluation_context,
         )
 
-    if initial_candidate_positions is None:
-        # Trigger 初始化：old position 只可作为 baseline/reference，不允许作为 z=1 最终候选。
-        for uav_id in triggered_ids:
-            best_position: np.ndarray | None = None
-            best_objective = float("-inf")
-            for candidate in initialization_candidates(old_positions[uav_id], search_config):
-                trial_positions = {key: value.copy() for key, value in final_positions.items()}
-                trial_positions[uav_id] = candidate
-                if not _candidate_is_feasible(
-                    uav_id,
-                    candidate,
-                    old_positions,
-                    trial_positions,
-                    triggers,
-                    flight_boundary,
-                    search_config,
-                ):
-                    continue
-                value = evaluate_uav_configuration(
-                    trial_positions,
-                    old_positions,
-                    triggers,
-                    scenario_slice,
-                    cache_state,
-                    local_cache_state,
-                    cache_nodes,
-                    cache_config,
-                    search_config,
-                    cache_cost_constant,
-                    evaluation_context=evaluation_context,
-                )["objective_value"]
-                if value > best_objective + search_config.objective_tolerance:
-                    best_objective = float(value)
-                    best_position = candidate.copy()
-            if best_position is None:
-                feasible_by_uav[uav_id] = False
-                return _result_from_positions(
-                    final_positions,
-                    old_positions,
-                    triggers,
-                    scenario_slice,
-                    cache_state,
-                    local_cache_state,
-                    cache_nodes,
-                    cache_config,
-                    search_config,
-                    feasible_by_uav,
-                    f"{uav_id}: no different feasible candidate",
-                    0,
-                    0,
-                    False,
-                    "infeasible_trigger",
-                    cache_cost_constant,
-                    evaluation_context=evaluation_context,
-                )
-            final_positions[uav_id] = best_position
-    else:
-        # 外层 refinement 起点必须已经满足 trigger-conditioned 语义；
-        # 这里不重新做强制初始化，但仍按 Q_prev 检查不同性、边界和移动距离。
-        for uav_id in uav_ids:
-            if triggers[uav_id] == 0 and not _same_position(
-                final_positions[uav_id],
-                old_positions[uav_id],
-                search_config.position_tolerance_m,
-            ):
-                raise ValueError("initial_candidate_positions 违反 z=0 reference position 不变语义。")
-            if triggers[uav_id] == 1 and not _candidate_is_feasible(
-                uav_id,
-                final_positions[uav_id],
-                old_positions,
-                final_positions,
-                triggers,
-                flight_boundary,
-                search_config,
-            ):
-                feasible_by_uav[uav_id] = False
-        if not bool(all(feasible_by_uav[uav_id] for uav_id in triggered_ids)):
-            return _result_from_positions(
-                final_positions,
-                old_positions,
-                triggers,
-                scenario_slice,
-                cache_state,
-                local_cache_state,
-                cache_nodes,
-                cache_config,
-                search_config,
-                feasible_by_uav,
-                "initial_candidate_positions infeasible relative to reference",
-                0,
-                0,
-                False,
-                "infeasible_initial_candidate",
-                cache_cost_constant,
-                evaluation_context=evaluation_context,
-            )
-
     current_eval = evaluate_uav_configuration(
         final_positions,
         old_positions,
@@ -659,6 +653,47 @@ def optimize_uav_configuration(
         evaluation_context=evaluation_context,
     )
     current_objective = float(current_eval["objective_value"])
+
+    if initial_candidate_positions is None:
+        # q_prev 是 request=1 的合法 baseline；只有严格提升的候选才会替换它。
+        for uav_id in triggered_ids:
+            best_position: np.ndarray | None = None
+            best_objective = current_objective
+            for candidate in initialization_candidates(old_positions[uav_id], search_config):
+                trial_positions = {key: value.copy() for key, value in final_positions.items()}
+                trial_positions[uav_id] = candidate
+                if not _candidate_is_feasible(
+                    uav_id,
+                    candidate,
+                    old_positions,
+                    trial_positions,
+                    triggers,
+                    flight_boundary,
+                    search_config,
+                ):
+                    continue
+                value = float(
+                    evaluate_uav_configuration(
+                        trial_positions,
+                        old_positions,
+                        triggers,
+                        scenario_slice,
+                        cache_state,
+                        local_cache_state,
+                        cache_nodes,
+                        cache_config,
+                        search_config,
+                        cache_cost_constant,
+                        evaluation_context=evaluation_context,
+                    )["objective_value"]
+                )
+                if value > best_objective + search_config.objective_tolerance:
+                    best_objective = value
+                    best_position = candidate.copy()
+            if best_position is not None:
+                final_positions[uav_id] = best_position
+                current_objective = best_objective
+
     accepted = 0
     completed_rounds = 0
 
@@ -767,6 +802,7 @@ def _result_to_dict(result: UavOptimizationResult) -> dict[str, Any]:
         "accepted_improvements": result.accepted_improvements,
         "converged": result.converged,
         "stop_reason": result.stop_reason,
+        "actual_uav_triggers": result.actual_uav_triggers,
     }
 
 
@@ -820,11 +856,32 @@ def validate_uav_optimizer_once(
         for uav_id in uav_ids:
             old_xy = current_positions[uav_id]
             new_xy = final_np[uav_id]
-            moved = not _same_position(old_xy, new_xy, search_config.position_tolerance_m)
-            if trigger[uav_id] == 0 and moved:
+            actual = int(
+                float(np.linalg.norm(new_xy - old_xy))
+                > search_config.position_tolerance_m
+            )
+            if result.actual_uav_triggers[uav_id] != actual:
+                raise AssertionError(f"trigger={label} 中 {uav_id} actual_uav_trigger 不一致。")
+            if trigger[uav_id] == 0 and actual:
                 raise AssertionError(f"trigger={label} 中 {uav_id} z=0 但发生移动。")
-            if trigger[uav_id] == 1 and not moved:
-                raise AssertionError(f"trigger={label} 中 {uav_id} z=1 但未移动。")
+            if actual == 0:
+                if not math.isclose(
+                    result.per_uav_displacement_m[uav_id],
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ) or not math.isclose(
+                    result.per_uav_movement_energy[uav_id],
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ) or not math.isclose(
+                    result.per_uav_movement_cost[uav_id],
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise AssertionError(f"trigger={label} 中 {uav_id} unchanged 却产生移动量或成本。")
             if result.per_uav_displacement_m[uav_id] > search_config.max_move_distance_m + search_config.position_tolerance_m:
                 raise AssertionError(f"trigger={label} 中 {uav_id} 超过单 slot 最大移动距离。")
             if not _inside_boundary(new_xy, flight_boundary):
@@ -950,6 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"trigger={label}")
         print(f"  old_positions={json.dumps({k: old_positions[k].tolist() for k in old_positions}, ensure_ascii=False)}")
         print(f"  new_positions={json.dumps(result.final_positions, ensure_ascii=False)}")
+        print(f"  actual_uav_triggers={json.dumps(result.actual_uav_triggers, ensure_ascii=False)}")
         print(f"  displacement_m={json.dumps(result.per_uav_displacement_m, ensure_ascii=False)}")
         print(f"  movement_energy_j={result.movement_energy:.6f}")
         print(f"  movement_cost={result.movement_cost:.6f}")
