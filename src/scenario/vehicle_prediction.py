@@ -167,17 +167,22 @@ class RouteGeometry:
         previous_s_m: float | None,
         window_m: float,
         backtrack_m: float,
+        reference_s_m: float | None = None,
     ) -> tuple[float, float]:
         """将 noisy GPS 点投影到 planned route，并用上一步 s 限制跳跃。"""
         point = np.asarray([x_m, y_m], dtype=float)
-        if previous_s_m is None:
+        if reference_s_m is not None:
+            lower = max(0.0, reference_s_m - backtrack_m)
+            upper = min(self.total_length_m, reference_s_m + window_m)
+        elif previous_s_m is None:
             lower, upper = 0.0, self.total_length_m
         else:
             lower = max(0.0, previous_s_m - backtrack_m)
             upper = min(self.total_length_m, previous_s_m + window_m)
 
-        best = self._project_in_range(point, lower, upper, previous_s_m)
-        if best is None:
+        continuity_s = previous_s_m if previous_s_m is not None else reference_s_m
+        best = self._project_in_range(point, lower, upper, continuity_s)
+        if best is None and reference_s_m is None:
             # 受限范围没有几何候选时，回退到整条 planned route，而不是返回 NaN。
             best = self._project_in_range(point, 0.0, self.total_length_m, previous_s_m)
         if best is None:
@@ -646,12 +651,33 @@ def build_noisy_observations(
             noisy_speed = sample.speed_mps + float(
                 rng.normal(0.0, config.sigma_speed_mps)
             )
+            candidates = geometry.candidate_s_for_edge(
+                sample.road_id,
+                sample.lane_position_m,
+            )
+            reference_s: float | None = None
+            if candidates:
+                if previous_s is None:
+                    reference_s = candidates[0]
+                else:
+                    lower = previous_s - config.projection_backtrack_m
+                    upper = previous_s + config.projection_window_m
+                    feasible = [
+                        value
+                        for value in candidates
+                        if lower <= value <= upper
+                    ]
+                    reference_s = min(
+                        feasible or candidates,
+                        key=lambda value: abs(value - previous_s),
+                    )
             s_obs, projection_distance = geometry.project_xy_to_s(
                 float(noisy_xy[0]),
                 float(noisy_xy[1]),
                 previous_s,
                 config.projection_window_m,
                 config.projection_backtrack_m,
+                reference_s_m=reference_s,
             )
             previous_s = s_obs
             vehicle_observations.append(
