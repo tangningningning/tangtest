@@ -1093,6 +1093,17 @@ def initialize_cache_for_triggers(
     cache = previous_cache.copy()
     trigger_feasible = np.ones(len(cache_trigger), dtype=bool)
     notes: list[str] = []
+    current_objective = objective(
+        cache,
+        previous_cache,
+        cache_trigger,
+        origin_scenario,
+        service_catalog,
+        local_cache_state,
+        cache_nodes,
+        config,
+        evaluation_context=evaluation_context,
+    )
     for node_index, triggered in enumerate(cache_trigger.tolist()):
         if not triggered:
             continue
@@ -1101,12 +1112,10 @@ def initialize_cache_for_triggers(
             service_catalog["service_sizes_mb"],
             cache_nodes["capacities_mb"][node_index],
         )
-        if not np.array_equal(init, previous_cache[node_index]):
-            cache[node_index] = init
-            continue
-        distinct = best_distinct_neighbor(
-            cache,
-            node_index,
+        candidate_cache = cache.copy()
+        candidate_cache[node_index] = init
+        candidate_objective = objective(
+            candidate_cache,
             previous_cache,
             cache_trigger,
             origin_scenario,
@@ -1116,14 +1125,16 @@ def initialize_cache_for_triggers(
             config,
             evaluation_context=evaluation_context,
         )
-        if distinct is None:
-            trigger_feasible[node_index] = False
-            notes.append(f"node {cache_nodes['node_ids'][node_index]} has no distinct feasible config")
-        else:
-            cache[node_index] = distinct[1]
+        if candidate_objective > current_objective + config.tolerance:
+            cache = candidate_cache
+            current_objective = candidate_objective
             notes.append(
-                f"node {cache_nodes['node_ids'][node_index]} knapsack equaled previous; "
-                f"used best distinct {distinct[0]} neighbor"
+                f"node {cache_nodes['node_ids'][node_index]} accepted knapsack candidate"
+            )
+        else:
+            notes.append(
+                f"node {cache_nodes['node_ids'][node_index]} knapsack candidate not better; "
+                "kept current cache"
             )
     return cache, {"trigger_feasible_by_node": trigger_feasible, "initialization_notes": notes}
 
@@ -1146,8 +1157,8 @@ def optimize_cache(
 ) -> dict[str, Any]:
     """Optimize cache configuration under a fixed trigger vector.
 
-    ``cache_trigger[m]=0`` 严格固定该节点缓存；``cache_trigger[m]=1`` 严格要求
-    最终配置与上一时隙不同，除非该节点不存在任何 distinct feasible config。
+    ``cache_trigger[m]`` 表示上层缓存更新意图：0 严格固定该节点缓存，1 允许
+    重新优化。实际更新由最终配置与上一时隙缓存的差异决定。
 
     ``previous_cache`` 是上一时隙真实 reference state，始终用于 trigger 语义
     和 0->1 loading cost。``initial_cache_state`` 只作为外层 coordinate
@@ -1193,6 +1204,10 @@ def optimize_cache(
             "new_cache": unchanged,
             "trigger_feasible": True,
             "trigger_feasible_by_node": np.ones_like(cache_trigger, dtype=bool),
+            "actual_cache_trigger": np.any(
+                unchanged != previous_cache,
+                axis=1,
+            ).astype(np.int8),
             "objective": float(utility - update_cost),
             "predicted_utility": utility,
             "cache_update_energy": energy,
@@ -1240,50 +1255,13 @@ def optimize_cache(
                 current_cache[node_index],
                 previous_cache[node_index],
             ):
-                trigger_feasible_by_node[node_index] = False
                 notes.append(
-                    f"node {cache_nodes['node_ids'][node_index]} initial state is not distinct from reference"
+                    f"node {cache_nodes['node_ids'][node_index]} initial state equals reference; "
+                    "actual update may remain zero"
                 )
         init_info = {
             "trigger_feasible_by_node": trigger_feasible_by_node,
             "initialization_notes": notes,
-        }
-    if not bool(np.all(trigger_feasible_by_node[cache_trigger.astype(bool)])):
-        update_cost, energy = cache_update_cost(
-            previous_cache,
-            previous_cache,
-            cache_trigger,
-            service_catalog["service_sizes_mb"],
-            cache_nodes,
-            config,
-        )
-        return {
-            "new_cache": previous_cache.copy(),
-            "trigger_feasible": False,
-            "trigger_feasible_by_node": trigger_feasible_by_node,
-            "objective": float("-inf"),
-            "predicted_utility": predicted_service_utility(
-                previous_cache,
-                predicted_scenarios,
-                local_cache_state,
-                cache_nodes,
-                config,
-                evaluation_context=evaluation_context,
-            ),
-            "cache_update_energy": energy,
-            "cache_update_cost": update_cost,
-            "statistics": {
-                "initial_objective": float("-inf"),
-                "final_objective": float("-inf"),
-                "num_coordinate_rounds": 0,
-                "num_accepted_moves": 0,
-                "num_add": 0,
-                "num_delete": 0,
-                "num_swap": 0,
-                "converged_by_no_improvement": False,
-                "hit_max_rounds": False,
-                "initialization_notes": init_info["initialization_notes"],
-            },
         }
 
     initial_objective = objective(
@@ -1297,6 +1275,24 @@ def optimize_cache(
         config,
         evaluation_context=evaluation_context,
     )
+    if initial_cache_state is not None:
+        previous_objective = objective(
+            previous_cache,
+            previous_cache,
+            cache_trigger,
+            predicted_scenarios,
+            service_catalog,
+            local_cache_state,
+            cache_nodes,
+            config,
+            evaluation_context=evaluation_context,
+        )
+        if initial_objective <= previous_objective + config.tolerance:
+            current_cache = previous_cache.copy()
+            initial_objective = previous_objective
+            init_info["initialization_notes"].append(
+                "previous cache objective was not worse; kept previous cache"
+            )
     current_objective = initial_objective
     counts = {"add": 0, "delete": 0, "swap": 0}
     accepted_moves = 0
@@ -1317,9 +1313,6 @@ def optimize_cache(
             ):
                 candidate_cache = current_cache.copy()
                 candidate_cache[node_index] = node_candidate
-                # z=1 节点最终必须不同；local search 中也不接受回到 previous。
-                if np.array_equal(candidate_cache[node_index], previous_cache[node_index]):
-                    continue
                 value = objective(
                     candidate_cache,
                     previous_cache,
@@ -1348,45 +1341,10 @@ def optimize_cache(
     else:
         hit_max_rounds = True
 
-    for node_index in triggered_indices:
-        if np.array_equal(current_cache[node_index], previous_cache[node_index]):
-            distinct = best_distinct_neighbor(
-                current_cache,
-                node_index,
-                previous_cache,
-                cache_trigger,
-                predicted_scenarios,
-                service_catalog,
-                local_cache_state,
-                cache_nodes,
-                config,
-                evaluation_context=evaluation_context,
-            )
-            if distinct is None:
-                trigger_feasible_by_node[node_index] = False
-            else:
-                current_cache[node_index] = distinct[1]
-                current_objective = objective(
-                    current_cache,
-                    previous_cache,
-                    cache_trigger,
-                    predicted_scenarios,
-                    service_catalog,
-                    local_cache_state,
-                    cache_nodes,
-                    config,
-                    evaluation_context=evaluation_context,
-                )
-
     validate_cache_shape_and_capacity(current_cache, service_catalog, cache_nodes)
     for node_index, triggered in enumerate(cache_trigger.tolist()):
         if triggered == 0 and not np.array_equal(current_cache[node_index], previous_cache[node_index]):
             raise AssertionError("z=0 节点 cache 被改变。")
-        if triggered == 1 and trigger_feasible_by_node[node_index] and np.array_equal(
-            current_cache[node_index],
-            previous_cache[node_index],
-        ):
-            raise AssertionError("z=1 且 feasible 的节点未发生配置改变。")
 
     predicted_utility = predicted_service_utility(
         current_cache,
@@ -1404,13 +1362,18 @@ def optimize_cache(
         cache_nodes,
         config,
     )
+    actual_cache_trigger = np.any(
+        current_cache != previous_cache,
+        axis=1,
+    ).astype(np.int8)
     final_objective = float(predicted_utility - update_cost)
     if not math.isfinite(final_objective):
         raise AssertionError("objective 非 finite。")
     return {
         "new_cache": current_cache,
-        "trigger_feasible": bool(np.all(trigger_feasible_by_node[cache_trigger.astype(bool)])),
+        "trigger_feasible": True,
         "trigger_feasible_by_node": trigger_feasible_by_node,
+        "actual_cache_trigger": actual_cache_trigger,
         "objective": final_objective,
         "predicted_utility": predicted_utility,
         "cache_update_energy": energy,
@@ -1492,9 +1455,21 @@ def random_feasible_initial_cache(
         service_order = rng.permutation(num_services)
         for service_id in service_order.tolist():
             size = float(service_sizes[service_id])
-            if size <= remaining + 1.0e-9 and int(rng.integers(0, 2)) == 1:
+            if size <= remaining + 1.0e-9:
                 cache[node_index, service_id] = 1
                 remaining -= size
+
+        used = node_used_capacity_mb(cache[node_index], service_sizes)
+        remaining_capacity = float(capacity) - used
+        for service_id in range(num_services):
+            if (
+                cache[node_index, service_id] == 0
+                and service_sizes[service_id] <= remaining_capacity + 1.0e-9
+            ):
+                raise AssertionError(
+                    f"node {cache_nodes['node_ids'][node_index]} "
+                    "initial cache is not maximal feasible"
+                )
 
     validate_cache_shape_and_capacity(cache, service_catalog, cache_nodes)
     return cache
@@ -1531,6 +1506,24 @@ def validate_optimizer_once(
     if not np.array_equal(result_z0["new_cache"], previous_cache):
         raise AssertionError("z=0 验证失败：cache 发生变化。")
 
+    def assert_actual_trigger(result: dict[str, Any], label: str) -> None:
+        expected = np.any(
+            result["new_cache"] != previous_cache,
+            axis=1,
+        ).astype(np.int8)
+        if not np.array_equal(result["actual_cache_trigger"], expected):
+            raise AssertionError(f"{label} actual_cache_trigger 与缓存差异不一致。")
+        if not np.any(expected):
+            if not math.isclose(
+                float(result["cache_update_cost"]),
+                0.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ) or not np.allclose(result["cache_update_energy"], 0.0):
+                raise AssertionError(f"{label} cache 未变化却产生了更新成本或能耗。")
+
+    assert_actual_trigger(result_z0, "z=0")
+
     z1 = np.zeros(previous_cache.shape[0], dtype=np.int8)
     z1[0] = 1
     result_single = optimize_cache(
@@ -1542,11 +1535,7 @@ def validate_optimizer_once(
         cache_nodes,
         config,
     )
-    if result_single["trigger_feasible"] and np.array_equal(
-        result_single["new_cache"][0],
-        previous_cache[0],
-    ):
-        raise AssertionError("单节点 z=1 验证失败：cache 未改变。")
+    assert_actual_trigger(result_single, "单节点 z=1")
 
     zmulti = np.zeros(previous_cache.shape[0], dtype=np.int8)
     zmulti[0] = 1
@@ -1566,9 +1555,7 @@ def validate_optimizer_once(
             previous_cache[node_index],
         ):
             raise AssertionError("多节点验证失败：z=0 节点发生变化。")
-        if triggered == 1 and result_multi["trigger_feasible_by_node"][node_index]:
-            if np.array_equal(result_multi["new_cache"][node_index], previous_cache[node_index]):
-                raise AssertionError("多节点验证失败：z=1 节点未改变。")
+    assert_actual_trigger(result_multi, "多节点")
 
     repeat = optimize_cache(
         previous_cache,

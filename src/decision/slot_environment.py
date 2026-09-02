@@ -267,10 +267,16 @@ def run_slot20_validation(config_path: str = "system_config.toml") -> dict[str, 
     project_config.validate_for_formal_experiment(cfg)
     root = Path(cfg["_meta"]["project_root"])
     cache_cfg = cache_configuration.cache_config_from_project(cfg)
+    slot = 20
+    time_s = 120.0
     scenarios = cache_configuration.load_prediction_scenarios(
         cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.prediction_scenarios"))
     )
-    origin = cache_configuration.scenario_at_origin(scenarios, 0)
+    origin = cache_configuration.scenario_at_origin(scenarios, slot)
+    if int(origin["origin_slot"]) != slot:
+        raise AssertionError(
+            f"prediction origin_slot={origin['origin_slot']} 与 slot={slot} 不一致。"
+        )
     service_catalog = cache_configuration.load_service_catalog(
         cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
     )
@@ -282,8 +288,6 @@ def run_slot20_validation(config_path: str = "system_config.toml") -> dict[str, 
         cache_cfg,
     )
     previous_uav = uav_configuration.initial_uav_positions_from_project(cfg)
-    slot = 20
-    time_s = 120.0
     actual_tasks = task_allocation.load_actual_tasks(root / "data/generated/tasks.csv", slot)
     roles = cache_configuration.load_json(root / "data/generated/vehicle_roles.json")
     sv_ids = {str(value) for value in roles["service_vehicles"]}
@@ -1067,8 +1071,6 @@ def validate_joint_optimizer_once(
         for node_index, trigger in enumerate(cache_trigger.tolist()):
             if trigger == 0 and node_index in changed_nodes:
                 raise AssertionError(f"Case {label} z_ca=0 cache node changed。")
-            if trigger == 1 and node_index not in changed_nodes:
-                raise AssertionError(f"Case {label} z_ca=1 cache node unchanged。")
         for uav_id, trigger in uav_trigger.items():
             if trigger == 0 and uav_id in changed_uav:
                 raise AssertionError(f"Case {label} z_q=0 UAV moved。")
