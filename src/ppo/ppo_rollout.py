@@ -862,16 +862,12 @@ def _check_trigger_semantics(
         equal = np.array_equal(previous_cache[index], final_cache[index])
         if int(trigger) == 0 and not equal:
             raise AssertionError(f"z_ca=0 但 cache node {index} 改变。")
-        if int(trigger) == 1 and equal:
-            raise AssertionError(f"z_ca=1 但 cache node {index} 未改变。")
     final_uav = result.next_uav_positions or {}
     for uav_id in action_spec.uav_ids:
         trigger = int(result.input_uav_triggers[uav_id])
         changed = _changed_uav(previous_uav, final_uav, uav_id)
         if trigger == 0 and changed:
             raise AssertionError(f"z_q=0 但 {uav_id} 移动。")
-        if trigger == 1 and not changed:
-            raise AssertionError(f"z_q=1 但 {uav_id} 未移动。")
 
 
 def _make_observation(
@@ -902,10 +898,10 @@ def build_trigger_action_mask_provider(
 ) -> Callable[[int, np.ndarray], np.ndarray]:
     """构造当前状态下的 autoregressive binary trigger mask。
 
-    Cache trigger 的 distinct feasibility 只依赖本节点上一状态和容量；UAV
-    trigger 则按 policy 当前的 UAV 顺序逐步检查几何 candidate assignment。
-    这里不调用 objective，因此 objective 选择造成的 residual infeasibility
-    仍由 InfeasibleActionBlocker 负责暴露。
+    Cache trigger 的 0/1 action 都对当前合法 previous cache 开放；UAV trigger
+    则按 policy 当前的 UAV 顺序逐步检查几何 candidate assignment。这里不调用
+    objective，因此 objective 选择造成的 residual infeasibility 仍由
+    InfeasibleActionBlocker 负责暴露。
     """
 
     previous_cache = np.asarray(previous_cache_state, dtype=np.int8)
@@ -919,19 +915,6 @@ def build_trigger_action_mask_provider(
         raise ValueError("previous_cache_state shape 与 cache_nodes/service catalog 不一致。")
     if not np.all(np.isin(previous_cache, [0, 1])):
         raise ValueError("previous_cache_state 必须是 0/1。")
-
-    cache_trigger_allowed = np.ones(len(cache_node_ids), dtype=bool)
-    service_sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
-    for node_index in range(len(cache_node_ids)):
-        neighbors = cache_configuration.generate_node_neighbors(
-            previous_cache[node_index],
-            service_sizes,
-            float(cache_nodes["capacities_mb"][node_index]),
-        )
-        cache_trigger_allowed[node_index] = any(
-            not np.array_equal(candidate, previous_cache[node_index])
-            for _, candidate in neighbors
-        )
 
     previous_uav = {
         str(uav_id): np.asarray(xy, dtype=np.float64).copy()
@@ -947,7 +930,7 @@ def build_trigger_action_mask_provider(
         if not np.all(np.isin(prefix, [0, 1])):
             raise ValueError("action mask prefix 必须是 0/1。")
         if index < cache_count:
-            return np.asarray([True, bool(cache_trigger_allowed[index])], dtype=bool)
+            return np.asarray([True, True], dtype=bool)
 
         uav_index = index - cache_count
         triggers = {uav_id: 0 for uav_id in action_spec.uav_ids}
