@@ -364,12 +364,18 @@ def point_route_distance(
     point: np.ndarray,
     previous_s: float | None,
 ) -> tuple[np.ndarray, float, float]:
+    if previous_s is None:
+        projection_window_m = max(geometry.total_length_m, 1.0)
+        projection_backtrack_m = max(geometry.total_length_m, 1.0)
+    else:
+        projection_window_m = veh.DEFAULT_CONFIG.projection_window_m
+        projection_backtrack_m = veh.DEFAULT_CONFIG.projection_backtrack_m
     s_value, distance = geometry.project_xy_to_s(
         float(point[0]),
         float(point[1]),
         previous_s,
-        max(geometry.total_length_m, 1.0),
-        max(geometry.total_length_m, 1.0),
+        projection_window_m,
+        projection_backtrack_m,
     )
     route_point, _ = geometry.point_and_tangent(s_value)
     return route_point, float(distance), float(s_value)
