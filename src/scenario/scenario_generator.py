@@ -452,13 +452,15 @@ def sample_positions(
                         tangents[origin_index, :, vehicle_index, :],
                         residual_block,
                     )
-                    # e_perp 是相对 planned route 切线法向的横向残差。第一版
-                    # 用整段 block 的最大横向偏离作为道路可行性 reject 条件；
-                    # 这样保留 block 时序连续性，fallback 再回到 route reference。
+                    # residual 加到 nominal trajectory 后，使用 block_is_road_valid()
+                    # 检查整个 H_p block 与 planned route 的距离是否满足容差。
                     if (
                         np.all(np.isfinite(points))
-                        and float(np.max(np.abs(residual_block[:, 1])))
-                        <= config.road_distance_tolerance_m
+                        and block_is_road_valid(
+                            points,
+                            geometry,
+                            config.road_distance_tolerance_m,
+                        )
                     ):
                         candidate_points = points
                         break
