@@ -35,17 +35,17 @@
     "service_size_sanity": {
       "service_count": 10,
       "min_service": {
-        "service_id": 1,
-        "size_mb": 1244.2733515029472
+        "service_id": 4,
+        "size_mb": 1076.277568738429
       },
       "second_min_service": {
-        "service_id": 8,
-        "size_mb": 1322.8042118988528
+        "service_id": 1,
+        "size_mb": 1199.7682862495885
       },
-      "min_service_size_mb": 1244.2733515029472,
-      "max_service_size_mb": 1890.4713524956487,
-      "min_two_service_sum_mb": 2567.0775634018,
-      "total_service_size_mb": 15851.373045559802,
+      "min_service_size_mb": 1076.277568738429,
+      "max_service_size_mb": 1986.3089190619562,
+      "min_two_service_sum_mb": 2276.0458549880177,
+      "total_service_size_mb": 15090.648268412238,
       "single_services_fit_count": 10,
       "all_pairs_exceed_capacity": true
     }
@@ -55,55 +55,55 @@
       "cached_service_ids": [
         3
       ],
-      "used_capacity_mb": 1890.4713524956487
+      "used_capacity_mb": 1845.517713257334
     },
     "30": {
       "cached_service_ids": [
         3
       ],
-      "used_capacity_mb": 1890.4713524956487
+      "used_capacity_mb": 1845.517713257334
     },
     "40": {
       "cached_service_ids": [
         8
       ],
-      "used_capacity_mb": 1322.8042118988528
+      "used_capacity_mb": 1530.7532108892865
     },
     "42": {
       "cached_service_ids": [
         4
       ],
-      "used_capacity_mb": 1469.15311654154
+      "used_capacity_mb": 1076.277568738429
     },
     "59": {
       "cached_service_ids": [
         4
       ],
-      "used_capacity_mb": 1469.15311654154
+      "used_capacity_mb": 1076.277568738429
     },
     "66": {
       "cached_service_ids": [
         9
       ],
-      "used_capacity_mb": 1618.283314976964
+      "used_capacity_mb": 1444.3681461741046
     },
     "70": {
       "cached_service_ids": [
         0
       ],
-      "used_capacity_mb": 1810.2205499074307
+      "used_capacity_mb": 1986.3089190619562
     },
     "78": {
       "cached_service_ids": [
         2
       ],
-      "used_capacity_mb": 1528.4271939162288
+      "used_capacity_mb": 1658.7141326573587
     },
     "96": {
       "cached_service_ids": [
         3
       ],
-      "used_capacity_mb": 1890.4713524956487
+      "used_capacity_mb": 1845.517713257334
     }
   }
 }

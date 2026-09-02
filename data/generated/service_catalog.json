@@ -9,76 +9,85 @@
     "tasks.cpu_cycles": "cycle"
   },
   "provisional_defaults": true,
+  "task_type_definition": "service_id",
+  "service_generation_mode": "stratified_uniform_per_dimension",
+  "parameter_assignment": "independent_permutation_across_dimensions",
+  "parameter_ranges": {
+    "program_size_mb": [
+      1000.0,
+      2000.0
+    ],
+    "mean_input_size_mbit": [
+      0.5,
+      1.5
+    ],
+    "cycles_per_bit": [
+      200.0,
+      1000.0
+    ]
+  },
+  "strata_count": 10,
+  "parameter_ranges_status": "PROVISIONAL service heterogeneity envelope; these ranges preserve the existing experiment scale and are not claimed as final literature-calibrated values.",
   "services": [
     {
       "service_id": 0,
-      "program_size": 1810.2205499074307,
-      "mean_input_size": 1498841.4312479424,
-      "cycles_per_bit": 285.737673486672,
-      "workload_class": "data_intensive"
+      "program_size": 1986.3089190619562,
+      "mean_input_size": 810821.7594247453,
+      "cycles_per_bit": 645.691883353784
     },
     {
       "service_id": 1,
-      "program_size": 1244.2733515029472,
-      "mean_input_size": 721840.7308705226,
-      "cycles_per_bit": 792.2596326678597,
-      "workload_class": "compute_intensive"
+      "program_size": 1199.7682862495885,
+      "mean_input_size": 905507.5753826859,
+      "cycles_per_bit": 548.6937077243424
     },
     {
       "service_id": 2,
-      "program_size": 1528.4271939162288,
-      "mean_input_size": 1199134.4897537814,
-      "cycles_per_bit": 586.5531397720017,
-      "workload_class": "balanced"
+      "program_size": 1658.7141326573587,
+      "mean_input_size": 1478279.7551972747,
+      "cycles_per_bit": 693.3142680462345
     },
     {
       "service_id": 3,
-      "program_size": 1890.4713524956487,
-      "mean_input_size": 1377318.1566699867,
-      "cycles_per_bit": 231.68070339600172,
-      "workload_class": "data_intensive"
+      "program_size": 1845.517713257334,
+      "mean_input_size": 575463.6313339974,
+      "cycles_per_bit": 360.08887680244413
     },
     {
       "service_id": 4,
-      "program_size": 1469.15311654154,
-      "mean_input_size": 554108.7971237269,
-      "cycles_per_bit": 716.5227261480579,
-      "workload_class": "compute_intensive"
+      "program_size": 1076.277568738429,
+      "mean_input_size": 1125023.2670580472,
+      "cycles_per_bit": 801.8283314976964
     },
     {
       "service_id": 5,
-      "program_size": 1867.7178047367909,
-      "mean_input_size": 875116.3352902365,
-      "cycles_per_bit": 532.9259727443258,
-      "workload_class": "balanced"
+      "program_size": 1228.5792244955574,
+      "mean_input_size": 1227641.9909147753,
+      "cycles_per_bit": 865.0575279027519
     },
     {
       "service_id": 6,
-      "program_size": 1462.8386204522753,
-      "mean_input_size": 1391398.7759863746,
-      "cycles_per_bit": 213.52376573780057,
-      "workload_class": "data_intensive"
+      "program_size": 1789.8268979507563,
+      "mean_input_size": 1096413.089415199,
+      "cycles_per_bit": 343.7183529131123
     },
     {
       "service_id": 7,
-      "program_size": 1637.1835291311231,
-      "mean_input_size": 500555.48001527606,
-      "cycles_per_bit": 779.4556027594859,
-      "workload_class": "compute_intensive"
+      "program_size": 1330.5341689378683,
+      "mean_input_size": 610560.2344653339,
+      "cycles_per_bit": 203.60633753008014
     },
     {
       "service_id": 8,
-      "program_size": 1322.8042118988528,
-      "mean_input_size": 1035574.27096115,
-      "cycles_per_bit": 499.9285051733795,
-      "workload_class": "balanced"
+      "program_size": 1530.7532108892865,
+      "mean_input_size": 1332854.8275565344,
+      "cycles_per_bit": 461.1881607358629
     },
     {
       "service_id": 9,
-      "program_size": 1618.283314976964,
-      "mean_input_size": 1156609.5493921996,
-      "cycles_per_bit": 451.02264404809057,
-      "workload_class": "data_intensive"
+      "program_size": 1444.3681461741046,
+      "mean_input_size": 758644.1395676925,
+      "cycles_per_bit": 986.9393717461575
     }
   ],
   "generation_config": {
@@ -106,44 +115,28 @@
     "warmup_time_s": 100.0,
     "episode_time_s": 300.0,
     "num_slots": 300,
+    "popularity_history_length": 20,
     "arrival_probability": 0.5,
     "zipf_exponent": 0.8,
     "popularity_epoch_length": 20,
     "popularity_changes_per_epoch": 1,
     "input_relative_jitter": 0.2,
-    "load_relative_jitter": 0.1,
-    "class_ranges": [
-      {
-        "workload_class": "data_intensive",
-        "program_size_min_MB": 1200.0,
-        "program_size_max_MB": 2000.0,
-        "mean_input_size_min_Mbit": 1.0,
-        "mean_input_size_max_Mbit": 1.5,
-        "cycles_per_bit_min": 200.0,
-        "cycles_per_bit_max": 500.0
-      },
-      {
-        "workload_class": "compute_intensive",
-        "program_size_min_MB": 1000.0,
-        "program_size_max_MB": 1800.0,
-        "mean_input_size_min_Mbit": 0.5,
-        "mean_input_size_max_Mbit": 1.0,
-        "cycles_per_bit_min": 700.0,
-        "cycles_per_bit_max": 1000.0
-      },
-      {
-        "workload_class": "balanced",
-        "program_size_min_MB": 1000.0,
-        "program_size_max_MB": 1900.0,
-        "mean_input_size_min_Mbit": 0.75,
-        "mean_input_size_max_Mbit": 1.25,
-        "cycles_per_bit_min": 450.0,
-        "cycles_per_bit_max": 750.0
-      }
-    ]
+    "load_relative_jitter": 0.1
   },
   "popularity_generation": {
     "initial_ranking": [
+      7,
+      9,
+      5,
+      0,
+      3,
+      4,
+      2,
+      8,
+      1,
+      6
+    ],
+    "prehistory_initial_ranking": [
       7,
       9,
       5,
@@ -157,8 +150,10 @@
     ],
     "epoch_changes": [
       {
-        "epoch": 1,
-        "slot": 20,
+        "epoch": 0,
+        "slot": 0,
+        "formal_slot": 0,
+        "history_index": null,
         "previous_ranking": [
           7,
           9,
@@ -177,6 +172,36 @@
           5,
           0,
           3,
+          4,
+          2,
+          8,
+          1,
+          6
+        ]
+      },
+      {
+        "epoch": 1,
+        "slot": 20,
+        "formal_slot": 20,
+        "history_index": null,
+        "previous_ranking": [
+          7,
+          9,
+          5,
+          0,
+          3,
+          4,
+          2,
+          8,
+          1,
+          6
+        ],
+        "new_ranking": [
+          7,
+          9,
+          5,
+          3,
+          0,
           4,
           2,
           8,
@@ -187,12 +212,14 @@
       {
         "epoch": 2,
         "slot": 40,
+        "formal_slot": 40,
+        "history_index": null,
         "previous_ranking": [
           7,
           9,
           5,
-          0,
           3,
+          0,
           4,
           2,
           8,
@@ -203,8 +230,8 @@
           7,
           9,
           5,
-          3,
           0,
+          3,
           4,
           2,
           8,
@@ -215,12 +242,14 @@
       {
         "epoch": 3,
         "slot": 60,
+        "formal_slot": 60,
+        "history_index": null,
         "previous_ranking": [
           7,
           9,
           5,
-          3,
           0,
+          3,
           4,
           2,
           8,
@@ -230,8 +259,8 @@
         "new_ranking": [
           7,
           9,
-          5,
           0,
+          5,
           3,
           4,
           2,
@@ -243,11 +272,13 @@
       {
         "epoch": 4,
         "slot": 80,
+        "formal_slot": 80,
+        "history_index": null,
         "previous_ranking": [
           7,
           9,
-          5,
           0,
+          5,
           3,
           4,
           2,
@@ -256,8 +287,8 @@
           6
         ],
         "new_ranking": [
-          7,
           9,
+          7,
           0,
           5,
           3,
@@ -271,9 +302,11 @@
       {
         "epoch": 5,
         "slot": 100,
+        "formal_slot": 100,
+        "history_index": null,
         "previous_ranking": [
-          7,
           9,
+          7,
           0,
           5,
           3,
@@ -289,8 +322,8 @@
           0,
           5,
           3,
-          4,
           2,
+          4,
           8,
           1,
           6
@@ -299,14 +332,16 @@
       {
         "epoch": 6,
         "slot": 120,
+        "formal_slot": 120,
+        "history_index": null,
         "previous_ranking": [
           9,
           7,
           0,
           5,
           3,
-          4,
           2,
+          4,
           8,
           1,
           6
@@ -314,8 +349,8 @@
         "new_ranking": [
           9,
           7,
-          0,
           5,
+          0,
           3,
           2,
           4,
@@ -327,11 +362,13 @@
       {
         "epoch": 7,
         "slot": 140,
+        "formal_slot": 140,
+        "history_index": null,
         "previous_ranking": [
           9,
           7,
-          0,
           5,
+          0,
           3,
           2,
           4,
@@ -348,13 +385,15 @@
           2,
           4,
           8,
-          1,
-          6
+          6,
+          1
         ]
       },
       {
         "epoch": 8,
         "slot": 160,
+        "formal_slot": 160,
+        "history_index": null,
         "previous_ranking": [
           9,
           7,
@@ -364,12 +403,12 @@
           2,
           4,
           8,
-          1,
-          6
+          6,
+          1
         ],
         "new_ranking": [
-          9,
           7,
+          9,
           5,
           0,
           3,
@@ -383,9 +422,11 @@
       {
         "epoch": 9,
         "slot": 180,
+        "formal_slot": 180,
+        "history_index": null,
         "previous_ranking": [
-          9,
           7,
+          9,
           5,
           0,
           3,
@@ -396,8 +437,8 @@
           1
         ],
         "new_ranking": [
-          7,
           9,
+          7,
           5,
           0,
           3,
@@ -411,9 +452,11 @@
       {
         "epoch": 10,
         "slot": 200,
+        "formal_slot": 200,
+        "history_index": null,
         "previous_ranking": [
-          7,
           9,
+          7,
           5,
           0,
           3,
@@ -432,13 +475,15 @@
           2,
           4,
           8,
-          6,
-          1
+          1,
+          6
         ]
       },
       {
         "epoch": 11,
         "slot": 220,
+        "formal_slot": 220,
+        "history_index": null,
         "previous_ranking": [
           9,
           7,
@@ -448,14 +493,14 @@
           2,
           4,
           8,
-          6,
-          1
+          1,
+          6
         ],
         "new_ranking": [
           9,
           7,
-          5,
           0,
+          5,
           3,
           2,
           4,
@@ -467,11 +512,13 @@
       {
         "epoch": 12,
         "slot": 240,
+        "formal_slot": 240,
+        "history_index": null,
         "previous_ranking": [
           9,
           7,
-          5,
           0,
+          5,
           3,
           2,
           4,
@@ -481,8 +528,8 @@
         ],
         "new_ranking": [
           9,
-          7,
           0,
+          7,
           5,
           3,
           2,
@@ -495,10 +542,12 @@
       {
         "epoch": 13,
         "slot": 260,
+        "formal_slot": 260,
+        "history_index": null,
         "previous_ranking": [
           9,
-          7,
           0,
+          7,
           5,
           3,
           2,
@@ -511,8 +560,8 @@
           9,
           0,
           7,
-          5,
           3,
+          5,
           2,
           4,
           8,
@@ -523,12 +572,14 @@
       {
         "epoch": 14,
         "slot": 280,
+        "formal_slot": 280,
+        "history_index": null,
         "previous_ranking": [
           9,
           0,
           7,
-          5,
           3,
+          5,
           2,
           4,
           8,
@@ -542,25 +593,118 @@
           3,
           5,
           2,
-          4,
           8,
+          4,
           1,
           6
         ]
       }
     ],
-    "epoch_count": 15
+    "epoch_count": 15,
+    "history_slots": 20,
+    "formal_slots": 300
   },
   "validation_summary": {
     "num_slots": 300,
     "num_tv": 9,
     "task_rows": 2700,
-    "total_arrivals": 1344,
-    "empirical_arrival_rate": 0.49777777777777776,
+    "total_arrivals": 1361,
+    "empirical_arrival_rate": 0.5040740740740741,
     "lambda_tolerance": 0.08,
     "rho_star_normalized": true,
     "adjacent_same_probability_fraction": 0.9531772575250836,
-    "service_distribution_correlation": 0.9941714692108017,
-    "epoch_count": 15
+    "service_distribution_correlation": 0.9947579828286404,
+    "service_parameter_generation": {
+      "program_size_mb": {
+        "stratum_count": 10,
+        "stratum_counts": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "stratum_index_by_service_id": [
+          9,
+          1,
+          6,
+          8,
+          0,
+          2,
+          7,
+          3,
+          5,
+          4
+        ]
+      },
+      "mean_input_size_mbit": {
+        "stratum_count": 10,
+        "stratum_counts": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "stratum_index_by_service_id": [
+          3,
+          4,
+          9,
+          0,
+          6,
+          7,
+          5,
+          1,
+          8,
+          2
+        ]
+      },
+      "cycles_per_bit": {
+        "stratum_count": 10,
+        "stratum_counts": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "stratum_index_by_service_id": [
+          5,
+          4,
+          6,
+          2,
+          7,
+          8,
+          1,
+          0,
+          3,
+          9
+        ]
+      },
+      "independent_dimension_orders": true,
+      "pairwise_correlations": {
+        "program_size_vs_mean_input_size": -0.15477215643675904,
+        "program_size_vs_cycles_per_bit": -0.31705338104564496,
+        "mean_input_size_vs_cycles_per_bit": 0.31173274108114374
+      }
+    },
+    "epoch_count": 15,
+    "history_slots": 20,
+    "history_request_total": 81
   }
 }
