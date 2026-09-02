@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "generator": "randomTrips",
+  "network": {
+    "path": "data/sumo/map/osm.net.xml.gz",
+    "sha256": "30379989e0f94505e30ed5ec27449367615847ab4baf1bfe2340d8c405388c7d"
+  },
+  "random_seed": 4402,
+  "traffic_seed": 4402,
+  "period_s": 1.0,
+  "departure_begin_s": 0.0,
+  "departure_end_s": 60.0,
+  "min_distance_m": 4000.0,
+  "intermediate": 2,
+  "maxtries": 1000,
+  "vehicle_class": "passenger"
+}
