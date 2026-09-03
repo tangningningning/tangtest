@@ -469,7 +469,8 @@ def build_per_trigger_q_critic_preserving_rng(
 class CentralizedJointActionCritic(nn.Module if nn is not None else object):
     """集中式联合动作 critic：``Q_c(s,a)=V_c(s)+D_c(s,a)``。
 
-    ``V_c`` 只接收 observation，``D_c`` 接收 observation 与完整的8维
+    ``V_c`` 只接收 observation，``D_c`` 接收 observation 与完整的 dynamic
+    joint action vector
     joint action。两条分支不与 Actor 共享 encoder；action-dependent 分支的
     最终 head 显式零初始化，因此新 critic 初始时对不同 joint action 给出相同
     Q 值，避免凭随机初始化制造 counterfactual preference。
@@ -568,7 +569,7 @@ def build_centralized_joint_action_critic_preserving_rng(
 class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
     """Shared encoder/AR block + trigger-specific binary heads + scalar critic.
 
-    The eight heads are initialized as exact copies of the historical shared
+    One head per dynamic trigger is initialized as an exact copy of the historical shared
     ``logit_head`` initialization.  A temporary single Linear is used only to
     preserve the old RNG draw order; it is not registered as a model
     parameter.  The formal V3 sparse Direct-CF optimizer freezes the
@@ -624,7 +625,7 @@ class ConditionalTriggerActorCritic(nn.Module if nn is not None else object):
             self.logit_head = nn.Linear(self.autoregressive_hidden_size, 1)
         else:
             # Keep the trigger-head initialization draw exactly once, then
-            # make eight bitwise copies without consuming additional RNG.
+            # make one bitwise copy per dynamic action without consuming additional RNG.
             shared_logit_head = nn.Linear(self.autoregressive_hidden_size, 1)
             self.trigger_heads = nn.ModuleList(
                 [copy.deepcopy(shared_logit_head) for _ in range(self.action_dim)]

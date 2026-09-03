@@ -68,7 +68,7 @@ COUNTERFACTUAL_TRAINING_HISTORY_SCHEMA_VERSION = 2
 CENTRALIZED_COUNTERFACTUAL_CHECKPOINT_VERSION = 4
 CENTRALIZED_COUNTERFACTUAL_TRAINING_HISTORY_SCHEMA_VERSION = 4
 # Bumped because the formal sparse Direct-CF Actor now has a different
-# parameter layout (encoder + eight trigger heads; autoregressive block frozen).
+# parameter layout (encoder + one head per dynamic trigger; autoregressive block frozen).
 SPARSE_DIRECT_CF_CHECKPOINT_VERSION = 6
 SPARSE_DIRECT_CF_TRAINING_HISTORY_SCHEMA_VERSION = 5
 # Frozen-policy multi-episode batching is a distinct formal method/checkpoint
@@ -90,16 +90,6 @@ HIERARCHICAL_GATE_CF_BATCH_EPISODES = 4
 LATEST_CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 TRAINING_HISTORY_FILENAME = "training_history.json"
 EXECUTION_LOCATION_ORDER = ("Local", "SV", "RSU", "UAV", "Cloud")
-SPARSE_DIRECT_CF_TRIGGER_LABELS = (
-    "z_46^ca",
-    "z_29^ca",
-    "z_80^ca",
-    "z_RSU_0^ca",
-    "z_UAV_0^ca",
-    "z_UAV_1^ca",
-    "z_UAV_0^q",
-    "z_UAV_1^q",
-)
 K8_EPISODE1_BASELINE = {
     "steps": 276,
     "G": 780.4936401668566,
@@ -777,35 +767,42 @@ def _cf_samples_per_episode(project_cfg: dict[str, Any]) -> int:
 def _trigger_count_list(
     value: dict[str, int] | list[int] | tuple[int, ...] | None,
     name: str,
+    labels: tuple[str, ...] | list[str] | None = None,
 ) -> list[int] | None:
-    """将新旧两种Trigger count reporting规范化为固定顺序长度8列表。"""
+    """规范化 Trigger count reporting，顺序由 dynamic action spec 或输入映射决定。"""
 
     if value is None:
         return None
+    expected_labels = None if labels is None else tuple(str(label) for label in labels)
     if isinstance(value, dict):
-        if set(value) != set(SPARSE_DIRECT_CF_TRIGGER_LABELS):
-            raise ValueError(f"{name} 必须覆盖固定8个Trigger且不包含额外键。")
-        result = [int(value[label]) for label in SPARSE_DIRECT_CF_TRIGGER_LABELS]
+        mapping_labels = tuple(str(label) for label in value)
+        if expected_labels is not None and set(mapping_labels) != set(expected_labels):
+            raise ValueError(f"{name} 必须覆盖当前 dynamic action spec 的全部 Trigger。")
+        ordered_labels = expected_labels or mapping_labels
+        result = [int(value[label]) for label in ordered_labels]
     else:
         result = [int(item) for item in value]
-    if len(result) != len(SPARSE_DIRECT_CF_TRIGGER_LABELS) or any(item < 0 for item in result):
-        raise ValueError(f"{name} 必须是长度8的非负整数列表。")
+    if expected_labels is not None and len(result) != len(expected_labels):
+        raise ValueError(f"{name} 长度必须与当前 dynamic action spec 一致。")
+    if not result or any(item < 0 for item in result):
+        raise ValueError(f"{name} 必须是非空非负整数列表。")
     return result
 
 
 def _trigger_weight_list(
     value: list[float] | tuple[float, ...] | None,
     name: str,
+    expected_count: int | None = None,
 ) -> list[float] | None:
-    """规范化Trigger sampling weights，长度固定为8。"""
+    """规范化 dynamic Trigger sampling weights。"""
 
     if value is None:
         return None
     result = [float(item) for item in value]
-    if len(result) != len(SPARSE_DIRECT_CF_TRIGGER_LABELS) or any(
+    if (expected_count is not None and len(result) != int(expected_count)) or not result or any(
         not math.isfinite(item) or item < 0.0 for item in result
     ):
-        raise ValueError(f"{name} 必须是长度8的finite非负数列表。")
+        raise ValueError(f"{name} 必须是与当前 Trigger 数量一致的 finite 非负列表。")
     return result
 
 
@@ -1147,10 +1144,14 @@ def _training_episode_history_record(
 
 def _direct_cf_trigger_sample_counts(
     direct_cf_samples: list[ppo_rollout.DirectCFCreditSample],
+    trigger_labels: tuple[str, ...] | list[str],
 ) -> dict[str, int]:
-    """按固定Trigger顺序统计已完成Direct-CF样本；只读reporting，不改变采样。"""
+    """按 dynamic action spec 顺序统计 Direct-CF 样本。"""
 
-    counts = {label: 0 for label in SPARSE_DIRECT_CF_TRIGGER_LABELS}
+    labels = tuple(str(label) for label in trigger_labels)
+    if not labels or len(set(labels)) != len(labels):
+        raise ValueError("Direct-CF trigger_labels 必须非空且不重复。")
+    counts = {label: 0 for label in labels}
     for sample in direct_cf_samples:
         label = str(sample.trigger_label)
         if label not in counts:
@@ -1170,7 +1171,7 @@ def _build_direct_cf_reservoir(
     if sampling_strategy == "trigger_stratified":
         if int(capacity) != int(action_spec.action_dim):
             raise ValueError(
-                "trigger_stratified 当前要求cf_samples_per_episode等于Trigger数量8。"
+                "trigger_stratified 当前要求cf_samples_per_episode等于 dynamic Trigger 数量。"
             )
         return ppo_rollout.TriggerStratifiedDirectCFReservoir(
             tuple(action_spec.labels),
@@ -1189,16 +1190,16 @@ def _build_direct_cf_reservoir(
 def _direct_cf_reservoir_reporting(
     reservoir: ppo_rollout.DirectCFReservoir,
 ) -> tuple[int, list[int], list[int], list[float]]:
-    """返回固定8顺序的K_eff、N_i、sample count和N_i/N。"""
+    """返回 reservoir action-spec 顺序的 K_eff、N_i、sample count 和 N_i/N。"""
 
-    expected_count = len(SPARSE_DIRECT_CF_TRIGGER_LABELS)
+    expected_count = int(reservoir.trigger_count)
     if int(reservoir.trigger_count) != expected_count:
-        raise ValueError("Direct-CF reservoir trigger数量必须为8。")
+        raise ValueError("Direct-CF reservoir trigger数量必须为正整数。")
     free_counts = [int(value) for value in reservoir.trigger_free_counts]
     sample_counts = [int(value) for value in reservoir.trigger_sample_counts]
     weights = [float(value) for value in reservoir.trigger_sampling_weights]
     if len(free_counts) != expected_count or len(sample_counts) != expected_count or len(weights) != expected_count:
-        raise ValueError("Direct-CF reservoir reporting必须是长度8。")
+        raise ValueError("Direct-CF reservoir reporting长度必须与 dynamic action spec 一致。")
     if int(reservoir.total_seen) != sum(free_counts):
         raise AssertionError("Direct-CF reservoir total_seen与Trigger free count不一致。")
     if not math.isclose(math.fsum(weights), 1.0, rel_tol=1e-12, abs_tol=1e-12) and reservoir.total_seen > 0:
@@ -1504,11 +1505,11 @@ def _training_episode_summary_from_builtin(value: Any) -> TrainingEpisodeSummary
                 kwargs[field.name] = None
             else:
                 values = [float(item) for item in raw]
-                if len(values) != len(SPARSE_DIRECT_CF_TRIGGER_LABELS) or not all(
+                if not values or not all(
                     math.isfinite(item) and item >= 0.0 for item in values
                 ):
                     raise ValueError(
-                        "training_episode_summary.cf_trigger_sampling_weights必须是长度8的finite非负列表。"
+                        "training_episode_summary.cf_trigger_sampling_weights必须是非空finite非负列表。"
                     )
                 kwargs[field.name] = values
         elif field.name in mapping_fields:
@@ -2036,22 +2037,20 @@ def _sparse_direct_cf_episode_summary_from_builtin(
             raw_trigger_counts,
             f"sparse_direct_cf episode[{expected_index}].cf_trigger_sample_counts",
         )
-        if set(trigger_counts_mapping) != set(SPARSE_DIRECT_CF_TRIGGER_LABELS):
-            raise ValueError("cf_trigger_sample_counts 必须覆盖固定8个Trigger且不包含额外键。")
         trigger_counts = {}
-        for label in SPARSE_DIRECT_CF_TRIGGER_LABELS:
+        for label in trigger_counts_mapping:
             raw_count = trigger_counts_mapping[label]
             if isinstance(raw_count, bool) or int(raw_count) != raw_count or int(raw_count) < 0:
                 raise ValueError(f"cf_trigger_sample_counts[{label}] 必须是非负整数。")
-            trigger_counts[label] = int(raw_count)
+            trigger_counts[str(label)] = int(raw_count)
     else:
         count_list = _trigger_count_list(
             raw_trigger_counts,
             f"sparse_direct_cf episode[{expected_index}].cf_trigger_sample_counts",
         )
         trigger_counts = {
-            label: int(count_list[index])
-            for index, label in enumerate(SPARSE_DIRECT_CF_TRIGGER_LABELS)
+            f"trigger_{index}": int(value)
+            for index, value in enumerate(count_list)
         }
     free_counts_raw = item.get("cf_trigger_free_counts")
     free_counts = _trigger_count_list(
@@ -4437,6 +4436,7 @@ def _formal_raw_rollout_statistics(batch: ppo_rollout.RolloutBatch) -> dict[str,
 
 def _rollout_trigger_action1_counts(
     batch: ppo_rollout.RolloutBatch,
+    trigger_labels: tuple[str, ...] | list[str],
 ) -> dict[str, int]:
     """Count ordinary rollout action=1 decisions without changing behavior.
 
@@ -4446,13 +4446,15 @@ def _rollout_trigger_action1_counts(
     which reports selected Direct-CF samples.
     """
 
-    labels = tuple(SPARSE_DIRECT_CF_TRIGGER_LABELS)
+    labels = tuple(str(label) for label in trigger_labels)
+    if not labels or len(set(labels)) != len(labels):
+        raise ValueError("rollout trigger_labels 必须非空且不重复。")
     counts = {label: 0 for label in labels}
     for transition in batch.transitions:
         action = np.asarray(transition.action_vector, dtype=np.int8).reshape(-1)
         if action.shape != (len(labels),) or not np.all(np.isin(action, [0, 1])):
             raise ValueError(
-                "ordinary rollout trigger action vector必须是长度8的0/1向量。"
+                "ordinary rollout trigger action vector长度必须与 dynamic action spec 一致。"
             )
         for index, label in enumerate(labels):
             counts[label] += int(action[index])
@@ -6403,10 +6405,13 @@ def _hierarchical_gate_formal_training(
             autoregressive_parameter_delta_norm=update.autoregressive_parameter_delta_norm,
             value_head_parameter_delta_norm=update.value_head_parameter_delta_norm,
             logit_head_parameter_delta_norm=update.logit_head_parameter_delta_norm,
-            trigger_action1_counts=_rollout_trigger_action1_counts(batch),
+            trigger_action1_counts=_rollout_trigger_action1_counts(
+                batch,
+                tuple(ctx.action_spec.labels),
+            ),
             cf_trigger_sample_counts={
                 label: int(cf_sample_counts[index])
-                for index, label in enumerate(SPARSE_DIRECT_CF_TRIGGER_LABELS)
+                for index, label in enumerate(ctx.action_spec.labels)
             },
             cf_sampling_strategy=sampling_strategy,
             cf_effective_sample_count=int(cf_effective_count),
@@ -7147,9 +7152,9 @@ def run_formal_ppo_training(
         else 1
     )
     if (_is_sparse_direct_cf_mode(ctx.cfg) or hierarchical_gate_mode) and sampling_strategy == "trigger_stratified":
-        if configured_cf_samples != len(SPARSE_DIRECT_CF_TRIGGER_LABELS):
+        if configured_cf_samples != int(ctx.action_spec.action_dim):
             raise ValueError(
-                "trigger_stratified 当前要求cf_samples_per_episode=8。"
+                "trigger_stratified 当前要求cf_samples_per_episode等于 dynamic Trigger 数量。"
             )
     plan = _build_formal_training_plan(
         protocol,
@@ -7436,8 +7441,6 @@ def run_formal_ppo_training(
         if _is_sparse_direct_cf_mode(ctx.cfg):
             if direct_cf_reservoir is None or direct_cf_steps is None:
                 raise AssertionError("sparse_direct_cf reservoir/steps未构造。")
-            if tuple(ctx.action_spec.labels) != SPARSE_DIRECT_CF_TRIGGER_LABELS:
-                raise RuntimeError("当前TriggerActionSpec顺序与正式coverage顺序不一致。")
             direct_cf_samples = ppo_rollout.run_direct_cf_branches(
                 policy,
                 direct_cf_reservoir,
@@ -7477,7 +7480,10 @@ def run_formal_ppo_training(
                         "Direct-CF Delta identity max error超过容差："
                         f"{max(identity_errors) if identity_errors else None}"
                     )
-            cf_trigger_sample_counts = _direct_cf_trigger_sample_counts(direct_cf_samples)
+            cf_trigger_sample_counts = _direct_cf_trigger_sample_counts(
+                direct_cf_samples,
+                tuple(ctx.action_spec.labels),
+            )
             (
                 cf_effective_sample_count,
                 cf_trigger_free_counts,
@@ -7486,7 +7492,7 @@ def run_formal_ppo_training(
             ) = _direct_cf_reservoir_reporting(direct_cf_reservoir)
             if reservoir_sample_counts != [
                 int(cf_trigger_sample_counts[label])
-                for label in SPARSE_DIRECT_CF_TRIGGER_LABELS
+                for label in ctx.action_spec.labels
             ]:
                 raise AssertionError("Direct-CF branch样本Trigger计数与reservoir不一致。")
         if reference_drift_mode:
@@ -7874,7 +7880,10 @@ def run_formal_ppo_training(
             autoregressive_parameter_delta_norm=update.autoregressive_parameter_delta_norm,
             value_head_parameter_delta_norm=update.value_head_parameter_delta_norm,
             logit_head_parameter_delta_norm=update.logit_head_parameter_delta_norm,
-            trigger_action1_counts=_rollout_trigger_action1_counts(batch),
+            trigger_action1_counts=_rollout_trigger_action1_counts(
+                batch,
+                tuple(ctx.action_spec.labels),
+            ),
             cf_trigger_sample_counts=cf_trigger_sample_counts,
             cf_sampling_strategy=sampling_strategy,
             cf_effective_sample_count=int(cf_effective_sample_count),

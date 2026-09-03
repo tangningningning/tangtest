@@ -53,9 +53,9 @@ class ScenarioConfig:
     dt_s: float = 1.0
     warmup_time_s: float = 100.0
     episode_time_s: float = 300.0
-    num_research_vehicles: int = 12
-    num_service_vehicles: int = 3
-    num_task_vehicles: int = 9
+    num_research_vehicles: int = 30
+    num_service_vehicles: int = 5
+    num_task_vehicles: int = 25
     random_seed: int = 4401
     traffic_seed: int = 4401
 
@@ -786,6 +786,65 @@ def _valid_trajectory_row(row: dict[str, Any]) -> bool:
     return True
 
 
+def load_existing_trajectory(
+    trajectory_file: Path,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], set[str], list[float]]:
+    """读取已有 SUMO 轨迹并恢复筛选所需的 route metadata。
+
+    该入口只复用已经落盘的真实 SUMO 记录，不启动 SUMO、不生成车辆，
+    用于在系统规模变化时重新执行正式的完整轨迹过滤和角色划分。
+    """
+
+    numeric_fields = (
+        "time_s",
+        "x_m",
+        "y_m",
+        "speed_mps",
+        "acceleration_mps2",
+        "lane_position_m",
+        "distance_m",
+    )
+    rows: list[dict[str, Any]] = []
+    route_cache: dict[str, dict[str, Any]] = {}
+    seen_vehicle_ids: set[str] = set()
+    observed_times: list[float] = []
+    previous_time = -math.inf
+    with trajectory_file.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != TRAJECTORY_FIELDS:
+            raise ValueError("已有 trajectory.csv 字段与正式约定不一致。")
+        for raw_row in reader:
+            row = dict(raw_row)
+            for field in numeric_fields:
+                row[field] = float(row[field])
+            vehicle_id = str(row["vehicle_id"])
+            route_edges = tuple(
+                edge for edge in str(row["route_edges"]).split() if edge
+            )
+            route = {
+                "route_id": str(row["route_id"]),
+                "route_edges": route_edges,
+            }
+            if vehicle_id in route_cache and route_cache[vehicle_id] != route:
+                raise ValueError(
+                    f"vehicle {vehicle_id} 的已有轨迹 route metadata 不一致。"
+                )
+            route_cache[vehicle_id] = route
+            time_s = float(row["time_s"])
+            if time_s < previous_time - 1.0e-9:
+                raise ValueError("已有 trajectory.csv 的 time_s 不是单调不减。")
+            if not observed_times or not math.isclose(
+                time_s, observed_times[-1], rel_tol=0.0, abs_tol=1.0e-9
+            ):
+                observed_times.append(time_s)
+            previous_time = time_s
+            seen_vehicle_ids.add(vehicle_id)
+            rows.append(row)
+    if not rows:
+        raise ValueError("已有 trajectory.csv 为空。")
+    return rows, route_cache, seen_vehicle_ids, observed_times
+
+
 def find_complete_vehicles(
     rows: Iterable[dict[str, Any]],
     route_cache: dict[str, dict[str, Any]],
@@ -1063,6 +1122,41 @@ def validate_outputs(
     }
 
 
+def reuse_existing_trajectory_roles(
+    trajectory_file: Path,
+    roles_file: Path,
+    config: ScenarioConfig,
+) -> tuple[dict[str, Any], dict[str, Any], list[str], list[float]]:
+    """基于已有真实 SUMO trajectory 重新筛选并写入动态角色文件。"""
+
+    rows, route_cache, seen_ids, observed_times = load_existing_trajectory(
+        trajectory_file
+    )
+    complete_ids, route_metadata, formal_steps = find_complete_vehicles(
+        rows,
+        route_cache,
+        config,
+    )
+    if len(complete_ids) < config.num_research_vehicles:
+        raise RuntimeError(
+            f"已有 trajectory.csv 中完整研究车辆只有 {len(complete_ids)} 辆，"
+            f"少于要求的 {config.num_research_vehicles} 辆。"
+        )
+    roles, selection_reproducible = build_role_assignments(
+        complete_ids,
+        route_metadata,
+        seen_ids,
+        config,
+    )
+    if not selection_reproducible:
+        raise AssertionError("角色选择可复现性验证失败。")
+    write_roles_json(roles, roles_file)
+    validation = validate_outputs(trajectory_file, roles_file, complete_ids, config)
+    validation["trajectory_reused_without_sumo"] = True
+    validation["formal_step_count"] = len(formal_steps)
+    return roles, validation, complete_ids, observed_times
+
+
 # ============================================================================
 # CLI
 # ============================================================================
@@ -1115,6 +1209,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sumo-home", default=None)
     parser.add_argument("--sumo-config", default=None)
     parser.add_argument("--net-file", default=None)
+    parser.add_argument(
+        "--trajectory-file",
+        default=None,
+        help="复用已有真实 SUMO trajectory.csv 时使用的输入文件。",
+    )
+    parser.add_argument(
+        "--reuse-existing-trajectory",
+        action="store_true",
+        help="只重用已有真实轨迹并重新划分角色，不启动 SUMO。",
+    )
     parser.add_argument(
         "--route-file",
         action="append",
@@ -1280,6 +1384,47 @@ def main(argv: list[str] | None = None) -> int:
         config = config_from_arguments(args, formal_config)
         config.validate()
 
+        output_dir = _resolve_from_project(
+            project_root,
+            args.output_dir
+            or Path(
+                project_config_module.get_config_value(
+                    formal_config,
+                    "paths.vehicle_roles",
+                    "data/generated/vehicle_roles.json",
+                )
+            ).parent,
+        )
+
+        if args.reuse_existing_trajectory:
+            trajectory_file = _resolve_from_project(
+                project_root,
+                args.trajectory_file
+                or project_config_module.get_config_value(
+                    formal_config,
+                    "paths.trajectory",
+                    "data/generated/trajectory.csv",
+                ),
+            )
+            roles_file = output_dir / "vehicle_roles.json"
+            roles, validation, complete_ids, observed_times = reuse_existing_trajectory_roles(
+                trajectory_file,
+                roles_file,
+                config,
+            )
+            print("复用已有真实 SUMO trajectory，未启动 SUMO：")
+            print(f"  trajectory: {trajectory_file}")
+            print(f"  complete candidates: {len(complete_ids)}")
+            print(f"  observed times: {len(observed_times)}")
+            print("最小验证通过：")
+            for key, value in validation.items():
+                print(f"  {key}: {value}")
+            print(f"正式输出：{roles_file}")
+            print(f"研究车辆({len(roles['research_vehicles'])})：{roles['research_vehicles']}")
+            print(f"SV({len(roles['service_vehicles'])})：{roles['service_vehicles']}")
+            print(f"TV({len(roles['task_vehicles'])})：{roles['task_vehicles']}")
+            return 0
+
         inventory = discover_sumo_files(project_root)
         print_sumo_inventory(project_root, inventory)
 
@@ -1297,18 +1442,6 @@ def main(argv: list[str] | None = None) -> int:
             ),
             explicit_routes=args.route_file,
         )
-        output_dir = _resolve_from_project(
-            project_root,
-            args.output_dir
-            or Path(
-                project_config_module.get_config_value(
-                    formal_config,
-                    "paths.vehicle_roles",
-                    "data/generated/vehicle_roles.json",
-                )
-            ).parent,
-        )
-
         if source is None:
             network = _choose_network(
                 project_root,
@@ -1386,8 +1519,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"正式输出：{trajectory_file}")
         print(f"正式输出：{roles_file}")
         print(f"研究车辆：{roles['research_vehicles']}")
-        print(f"SV(3)：{roles['service_vehicles']}")
-        print(f"TV(9)：{roles['task_vehicles']}")
+        print(f"SV({len(roles['service_vehicles'])})：{roles['service_vehicles']}")
+        print(f"TV({len(roles['task_vehicles'])})：{roles['task_vehicles']}")
         print(f"正式时隙数：{len(formal_steps)}；采集时刻数：{len(observed_times)}")
         return 0
     except Exception as exc:

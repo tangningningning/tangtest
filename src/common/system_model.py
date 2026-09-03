@@ -135,28 +135,46 @@ def cloud_execution(
     cloud_cpu_cycles_per_s: float,
     cloud_delay_factor: float,
     transmit_power_w: float,
+    cloud_task_count: int = 1,
 ) -> dict[str, float]:
+    """Evaluate one task on the single shared Cloud node.
+
+    ``cloud_rate_bps`` and ``cloud_cpu_cycles_per_s`` are total Cloud-node
+    capacities.  All Cloud tasks in the same slot pass the same
+    ``cloud_task_count`` and receive an equal resource share.  The default of
+    one preserves the single-task/legacy call contract used by analysis-only
+    surrogate evaluations.
+    """
     bits = _require_finite("input_bits", input_bits)
     cycles = _require_finite("cpu_cycles", cpu_cycles)
     rate = _require_finite("cloud_rate_bps", cloud_rate_bps)
     cpu = _require_finite("cloud_cpu_cycles_per_s", cloud_cpu_cycles_per_s)
     factor = _require_finite("cloud_delay_factor", cloud_delay_factor)
     power = _require_finite("transmit_power_w", transmit_power_w)
+    count_value = _require_finite("cloud_task_count", float(cloud_task_count))
     if bits < 0.0 or cycles < 0.0:
         raise ValueError("input_bits/cpu_cycles 不能为负数。")
     if rate <= 0.0 or cpu <= 0.0:
         raise ValueError("cloud_rate_bps/cloud_cpu_cycles_per_s 必须大于 0。")
+    if count_value < 1.0 or not math.isclose(count_value, round(count_value), rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("cloud_task_count 必须是正整数。")
     if factor < 1.0:
         raise ValueError("cloud_delay_factor/psi_c 必须不小于 1。")
     if power < 0.0:
         raise ValueError("transmit_power_w 不能为负数。")
-    upload_delay = factor * bits / rate
-    compute_delay = cycles / cpu
+    task_count = int(round(count_value))
+    allocated_rate = rate / task_count
+    allocated_cpu = cpu / task_count
+    upload_delay = factor * bits / allocated_rate
+    compute_delay = cycles / allocated_cpu
     return {
+        "allocated_bandwidth_bps": allocated_rate,
+        "allocated_cpu_cycles_per_s": allocated_cpu,
         "upload_delay_s": upload_delay,
+        "communication_delay_s": upload_delay,
         "compute_delay_s": compute_delay,
         "total_delay_s": upload_delay + compute_delay,
-        "vehicle_energy_j": power * bits / rate,
+        "vehicle_energy_j": power * bits / allocated_rate,
     }
 
 

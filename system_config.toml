@@ -41,7 +41,7 @@ output_tag = "main"
 
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
-# 不在本 TOML 中复制 10 个具体服务，避免两份 service catalog 不一致。
+# 不在本 TOML 中复制 20 个具体服务，避免两份 service catalog 不一致。
 service_catalog = "data/generated/service_catalog.json"
 # 车辆角色文件。SV/TV 真实 ID 从这里读取，system_config 不写死 46/29/80。
 vehicle_roles = "data/generated/vehicle_roles.json"
@@ -77,12 +77,12 @@ dt_s = 1.0
 warmup_time_s = 100.0
 # 正式优化 episode 长度，单位 s。当前正式数据覆盖 300 个 slot。
 episode_time_s = 300.0
-# 研究车辆数量。当前已确定数据值；修改需要重新筛选车辆与生成任务/预测链。
-num_research_vehicles = 12
-# TV 数量。当前已确定数据值；TV ID 从 vehicle_roles.json 读取。
-num_task_vehicles = 9
-# SV 数量。当前已确定数据值；SV ID 从 vehicle_roles.json 读取。
-num_service_vehicles = 3
+# 研究车辆数量。正式 baseline 为 5 SV + 25 TV；ID 从 vehicle_roles.json 读取。
+num_research_vehicles = 30
+# TV 数量。正式 baseline 为 25；TV ID 从 vehicle_roles.json 读取。
+num_task_vehicles = 25
+# SV 数量。正式 baseline 为 5；SV ID 从 vehicle_roles.json 读取。
+num_service_vehicles = 5
 # SUMO / 角色筛选主 seed。当前实际值来自已有 vehicle_roles.json。
 sumo_seed = 4401
 # 交通需求 seed。当前项目未单独冻结 traffic_seed，先沿用 sumo_seed；如后续拆分需重新生成 SUMO 轨迹。
@@ -96,9 +96,9 @@ random_trips_intermediate = 2
 random_trips_maxtries = 1000
 
 [service]
-# 服务总数 F。当前已确定数据值；修改后必须重新运行 task_scenario.py，
+# 服务总数 F。正式 baseline 为 20；修改后必须重新运行 task_scenario.py，
 # 生成新的 service_catalog.json、popularity.csv、tasks.csv，并重跑依赖链。
-count = 10
+count = 20
 # 实际服务实例目录。缓存模块读取 s_f 时必须使用此 JSON。
 catalog_path = "data/generated/service_catalog.json"
 
@@ -157,15 +157,15 @@ transmit_power_w = 0.1995262315
 [nodes.sv]
 # 参数状态：系统尺度校准实验基线。
 # SV 公共缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
-# 当前值依据本项目 10 种 service 的实际 program_size 设置，
+# 当前值依据本项目 20 种 service 的实际 program_size 设置，
 # 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
 # 后续通过 cache capacity sensitivity 实验验证。
-cache_capacity_mb = 4500.0
+# 正式 baseline：SV 公共缓存容量，单位 MB。
+cache_capacity_mb = 6000.0
 # SV 总 CPU 能力，单位 cycle/s。
-# 已有区分 Task Vehicle 和 Service Vehicle 的 VEC 研究使用 [3,5]GHz；
-# 当前主实验取下界 3GHz，保持 F_vehicle < F_SV。
+# 正式 baseline：SV 总 CPU 能力为 1GHz，单位 cycle/s。
 # 这是文献校准实验基线，不代表硬件实测数据。
-cpu_cycles_per_s = 3.0e9
+cpu_cycles_per_s = 1.0e9
 # SV 链路带宽，单位 Hz。
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
@@ -178,19 +178,21 @@ eta_ca = 0.20
 # SV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
 # 当前项目不把 xi_ca 解释为严格 Joule/MB。
 xi_ca = 1.0e-3
-# 仅用于配置阶段轻量 surrogate 的候选节点筛选。
-# 不替代 ground/air channel model，也不代表最终 Matching/KKT 中的物理硬覆盖半径。
+# Legacy compatibility parameter.
+# 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
+# 距离只通过正式 ground/air channel model 影响 rate、delay、energy 和 utility。
 range_m = 100.0
 
 [nodes.rsu]
-# RSU 数量。当前已有代码只有 1 个 RSU，因此保持 1，不擅自增加。
-count = 1
+# RSU 数量。正式 baseline 使用三个动态实例 RSU_0、RSU_1、RSU_2。
+count = 3
 # 参数状态：系统尺度校准实验基线。
 # RSU 公共缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
-# 当前值依据本项目 10 种 service 的实际 program_size 设置，
+# 当前值依据本项目 20 种 service 的实际 program_size 设置，
 # 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
 # 后续通过 cache capacity sensitivity 实验验证。
-cache_capacity_mb = 8000.0
+# 正式 baseline：RSU 公共缓存容量，单位 MB。
+cache_capacity_mb = 15000.0
 # RSU 总 CPU 能力，单位 cycle/s。
 # SUMO+NS3 VEC 仿真研究将 MEC server computation rate 设置为 8GHz；
 # 当前 RSU 部署 MEC 计算资源，因此主实验基线采用 8GHz。
@@ -207,19 +209,32 @@ eta_ca = 0.10
 # RSU 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
 # 当前项目不把 xi_ca 解释为严格 Joule/MB。
 xi_ca = 0.7e-3
-# 仅用于配置阶段轻量 surrogate 的候选节点筛选。
-# 不替代 ground/air channel model，也不代表最终 Matching/KKT 中的物理硬覆盖半径。
+# Legacy compatibility parameter.
+# 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
+# 距离只通过正式 ground/air channel model 影响 rate、delay、energy 和 utility。
 range_m = 250.0
 
 [[nodes.rsu.instances]]
-# PROVISIONAL：RSU_0 位置由当前 SUMO map boundary 的中心确定，不是论文部署结论。
+# PROVISIONAL：RSU_0 位置由当前 SUMO map boundary 内的固定部署点确定。
 id = "RSU_0"
+x_m = 3500.0
+y_m = 600.0
+
+[[nodes.rsu.instances]]
+# PROVISIONAL：RSU_1 位置由当前 SUMO map boundary 内的固定部署点确定。
+id = "RSU_1"
 x_m = 4121.86
 y_m = 986.375
 
+[[nodes.rsu.instances]]
+# PROVISIONAL：RSU_2 位置由当前 SUMO map boundary 内的固定部署点确定。
+id = "RSU_2"
+x_m = 4750.0
+y_m = 1370.0
+
 [nodes.uav]
-# UAV 数量。当前系统正式要求 UAV 数量至少为 2；project_config.py 会强制校验。
-count = 2
+# UAV 数量。正式 baseline 使用三个动态实例 UAV_0、UAV_1、UAV_2。
+count = 3
 # UAV 初始水平位置生成规则说明。map_stratified 表示根据 SUMO 地图合法边界
 # 将初始点均匀分散到地图内部；这是 UAV 优化算法的初始可行位置生成规则，
 # 不是未来真实轨迹，也不是论文固定部署结论。后续 UAV 位置仍由优化算法调整。
@@ -233,10 +248,11 @@ initialization_mode = "map_stratified"
 altitude_m = 100.0
 # 参数状态：系统尺度校准实验基线。
 # UAV 缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
-# 当前值依据本项目 10 种 service 的实际 program_size 设置，
+# 当前值依据本项目 20 种 service 的实际 program_size 设置，
 # 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
 # 后续通过 cache capacity sensitivity 实验验证。
-cache_capacity_mb = 6000.0
+# 正式 baseline：UAV 公共缓存容量，单位 MB。
+cache_capacity_mb = 10000.0
 # UAV 总 CPU 能力，单位 cycle/s。
 # 文献来源：Li et al., Collaborative offloading for UAV-enabled time-sensitive MEC networks,
 # EURASIP Journal on Wireless Communications and Networking 2021:1,
@@ -250,15 +266,17 @@ cpu_cycles_per_s = 5.0e9
 # 因此 10 MHz 直接换算为 10.0e6 Hz。
 # 这是文献校准实验基线，不代表硬件实测值。
 bandwidth_hz = 10.0e6
-# 参数状态：系统尺度校准实验基线。
-# UAV 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数。
-eta_ca = 0.30
+# 参数状态：system-scale calibrated baseline。
+# 依据 representative dry-run、sequential validation、300-slot continuous validation
+# 和 targeted causal validation；不是文献直接物理常数。
+eta_ca = 0.15
 # 参数状态：系统尺度校准实验基线。
 # UAV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
 # 当前项目不把 xi_ca 解释为严格 Joule/MB。
 xi_ca = 1.2e-3
-# 仅用于配置阶段轻量 surrogate 的候选节点筛选。
-# 不替代 ground/air channel model，也不代表最终 Matching/KKT 中的物理硬覆盖半径。
+# Legacy compatibility parameter.
+# 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
+# 距离只通过正式 ground/air channel model 影响 rate、delay、energy 和 utility。
 range_m = 300.0
 # 参数状态：文献校准实验基线。
 # UAV 最大水平飞行速度，单位 m/s。
@@ -277,7 +295,7 @@ max_horizontal_speed_mps = 15.0
 min_safety_distance_m = 10.0
 
 [nodes.uav.movement]
-# 参数状态：文献旋翼模型等效校准 baseline。
+# 参数状态：literature rotor-model equivalent mapping。
 # 等效单位水平移动距离能耗，单位 J/m。
 # Li et al., DOI 10.1186/s13638-020-01861-8，Table 1 给出旋翼 UAV 功率模型参数，
 # 但论文并未直接给出“15 J/m”作为物理常数。
@@ -285,14 +303,11 @@ min_safety_distance_m = 10.0
 # 因此在代表速度 V_ref=15m/s 处按 Li et al. 旋翼功率模型计算
 # P(15)/15 ≈ 14.73 J/m，并取整为 15 J/m 作为线性等效系数。
 movement_energy_coefficient_j_per_m = 15.0
-# 参数状态：系统尺度校准基线。
-# UAV 移动固定成本 eta_q。
-# 该参数不是文献直接给出的物理常数。
-# 它依据当前真实任务数据、已校准 T_ref/E_ref、
-# normal-slot aggregate utility 尺度进行定标。
-# 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
-# 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
-movement_fixed_cost = 0.2
+# 参数状态：system-scale calibrated baseline。
+# 依据 sequential movement audit、300-slot continuous validation
+# 和 UAV targeted causal validation；不是文献直接物理常数。
+# 该成本保持 state-dependent，不强制每 slot 移动。
+movement_fixed_cost = 0.00176
 
 [[nodes.uav.instances]]
 # 根据 map_stratified 和当前 SUMO map boundary [3027.76,226.37,5215.96,1746.38]
@@ -307,27 +322,35 @@ id = "UAV_1"
 initial_x_m = 4486.56
 initial_y_m = 986.375
 
+[[nodes.uav.instances]]
+# 根据相同 map_stratified 规则生成的第三个 UAV 初始水平位置；与前两个不重合。
+id = "UAV_2"
+initial_x_m = 4850.0
+initial_y_m = 986.375
+
 [nodes.cloud]
-# Cloud 总 CPU 能力 F_c，单位 cycle/s。
-# 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c。
+# Cloud 单节点共享资源配置。正式系统对同一 slot 的所有 Cloud 任务
+# 使用 total_cpu_cycles_per_s / N_cloud 和 total_bandwidth_bps / N_cloud。
+# 当前系统公式：T_vc = psi_c * D_v / R_cloud_i + L_v / F_cloud_i。
 # 文献来源：Al-Shareeda et al., Novel DT-assisted Vehicular Task Offloading for Cloud,
 # Edge, and Hybrid Deployments, IEEE Transactions on Vehicular Technology 75(4):6565-6581, 2026,
 # DOI 10.1109/TVT.2025.3620810。
-# 本项目 F_c 表示单任务使用的固定等效 Cloud 计算频率，
-# 而参考文献中 20GHz 表示 Cloud 总容量，不能直接映射。
-# 参考文献对单任务动态分配的 Cloud 计算资源为 U[2,4]GHz。
-# 本项目由于不显式优化 Cloud 内部资源分配，
-# 采用其均值 3GHz 作为固定等效单任务计算能力。
-# 这是“文献参数到当前简化模型的等效映射”，
-# 不是论文直接给出的固定 3GHz Cloud CPU。
+# 旧 cpu_cycles_per_s 仅保留作 legacy parameter compatibility，正式模型不再
+# 将其解释为每任务独占 CPU。
 cpu_cycles_per_s = 3.0e9
-# Cloud uplink rate R_c，单位 bps。
-# 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c，E_vc_vehicle = p_v * D_v / R_c。
-# 文献来源同上，Table IV 给出 T_up_iC = 200 Mbps，语义为 Avg. uplink rate to cloud。
-# 该语义与当前 D_v/R_c 的 vehicle-to-cloud 上传链路相容；
-# 200 Mbps 直接换算为 200.0e6 bit/s。
-# 这是文献校准实验基线，不代表硬件实测值。
+# Cloud 总计算能力 F_cloud_total，单位 cycle/s；单任务分配为 F_total/N_cloud。
+total_cpu_cycles_per_s = 20.0e9
+# 旧 uplink_rate_bps 仅保留作 legacy parameter compatibility，正式模型使用
+# total_bandwidth_bps 作为单 Cloud 节点总 uplink，不按任务复制资源。
 uplink_rate_bps = 200.0e6
+# Cloud 总 uplink R_cloud_total，单位 bps；单任务分配为 R_total/N_cloud。
+# 当前系统公式：T_vc = psi_c * D_v / R_cloud_i + L_v / F_cloud_i，
+# E_vc_vehicle = p_v * D_v / R_cloud_i。
+# 文献来源同上，Table IV 给出 T_up_iC = 200 Mbps，语义为 Avg. uplink rate to cloud。
+# 该语义与当前 D_v/R_cloud_i 的 vehicle-to-cloud 上传链路相容；
+# 200 Mbps 作为单 Cloud 节点总 uplink，直接换算为 200.0e6 bit/s。
+# 这是文献校准实验基线，不代表硬件实测值。
+total_bandwidth_bps = 200.0e6
 # Cloud 传输扩展系数 psi_c，当前系统公式中作为 D_v/R_c 的乘法因子。
 # 系统模型要求 psi_c >= 1。
 # psi_c 用于将远程 Cloud 的回传/核心网附加传输时延
@@ -390,7 +413,8 @@ alpha_nlos = 2.0
 noise_power_w = 3.16227766e-13
 
 [communication.cloud]
-# Cloud 链路上传速率，单位 bps。与 nodes.cloud.uplink_rate_bps 保持一致。
+# Legacy compatibility parameter；正式共享 Cloud 总 uplink 使用
+# nodes.cloud.total_bandwidth_bps。
 uplink_rate_bps = 200.0e6
 
 [cache]
@@ -420,14 +444,10 @@ omega_energy = 0.5
 # 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
 # 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
 lambda_cache = 0.1
-# 参数状态：系统尺度校准基线。
-# UAV movement 配置成本权重 lambda_movement。
-# 该参数不是文献直接给出的物理常数。
-# 它依据当前真实任务数据、已校准 T_ref/E_ref、
-# normal-slot aggregate utility 尺度进行定标。
-# 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
-# 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
-lambda_movement = 0.002
+# 参数状态：system-scale calibrated baseline。
+# 依据 sequential movement audit、300-slot continuous validation
+# 和 UAV targeted causal validation；不是文献直接物理常数。
+lambda_movement = 1.76e-5
 # T_ref/E_ref 采用当前任务工作负载下 Local execution 的 P95 尺度，并做轻微取整。
 # 这样参考值主要由任务工作负载和车辆本地计算能力决定，
 # 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
@@ -604,6 +624,7 @@ num_minibatches = 4
 "prediction.popularity.hidden_size" = "CONFIRMED_DATA"
 "scenario.num_scenarios" = "CONFIRMED_DATA"
 "scenario.cross_vehicle_residual_sampling" = "CONFIRMED_DATA"
+"nodes.rsu.count" = "CONFIRMED_DATA"
 "nodes.uav.count" = "CONFIRMED_DATA"
 "nodes.sv.cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.rsu.cache_capacity_mb" = "CONFIRMED_DATA"
@@ -625,7 +646,9 @@ num_minibatches = 4
 "nodes.rsu.cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.uav.cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.cloud.cpu_cycles_per_s" = "CONFIRMED_DATA"
+"nodes.cloud.total_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
+"nodes.cloud.total_bandwidth_bps" = "CONFIRMED_DATA"
 "nodes.cloud.cloud_delay_factor" = "CONFIRMED_DATA"
 "nodes.sv.bandwidth_hz" = "CONFIRMED_DATA"
 "nodes.rsu.bandwidth_hz" = "CONFIRMED_DATA"

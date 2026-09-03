@@ -302,12 +302,18 @@ def run_slot20_validation(config_path: str = "system_config.toml") -> dict[str, 
     )
     boundary = uav_configuration.boundary_from_project(cfg)
     node_count = previous_cache.shape[0]
-    first_sv = cache_nodes["node_roles"].index("SV")
+    first_cache_index = 0
+    uav_ids = tuple(str(node_id) for node_id in previous_uav)
+    zero_uav_triggers = {uav_id: 0 for uav_id in uav_ids}
+    first_uav_triggers = dict(zero_uav_triggers)
+    first_uav_triggers[uav_ids[0]] = 1
+    first_cache_trigger = np.zeros(node_count, dtype=np.int8)
+    first_cache_trigger[first_cache_index] = 1
     cases = {
-        "A": (np.zeros(node_count, dtype=np.int8), {"UAV_0": 0, "UAV_1": 0}),
-        "B": (np.eye(1, node_count, first_sv, dtype=np.int8).reshape(-1), {"UAV_0": 0, "UAV_1": 0}),
-        "C": (np.zeros(node_count, dtype=np.int8), {"UAV_0": 1, "UAV_1": 0}),
-        "D": (np.eye(1, node_count, first_sv, dtype=np.int8).reshape(-1), {"UAV_0": 1, "UAV_1": 0}),
+        "A": (np.zeros(node_count, dtype=np.int8), zero_uav_triggers),
+        "B": (first_cache_trigger, zero_uav_triggers),
+        "C": (np.zeros(node_count, dtype=np.int8), first_uav_triggers),
+        "D": (first_cache_trigger, first_uav_triggers),
     }
     results: dict[str, SlotExecutionResult] = {}
     for label, (cache_trigger, uav_trigger) in cases.items():

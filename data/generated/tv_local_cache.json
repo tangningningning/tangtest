@@ -4,7 +4,7 @@
     "seed": 4401,
     "capacity_mb": 2000.0,
     "generation_rule": "uniform_one_service_per_tv",
-    "service_count": 10,
+    "service_count": 20,
     "service_ids": [
       0,
       1,
@@ -15,95 +15,217 @@
       6,
       7,
       8,
-      9
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
     ],
-    "tv_count": 9,
+    "tv_count": 25,
     "tv_ids": [
-      "12",
-      "30",
-      "40",
-      "42",
-      "59",
-      "66",
-      "70",
-      "78",
-      "96"
+      "8",
+      "9",
+      "11",
+      "15",
+      "16",
+      "18",
+      "19",
+      "21",
+      "23",
+      "25",
+      "35",
+      "43",
+      "47",
+      "48",
+      "55",
+      "56",
+      "58",
+      "64",
+      "73",
+      "75",
+      "83",
+      "87",
+      "88",
+      "95",
+      "98"
     ],
     "fixed_over_episode": true,
     "uses_future_requests": false,
     "parameter_basis": "system-scale experimental baseline derived from current service catalog",
     "service_size_sanity": {
-      "service_count": 10,
+      "service_count": 20,
       "min_service": {
-        "service_id": 4,
-        "size_mb": 1076.277568738429
+        "service_id": 18,
+        "size_mb": 1038.1387843692144
       },
       "second_min_service": {
-        "service_id": 1,
-        "size_mb": 1199.7682862495885
+        "service_id": 8,
+        "size_mb": 1099.8841431247943
       },
-      "min_service_size_mb": 1076.277568738429,
-      "max_service_size_mb": 1986.3089190619562,
-      "min_two_service_sum_mb": 2276.0458549880177,
-      "total_service_size_mb": 15090.648268412238,
-      "single_services_fit_count": 10,
+      "min_service_size_mb": 1038.1387843692144,
+      "max_service_size_mb": 1989.1398775986374,
+      "min_two_service_sum_mb": 2138.0229274940084,
+      "total_service_size_mb": 30005.929269364267,
+      "single_services_fit_count": 20,
       "all_pairs_exceed_capacity": true
     }
   },
   "vehicles": {
-    "12": {
+    "8": {
       "cached_service_ids": [
-        3
+        7
       ],
-      "used_capacity_mb": 1845.517713257334
+      "used_capacity_mb": 1863.8209954573877
     },
-    "30": {
+    "9": {
       "cached_service_ids": [
-        3
+        7
       ],
-      "used_capacity_mb": 1845.517713257334
+      "used_capacity_mb": 1863.8209954573877
     },
-    "40": {
+    "11": {
       "cached_service_ids": [
-        8
+        16
       ],
-      "used_capacity_mb": 1530.7532108892865
+      "used_capacity_mb": 1394.9134489753783
     },
-    "42": {
-      "cached_service_ids": [
-        4
-      ],
-      "used_capacity_mb": 1076.277568738429
-    },
-    "59": {
-      "cached_service_ids": [
-        4
-      ],
-      "used_capacity_mb": 1076.277568738429
-    },
-    "66": {
+    "15": {
       "cached_service_ids": [
         9
       ],
-      "used_capacity_mb": 1444.3681461741046
+      "used_capacity_mb": 1537.7318156669987
     },
-    "70": {
+    "16": {
       "cached_service_ids": [
-        0
+        9
       ],
-      "used_capacity_mb": 1986.3089190619562
+      "used_capacity_mb": 1537.7318156669987
     },
-    "78": {
+    "18": {
       "cached_service_ids": [
-        2
+        19
       ],
-      "used_capacity_mb": 1658.7141326573587
+      "used_capacity_mb": 1114.2896122477787
     },
-    "96": {
+    "19": {
+      "cached_service_ids": [
+        1
+      ],
+      "used_capacity_mb": 1812.5116335290236
+    },
+    "21": {
+      "cached_service_ids": [
+        5
+      ],
+      "used_capacity_mb": 1989.1398775986374
+    },
+    "23": {
+      "cached_service_ids": [
+        6
+      ],
+      "used_capacity_mb": 1265.3766054446432
+    },
+    "25": {
+      "cached_service_ids": [
+        6
+      ],
+      "used_capacity_mb": 1265.3766054446432
+    },
+    "35": {
+      "cached_service_ids": [
+        8
+      ],
+      "used_capacity_mb": 1099.8841431247943
+    },
+    "43": {
       "cached_service_ids": [
         3
       ],
-      "used_capacity_mb": 1845.517713257334
+      "used_capacity_mb": 1702.753787691343
+    },
+    "47": {
+      "cached_service_ids": [
+        13
+      ],
+      "used_capacity_mb": 1798.2065447075995
+    },
+    "48": {
+      "cached_service_ids": [
+        13
+      ],
+      "used_capacity_mb": 1798.2065447075995
+    },
+    "55": {
+      "cached_service_ids": [
+        6
+      ],
+      "used_capacity_mb": 1265.3766054446432
+    },
+    "56": {
+      "cached_service_ids": [
+        2
+      ],
+      "used_capacity_mb": 1629.3220697838462
+    },
+    "58": {
+      "cached_service_ids": [
+        9
+      ],
+      "used_capacity_mb": 1537.7318156669987
+    },
+    "64": {
+      "cached_service_ids": [
+        14
+      ],
+      "used_capacity_mb": 1655.4108797123727
+    },
+    "73": {
+      "cached_service_ids": [
+        0
+      ],
+      "used_capacity_mb": 1165.2670844689342
+    },
+    "75": {
+      "cached_service_ids": [
+        7
+      ],
+      "used_capacity_mb": 1863.8209954573877
+    },
+    "83": {
+      "cached_service_ids": [
+        19
+      ],
+      "used_capacity_mb": 1114.2896122477787
+    },
+    "87": {
+      "cached_service_ids": [
+        10
+      ],
+      "used_capacity_mb": 1916.4274137782672
+    },
+    "88": {
+      "cached_service_ids": [
+        14
+      ],
+      "used_capacity_mb": 1655.4108797123727
+    },
+    "95": {
+      "cached_service_ids": [
+        5
+      ],
+      "used_capacity_mb": 1989.1398775986374
+    },
+    "98": {
+      "cached_service_ids": [
+        3
+      ],
+      "used_capacity_mb": 1702.753787691343
     }
   }
 }

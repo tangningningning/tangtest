@@ -38,7 +38,7 @@ class TaskConfig:
     system_config.toml 读取参数，vehicle_roles.json 仅用于检查上游时间轴漂移。
     """
 
-    num_services: int = 10
+    num_services: int = 20
     arrival_probability: float = 0.5
     zipf_exponent: float = 0.8
     popularity_epoch_length: int = 20

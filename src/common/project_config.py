@@ -172,7 +172,9 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "task.load_relative_jitter",
     "task.master_seed",
     "nodes.sv.cache_capacity_mb",
+    "nodes.rsu.count",
     "nodes.rsu.cache_capacity_mb",
+    "nodes.uav.count",
     "nodes.uav.cache_capacity_mb",
     "nodes.sv.eta_ca",
     "nodes.rsu.eta_ca",
@@ -188,7 +190,9 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "nodes.rsu.cpu_cycles_per_s",
     "nodes.uav.cpu_cycles_per_s",
     "nodes.cloud.cpu_cycles_per_s",
+    "nodes.cloud.total_cpu_cycles_per_s",
     "nodes.cloud.uplink_rate_bps",
+    "nodes.cloud.total_bandwidth_bps",
     "nodes.cloud.cloud_delay_factor",
     "nodes.sv.bandwidth_hz",
     "nodes.rsu.bandwidth_hz",
@@ -326,8 +330,8 @@ def validate_config(config: dict[str, Any]) -> None:
             )
 
     uav_count = int(get_config_value(config, "nodes.uav.count"))
-    if uav_count < 2:
-        raise ValueError("当前系统要求UAV数量至少为2，请检查system_config.toml中的nodes.uav.count。")
+    if uav_count < 1:
+        raise ValueError("nodes.uav.count 必须至少为1，请检查system_config.toml。")
     uav_instances = get_config_value(config, "nodes.uav.instances", [])
     if len(uav_instances) != uav_count:
         raise ValueError("nodes.uav.instances 数量必须等于 nodes.uav.count。")
@@ -359,6 +363,21 @@ def validate_config(config: dict[str, Any]) -> None:
     tv = [str(value) for value in roles.get("task_vehicles", [])]
     sv = [str(value) for value in roles.get("service_vehicles", [])]
     research = [str(value) for value in roles.get("research_vehicles", [])]
+    configured_research = int(
+        get_config_value(config, "simulation.num_research_vehicles")
+    )
+    configured_sv = int(get_config_value(config, "simulation.num_service_vehicles"))
+    configured_tv = int(get_config_value(config, "simulation.num_task_vehicles"))
+    if (len(research), len(sv), len(tv)) != (
+        configured_research,
+        configured_sv,
+        configured_tv,
+    ):
+        raise ValueError(
+            "vehicle_roles.json 车辆数量必须与 system_config.toml 的正式 baseline 一致。"
+        )
+    if len(research) != len(set(research)) or len(sv) != len(set(sv)) or len(tv) != len(set(tv)):
+        raise ValueError("vehicle_roles.json 研究车辆角色列表不能包含重复 ID。")
     if len(tv) + len(sv) != len(research) or set(tv) | set(sv) != set(research):
         raise ValueError("TV+SV数量或集合与research vehicle不一致。")
 
@@ -597,6 +616,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "nodes.rsu.cpu_cycles_per_s",
         "nodes.uav.cpu_cycles_per_s",
         "nodes.cloud.cpu_cycles_per_s",
+        "nodes.cloud.total_cpu_cycles_per_s",
+        "nodes.cloud.total_bandwidth_bps",
         "nodes.uav.altitude_m",
         "nodes.uav.max_horizontal_speed_mps",
         "nodes.uav.min_safety_distance_m",
@@ -616,9 +637,15 @@ def validate_config(config: dict[str, Any]) -> None:
         _require_positive(config, key)
 
     rsu_count = int(get_config_value(config, "nodes.rsu.count"))
+    if rsu_count < 1:
+        raise ValueError("nodes.rsu.count 必须至少为1。")
     rsu_instances = get_config_value(config, "nodes.rsu.instances", [])
     if len(rsu_instances) != rsu_count:
         raise ValueError("nodes.rsu.instances 数量必须等于 nodes.rsu.count。")
+    expected_rsu_ids = [f"RSU_{index}" for index in range(rsu_count)]
+    actual_rsu_ids = [str(item.get("id")) for item in rsu_instances]
+    if actual_rsu_ids != expected_rsu_ids:
+        raise ValueError("RSU ID 必须按 RSU_0, RSU_1, ... 连续命名。")
 
     omega_delay = float(get_config_value(config, "objective.omega_delay"))
     omega_energy = float(get_config_value(config, "objective.omega_energy"))
@@ -678,7 +705,15 @@ def main() -> int:
     config = load_config()
     print("system_config.toml 解析与校验通过")
     print(f"config_hash={config_hash(config)}")
+    print(
+        "vehicle_counts="
+        f"research:{get_config_value(config, 'simulation.num_research_vehicles')},"
+        f"SV:{get_config_value(config, 'simulation.num_service_vehicles')},"
+        f"TV:{get_config_value(config, 'simulation.num_task_vehicles')}"
+    )
+    print(f"rsu_count={get_config_value(config, 'nodes.rsu.count')}")
     print(f"uav_count={get_config_value(config, 'nodes.uav.count')}")
+    print(f"service_count={get_config_value(config, 'service.count')}")
     return 0
 
 

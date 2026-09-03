@@ -2,7 +2,7 @@
 """Hierarchical ``WHEN`` gate for the configuration-trigger policy.
 
 The module is deliberately additive to the existing V3 Direct-CF path.  The
-existing eight-trigger Actor remains the ``WHAT`` policy; this module only
+existing dynamic-trigger Actor remains the ``WHAT`` policy; this module only
 adds an independent binary policy deciding whether the configuration branch
 is entered at all.
 
@@ -611,7 +611,7 @@ def run_joint_null_branches(
     pre-action environment state and replay common environment/continuation
     randomness.  This function itself does not call an environment.  It
     restores the caller's torch RNG on exit and starts both branches from the
-    same policy RNG state; NULL still consumes a fixed eight-trigger draw so
+    same policy RNG state; NULL still consumes the dynamic-trigger draw so
     the suffix can use aligned old-policy randomness.
     """
 

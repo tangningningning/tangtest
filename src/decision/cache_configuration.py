@@ -53,7 +53,10 @@ class CacheOptimizationConfig:
     sv_cpu_cycles_per_s: float
     rsu_cpu_cycles_per_s: float
     uav_cpu_cycles_per_s: float
+    # Legacy Cloud scalar retained for compatibility; formal execution uses the
+    # explicit single-node total capacity below.
     cloud_cpu_cycles_per_s: float
+    cloud_total_cpu_cycles_per_s: float
     local_energy_per_cycle_j: float
     tx_power_w: float
     sv_bandwidth_hz: float
@@ -69,7 +72,10 @@ class CacheOptimizationConfig:
     air_beta_nlos: float
     air_alpha_los: float
     air_alpha_nlos: float
+    # Legacy Cloud link scalar retained for compatibility; formal execution
+    # uses the explicit single-node total uplink below.
     cloud_uplink_rate_bps: float
+    cloud_total_bandwidth_bps: float
     cloud_delay_factor: float
     sv_range_m: float
     rsu_range_m: float
@@ -77,6 +83,10 @@ class CacheOptimizationConfig:
     tolerance: float
     max_coordinate_rounds: int
     initial_cache_seed: int
+    # Analysis-only switch.  The formal project configuration keeps the
+    # finite single-Cloud sharing model (True).  False reproduces the legacy
+    # per-task scalar-resource baseline without changing system_config.toml.
+    cloud_resource_sharing: bool = True
 
     def validate(self) -> None:
         values = [
@@ -90,6 +100,8 @@ class CacheOptimizationConfig:
             self.time_ref_s,
             self.energy_ref_j,
             self.local_cpu_cycles_per_s,
+            self.cloud_total_cpu_cycles_per_s,
+            self.cloud_total_bandwidth_bps,
             self.sv_bandwidth_hz,
             self.rsu_bandwidth_hz,
             self.uav_bandwidth_hz,
@@ -155,6 +167,7 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         rsu_cpu_cycles_per_s=float(get(config, "nodes.rsu.cpu_cycles_per_s")),
         uav_cpu_cycles_per_s=float(get(config, "nodes.uav.cpu_cycles_per_s")),
         cloud_cpu_cycles_per_s=float(get(config, "nodes.cloud.cpu_cycles_per_s")),
+        cloud_total_cpu_cycles_per_s=float(get(config, "nodes.cloud.total_cpu_cycles_per_s")),
         local_energy_per_cycle_j=float(get(config, "nodes.vehicle.kappa")),
         tx_power_w=float(get(config, "nodes.vehicle.transmit_power_w")),
         sv_bandwidth_hz=float(get(config, "nodes.sv.bandwidth_hz")),
@@ -171,6 +184,7 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         air_alpha_los=float(get(config, "communication.air.alpha_los")),
         air_alpha_nlos=float(get(config, "communication.air.alpha_nlos")),
         cloud_uplink_rate_bps=float(get(config, "nodes.cloud.uplink_rate_bps")),
+        cloud_total_bandwidth_bps=float(get(config, "nodes.cloud.total_bandwidth_bps")),
         cloud_delay_factor=float(get(config, "nodes.cloud.cloud_delay_factor")),
         sv_range_m=float(get(config, "nodes.sv.range_m")),
         rsu_range_m=float(get(config, "nodes.rsu.range_m")),
@@ -433,8 +447,8 @@ def _cloud_task_utility(
     execution = system_model.cloud_execution(
         event.input_bits,
         event.cpu_cycles,
-        config.cloud_uplink_rate_bps,
-        config.cloud_cpu_cycles_per_s,
+        config.cloud_total_bandwidth_bps,
+        config.cloud_total_cpu_cycles_per_s,
         config.cloud_delay_factor,
         config.tx_power_w,
     )
@@ -550,8 +564,6 @@ def build_surrogate_evaluation_context(
                 event.horizon,
             )
             distance = float(np.linalg.norm(event.predicted_tv_position - node_xy))
-            if distance > role_range_m(role, config):
-                continue
             ground_edge_utility[event_index, node_index] = _ground_edge_task_utility(
                 event,
                 role,
@@ -591,8 +603,6 @@ def _uav_edge_utility_vector(
     values = np.full(len(context.events), -float("inf"), dtype=np.float64)
     for event_index, event in enumerate(context.events):
         distance = float(np.linalg.norm(event.predicted_tv_position - xy))
-        if distance > config.uav_range_m:
-            continue
         gain = system_model.air_channel_gain(
             distance,
             config.uav_altitude_m,
@@ -730,8 +740,8 @@ def best_task_surrogate(
     cloud = system_model.cloud_execution(
         input_bits,
         cpu_cycles,
-        config.cloud_uplink_rate_bps,
-        config.cloud_cpu_cycles_per_s,
+        config.cloud_total_bandwidth_bps,
+        config.cloud_total_cpu_cycles_per_s,
         config.cloud_delay_factor,
         config.tx_power_w,
     )
@@ -759,8 +769,6 @@ def best_task_surrogate(
             horizon,
         )
         distance = float(np.linalg.norm(tv_xy - node_xy))
-        if distance > role_range_m(role, config):
-            continue
         if role == "UAV":
             gain = system_model.air_channel_gain(
                 distance,
@@ -984,7 +992,7 @@ def knapsack_initial_node(
     sizes_mb: np.ndarray,
     capacity_mb: float,
 ) -> np.ndarray:
-    """F=10 小规模 0-1 knapsack：只用于初始化，不作为最终 solver。"""
+    """按当前 service 数量执行 0-1 knapsack：只用于初始化，不作为最终 solver。"""
     num_services = len(values)
     best_value = -float("inf")
     best_mask = 0

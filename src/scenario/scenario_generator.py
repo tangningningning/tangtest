@@ -460,12 +460,25 @@ def sample_positions(
                     )
                     # residual 加到 nominal trajectory 后，使用 block_is_road_valid()
                     # 检查整个 H_p block 与 planned route 的距离是否满足容差。
+                    # nominal 点本身由 route geometry 生成，因此当每个残差点
+                    # 到对应 nominal route 点的距离都不超过容差时，候选必然
+                    # 满足同一合法性条件；只有可能超出容差的 block 才需要
+                    # 进入逐段几何投影。该短路不改变判定结果，只避免扩容后
+                    # 对相同的已知合法 nominal route 重复扫描几何线段。
+                    residual_distance = np.linalg.norm(
+                        points - nominal_xy[origin_index, :, vehicle_index, :],
+                        axis=1,
+                    )
                     if (
                         np.all(np.isfinite(points))
-                        and block_is_road_valid(
-                            points,
-                            geometry,
-                            config.road_distance_tolerance_m,
+                        and (
+                            float(np.max(residual_distance))
+                            <= config.road_distance_tolerance_m
+                            or block_is_road_valid(
+                                points,
+                                geometry,
+                                config.road_distance_tolerance_m,
+                            )
                         )
                     ):
                         candidate_points = points
