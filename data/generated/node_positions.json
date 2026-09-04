@@ -1,0 +1,47 @@
+{
+  "network": {
+    "net_file": "data/sumo/map/osm.net.xml.gz"
+  },
+  "network_boundary": {
+    "min_x": 3027.76,
+    "max_x": 5215.96,
+    "min_y": 226.37,
+    "max_y": 1746.38
+  },
+  "rsu": {
+    "RSU_0": {
+      "position": [
+        3364.03,
+        901.06,
+        10.0
+      ],
+      "source_junction": "6796414953"
+    },
+    "RSU_1": {
+      "position": [
+        5179.65,
+        1491.59,
+        10.0
+      ],
+      "source_junction": "J9"
+    }
+  },
+  "uav": {
+    "UAV_0": {
+      "position": [
+        3364.03,
+        1119.88,
+        50.0
+      ],
+      "initial_rsu": "RSU_0"
+    },
+    "UAV_1": {
+      "position": [
+        5179.65,
+        1710.41,
+        50.0
+      ],
+      "initial_rsu": "RSU_1"
+    }
+  }
+}

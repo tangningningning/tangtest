@@ -1,0 +1,113 @@
+section,metric,entity,value,unit,source,notes
+map,location_present,SUMO,true,bool,data/sumo/map/osm.net.xml.gz,SUMO <location> element
+map,boundary_source,SUMO,SUMO location.convBoundary,,data/sumo/map/osm.net.xml.gz,Metric dimensions use convBoundary when available
+map,fallback_bbox_used,SUMO,false,bool,data/sumo/map/osm.net.xml.gz,"Fallback combines edge, lane, junction and connection-resolved coordinates"
+map,orig_lon_min,SUMO,113.617463,degree,data/sumo/map/osm.net.xml.gz,origBoundary: xmin/original longitude
+map,orig_lon_max,SUMO,113.701357,degree,data/sumo/map/osm.net.xml.gz,origBoundary: xmax/original longitude
+map,orig_lat_min,SUMO,34.73468,degree,data/sumo/map/osm.net.xml.gz,origBoundary: ymin/original latitude
+map,orig_lat_max,SUMO,34.798767,degree,data/sumo/map/osm.net.xml.gz,origBoundary: ymax/original latitude
+map,net_offset_x,SUMO,-740878.16,m,data/sumo/map/osm.net.xml.gz,SUMO netOffset x
+map,net_offset_y,SUMO,-3850218.41,m,data/sumo/map/osm.net.xml.gz,SUMO netOffset y
+map,xmin,SUMO,3027.76,m,data/sumo/map/osm.net.xml.gz,Metric network boundary xmin
+map,xmax,SUMO,5215.96,m,data/sumo/map/osm.net.xml.gz,Metric network boundary xmax
+map,ymin,SUMO,226.37,m,data/sumo/map/osm.net.xml.gz,Metric network boundary ymin
+map,ymax,SUMO,1746.38,m,data/sumo/map/osm.net.xml.gz,Metric network boundary ymax
+map,width,SUMO,2188.2,m,data/sumo/map/osm.net.xml.gz,xmax - xmin
+map,height,SUMO,1520.01,m,data/sumo/map/osm.net.xml.gz,ymax - ymin
+map,area,SUMO,3326085.882,m^2,data/sumo/map/osm.net.xml.gz,width * height
+map,area,SUMO,3.326085882,km^2,data/sumo/map/osm.net.xml.gz,"area_m2 / 1,000,000"
+trajectory,trajectory_observation_count,all,35044,rows,data/generated/trajectory.csv,All rows in trajectory.csv
+trajectory,trajectory_vehicle_count,all,100,vehicles,data/generated/trajectory.csv,All vehicle IDs in trajectory.csv
+trajectory,trajectory_x_min,all,3059.74809868,m,data/generated/trajectory.csv,All trajectory rows
+trajectory,trajectory_x_max,all,5210.82187518,m,data/generated/trajectory.csv,All trajectory rows
+trajectory,trajectory_y_min,all,232.079401198,m,data/generated/trajectory.csv,All trajectory rows
+trajectory,trajectory_y_max,all,1733.99203518,m,data/generated/trajectory.csv,All trajectory rows
+trajectory,research_vehicle_count_expected,research,30,vehicles,system_config.toml,simulation.num_research_vehicles
+trajectory,research_vehicle_count,research,30,vehicles,data/generated/trajectory.csv,Filtered by data/generated/vehicle_roles.json
+trajectory,research_vehicle_missing_count,research,0,vehicles,data/generated/trajectory.csv,Expected research IDs absent from trajectory
+trajectory,research_observation_count,research,10599,rows,data/generated/trajectory.csv,Rows for the 30 configured research vehicle IDs
+trajectory,research_time_min,research,10,s,data/generated/trajectory.csv,Research trajectory time span
+trajectory,research_time_max,research,400,s,data/generated/trajectory.csv,Research trajectory time span
+trajectory,research_x_min,research,3073.45803501,m,data/generated/trajectory.csv,30 research vehicles
+trajectory,research_x_max,research,5210.82187518,m,data/generated/trajectory.csv,30 research vehicles
+trajectory,research_y_min,research,247.639966965,m,data/generated/trajectory.csv,30 research vehicles
+trajectory,research_y_max,research,1710.09533524,m,data/generated/trajectory.csv,30 research vehicles
+trajectory,research_trajectory_width,research,2137.36384017,m,data/generated/trajectory.csv,research_x_max - research_x_min
+trajectory,research_trajectory_height,research,1462.45536827,m,data/generated/trajectory.csv,research_y_max - research_y_min
+trajectory,research_trajectory_bbox_area,research,3125799.22202,m^2,data/generated/trajectory.csv,Research trajectory bounding rectangle
+trajectory,research_trajectory_bbox_area_fraction_of_map,research,0.939783076238,ratio,data/generated/trajectory.csv,Research trajectory bbox area / SUMO metric bbox area
+trajectory,research_x_span_fraction_of_map,research,0.976768046876,ratio,data/generated/trajectory.csv,Research x span / map width
+trajectory,research_y_span_fraction_of_map,research,0.962135359816,ratio,data/generated/trajectory.csv,Research y span / map height
+trajectory,research_vehicle_density,research,9.019610757,vehicles/km^2,data/generated/trajectory.csv,30 research vehicles / map area
+trajectory,research_vehicle_density_in_trajectory_bbox,research,9.59754541773,vehicles/km^2,data/generated/trajectory.csv,30 research vehicles / research trajectory bbox area
+trajectory,research_concentrated_in_local_area,research,false,bool,data/generated/trajectory.csv,Audit flag: bbox area < 50% and at least one axis span < 75% of map
+rsu,count,RSU,3,nodes,system_config.toml,nodes.rsu.count and nodes.rsu.instances
+rsu,x,RSU_0,3500,m,system_config.toml,nodes.rsu.instances.x_m
+rsu,y,RSU_0,600,m,system_config.toml,nodes.rsu.instances.y_m
+rsu,coverage_sample_fraction,RSU_0,0.0360411359562,ratio,data/generated/trajectory.csv,Legacy horizontal range_m proxy over research trajectory samples
+rsu,x,RSU_1,4121.86,m,system_config.toml,nodes.rsu.instances.x_m
+rsu,y,RSU_1,986.375,m,system_config.toml,nodes.rsu.instances.y_m
+rsu,coverage_sample_fraction,RSU_1,0.141711482215,ratio,data/generated/trajectory.csv,Legacy horizontal range_m proxy over research trajectory samples
+rsu,x,RSU_2,4750,m,system_config.toml,nodes.rsu.instances.x_m
+rsu,y,RSU_2,1370,m,system_config.toml,nodes.rsu.instances.y_m
+rsu,coverage_sample_fraction,RSU_2,0.088498914992,ratio,data/generated/trajectory.csv,Legacy horizontal range_m proxy over research trajectory samples
+rsu,pair_distance,RSU_0--RSU_1,732.11713559,m,system_config.toml,Euclidean distance between configured fixed positions
+rsu,pair_distance,RSU_0--RSU_2,1468.12805981,m,system_config.toml,Euclidean distance between configured fixed positions
+rsu,pair_distance,RSU_1--RSU_2,736.021738962,m,system_config.toml,Euclidean distance between configured fixed positions
+rsu,range_m,RSU,250,m,system_config.toml,Legacy compatibility parameter; not a hard formal coverage cutoff
+rsu,deployment_code,RSU,fixed_positions,,src/decision/cache_configuration.py; src/decision/uav_configuration.py; src/common/project_config.py,cache_configuration.py builds fixed_positions from RSU instances
+uav,count,UAV,3,nodes,system_config.toml,nodes.uav.count and nodes.uav.instances
+uav,initialization_mode,UAV,map_stratified,,system_config.toml,Configured initial placement mode
+uav,initial_x,UAV_0,3757.16,m,system_config.toml,nodes.uav.instances.initial_x_m
+uav,initial_y,UAV_0,986.375,m,system_config.toml,nodes.uav.instances.initial_y_m
+uav,coverage_sample_fraction,UAV_0,0.208793282385,ratio,data/generated/trajectory.csv,Legacy horizontal range_m proxy over research trajectory samples
+uav,initial_x,UAV_1,4486.56,m,system_config.toml,nodes.uav.instances.initial_x_m
+uav,initial_y,UAV_1,986.375,m,system_config.toml,nodes.uav.instances.initial_y_m
+uav,coverage_sample_fraction,UAV_1,0.131521841683,ratio,data/generated/trajectory.csv,Legacy horizontal range_m proxy over research trajectory samples
+uav,initial_x,UAV_2,4850,m,system_config.toml,nodes.uav.instances.initial_x_m
+uav,initial_y,UAV_2,986.375,m,system_config.toml,nodes.uav.instances.initial_y_m
+uav,coverage_sample_fraction,UAV_2,0.17633739032,ratio,data/generated/trajectory.csv,Legacy horizontal range_m proxy over research trajectory samples
+uav,pair_distance,UAV_0--UAV_1,729.4,m,system_config.toml,Euclidean distance between configured initial horizontal positions
+uav,pair_distance,UAV_0--UAV_2,1092.84,m,system_config.toml,Euclidean distance between configured initial horizontal positions
+uav,pair_distance,UAV_1--UAV_2,363.44,m,system_config.toml,Euclidean distance between configured initial horizontal positions
+uav,range_m,UAV,300,m,system_config.toml,Legacy compatibility parameter; not a hard formal coverage cutoff
+uav,altitude_m,UAV,100,m,system_config.toml,Fixed UAV altitude; coverage proxy uses horizontal distance
+uav,deployment_code,UAV,initial_positions,,src/decision/cache_configuration.py; src/decision/uav_configuration.py; src/common/project_config.py,uav_configuration.py reads initial_x_m/initial_y_m and SUMO boundary
+spacing,edge_node_count,RSU+UAV,6,nodes,system_config.toml,"Current deployment: RSU=3, UAV=3"
+spacing,edge_nodes_per_km2,RSU+UAV,1.8039221514,nodes/km^2,system_config.toml,6 / SUMO metric map area
+spacing,rsu_per_km2,RSU,0.9019610757,nodes/km^2,system_config.toml,3 / SUMO metric map area
+spacing,uav_per_km2,UAV,0.9019610757,nodes/km^2,system_config.toml,3 / SUMO metric map area
+spacing,average_map_area_per_edge_node,RSU+UAV,0.554347647,km^2/node,system_config.toml,Map area / 6 edge nodes
+spacing,pair_distance,RSU_0--RSU_1,732.11713559,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_0--RSU_2,1468.12805981,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_0--UAV_0,464.130268594,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_0--UAV_1,1059.52171956,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_0--UAV_2,1404.20284882,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_1--RSU_2,736.021738962,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_1--UAV_0,364.7,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_1--UAV_1,364.7,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_1--UAV_2,728.14,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_2--UAV_0,1064.37747356,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_2--UAV_1,465.369502895,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,RSU_2--UAV_2,396.444372674,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,UAV_0--UAV_1,729.4,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,UAV_0--UAV_2,1092.84,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+spacing,pair_distance,UAV_1--UAV_2,363.44,m,system_config.toml,Cross-role Euclidean distance; diagnostic only
+coverage,communication_range_key_found,config,false,bool,system_config.toml; data/generated/trajectory.csv,No communication_range key found in the inspected project configuration
+coverage,coverage_radius_key_found,config,false,bool,system_config.toml; data/generated/trajectory.csv,No coverage_radius key found in the inspected project configuration
+coverage,range_parameter,RSU/UAV,range_m,,system_config.toml; data/generated/trajectory.csv,The available RSU/UAV range parameters are legacy compatibility values
+coverage,geometric_proxy_grid_step,SUMO bbox,5,m,system_config.toml; data/generated/trajectory.csv,Deterministic rectangular-grid estimate; not a parameter sweep
+coverage,map_area_fraction_rsu,RSU union,0.176285650124,ratio,system_config.toml; data/generated/trajectory.csv,Union of 250m horizontal disks over metric map rectangle
+coverage,map_area_fraction_uav,UAV union,0.230451381091,ratio,system_config.toml; data/generated/trajectory.csv,Union of 300m horizontal disks over metric map rectangle
+coverage,map_area_fraction_any_edge,RSU+UAV union,0.355543079572,ratio,system_config.toml; data/generated/trajectory.csv,Union of all legacy horizontal disks over metric map rectangle
+coverage,research_trajectory_sample_fraction_rsu,RSU union,0.266251533164,ratio,system_config.toml; data/generated/trajectory.csv,Fraction of research trajectory observations within any RSU range_m
+coverage,research_trajectory_sample_fraction_uav,UAV union,0.513916407208,ratio,system_config.toml; data/generated/trajectory.csv,Fraction of research trajectory observations within any UAV range_m
+coverage,research_trajectory_sample_fraction_any_edge,RSU+UAV union,0.63883385225,ratio,system_config.toml; data/generated/trajectory.csv,Fraction of research trajectory observations within any legacy range_m
+coverage,mean_per_vehicle_fraction_rsu,RSU union,0.267231302575,ratio,system_config.toml; data/generated/trajectory.csv,Unweighted mean of per-vehicle covered observation fractions
+coverage,mean_per_vehicle_fraction_uav,UAV union,0.514128504545,ratio,system_config.toml; data/generated/trajectory.csv,Unweighted mean of per-vehicle covered observation fractions
+coverage,mean_per_vehicle_fraction_any_edge,RSU+UAV union,0.638711592643,ratio,system_config.toml; data/generated/trajectory.csv,Unweighted mean of per-vehicle covered observation fractions
+coverage,formal_channel_caveat,RSU/UAV,not_hard_cutoff,,system_config.toml; src/common/system_model.py,Formal ground/air channel model uses distance in rate/delay/energy; range_m is not a hard reachability gate
+judgement,classification,scene,B:AREA_REASONABLE,label,derived from audit metrics,B because research trajectories span the map and legacy disk coverage is not saturated; A/C criteria are not met
+judgement,cache_update_0_spatial_scale_assessment,cache,unlikely_primary_cause,assessment,derived from audit metrics,A small/over-dense scene is not supported; spatial scale alone does not explain cache update=0
+judgement,uav_movement_0_spatial_scale_assessment,UAV,unlikely_primary_cause,assessment,derived from audit metrics,Initial UAVs are not globally redundant under the proxy; movement still depends on trigger/optimizer utility and constraints
+judgement,scope,audit,static_file_audit_only,,project files,"No PPO, training, SUMO run, 300-slot trajectory run, parameter sweep, code/config/generated-data modification"

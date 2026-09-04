@@ -1,0 +1,70 @@
+{
+  "schema": "cache_marginal_value_audit_v1",
+  "config": {
+    "path": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\system_config.toml",
+    "cloud_delay_factor": 10.0
+  },
+  "scope": {
+    "slots": [
+      0,
+      30
+    ],
+    "nodes": [
+      "RSU_0",
+      "UAV_0"
+    ],
+    "candidate_selection": "highest-ranked uncached service in current Top-5",
+    "popularity_source": "data/generated/popularity.csv::rho_obs"
+  },
+  "state_semantics": {
+    "current_cache": "deterministic_initial_cache at slot 0",
+    "slots_0_to_30": "carried forward unchanged under no-update",
+    "initial_cache_snapshot": {
+      "20": "{2,13,17,19}",
+      "68": "{2,13,17,19}",
+      "31": "{2,13,17,19}",
+      "57": "{2,13,17,19}",
+      "50": "{2,13,17,19}",
+      "RSU_0": "{2,5,7,8,9,11,13,17,18,19}",
+      "RSU_1": "{2,5,7,8,9,11,13,17,18,19}",
+      "RSU_2": "{2,5,7,8,9,11,13,17,18,19}",
+      "UAV_0": "{2,5,8,13,17,18,19}",
+      "UAV_1": "{2,5,8,13,17,18,19}",
+      "UAV_2": "{2,5,8,13,17,18,19}"
+    }
+  },
+  "evaluation_semantics": {
+    "Q": "actual Matching/KKT task_utility_sum",
+    "delta_Q": "Q_candidate - Q_current",
+    "delta_G_before_cost": "delta_Q",
+    "delta_G_after_cost": "Q_candidate - cache_cost - Q_current",
+    "delta_G_output_alias": "delta_G_after_cost",
+    "forced_candidate": "set selected node/service from 0 to 1; no eviction",
+    "capacity_policy": "evaluate forced bit-flip even if infeasible; report capacity_feasible",
+    "uav_positions": "formal initial UAV positions, no movement trigger"
+  },
+  "counts": {
+    "rows": 62,
+    "no_candidate_slots": {},
+    "positive_delta_Q": {
+      "UAV_0": 29,
+      "RSU_0": 5
+    },
+    "zero_delta_Q": {
+      "RSU_0": 26,
+      "UAV_0": 2
+    },
+    "positive_delta_G": {
+      "UAV_0": 14,
+      "RSU_0": 3
+    },
+    "capacity_feasible": {}
+  },
+  "read_only_contract": {
+    "ppo": false,
+    "training": false,
+    "parameter_sweep": false,
+    "configuration_modified_by_audit": false
+  },
+  "output_csv": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\data\\analysis\\cache_marginal_value_audit.csv"
+}
