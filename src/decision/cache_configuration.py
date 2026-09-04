@@ -4,7 +4,8 @@
 
 本阶段只解决：给定上一时隙缓存状态、cache trigger 和预测场景后，选择新的
 动态缓存配置。这里不训练 PPO，不调用 Matching/KKT，也不读取任何未来真实
-trajectory/tasks/popularity 标签。
+trajectory/tasks/popularity 标签；正式 episode 初始缓存只使用 service catalog
+中的 service size、节点容量和显式 seed。
 """
 
 from __future__ import annotations
@@ -1427,18 +1428,17 @@ def deterministic_initial_cache(
     return cache
 
 
-def random_feasible_initial_cache(
+def popularity_aware_initial_cache(
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
-    seed: int | None = None,
 ) -> np.ndarray:
-    """生成正式 episode 的固定 seed 随机可行初始动态缓存 C(0)。
+    """生成正式 episode 的 uniform feasible 初始缓存 C(0)。
 
-    该函数只访问 service catalog、节点容量和显式 seed；不读取 prediction
-    scenarios、future tasks、popularity，也不调用任何 utility/objective。
-    ``default_rng`` 是局部 RNG，不改变全局随机状态。正式 caller 应只在
-    context 构造阶段调用一次，并在每个 episode reset 时复制返回状态。
+    保留该函数名以兼容现有 formal caller；其当前语义是均匀可行初始化，
+    不再读取 popularity、prediction 或 request。每个节点使用 seed 驱动的
+    局部 RNG 对全部 service 做均匀随机排列，然后按容量逐个装入；因此每
+    个 service 在选择顺序中具有相同概率，并且最终 cache 严格满足容量约束。
     """
 
     config.validate()
@@ -1451,17 +1451,14 @@ def random_feasible_initial_cache(
     if len(cache_nodes["node_ids"]) != len(cache_nodes["capacities_mb"]):
         raise ValueError("cache_nodes node_ids/capacities_mb 长度不一致。")
 
-    rng = np.random.default_rng(
-        int(config.initial_cache_seed if seed is None else seed)
-    )
+    rng = np.random.default_rng(int(config.initial_cache_seed))
     cache = np.zeros(
         (len(cache_nodes["node_ids"]), num_services),
         dtype=np.int8,
     )
     for node_index, capacity in enumerate(cache_nodes["capacities_mb"]):
         remaining = float(capacity)
-        service_order = rng.permutation(num_services)
-        for service_id in service_order.tolist():
+        for service_id in rng.permutation(num_services).tolist():
             size = float(service_sizes[service_id])
             if size <= remaining + 1.0e-9:
                 cache[node_index, service_id] = 1
@@ -1476,7 +1473,7 @@ def random_feasible_initial_cache(
             ):
                 raise AssertionError(
                     f"node {cache_nodes['node_ids'][node_index]} "
-                    "initial cache is not maximal feasible"
+                    "uniform initial cache is not maximal feasible"
                 )
 
     validate_cache_shape_and_capacity(cache, service_catalog, cache_nodes)

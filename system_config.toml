@@ -77,11 +77,11 @@ dt_s = 1.0
 warmup_time_s = 100.0
 # 正式优化 episode 长度，单位 s。当前正式数据覆盖 300 个 slot。
 episode_time_s = 300.0
-# 研究车辆数量。正式 baseline 为 5 SV + 25 TV；ID 从 vehicle_roles.json 读取。
-num_research_vehicles = 30
-# TV 数量。正式 baseline 为 25；TV ID 从 vehicle_roles.json 读取。
-num_task_vehicles = 25
-# SV 数量。正式 baseline 为 5；SV ID 从 vehicle_roles.json 读取。
+# 研究车辆数量。最终冻结 baseline 为 5 SV + 30 TV；ID 从 vehicle_roles.json 读取。
+num_research_vehicles = 35
+# TV 数量。最终冻结 baseline 为 30；TV ID 从 vehicle_roles.json 读取。
+num_task_vehicles = 30
+# SV 数量。最终冻结 baseline 为 5；SV ID 从 vehicle_roles.json 读取。
 num_service_vehicles = 5
 # SUMO / 角色筛选主 seed。当前实际值来自已有 vehicle_roles.json。
 sumo_seed = 4401
@@ -114,8 +114,8 @@ cycles_per_bit_min = 200.0
 cycles_per_bit_max = 1000.0
 
 [task]
-# Bernoulli 任务到达概率 lambda。当前实际值来自 task_scenario.py；修改需要重生成任务。
-arrival_probability = 0.5
+# Bernoulli 任务到达概率 lambda。最终冻结 baseline 为 0.7；修改需要重生成任务。
+arrival_probability = 0.7
 # Zipf 指数 zeta。当前实际值；修改会改变真实 rho_star，需要重生成 popularity/tasks。
 popularity_zeta = 0.8
 # popularity epoch 长度，单位 slot。当前实际值 20。
@@ -155,13 +155,8 @@ kappa = 1.0e-28
 transmit_power_w = 0.1995262315
 
 [nodes.sv]
-# 参数状态：系统尺度校准实验基线。
-# SV 公共缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
-# 当前值依据本项目 20 种 service 的实际 program_size 设置，
-# 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
-# 后续通过 cache capacity sensitivity 实验验证。
-# 正式 baseline：SV 公共缓存容量，单位 MB。
-cache_capacity_mb = 6000.0
+# 最终冻结 baseline：SV 公共缓存容量，单位 MB。
+cache_capacity_mb = 2000.0
 # SV 总 CPU 能力，单位 cycle/s。
 # 正式 baseline：SV 总 CPU 能力为 1GHz，单位 cycle/s。
 # 这是文献校准实验基线，不代表硬件实测数据。
@@ -187,17 +182,11 @@ range_m = 100.0
 # RSU 数量。正式 baseline 使用三个动态实例 RSU_0、RSU_1、RSU_2。
 count = 3
 # 参数状态：系统尺度校准实验基线。
-# RSU 公共缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
-# 当前值依据本项目 20 种 service 的实际 program_size 设置，
-# 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
-# 后续通过 cache capacity sensitivity 实验验证。
-# 正式 baseline：RSU 公共缓存容量，单位 MB。
-cache_capacity_mb = 15000.0
+# 最终冻结 baseline：RSU 公共缓存容量，单位 MB。
+cache_capacity_mb = 6000.0
 # RSU 总 CPU 能力，单位 cycle/s。
-# SUMO+NS3 VEC 仿真研究将 MEC server computation rate 设置为 8GHz；
-# 当前 RSU 部署 MEC 计算资源，因此主实验基线采用 8GHz。
-# 这是文献校准实验基线，不代表硬件实测数据。
-cpu_cycles_per_s = 8.0e9
+# 最终冻结 baseline：RSU MEC server computation rate 为 5GHz。
+cpu_cycles_per_s = 5.0e9
 # RSU 带宽，单位 Hz。
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
@@ -246,20 +235,11 @@ initialization_mode = "map_stratified"
 # DOI 10.1186/s13638-020-01861-8，Table 1 采用 UAV altitude H = 100m。
 # 本文只优化 UAV 二维水平位置，不优化高度；该值是仿真基线，不代表唯一硬件/法规参数。
 altitude_m = 100.0
-# 参数状态：系统尺度校准实验基线。
-# UAV 缓存容量，单位 MB；不是某篇论文直接给出的硬件存储容量。
-# 当前值依据本项目 20 种 service 的实际 program_size 设置，
-# 保证不同节点只能缓存部分服务，从而形成非退化的缓存优化问题。
-# 后续通过 cache capacity sensitivity 实验验证。
-# 正式 baseline：UAV 公共缓存容量，单位 MB。
-cache_capacity_mb = 10000.0
+# 最终冻结 baseline：UAV 公共缓存容量，单位 MB。
+cache_capacity_mb = 6000.0
 # UAV 总 CPU 能力，单位 cycle/s。
-# 文献来源：Li et al., Collaborative offloading for UAV-enabled time-sensitive MEC networks,
-# EURASIP Journal on Wireless Communications and Networking 2021:1,
-# DOI 10.1186/s13638-020-01861-8，Table 1 给出 Maximal CPU frequency of UAV = 5 GHz。
-# 当前系统公式中 UAV compute delay 使用 L/F_uav，因此 5 GHz 直接换算为 5.0e9 cycle/s。
-# 这是文献校准实验基线，不代表硬件实测值。
-cpu_cycles_per_s = 5.0e9
+# 最终冻结 baseline：UAV MEC computation rate 为 3GHz。
+cpu_cycles_per_s = 3.0e9
 # UAV 链路带宽，单位 Hz。
 # 文献来源同上，Table 1 给出 Total bandwidth B = 10 MHz；
 # 当前系统将 UAV bandwidth_hz 作为空地 uplink_rate() 的系统带宽输入，
@@ -329,6 +309,7 @@ initial_x_m = 4850.0
 initial_y_m = 986.375
 
 [nodes.cloud]
+# Cloud 数量固定为 1 个逻辑共享资源；本项目不展开 Cloud 实例列表。
 # Cloud 单节点共享资源配置。正式系统对同一 slot 的所有 Cloud 任务
 # 使用 total_cpu_cycles_per_s / N_cloud 和 total_bandwidth_bps / N_cloud。
 # 当前系统公式：T_vc = psi_c * D_v / R_cloud_i + L_v / F_cloud_i。
@@ -352,17 +333,9 @@ uplink_rate_bps = 200.0e6
 # 这是文献校准实验基线，不代表硬件实测值。
 total_bandwidth_bps = 200.0e6
 # Cloud 传输扩展系数 psi_c，当前系统公式中作为 D_v/R_c 的乘法因子。
-# 系统模型要求 psi_c >= 1。
-# psi_c 用于将远程 Cloud 的回传/核心网附加传输时延
-# 等效吸收到 psi_c * D/R_c 中。
-# 参考 Cloud 文献采用 1000km Cloud 距离并显式计算往返传播时延 2D_C/s。
-# 当前项目没有单独传播时延项，因此以当前真实任务 median input_size 为参考，
-# 将该传播时延映射为固定乘法系数 psi_c。
-# median D=1025623.812 bit，R_c=200Mbps，D_C=1000km，s=3e8m/s，
-# psi_c = 1 + (2*1000e3/3e8)/(D_median/R_c) ≈ 2.3000218。
-# 该值属于“文献物理参数 + 当前模型结构”的等效校准值，
-# 不是参考论文直接给出的 psi 参数。
-# 如果以后任务输入规模发生明显变化，该等效 psi 需要重新检查。
+# 系统模型要求 psi_c >= 1；最终冻结 baseline 固定为 10.0。
+# 该固定系数将远程 Cloud 的回传、核心网及跨域附加时延统一吸收到
+# psi_c * D/R_c 中，不读取未来任务或运行时请求统计动态重算。
 cloud_delay_factor = 10.0
 
 [communication]
@@ -424,8 +397,8 @@ discount_beta = 0.95
 local_search_tolerance = 1.0e-9
 # coordinate optimization 最大轮数，避免无限循环。
 max_coordinate_rounds = 20
-# Knapsack 只用于初始化，不是最终 cache solver。
-knapsack_initialization = "enumeration"
+# 正式 episode 初始 cache 使用 uniform feasible initialization。
+knapsack_initialization = "uniform_feasible"
 
 [objective]
 # 主实验采用时延和车辆能耗等权重。

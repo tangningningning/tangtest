@@ -4105,11 +4105,10 @@ def _build_context(config_path: str) -> TrainingSanityContext:
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
     )
     gamma, gae_lambda = ppo_rollout.ppo_gae_config_from_project(cfg)
-    initial_cache = cache_configuration.random_feasible_initial_cache(
+    initial_cache = cache_configuration.popularity_aware_initial_cache(
         service_catalog,
         cache_nodes,
         cache_cfg,
-        seed=int(project_config.get_config_value(cfg, "experiment.seed")),
     )
     initial_uav = uav_configuration.initial_uav_positions_from_project(cfg)
     return TrainingSanityContext(
@@ -4168,8 +4167,8 @@ def build_formal_training_protocol(
         true_terminal_time_s=float(times[-1]),
         single_trace_training=True,
         initial_cache_source=(
-            "cache_configuration.random_feasible_initial_cache(service_catalog, cache_nodes, "
-            "cache_cfg, seed=experiment.seed); fixed once per formal run"
+            "cache_configuration.popularity_aware_initial_cache(service_catalog, cache_nodes, "
+            "cache_cfg); fixed once per formal run"
         ),
         initial_uav_source="uav_configuration.initial_uav_positions_from_project(system_config)",
         tv_local_cache_source=str(project_config.get_config_value(project_cfg, "paths.tv_local_cache")),

@@ -159,7 +159,7 @@
       "service_request": 17798879212459637611,
       "workload_variation": 1922379454717095758
     },
-    "num_task_vehicles": 25,
+    "num_task_vehicles": 30,
     "task_vehicle_ids": [
       "64",
       "25",
@@ -169,30 +169,35 @@
       "8",
       "88",
       "83",
-      "87",
       "9",
       "75",
       "55",
+      "31",
       "48",
       "19",
-      "35",
       "73",
+      "20",
+      "50",
       "58",
       "16",
       "23",
       "11",
       "98",
       "47",
-      "15",
+      "68",
       "56",
-      "21"
+      "21",
+      "45",
+      "65",
+      "78",
+      "96"
     ],
     "dt_s": 1.0,
     "warmup_time_s": 100.0,
     "episode_time_s": 300.0,
     "num_slots": 300,
     "popularity_history_length": 20,
-    "arrival_probability": 0.5,
+    "arrival_probability": 0.7,
     "zipf_exponent": 0.8,
     "popularity_epoch_length": 20,
     "popularity_changes_per_epoch": 1,
@@ -1002,14 +1007,14 @@
   },
   "validation_summary": {
     "num_slots": 300,
-    "num_tv": 25,
-    "task_rows": 7500,
-    "total_arrivals": 3737,
-    "empirical_arrival_rate": 0.4982666666666667,
+    "num_tv": 30,
+    "task_rows": 9000,
+    "total_arrivals": 6318,
+    "empirical_arrival_rate": 0.702,
     "lambda_tolerance": 0.08,
     "rho_star_normalized": true,
     "adjacent_same_probability_fraction": 0.9531772575250836,
-    "service_distribution_correlation": 0.9966106854210119,
+    "service_distribution_correlation": 0.9985517331032109,
     "service_parameter_generation": {
       "program_size_mb": {
         "stratum_count": 20,
@@ -1154,13 +1159,13 @@
       },
       "independent_dimension_orders": true,
       "pairwise_correlations": {
-        "program_size_vs_mean_input_size": 0.06601707328768179,
-        "program_size_vs_cycles_per_bit": -0.19372712306215198,
-        "mean_input_size_vs_cycles_per_bit": 0.1281761520382348
+        "program_size_vs_mean_input_size": 0.06601707328768178,
+        "program_size_vs_cycles_per_bit": -0.19372712306215206,
+        "mean_input_size_vs_cycles_per_bit": 0.12817615203823482
       }
     },
     "epoch_count": 15,
     "history_slots": 20,
-    "history_request_total": 241
+    "history_request_total": 412
   }
 }
