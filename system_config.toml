@@ -363,7 +363,7 @@ total_bandwidth_bps = 200.0e6
 # 该值属于“文献物理参数 + 当前模型结构”的等效校准值，
 # 不是参考论文直接给出的 psi 参数。
 # 如果以后任务输入规模发生明显变化，该等效 psi 需要重新检查。
-cloud_delay_factor = 2.30
+cloud_delay_factor = 10.0
 
 [communication]
 # 本 section 集中通信模型参数，后续 Cache surrogate、Matching、KKT 必须共用。
