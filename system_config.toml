@@ -18,7 +18,8 @@
 # prediction.vehicle.sigma_speed_mps、prediction.vehicle.horizon。
 #
 # 【修改以下参数需要重新训练 GRU】
-# service.count、popularity 过程、prediction.popularity.history_length、
+# service.count、服务大小/输入大小/计算密度范围、popularity 过程、
+# prediction.popularity.history_length、
 # prediction.vehicle.horizon / prediction.popularity.horizon。
 #
 # 【修改 H_p】
@@ -41,7 +42,7 @@ output_tag = "main"
 
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
-# 不在本 TOML 中复制 20 个具体服务，避免两份 service catalog 不一致。
+# 不在本 TOML 中复制具体服务，避免两份 service catalog 不一致。
 service_catalog = "data/generated/service_catalog.json"
 # 车辆角色文件。SV/TV 真实 ID 从这里读取，system_config 不写死 46/29/80。
 vehicle_roles = "data/generated/vehicle_roles.json"
@@ -98,21 +99,21 @@ random_trips_intermediate = 2
 random_trips_maxtries = 1000
 
 [service]
-# 服务总数 F。正式 baseline 为 20；修改后必须重新运行 task_scenario.py，
+# 服务总数 F。正式 baseline 为 10；修改后必须通过统一入口重生成依赖 artifact，
 # 生成新的 service_catalog.json、popularity.csv、tasks.csv，并重跑依赖链。
-count = 20
+count = 10
 # 实际服务实例目录。缓存模块读取 s_f 时必须使用此 JSON。
 catalog_path = "data/generated/service_catalog.json"
 
 [service.generation]
-# PROVISIONAL service heterogeneity envelope.
-# These ranges preserve the existing experiment scale and are not claimed
-# as final literature-calibrated values.
-program_size_min_mb = 1000.0
-program_size_max_mb = 2000.0
-mean_input_size_min_mbit = 0.5
-mean_input_size_max_mbit = 1.5
-cycles_per_bit_min = 200.0
+# Table I 校准的服务缓存大小范围，单位 GB；运行时 program_size 由生成器换算为 MB。
+service_size_min_gb = 2.0
+service_size_max_gb = 20.0
+# Table I 校准的任务输入基准范围，单位 KB；任务行仍以 bit 保存。
+input_size_min_kb = 500.0
+input_size_max_kb = 5000.0
+# Table I 校准的计算密度范围，单位 cycle/bit。
+cycles_per_bit_min = 400.0
 cycles_per_bit_max = 1000.0
 
 [task]
@@ -136,11 +137,9 @@ master_seed = 4401
 # VEC 仿真中车辆本地 CPU 常设置在 0.5~1GHz 量级，当前主实验取 1GHz。
 # 这是文献校准实验基线，不代表硬件实测数据。
 local_cpu_cycles_per_s = 1.0e9
-# TV 固定本地缓存容量，单位 MB。
-# 当前实验设计基线：2000MB 位于当前最大单服务大小与最小两服务大小之和之间，
-# 因此每辆任务车辆最多缓存一个完整服务，同时所有服务均可单独缓存。
-# 该值由当前正式 service_catalog 推导得到，不是文献直接硬件参数。
-local_cache_capacity_mb = 2000.0
+# TV 固定本地缓存容量，单位 MB；由 cache.capacity_policy.tv_ratio 和
+# service_catalog 总大小通过统一 artifact 入口自动生成。
+local_cache_capacity_mb = 5581.58344157102
 # 文献校准基线。
 # 本地计算能耗模型：E = kappa * L * F^2。
 # L 单位 cycle，F 单位 cycle/s，E 单位 J。
@@ -157,8 +156,8 @@ kappa = 1.0e-28
 transmit_power_w = 0.1995262315
 
 [nodes.sv]
-# 最终冻结 baseline：SV 公共缓存容量，单位 MB。
-cache_capacity_mb = 2000.0
+# SV 公共缓存容量，单位 MB；由 cache.capacity_policy.sv_ratio 自动生成。
+cache_capacity_mb = 16744.750324713
 # SV 总 CPU 能力，单位 cycle/s。
 # 正式 baseline：SV 总 CPU 能力为 1GHz，单位 cycle/s。
 # 这是文献校准实验基线，不代表硬件实测数据。
@@ -185,9 +184,8 @@ range_m = 100.0
 count = 2
 # RSU 初始部署高度，单位 m；节点部署脚本从此参数生成位置文件。
 deployment_altitude_m = 10.0
-# 参数状态：系统尺度校准实验基线。
-# 最终冻结 baseline：RSU 公共缓存容量，单位 MB。
-cache_capacity_mb = 6000.0
+# RSU 公共缓存容量，单位 MB；由 cache.capacity_policy.rsu_ratio 自动生成。
+cache_capacity_mb = 44652.6675325681
 # RSU 总 CPU 能力，单位 cycle/s。
 # 最终冻结 baseline：RSU MEC server computation rate 为 5GHz。
 cpu_cycles_per_s = 5.0e9
@@ -224,11 +222,11 @@ initialization_mode = "topology_aware"
 # DOI 10.1186/s13638-020-01861-8，Table 1 采用 UAV altitude H = 100m。
 # 本文只优化 UAV 二维水平位置，不优化高度；该值是仿真基线，不代表唯一硬件/法规参数。
 altitude_m = 100.0
-# 最终冻结 baseline：UAV 公共缓存容量，单位 MB。
-cache_capacity_mb = 6000.0
+# UAV 公共缓存容量，单位 MB；由 cache.capacity_policy.uav_ratio 自动生成。
+cache_capacity_mb = 33489.5006494261
 # UAV 总 CPU 能力，单位 cycle/s。
-# 最终冻结 baseline：UAV MEC computation rate 为 3GHz。
-cpu_cycles_per_s = 3.0e9
+# 最终冻结 baseline：UAV MEC computation rate 为 5GHz。
+cpu_cycles_per_s = 5.0e9
 # UAV 链路带宽，单位 Hz。
 # 文献来源同上，Table 1 给出 Total bandwidth B = 10 MHz；
 # 当前系统将 UAV bandwidth_hz 作为空地 uplink_rate() 的系统带宽输入，
@@ -286,9 +284,8 @@ movement_fixed_cost = 0.00176
 # 文献来源：Al-Shareeda et al., Novel DT-assisted Vehicular Task Offloading for Cloud,
 # Edge, and Hybrid Deployments, IEEE Transactions on Vehicular Technology 75(4):6565-6581, 2026,
 # DOI 10.1109/TVT.2025.3620810。
-# 旧 cpu_cycles_per_s 仅保留作 legacy parameter compatibility，正式模型不再
-# 将其解释为每任务独占 CPU。
-cpu_cycles_per_s = 3.0e9
+# cpu_cycles_per_s 与 Cloud 总计算能力保持 20GHz 一致；正式模型按任务数共享。
+cpu_cycles_per_s = 20.0e9
 # Cloud 总计算能力 F_cloud_total，单位 cycle/s；单任务分配为 F_total/N_cloud。
 total_cpu_cycles_per_s = 20.0e9
 # 旧 uplink_rate_bps 仅保留作 legacy parameter compatibility，正式模型使用
@@ -369,6 +366,14 @@ local_search_tolerance = 1.0e-9
 max_coordinate_rounds = 20
 # 正式 episode 初始 cache 使用 uniform feasible initialization。
 knapsack_initialization = "uniform_feasible"
+
+[cache.capacity_policy]
+# cache 容量由统一 artifact 入口根据 service_catalog 总大小自动换算为 MB；
+# 以下比例是正式 baseline 的唯一容量规则，不在配置中复制服务大小。
+tv_ratio = 0.05
+sv_ratio = 0.15
+rsu_ratio = 0.40
+uav_ratio = 0.30
 
 [objective]
 # 主实验采用时延和车辆能耗等权重。
@@ -553,6 +558,12 @@ num_minibatches = 4
 "simulation.num_service_vehicles" = "CONFIRMED_DATA"
 "service.count" = "CONFIRMED_DATA"
 "service.catalog_path" = "CONFIRMED_DATA"
+"service.generation.service_size_min_gb" = "CONFIRMED_DATA"
+"service.generation.service_size_max_gb" = "CONFIRMED_DATA"
+"service.generation.input_size_min_kb" = "CONFIRMED_DATA"
+"service.generation.input_size_max_kb" = "CONFIRMED_DATA"
+"service.generation.cycles_per_bit_min" = "CONFIRMED_DATA"
+"service.generation.cycles_per_bit_max" = "CONFIRMED_DATA"
 "task.arrival_probability" = "CONFIRMED_DATA"
 "task.popularity_zeta" = "CONFIRMED_DATA"
 "task.popularity_epoch_length" = "CONFIRMED_DATA"

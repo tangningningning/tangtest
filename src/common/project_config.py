@@ -18,7 +18,10 @@ from typing import Any
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - only for Python < 3.11
-    import tomli as tomllib  # type: ignore[no-redef]
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        from pip._vendor import tomli as tomllib  # type: ignore[no-redef]
 
 
 def find_project_root() -> Path:
@@ -307,6 +310,12 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "simulation.num_service_vehicles",
     "service.count",
     "service.catalog_path",
+    "service.generation.service_size_min_gb",
+    "service.generation.service_size_max_gb",
+    "service.generation.input_size_min_kb",
+    "service.generation.input_size_max_kb",
+    "service.generation.cycles_per_bit_min",
+    "service.generation.cycles_per_bit_max",
     "task.arrival_probability",
     "task.popularity_zeta",
     "task.popularity_epoch_length",
@@ -447,11 +456,11 @@ def validate_config(config: dict[str, Any]) -> None:
     if not isinstance(service_generation, dict):
         raise ValueError("缺少 service.generation 配置表。")
     service_ranges = (
-        ("program_size_min_mb", "program_size_max_mb", "program_size"),
+        ("service_size_min_gb", "service_size_max_gb", "service_size"),
         (
-            "mean_input_size_min_mbit",
-            "mean_input_size_max_mbit",
-            "mean_input_size",
+            "input_size_min_kb",
+            "input_size_max_kb",
+            "input_size",
         ),
         ("cycles_per_bit_min", "cycles_per_bit_max", "cycles_per_bit"),
     )

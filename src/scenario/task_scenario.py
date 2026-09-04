@@ -38,8 +38,8 @@ class TaskConfig:
     system_config.toml 读取参数，vehicle_roles.json 仅用于检查上游时间轴漂移。
     """
 
-    num_services: int = 20
-    arrival_probability: float = 0.5
+    num_services: int = 10
+    arrival_probability: float = 0.7
     zipf_exponent: float = 0.8
     popularity_epoch_length: int = 20
     popularity_changes_per_epoch: int = 1
@@ -62,19 +62,20 @@ class TaskConfig:
         "workload_variation",
     )
 
-    # PROVISIONAL service heterogeneity envelope. These ranges preserve the
-    # existing experiment scale and are not claimed as final
-    # literature-calibrated values.
-    program_size_min_mb: float = 1000.0
-    program_size_max_mb: float = 2000.0
-    mean_input_size_min_mbit: float = 0.5
-    mean_input_size_max_mbit: float = 1.5
-    cycles_per_bit_min: float = 200.0
+    # 服务大小以 GB 配置，生成后同时保存 GB 展示值和运行时所需的 MB 值。
+    service_size_min_gb: float = 2.0
+    service_size_max_gb: float = 20.0
+    # 任务输入范围以 KB 配置，目录和任务行仍保存 bit，避免改变既有计算公式接口。
+    input_size_min_kb: float = 500.0
+    input_size_max_kb: float = 5000.0
+    cycles_per_bit_min: float = 400.0
     cycles_per_bit_max: float = 1000.0
 
-    # implementation provisional defaults：参数范围由 system_config.toml
+    # 实现层回退默认值：参数范围由 system_config.toml
     # 正式入口统一读取；以下值只用于无 TOML 的函数级回退。
+    service_size_unit: str = "GB"
     program_size_unit: str = "MB"
+    input_size_range_unit: str = "KB"
     input_size_unit: str = "bit"
     cpu_cycles_unit: str = "cycle"
     cycles_per_bit_unit: str = "cycle/bit"
@@ -99,12 +100,8 @@ class TaskConfig:
         if num_tv <= 0:
             raise ValueError("task_vehicles 不能为空。")
         parameter_ranges = (
-            ("program_size", self.program_size_min_mb, self.program_size_max_mb),
-            (
-                "mean_input_size",
-                self.mean_input_size_min_mbit,
-                self.mean_input_size_max_mbit,
-            ),
+            ("service_size", self.service_size_min_gb, self.service_size_max_gb),
+            ("input_size", self.input_size_min_kb, self.input_size_max_kb),
             ("cycles_per_bit", self.cycles_per_bit_min, self.cycles_per_bit_max),
         )
         for name, lower, upper in parameter_ranges:
@@ -117,6 +114,11 @@ class TaskConfig:
 
 
 DEFAULT_CONFIG = TaskConfig()
+
+# 服务缓存容量以 MB 参与约束；这里使用十进制单位完成 GB 到 MB 的配置换算。
+SERVICE_SIZE_MB_PER_GB = 1000.0
+# 任务输入以 bit 进入既有计算公式；这里使用十进制 KB 完成单位换算。
+INPUT_SIZE_BITS_PER_KB = 8000.0
 
 SERVICE_CATALOG_FIELDS = (
     "service_id",
@@ -422,17 +424,17 @@ def make_service_catalog(
     每个参数维度单独分层采样，再由独立 permutation 随机分配给 service
     identity；因此 service_id 不携带 workload 大小排序语义。
     """
-    program_samples = stratified_uniform_samples(
+    service_size_samples_gb = stratified_uniform_samples(
         rng,
         config.num_services,
-        config.program_size_min_mb,
-        config.program_size_max_mb,
+        config.service_size_min_gb,
+        config.service_size_max_gb,
     )
-    input_samples_mbit = stratified_uniform_samples(
+    input_size_samples_kb = stratified_uniform_samples(
         rng,
         config.num_services,
-        config.mean_input_size_min_mbit,
-        config.mean_input_size_max_mbit,
+        config.input_size_min_kb,
+        config.input_size_max_kb,
     )
     cycle_samples = stratified_uniform_samples(
         rng,
@@ -449,14 +451,21 @@ def make_service_catalog(
 
     catalog: list[dict[str, Any]] = []
     for service_id in range(config.num_services):
+        service_size_gb = float(
+            service_size_samples_gb[program_permutation[service_id]]
+        )
+        input_size_kb = float(input_size_samples_kb[input_permutation[service_id]])
         catalog.append(
             {
                 "service_id": service_id,
-                "program_size": float(program_samples[program_permutation[service_id]]),
-                "mean_input_size": float(
-                    input_samples_mbit[input_permutation[service_id]]
-                    * 1_000_000.0
-                ),
+                # program_size 保留运行时既有字段，单位为 MB。
+                "program_size": service_size_gb * SERVICE_SIZE_MB_PER_GB,
+                # service_size/service_size_gb 面向 artifact 阅读，单位为 GB。
+                "service_size": service_size_gb,
+                "service_size_gb": service_size_gb,
+                # mean_input_size 保留任务公式接口，单位为 bit。
+                "mean_input_size": input_size_kb * INPUT_SIZE_BITS_PER_KB,
+                "input_size_kb": input_size_kb,
                 "cycles_per_bit": float(cycle_samples[cycle_permutation[service_id]]),
             }
         )
@@ -477,23 +486,23 @@ def service_parameter_stratum_summary(
     """返回 service catalog 三个参数维度的 stratum 覆盖诊断。
 
     stratum 只属于生成 metadata/validation，不写入正式 service/task 行。
-    ``mean_input_size`` 在 catalog 中是 bit，因此校验时先还原为 Mbit。
+    ``mean_input_size`` 在 catalog 中是 bit，因此校验时先还原为 KB。
     """
     by_id = catalog_by_id(catalog)
     dimensions = (
         (
-            "program_size_mb",
-            "program_size",
-            config.program_size_min_mb,
-            config.program_size_max_mb,
+            "service_size_gb",
+            "service_size_gb",
+            config.service_size_min_gb,
+            config.service_size_max_gb,
             1.0,
         ),
         (
-            "mean_input_size_mbit",
+            "input_size_kb",
             "mean_input_size",
-            config.mean_input_size_min_mbit,
-            config.mean_input_size_max_mbit,
-            1.0e-6,
+            config.input_size_min_kb,
+            config.input_size_max_kb,
+            1.0 / INPUT_SIZE_BITS_PER_KB,
         ),
         (
             "cycles_per_bit",
@@ -573,16 +582,16 @@ def service_parameter_stratum_summary(
         return value if math.isfinite(value) else None
 
     summary["pairwise_correlations"] = {
-        "program_size_vs_mean_input_size": safe_correlation(
-            parameter_values["program_size_mb"],
-            parameter_values["mean_input_size_mbit"],
+        "service_size_vs_input_size": safe_correlation(
+            parameter_values["service_size_gb"],
+            parameter_values["input_size_kb"],
         ),
-        "program_size_vs_cycles_per_bit": safe_correlation(
-            parameter_values["program_size_mb"],
+        "service_size_vs_cycles_per_bit": safe_correlation(
+            parameter_values["service_size_gb"],
             parameter_values["cycles_per_bit"],
         ),
-        "mean_input_size_vs_cycles_per_bit": safe_correlation(
-            parameter_values["mean_input_size_mbit"],
+        "input_size_vs_cycles_per_bit": safe_correlation(
+            parameter_values["input_size_kb"],
             parameter_values["cycles_per_bit"],
         ),
     }
@@ -1000,7 +1009,7 @@ def service_size_sanity(
     service_sizes_mb: dict[int, float],
     local_cache_capacity_mb: float,
 ) -> dict[str, Any]:
-    """验证 local cache capacity 位于 max single 与 min two-service sum 之间。"""
+    """检查 TV 容量可容纳的完整服务集合及其单服务可行性。"""
 
     if local_cache_capacity_mb <= 0.0:
         raise ValueError("TV local cache capacity 必须大于 0。")
@@ -1009,10 +1018,14 @@ def service_size_sanity(
         raise ValueError("至少需要两个 service 才能验证 min_two_service_sum。")
     max_single = max(service_sizes_mb.values())
     min_two = ordered[0][1] + ordered[1][1]
-    if not (max_single < local_cache_capacity_mb < min_two):
+    fitting_service_ids = [
+        service_id
+        for service_id, size_mb in ordered
+        if size_mb <= local_cache_capacity_mb + 1.0e-9
+    ]
+    if not fitting_service_ids:
         raise ValueError(
-            "TV local cache capacity 必须满足 "
-            "max_single_service < capacity < min_two_service_sum。"
+            "TV local cache capacity 至少应能容纳一个完整 service。"
         )
     return {
         "service_count": len(service_sizes_mb),
@@ -1022,10 +1035,10 @@ def service_size_sanity(
         "max_service_size_mb": max_single,
         "min_two_service_sum_mb": min_two,
         "total_service_size_mb": float(sum(service_sizes_mb.values())),
-        "single_services_fit_count": int(
-            sum(1 for size in service_sizes_mb.values() if size <= local_cache_capacity_mb)
-        ),
-        "all_pairs_exceed_capacity": True,
+        "single_services_fit_count": len(fitting_service_ids),
+        "single_service_ids_fit": fitting_service_ids,
+        "all_services_fit": len(fitting_service_ids) == len(service_sizes_mb),
+        "all_pairs_exceed_capacity": bool(local_cache_capacity_mb < min_two),
     }
 
 
@@ -1037,9 +1050,9 @@ def generate_tv_local_cache(
 ) -> dict[str, Any]:
     """为每个TV生成实验前固定的本地缓存初始状态。
 
-    生成规则严格为 uniform one-service-per-TV，不读取 tasks.csv/popularity/future
-    request，因此不泄漏未来ground truth。相同 TV 集合、service catalog 和 seed
-    会得到完全相同 artifact。
+    生成规则为对“能够完整放入 TV 容量”的服务均匀执行 one-service-per-TV，
+    不读取 tasks.csv/popularity/future request，因此不泄漏未来 ground truth。
+    相同 TV 集合、service catalog 和 seed 会得到完全相同 artifact。
     """
 
     service_sizes = service_size_by_id(service_catalog)
@@ -1048,10 +1061,11 @@ def generate_tv_local_cache(
     if len(tv_ids) != len(set(tv_ids)):
         raise ValueError("task_vehicle_ids 存在重复。")
     service_ids = sorted(service_sizes)
+    eligible_service_ids = list(sanity["single_service_ids_fit"])
     rng = np.random.default_rng(int(seed))
     vehicles: dict[str, dict[str, Any]] = {}
     for tv_id in tv_ids:
-        service_id = int(rng.choice(service_ids))
+        service_id = int(rng.choice(eligible_service_ids))
         used = float(service_sizes[service_id])
         if used > local_cache_capacity_mb:
             raise AssertionError("抽中的单个service超过TV local cache容量。")
@@ -1064,9 +1078,10 @@ def generate_tv_local_cache(
         "metadata": {
             "seed": int(seed),
             "capacity_mb": float(local_cache_capacity_mb),
-            "generation_rule": "uniform_one_service_per_tv",
+            "generation_rule": "uniform_one_service_per_tv_among_fitting_services",
             "service_count": len(service_ids),
             "service_ids": service_ids,
+            "eligible_service_ids": eligible_service_ids,
             "tv_count": len(tv_ids),
             "tv_ids": tv_ids,
             "fixed_over_episode": True,
@@ -1086,7 +1101,7 @@ def validate_tv_local_cache(
 ) -> dict[str, Any]:
     service_sizes = service_size_by_id(service_catalog)
     sanity = service_size_sanity(service_sizes, local_cache_capacity_mb)
-    valid_services = set(service_sizes)
+    valid_services = set(sanity["single_service_ids_fit"])
     expected_tv = {str(vehicle_id) for vehicle_id in task_vehicle_ids}
     vehicles = tv_local_cache.get("vehicles")
     if not isinstance(vehicles, dict):
@@ -1107,7 +1122,8 @@ def validate_tv_local_cache(
             raise ValueError(f"TV {tv_id} used_capacity_mb 与service size不一致。")
     return {
         "tv_count": len(actual_tv),
-        "service_count": len(valid_services),
+        "service_count": len(service_sizes),
+        "eligible_service_count": len(valid_services),
         "all_tv_exactly_once": True,
         "all_cached_services_valid": True,
         "all_used_capacity_within_limit": True,
@@ -1406,24 +1422,26 @@ def make_service_catalog_output(
         "schema_version": 1,
         "service_count": config.num_services,
         "units": {
+            "service_size": config.service_size_unit,
             "program_size": config.program_size_unit,
+            "input_size_range": config.input_size_range_unit,
             "mean_input_size": config.input_size_unit,
             "cycles_per_bit": config.cycles_per_bit_unit,
             "tasks.input_size": config.input_size_unit,
             "tasks.cpu_cycles": config.cpu_cycles_unit,
         },
-        "provisional_defaults": True,
+        "provisional_defaults": False,
         "task_type_definition": TASK_TYPE_DEFINITION,
         "service_generation_mode": SERVICE_GENERATION_MODE,
         "parameter_assignment": SERVICE_PARAMETER_ASSIGNMENT,
         "parameter_ranges": {
-            "program_size_mb": [
-                float(config.program_size_min_mb),
-                float(config.program_size_max_mb),
+            "service_size_gb": [
+                float(config.service_size_min_gb),
+                float(config.service_size_max_gb),
             ],
-            "mean_input_size_mbit": [
-                float(config.mean_input_size_min_mbit),
-                float(config.mean_input_size_max_mbit),
+            "input_size_kb": [
+                float(config.input_size_min_kb),
+                float(config.input_size_max_kb),
             ],
             "cycles_per_bit": [
                 float(config.cycles_per_bit_min),
@@ -1431,12 +1449,18 @@ def make_service_catalog_output(
             ],
         },
         "strata_count": config.num_services,
-        "parameter_ranges_status": (
-            "PROVISIONAL service heterogeneity envelope; these ranges preserve "
-            "the existing experiment scale and are not claimed as final "
-            "literature-calibrated values."
-        ),
-        "services": artifacts["catalog"],
+        "parameter_ranges_status": "Table I calibrated baseline ranges",
+        "services": [
+            {
+                **row,
+                # popularity 保存正式 episode 第一个 slot 的 rho_star，完整动态
+                # 流行度仍由 popularity.csv 和 popularity_generation 保存。
+                "popularity": float(
+                    artifacts["probabilities"][0][int(row["service_id"])]
+                ),
+            }
+            for row in artifacts["catalog"]
+        ],
         "generation_config": {
             "master_seed": master_seed,
             "child_seeds": child_seeds,
@@ -1451,6 +1475,12 @@ def make_service_catalog_output(
             "zipf_exponent": config.zipf_exponent,
             "popularity_epoch_length": config.popularity_epoch_length,
             "popularity_changes_per_epoch": config.popularity_changes_per_epoch,
+            "service_size_min_gb": config.service_size_min_gb,
+            "service_size_max_gb": config.service_size_max_gb,
+            "input_size_min_kb": config.input_size_min_kb,
+            "input_size_max_kb": config.input_size_max_kb,
+            "cycles_per_bit_min": config.cycles_per_bit_min,
+            "cycles_per_bit_max": config.cycles_per_bit_max,
             "input_relative_jitter": config.input_relative_jitter,
             "load_relative_jitter": config.load_relative_jitter,
         },
@@ -1507,32 +1537,32 @@ def task_config_from_project_config(
         num_services=int(
             get_config_value(project_config, "service.count", base.num_services)
         ),
-        program_size_min_mb=float(
+        service_size_min_gb=float(
             get_config_value(
                 project_config,
-                "service.generation.program_size_min_mb",
-                base.program_size_min_mb,
+                "service.generation.service_size_min_gb",
+                base.service_size_min_gb,
             )
         ),
-        program_size_max_mb=float(
+        service_size_max_gb=float(
             get_config_value(
                 project_config,
-                "service.generation.program_size_max_mb",
-                base.program_size_max_mb,
+                "service.generation.service_size_max_gb",
+                base.service_size_max_gb,
             )
         ),
-        mean_input_size_min_mbit=float(
+        input_size_min_kb=float(
             get_config_value(
                 project_config,
-                "service.generation.mean_input_size_min_mbit",
-                base.mean_input_size_min_mbit,
+                "service.generation.input_size_min_kb",
+                base.input_size_min_kb,
             )
         ),
-        mean_input_size_max_mbit=float(
+        input_size_max_kb=float(
             get_config_value(
                 project_config,
-                "service.generation.mean_input_size_max_mbit",
-                base.mean_input_size_max_mbit,
+                "service.generation.input_size_max_kb",
+                base.input_size_max_kb,
             )
         ),
         cycles_per_bit_min=float(
@@ -1615,7 +1645,9 @@ def task_config_from_project_config(
             get_config_value(project_config, "task.master_seed", base.fallback_master_seed)
         ),
         rng_stream_names=base.rng_stream_names,
+        service_size_unit=base.service_size_unit,
         program_size_unit=base.program_size_unit,
+        input_size_range_unit=base.input_size_range_unit,
         input_size_unit=base.input_size_unit,
         cpu_cycles_unit=base.cpu_cycles_unit,
         cycles_per_bit_unit=base.cycles_per_bit_unit,
@@ -1682,10 +1714,10 @@ def config_from_args(
         num_services=(
             base.num_services if args.num_services is None else args.num_services
         ),
-        program_size_min_mb=base.program_size_min_mb,
-        program_size_max_mb=base.program_size_max_mb,
-        mean_input_size_min_mbit=base.mean_input_size_min_mbit,
-        mean_input_size_max_mbit=base.mean_input_size_max_mbit,
+        service_size_min_gb=base.service_size_min_gb,
+        service_size_max_gb=base.service_size_max_gb,
+        input_size_min_kb=base.input_size_min_kb,
+        input_size_max_kb=base.input_size_max_kb,
         cycles_per_bit_min=base.cycles_per_bit_min,
         cycles_per_bit_max=base.cycles_per_bit_max,
         arrival_probability=(
@@ -1726,7 +1758,9 @@ def config_from_args(
         fallback_episode_time_s=base.fallback_episode_time_s,
         fallback_master_seed=base.fallback_master_seed,
         rng_stream_names=base.rng_stream_names,
+        service_size_unit=base.service_size_unit,
         program_size_unit=base.program_size_unit,
+        input_size_range_unit=base.input_size_range_unit,
         input_size_unit=base.input_size_unit,
         cpu_cycles_unit=base.cpu_cycles_unit,
         cycles_per_bit_unit=base.cycles_per_bit_unit,

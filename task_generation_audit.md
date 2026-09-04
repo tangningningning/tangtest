@@ -35,18 +35,18 @@
 
 | 参数 | 当前值 | 作用 |
 |---|---:|---|
-| service 数量 | 20 | service catalog 和概率向量维度 |
+| service 数量 | 10 | service catalog 和概率向量维度 |
 | `task.arrival_probability` | 0.7 | 每个 task vehicle、每个 slot 的 Bernoulli 到达概率 |
 | `task.popularity_zeta` | 0.8 | Zipf 指数 |
 | popularity epoch length | 20 slot | rank 演化边界 |
 | 每 epoch rank 变化次数 | 1 | 局部 rank swap/shift 次数 |
 | `input_relative_jitter` | 0.20 | input size 的相对扰动 |
 | `load_relative_jitter` | 0.10 | cycles 的负载相对扰动 |
-| `mean_input_size_min_mbit` / max | 0.5 / 1.5 Mbit | service 基准 input size 范围 |
-| `cycles_per_bit_min` / max | 200 / 1000 cycle/bit | service 基准计算密度范围 |
+| `input_size_min_kb` / max | 500 / 5000 KB | service 基准 input size 范围 |
+| `cycles_per_bit_min` / max | 400 / 1000 cycle/bit | service 基准计算密度范围 |
 
-注：`TaskConfig` 中的 `arrival_probability=0.5` 等数值是无 TOML 时的回退默认值；
-正式入口读取当前 `system_config.toml`，所以本审计对正式配置采用 0.7。
+`TaskConfig` 的回退默认值与当前正式 `system_config.toml` 保持一致；正式入口仍以
+该 TOML 为唯一参数来源。
 
 ## 1. service_id 生成方式
 
@@ -109,14 +109,14 @@ uniform：否
 ### 2.1 service catalog 基准值
 
 `make_service_catalog` 对 `mean_input_size` 使用
-`stratified_uniform_samples`：在 `[0.5, 1.5]` Mbit 的 20 个等宽 strata 中每个
+`stratified_uniform_samples`：在 `[500, 5000]` KB 的 10 个等宽 strata 中每个
 抽样一次，然后用独立 permutation 分配给 service ID，最后转换为 bit：
 
 ```text
-mean_input_size_f = sampled_mbit_f * 1,000,000
+mean_input_size_f = sampled_kb_f * 8,000
 ```
 
-这不是 20 个完全独立的普通 uniform 样本，而是覆盖整个区间的分层均匀样本；
+这不是 10 个完全独立的普通 uniform 样本，而是覆盖整个区间的分层均匀样本；
 service ID 与 input size 没有固定的大小排序语义。
 
 ### 2.2 每个有效任务的 input size
@@ -132,8 +132,8 @@ input_size = mean_input_size_f * (1 + input_factor)
 
 | 层次 | min | max | 分布 |
 |---|---:|---:|---|
-| catalog `mean_input_size` | 0.5 Mbit（500,000 bit） | 1.5 Mbit（1,500,000 bit） | 分层均匀，每个 service 一个基准值 |
-| 有效任务 `input_size` | 约 0.4 Mbit（400,000 bit） | 小于约 1.8 Mbit（1,800,000 bit） | 条件于 service 的乘法 Uniform ±20%，跨 service 为混合分布 |
+| catalog `mean_input_size` | 约 839.586 KB | 约 4902.259 KB | 分层均匀，每个 service 一个基准值 |
+| 有效任务 `input_size` | 约 400 KB | 小于约 6000 KB | 条件于 service 的乘法 Uniform ±20%，跨 service 为混合分布 |
 
 NumPy 的 `uniform(low, high)` 使用下界包含、上界不包含；因此按当前实现写成
 `400,000 <= input_size < 1,800,000 bit` 更精确。实际一次运行的精确 min/max
@@ -165,7 +165,7 @@ cycles
 其中：
 
 - `cycles_per_bit_f` 是 catalog 中按 service 固定的基准值，范围为
-  200–1000 cycle/bit，并采用分层均匀生成后独立分配到 service ID。
+  400–1000 cycle/bit，并采用分层均匀生成后独立分配到 service ID。
 - `load_factor` 的实际乘数范围为 `[0.9, 1.1)`。
 - `input_size` 单位是 bit，`cpu_cycles` 单位是 cycle。
 
@@ -177,7 +177,7 @@ computation_density_effective
   = cycles_per_bit_f * load_factor
 ```
 
-其理论范围约为 180–1100 cycle/bit（上端按 NumPy 半开区间理解）。
+其理论范围约为 360–1100 cycle/bit（上端按 NumPy 半开区间理解）。
 
 ## 4. task arrival probability 的作用
 
@@ -187,11 +187,11 @@ computation_density_effective
 arrival_i,t ~ Bernoulli(task.arrival_probability)
 ```
 
-当前正式值为 `p=0.7`。因此，在 30 个 task vehicles 的正式配置下，每个 slot 的
+当前正式值为 `p=0.7`。因此，在 20 个 task vehicles 的正式配置下，每个 slot 的
 期望到达数为：
 
 ```text
-E[arrivals per slot] = 30 * 0.7 = 21
+E[arrivals per slot] = 20 * 0.7 = 14
 ```
 
 它的作用是门控后续生成流程：
@@ -233,4 +233,3 @@ E[arrivals per slot] = 30 * 0.7 = 21
   - `task_config_from_catalog`
   - `sample_tasks`
   - `online_information_boundary` 元数据
-

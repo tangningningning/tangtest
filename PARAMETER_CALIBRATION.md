@@ -1,20 +1,19 @@
 # 正式 baseline 系统规模与参数状态
 
 本报告对应当前 `system_config.toml` 和 `data/generated/` 正式 artifact。
-当前唯一正式规模为 5 个 SV、25 个 TV、3 个 RSU、3 个 UAV、1 个 Cloud
-和 20 个 service。旧的 3 SV / 9 TV / 1 RSU / 2 UAV / 10 service
-不再作为正式 baseline。
+`system_config.toml` 是唯一正式参数入口。当前正式规模为 5 个 SV、20 个 TV、
+2 个 RSU、2 个 UAV、1 个 Cloud 和 10 个 service；artifact 一致性状态见第 5 节。
 
 ## 1. 系统规模
 
 | 项目 | 正式值 |
 |---|---:|
-| research vehicles | 30 |
-| SV / TV | 5 / 25 |
-| RSU | 3 (`RSU_0` ... `RSU_2`) |
-| UAV | 3 (`UAV_0` ... `UAV_2`) |
+| research vehicles | 25 |
+| SV / TV | 5 / 20 |
+| RSU | 2 (`RSU_0` ... `RSU_1`) |
+| UAV | 2 (`UAV_0` ... `UAV_1`) |
 | Cloud | 1 个共享节点 |
-| service | 20 |
+| service | 10 |
 
 车辆角色来自已有真实 SUMO `trajectory.csv` 的完整轨迹筛选；本次未启动
 SUMO、未生成合成车辆。角色划分仍使用固定 seed 选择，研究车辆均覆盖正式
@@ -24,69 +23,86 @@ SUMO、未生成合成车辆。角色划分仍使用固定 seed 选择，研究�
 
 | 参数 | 值 |
 |---|---:|
+| TV local CPU | `1.0e9` cycle/s |
 | SV CPU | `1.0e9` cycle/s |
-| RSU CPU | `8.0e9` cycle/s |
+| RSU CPU | `5.0e9` cycle/s |
 | UAV CPU | `5.0e9` cycle/s |
 | Cloud total CPU | `20.0e9` cycle/s |
 | Cloud total bandwidth | `200.0e6` bit/s |
-| SV / RSU / UAV cache | `6000 / 15000 / 10000` MB |
+| TV / SV / RSU / UAV cache | `5581.583442 / 16744.750325 / 44652.667533 / 33489.500649` MB |
 | `eta_ca` (SV / RSU / UAV) | `0.20 / 0.10 / 0.15` |
 | `xi_ca` (SV / RSU / UAV) | `0.0010 / 0.0007 / 0.0012` |
 | `objective.lambda_cache` | `0.1` |
-| `psi_c` | `2.30` |
+| `psi_c` | `10.0` |
 
 Cloud 仍是单节点有限共享模型：同一 slot 的 `N_cloud` 个任务分别获得
-`20e9 / N_cloud` CPU 和 `200e6 / N_cloud` uplink。旧 Cloud 标量配置仅为
-兼容字段，不作为每任务独占资源。
+`20e9 / N_cloud` CPU 和 `200e6 / N_cloud` uplink；兼容字段
+`nodes.cloud.cpu_cycles_per_s` 也统一为 `20e9`，不作为每任务独占资源。
 
 reward、utility、`omega_T`、`omega_E`、`T_ref`、`E_ref`、movement model、
 prediction model 和 cache cost 公式均未改动。
 
 ## 3. Service catalog 与 cache 比例
 
-当前 `data/generated/service_catalog.json` 为 F=20，服务大小来自原有
-1,000--2,000 MB 分层生成范围：
+当前 `data/generated/service_catalog.json` 为 F=10，服务大小来自
+2--20 GB 分层生成范围；artifact 同时保存 `service_size_gb`（GB）和运行时
+兼容字段 `program_size`（MB）：
+
+任务生成参数为：`arrival_probability = 0.7`，输入规模基准范围为
+`500--5000 KB`，`cycles_per_bit = 400--1000`，
+`input_relative_jitter = 0.20`，`load_relative_jitter = 0.10`；Zipf 和
+popularity 演化过程不变。
 
 | statistic | value (MB) |
 |---|---:|
-| min | 1038.138784 |
-| median | 1515.443138 |
-| mean | 1500.296463 |
-| max | 1989.139878 |
-| total | 30005.929269 |
+| min | 3372.996237 |
+| median | 10776.092214 |
+| mean | 11163.166883 |
+| max | 19753.560543 |
+| total | 111631.668831 |
 
 | node role | capacity (MB) | capacity / catalog total |
 |---|---:|---:|
-| SV | 6000 | 19.996% |
-| RSU | 15000 | 49.990% |
-| UAV | 10000 | 33.327% |
+| TV local | 5581.583442 | 5.000% |
+| SV | 16744.750325 | 15.000% |
+| RSU | 44652.667533 | 40.000% |
+| UAV | 33489.500649 | 30.000% |
 
-按实际 service size 的 exact subset sanity，单个 SV、RSU、UAV 最多可分别
-完整容纳 5、11、8 个 service；任一节点都不能容纳全部 20 个 service。
-TV 本地 cache 仍为 episode 前生成并固定，每个 TV 放置一个完整 service，
-容量为 2000 MB，不读取未来 request。
+容量由 `cache.capacity_policy` 中的 5%/15%/40%/30% 自动乘以实际 catalog
+总大小得到，严格满足 `RSU > UAV > SV > TV`，且任一节点都不能容纳全部 10 个
+service。当前 TV 容量可完整容纳 1 个 service，因此 `tv_local_cache.json`
+从可放入容量的服务集合中为每个 TV 固定放置 1 个 service，不读取未来 request；
+运行时 cache optimizer 的容量约束和 placement 算法未修改。
+
+catalog 中的 mean input size 基准实际为 839.586341--4902.258898 KB。
+保留现有 ±20% input jitter 后，当前生成的有效任务观测范围为
+673.640852--5878.270324 KB；理论有效 envelope 为 400--6000 KB。
 
 ## 4. Dynamic action / observation
 
-cache node 列表按角色文件和配置实例动态构造：5 SV + 3 RSU + 3 UAV = 11
-个 cache node。UAV movement action 由 3 个 UAV 实例动态构造。
+cache node 列表按角色文件和配置实例动态构造：5 SV + 2 RSU + 2 UAV = 9
+个 cache node。UAV movement action 由 2 个 UAV 实例动态构造。
 
 正式 action 顺序为：
 
-`[z_<all cache node>^ca, z_UAV_0^q, z_UAV_1^q, z_UAV_2^q]`
+`[z_<all cache node>^ca, z_UAV_0^q, z_UAV_1^q]`
 
-因此当前 `action_dim = 11 + 3 = 14`，不存在旧的固定 8-action schema。
-以 11 cache node、20 service、3 UAV、30 research vehicle 构造 observation
-时，`observation_dim = 11*20 + 3*2 + 30*2 + 20 = 306`。
+因此当前 `action_dim = 9 + 2 = 11`，不存在固定的旧 action schema。
+以 9 cache node、10 service、2 UAV、25 research vehicle 构造 observation
+时，`observation_dim = 9*10 + 2*2 + 25*2 + 10 = 164`。
 observation 只包含 previous configuration、causal prediction state 和
 固定 schema，不读取同 slot actual task、Matching/KKT、Q 或 G。
 
 ## 5. 生成与验证边界
 
-本次按新规模重新生成了 service catalog、popularity、tasks、TV local cache、
-F=20 GRU checkpoint 和 formal prediction scenarios；复用了已有独立
-calibration residual bank。未运行 PPO、SUMO、pytest、benchmark 或 300-slot
-trajectory scan。
+本次已按依赖链重新生成 `vehicle_roles.json`、`service_catalog.json`、
+`popularity.csv`、`popularity_history.csv`、`tasks.csv`、`tv_local_cache.json`、
+`popularity_gru.pt`、`popularity_predictions.csv`、`vehicle_predictions.csv` 和
+`prediction_scenarios.npz`；`node_positions.json` 保持现有 2 RSU + 2 UAV。
+统一入口同时生成 `generation_metadata.json` 和
+`reports/artifact_consistency_report.md`，一致性检查全部通过。
+角色筛选复用了已有轨迹，预测场景只执行既有 GRU/场景生成流程；未运行 PPO、
+完整 SUMO 仿真、pytest、benchmark 或额外训练实验。
 
 本报告不表示 PPO 已接受；PPO 训练需在本 baseline 的配置、artifact、dynamic
 action/observation 和 invariant validation 全部通过后另行进行。
