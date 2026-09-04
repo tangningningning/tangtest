@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-09-04T09:22:46.819629+00:00",
+  "config_source": "system_config.toml",
+  "vehicles": {
+    "research": 25,
+    "SV": 5,
+    "TV": 20
+  },
+  "RSU": 2,
+  "UAV": 2,
+  "service_count": 10,
+  "task_input_range": [
+    500.0,
+    5000.0
+  ],
+  "cycles_per_bit": [
+    400.0,
+    1000.0
+  ],
+  "service_size_gb": [
+    2.0,
+    20.0
+  ],
+  "cache_capacity": {
+    "TV": 5581.583441571016,
+    "SV": 16744.750324713048,
+    "RSU": 44652.66753256813,
+    "UAV": 33489.500649426096
+  },
+  "service_catalog_total_mb": 111631.66883142032,
+  "configuration": {
+    "vehicles": {
+      "research": 25,
+      "SV": 5,
+      "TV": 20,
+      "sumo_seed": 4401
+    },
+    "infrastructure": {
+      "RSU": 2,
+      "UAV": 2
+    },
+    "service_count": 10,
+    "service_generation": {
+      "service_size_min_gb": 2.0,
+      "service_size_max_gb": 20.0,
+      "input_size_min_kb": 500.0,
+      "input_size_max_kb": 5000.0,
+      "cycles_per_bit_min": 400.0,
+      "cycles_per_bit_max": 1000.0
+    },
+    "task": {
+      "arrival_probability": 0.7,
+      "popularity_zeta": 0.8,
+      "popularity_epoch_length": 20,
+      "popularity_changes_per_epoch": 1,
+      "input_relative_jitter": 0.2,
+      "load_relative_jitter": 0.1,
+      "master_seed": 4401
+    },
+    "time": {
+      "dt_s": 1.0,
+      "warmup_time_s": 100.0,
+      "episode_time_s": 300.0
+    },
+    "cache_policy": {
+      "TV": 0.05,
+      "SV": 0.15,
+      "RSU": 0.4,
+      "UAV": 0.3
+    },
+    "cache_capacity_mb": {
+      "TV": 5581.583441571016,
+      "SV": 16744.750324713048,
+      "RSU": 44652.66753256813,
+      "UAV": 33489.500649426096
+    },
+    "compute": {
+      "TV": 1000000000.0,
+      "SV": 1000000000.0,
+      "RSU": 5000000000.0,
+      "UAV": 5000000000.0,
+      "Cloud": 20000000000.0
+    },
+    "prediction": {
+      "vehicle_horizon": 5,
+      "popularity_history_length": 20,
+      "popularity_hidden_size": 32,
+      "scenario_count": 20
+    },
+    "roles_sha256": "22f37e6f64c1984a709749e9ca46c142a8914c614fe18252392666c9d0ae1dd5"
+  },
+  "artifacts": {
+    "roles": "data/generated/vehicle_roles.json",
+    "trajectory": "data/generated/trajectory.csv",
+    "catalog": "data/generated/service_catalog.json",
+    "popularity": "data/generated/popularity.csv",
+    "popularity_predictions": "data/generated/popularity_predictions.csv",
+    "popularity_history": "data/generated/popularity_history.csv",
+    "tasks": "data/generated/tasks.csv",
+    "tv_local_cache": "data/generated/tv_local_cache.json",
+    "vehicle_predictions": "data/generated/vehicle_predictions.csv",
+    "prediction_scenarios": "data/generated/prediction_scenarios.npz",
+    "popularity_gru": "data/generated/popularity_gru.pt",
+    "node_positions": "data/generated/node_positions.json"
+  },
+  "stages": {
+    "vehicle_roles": "跳过（与配置一致）",
+    "node_positions": "跳过（RSU/UAV 数量一致）",
+    "service_catalog": "跳过（与 metadata 一致）",
+    "tasks": "跳过（与 metadata 一致）",
+    "tv_local_cache": "跳过（与 metadata 一致）",
+    "popularity": "跳过（与 metadata 一致）",
+    "prediction": "跳过（与 metadata 一致）"
+  },
+  "vehicle_predictions_depend_on": "trajectory.csv + current vehicle_roles.json",
+  "prediction_note": "预测 artifact 只在车辆/服务/任务/预测维度变化时重生成。"
+}
