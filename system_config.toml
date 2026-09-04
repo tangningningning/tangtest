@@ -52,8 +52,10 @@ popularity = "data/generated/popularity.csv"
 tasks = "data/generated/tasks.csv"
 # 当前预测场景文件。cache optimizer 只能读取该预测输入，不能读取未来真实任务。
 prediction_scenarios = "data/generated/prediction_scenarios.npz"
-# SUMO 路网文件。用于后续 map_stratified 初始化、车辆预测和道路约束。
+# SUMO 路网文件。用于节点自动部署、车辆预测和道路约束。
 sumo_net = "data/sumo/map/osm.net.xml.gz"
+# RSU/UAV 节点位置由 node_placement.py 根据 sumo_net 自动生成。
+node_positions = "data/generated/node_positions.json"
 # 残差库。修改 H_p、sigma 或车辆预测参数后需要重新生成。
 # 该旧路径仅作为 legacy 配置记录，正式流程不读取，也不再要求其存在。
 residual_bank = "data/generated/residual_blocks.npz"
@@ -77,10 +79,10 @@ dt_s = 1.0
 warmup_time_s = 100.0
 # 正式优化 episode 长度，单位 s。当前正式数据覆盖 300 个 slot。
 episode_time_s = 300.0
-# 研究车辆数量。最终冻结 baseline 为 5 SV + 30 TV；ID 从 vehicle_roles.json 读取。
-num_research_vehicles = 35
-# TV 数量。最终冻结 baseline 为 30；TV ID 从 vehicle_roles.json 读取。
-num_task_vehicles = 30
+# 研究车辆数量。正式 baseline 为 5 SV + 20 TV；ID 从 vehicle_roles.json 读取。
+num_research_vehicles = 25
+# TV 数量。正式 baseline 为 20；TV ID 从 vehicle_roles.json 读取。
+num_task_vehicles = 20
 # SV 数量。最终冻结 baseline 为 5；SV ID 从 vehicle_roles.json 读取。
 num_service_vehicles = 5
 # SUMO / 角色筛选主 seed。当前实际值来自已有 vehicle_roles.json。
@@ -179,8 +181,10 @@ xi_ca = 1.0e-3
 range_m = 100.0
 
 [nodes.rsu]
-# RSU 数量。正式 baseline 使用三个动态实例 RSU_0、RSU_1、RSU_2。
-count = 3
+# RSU 数量；坐标由 node_positions.json 自动生成。
+count = 2
+# RSU 初始部署高度，单位 m；节点部署脚本从此参数生成位置文件。
+deployment_altitude_m = 10.0
 # 参数状态：系统尺度校准实验基线。
 # 最终冻结 baseline：RSU 公共缓存容量，单位 MB。
 cache_capacity_mb = 6000.0
@@ -203,31 +207,16 @@ xi_ca = 0.7e-3
 # 距离只通过正式 ground/air channel model 影响 rate、delay、energy 和 utility。
 range_m = 250.0
 
-[[nodes.rsu.instances]]
-# PROVISIONAL：RSU_0 位置由当前 SUMO map boundary 内的固定部署点确定。
-id = "RSU_0"
-x_m = 3500.0
-y_m = 600.0
-
-[[nodes.rsu.instances]]
-# PROVISIONAL：RSU_1 位置由当前 SUMO map boundary 内的固定部署点确定。
-id = "RSU_1"
-x_m = 4121.86
-y_m = 986.375
-
-[[nodes.rsu.instances]]
-# PROVISIONAL：RSU_2 位置由当前 SUMO map boundary 内的固定部署点确定。
-id = "RSU_2"
-x_m = 4750.0
-y_m = 1370.0
-
 [nodes.uav]
-# UAV 数量。正式 baseline 使用三个动态实例 UAV_0、UAV_1、UAV_2。
-count = 3
-# UAV 初始水平位置生成规则说明。map_stratified 表示根据 SUMO 地图合法边界
-# 将初始点均匀分散到地图内部；这是 UAV 优化算法的初始可行位置生成规则，
-# 不是未来真实轨迹，也不是论文固定部署结论。后续 UAV 位置仍由优化算法调整。
-initialization_mode = "map_stratified"
+# UAV 数量；坐标由 node_positions.json 自动生成。
+count = 2
+# UAV 初始部署高度，单位 m；与动态飞行模型的 altitude_m 参数分开维护。
+deployment_altitude_m = 50.0
+# UAV 相对 RSU 的初始偏移占路网最大尺度的比例。
+deployment_offset_fraction = 0.1
+# UAV 初始水平位置由 node_placement.py 根据已选 RSU 和路网拓扑生成。
+# 该初始位置不是未来真实轨迹，也不是论文固定部署结论；后续位置仍由优化算法调整。
+initialization_mode = "topology_aware"
 # 参数状态：文献校准实验基线。
 # UAV 固定飞行高度，单位 m。
 # 文献来源：Li et al., Collaborative offloading for UAV-enabled time-sensitive MEC networks,
@@ -288,25 +277,6 @@ movement_energy_coefficient_j_per_m = 15.0
 # 和 UAV targeted causal validation；不是文献直接物理常数。
 # 该成本保持 state-dependent，不强制每 slot 移动。
 movement_fixed_cost = 0.00176
-
-[[nodes.uav.instances]]
-# 根据 map_stratified 和当前 SUMO map boundary [3027.76,226.37,5215.96,1746.38]
-# 确定性生成的第一个 UAV 初始水平位置；不使用未来任务或系统效用。
-id = "UAV_0"
-initial_x_m = 3757.16
-initial_y_m = 986.375
-
-[[nodes.uav.instances]]
-# 根据相同 map_stratified 规则生成的第二个 UAV 初始水平位置；与 UAV_0 不重合。
-id = "UAV_1"
-initial_x_m = 4486.56
-initial_y_m = 986.375
-
-[[nodes.uav.instances]]
-# 根据相同 map_stratified 规则生成的第三个 UAV 初始水平位置；与前两个不重合。
-id = "UAV_2"
-initial_x_m = 4850.0
-initial_y_m = 986.375
 
 [nodes.cloud]
 # Cloud 数量固定为 1 个逻辑共享资源；本项目不展开 Cloud 实例列表。

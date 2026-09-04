@@ -53,9 +53,9 @@ class ScenarioConfig:
     dt_s: float = 1.0
     warmup_time_s: float = 100.0
     episode_time_s: float = 300.0
-    num_research_vehicles: int = 30
+    num_research_vehicles: int = 25
     num_service_vehicles: int = 5
-    num_task_vehicles: int = 25
+    num_task_vehicles: int = 20
     random_seed: int = 4401
     traffic_seed: int = 4401
 

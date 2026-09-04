@@ -60,6 +60,149 @@ def get_config_value(config: dict[str, Any], dotted_key: str, default: Any = Non
     return current
 
 
+def _node_positions_path(config: dict[str, Any]) -> Path:
+    project_root = Path(
+        config.get("_meta", {}).get("project_root", find_project_root())
+    )
+    value = get_config_value(config, "paths.node_positions")
+    if not value:
+        raise ValueError("缺少路径配置：paths.node_positions")
+    return resolve_path(project_root, value)
+
+
+def _normalise_node_position(node_id: str, value: Any) -> list[float]:
+    """兼容旧数组格式，并读取新 JSON 中的 position 字段。"""
+
+    if isinstance(value, dict):
+        value = value.get("position")
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(
+            f"node_positions.json 的 {node_id} 位置必须是 [x, y, z]。"
+        )
+    try:
+        position = [float(component) for component in value]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"node_positions.json 的 {node_id} 位置必须全部是数值。"
+        ) from exc
+    if not all(math.isfinite(component) for component in position):
+        raise ValueError(f"node_positions.json 的 {node_id} 位置不能是 NaN/Inf。")
+    return position
+
+
+def load_node_positions(config: dict[str, Any]) -> dict[str, Any]:
+    """读取并校验由 scenario.node_placement 生成的节点位置文件。"""
+
+    positions_path = _node_positions_path(config)
+    with positions_path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError("node_positions.json 根对象必须是 object。")
+
+    raw_boundary = payload.get("network_boundary")
+    if not isinstance(raw_boundary, dict):
+        network_metadata = payload.get("network")
+        if isinstance(network_metadata, dict):
+            raw_boundary = network_metadata.get("boundary")
+    if not isinstance(raw_boundary, dict):
+        raise ValueError("node_positions.json 缺少 network_boundary。")
+    required_boundary_keys = ("min_x", "max_x", "min_y", "max_y")
+    if any(key not in raw_boundary for key in required_boundary_keys):
+        raise ValueError(
+            "node_positions.json 的 network_boundary 必须包含 min_x/max_x/min_y/max_y。"
+        )
+    boundary = {
+        key: float(raw_boundary[key])
+        for key in required_boundary_keys
+    }
+    if not all(math.isfinite(value) for value in boundary.values()):
+        raise ValueError("node_positions.json 的 network_boundary 不能是 NaN/Inf。")
+    if boundary["min_x"] >= boundary["max_x"] or boundary["min_y"] >= boundary["max_y"]:
+        raise ValueError("node_positions.json 的 network_boundary 非法。")
+
+    positions: dict[str, Any] = {"network_boundary": boundary}
+    for role in ("rsu", "uav"):
+        raw_nodes = payload.get(role)
+        if not isinstance(raw_nodes, dict):
+            raise ValueError(f"node_positions.json 缺少 {role} 节点位置表。")
+        normalised: dict[str, list[float]] = {}
+        for raw_id, raw_position in raw_nodes.items():
+            node_id = str(raw_id)
+            position = _normalise_node_position(node_id, raw_position)
+            x, y = position[:2]
+            if not (
+                boundary["min_x"] <= x <= boundary["max_x"]
+                and boundary["min_y"] <= y <= boundary["max_y"]
+            ):
+                raise ValueError(f"{node_id} 坐标超出 SUMO 路网区域：{position}")
+            normalised[node_id] = position
+        positions[role] = normalised
+    return positions
+
+
+def _materialise_node_instances(config: dict[str, Any]) -> None:
+    """将 JSON 位置转换为现有模块使用的 nodes.*.instances 结构。"""
+
+    positions = load_node_positions(config)
+    nodes = config.get("nodes")
+    if not isinstance(nodes, dict):
+        raise ValueError("缺少 nodes 配置表。")
+
+    for role, prefix, x_key, y_key, z_key, altitude_key in (
+        ("rsu", "RSU", "x_m", "y_m", "z_m", "deployment_altitude_m"),
+        (
+            "uav",
+            "UAV",
+            "initial_x_m",
+            "initial_y_m",
+            "initial_z_m",
+            "deployment_altitude_m",
+        ),
+    ):
+        count_value = get_config_value(config, f"nodes.{role}.count")
+        if (
+            count_value is None
+            or isinstance(count_value, bool)
+            or int(count_value) != count_value
+            or int(count_value) < 1
+        ):
+            raise ValueError(f"nodes.{role}.count 必须是正整数。")
+        count = int(count_value)
+        expected_ids = [f"{prefix}_{index}" for index in range(count)]
+        role_positions = positions[role]
+        if set(role_positions) != set(expected_ids):
+            raise ValueError(
+                f"node_positions.json 的 {role} IDs 必须与 nodes.{role}.count 一致。"
+            )
+        instances = []
+        expected_altitude = get_config_value(
+            config,
+            f"nodes.{role}.{altitude_key}",
+        )
+        if expected_altitude is None:
+            raise ValueError(f"缺少配置项：nodes.{role}.{altitude_key}")
+        expected_altitude = float(expected_altitude)
+        for node_id in expected_ids:
+            x, y, z = role_positions[node_id]
+            if not math.isclose(z, expected_altitude, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError(
+                    f"{node_id} 高度 {z} 与配置 nodes.{role}.{altitude_key} "
+                    f"={expected_altitude} 不一致。"
+                )
+            instances.append(
+                {
+                    "id": node_id,
+                    x_key: x,
+                    y_key: y,
+                    z_key: z,
+                }
+            )
+        node_config = nodes.get(role)
+        if not isinstance(node_config, dict):
+            raise ValueError(f"缺少 nodes.{role} 配置表。")
+        node_config["instances"] = instances
+
+
 def parse_override_value(raw: str) -> Any:
     lowered = raw.strip().lower()
     if lowered == "true":
@@ -289,6 +432,7 @@ def validate_config(config: dict[str, Any]) -> None:
     config.setdefault("_meta", {})
     config["_meta"].setdefault("project_root", str(project_root))
 
+    _materialise_node_instances(config)
     _walk_numbers(config)
 
     service_count_value = get_config_value(config, "service.count")
@@ -625,6 +769,9 @@ def validate_config(config: dict[str, Any]) -> None:
         "nodes.sv.bandwidth_hz",
         "nodes.rsu.bandwidth_hz",
         "nodes.uav.bandwidth_hz",
+        "nodes.rsu.deployment_altitude_m",
+        "nodes.uav.deployment_altitude_m",
+        "nodes.uav.deployment_offset_fraction",
         "communication.ground.bandwidth_hz",
         "communication.air.eta1",
         "communication.air.eta2",
@@ -695,6 +842,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "paths.vehicle_roles",
         "paths.prediction_scenarios",
         "paths.sumo_net",
+        "paths.node_positions",
         "paths.popularity_gru",
         "paths.tv_local_cache",
     ):
