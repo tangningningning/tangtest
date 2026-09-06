@@ -3,7 +3,7 @@
 """Trigger-conditioned cache configuration optimization.
 
 本阶段只解决：给定上一时隙缓存状态、cache trigger 和预测场景后，选择新的
-动态缓存配置。预测候选复用实际执行侧的 Matching/KKT、Cloud 共享和队列模型，
+动态缓存配置。预测候选复用实际执行侧的 Matching/KKT 和固定每任务 Cloud 模型，
 但不训练 PPO，也不读取任何未来真实 trajectory/tasks/popularity 标签；正式
 episode 初始缓存只使用 service catalog 中的 service size、节点容量和显式 seed。
 """
@@ -54,7 +54,7 @@ class CacheOptimizationConfig:
     sv_cpu_cycles_per_s: float
     rsu_cpu_cycles_per_s: float
     uav_cpu_cycles_per_s: float
-    # 保留旧 Cloud 标量用于兼容；正式执行统一使用下方单节点总容量。
+    # Cloud 两组字段保持兼容，但正式语义是每任务固定资源。
     cloud_cpu_cycles_per_s: float
     cloud_total_cpu_cycles_per_s: float
     local_energy_per_cycle_j: float
@@ -72,28 +72,23 @@ class CacheOptimizationConfig:
     air_beta_nlos: float
     air_alpha_los: float
     air_alpha_nlos: float
-    # 保留旧 Cloud 链路标量用于兼容；正式执行统一使用下方单节点总上行带宽。
+    # Cloud 两组字段保持兼容，但正式语义是每任务固定等效上行速率。
     cloud_uplink_rate_bps: float
     cloud_total_bandwidth_bps: float
     cloud_delay_factor: float
+    cloud_resource_sharing: bool
     sv_range_m: float
     rsu_range_m: float
     uav_range_m: float
     tolerance: float
     max_coordinate_rounds: int
     initial_cache_seed: int
-    slot_duration_s: float
-    cross_slot_task_model: str
     matching_max_updates: int
     matching_objective_tolerance: float
     kkt_min_cpu_fraction: float
     kkt_min_bandwidth_fraction: float
     kkt_bisection_tolerance: float
     kkt_max_bisection_iterations: int
-    # 仅供分析的开关。正式配置固定为单 Cloud 有限共享；False 只用于复现旧的
-    # 每任务独占标量资源口径，不改变 system_config.toml。
-    cloud_resource_sharing: bool = True
-
     def validate(self) -> None:
         values = [
             self.num_rsu,
@@ -114,7 +109,6 @@ class CacheOptimizationConfig:
             self.noise_power_w,
             self.max_coordinate_rounds,
             self.matching_max_updates,
-            self.slot_duration_s,
             self.kkt_min_cpu_fraction,
             self.kkt_min_bandwidth_fraction,
             self.kkt_bisection_tolerance,
@@ -130,8 +124,13 @@ class CacheOptimizationConfig:
             raise ValueError("RSU instance 数量必须等于 num_rsu。")
         if self.num_uav != len(self.uav_instances):
             raise ValueError("UAV instance 数量必须等于 num_uav。")
-        if self.cross_slot_task_model != "deterministic_batch_fifo":
-            raise ValueError("仅支持 execution.cross_slot_task_model=deterministic_batch_fifo。")
+        if not isinstance(self.cloud_resource_sharing, bool):
+            raise ValueError("cloud_resource_sharing 必须是显式 bool。")
+        if self.cloud_resource_sharing:
+            raise ValueError(
+                "当前正式模型要求 Cloud 固定每任务资源，"
+                "cloud_resource_sharing 必须为 false。"
+            )
 
 
 DEFAULT_CONFIG: CacheOptimizationConfig | None = None
@@ -156,6 +155,12 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         )
         for item in get(config, "nodes.uav.instances", [])
     )
+    cloud_resource_sharing = get(config, "nodes.cloud.resource_sharing")
+    if not isinstance(cloud_resource_sharing, bool):
+        raise ValueError(
+            "缺少或非法的 nodes.cloud.resource_sharing；"
+            "正式模型不允许静默回退到 Cloud 共享资源。"
+        )
     return CacheOptimizationConfig(
         num_rsu=int(get(config, "nodes.rsu.count")),
         num_uav=int(get(config, "nodes.uav.count")),
@@ -200,14 +205,13 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         cloud_uplink_rate_bps=float(get(config, "nodes.cloud.uplink_rate_bps")),
         cloud_total_bandwidth_bps=float(get(config, "nodes.cloud.total_bandwidth_bps")),
         cloud_delay_factor=float(get(config, "nodes.cloud.cloud_delay_factor")),
+        cloud_resource_sharing=cloud_resource_sharing,
         sv_range_m=float(get(config, "nodes.sv.range_m")),
         rsu_range_m=float(get(config, "nodes.rsu.range_m")),
         uav_range_m=float(get(config, "nodes.uav.range_m")),
         tolerance=float(get(config, "algorithm.cache.tolerance")),
         max_coordinate_rounds=int(get(config, "algorithm.cache.max_coordinate_rounds")),
         initial_cache_seed=int(get(config, "experiment.seed")),
-        slot_duration_s=float(get(config, "simulation.dt_s")),
-        cross_slot_task_model=str(get(config, "execution.cross_slot_task_model")),
         matching_max_updates=int(get(config, "algorithm.matching.max_updates")),
         matching_objective_tolerance=float(
             get(config, "algorithm.matching.objective_tolerance")
@@ -428,7 +432,6 @@ class SurrogateEvaluationContext:
     node_roles: tuple[str, ...]
     node_ids: tuple[str, ...]
     local_cache_state: dict[str, frozenset[int]]
-    initial_queue_workload_s: dict[str, float]
     matching_project_config: dict[str, Any]
     configuration_utility_cache: dict[tuple[bytes, tuple[tuple[str, float, float], ...]], float] = field(
         default_factory=dict
@@ -470,7 +473,6 @@ def build_surrogate_evaluation_context(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
-    queue_workload_s: dict[str, float] | None = None,
 ) -> SurrogateEvaluationContext:
     """把预测切片整理成与实际执行模型一致的并发任务批次。"""
 
@@ -515,7 +517,7 @@ def build_surrogate_evaluation_context(
                 )
                 events.append(event)
                 batch_events.append(event)
-            # 即使当前预测步没有任务，也保留空批次以正确衰减跨时隙队列。
+            # 即使当前预测步没有任务，也保留空批次以保持预测时域结构。
             # 实际执行侧需要同一预测步内全部研究车辆的位置，其中 SV 位置
             # 用于构造移动边缘节点，TV 位置用于无线链路计算。
             positions = {
@@ -550,10 +552,6 @@ def build_surrogate_evaluation_context(
         local_cache_state={
             str(vehicle_id): frozenset(int(service_id) for service_id in services)
             for vehicle_id, services in local_cache_state.items()
-        },
-        initial_queue_workload_s={
-            str(node_id): float(value)
-            for node_id, value in (queue_workload_s or {}).items()
         },
         matching_project_config=_matching_project_config(config),
     )
@@ -594,10 +592,6 @@ def evaluate_surrogate_context(
         for node_id, x_m, y_m in uav_positions
     }
     total = 0.0
-    scenario_queues = {
-        scenario_index: dict(context.initial_queue_workload_s)
-        for scenario_index in range(context.num_scenarios)
-    }
     for batch in context.batches:
         tasks = [
             task_allocation.Task(
@@ -623,7 +617,6 @@ def evaluate_surrogate_context(
             context.matching_project_config,
             cache_nodes,
             config,
-            queue_workload_s=scenario_queues[batch.scenario_index],
         )
         if not result.resource_feasible:
             raise AssertionError(
@@ -631,12 +624,6 @@ def evaluate_surrogate_context(
                 f"scenario={batch.scenario_index}, horizon={batch.horizon}"
             )
         total += batch.discount * float(result.task_utility_sum)
-        scenario_queues[batch.scenario_index] = task_allocation.advance_queue_workload(
-            scenario_queues[batch.scenario_index],
-            result.matching,
-            result.per_task_delay_s,
-            config.slot_duration_s,
-        )
     utility = float(total / max(context.num_scenarios, 1))
     context.configuration_utility_cache[cache_key] = utility
     return utility

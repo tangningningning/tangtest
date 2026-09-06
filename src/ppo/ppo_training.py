@@ -206,7 +206,6 @@ class RolloutSanitySummary:
     step_count: int
     final_cache_state: np.ndarray
     final_uav_positions: dict[str, tuple[float, float]]
-    final_queue_workload_s: dict[str, float]
     truncated: bool
     true_terminal: bool
 
@@ -227,7 +226,6 @@ class BoundedTrainingSanityResult:
     rollout_origins_continuous_non_overlapping: bool
     rollout_2_first_cache_matches_rollout_1_final: bool | None
     rollout_2_first_uav_matches_rollout_1_final: bool | None
-    rollout_2_first_queue_matches_rollout_1_final: bool | None
     reward_is_system_utility: bool
     repeated_bounded_sanity_deterministic: bool | None
     formal_validation: bool
@@ -4105,9 +4103,6 @@ def _build_context(config_path: str) -> TrainingSanityContext:
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
-        task_vehicle_ids=[
-            str(value) for value in first_origin["task_vehicle_ids"].tolist()
-        ],
     )
     gamma, gae_lambda = ppo_rollout.ppo_gae_config_from_project(cfg)
     initial_cache = cache_configuration.popularity_aware_initial_cache(
@@ -8174,7 +8169,6 @@ def evaluate_formal_episode(
         str(uav_id): (float(np.asarray(xy)[0]), float(np.asarray(xy)[1]))
         for uav_id, xy in ctx.initial_uav.items()
     }
-    previous_queue: dict[str, float] = {}
     cache_trigger_counts = {label: 0 for label in ctx.action_spec.labels[: len(ctx.action_spec.cache_node_ids)]}
     uav_trigger_counts = {label: 0 for label in ctx.action_spec.labels[len(ctx.action_spec.cache_node_ids) :]}
     rewards: list[float] = []
@@ -8204,8 +8198,6 @@ def evaluate_formal_episode(
                 step.predicted_service_popularity,
                 ctx.observation_spec,
                 ctx.flight_boundary,
-                queue_workload_s=previous_queue,
-                queue_time_ref_s=ctx.cache_cfg.time_ref_s,
             )
             action_mask_provider = ppo_rollout.build_trigger_action_mask_provider(
                 previous_cache,
@@ -8237,7 +8229,6 @@ def evaluate_formal_episode(
                 ctx.flight_boundary,
                 slot_id=step.slot,
                 time_s=step.time_s,
-                previous_queue_workload_s=previous_queue,
             )
             if not result.step_feasible:
                 all_steps_feasible = False
@@ -8308,7 +8299,6 @@ def evaluate_formal_episode(
                 uav_trigger_counts[ctx.action_spec.labels[cache_count + uav_index]] += int(sample.uav_triggers[uav_id])
             previous_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
             previous_uav = dict(result.next_uav_positions or {})
-            previous_queue = dict(result.next_queue_workload_s or {})
 
     cumulative_g = float(math.fsum(rewards))
     actual_q_sum = float(math.fsum(actual_q_values))
@@ -8532,7 +8522,6 @@ def _collect_rollout(
     initial_uav: dict[str, Any],
     policy_version: int,
     rollout_index: int,
-    initial_queue_workload_s: dict[str, float] | None = None,
 ) -> tuple[ppo_rollout.RolloutBatch, RolloutSanitySummary]:
     steps = _aligned_steps(ctx, origin_start_index)
     batch = ppo_rollout.collect_on_policy_rollout(
@@ -8551,7 +8540,6 @@ def _collect_rollout(
         ctx.gamma,
         ctx.gae_lambda,
         ctx.terminal_slot,
-        initial_queue_workload_s=initial_queue_workload_s,
     )
     transitions = batch.transitions
     rewards = [float(item.reward) for item in transitions]
@@ -8572,7 +8560,6 @@ def _collect_rollout(
         step_count=len(transitions),
         final_cache_state=transitions[-1].next_cache_state.copy(),
         final_uav_positions=dict(transitions[-1].next_uav_positions),
-        final_queue_workload_s=dict(transitions[-1].next_queue_workload_s),
         truncated=batch.truncated,
         true_terminal=bool(batch.metadata["true_terminal"]),
     )
@@ -8715,7 +8702,6 @@ def _run_once(config_path: str) -> BoundedTrainingSanityResult:
     update2 = None
     cache_continuity = None
     uav_continuity = None
-    queue_continuity = None
     if not rollout1.true_terminal:
         if rollout_count >= SANITY_MAX_ROLLOUTS:
             raise RuntimeError("rollout 硬上限已达。")
@@ -8728,7 +8714,6 @@ def _run_once(config_path: str) -> BoundedTrainingSanityResult:
             rollout1.final_uav_positions,
             policy_version,
             2,
-            rollout1.final_queue_workload_s,
         )
         rollout_count += 1
         environment_step_count += rollout2.step_count
@@ -8749,21 +8734,6 @@ def _run_once(config_path: str) -> BoundedTrainingSanityResult:
             ]
         )
         uav_continuity = bool(np.allclose(uav_features, expected_uav, atol=1e-6, rtol=0.0))
-        queue_features = first_obs[ctx.observation_spec.queue_workload_slice].astype(np.float64)
-        expected_queue = np.asarray(
-            [
-                float(rollout1.final_queue_workload_s.get(node_id, 0.0))
-                / (
-                    float(rollout1.final_queue_workload_s.get(node_id, 0.0))
-                    + float(ctx.cache_cfg.time_ref_s)
-                )
-                for node_id in ctx.observation_spec.execution_node_ids
-            ],
-            dtype=np.float64,
-        )
-        queue_continuity = bool(
-            np.allclose(queue_features, expected_queue, atol=1e-6, rtol=0.0)
-        )
         update2 = _single_update(policy, optimizer, batch2, training_cfg, policy_version, optimizer_step_count)
         optimizer_step_count = update2.optimizer_step_count_after
         policy_version = update2.policy_version_after
@@ -8790,7 +8760,6 @@ def _run_once(config_path: str) -> BoundedTrainingSanityResult:
         rollout_origins_continuous_non_overlapping=origins_ok,
         rollout_2_first_cache_matches_rollout_1_final=cache_continuity,
         rollout_2_first_uav_matches_rollout_1_final=uav_continuity,
-        rollout_2_first_queue_matches_rollout_1_final=queue_continuity,
         reward_is_system_utility=True,
         repeated_bounded_sanity_deterministic=None,
         formal_validation=True,
@@ -8861,7 +8830,6 @@ def _rollout_summary(rollout: RolloutSanitySummary | None) -> dict[str, Any] | N
         "actual_q_sum": rollout.actual_q_sum,
         "cache_cost_sum": rollout.cache_cost_sum,
         "movement_cost_sum": rollout.movement_cost_sum,
-        "final_queue_workload_s": dict(rollout.final_queue_workload_s),
         "truncated": rollout.truncated,
         "true_terminal": rollout.true_terminal,
     }
@@ -8889,7 +8857,6 @@ def _summary(result: BoundedTrainingSanityResult) -> dict[str, Any]:
         "rollout_origins_continuous_non_overlapping": result.rollout_origins_continuous_non_overlapping,
         "rollout_2_first_cache_matches_rollout_1_final": result.rollout_2_first_cache_matches_rollout_1_final,
         "rollout_2_first_uav_matches_rollout_1_final": result.rollout_2_first_uav_matches_rollout_1_final,
-        "rollout_2_first_queue_matches_rollout_1_final": result.rollout_2_first_queue_matches_rollout_1_final,
         "reward_is_system_utility": result.reward_is_system_utility,
         "repeated_bounded_sanity_deterministic": result.repeated_bounded_sanity_deterministic,
         "formal_validation": result.formal_validation,

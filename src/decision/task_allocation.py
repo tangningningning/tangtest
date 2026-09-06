@@ -6,7 +6,7 @@
 默认 candidate 路径使用 affected-node incremental evaluator；
 ``evaluate_matching_candidate()`` 保留为 full-recompute reference，二者都求
 KKT 连续资源分配和 ``J(mu)=sum_v Q_v``。本模块不实现 PPO、不扣 Cache/UAV configuration cost、
-不读取 prediction_scenarios 作为调度输入。
+不读取 prediction_scenarios 作为调度输入；每个 slot 的任务独立完成评价。
 
 Local 在 Matching 层用 ``LOCAL:<vehicle_id>`` 表示任务车辆自身本地执行，
 避免把 Local 错误建模成多个任务共享的公共节点。调用 KKT evaluator 前，
@@ -63,49 +63,6 @@ def local_target(task_id: str) -> str:
     return f"{LOCAL_PREFIX}{task_id}"
 
 
-def advance_queue_workload(
-    previous_workload_s: dict[str, float] | None,
-    matching: dict[str, str],
-    per_task_delay_s: dict[str, float],
-    slot_duration_s: float,
-) -> dict[str, float]:
-    """按批次 FIFO 语义推进各执行节点的剩余工作时间。
-
-    同一时隙分配到同一节点的任务按照 KKT 结果并发执行；该批次在最慢任务
-    完成后释放节点。上一时隙遗留工作先形成共同等待时间，经过一个 slot 后
-    将剩余秒数传递给下一时隙。
-    """
-
-    duration = float(slot_duration_s)
-    if not math.isfinite(duration) or duration <= 0.0:
-        raise ValueError("slot_duration_s 必须为正 finite 秒数。")
-    previous = {
-        str(node_id): float(value)
-        for node_id, value in (previous_workload_s or {}).items()
-    }
-    if any(not math.isfinite(value) or value < 0.0 for value in previous.values()):
-        raise ValueError("previous_workload_s 必须是非负 finite 秒数。")
-    if set(matching) != set(per_task_delay_s):
-        raise ValueError("matching 与 per_task_delay_s 的任务集合必须一致。")
-
-    next_workload = {
-        node_id: max(0.0, value - duration)
-        for node_id, value in previous.items()
-    }
-    completion_by_node: dict[str, float] = {}
-    for task_id, target in matching.items():
-        delay = float(per_task_delay_s[task_id])
-        if not math.isfinite(delay) or delay < 0.0:
-            raise ValueError("per_task_delay_s 必须是非负 finite 秒数。")
-        completion_by_node[target] = max(completion_by_node.get(target, 0.0), delay)
-    for node_id, completion_s in completion_by_node.items():
-        next_workload[node_id] = max(
-            next_workload.get(node_id, 0.0),
-            max(0.0, completion_s - duration),
-        )
-    return next_workload
-
-
 def _stable_id_key(value: str) -> tuple[int, int | str]:
     text = str(value)
     return (0, int(text)) if text.isdigit() else (1, text)
@@ -127,24 +84,58 @@ def build_feasible_targets(
     local_cache_state: dict[str, set[int]],
     edge_cache_state: np.ndarray,
     cache_nodes: dict[str, Any],
+    vehicle_positions: dict[str, np.ndarray] | None = None,
+    service_node_positions: dict[str, np.ndarray] | None = None,
+    cache_config: cache_configuration.CacheOptimizationConfig | None = None,
 ) -> dict[str, list[str]]:
-    """按 11.pdf 缓存可用性构造 N_v^fea，不使用 surrogate range。"""
+    """按缓存可用性和当前物理路径构造 N_v^fea。
+
+    正式实际/预测调用必须提供 vehicle_positions、service_node_positions 和
+    cache_config；若某个缓存边缘节点缺少当前位置、角色、正带宽/CPU 或正信道
+    速率，则该节点不进入 M_edge，Cloud 作为后备节点保留。旧的纯集合 sanity
+    调用可以省略物理上下文，此时只检查 cache node 的结构存在性。
+    """
 
     edge_cache = np.asarray(edge_cache_state, dtype=np.int8)
     node_ids = [str(value) for value in cache_nodes["node_ids"]]
     if edge_cache.shape[0] != len(node_ids):
         raise ValueError("edge_cache_state node维度与cache_nodes不一致。")
+    physical_context = (
+        vehicle_positions is not None
+        or service_node_positions is not None
+        or cache_config is not None
+    )
+    if physical_context and (
+        vehicle_positions is None
+        or service_node_positions is None
+        or cache_config is None
+    ):
+        raise ValueError(
+            "正式 Cloud 候选门控必须同时提供车辆位置、服务节点位置和 cache_config。"
+        )
     feasible: dict[str, list[str]] = {}
     for task in sorted(tasks, key=lambda item: _stable_id_key(item.task_id)):
         targets: list[str] = []
         if task.service_id in local_cache_state.get(task.vehicle_id, set()):
             targets.append(local_target(task.task_id))
+        edge_targets: list[str] = []
         for node_index, node_id in enumerate(node_ids):
-            if int(edge_cache[node_index, task.service_id]) == 1:
-                targets.append(node_id)
-        targets.append(CLOUD)
-        if CLOUD not in targets:
-            raise AssertionError("CLOUD 必须始终属于 feasible targets。")
+            if int(edge_cache[node_index, task.service_id]) != 1:
+                continue
+            if physical_context and not _edge_path_is_feasible(
+                task,
+                node_id,
+                vehicle_positions,
+                service_node_positions,
+                cache_nodes,
+                cache_config,
+            ):
+                continue
+            edge_targets.append(node_id)
+        if edge_targets:
+            targets.extend(edge_targets)
+        else:
+            targets.append(CLOUD)
         feasible[task.task_id] = targets
     return feasible
 
@@ -170,7 +161,6 @@ def evaluate_matching_candidate(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
-    queue_workload_s: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
     """薄 adapter：Matching层 LOCAL:v -> KKT层 LOCAL。"""
 
@@ -182,7 +172,6 @@ def evaluate_matching_candidate(
         project_cfg,
         cache_nodes,
         cache_config,
-        queue_workload_s=queue_workload_s,
     )
 
 
@@ -236,7 +225,6 @@ def enumerate_best_operation(
     tolerance: float,
     evaluate_only: bool = False,
     evaluation_mode: str = "incremental",
-    queue_workload_s: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
     """枚举全部合法transfer/exchange，返回本轮最大增益候选。"""
 
@@ -269,7 +257,6 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
-                    queue_workload_s=queue_workload_s,
                 )
             else:
                 evaluation = evaluate_matching_candidate_incremental(
@@ -283,7 +270,6 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
-                    queue_workload_s=queue_workload_s,
                 )
             stats["candidate_evaluations_total"] += 1
             stats["transfer_candidates_evaluated"] += 1
@@ -325,7 +311,6 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
-                    queue_workload_s=queue_workload_s,
                 )
             else:
                 evaluation = evaluate_matching_candidate_incremental(
@@ -339,7 +324,6 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
-                    queue_workload_s=queue_workload_s,
                 )
             stats["candidate_evaluations_total"] += 1
             stats["exchange_candidates_evaluated"] += 1
@@ -384,11 +368,15 @@ def _resource_constraints_ok(
     eps_b = float(project_config.get_config_value(project_cfg, "algorithm.kkt.min_bandwidth_fraction"))
     tol = 1e-8
     for node_id, values in evaluation.cpu_allocations.items():
+        if node_id == CLOUD:
+            continue
         if sum(values.values()) > 1.0 + tol:
             return False
         if any(value + tol < eps_w for value in values.values()):
             return False
     for node_id, values in evaluation.bandwidth_allocations.items():
+        if node_id == CLOUD:
+            continue
         if sum(values.values()) > 1.0 + tol:
             return False
         if any(value + tol < eps_b for value in values.values()):
@@ -406,9 +394,8 @@ def optimize_task_matching(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     evaluation_mode: str = "incremental",
-    queue_workload_s: dict[str, float] | None = None,
 ) -> TransferExchangeMatchingResult:
-    """在当前缓存、无线状态和显式跨时隙队列下执行稳定匹配。"""
+    """在当前 slot 的缓存和无线状态下执行稳定匹配。"""
 
     if evaluation_mode not in {"full", "incremental"}:
         raise ValueError(f"未知 Matching candidate evaluation mode：{evaluation_mode}")
@@ -441,8 +428,19 @@ def optimize_task_matching(
             feasible_targets={},
         )
 
-    feasible_targets = build_feasible_targets(tasks, local_cache_state, edge_cache_state, cache_nodes)
-    current_matching = {task.task_id: CLOUD for task in tasks}
+    feasible_targets = build_feasible_targets(
+        tasks,
+        local_cache_state,
+        edge_cache_state,
+        cache_nodes,
+        vehicle_positions=vehicle_positions,
+        service_node_positions=service_node_positions,
+        cache_config=cache_config,
+    )
+    current_matching = {
+        task.task_id: feasible_targets[task.task_id][0]
+        for task in tasks
+    }
     current_eval = evaluate_matching_candidate(
         tasks,
         current_matching,
@@ -451,10 +449,9 @@ def optimize_task_matching(
         project_cfg,
         cache_nodes,
         cache_config,
-        queue_workload_s=queue_workload_s,
     )
     if not current_eval.resource_feasible:
-        raise AssertionError("全Cloud初始matching应资源可行。")
+        raise AssertionError("Cloud门控后的初始matching应资源可行。")
 
     counters = {
         "candidate_evaluations_total": 0,
@@ -482,7 +479,6 @@ def optimize_task_matching(
             cache_config,
             tolerance,
             evaluation_mode=evaluation_mode,
-            queue_workload_s=queue_workload_s,
         )
         for key, value in stats.items():
             counters[key] += value
@@ -525,7 +521,6 @@ def optimize_task_matching(
             tolerance,
             evaluate_only=True,
             evaluation_mode=evaluation_mode,
-            queue_workload_s=queue_workload_s,
         )
         # 复检也是候选评价的一部分，便于复杂度记录。
         for key, value in check_stats.items():
@@ -571,16 +566,27 @@ def operation_generation_sanity() -> dict[str, bool]:
     """极小操作语义检查，不跑KKT，不伪造物理参数。"""
 
     feasible = {
-        "12": ["LOCAL:12", "EDGE_A", CLOUD],
-        "30": ["LOCAL:30", "EDGE_A", CLOUD],
-        "40": ["EDGE_B", CLOUD],
+        "12": ["LOCAL:12", "EDGE_A"],
+        "30": ["LOCAL:30", "EDGE_A"],
+        "40": ["LOCAL:40", CLOUD],
     }
     checks = {
         "edge_edge_swap": "EDGE_B" in feasible["12"] if False else True,
         "local_v_not_for_j": "LOCAL:12" not in feasible["30"],
         "local_local_swap_infeasible": ("LOCAL:30" not in feasible["12"] and "LOCAL:12" not in feasible["30"]),
         "identical_target_skipped": True,
-        "cloud_edge_feasible_by_set": ("EDGE_A" in feasible["30"] and CLOUD in feasible["12"]),
+        "no_edge_cache_uses_cloud": feasible["40"] == ["LOCAL:40", CLOUD],
+        "edge_cache_suppresses_cloud": (
+            "EDGE_A" in feasible["12"]
+            and "EDGE_A" in feasible["30"]
+            and CLOUD not in feasible["12"]
+            and CLOUD not in feasible["30"]
+        ),
+        "local_candidate_coexists_without_cloud": (
+            "LOCAL:12" in feasible["12"]
+            and "EDGE_A" in feasible["12"]
+            and CLOUD not in feasible["12"]
+        ),
     }
     return checks
 
@@ -645,7 +651,19 @@ def run_slot20_validation(config_path: str = "system_config.toml") -> dict[str, 
         evaluation_mode="incremental",
     )
     result = incremental_result
-    initial_matching = {task.task_id: CLOUD for task in tasks}
+    initial_targets = build_feasible_targets(
+        tasks,
+        local_cache,
+        edge_cache_state,
+        cache_nodes,
+        vehicle_positions=actual_positions,
+        service_node_positions=service_positions,
+        cache_config=cache_cfg,
+    )
+    initial_matching = {
+        task.task_id: initial_targets[task.task_id][0]
+        for task in tasks
+    }
     initial_eval = evaluate_matching_candidate(
         tasks,
         initial_matching,
@@ -753,69 +771,76 @@ def run_slot20_validation(config_path: str = "system_config.toml") -> dict[str, 
     if len(controlled_pairs) >= 2:
         first_task, first_edge = controlled_pairs[0]
         second_task, second_edge = controlled_pairs[1]
-        controlled_current_matching = {task.task_id: CLOUD for task in tasks}
+        controlled_current_matching = dict(initial_matching)
         controlled_current_matching[first_task.task_id] = first_edge
         controlled_current_matching[second_task.task_id] = second_edge
-        controlled_candidate_matching = dict(controlled_current_matching)
-        controlled_candidate_matching[first_task.task_id] = CLOUD
-        controlled_current_evaluation = evaluate_matching_candidate(
-            tasks,
-            controlled_current_matching,
-            actual_positions,
-            service_positions,
-            cfg,
-            cache_nodes,
-            cache_cfg,
-        )
-        controlled_full_evaluation = evaluate_matching_candidate(
-            tasks,
-            controlled_candidate_matching,
-            actual_positions,
-            service_positions,
-            cfg,
-            cache_nodes,
-            cache_cfg,
-        )
-        controlled_incremental_evaluation = evaluate_matching_candidate_incremental(
-            tasks,
-            controlled_current_matching,
-            controlled_current_evaluation,
-            controlled_candidate_matching,
-            [first_task.task_id],
-            actual_positions,
-            service_positions,
-            cfg,
-            cache_nodes,
-            cache_cfg,
-        )
-        if not controlled_full_evaluation.resource_feasible:
-            raise AssertionError(
-                "dynamic multi-task edge candidate 不可行："
-                f"{controlled_full_evaluation.infeasible_reason}"
+        fallback_targets = [
+            target
+            for target in initial_targets[first_task.task_id]
+            if target != first_edge
+        ]
+        if fallback_targets:
+            controlled_candidate_matching = dict(controlled_current_matching)
+            controlled_candidate_matching[first_task.task_id] = fallback_targets[0]
+            controlled_current_evaluation = evaluate_matching_candidate(
+                tasks,
+                controlled_current_matching,
+                actual_positions,
+                service_positions,
+                cfg,
+                cache_nodes,
+                cache_cfg,
             )
-        if not controlled_incremental_evaluation.resource_feasible:
-            raise AssertionError("dynamic multi-task incremental candidate 不可行。")
-        multi_task_differences = _assert_evaluation_equivalent(
-            controlled_full_evaluation,
-            controlled_incremental_evaluation,
-            "dynamic multi-task edge candidate",
-        )
-        multi_task_rsu_case = {
-            "tested": True,
-            "current_matching": controlled_current_matching,
-            "candidate_matching": controlled_candidate_matching,
-            "first_edge": first_edge,
-            "second_edge": second_edge,
-            "full_J": controlled_full_evaluation.task_utility_sum,
-            "incremental_J": controlled_incremental_evaluation.task_utility_sum,
-            "J_diff": multi_task_differences["J_diff"],
-            "full_incremental_equal": True,
-            "max_allocation_diff": max(
-                multi_task_differences["CPU_max_diff"],
-                multi_task_differences["BW_max_diff"],
-            ),
-            "evaluation_differences": multi_task_differences,
-        }
+            controlled_full_evaluation = evaluate_matching_candidate(
+                tasks,
+                controlled_candidate_matching,
+                actual_positions,
+                service_positions,
+                cfg,
+                cache_nodes,
+                cache_cfg,
+            )
+            controlled_incremental_evaluation = evaluate_matching_candidate_incremental(
+                tasks,
+                controlled_current_matching,
+                controlled_current_evaluation,
+                controlled_candidate_matching,
+                [first_task.task_id],
+                actual_positions,
+                service_positions,
+                cfg,
+                cache_nodes,
+                cache_cfg,
+            )
+            if not controlled_full_evaluation.resource_feasible:
+                raise AssertionError(
+                    "dynamic multi-task edge candidate 不可行："
+                    f"{controlled_full_evaluation.infeasible_reason}"
+                )
+            if not controlled_incremental_evaluation.resource_feasible:
+                raise AssertionError("dynamic multi-task incremental candidate 不可行。")
+            multi_task_differences = _assert_evaluation_equivalent(
+                controlled_full_evaluation,
+                controlled_incremental_evaluation,
+                "dynamic multi-task edge candidate",
+            )
+            multi_task_rsu_case = {
+                "tested": True,
+                "current_matching": controlled_current_matching,
+                "candidate_matching": controlled_candidate_matching,
+                "first_edge": first_edge,
+                "second_edge": second_edge,
+                "fallback_target": fallback_targets[0],
+                "full_J": controlled_full_evaluation.task_utility_sum,
+                "incremental_J": controlled_incremental_evaluation.task_utility_sum,
+                "J_diff": multi_task_differences["J_diff"],
+                "full_incremental_equal": True,
+                "max_allocation_diff": max(
+                    multi_task_differences["CPU_max_diff"],
+                    multi_task_differences["BW_max_diff"],
+                ),
+                "evaluation_differences": multi_task_differences,
+            }
     task_rows = []
     for task in tasks:
         task_rows.append(
@@ -878,7 +903,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cloud-resource-sharing-audit",
         action="store_true",
-        help="写出 analysis-only 的单 Cloud 总资源共享审计。",
+        help="写出 analysis-only 的 Cloud 固定每任务资源审计。",
     )
     return parser
 
@@ -1061,6 +1086,54 @@ def _base_rate(
     )
 
 
+def _edge_path_is_feasible(
+    task: Task,
+    node_id: str,
+    vehicle_positions: dict[str, np.ndarray] | None,
+    service_node_positions: dict[str, np.ndarray] | None,
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig | None,
+) -> bool:
+    """Fail closed for a cached edge node without a usable current path."""
+
+    if vehicle_positions is None or service_node_positions is None or cache_config is None:
+        return False
+    if node_id not in service_node_positions or task.vehicle_id not in vehicle_positions:
+        return False
+    try:
+        role = _edge_node_role(node_id, cache_nodes)
+        if role is None:
+            return False
+        tv_xy = np.asarray(vehicle_positions[task.vehicle_id], dtype=np.float64)
+        node_xy = np.asarray(service_node_positions[node_id], dtype=np.float64)
+        if tv_xy.shape != (2,) or node_xy.shape != (2,):
+            return False
+        if not np.all(np.isfinite(tv_xy)) or not np.all(np.isfinite(node_xy)):
+            return False
+        cpu = _node_cpu(role, cache_config)
+        bandwidth = _node_bandwidth(role, cache_config)
+        gain = _channel_gain(role, tv_xy, node_xy, cache_config)
+        rate = system_model.uplink_rate(
+            bandwidth,
+            1.0,
+            cache_config.tx_power_w,
+            gain,
+            cache_config.noise_power_w,
+        )
+        return (
+            math.isfinite(cpu)
+            and cpu > 0.0
+            and math.isfinite(bandwidth)
+            and bandwidth > 0.0
+            and math.isfinite(gain)
+            and gain > 0.0
+            and math.isfinite(rate)
+            and rate > 0.0
+        )
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def solve_kkt_fraction_allocation(
     coefficients: list[float],
     epsilon: float,
@@ -1134,22 +1207,6 @@ def _group_edge_tasks(
     return grouped
 
 
-def _group_cloud_tasks(
-    tasks: list[Task],
-    matching: dict[str, str],
-) -> list[Task]:
-    """Return the tasks sharing the single Cloud node in this matching."""
-
-    cloud_tasks: list[Task] = []
-    for task in tasks:
-        target = matching.get(task.task_id)
-        if target is None:
-            raise ValueError(f"matching 缺少任务 {task.task_id}")
-        if target == CLOUD:
-            cloud_tasks.append(task)
-    return cloud_tasks
-
-
 def allocate_resources_kkt(
     tasks: list[Task],
     matching: dict[str, str],
@@ -1159,7 +1216,7 @@ def allocate_resources_kkt(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
 ) -> KKTResourceAllocationResult:
-    """给定 matching 后，为 edge 节点分配 w/b，并共享单 Cloud 总资源。"""
+    """给定 matching 后，只为 edge 节点分配 KKT 的 w/b。"""
 
     kkt_cfg = kkt_config_from_project(project_cfg)
     grouped = _group_edge_tasks(tasks, matching, cache_nodes)
@@ -1228,20 +1285,8 @@ def allocate_resources_kkt(
         cpu_mu[node_id] = float(mu)
         bw_nu[node_id] = float(nu)
 
-    cloud_tasks = _group_cloud_tasks(tasks, matching)
-    if cloud_tasks and cache_config.cloud_resource_sharing:
-        cloud_task_count = len(cloud_tasks)
-        cloud_share = 1.0 / cloud_task_count
-        cpu_alloc[CLOUD] = {
-            task.task_id: cloud_share for task in cloud_tasks
-        }
-        bw_alloc[CLOUD] = {
-            task.task_id: cloud_share for task in cloud_tasks
-        }
-        cpu_sums[CLOUD] = 1.0
-        bw_sums[CLOUD] = 1.0
-        cpu_mu[CLOUD] = 0.0
-        bw_nu[CLOUD] = 0.0
+    # Cloud uses fixed per-task resources and is intentionally absent from the
+    # SV/RSU/UAV KKT allocation maps and fraction constraints.
 
     return KKTResourceAllocationResult(
         True,
@@ -1263,9 +1308,8 @@ def evaluate_matching_with_kkt(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
-    queue_workload_s: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
-    """评价给定 matching，并把上一时隙遗留工作量计入任务等待时延。"""
+    """评价当前 slot 的 matching、KKT 资源、完成时延和车辆能耗。"""
 
     if not tasks:
         return KKTMatchingEvaluation(True, "", 0.0, {}, {}, {}, {}, {}, {}, {}, {}, {})
@@ -1300,19 +1344,6 @@ def evaluate_matching_with_kkt(
     per_target: dict[str, str] = {}
     counts: dict[str, int] = {}
     total_utility = 0.0
-    cloud_task_count = (
-        len(_group_cloud_tasks(tasks, matching))
-        if cache_config.cloud_resource_sharing
-        else 1
-    )
-
-    normalized_queue = {
-        str(node_id): float(workload_s)
-        for node_id, workload_s in (queue_workload_s or {}).items()
-    }
-    if any(not math.isfinite(value) or value < 0.0 for value in normalized_queue.values()):
-        raise ValueError("queue_workload_s 必须是非负 finite 秒数。")
-
     for task in tasks:
         target = matching[task.task_id]
         per_target[task.task_id] = target
@@ -1333,7 +1364,6 @@ def evaluate_matching_with_kkt(
                 cache_config.cloud_total_cpu_cycles_per_s,
                 cache_config.cloud_delay_factor,
                 cache_config.tx_power_w,
-                cloud_task_count=cloud_task_count,
             )
             delay = float(result["total_delay_s"])
             energy = float(result["vehicle_energy_j"])
@@ -1356,10 +1386,6 @@ def evaluate_matching_with_kkt(
             )
             delay = float(edge["total_delay_s"])
             energy = float(edge["vehicle_energy_j"])
-        # Local 资源按任务车辆区分；公共 edge/Cloud 直接使用执行节点 ID。
-        queue_target = local_target(task.task_id) if target == LOCAL else target
-        queue_wait_s = float(normalized_queue.get(queue_target, 0.0))
-        delay += queue_wait_s
         utility = float(
             system_model.task_utility(
                 delay,
@@ -1402,7 +1428,6 @@ def evaluate_matching_candidate_incremental(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
-    queue_workload_s: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
     """只重算 candidate 受影响 edge nodes，返回完整 KKT matching evaluation。"""
 
@@ -1420,11 +1445,12 @@ def evaluate_matching_candidate_incremental(
         raise ValueError("affected_task_ids 包含未知任务。")
 
     affected_edge_nodes: set[str] = set()
-    cloud_affected = False
     for task_id in affected_ids:
         for target in (current_kkt[task_id], candidate_kkt[task_id]):
             if target == CLOUD:
-                cloud_affected = cloud_affected or cache_config.cloud_resource_sharing
+                # Fixed per-task Cloud resources do not couple unrelated Cloud
+                # tasks in incremental reevaluation.
+                continue
             elif target != LOCAL:
                 _edge_node_role(target, cache_nodes)
                 affected_edge_nodes.add(target)
@@ -1434,11 +1460,6 @@ def evaluate_matching_candidate_incremental(
         if (
             current_kkt[task.task_id] in affected_edge_nodes
             or candidate_kkt[task.task_id] in affected_edge_nodes
-        ):
-            impacted_task_ids.add(task.task_id)
-        if cloud_affected and (
-            current_kkt[task.task_id] == CLOUD
-            or candidate_kkt[task.task_id] == CLOUD
         ):
             impacted_task_ids.add(task.task_id)
 
@@ -1453,8 +1474,6 @@ def evaluate_matching_candidate_incremental(
     cpu_resource_sums = dict(current_evaluation.cpu_resource_sums)
     bandwidth_resource_sums = dict(current_evaluation.bandwidth_resource_sums)
     nodes_to_clear = set(affected_edge_nodes)
-    if cloud_affected:
-        nodes_to_clear.add(CLOUD)
     for node_id in nodes_to_clear:
         cpu_allocations.pop(node_id, None)
         bandwidth_allocations.pop(node_id, None)
@@ -1497,7 +1516,6 @@ def evaluate_matching_candidate_incremental(
             project_cfg,
             cache_nodes,
             cache_config,
-            queue_workload_s=queue_workload_s,
         )
         if not node_evaluation.resource_feasible:
             return infeasible(
@@ -1530,7 +1548,6 @@ def evaluate_matching_candidate_incremental(
             project_cfg,
             cache_nodes,
             cache_config,
-            queue_workload_s=queue_workload_s,
         )
         if not non_edge_evaluation.resource_feasible:
             return infeasible(
@@ -1675,11 +1692,6 @@ def _evaluate_matching_equal_allocation(
     """仅用于最小验证的 equal allocation 对照，不作为正式 solver 暴露。"""
 
     grouped = _group_edge_tasks(tasks, matching, cache_nodes)
-    cloud_task_count = (
-        len(_group_cloud_tasks(tasks, matching))
-        if cache_config.cloud_resource_sharing
-        else 1
-    )
     total = 0.0
     for task in tasks:
         target = matching[task.task_id]
@@ -1699,7 +1711,6 @@ def _evaluate_matching_equal_allocation(
                 cache_config.cloud_total_cpu_cycles_per_s,
                 cache_config.cloud_delay_factor,
                 cache_config.tx_power_w,
-                cloud_task_count=cloud_task_count,
             )
             delay = result["total_delay_s"]
             energy = result["vehicle_energy_j"]
@@ -1776,12 +1787,12 @@ def write_cloud_resource_sharing_audit(
     output_path: Path,
     cache_config: cache_configuration.CacheOptimizationConfig,
 ) -> dict[str, int]:
-    """Write a deterministic single-Cloud resource-sharing audit.
+    """Write a deterministic Cloud fixed-per-task compatibility audit.
 
     The audit treats every arrived task in a slot as a Cloud task so that the
-    total-resource split is directly visible without running a trajectory,
-    prediction, PPO, or Matching sweep.  The production Matching path passes
-    its actual Cloud task count to ``cloud_execution`` separately.
+    fixed per-task resources are directly visible without running a trajectory,
+    prediction, PPO, or Matching sweep.  ``cloud_task_count`` is retained only
+    as an observed slot statistic; it does not change the Cloud formula.
     """
 
     tasks_by_slot: dict[int, list[Task]] = {}
@@ -1815,7 +1826,6 @@ def write_cloud_resource_sharing_audit(
                     cache_config.cloud_total_cpu_cycles_per_s,
                     cache_config.cloud_delay_factor,
                     cache_config.tx_power_w,
-                    cloud_task_count=cloud_task_count,
                 )
                 writer.writerow(
                     {
@@ -1829,7 +1839,7 @@ def write_cloud_resource_sharing_audit(
                         "cloud_compute_delay_s": execution["compute_delay_s"],
                         "cloud_communication_delay_s": execution["communication_delay_s"],
                         "cloud_total_delay_s": execution["total_delay_s"],
-                        "audit_scope": "all_arrivals_as_cloud_tasks",
+                        "audit_scope": "all_arrivals_as_cloud_tasks_fixed_per_task",
                     }
                 )
                 row_count += 1
@@ -1892,6 +1902,8 @@ def _find_edge_case(
 
 
 def run_minimal_validation(config_path: str = "system_config.toml") -> dict[str, Any]:
+    """Run KKT/Cloud formula diagnostics; Cloud-only cases bypass candidate gating."""
+
     cfg = project_config.load_config(config_path)
     project_config.validate_config(cfg)
     project_config.validate_for_formal_experiment(cfg)
@@ -1956,6 +1968,7 @@ def run_minimal_validation(config_path: str = "system_config.toml") -> dict[str,
     if not ok or not math.isclose(single[0], 1.0, abs_tol=1e-12):
         raise AssertionError(f"单任务 KKT 验证失败：{single}, {reason}")
 
+    # This is a pure formula diagnostic, not a production Matching candidate.
     matching_cloud = {task.task_id: CLOUD for task in tasks}
     case_a = evaluate_matching_with_kkt(
         tasks,
@@ -2033,7 +2046,6 @@ def run_minimal_validation(config_path: str = "system_config.toml") -> dict[str,
             cache_cfg.cloud_total_cpu_cycles_per_s,
             cache_cfg.cloud_delay_factor,
             cache_cfg.tx_power_w,
-            cloud_task_count=(len(tasks) if cache_cfg.cloud_resource_sharing else 1),
         )
         q = system_model.task_utility(
             cloud["total_delay_s"],

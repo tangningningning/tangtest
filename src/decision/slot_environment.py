@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Single-slot system execution.
 
-本模块把一个时隙内已经完成的模块按 11.pdf 时间语义串起来：
+本模块把一个时隙内已经完成的模块按 12.pdf 时间语义串起来：
 
 previous configuration state + external trigger Z(t) + prediction scenario slice
 -> trigger-conditioned configuration
@@ -40,7 +40,6 @@ class SlotExecutionResult:
     input_uav_triggers: dict[str, int]
     previous_cache_state: np.ndarray
     previous_uav_positions: dict[str, tuple[float, float]]
-    previous_queue_workload_s: dict[str, float]
     final_cache_state: np.ndarray | None
     final_uav_positions: dict[str, tuple[float, float]] | None
     predictive_configuration_utility: float | None
@@ -54,14 +53,12 @@ class SlotExecutionResult:
     cpu_allocations: dict[str, dict[str, float]]
     bandwidth_allocations: dict[str, dict[str, float]]
     per_task_delay_s: dict[str, float]
-    per_task_queue_wait_s: dict[str, float]
     per_task_vehicle_energy_j: dict[str, float]
     per_task_utility: dict[str, float]
     configuration_summary: dict[str, Any]
     matching_summary: dict[str, Any]
     next_cache_state: np.ndarray | None
     next_uav_positions: dict[str, tuple[float, float]] | None
-    next_queue_workload_s: dict[str, float] | None
 
 
 def _position_tuples(positions: dict[str, Any]) -> dict[str, tuple[float, float]]:
@@ -120,7 +117,6 @@ def execute_slot(
     flight_boundary: tuple[float, float, float, float],
     slot_id: int | None = None,
     time_s: float | None = None,
-    previous_queue_workload_s: dict[str, float] | None = None,
 ) -> SlotExecutionResult:
     """Execute one slot from external trigger to actual system utility.
 
@@ -132,12 +128,6 @@ def execute_slot(
     previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     previous_uav = _position_tuples(previous_uav_positions)
     cache_trigger = np.asarray(cache_triggers, dtype=np.int8).copy()
-    previous_queue = {
-        str(node_id): float(value)
-        for node_id, value in (previous_queue_workload_s or {}).items()
-    }
-    if any(not math.isfinite(value) or value < 0.0 for value in previous_queue.values()):
-        raise ValueError("previous_queue_workload_s 必须是非负 finite 秒数。")
     cache_configuration.validate_cache_shape_and_capacity(
         previous_cache,
         service_catalog,
@@ -188,7 +178,6 @@ def execute_slot(
             local_cache_state,
             cache_nodes,
             cache_config,
-            queue_workload_s=previous_queue,
         )
         configuration = optimize_joint_configuration(
             previous_cache,
@@ -214,7 +203,6 @@ def execute_slot(
             input_uav_triggers=dict(uav_triggers),
             previous_cache_state=previous_cache.copy(),
             previous_uav_positions=previous_uav,
-            previous_queue_workload_s=dict(previous_queue),
             final_cache_state=None,
             final_uav_positions=None,
             predictive_configuration_utility=None,
@@ -228,14 +216,12 @@ def execute_slot(
             cpu_allocations={},
             bandwidth_allocations={},
             per_task_delay_s={},
-            per_task_queue_wait_s={},
             per_task_vehicle_energy_j={},
             per_task_utility={},
             configuration_summary=_configuration_summary(configuration),
             matching_summary={},
             next_cache_state=None,
             next_uav_positions=None,
-            next_queue_workload_s=None,
         )
 
     final_cache = np.asarray(configuration.final_cache_state, dtype=np.int8).copy()
@@ -254,7 +240,6 @@ def execute_slot(
         project_cfg,
         cache_nodes,
         cache_config,
-        queue_workload_s=previous_queue,
     )
     if not matching.resource_feasible:
         return SlotExecutionResult(
@@ -266,7 +251,6 @@ def execute_slot(
             input_uav_triggers=dict(uav_triggers),
             previous_cache_state=previous_cache.copy(),
             previous_uav_positions=previous_uav,
-            previous_queue_workload_s=dict(previous_queue),
             final_cache_state=None,
             final_uav_positions=None,
             predictive_configuration_utility=None,
@@ -280,31 +264,13 @@ def execute_slot(
             cpu_allocations={},
             bandwidth_allocations={},
             per_task_delay_s={},
-            per_task_queue_wait_s={},
             per_task_vehicle_energy_j={},
             per_task_utility={},
             configuration_summary=_configuration_summary(configuration),
             matching_summary=_matching_summary(matching),
             next_cache_state=None,
             next_uav_positions=None,
-            next_queue_workload_s=None,
         )
-
-    per_task_queue_wait_s = {
-        task.task_id: float(
-            previous_queue.get(matching.matching[task.task_id], 0.0)
-        )
-        for task in actual_tasks
-    }
-    slot_duration_s = float(
-        project_config.get_config_value(project_cfg, "simulation.dt_s")
-    )
-    next_queue = task_allocation.advance_queue_workload(
-        previous_queue,
-        matching.matching,
-        matching.per_task_delay_s,
-        slot_duration_s,
-    )
 
     actual_q = float(matching.task_utility_sum)
     cache_cost = float(configuration.cache_cost)
@@ -327,7 +293,6 @@ def execute_slot(
         input_uav_triggers=dict(uav_triggers),
         previous_cache_state=previous_cache.copy(),
         previous_uav_positions=previous_uav,
-        previous_queue_workload_s=dict(previous_queue),
         final_cache_state=final_cache.copy(),
         final_uav_positions=final_uav,
         predictive_configuration_utility=(
@@ -349,14 +314,12 @@ def execute_slot(
         cpu_allocations=matching.cpu_allocations,
         bandwidth_allocations=matching.bandwidth_allocations,
         per_task_delay_s=matching.per_task_delay_s,
-        per_task_queue_wait_s=per_task_queue_wait_s,
         per_task_vehicle_energy_j=matching.per_task_vehicle_energy_j,
         per_task_utility=matching.per_task_utility,
         configuration_summary=_configuration_summary(configuration),
         matching_summary=_matching_summary(matching),
         next_cache_state=final_cache.copy(),
         next_uav_positions=final_uav,
-        next_queue_workload_s=next_queue,
     )
 
 

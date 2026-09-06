@@ -120,8 +120,6 @@ class ConfigurationObservationSpec:
     uav_position_slice: slice
     predicted_vehicle_slice: slice
     popularity_slice: slice
-    queue_workload_slice: slice
-    execution_node_ids: tuple[str, ...]
     observation_dim: int
 
     @classmethod
@@ -131,17 +129,11 @@ class ConfigurationObservationSpec:
         service_ids: list[int] | tuple[int, ...],
         uav_ids: list[str] | tuple[str, ...],
         vehicle_ids: list[str] | tuple[str, ...],
-        task_vehicle_ids: list[str] | tuple[str, ...] | None = None,
     ) -> "ConfigurationObservationSpec":
         cache_node_ids_t = tuple(str(value) for value in cache_node_ids)
         service_ids_t = tuple(int(value) for value in service_ids)
         uav_ids_t = tuple(str(value) for value in uav_ids)
         vehicle_ids_t = tuple(str(value) for value in vehicle_ids)
-        task_vehicle_ids_t = tuple(
-            str(value) for value in (
-                vehicle_ids_t if task_vehicle_ids is None else task_vehicle_ids
-            )
-        )
         if len(set(cache_node_ids_t)) != len(cache_node_ids_t) or not cache_node_ids_t:
             raise ValueError("cache_node_ids 不能为空且不能重复。")
         if service_ids_t != tuple(range(len(service_ids_t))):
@@ -150,10 +142,6 @@ class ConfigurationObservationSpec:
             raise ValueError("uav_ids 不能为空且不能重复。")
         if len(set(vehicle_ids_t)) != len(vehicle_ids_t) or not vehicle_ids_t:
             raise ValueError("vehicle_ids 不能为空且不能重复。")
-        if len(set(task_vehicle_ids_t)) != len(task_vehicle_ids_t) or not task_vehicle_ids_t:
-            raise ValueError("task_vehicle_ids 不能为空且不能重复。")
-        if not set(task_vehicle_ids_t).issubset(set(vehicle_ids_t)):
-            raise ValueError("task_vehicle_ids 必须属于 vehicle_ids。")
 
         start = 0
         cache_len = len(cache_node_ids_t) * len(service_ids_t)
@@ -168,13 +156,6 @@ class ConfigurationObservationSpec:
         popularity_len = len(service_ids_t)
         popularity_slice = slice(start, start + popularity_len)
         start += popularity_len
-        execution_node_ids = tuple(
-            [f"LOCAL:{vehicle_id}" for vehicle_id in task_vehicle_ids_t]
-            + list(cache_node_ids_t)
-            + ["CLOUD"]
-        )
-        queue_workload_slice = slice(start, start + len(execution_node_ids))
-        start += len(execution_node_ids)
         return cls(
             cache_node_ids=cache_node_ids_t,
             service_ids=service_ids_t,
@@ -184,8 +165,6 @@ class ConfigurationObservationSpec:
             uav_position_slice=uav_position_slice,
             predicted_vehicle_slice=predicted_vehicle_slice,
             popularity_slice=popularity_slice,
-            queue_workload_slice=queue_workload_slice,
-            execution_node_ids=execution_node_ids,
             observation_dim=start,
         )
 
@@ -196,14 +175,12 @@ class ConfigurationObservationSpec:
         service_ids: list[int] | tuple[int, ...],
         uav_ids: list[str] | tuple[str, ...],
         vehicle_ids: list[str] | tuple[str, ...],
-        task_vehicle_ids: list[str] | tuple[str, ...] | None = None,
     ) -> "ConfigurationObservationSpec":
         return cls.create(
             cache_nodes["node_ids"],
             service_ids,
             uav_ids,
             vehicle_ids,
-            task_vehicle_ids=task_vehicle_ids,
         )
 
 
@@ -365,13 +342,10 @@ def build_configuration_observation(
     predicted_service_popularity: dict[int | str, float] | Any,
     observation_spec: ConfigurationObservationSpec,
     flight_boundary: tuple[float, float, float, float],
-    queue_workload_s: dict[str, float] | None = None,
-    queue_time_ref_s: float = 1.0,
 ) -> np.ndarray:
     """构造 ``s_cfg(t)`` 的纯函数。
 
-    包含 ``C(t-1)``, ``Q^U(t-1)``, ``q_hat^V(t)``, ``rho_hat(t)`` 和
-    各执行资源在 slot 开始时的显式剩余工作时间；
+    包含 ``C(t-1)``, ``Q^U(t-1)``, ``q_hat^V(t)`` 和 ``rho_hat(t)``；
     不包含 TV fixed local cache、slot t 真实任务、slot t 真实车辆位置，也不展开
     stochastic ``S × H_p`` scenarios。
     """
@@ -398,25 +372,6 @@ def build_configuration_observation(
         predicted_service_popularity,
         observation_spec.service_ids,
     )
-    queue_reference = float(queue_time_ref_s)
-    if not math.isfinite(queue_reference) or queue_reference <= 0.0:
-        raise ValueError("queue_time_ref_s 必须为正 finite 秒数。")
-    queue = {
-        str(node_id): float(value)
-        for node_id, value in (queue_workload_s or {}).items()
-    }
-    unknown_queue_nodes = set(queue) - set(observation_spec.execution_node_ids)
-    if unknown_queue_nodes:
-        raise ValueError(f"queue_workload_s 包含未知节点：{sorted(unknown_queue_nodes)}")
-    if any(not math.isfinite(value) or value < 0.0 for value in queue.values()):
-        raise ValueError("queue_workload_s 必须是非负 finite 秒数。")
-    raw_queue = np.asarray(
-        [queue.get(node_id, 0.0) for node_id in observation_spec.execution_node_ids],
-        dtype=np.float64,
-    )
-    # 使用单调有界映射保留长队列间差异，避免任意硬截断阈值。
-    queue_features = raw_queue / (raw_queue + queue_reference)
-
     cache_features = previous_cache.reshape(-1).astype(np.float64)
     uav_features = np.concatenate(
         [
@@ -431,7 +386,7 @@ def build_configuration_observation(
         ]
     )
     observation = np.concatenate(
-        [cache_features, uav_features, vehicle_features, popularity, queue_features]
+        [cache_features, uav_features, vehicle_features, popularity]
     )
     if observation.shape != (observation_spec.observation_dim,):
         raise AssertionError("observation length 与 spec 不一致。")

@@ -97,11 +97,8 @@ random_trips_intermediate = 2
 random_trips_maxtries = 1000
 
 [execution]
-# 跨 slot 任务采用确定性批次 FIFO：同一节点当前 slot 内按 KKT 并发执行，
-# 未完成的最慢任务形成下一 slot 可观测的剩余工作时间。
-cross_slot_task_model = "deterministic_batch_fifo"
-# 队列每步推进时长唯一取自 simulation.dt_s，不设置第二套时间尺度。
-slot_duration_source = "simulation.dt_s"
+# 每个 slot 独立完成任务卸载、资源分配、时延/能耗评价；不跨 slot 保存任务状态。
+cross_slot_task_model = "independent_per_slot"
 
 [service]
 # 服务总数 F。正式 baseline 为 10；修改后必须通过统一入口重生成依赖 artifact，
@@ -211,15 +208,15 @@ range_m = 250.0
 [nodes.uav]
 # UAV 数量；坐标由 node_positions.json 自动生成。
 count = 2
-# UAV 初始部署高度，单位 m；与动态飞行模型的 altitude_m 参数分开维护。
-deployment_altitude_m = 50.0
+# UAV 固定高度，单位 m；部署位置和空地信道共用同一高度合同。
+deployment_altitude_m = 100.0
 # UAV 相对 RSU 的初始偏移占路网最大尺度的比例。
 deployment_offset_fraction = 0.1
 # UAV 初始水平位置由 node_placement.py 根据已选 RSU 和路网拓扑生成。
 # 该初始位置不是未来真实轨迹，也不是论文固定部署结论；后续位置仍由优化算法调整。
 initialization_mode = "topology_aware"
 # 参数状态：文献校准实验基线。
-# UAV 固定飞行高度，单位 m。
+# UAV 固定飞行高度，单位 m；必须与 deployment_altitude_m 一致。
 # 文献来源：Li et al., Collaborative offloading for UAV-enabled time-sensitive MEC networks,
 # EURASIP Journal on Wireless Communications and Networking 2021:1,
 # DOI 10.1186/s13638-020-01861-8，Table 1 采用 UAV altitude H = 100m。
@@ -269,7 +266,7 @@ min_safety_distance_m = 10.0
 # 等效单位水平移动距离能耗，单位 J/m。
 # Li et al., DOI 10.1186/s13638-020-01861-8，Table 1 给出旋翼 UAV 功率模型参数，
 # 但论文并未直接给出“15 J/m”作为物理常数。
-# 当前项目沿用 11.pdf 的线性移动能耗 E_mov = xi_mov * distance，
+# 当前项目沿用 12.pdf 的线性移动能耗 E_mov = xi_mov * distance，
 # 因此在代表速度 V_ref=15m/s 处按 Li et al. 旋翼功率模型计算
 # P(15)/15 ≈ 14.73 J/m，并取整为 15 J/m 作为线性等效系数。
 movement_energy_coefficient_j_per_m = 15.0
@@ -280,28 +277,30 @@ movement_energy_coefficient_j_per_m = 15.0
 movement_fixed_cost = 0.00176
 
 [nodes.cloud]
-# Cloud 数量固定为 1 个逻辑共享资源；本项目不展开 Cloud 实例列表。
-# Cloud 单节点共享资源配置。正式系统对同一 slot 的所有 Cloud 任务
-# 使用 total_cpu_cycles_per_s / N_cloud 和 total_bandwidth_bps / N_cloud。
-# 当前系统公式：T_vc = psi_c * D_v / R_cloud_i + L_v / F_cloud_i。
+# Cloud 数量固定为 1 个逻辑节点；本项目不展开 Cloud 实例列表。
+# Cloud 对每个任务提供固定等效资源，不按同一 slot 的 Cloud 任务数均分。
+# 正式系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c。
+# Cloud 仅在没有可用边缘缓存节点时作为后备执行节点。
 # 文献来源：Al-Shareeda et al., Novel DT-assisted Vehicular Task Offloading for Cloud,
 # Edge, and Hybrid Deployments, IEEE Transactions on Vehicular Technology 75(4):6565-6581, 2026,
 # DOI 10.1109/TVT.2025.3620810。
-# cpu_cycles_per_s 与 Cloud 总计算能力保持 20GHz 一致；正式模型按任务数共享。
-cpu_cycles_per_s = 20.0e9
-# Cloud 总计算能力 F_cloud_total，单位 cycle/s；单任务分配为 F_total/N_cloud。
-total_cpu_cycles_per_s = 20.0e9
-# 旧 uplink_rate_bps 仅保留作 legacy parameter compatibility，正式模型使用
-# total_bandwidth_bps 作为单 Cloud 节点总 uplink，不按任务复制资源。
+# Cloud 每任务固定计算能力 F_c，单位 cycle/s；参考 IEEE 论文取 5GHz。
+cpu_cycles_per_s = 5.0e9
+# 兼容字段与唯一固定每任务计算能力保持一致。
+total_cpu_cycles_per_s = 5.0e9
+# Cloud 每任务固定等效上行速率 R_c，单位 bit/s；参考 IEEE 论文取 200Mbps。
 uplink_rate_bps = 200.0e6
-# Cloud 总 uplink R_cloud_total，单位 bps；单任务分配为 R_total/N_cloud。
-# 当前系统公式：T_vc = psi_c * D_v / R_cloud_i + L_v / F_cloud_i，
-# E_vc_vehicle = p_v * D_v / R_cloud_i。
+# 兼容字段与唯一固定每任务上行速率保持一致。
+total_bandwidth_bps = 200.0e6
+# 显式 Cloud 资源合同：false 表示不按同槽 Cloud 任务数共享。
+# 缺失或 true 均不得静默回退到共享资源模型。
+resource_sharing = false
+# 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c，
+# E_vc_vehicle = p_v * D_v / R_c；psi_c 不进入能耗。
 # 文献来源同上，Table IV 给出 T_up_iC = 200 Mbps，语义为 Avg. uplink rate to cloud。
 # 该语义与当前 D_v/R_cloud_i 的 vehicle-to-cloud 上传链路相容；
 # 200 Mbps 作为单 Cloud 节点总 uplink，直接换算为 200.0e6 bit/s。
 # 这是文献校准实验基线，不代表硬件实测值。
-total_bandwidth_bps = 200.0e6
 # Cloud 传输扩展系数 psi_c，配置键 cloud_delay_factor，当前系统公式中作为 D_v/R_c 的乘法因子。
 # 系统模型要求 psi_c >= 1；当前 baseline 固定为 11.0。
 # 该固定系数将远程 Cloud 的回传、核心网及跨域附加时延统一吸收到
@@ -356,8 +355,7 @@ alpha_nlos = 2.0
 noise_power_w = 3.16227766e-13
 
 [communication.cloud]
-# Legacy compatibility parameter；正式共享 Cloud 总 uplink 使用
-# nodes.cloud.total_bandwidth_bps。
+# Legacy compatibility parameter；正式固定每任务速率与 nodes.cloud.uplink_rate_bps 一致。
 uplink_rate_bps = 200.0e6
 
 [cache]
@@ -479,7 +477,7 @@ objective_tolerance = 1.0e-9
 
 [algorithm.kkt]
 # 数值实现保护常数，不是物理参数，也不是文献硬件参数。
-# 对应 11.pdf 中的 epsilon_w / epsilon_b，仅用于避免分母为0。
+# 对应 12.pdf 中的 epsilon_w / epsilon_b，仅用于避免分母为0。
 # 当前每slot最多9个TV任务，因此 1e-6 不会形成实际资源瓶颈。
 min_cpu_fraction = 1.0e-6
 min_bandwidth_fraction = 1.0e-6
@@ -551,7 +549,6 @@ num_minibatches = 4
 # TODO_LITERATURE_CALIBRATION：当前没有可靠依据，正式实验前必须补充文献/模型依据。
 "simulation.dt_s" = "CONFIRMED_DATA"
 "execution.cross_slot_task_model" = "CONFIRMED_DATA"
-"execution.slot_duration_source" = "CONFIRMED_DATA"
 "simulation.warmup_time_s" = "CONFIRMED_DATA"
 "simulation.episode_time_s" = "CONFIRMED_DATA"
 "simulation.num_research_vehicles" = "CONFIRMED_DATA"
@@ -602,6 +599,7 @@ num_minibatches = 4
 "nodes.cloud.total_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
 "nodes.cloud.total_bandwidth_bps" = "CONFIRMED_DATA"
+"nodes.cloud.resource_sharing" = "CONFIRMED_DATA"
 "nodes.cloud.cloud_delay_factor" = "CONFIRMED_DATA"
 "nodes.sv.bandwidth_hz" = "CONFIRMED_DATA"
 "nodes.rsu.bandwidth_hz" = "CONFIRMED_DATA"
@@ -610,6 +608,7 @@ num_minibatches = 4
 "nodes.rsu.range_m" = "PROVISIONAL_IMPLEMENTATION"
 "nodes.uav.range_m" = "PROVISIONAL_IMPLEMENTATION"
 "nodes.uav.altitude_m" = "CONFIRMED_DATA"
+"nodes.uav.deployment_altitude_m" = "CONFIRMED_DATA"
 "nodes.uav.max_horizontal_speed_mps" = "CONFIRMED_DATA"
 "nodes.uav.min_safety_distance_m" = "CONFIRMED_DATA"
 "nodes.uav.movement.movement_energy_coefficient_j_per_m" = "CONFIRMED_DATA"

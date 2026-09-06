@@ -304,7 +304,6 @@ def list_unresolved_parameters(config: dict[str, Any]) -> dict[str, str]:
 FORMAL_SYSTEM_PARAMETER_KEYS = {
     "simulation.dt_s",
     "execution.cross_slot_task_model",
-    "execution.slot_duration_source",
     "simulation.warmup_time_s",
     "simulation.episode_time_s",
     "simulation.num_research_vehicles",
@@ -347,11 +346,13 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "nodes.cloud.total_cpu_cycles_per_s",
     "nodes.cloud.uplink_rate_bps",
     "nodes.cloud.total_bandwidth_bps",
+    "nodes.cloud.resource_sharing",
     "nodes.cloud.cloud_delay_factor",
     "nodes.sv.bandwidth_hz",
     "nodes.rsu.bandwidth_hz",
     "nodes.uav.bandwidth_hz",
     "nodes.uav.altitude_m",
+    "nodes.uav.deployment_altitude_m",
     "nodes.uav.max_horizontal_speed_mps",
     "nodes.uav.min_safety_distance_m",
     "nodes.uav.movement.movement_energy_coefficient_j_per_m",
@@ -733,12 +734,10 @@ def validate_config(config: dict[str, Any]) -> None:
     episode_s = float(get_config_value(config, "simulation.episode_time_s"))
     if dt_s <= 0.0 or warmup_s < 0.0 or episode_s <= 0.0:
         raise ValueError("simulation.dt_s/warmup_time_s/episode_time_s 数值范围无效。")
-    if str(get_config_value(config, "execution.cross_slot_task_model")) != "deterministic_batch_fifo":
+    if str(get_config_value(config, "execution.cross_slot_task_model")) != "independent_per_slot":
         raise ValueError(
-            "execution.cross_slot_task_model 必须为 deterministic_batch_fifo。"
+            "execution.cross_slot_task_model 必须为 independent_per_slot。"
         )
-    if str(get_config_value(config, "execution.slot_duration_source")) != "simulation.dt_s":
-        raise ValueError("execution.slot_duration_source 必须唯一指向 simulation.dt_s。")
     for label, duration in (("warmup_time_s", warmup_s), ("episode_time_s", episode_s)):
         steps = duration / dt_s
         if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
@@ -830,6 +829,31 @@ def validate_config(config: dict[str, Any]) -> None:
             "Cloud传输扩展系数psi_c必须不小于1，"
             "因为其用于表示蜂窝接入基础上传时延之外的"
             "回传网络和核心网附加时延。"
+        )
+    cloud_resource_sharing = get_config_value(config, "nodes.cloud.resource_sharing")
+    if not isinstance(cloud_resource_sharing, bool):
+        raise ValueError(
+            "nodes.cloud.resource_sharing 必须显式配置为 true/false，"
+            "不允许缺失后静默采用默认共享语义。"
+        )
+    if cloud_resource_sharing:
+        raise ValueError(
+            "当前正式模型要求 nodes.cloud.resource_sharing=false；"
+            "Cloud 使用固定每任务资源，不按同槽任务数均分。"
+        )
+    uav_deployment_altitude = float(
+        get_config_value(config, "nodes.uav.deployment_altitude_m")
+    )
+    uav_channel_altitude = float(get_config_value(config, "nodes.uav.altitude_m"))
+    if not math.isclose(
+        uav_deployment_altitude,
+        uav_channel_altitude,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise ValueError(
+            "nodes.uav.deployment_altitude_m 必须与 nodes.uav.altitude_m 一致，"
+            "以保持 UAV 部署与通信高度的单一合同。"
         )
 
     # 单位/重复参数一致性：配置中统一使用 cycle/s、Hz、W、bit/s、MB。

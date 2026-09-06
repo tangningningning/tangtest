@@ -28,7 +28,7 @@
 | 阶段 | 状态 |
 |---|---|
 | vehicle_roles | 跳过（与配置一致） |
-| node_positions | 跳过（RSU/UAV 数量一致） |
+| node_positions | 已调用 node_placement.py 重生成 |
 | service_catalog | 跳过（与 metadata 一致） |
 | tasks | 跳过（与 metadata 一致） |
 | tv_local_cache | 跳过（与 metadata 一致） |

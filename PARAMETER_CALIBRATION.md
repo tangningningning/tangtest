@@ -12,7 +12,7 @@
 | SV / TV | 5 / 20 |
 | RSU | 2 (`RSU_0` ... `RSU_1`) |
 | UAV | 2 (`UAV_0` ... `UAV_1`) |
-| Cloud | 1 个共享节点 |
+| Cloud | 1 个固定每任务资源的后备节点 |
 | service | 10 |
 
 车辆角色来自已有真实 SUMO `trajectory.csv` 的完整轨迹筛选；本次未启动
@@ -27,8 +27,10 @@ SUMO、未生成合成车辆。角色划分仍使用固定 seed 选择，研究�
 | SV CPU | `1.0e9` cycle/s |
 | RSU CPU | `5.0e9` cycle/s |
 | UAV CPU | `5.0e9` cycle/s |
-| Cloud total CPU | `20.0e9` cycle/s |
-| Cloud total bandwidth | `200.0e6` bit/s |
+| UAV deployment / channel height | `100.0 m` |
+| Cloud per-task CPU (`cpu_cycles_per_s`, `total_cpu_cycles_per_s`) | `5.0e9` cycle/s |
+| Cloud per-task uplink (`uplink_rate_bps`, `total_bandwidth_bps`) | `200.0e6` bit/s |
+| Cloud resource sharing | `false` |
 | TV / SV / RSU / UAV cache | `5581.583442 / 16744.750325 / 44652.667533 / 33489.500649` MB |
 | `eta_ca` (SV / RSU / UAV) | `0.20 / 0.10 / 0.15` |
 | `xi_ca` (SV / RSU / UAV) | `0.0010 / 0.0007 / 0.0012` |
@@ -39,9 +41,14 @@ SUMO、未生成合成车辆。角色划分仍使用固定 seed 选择，研究�
 | `T_ref` | `30.79009347 s` |
 | `E_ref` | `3.079009347 J` |
 
-Cloud 仍是单节点有限共享模型：同一 slot 的 `N_cloud` 个任务分别获得
-`20e9 / N_cloud` CPU 和 `200e6 / N_cloud` uplink；兼容字段
-`nodes.cloud.cpu_cycles_per_s` 也统一为 `20e9`，不作为每任务独占资源。
+Cloud 按每个任务固定资源执行：`F_c=5e9 cycle/s`、`R_c=200e6 bit/s`、
+`psi_c=11`。任务的 Cloud 时延为
+`T_c = psi_c * D / R_c + L / F_c`，车辆能耗为 `p * D / R_c`；
+`psi_c` 只放大通信时延，不进入能耗。`nodes.cloud.resource_sharing=false`
+是显式正式合同，禁止按同一 slot 的 `N_cloud` 对资源做除法，也不进入 edge
+KKT 的 CPU / bandwidth 资源和。Cloud 仅在当前任务没有任何可执行的缓存
+SV/RSU/UAV 时作为后备候选；本地候选独立保留。输入大小按
+`1 KB = 1000 B = 8000 bit`，service ID 为 0-based。
 
 `T_ref/E_ref` 由当前 `tasks.csv` 中 4210 个到达任务的 Local execution P95
 重新校准：CPU-cycle P95 为 `30,790,093,469.931866 cycle`，在 TV
@@ -96,16 +103,15 @@ cache node 列表按角色文件和配置实例动态构造：5 SV + 2 RSU + 2 U
 
 因此当前 `action_dim = 9 + 2 = 11`，不存在固定的旧 action schema。
 以 9 cache node、10 service、2 UAV、25 research vehicle 构造 observation
-时，原有配置/预测特征维度为
-`9*10 + 2*2 + 25*2 + 10 = 154`。为明确跨 slot 任务语义，当前系统采用
-`execution.cross_slot_task_model = "deterministic_batch_fifo"`：同一节点在当前
-slot 内按 KKT 并发执行，最慢任务未完成的秒数传入下一 slot。20 个 TV Local、
-9 个 cache/edge 节点和 1 个 Cloud 共增加 30 个显式队列特征，因此当前
-`observation_dim = 154 + 30 = 184`。
+时，正式配置/预测特征维度为
+`9*10 + 2*2 + 25*2 + 10 = 154`。当前系统采用
+`execution.cross_slot_task_model = "independent_per_slot"`：每个 slot 独立完成
+任务卸载、KKT 资源分配、完整时延/能耗评价；任务时延即使超过 `simulation.dt_s`
+也不会形成下一 slot 的任务状态或资源占用。observation 不包含任何任务队列特征，
+因此正式 `observation_dim = 154`。
 
-队列工作量使用 `workload / (workload + T_ref)` 单调归一化。observation 仍不读取
-同 slot actual task、Matching/KKT、Q 或 G；它只读取进入该 slot 前已经形成的
-队列状态，所以没有未来信息泄漏。
+observation 仍不读取同 slot actual task、Matching/KKT、Q 或 G；它只使用配置阶段
+允许的上一 slot cache/UAV 状态、当前 slot 预测车辆位置和服务流行度。
 
 ## 5. 生成与验证边界
 

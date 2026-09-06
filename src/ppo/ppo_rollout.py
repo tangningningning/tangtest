@@ -91,7 +91,6 @@ class RolloutTransition:
     movement_cost: float
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
-    next_queue_workload_s: dict[str, float]
     # Hierarchical WHEN-policy fields.  They are optional so historical
     # trigger-only rollout fixtures keep their exact schema/constructor.
     gate_action: int | None = None
@@ -165,7 +164,6 @@ class DirectCFDecisionSnapshot:
     decision_id: str
     previous_cache_state: np.ndarray
     previous_uav_positions: dict[str, tuple[float, float]]
-    previous_queue_workload_s: dict[str, float]
     observation: np.ndarray
     action_vector: np.ndarray
     action_prefix: np.ndarray
@@ -227,7 +225,6 @@ class GateDecisionSnapshot:
     decision_id: str
     previous_cache_state: np.ndarray
     previous_uav_positions: dict[str, tuple[float, float]]
-    previous_queue_workload_s: dict[str, float]
     observation: np.ndarray
     gate_action: int
     old_gate_probability: float
@@ -887,11 +884,9 @@ def _check_trigger_semantics(
 def _make_observation(
     previous_cache: np.ndarray,
     previous_uav: dict[str, Any],
-    previous_queue: dict[str, float],
     step: AlignedRolloutStep,
     observation_spec: ppo_trigger_policy.ConfigurationObservationSpec,
     flight_boundary: tuple[float, float, float, float],
-    queue_time_ref_s: float,
 ) -> np.ndarray:
     return ppo_trigger_policy.build_configuration_observation(
         previous_cache,
@@ -900,8 +895,6 @@ def _make_observation(
         step.predicted_service_popularity,
         observation_spec,
         flight_boundary,
-        queue_workload_s=previous_queue,
-        queue_time_ref_s=queue_time_ref_s,
     )
 
 
@@ -990,7 +983,6 @@ def collect_on_policy_rollout(
     collection_policy_version: int = 0,
     collect_reference_states: bool = False,
     gate_cf_reservoir: GateCFReservoir | None = None,
-    initial_queue_workload_s: dict[str, float] | None = None,
     forced_gate_action: int | None = None,
     force_noop_configuration: bool = False,
 ) -> RolloutBatch:
@@ -1003,11 +995,6 @@ def collect_on_policy_rollout(
         str(uav_id): (float(np.asarray(xy)[0]), float(np.asarray(xy)[1]))
         for uav_id, xy in initial_uav_positions.items()
     }
-    previous_queue = {
-        str(node_id): float(value)
-        for node_id, value in (initial_queue_workload_s or {}).items()
-    }
-    queue_time_ref_s = float(cache_config.time_ref_s)
     transitions: list[RolloutTransition] = []
     action_masks: list[np.ndarray] = []
     old_per_action_log_probs: list[np.ndarray] = []
@@ -1051,16 +1038,12 @@ def collect_on_policy_rollout(
                     atol=0.0,
                     rtol=0.0,
                 )
-            state_propagation_ok = state_propagation_ok and prev.next_queue_workload_s == previous_queue
-
         observation = _make_observation(
             previous_cache,
             previous_uav,
-            previous_queue,
             step,
             observation_spec,
             flight_boundary,
-            queue_time_ref_s,
         )
         action_mask_provider = build_trigger_action_mask_provider(
             previous_cache,
@@ -1095,7 +1078,6 @@ def collect_on_policy_rollout(
             )
             for uav_id, xy in previous_uav.items()
         }
-        previous_queue_before_action = dict(previous_queue)
         baseline_rng_before = (
             capture_direct_cf_rng_state()
             if direct_cf_reservoir is not None or gate_cf_reservoir is not None
@@ -1124,7 +1106,6 @@ def collect_on_policy_rollout(
             flight_boundary,
             slot_id=step.slot,
             time_s=step.time_s,
-            previous_queue_workload_s=previous_queue,
         )
         if not result.step_feasible:
             raise InfeasibleActionBlocker(
@@ -1193,7 +1174,6 @@ def collect_on_policy_rollout(
                             decision_id=decision_id,
                             previous_cache_state=previous_cache_before_action.copy(),
                             previous_uav_positions=previous_uav_before_action.copy(),
-                            previous_queue_workload_s=previous_queue_before_action.copy(),
                             observation=np.asarray(observation, dtype=np.float32).copy(),
                             action_vector=np.asarray(sample.action_vector, dtype=np.int8).copy(),
                             action_prefix=np.asarray(
@@ -1223,7 +1203,6 @@ def collect_on_policy_rollout(
                     decision_id=decision_id,
                     previous_cache_state=previous_cache_before_action.copy(),
                     previous_uav_positions=previous_uav_before_action.copy(),
-                    previous_queue_workload_s=previous_queue_before_action.copy(),
                     observation=np.asarray(observation, dtype=np.float32).copy(),
                     gate_action=int(sample.gate_action),
                     old_gate_probability=float(sample.p_old_gate),
@@ -1262,7 +1241,6 @@ def collect_on_policy_rollout(
             movement_cost=float(result.movement_cost),
             next_cache_state=np.asarray(result.next_cache_state, dtype=np.int8).copy(),
             next_uav_positions=dict(result.next_uav_positions or {}),
-            next_queue_workload_s=dict(result.next_queue_workload_s or {}),
             gate_action=(
                 None if not hasattr(sample, "gate_action") else int(sample.gate_action)
             ),
@@ -1284,7 +1262,6 @@ def collect_on_policy_rollout(
         old_per_action_probability_tables.append(transition.old_per_action_probability_table.copy())
         previous_cache = transition.next_cache_state.copy()
         previous_uav = dict(transition.next_uav_positions)
-        previous_queue = dict(transition.next_queue_workload_s)
         if done:
             break
 
@@ -1300,11 +1277,9 @@ def collect_on_policy_rollout(
         next_observation = _make_observation(
             previous_cache,
             previous_uav,
-            previous_queue,
             next_step,
             observation_spec,
             flight_boundary,
-            queue_time_ref_s,
         )
         bootstrap_value = _value_only(policy, next_observation)
 
@@ -1515,7 +1490,6 @@ def run_direct_cf_branches(
                 str(uav_id): (float(xy[0]), float(xy[1]))
                 for uav_id, xy in snapshot.previous_uav_positions.items()
             }
-            previous_queue = dict(snapshot.previous_queue_workload_s)
             branch_g: list[float] = []
             branch_q: list[float] = []
             branch_cache: list[float] = []
@@ -1528,11 +1502,9 @@ def run_direct_cf_branches(
                 observation = _make_observation(
                     previous_cache,
                     previous_uav,
-                    previous_queue,
                     step,
                     observation_spec,
                     flight_boundary,
-                    cache_config.time_ref_s,
                 )
                 mask_provider = build_trigger_action_mask_provider(
                     previous_cache,
@@ -1581,7 +1553,6 @@ def run_direct_cf_branches(
                     flight_boundary,
                     slot_id=step.slot,
                     time_s=step.time_s,
-                    previous_queue_workload_s=previous_queue,
                 )
                 if not result.step_feasible:
                     raise InfeasibleActionBlocker(
@@ -1612,7 +1583,6 @@ def run_direct_cf_branches(
                     str(uav_id): (float(xy[0]), float(xy[1]))
                     for uav_id, xy in (result.next_uav_positions or {}).items()
                 }
-                previous_queue = dict(result.next_queue_workload_s or {})
                 branch_steps += 1
                 if int(step.slot) >= int(terminal_slot):
                     break
@@ -1758,7 +1728,6 @@ def run_gate_cf_branches(
                     str(uav_id): (float(xy[0]), float(xy[1]))
                     for uav_id, xy in snapshot.previous_uav_positions.items()
                 }
-                previous_queue = dict(snapshot.previous_queue_workload_s)
                 branch_local_cache = clone_local_cache()
                 branch_g: list[float] = []
                 branch_q: list[float] = []
@@ -1770,11 +1739,9 @@ def run_gate_cf_branches(
                     observation = _make_observation(
                         previous_cache,
                         previous_uav,
-                        previous_queue,
                         step,
                         observation_spec,
                         flight_boundary,
-                        cache_config.time_ref_s,
                     )
                     mask_provider = build_trigger_action_mask_provider(
                         previous_cache,
@@ -1831,7 +1798,6 @@ def run_gate_cf_branches(
                         flight_boundary,
                         slot_id=step.slot,
                         time_s=step.time_s,
-                        previous_queue_workload_s=previous_queue,
                     )
                     if not result.step_feasible:
                         raise InfeasibleActionBlocker(
@@ -1862,7 +1828,6 @@ def run_gate_cf_branches(
                         str(uav_id): (float(xy[0]), float(xy[1]))
                         for uav_id, xy in (result.next_uav_positions or {}).items()
                     }
-                    previous_queue = dict(result.next_queue_workload_s or {})
                     branch_steps += 1
                     if int(step.slot) >= int(terminal_slot):
                         break
@@ -2197,9 +2162,6 @@ def run_minimal_sanity(
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
-        task_vehicle_ids=[
-            str(value) for value in first_origin["task_vehicle_ids"].tolist()
-        ],
     )
     gamma, gae_lambda = ppo_gae_config_from_project(cfg)
     terminal_slot = int(scenarios["origin_slots"][-1])
@@ -2379,8 +2341,6 @@ def run_hierarchical_minimal_e2e_validation(
             )
             and null_transition.next_uav_positions
             == configure_transition.next_uav_positions
-            and null_transition.next_queue_workload_s
-            == configure_transition.next_queue_workload_s
         ),
         "finite_rollout_ok": finite_rollout_ok,
         "null_maps_to_all_zero": null_action_ok,

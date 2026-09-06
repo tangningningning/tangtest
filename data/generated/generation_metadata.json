@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at_utc": "2026-09-05T09:36:33.012340+00:00",
+  "generated_at_utc": "2026-09-06T09:37:46.254563+00:00",
   "config_source": "system_config.toml",
-  "config_sha256": "a8c559c8d695a0a3d9796f0849d1b4f5ebe7bb8daf7ba5b9822b4b2088091957",
+  "config_sha256": "6f3587f4b583748047bc67dde5014569f2e365baaef3c1d8fc354b389249b5e0",
   "vehicles": {
     "research": 25,
     "SV": 5,
@@ -81,7 +81,7 @@
       "SV": 1000000000.0,
       "RSU": 5000000000.0,
       "UAV": 5000000000.0,
-      "Cloud": 20000000000.0
+      "Cloud": 5000000000.0
     },
     "prediction": {
       "vehicle": {
@@ -115,7 +115,7 @@
     "node_placement": {
       "sumo_net": "data/sumo/map/osm.net.xml.gz",
       "rsu_altitude_m": 10.0,
-      "uav_altitude_m": 50.0,
+      "uav_altitude_m": 100.0,
       "uav_offset_fraction": 0.1
     },
     "roles_sha256": "22f37e6f64c1984a709749e9ca46c142a8914c614fe18252392666c9d0ae1dd5"
@@ -146,11 +146,11 @@
     "vehicle_predictions": "03c18f1a324d35c93c1fffcdb625dab985654a02aaf307667aa2a89926d10687",
     "prediction_scenarios": "3840032ec47e969890312bd3e5bf2ba097d844b9bc0e2ba657c0cb9c28a4a983",
     "popularity_gru": "6f6a483c6807fca272fdb483df23280702ab1d61611af6971c7a302926a7ed8a",
-    "node_positions": "a606a6fc3c629c4987c9c6b7151ca0b7577eac2de180c1178ffaa8cac93a8fdb"
+    "node_positions": "14407444be9238b0ac61f3ccd7ec81e1b65639c4c7837c738c59bb32da0978d2"
   },
   "stages": {
     "vehicle_roles": "跳过（与配置一致）",
-    "node_positions": "跳过（RSU/UAV 数量一致）",
+    "node_positions": "已调用 node_placement.py 重生成",
     "service_catalog": "跳过（与 metadata 一致）",
     "tasks": "跳过（与 metadata 一致）",
     "tv_local_cache": "跳过（与 metadata 一致）",

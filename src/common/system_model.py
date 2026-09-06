@@ -137,13 +137,12 @@ def cloud_execution(
     transmit_power_w: float,
     cloud_task_count: int = 1,
 ) -> dict[str, float]:
-    """Evaluate one task on the single shared Cloud node.
+    """Evaluate one task with fixed per-task Cloud resources.
 
-    ``cloud_rate_bps`` and ``cloud_cpu_cycles_per_s`` are total Cloud-node
-    capacities.  All Cloud tasks in the same slot pass the same
-    ``cloud_task_count`` and receive an equal resource share.  The default of
-    one preserves the single-task/legacy call contract used by analysis-only
-    surrogate evaluations.
+    cloud_rate_bps and cloud_cpu_cycles_per_s are the fixed equivalent
+    per-task resources in the formal model. cloud_task_count remains as a
+    validated compatibility argument for existing callers, but it does not
+    change the resource allocation or any returned value.
     """
     bits = _require_finite("input_bits", input_bits)
     cycles = _require_finite("cpu_cycles", cpu_cycles)
@@ -162,9 +161,8 @@ def cloud_execution(
         raise ValueError("cloud_delay_factor/psi_c 必须不小于 1。")
     if power < 0.0:
         raise ValueError("transmit_power_w 不能为负数。")
-    task_count = int(round(count_value))
-    allocated_rate = rate / task_count
-    allocated_cpu = cpu / task_count
+    allocated_rate = rate
+    allocated_cpu = cpu
     upload_delay = factor * bits / allocated_rate
     compute_delay = cycles / allocated_cpu
     return {
