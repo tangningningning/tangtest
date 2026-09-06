@@ -789,6 +789,7 @@ def save_npz(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="生成 S 个未来预测场景 Xi_pred。")
+    parser.add_argument("--config", default="system_config.toml")
     parser.add_argument("--roles-file", default=None)
     parser.add_argument("--trajectory-file", default=None)
     parser.add_argument("--popularity-file", default=None)
@@ -880,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         project_root = find_project_root()
-        formal_config = project_config_module.load_config()
+        formal_config = project_config_module.load_config(args.config)
         config = config_from_args(args, formal_config)
         config.validate()
         if config.device == "cuda" and not torch.cuda.is_available():

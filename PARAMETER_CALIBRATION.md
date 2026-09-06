@@ -33,14 +33,21 @@ SUMO、未生成合成车辆。角色划分仍使用固定 seed 选择，研究�
 | `eta_ca` (SV / RSU / UAV) | `0.20 / 0.10 / 0.15` |
 | `xi_ca` (SV / RSU / UAV) | `0.0010 / 0.0007 / 0.0012` |
 | `objective.lambda_cache` | `0.1` |
-| `psi_c` | `10.0` |
+| `psi_c` | `11.0` |
+| `alpha(delay)` / `objective.omega_delay` | `0.6` |
+| `beta(energy)` / `objective.omega_energy` | `0.4` |
+| `T_ref` | `30.79009347 s` |
+| `E_ref` | `3.079009347 J` |
 
 Cloud 仍是单节点有限共享模型：同一 slot 的 `N_cloud` 个任务分别获得
 `20e9 / N_cloud` CPU 和 `200e6 / N_cloud` uplink；兼容字段
 `nodes.cloud.cpu_cycles_per_s` 也统一为 `20e9`，不作为每任务独占资源。
 
-reward、utility、`omega_T`、`omega_E`、`T_ref`、`E_ref`、movement model、
-prediction model 和 cache cost 公式均未改动。
+`T_ref/E_ref` 由当前 `tasks.csv` 中 4210 个到达任务的 Local execution P95
+重新校准：CPU-cycle P95 为 `30,790,093,469.931866 cycle`，在 TV
+`1.0e9 cycle/s` 与 `kappa=1.0e-28` 下分别得到 `30.7900934699 s` 和
+`3.07900934699 J`。reward、utility、movement model、prediction model 和
+cache cost 公式均未改动。
 
 ## 3. Service catalog 与 cache 比例
 
@@ -89,9 +96,16 @@ cache node 列表按角色文件和配置实例动态构造：5 SV + 2 RSU + 2 U
 
 因此当前 `action_dim = 9 + 2 = 11`，不存在固定的旧 action schema。
 以 9 cache node、10 service、2 UAV、25 research vehicle 构造 observation
-时，`observation_dim = 9*10 + 2*2 + 25*2 + 10 = 164`。
-observation 只包含 previous configuration、causal prediction state 和
-固定 schema，不读取同 slot actual task、Matching/KKT、Q 或 G。
+时，原有配置/预测特征维度为
+`9*10 + 2*2 + 25*2 + 10 = 154`。为明确跨 slot 任务语义，当前系统采用
+`execution.cross_slot_task_model = "deterministic_batch_fifo"`：同一节点在当前
+slot 内按 KKT 并发执行，最慢任务未完成的秒数传入下一 slot。20 个 TV Local、
+9 个 cache/edge 节点和 1 个 Cloud 共增加 30 个显式队列特征，因此当前
+`observation_dim = 154 + 30 = 184`。
+
+队列工作量使用 `workload / (workload + T_ref)` 单调归一化。observation 仍不读取
+同 slot actual task、Matching/KKT、Q 或 G；它只读取进入该 slot 前已经形成的
+队列状态，所以没有未来信息泄漏。
 
 ## 5. 生成与验证边界
 

@@ -3,9 +3,9 @@
 """Trigger-conditioned cache configuration optimization.
 
 本阶段只解决：给定上一时隙缓存状态、cache trigger 和预测场景后，选择新的
-动态缓存配置。这里不训练 PPO，不调用 Matching/KKT，也不读取任何未来真实
-trajectory/tasks/popularity 标签；正式 episode 初始缓存只使用 service catalog
-中的 service size、节点容量和显式 seed。
+动态缓存配置。预测候选复用实际执行侧的 Matching/KKT、Cloud 共享和队列模型，
+但不训练 PPO，也不读取任何未来真实 trajectory/tasks/popularity 标签；正式
+episode 初始缓存只使用 service catalog 中的 service size、节点容量和显式 seed。
 """
 
 from __future__ import annotations
@@ -54,8 +54,7 @@ class CacheOptimizationConfig:
     sv_cpu_cycles_per_s: float
     rsu_cpu_cycles_per_s: float
     uav_cpu_cycles_per_s: float
-    # Legacy Cloud scalar retained for compatibility; formal execution uses the
-    # explicit single-node total capacity below.
+    # 保留旧 Cloud 标量用于兼容；正式执行统一使用下方单节点总容量。
     cloud_cpu_cycles_per_s: float
     cloud_total_cpu_cycles_per_s: float
     local_energy_per_cycle_j: float
@@ -73,8 +72,7 @@ class CacheOptimizationConfig:
     air_beta_nlos: float
     air_alpha_los: float
     air_alpha_nlos: float
-    # Legacy Cloud link scalar retained for compatibility; formal execution
-    # uses the explicit single-node total uplink below.
+    # 保留旧 Cloud 链路标量用于兼容；正式执行统一使用下方单节点总上行带宽。
     cloud_uplink_rate_bps: float
     cloud_total_bandwidth_bps: float
     cloud_delay_factor: float
@@ -84,9 +82,16 @@ class CacheOptimizationConfig:
     tolerance: float
     max_coordinate_rounds: int
     initial_cache_seed: int
-    # Analysis-only switch.  The formal project configuration keeps the
-    # finite single-Cloud sharing model (True).  False reproduces the legacy
-    # per-task scalar-resource baseline without changing system_config.toml.
+    slot_duration_s: float
+    cross_slot_task_model: str
+    matching_max_updates: int
+    matching_objective_tolerance: float
+    kkt_min_cpu_fraction: float
+    kkt_min_bandwidth_fraction: float
+    kkt_bisection_tolerance: float
+    kkt_max_bisection_iterations: int
+    # 仅供分析的开关。正式配置固定为单 Cloud 有限共享；False 只用于复现旧的
+    # 每任务独占标量资源口径，不改变 system_config.toml。
     cloud_resource_sharing: bool = True
 
     def validate(self) -> None:
@@ -108,6 +113,12 @@ class CacheOptimizationConfig:
             self.uav_bandwidth_hz,
             self.noise_power_w,
             self.max_coordinate_rounds,
+            self.matching_max_updates,
+            self.slot_duration_s,
+            self.kkt_min_cpu_fraction,
+            self.kkt_min_bandwidth_fraction,
+            self.kkt_bisection_tolerance,
+            self.kkt_max_bisection_iterations,
         ]
         if any(float(value) <= 0.0 for value in values):
             raise ValueError("缓存优化配置存在非正数参数。")
@@ -119,6 +130,8 @@ class CacheOptimizationConfig:
             raise ValueError("RSU instance 数量必须等于 num_rsu。")
         if self.num_uav != len(self.uav_instances):
             raise ValueError("UAV instance 数量必须等于 num_uav。")
+        if self.cross_slot_task_model != "deterministic_batch_fifo":
+            raise ValueError("仅支持 execution.cross_slot_task_model=deterministic_batch_fifo。")
 
 
 DEFAULT_CONFIG: CacheOptimizationConfig | None = None
@@ -190,9 +203,25 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         sv_range_m=float(get(config, "nodes.sv.range_m")),
         rsu_range_m=float(get(config, "nodes.rsu.range_m")),
         uav_range_m=float(get(config, "nodes.uav.range_m")),
-        tolerance=float(get(config, "cache.local_search_tolerance")),
-        max_coordinate_rounds=int(get(config, "cache.max_coordinate_rounds")),
+        tolerance=float(get(config, "algorithm.cache.tolerance")),
+        max_coordinate_rounds=int(get(config, "algorithm.cache.max_coordinate_rounds")),
         initial_cache_seed=int(get(config, "experiment.seed")),
+        slot_duration_s=float(get(config, "simulation.dt_s")),
+        cross_slot_task_model=str(get(config, "execution.cross_slot_task_model")),
+        matching_max_updates=int(get(config, "algorithm.matching.max_updates")),
+        matching_objective_tolerance=float(
+            get(config, "algorithm.matching.objective_tolerance")
+        ),
+        kkt_min_cpu_fraction=float(get(config, "algorithm.kkt.min_cpu_fraction")),
+        kkt_min_bandwidth_fraction=float(
+            get(config, "algorithm.kkt.min_bandwidth_fraction")
+        ),
+        kkt_bisection_tolerance=float(
+            get(config, "algorithm.kkt.bisection_tolerance")
+        ),
+        kkt_max_bisection_iterations=int(
+            get(config, "algorithm.kkt.max_bisection_iterations")
+        ),
     )
 
 
@@ -385,106 +414,55 @@ class SurrogateEvent:
 
 @dataclass
 class SurrogateEvaluationContext:
-    """slot-scoped surrogate 预计算结果和 UAV lazy position cache。
+    """时隙级预测评价上下文。
 
-    该对象只由当前 scenario slice 生命周期内的调用显式传递，不使用
-    module global cache。ground_edge_utility 对 SV/RSU 固定部分预计算一次，
-    UAV 部分按 ``(uav_id, exact_x, exact_y)`` 惰性缓存。
+    候选缓存或 UAV 位置的预测效用不再使用逐任务独占资源近似，而是按每个
+    ``场景 × 预测步`` 组成完整任务批次，并复用实际执行侧的
+    Transfer-Exchange Matching 与 KKT 资源分配。缓存仅保存同一时隙内已经
+    完整评价过的候选，避免重复计算。
     """
 
     events: tuple[SurrogateEvent, ...]
+    batches: tuple["SurrogateBatch", ...]
     num_scenarios: int
     node_roles: tuple[str, ...]
     node_ids: tuple[str, ...]
-    uav_node_indices: dict[str, int]
-    base_utility: np.ndarray
-    ground_edge_utility: np.ndarray
-    uav_utility_cache: dict[tuple[str, float, float], np.ndarray] = field(default_factory=dict)
-
-
-def _task_utility_from_execution(
-    execution: dict[str, float],
-    config: CacheOptimizationConfig,
-) -> float:
-    """只负责复用统一 system_model.task_utility，不重写物理公式。"""
-
-    return float(
-        system_model.task_utility(
-            execution["total_delay_s"],
-            execution["vehicle_energy_j"],
-            config.time_ref_s,
-            config.energy_ref_j,
-            config.omega_t,
-            config.omega_e,
-        )
+    local_cache_state: dict[str, frozenset[int]]
+    initial_queue_workload_s: dict[str, float]
+    matching_project_config: dict[str, Any]
+    configuration_utility_cache: dict[tuple[bytes, tuple[tuple[str, float, float], ...]], float] = field(
+        default_factory=dict
     )
 
 
-def _local_task_utility(
-    event: SurrogateEvent,
-    config: CacheOptimizationConfig,
-) -> float:
-    execution = system_model.local_execution(
-        event.cpu_cycles,
-        config.local_cpu_cycles_per_s,
-        config.local_energy_per_cycle_j,
-    )
-    return float(
-        system_model.task_utility(
-            execution["delay_s"],
-            execution["vehicle_energy_j"],
-            config.time_ref_s,
-            config.energy_ref_j,
-            config.omega_t,
-            config.omega_e,
-        )
-    )
+@dataclass(frozen=True)
+class SurrogateBatch:
+    """一个预测场景步中的并发任务及对应车辆位置。"""
+
+    scenario_index: int
+    horizon: int
+    discount: float
+    events: tuple[SurrogateEvent, ...]
+    vehicle_positions: dict[str, np.ndarray]
 
 
-def _cloud_task_utility(
-    event: SurrogateEvent,
-    config: CacheOptimizationConfig,
-) -> float:
-    execution = system_model.cloud_execution(
-        event.input_bits,
-        event.cpu_cycles,
-        config.cloud_total_bandwidth_bps,
-        config.cloud_total_cpu_cycles_per_s,
-        config.cloud_delay_factor,
-        config.tx_power_w,
-    )
-    return _task_utility_from_execution(
-        {
-            "total_delay_s": execution["total_delay_s"],
-            "vehicle_energy_j": execution["vehicle_energy_j"],
-        },
-        config,
-    )
+def _matching_project_config(config: CacheOptimizationConfig) -> dict[str, Any]:
+    """从统一配置对象提取 Matching/KKT 所需参数，避免读取第二套配置。"""
 
-
-def _ground_edge_task_utility(
-    event: SurrogateEvent,
-    role: str,
-    distance: float,
-    config: CacheOptimizationConfig,
-) -> float:
-    gain = system_model.ground_channel_gain(
-        max(distance, 1e-9),
-        config.channel_gain_at_1m,
-        config.pathloss_exponent,
-    )
-    execution = system_model.edge_execution(
-        event.input_bits,
-        event.cpu_cycles,
-        role_bandwidth_hz(role, config),
-        bandwidth_fraction=1.0,
-        transmit_power_w=config.tx_power_w,
-        channel_gain=gain,
-        noise_power_w=config.noise_power_w,
-        node_cpu_cycles_per_s=role_cpu_cycles_per_s(role, config),
-        cpu_fraction=1.0,
-    )
-    return _task_utility_from_execution(execution, config)
+    return {
+        "algorithm": {
+            "matching": {
+                "max_updates": int(config.matching_max_updates),
+                "objective_tolerance": float(config.matching_objective_tolerance),
+            },
+            "kkt": {
+                "min_cpu_fraction": float(config.kkt_min_cpu_fraction),
+                "min_bandwidth_fraction": float(config.kkt_min_bandwidth_fraction),
+                "bisection_tolerance": float(config.kkt_bisection_tolerance),
+                "max_bisection_iterations": int(config.kkt_max_bisection_iterations),
+            },
+        }
+    }
 
 
 def build_surrogate_evaluation_context(
@@ -492,8 +470,9 @@ def build_surrogate_evaluation_context(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    queue_workload_s: dict[str, float] | None = None,
 ) -> SurrogateEvaluationContext:
-    """为一个 scenario slice 预计算不随 cache/UAV candidate 改变的量。"""
+    """把预测切片整理成与实际执行模型一致的并发任务批次。"""
 
     arrival = origin_scenario["arrival"]
     service_id = origin_scenario["service_id"]
@@ -501,133 +480,83 @@ def build_surrogate_evaluation_context(
     cpu_cycles = origin_scenario["cpu_cycles"]
     tv_ids = [str(value) for value in origin_scenario["task_vehicle_ids"].tolist()]
     num_scenarios, horizon_steps, num_tv = arrival.shape
-    local_services = {
-        tv_id: _local_services_for_tv(local_cache_state, tv_id)
-        for tv_id in tv_ids
-    }
+    vehicle_ids = [str(value) for value in origin_scenario["vehicle_ids"].tolist()]
     events: list[SurrogateEvent] = []
+    batches: list[SurrogateBatch] = []
     for scenario_index in range(num_scenarios):
         for horizon in range(horizon_steps):
             discount = config.beta_discount ** horizon
+            batch_events: list[SurrogateEvent] = []
             for tv_index in range(num_tv):
                 if int(arrival[scenario_index, horizon, tv_index]) == 0:
                     continue
                 service = int(service_id[scenario_index, horizon, tv_index])
                 if service < 0:
                     raise ValueError("arrival=1 时 service_id 无效。")
-                events.append(
-                    SurrogateEvent(
-                        scenario_index=scenario_index,
-                        horizon=horizon,
-                        tv_index=tv_index,
-                        tv_id=tv_ids[tv_index],
-                        service_id=service,
-                        input_bits=float(input_size[scenario_index, horizon, tv_index]),
-                        cpu_cycles=float(cpu_cycles[scenario_index, horizon, tv_index]),
-                        discount=float(discount),
-                        num_scenarios=int(num_scenarios),
-                        predicted_tv_position=np.asarray(
-                            tv_position(
-                                origin_scenario,
-                                tv_ids[tv_index],
-                                scenario_index,
-                                horizon,
-                            ),
-                            dtype=np.float64,
-                        ).copy(),
-                    )
+                event = SurrogateEvent(
+                    scenario_index=scenario_index,
+                    horizon=horizon,
+                    tv_index=tv_index,
+                    tv_id=tv_ids[tv_index],
+                    service_id=service,
+                    input_bits=float(input_size[scenario_index, horizon, tv_index]),
+                    cpu_cycles=float(cpu_cycles[scenario_index, horizon, tv_index]),
+                    discount=float(discount),
+                    num_scenarios=int(num_scenarios),
+                    predicted_tv_position=np.asarray(
+                        tv_position(
+                            origin_scenario,
+                            tv_ids[tv_index],
+                            scenario_index,
+                            horizon,
+                        ),
+                        dtype=np.float64,
+                    ).copy(),
                 )
+                events.append(event)
+                batch_events.append(event)
+            # 即使当前预测步没有任务，也保留空批次以正确衰减跨时隙队列。
+            # 实际执行侧需要同一预测步内全部研究车辆的位置，其中 SV 位置
+            # 用于构造移动边缘节点，TV 位置用于无线链路计算。
+            positions = {
+                vehicle_id: np.asarray(
+                    origin_scenario["positions_xy"][
+                        scenario_index,
+                        horizon,
+                        vehicle_index,
+                    ],
+                    dtype=np.float64,
+                ).copy()
+                for vehicle_index, vehicle_id in enumerate(vehicle_ids)
+            }
+            batches.append(
+                SurrogateBatch(
+                    scenario_index=scenario_index,
+                    horizon=horizon,
+                    discount=float(discount),
+                    events=tuple(batch_events),
+                    vehicle_positions=positions,
+                )
+            )
 
-    event_count = len(events)
     node_roles = tuple(str(role) for role in cache_nodes["node_roles"])
     node_ids = tuple(str(node_id) for node_id in cache_nodes["node_ids"])
-    base_utility = np.full(event_count, -float("inf"), dtype=np.float64)
-    ground_edge_utility = np.full(
-        (event_count, len(node_roles)),
-        -float("inf"),
-        dtype=np.float64,
-    )
-    for event_index, event in enumerate(events):
-        local = -float("inf")
-        if event.service_id in local_services[event.tv_id]:
-            local = _local_task_utility(event, config)
-        cloud = _cloud_task_utility(event, config)
-        base_utility[event_index] = max(local, cloud)
-
-        for node_index, role in enumerate(node_roles):
-            if role == "UAV":
-                continue
-            node_xy = node_position(
-                origin_scenario,
-                cache_nodes,
-                node_index,
-                event.scenario_index,
-                event.horizon,
-            )
-            distance = float(np.linalg.norm(event.predicted_tv_position - node_xy))
-            ground_edge_utility[event_index, node_index] = _ground_edge_task_utility(
-                event,
-                role,
-                distance,
-                config,
-            )
-
     return SurrogateEvaluationContext(
         events=tuple(events),
+        batches=tuple(batches),
         num_scenarios=int(num_scenarios),
         node_roles=node_roles,
         node_ids=node_ids,
-        uav_node_indices={
-            node_id: index
-            for index, (node_id, role) in enumerate(zip(node_ids, node_roles))
-            if role == "UAV"
+        local_cache_state={
+            str(vehicle_id): frozenset(int(service_id) for service_id in services)
+            for vehicle_id, services in local_cache_state.items()
         },
-        base_utility=base_utility,
-        ground_edge_utility=ground_edge_utility,
+        initial_queue_workload_s={
+            str(node_id): float(value)
+            for node_id, value in (queue_workload_s or {}).items()
+        },
+        matching_project_config=_matching_project_config(config),
     )
-
-
-def _uav_edge_utility_vector(
-    context: SurrogateEvaluationContext,
-    uav_id: str,
-    position: Any,
-    config: CacheOptimizationConfig,
-) -> np.ndarray:
-    xy = np.asarray(position, dtype=np.float64)
-    if xy.shape != (2,) or not np.all(np.isfinite(xy)):
-        raise ValueError(f"UAV 位置必须是 finite 二维坐标：{uav_id}")
-    key = (str(uav_id), float(xy[0]), float(xy[1]))
-    cached = context.uav_utility_cache.get(key)
-    if cached is not None:
-        return cached
-
-    values = np.full(len(context.events), -float("inf"), dtype=np.float64)
-    for event_index, event in enumerate(context.events):
-        distance = float(np.linalg.norm(event.predicted_tv_position - xy))
-        gain = system_model.air_channel_gain(
-            distance,
-            config.uav_altitude_m,
-            config.air_eta1,
-            config.air_eta2,
-            config.air_beta_los,
-            config.air_beta_nlos,
-            config.air_alpha_los,
-            config.air_alpha_nlos,
-        )["channel_gain"]
-        execution = system_model.edge_execution(
-            event.input_bits,
-            event.cpu_cycles,
-            config.uav_bandwidth_hz,
-            bandwidth_fraction=1.0,
-            transmit_power_w=config.tx_power_w,
-            channel_gain=gain,
-            noise_power_w=config.noise_power_w,
-            node_cpu_cycles_per_s=config.uav_cpu_cycles_per_s,
-            cpu_fraction=1.0,
-        )
-        values[event_index] = _task_utility_from_execution(execution, config)
-    context.uav_utility_cache[key] = values
-    return values
 
 
 def evaluate_surrogate_context(
@@ -636,180 +565,81 @@ def evaluate_surrogate_context(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> float:
-    """按旧 scenario→horizon→tv、node 顺序累计预计算 surrogate。"""
+    """用实际 Matching/KKT 链评价候选配置的预测效用。"""
 
-    uav_positions = {
-        uav_id: cache_nodes["fixed_positions"][uav_id]
-        for uav_id in context.uav_node_indices
+    # 局部导入用于避免 cache_configuration 与 task_allocation 的模块级循环依赖。
+    from decision import task_allocation
+
+    candidate_cache = np.ascontiguousarray(cache, dtype=np.int8)
+    uav_positions = tuple(
+        (
+            node_id,
+            float(np.asarray(cache_nodes["fixed_positions"][node_id])[0]),
+            float(np.asarray(cache_nodes["fixed_positions"][node_id])[1]),
+        )
+        for node_id, role in zip(context.node_ids, context.node_roles)
+        if role == "UAV"
+    )
+    cache_key = (candidate_cache.tobytes(), uav_positions)
+    cached = context.configuration_utility_cache.get(cache_key)
+    if cached is not None:
+        return float(cached)
+
+    local_cache = {
+        vehicle_id: set(services)
+        for vehicle_id, services in context.local_cache_state.items()
+    }
+    uav_position_map = {
+        node_id: np.asarray([x_m, y_m], dtype=np.float64)
+        for node_id, x_m, y_m in uav_positions
     }
     total = 0.0
-    for event_index, event in enumerate(context.events):
-        best = float(context.base_utility[event_index])
-        for node_index, role in enumerate(context.node_roles):
-            if cache[node_index, event.service_id] == 0:
-                continue
-            if role == "UAV":
-                edge = _uav_edge_utility_vector(
-                    context,
-                    context.node_ids[node_index],
-                    uav_positions[context.node_ids[node_index]],
-                    config,
-                )
-            else:
-                edge = float(context.ground_edge_utility[event_index, node_index])
-            if isinstance(edge, np.ndarray):
-                edge = float(edge[event_index])
-            if edge > best:
-                best = edge
-        total += event.discount * best
-    return float(total / max(context.num_scenarios, 1))
-
-
-def role_range_m(role: str, config: CacheOptimizationConfig) -> float:
-    if role == "SV":
-        return config.sv_range_m
-    if role == "RSU":
-        return config.rsu_range_m
-    if role == "UAV":
-        return config.uav_range_m
-    raise AssertionError("未知 role。")
-
-
-def role_cpu_cycles_per_s(role: str, config: CacheOptimizationConfig) -> float:
-    if role == "SV":
-        return config.sv_cpu_cycles_per_s
-    if role == "RSU":
-        return config.rsu_cpu_cycles_per_s
-    if role == "UAV":
-        return config.uav_cpu_cycles_per_s
-    raise AssertionError("未知 role。")
-
-
-def role_bandwidth_hz(role: str, config: CacheOptimizationConfig) -> float:
-    if role == "SV":
-        return config.sv_bandwidth_hz
-    if role == "RSU":
-        return config.rsu_bandwidth_hz
-    if role == "UAV":
-        return config.uav_bandwidth_hz
-    raise AssertionError("未知 role。")
-
-
-def _local_services_for_tv(
-    local_cache_state: dict[str, set[int]],
-    tv_id: str,
-) -> set[int]:
-    """读取显式传入的 TV fixed local cache，不在核心 optimizer 内读文件。"""
-
-    if tv_id not in local_cache_state:
-        raise ValueError(f"local_cache_state 缺少 TV：{tv_id}")
-    return {int(service_id) for service_id in local_cache_state[tv_id]}
-
-
-def best_task_surrogate(
-    cache: np.ndarray,
-    origin_scenario: dict[str, Any],
-    cache_nodes: dict[str, Any],
-    service_id: int,
-    input_bits: float,
-    cpu_cycles: float,
-    tv_id: str,
-    local_cache_state: dict[str, set[int]],
-    scenario_index: int,
-    horizon: int,
-    config: CacheOptimizationConfig,
-) -> float:
-    best = -float("inf")
-
-    # Local 只有在该 TV 的 fixed local cache 中包含 service 时才可用。
-    if service_id in _local_services_for_tv(local_cache_state, tv_id):
-        local = system_model.local_execution(
-            cpu_cycles,
-            config.local_cpu_cycles_per_s,
-            config.local_energy_per_cycle_j,
-        )
-        best = system_model.task_utility(
-            local["delay_s"],
-            local["vehicle_energy_j"],
-            config.time_ref_s,
-            config.energy_ref_j,
-            config.omega_t,
-            config.omega_e,
-        )
-
-    # Cloud fallback：不需要缓存。
-    cloud = system_model.cloud_execution(
-        input_bits,
-        cpu_cycles,
-        config.cloud_total_bandwidth_bps,
-        config.cloud_total_cpu_cycles_per_s,
-        config.cloud_delay_factor,
-        config.tx_power_w,
-    )
-    best = max(
-        best,
-        system_model.task_utility(
-            cloud["total_delay_s"],
-            cloud["vehicle_energy_j"],
-            config.time_ref_s,
-            config.energy_ref_j,
-            config.omega_t,
-            config.omega_e,
-        ),
-    )
-
-    tv_xy = tv_position(origin_scenario, tv_id, scenario_index, horizon)
-    for node_index, role in enumerate(cache_nodes["node_roles"]):
-        if cache[node_index, service_id] == 0:
-            continue
-        node_xy = node_position(
-            origin_scenario,
-            cache_nodes,
-            node_index,
-            scenario_index,
-            horizon,
-        )
-        distance = float(np.linalg.norm(tv_xy - node_xy))
-        if role == "UAV":
-            gain = system_model.air_channel_gain(
-                distance,
-                config.uav_altitude_m,
-                config.air_eta1,
-                config.air_eta2,
-                config.air_beta_los,
-                config.air_beta_nlos,
-                config.air_alpha_los,
-                config.air_alpha_nlos,
-            )["channel_gain"]
-        else:
-            gain = system_model.ground_channel_gain(
-                max(distance, 1e-9),
-                config.channel_gain_at_1m,
-                config.pathloss_exponent,
+    scenario_queues = {
+        scenario_index: dict(context.initial_queue_workload_s)
+        for scenario_index in range(context.num_scenarios)
+    }
+    for batch in context.batches:
+        tasks = [
+            task_allocation.Task(
+                task_id=event.tv_id,
+                vehicle_id=event.tv_id,
+                service_id=event.service_id,
+                input_bits=event.input_bits,
+                cpu_cycles=event.cpu_cycles,
             )
-        edge = system_model.edge_execution(
-            input_bits,
-            cpu_cycles,
-            role_bandwidth_hz(role, config),
-            bandwidth_fraction=1.0,
-            transmit_power_w=config.tx_power_w,
-            channel_gain=gain,
-            noise_power_w=config.noise_power_w,
-            node_cpu_cycles_per_s=role_cpu_cycles_per_s(role, config),
-            cpu_fraction=1.0,
+            for event in batch.events
+        ]
+        service_positions = task_allocation.build_service_node_positions(
+            cache_nodes,
+            batch.vehicle_positions,
+            uav_position_map,
         )
-        best = max(
-            best,
-            system_model.task_utility(
-                edge["total_delay_s"],
-                edge["vehicle_energy_j"],
-                config.time_ref_s,
-                config.energy_ref_j,
-                config.omega_t,
-                config.omega_e,
-            ),
+        result = task_allocation.optimize_task_matching(
+            tasks,
+            batch.vehicle_positions,
+            service_positions,
+            local_cache,
+            candidate_cache,
+            context.matching_project_config,
+            cache_nodes,
+            config,
+            queue_workload_s=scenario_queues[batch.scenario_index],
         )
-    return float(best)
+        if not result.resource_feasible:
+            raise AssertionError(
+                "预测配置的实际 Matching/KKT 评价不可行："
+                f"scenario={batch.scenario_index}, horizon={batch.horizon}"
+            )
+        total += batch.discount * float(result.task_utility_sum)
+        scenario_queues[batch.scenario_index] = task_allocation.advance_queue_workload(
+            scenario_queues[batch.scenario_index],
+            result.matching,
+            result.per_task_delay_s,
+            config.slot_duration_s,
+        )
+    utility = float(total / max(context.num_scenarios, 1))
+    context.configuration_utility_cache[cache_key] = utility
+    return utility
 
 
 def predicted_service_utility(

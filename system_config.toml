@@ -31,8 +31,6 @@
 [experiment]
 # 实验名称。用于后续结果 metadata 和配置快照引用；修改它不需要重新生成数据。
 name = "main"
-# 算法方法名。对比实验只应改变 algorithm / experiment 相关 section，不能偷偷改变物理参数。
-method = "proposed_sparse_direct_cf_ppo"
 # 主实验随机种子。当前沿用已有正式数据中的主 seed；修改后若用于生成任务/预测场景，需要重跑对应上游模块。
 seed = 4401
 # 重复实验编号。只用于后续批量实验标识，不改变系统物理模型。
@@ -98,12 +96,17 @@ random_trips_min_distance_m = 4000.0
 random_trips_intermediate = 2
 random_trips_maxtries = 1000
 
+[execution]
+# 跨 slot 任务采用确定性批次 FIFO：同一节点当前 slot 内按 KKT 并发执行，
+# 未完成的最慢任务形成下一 slot 可观测的剩余工作时间。
+cross_slot_task_model = "deterministic_batch_fifo"
+# 队列每步推进时长唯一取自 simulation.dt_s，不设置第二套时间尺度。
+slot_duration_source = "simulation.dt_s"
+
 [service]
 # 服务总数 F。正式 baseline 为 10；修改后必须通过统一入口重生成依赖 artifact，
 # 生成新的 service_catalog.json、popularity.csv、tasks.csv，并重跑依赖链。
 count = 10
-# 实际服务实例目录。缓存模块读取 s_f 时必须使用此 JSON。
-catalog_path = "data/generated/service_catalog.json"
 
 [service.generation]
 # Table I 校准的服务缓存大小范围，单位 GB；运行时 program_size 由生成器换算为 MB。
@@ -299,11 +302,11 @@ uplink_rate_bps = 200.0e6
 # 200 Mbps 作为单 Cloud 节点总 uplink，直接换算为 200.0e6 bit/s。
 # 这是文献校准实验基线，不代表硬件实测值。
 total_bandwidth_bps = 200.0e6
-# Cloud 传输扩展系数 psi_c，当前系统公式中作为 D_v/R_c 的乘法因子。
-# 系统模型要求 psi_c >= 1；最终冻结 baseline 固定为 10.0。
+# Cloud 传输扩展系数 psi_c，配置键 cloud_delay_factor，当前系统公式中作为 D_v/R_c 的乘法因子。
+# 系统模型要求 psi_c >= 1；当前 baseline 固定为 11.0。
 # 该固定系数将远程 Cloud 的回传、核心网及跨域附加时延统一吸收到
 # psi_c * D/R_c 中，不读取未来任务或运行时请求统计动态重算。
-cloud_delay_factor = 10.0
+cloud_delay_factor = 11.0
 
 [communication]
 # 本 section 集中通信模型参数，后续 Cache surrogate、Matching、KKT 必须共用。
@@ -360,10 +363,6 @@ uplink_rate_bps = 200.0e6
 [cache]
 # cache surrogate 的 horizon 折扣 beta。PROVISIONAL。
 discount_beta = 0.95
-# local search strict improvement 容差。只接受 J(new) > J(old) + tolerance。
-local_search_tolerance = 1.0e-9
-# coordinate optimization 最大轮数，避免无限循环。
-max_coordinate_rounds = 20
 # 正式 episode 初始 cache 使用 uniform feasible initialization。
 knapsack_initialization = "uniform_feasible"
 
@@ -376,14 +375,14 @@ rsu_ratio = 0.40
 uav_ratio = 0.30
 
 [objective]
-# 主实验采用时延和车辆能耗等权重。
+# 主实验采用时延权重 0.6、车辆能耗权重 0.4。
 # 该值属于实验设计基线，不是硬件物理常数。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
-omega_delay = 0.5
-# 主实验采用时延和车辆能耗等权重。
+omega_delay = 0.6
+# 主实验采用时延权重 0.6、车辆能耗权重 0.4。
 # 该值属于实验设计基线，不是硬件物理常数。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
-omega_energy = 0.5
+omega_energy = 0.4
 # 参数状态：系统尺度校准基线。
 # Cache 配置成本权重 lambda_cache，是系统目标函数中唯一的 lambda^ca 入口。
 # 该参数不是文献直接给出的物理常数。
@@ -396,18 +395,18 @@ lambda_cache = 0.1
 # 依据 sequential movement audit、300-slot continuous validation
 # 和 UAV targeted causal validation；不是文献直接物理常数。
 lambda_movement = 1.76e-5
-# T_ref/E_ref 采用当前任务工作负载下 Local execution 的 P95 尺度，并做轻微取整。
+# T_ref/E_ref 采用当前正式 tasks.csv 中 arrival=1 任务在 TV local CPU 上的 P95 尺度。
 # 这样参考值主要由任务工作负载和车辆本地计算能力决定，
 # 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
 # 因此适合作为不同算法统一使用的归一化基准。
-# T_ref=0.65s 来源于当前 Local delay p95≈0.65463s。
-T_ref = 0.65
-# T_ref/E_ref 采用当前任务工作负载下 Local execution 的 P95 尺度，并做轻微取整。
+# 4210 个到达任务的 cpu_cycles P95=30,790,093,469.931866 cycle；
+# 在 1.0e9 cycle/s 的 TV CPU 上对应 30.7900934699 s。
+T_ref = 30.79009347
 # 这样参考值主要由任务工作负载和车辆本地计算能力决定，
 # 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
 # 因此适合作为不同算法统一使用的归一化基准。
-# E_ref=0.065J 来源于当前 Local energy p95≈0.06546J。
-E_ref = 0.065
+# 使用同一 P95 工作负载和 kappa=1.0e-28，Local energy P95=3.07900934699 J。
+E_ref = 3.079009347
 
 [prediction.vehicle]
 # 车辆预测 horizon H_p。当前实际值 5；修改需重跑车辆预测、GRU、scenario。
@@ -551,6 +550,8 @@ num_minibatches = 4
 # PROVISIONAL_IMPLEMENTATION：当前为了代码连通性验证而设置，正式实验前必须校准。
 # TODO_LITERATURE_CALIBRATION：当前没有可靠依据，正式实验前必须补充文献/模型依据。
 "simulation.dt_s" = "CONFIRMED_DATA"
+"execution.cross_slot_task_model" = "CONFIRMED_DATA"
+"execution.slot_duration_source" = "CONFIRMED_DATA"
 "simulation.warmup_time_s" = "CONFIRMED_DATA"
 "simulation.episode_time_s" = "CONFIRMED_DATA"
 "simulation.num_research_vehicles" = "CONFIRMED_DATA"
@@ -590,8 +591,6 @@ num_minibatches = 4
 "nodes.rsu.xi_ca" = "CONFIRMED_DATA"
 "nodes.uav.xi_ca" = "CONFIRMED_DATA"
 "cache.discount_beta" = "PROVISIONAL_IMPLEMENTATION"
-"cache.local_search_tolerance" = "PROVISIONAL_IMPLEMENTATION"
-"cache.max_coordinate_rounds" = "PROVISIONAL_IMPLEMENTATION"
 "nodes.vehicle.local_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.vehicle.local_cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.vehicle.kappa" = "CONFIRMED_DATA"

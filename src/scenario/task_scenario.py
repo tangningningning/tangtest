@@ -1663,6 +1663,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="生成真实动态 rho_star、TV 任务到达和服务相关 D/L。"
     )
+    parser.add_argument("--config", default="system_config.toml")
     parser.add_argument("--roles-file", default=None)
     parser.add_argument("--trajectory-file", default=None)
     parser.add_argument("--output-dir", default=None)
@@ -1774,7 +1775,7 @@ def main(argv: list[str] | None = None) -> int:
         project_root = find_project_root()
         from common import project_config as project_config_module
 
-        formal_config = project_config_module.load_config()
+        formal_config = project_config_module.load_config(args.config)
         config = config_from_args(args, formal_config)
         roles_file = resolve_path(
             project_root,

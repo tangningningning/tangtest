@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
-  "generated_at_utc": "2026-09-04T09:22:46.819629+00:00",
+  "generated_at_utc": "2026-09-05T09:36:33.012340+00:00",
   "config_source": "system_config.toml",
+  "config_sha256": "a8c559c8d695a0a3d9796f0849d1b4f5ebe7bb8daf7ba5b9822b4b2088091957",
   "vehicles": {
     "research": 25,
     "SV": 5,
@@ -24,11 +25,11 @@
   ],
   "cache_capacity": {
     "TV": 5581.583441571016,
-    "SV": 16744.750324713048,
+    "SV": 16744.750324713044,
     "RSU": 44652.66753256813,
-    "UAV": 33489.500649426096
+    "UAV": 33489.50064942609
   },
-  "service_catalog_total_mb": 111631.66883142032,
+  "service_catalog_total_mb": 111631.6688314203,
   "configuration": {
     "vehicles": {
       "research": 25,
@@ -71,9 +72,9 @@
     },
     "cache_capacity_mb": {
       "TV": 5581.583441571016,
-      "SV": 16744.750324713048,
+      "SV": 16744.750324713044,
       "RSU": 44652.66753256813,
-      "UAV": 33489.500649426096
+      "UAV": 33489.50064942609
     },
     "compute": {
       "TV": 1000000000.0,
@@ -83,10 +84,39 @@
       "Cloud": 20000000000.0
     },
     "prediction": {
-      "vehicle_horizon": 5,
-      "popularity_history_length": 20,
-      "popularity_hidden_size": 32,
-      "scenario_count": 20
+      "vehicle": {
+        "horizon": 5,
+        "sigma_position_m": 3.0,
+        "sigma_speed_mps": 1.0,
+        "observation_noise_seed": 9101
+      },
+      "popularity": {
+        "history_length": 20,
+        "hidden_size": 32,
+        "training_seed": 20260819,
+        "sequence_seed_base": 880001,
+        "num_train_sequences": 24,
+        "num_val_sequences": 6,
+        "num_test_sequences": 6,
+        "learning_rate": 0.001,
+        "batch_size": 64,
+        "max_epochs": 60,
+        "patience": 8
+      },
+      "scenario": {
+        "num_scenarios": 20,
+        "master_seed": 20260820,
+        "max_resample_attempts": 20,
+        "cross_vehicle_residual_sampling": "independent",
+        "residual_bank_path": "data/calibration/residual_blocks.npz",
+        "gru_checkpoint_path": "data/generated/popularity_gru.pt"
+      }
+    },
+    "node_placement": {
+      "sumo_net": "data/sumo/map/osm.net.xml.gz",
+      "rsu_altitude_m": 10.0,
+      "uav_altitude_m": 50.0,
+      "uav_offset_fraction": 0.1
     },
     "roles_sha256": "22f37e6f64c1984a709749e9ca46c142a8914c614fe18252392666c9d0ae1dd5"
   },
@@ -103,6 +133,20 @@
     "prediction_scenarios": "data/generated/prediction_scenarios.npz",
     "popularity_gru": "data/generated/popularity_gru.pt",
     "node_positions": "data/generated/node_positions.json"
+  },
+  "artifact_sha256": {
+    "roles": "22f37e6f64c1984a709749e9ca46c142a8914c614fe18252392666c9d0ae1dd5",
+    "trajectory": "923670704b2367775edcd1184d7042ba67db53eedf3eb641ad800bd6cc7914e8",
+    "catalog": "3adb64f9724a429a5cb6bf9c6eb609a54120d9918feaab1dd0475034af22e402",
+    "popularity": "b1d09214fff1508e5d246ef9be25202f9eeea1429f5a0d32db2918c326ba176e",
+    "popularity_predictions": "46a254c5b2d61002d92e29ffcfbbb5974be388e12868a1ab4f6ad661cfbf3d6e",
+    "popularity_history": "9848cab8f22646a64aa26dbfb00a0ef433e4061cdc2cdf2f83a807e8c6b7610a",
+    "tasks": "a5d30192e6e1ae3bb6ecc6585b1d79eb3d115046541959cb0eeba11a5be1d162",
+    "tv_local_cache": "c5eceebec794c895ce986eef5940e7d1c2c5e83c5bf3c6b4af6a233b5f621ab0",
+    "vehicle_predictions": "03c18f1a324d35c93c1fffcdb625dab985654a02aaf307667aa2a89926d10687",
+    "prediction_scenarios": "3840032ec47e969890312bd3e5bf2ba097d844b9bc0e2ba657c0cb9c28a4a983",
+    "popularity_gru": "6f6a483c6807fca272fdb483df23280702ab1d61611af6971c7a302926a7ed8a",
+    "node_positions": "a606a6fc3c629c4987c9c6b7151ca0b7577eac2de180c1178ffaa8cac93a8fdb"
   },
   "stages": {
     "vehicle_roles": "跳过（与配置一致）",

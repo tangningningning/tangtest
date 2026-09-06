@@ -922,6 +922,9 @@ def _collect_single_short_rollout(
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
+        task_vehicle_ids=[
+            str(value) for value in first_origin["task_vehicle_ids"].tolist()
+        ],
     )
     gamma, gae_lambda = ppo_rollout.ppo_gae_config_from_project(cfg)
     terminal_slot = int(scenarios["origin_slots"][-1])

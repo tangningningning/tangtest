@@ -44,6 +44,17 @@ def _sample_action_without_grad(policy: Any, *args: Any, **kwargs: Any) -> Any:
         return policy.sample_action(*args, **kwargs)
 
 
+def _is_hierarchical_policy(policy: Any) -> bool:
+    """判断当前策略是否为正式的分层 Gate + WHAT 策略。"""
+
+    from ppo import hierarchical_reconfiguration_gate
+
+    return isinstance(
+        policy,
+        hierarchical_reconfiguration_gate.HierarchicalReconfigurationGatePolicy,
+    )
+
+
 @dataclass(frozen=True)
 class AlignedRolloutStep:
     """已经按同一个真实 slot/time 对齐的一步输入。"""
@@ -80,6 +91,7 @@ class RolloutTransition:
     movement_cost: float
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
+    next_queue_workload_s: dict[str, float]
     # Hierarchical WHEN-policy fields.  They are optional so historical
     # trigger-only rollout fixtures keep their exact schema/constructor.
     gate_action: int | None = None
@@ -153,6 +165,7 @@ class DirectCFDecisionSnapshot:
     decision_id: str
     previous_cache_state: np.ndarray
     previous_uav_positions: dict[str, tuple[float, float]]
+    previous_queue_workload_s: dict[str, float]
     observation: np.ndarray
     action_vector: np.ndarray
     action_prefix: np.ndarray
@@ -214,6 +227,7 @@ class GateDecisionSnapshot:
     decision_id: str
     previous_cache_state: np.ndarray
     previous_uav_positions: dict[str, tuple[float, float]]
+    previous_queue_workload_s: dict[str, float]
     observation: np.ndarray
     gate_action: int
     old_gate_probability: float
@@ -873,9 +887,11 @@ def _check_trigger_semantics(
 def _make_observation(
     previous_cache: np.ndarray,
     previous_uav: dict[str, Any],
+    previous_queue: dict[str, float],
     step: AlignedRolloutStep,
     observation_spec: ppo_trigger_policy.ConfigurationObservationSpec,
     flight_boundary: tuple[float, float, float, float],
+    queue_time_ref_s: float,
 ) -> np.ndarray:
     return ppo_trigger_policy.build_configuration_observation(
         previous_cache,
@@ -884,6 +900,8 @@ def _make_observation(
         step.predicted_service_popularity,
         observation_spec,
         flight_boundary,
+        queue_workload_s=previous_queue,
+        queue_time_ref_s=queue_time_ref_s,
     )
 
 
@@ -972,6 +990,9 @@ def collect_on_policy_rollout(
     collection_policy_version: int = 0,
     collect_reference_states: bool = False,
     gate_cf_reservoir: GateCFReservoir | None = None,
+    initial_queue_workload_s: dict[str, float] | None = None,
+    forced_gate_action: int | None = None,
+    force_noop_configuration: bool = False,
 ) -> RolloutBatch:
     """收集连续 on-policy rollout；核心逻辑不读磁盘、不重置 RNG。"""
 
@@ -982,6 +1003,11 @@ def collect_on_policy_rollout(
         str(uav_id): (float(np.asarray(xy)[0]), float(np.asarray(xy)[1]))
         for uav_id, xy in initial_uav_positions.items()
     }
+    previous_queue = {
+        str(node_id): float(value)
+        for node_id, value in (initial_queue_workload_s or {}).items()
+    }
+    queue_time_ref_s = float(cache_config.time_ref_s)
     transitions: list[RolloutTransition] = []
     action_masks: list[np.ndarray] = []
     old_per_action_log_probs: list[np.ndarray] = []
@@ -992,7 +1018,14 @@ def collect_on_policy_rollout(
         raise TypeError("direct_cf_reservoir 必须是 DirectCFReservoir 或 None。")
     if gate_cf_reservoir is not None and not isinstance(gate_cf_reservoir, GateCFReservoir):
         raise TypeError("gate_cf_reservoir 必须是 GateCFReservoir 或 None。")
-    hierarchical_rollout = gate_cf_reservoir is not None
+    hierarchical_rollout = _is_hierarchical_policy(policy)
+    if forced_gate_action is not None:
+        if not hierarchical_rollout:
+            raise TypeError("forced_gate_action 只能用于分层 Gate 策略。")
+        if int(forced_gate_action) not in (0, 1):
+            raise ValueError("forced_gate_action 必须为0或1。")
+    if force_noop_configuration and int(forced_gate_action or 0) != 1:
+        raise ValueError("force_noop_configuration 只允许与 forced_gate_action=1 一起使用。")
 
     # aligned_steps 可包含最后一个只用于 truncation bootstrap 的 next step。
     # 若最后一个 step 已是真正 terminal，则全部可执行；否则保留最后一个不采样动作。
@@ -1018,13 +1051,16 @@ def collect_on_policy_rollout(
                     atol=0.0,
                     rtol=0.0,
                 )
+            state_propagation_ok = state_propagation_ok and prev.next_queue_workload_s == previous_queue
 
         observation = _make_observation(
             previous_cache,
             previous_uav,
+            previous_queue,
             step,
             observation_spec,
             flight_boundary,
+            queue_time_ref_s,
         )
         action_mask_provider = build_trigger_action_mask_provider(
             previous_cache,
@@ -1035,6 +1071,22 @@ def collect_on_policy_rollout(
             flight_boundary,
             action_spec,
         )
+        if force_noop_configuration:
+            original_mask_provider = action_mask_provider
+
+            def action_mask_provider(
+                action_index: int,
+                prefix: np.ndarray,
+            ) -> np.ndarray:
+                """保留动态合法性检查，并在验证分支中强制 WHAT 为全零。"""
+
+                dynamic_mask = np.asarray(
+                    original_mask_provider(action_index, prefix),
+                    dtype=bool,
+                )
+                if not bool(dynamic_mask[0]):
+                    raise AssertionError("当前动态动作约束不允许合法的零动作。")
+                return np.asarray([True, False], dtype=bool)
         previous_cache_before_action = previous_cache.copy()
         previous_uav_before_action = {
             str(uav_id): (
@@ -1043,17 +1095,19 @@ def collect_on_policy_rollout(
             )
             for uav_id, xy in previous_uav.items()
         }
+        previous_queue_before_action = dict(previous_queue)
         baseline_rng_before = (
             capture_direct_cf_rng_state()
             if direct_cf_reservoir is not None or gate_cf_reservoir is not None
             else None
         )
-        sample = _sample_action_without_grad(
-            policy,
-            observation,
-            deterministic=False,
-            action_mask=action_mask_provider,
-        )
+        sample_kwargs: dict[str, Any] = {
+            "deterministic": False,
+            "action_mask": action_mask_provider,
+        }
+        if forced_gate_action is not None:
+            sample_kwargs["force_gate_action"] = int(forced_gate_action)
+        sample = _sample_action_without_grad(policy, observation, **sample_kwargs)
         result = slot_environment.execute_slot(
             previous_cache,
             previous_uav,
@@ -1070,6 +1124,7 @@ def collect_on_policy_rollout(
             flight_boundary,
             slot_id=step.slot,
             time_s=step.time_s,
+            previous_queue_workload_s=previous_queue,
         )
         if not result.step_feasible:
             raise InfeasibleActionBlocker(
@@ -1138,6 +1193,7 @@ def collect_on_policy_rollout(
                             decision_id=decision_id,
                             previous_cache_state=previous_cache_before_action.copy(),
                             previous_uav_positions=previous_uav_before_action.copy(),
+                            previous_queue_workload_s=previous_queue_before_action.copy(),
                             observation=np.asarray(observation, dtype=np.float32).copy(),
                             action_vector=np.asarray(sample.action_vector, dtype=np.int8).copy(),
                             action_prefix=np.asarray(
@@ -1167,6 +1223,7 @@ def collect_on_policy_rollout(
                     decision_id=decision_id,
                     previous_cache_state=previous_cache_before_action.copy(),
                     previous_uav_positions=previous_uav_before_action.copy(),
+                    previous_queue_workload_s=previous_queue_before_action.copy(),
                     observation=np.asarray(observation, dtype=np.float32).copy(),
                     gate_action=int(sample.gate_action),
                     old_gate_probability=float(sample.p_old_gate),
@@ -1205,6 +1262,7 @@ def collect_on_policy_rollout(
             movement_cost=float(result.movement_cost),
             next_cache_state=np.asarray(result.next_cache_state, dtype=np.int8).copy(),
             next_uav_positions=dict(result.next_uav_positions or {}),
+            next_queue_workload_s=dict(result.next_queue_workload_s or {}),
             gate_action=(
                 None if not hasattr(sample, "gate_action") else int(sample.gate_action)
             ),
@@ -1226,6 +1284,7 @@ def collect_on_policy_rollout(
         old_per_action_probability_tables.append(transition.old_per_action_probability_table.copy())
         previous_cache = transition.next_cache_state.copy()
         previous_uav = dict(transition.next_uav_positions)
+        previous_queue = dict(transition.next_queue_workload_s)
         if done:
             break
 
@@ -1241,9 +1300,11 @@ def collect_on_policy_rollout(
         next_observation = _make_observation(
             previous_cache,
             previous_uav,
+            previous_queue,
             next_step,
             observation_spec,
             flight_boundary,
+            queue_time_ref_s,
         )
         bootstrap_value = _value_only(policy, next_observation)
 
@@ -1454,6 +1515,7 @@ def run_direct_cf_branches(
                 str(uav_id): (float(xy[0]), float(xy[1]))
                 for uav_id, xy in snapshot.previous_uav_positions.items()
             }
+            previous_queue = dict(snapshot.previous_queue_workload_s)
             branch_g: list[float] = []
             branch_q: list[float] = []
             branch_cache: list[float] = []
@@ -1466,9 +1528,11 @@ def run_direct_cf_branches(
                 observation = _make_observation(
                     previous_cache,
                     previous_uav,
+                    previous_queue,
                     step,
                     observation_spec,
                     flight_boundary,
+                    cache_config.time_ref_s,
                 )
                 mask_provider = build_trigger_action_mask_provider(
                     previous_cache,
@@ -1517,6 +1581,7 @@ def run_direct_cf_branches(
                     flight_boundary,
                     slot_id=step.slot,
                     time_s=step.time_s,
+                    previous_queue_workload_s=previous_queue,
                 )
                 if not result.step_feasible:
                     raise InfeasibleActionBlocker(
@@ -1547,6 +1612,7 @@ def run_direct_cf_branches(
                     str(uav_id): (float(xy[0]), float(xy[1]))
                     for uav_id, xy in (result.next_uav_positions or {}).items()
                 }
+                previous_queue = dict(result.next_queue_workload_s or {})
                 branch_steps += 1
                 if int(step.slot) >= int(terminal_slot):
                     break
@@ -1692,6 +1758,7 @@ def run_gate_cf_branches(
                     str(uav_id): (float(xy[0]), float(xy[1]))
                     for uav_id, xy in snapshot.previous_uav_positions.items()
                 }
+                previous_queue = dict(snapshot.previous_queue_workload_s)
                 branch_local_cache = clone_local_cache()
                 branch_g: list[float] = []
                 branch_q: list[float] = []
@@ -1703,9 +1770,11 @@ def run_gate_cf_branches(
                     observation = _make_observation(
                         previous_cache,
                         previous_uav,
+                        previous_queue,
                         step,
                         observation_spec,
                         flight_boundary,
+                        cache_config.time_ref_s,
                     )
                     mask_provider = build_trigger_action_mask_provider(
                         previous_cache,
@@ -1762,6 +1831,7 @@ def run_gate_cf_branches(
                         flight_boundary,
                         slot_id=step.slot,
                         time_s=step.time_s,
+                        previous_queue_workload_s=previous_queue,
                     )
                     if not result.step_feasible:
                         raise InfeasibleActionBlocker(
@@ -1792,6 +1862,7 @@ def run_gate_cf_branches(
                         str(uav_id): (float(xy[0]), float(xy[1]))
                         for uav_id, xy in (result.next_uav_positions or {}).items()
                     }
+                    previous_queue = dict(result.next_queue_workload_s or {})
                     branch_steps += 1
                     if int(step.slot) >= int(terminal_slot):
                         break
@@ -2047,7 +2118,44 @@ def _batch_consistency(policy: Any, batch: RolloutBatch) -> tuple[float, float]:
     )
 
 
-def run_minimal_sanity(config_path: str = "system_config.toml", origin_start_index: int = 0, max_steps: int = 8) -> dict[str, Any]:
+def _build_rollout_policy_from_config(
+    cfg: dict[str, Any],
+    observation_dim: int,
+    action_spec: ppo_trigger_policy.TriggerActionSpec,
+) -> Any:
+    """按照统一配置构造 rollout 策略，不创建优化器。"""
+
+    method = str(project_config.get_config_value(cfg, "algorithm.ppo.method"))
+    network_cfg = ppo_trigger_policy.ppo_network_config_from_project(cfg)
+    from ppo import hierarchical_reconfiguration_gate
+
+    if method == hierarchical_reconfiguration_gate.HIERARCHICAL_GATE_METHOD:
+        return hierarchical_reconfiguration_gate.build_hierarchical_policy(
+            observation_dim,
+            action_spec,
+            subpolicy_hidden_sizes=tuple(
+                int(value) for value in network_cfg["hidden_sizes"]
+            ),
+            autoregressive_hidden_size=int(
+                network_cfg["autoregressive_hidden_size"]
+            ),
+        )
+    return ppo_trigger_policy.ConditionalTriggerActorCritic(
+        observation_dim,
+        action_spec,
+        **network_cfg,
+    )
+
+
+def run_minimal_sanity(
+    config_path: str = "system_config.toml",
+    origin_start_index: int = 0,
+    max_steps: int = 8,
+    *,
+    forced_gate_action: int | None = None,
+    force_noop_configuration: bool = False,
+    repeat_check: bool = True,
+) -> dict[str, Any]:
     cfg = project_config.load_config(config_path)
     project_config.validate_for_formal_experiment(cfg)
     root = Path(cfg["_meta"]["project_root"])
@@ -2089,16 +2197,19 @@ def run_minimal_sanity(config_path: str = "system_config.toml", origin_start_ind
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
+        task_vehicle_ids=[
+            str(value) for value in first_origin["task_vehicle_ids"].tolist()
+        ],
     )
     gamma, gae_lambda = ppo_gae_config_from_project(cfg)
     terminal_slot = int(scenarios["origin_slots"][-1])
 
     ppo_trigger_policy.set_torch_seed(seed)
     np.random.seed(seed)
-    policy = ppo_trigger_policy.ConditionalTriggerActorCritic(
+    policy = _build_rollout_policy_from_config(
+        cfg,
         observation_spec.observation_dim,
         action_spec,
-        **ppo_trigger_policy.ppo_network_config_from_project(cfg),
     )
     batch = collect_on_policy_rollout(
         policy,
@@ -2116,38 +2227,44 @@ def run_minimal_sanity(config_path: str = "system_config.toml", origin_start_ind
         gamma,
         gae_lambda,
         terminal_slot,
+        forced_gate_action=forced_gate_action,
+        force_noop_configuration=force_noop_configuration,
     )
     logprob_error, value_error = _batch_consistency(policy, batch)
 
-    # 重复 sanity：重新初始化同一 policy weights + 同一 RNG，动作和reward应一致。
-    ppo_trigger_policy.set_torch_seed(seed)
-    np.random.seed(seed)
-    policy_repeat = ppo_trigger_policy.ConditionalTriggerActorCritic(
-        observation_spec.observation_dim,
-        action_spec,
-        **ppo_trigger_policy.ppo_network_config_from_project(cfg),
-    )
-    repeat = collect_on_policy_rollout(
-        policy_repeat,
-        initial_cache,
-        initial_uav,
-        aligned_steps,
-        local_cache,
-        service_catalog,
-        cfg,
-        cache_nodes,
-        cache_cfg,
-        boundary,
-        observation_spec,
-        action_spec,
-        gamma,
-        gae_lambda,
-        terminal_slot,
-    )
-    repeated_ok = bool(
-        np.array_equal(batch.actions, repeat.actions)
-        and np.allclose(batch.rewards, repeat.rewards, atol=0.0, rtol=0.0)
-    )
+    repeated_ok: bool | None = None
+    if repeat_check:
+        # 重复 sanity：重新初始化同一策略参数和随机数，动作及 reward 应完全一致。
+        ppo_trigger_policy.set_torch_seed(seed)
+        np.random.seed(seed)
+        policy_repeat = _build_rollout_policy_from_config(
+            cfg,
+            observation_spec.observation_dim,
+            action_spec,
+        )
+        repeat = collect_on_policy_rollout(
+            policy_repeat,
+            initial_cache,
+            initial_uav,
+            aligned_steps,
+            local_cache,
+            service_catalog,
+            cfg,
+            cache_nodes,
+            cache_cfg,
+            boundary,
+            observation_spec,
+            action_spec,
+            gamma,
+            gae_lambda,
+            terminal_slot,
+            forced_gate_action=forced_gate_action,
+            force_noop_configuration=force_noop_configuration,
+        )
+        repeated_ok = bool(
+            np.array_equal(batch.actions, repeat.actions)
+            and np.allclose(batch.rewards, repeat.rewards, atol=0.0, rtol=0.0)
+        )
     return {
         "gamma": gamma,
         "gae_lambda": gae_lambda,
@@ -2158,8 +2275,138 @@ def run_minimal_sanity(config_path: str = "system_config.toml", origin_start_ind
         "old_logprob_recompute_max_error": logprob_error,
         "old_value_recompute_max_error": value_error,
         "repeated_rollout_deterministic": repeated_ok,
+        "policy": policy,
+        "policy_type": type(policy).__name__,
         "formal_validation": True,
         "alignment_steps_prepared": len(aligned_steps),
+    }
+
+
+def run_hierarchical_minimal_e2e_validation(
+    config_path: str = "system_config.toml",
+    origin_start_index: int = 0,
+) -> dict[str, Any]:
+    """执行一次无训练的分层策略最小端到端验证。"""
+
+    from ppo import hierarchical_reconfiguration_gate
+
+    null_payload = run_minimal_sanity(
+        config_path,
+        origin_start_index,
+        1,
+        forced_gate_action=hierarchical_reconfiguration_gate.GATE_ACTION_NULL,
+        repeat_check=False,
+    )
+    configure_payload = run_minimal_sanity(
+        config_path,
+        origin_start_index,
+        1,
+        forced_gate_action=hierarchical_reconfiguration_gate.GATE_ACTION_CONFIGURE,
+        force_noop_configuration=True,
+        repeat_check=False,
+    )
+    policy = null_payload["policy"]
+    if not isinstance(
+        policy,
+        hierarchical_reconfiguration_gate.HierarchicalReconfigurationGatePolicy,
+    ):
+        raise TypeError("当前正式配置没有构造 Hierarchical Gate 策略。")
+    null_batch: RolloutBatch = null_payload["batch"]
+    configure_batch: RolloutBatch = configure_payload["batch"]
+    null_transition = null_batch.transitions[0]
+    configure_transition = configure_batch.transitions[0]
+    if (
+        null_batch.gate_actions is None
+        or null_batch.subpolicy_actions is None
+        or configure_batch.gate_actions is None
+        or configure_batch.subpolicy_actions is None
+    ):
+        raise AssertionError("分层 rollout 未保存 Gate/WHAT 动作字段。")
+    null_action_ok = bool(
+        int(null_transition.gate_action)
+        == hierarchical_reconfiguration_gate.GATE_ACTION_NULL
+        and not np.any(null_transition.action_vector)
+    )
+    configure_mapping_ok = bool(
+        int(configure_transition.gate_action)
+        == hierarchical_reconfiguration_gate.GATE_ACTION_CONFIGURE
+        and np.array_equal(
+            configure_transition.action_vector,
+            configure_transition.subpolicy_action_vector,
+        )
+        and not np.any(configure_transition.action_vector)
+    )
+    finite_rollout_ok = bool(
+        all(
+            np.all(np.isfinite(array))
+            for batch in (null_batch, configure_batch)
+            for array in (
+                batch.observations,
+                batch.old_log_probs,
+                batch.old_values,
+                batch.rewards,
+            )
+        )
+    )
+    return {
+        "policy_type": type(policy).__name__,
+        "method": str(
+            project_config.get_config_value(
+                project_config.load_config(config_path),
+                "algorithm.ppo.method",
+            )
+        ),
+        "observation_dim": int(null_payload["observation_spec"].observation_dim),
+        "action_dim": int(null_payload["action_spec"].action_dim),
+        "executed_slots_per_branch": 1,
+        "environment_steps_total": 2,
+        "null_gate_action": int(null_transition.gate_action),
+        "configure_gate_action": int(configure_transition.gate_action),
+        "null_final_action": null_transition.action_vector.astype(int).tolist(),
+        "configure_final_action": configure_transition.action_vector.astype(int).tolist(),
+        "null_reward": float(null_transition.reward),
+        "configure_noop_reward": float(configure_transition.reward),
+        "same_noop_environment_result": bool(
+            math.isclose(
+                float(null_transition.reward),
+                float(configure_transition.reward),
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+            and np.array_equal(
+                null_transition.next_cache_state,
+                configure_transition.next_cache_state,
+            )
+            and null_transition.next_uav_positions
+            == configure_transition.next_uav_positions
+            and null_transition.next_queue_workload_s
+            == configure_transition.next_queue_workload_s
+        ),
+        "finite_rollout_ok": finite_rollout_ok,
+        "null_maps_to_all_zero": null_action_ok,
+        "configure_maps_to_what": configure_mapping_ok,
+        "gate_fields_preserved": bool(
+            null_batch.metadata["hierarchical_gate_rollout"]
+            and configure_batch.metadata["hierarchical_gate_rollout"]
+        ),
+        "old_logprob_recompute_max_error": float(
+            max(
+                null_payload["old_logprob_recompute_max_error"],
+                configure_payload["old_logprob_recompute_max_error"],
+            )
+        ),
+        "old_value_recompute_max_error": float(
+            max(
+                null_payload["old_value_recompute_max_error"],
+                configure_payload["old_value_recompute_max_error"],
+            )
+        ),
+        "state_propagation_ok": bool(
+            null_batch.metadata["state_propagation_ok"]
+            and configure_batch.metadata["state_propagation_ok"]
+        ),
+        "optimizer_steps": 0,
+        "backward_calls": 0,
     }
 
 
@@ -2207,14 +2454,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="system_config.toml")
     parser.add_argument("--origin-start-index", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument(
+        "--hierarchical-e2e",
+        action="store_true",
+        help="仅执行一次分层策略最小端到端验证，不训练。",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        payload = run_minimal_sanity(args.config, args.origin_start_index, args.max_steps)
-        print(json.dumps(_summary(payload), ensure_ascii=False, indent=2))
+        if args.hierarchical_e2e:
+            summary = run_hierarchical_minimal_e2e_validation(
+                args.config,
+                args.origin_start_index,
+            )
+        else:
+            payload = run_minimal_sanity(
+                args.config,
+                args.origin_start_index,
+                args.max_steps,
+            )
+            summary = _summary(payload)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
     except InfeasibleActionBlocker as exc:
         print(str(exc))

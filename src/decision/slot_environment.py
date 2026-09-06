@@ -40,6 +40,7 @@ class SlotExecutionResult:
     input_uav_triggers: dict[str, int]
     previous_cache_state: np.ndarray
     previous_uav_positions: dict[str, tuple[float, float]]
+    previous_queue_workload_s: dict[str, float]
     final_cache_state: np.ndarray | None
     final_uav_positions: dict[str, tuple[float, float]] | None
     predictive_configuration_utility: float | None
@@ -53,12 +54,14 @@ class SlotExecutionResult:
     cpu_allocations: dict[str, dict[str, float]]
     bandwidth_allocations: dict[str, dict[str, float]]
     per_task_delay_s: dict[str, float]
+    per_task_queue_wait_s: dict[str, float]
     per_task_vehicle_energy_j: dict[str, float]
     per_task_utility: dict[str, float]
     configuration_summary: dict[str, Any]
     matching_summary: dict[str, Any]
     next_cache_state: np.ndarray | None
     next_uav_positions: dict[str, tuple[float, float]] | None
+    next_queue_workload_s: dict[str, float] | None
 
 
 def _position_tuples(positions: dict[str, Any]) -> dict[str, tuple[float, float]]:
@@ -95,6 +98,9 @@ def _configuration_summary(result: JointConfigurationResult) -> dict[str, Any]:
         "accepted_cache_updates": result.accepted_cache_updates,
         "accepted_uav_updates": result.accepted_uav_updates,
         "stop_reason": result.stop_reason,
+        "predictive_evaluation_skipped": (
+            result.stop_reason == "no_trigger_prediction_skipped"
+        ),
     }
 
 
@@ -114,6 +120,7 @@ def execute_slot(
     flight_boundary: tuple[float, float, float, float],
     slot_id: int | None = None,
     time_s: float | None = None,
+    previous_queue_workload_s: dict[str, float] | None = None,
 ) -> SlotExecutionResult:
     """Execute one slot from external trigger to actual system utility.
 
@@ -125,20 +132,78 @@ def execute_slot(
     previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     previous_uav = _position_tuples(previous_uav_positions)
     cache_trigger = np.asarray(cache_triggers, dtype=np.int8).copy()
-
-    configuration = optimize_joint_configuration(
+    previous_queue = {
+        str(node_id): float(value)
+        for node_id, value in (previous_queue_workload_s or {}).items()
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in previous_queue.values()):
+        raise ValueError("previous_queue_workload_s 必须是非负 finite 秒数。")
+    cache_configuration.validate_cache_shape_and_capacity(
         previous_cache,
-        previous_uav,
-        cache_trigger,
-        dict(uav_triggers),
-        scenario_slice,
-        local_cache_state,
         service_catalog,
-        project_cfg,
         cache_nodes,
-        cache_config,
-        flight_boundary,
     )
+    if cache_trigger.shape != (previous_cache.shape[0],) or not np.all(
+        np.isin(cache_trigger, [0, 1])
+    ):
+        raise ValueError("cache_triggers 必须是与 cache node 数量一致的0/1向量。")
+    if set(uav_triggers) != set(previous_uav) or any(
+        int(value) not in (0, 1) for value in uav_triggers.values()
+    ):
+        raise ValueError("uav_triggers 必须覆盖全部 UAV 且只能取0/1。")
+
+    no_configuration_trigger = (
+        int(cache_trigger.sum()) == 0
+        and not any(int(value) == 1 for value in uav_triggers.values())
+    )
+    if no_configuration_trigger:
+        # Gate=NULL 时配置状态严格保持不变；预测目标既不参与 Matching，也不参与
+        # 当前 reward，因此不执行昂贵且无决策作用的场景配置评价。
+        configuration = JointConfigurationResult(
+            previous_cache_state=previous_cache.copy(),
+            final_cache_state=previous_cache.copy(),
+            previous_uav_positions=dict(previous_uav),
+            final_uav_positions=dict(previous_uav),
+            cache_triggers=cache_trigger.astype(int).tolist(),
+            uav_triggers={key: int(value) for key, value in uav_triggers.items()},
+            trigger_feasible=True,
+            infeasible_reason="",
+            predictive_utility=0.0,
+            cache_cost=0.0,
+            movement_energy=0.0,
+            movement_cost=0.0,
+            objective_value=0.0,
+            initial_objective=0.0,
+            objective_history=[],
+            outer_rounds=0,
+            accepted_cache_updates=0,
+            accepted_uav_updates=0,
+            stop_reason="no_trigger_prediction_skipped",
+            cache_result_summary={},
+            uav_result_summary={},
+        )
+    else:
+        evaluation_context = cache_configuration.build_surrogate_evaluation_context(
+            scenario_slice,
+            local_cache_state,
+            cache_nodes,
+            cache_config,
+            queue_workload_s=previous_queue,
+        )
+        configuration = optimize_joint_configuration(
+            previous_cache,
+            previous_uav,
+            cache_trigger,
+            dict(uav_triggers),
+            scenario_slice,
+            local_cache_state,
+            service_catalog,
+            project_cfg,
+            cache_nodes,
+            cache_config,
+            flight_boundary,
+            evaluation_context=evaluation_context,
+        )
     if not configuration.trigger_feasible:
         return SlotExecutionResult(
             slot_id=slot_id,
@@ -149,6 +214,7 @@ def execute_slot(
             input_uav_triggers=dict(uav_triggers),
             previous_cache_state=previous_cache.copy(),
             previous_uav_positions=previous_uav,
+            previous_queue_workload_s=dict(previous_queue),
             final_cache_state=None,
             final_uav_positions=None,
             predictive_configuration_utility=None,
@@ -162,12 +228,14 @@ def execute_slot(
             cpu_allocations={},
             bandwidth_allocations={},
             per_task_delay_s={},
+            per_task_queue_wait_s={},
             per_task_vehicle_energy_j={},
             per_task_utility={},
             configuration_summary=_configuration_summary(configuration),
             matching_summary={},
             next_cache_state=None,
             next_uav_positions=None,
+            next_queue_workload_s=None,
         )
 
     final_cache = np.asarray(configuration.final_cache_state, dtype=np.int8).copy()
@@ -186,6 +254,7 @@ def execute_slot(
         project_cfg,
         cache_nodes,
         cache_config,
+        queue_workload_s=previous_queue,
     )
     if not matching.resource_feasible:
         return SlotExecutionResult(
@@ -197,6 +266,7 @@ def execute_slot(
             input_uav_triggers=dict(uav_triggers),
             previous_cache_state=previous_cache.copy(),
             previous_uav_positions=previous_uav,
+            previous_queue_workload_s=dict(previous_queue),
             final_cache_state=None,
             final_uav_positions=None,
             predictive_configuration_utility=None,
@@ -210,13 +280,31 @@ def execute_slot(
             cpu_allocations={},
             bandwidth_allocations={},
             per_task_delay_s={},
+            per_task_queue_wait_s={},
             per_task_vehicle_energy_j={},
             per_task_utility={},
             configuration_summary=_configuration_summary(configuration),
             matching_summary=_matching_summary(matching),
             next_cache_state=None,
             next_uav_positions=None,
+            next_queue_workload_s=None,
         )
+
+    per_task_queue_wait_s = {
+        task.task_id: float(
+            previous_queue.get(matching.matching[task.task_id], 0.0)
+        )
+        for task in actual_tasks
+    }
+    slot_duration_s = float(
+        project_config.get_config_value(project_cfg, "simulation.dt_s")
+    )
+    next_queue = task_allocation.advance_queue_workload(
+        previous_queue,
+        matching.matching,
+        matching.per_task_delay_s,
+        slot_duration_s,
+    )
 
     actual_q = float(matching.task_utility_sum)
     cache_cost = float(configuration.cache_cost)
@@ -239,10 +327,19 @@ def execute_slot(
         input_uav_triggers=dict(uav_triggers),
         previous_cache_state=previous_cache.copy(),
         previous_uav_positions=previous_uav,
+        previous_queue_workload_s=dict(previous_queue),
         final_cache_state=final_cache.copy(),
         final_uav_positions=final_uav,
-        predictive_configuration_utility=float(configuration.predictive_utility),
-        predictive_configuration_objective=float(configuration.objective_value),
+        predictive_configuration_utility=(
+            None
+            if no_configuration_trigger
+            else float(configuration.predictive_utility)
+        ),
+        predictive_configuration_objective=(
+            None
+            if no_configuration_trigger
+            else float(configuration.objective_value)
+        ),
         cache_cost=cache_cost,
         movement_energy=float(configuration.movement_energy),
         movement_cost=movement_cost,
@@ -252,12 +349,14 @@ def execute_slot(
         cpu_allocations=matching.cpu_allocations,
         bandwidth_allocations=matching.bandwidth_allocations,
         per_task_delay_s=matching.per_task_delay_s,
+        per_task_queue_wait_s=per_task_queue_wait_s,
         per_task_vehicle_energy_j=matching.per_task_vehicle_energy_j,
         per_task_utility=matching.per_task_utility,
         configuration_summary=_configuration_summary(configuration),
         matching_summary=_matching_summary(matching),
         next_cache_state=final_cache.copy(),
         next_uav_positions=final_uav,
+        next_queue_workload_s=next_queue,
     )
 
 

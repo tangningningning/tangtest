@@ -1191,6 +1191,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="从独立 calibration SUMO 轨迹生成 causal Kalman predictions 和 residual bank。"
     )
+    parser.add_argument("--config", default="system_config.toml")
     parser.add_argument(
         "--roles-file",
         default=None,
@@ -1300,7 +1301,7 @@ def main(argv: list[str] | None = None) -> int:
         project_root = find_project_root()
         from common import project_config as project_config_module
 
-        formal_config = project_config_module.load_config()
+        formal_config = project_config_module.load_config(args.config)
         get_value = project_config_module.get_config_value
         config = config_from_args(args, formal_config)
         config.validate()

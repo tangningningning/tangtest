@@ -63,6 +63,49 @@ def local_target(task_id: str) -> str:
     return f"{LOCAL_PREFIX}{task_id}"
 
 
+def advance_queue_workload(
+    previous_workload_s: dict[str, float] | None,
+    matching: dict[str, str],
+    per_task_delay_s: dict[str, float],
+    slot_duration_s: float,
+) -> dict[str, float]:
+    """按批次 FIFO 语义推进各执行节点的剩余工作时间。
+
+    同一时隙分配到同一节点的任务按照 KKT 结果并发执行；该批次在最慢任务
+    完成后释放节点。上一时隙遗留工作先形成共同等待时间，经过一个 slot 后
+    将剩余秒数传递给下一时隙。
+    """
+
+    duration = float(slot_duration_s)
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise ValueError("slot_duration_s 必须为正 finite 秒数。")
+    previous = {
+        str(node_id): float(value)
+        for node_id, value in (previous_workload_s or {}).items()
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in previous.values()):
+        raise ValueError("previous_workload_s 必须是非负 finite 秒数。")
+    if set(matching) != set(per_task_delay_s):
+        raise ValueError("matching 与 per_task_delay_s 的任务集合必须一致。")
+
+    next_workload = {
+        node_id: max(0.0, value - duration)
+        for node_id, value in previous.items()
+    }
+    completion_by_node: dict[str, float] = {}
+    for task_id, target in matching.items():
+        delay = float(per_task_delay_s[task_id])
+        if not math.isfinite(delay) or delay < 0.0:
+            raise ValueError("per_task_delay_s 必须是非负 finite 秒数。")
+        completion_by_node[target] = max(completion_by_node.get(target, 0.0), delay)
+    for node_id, completion_s in completion_by_node.items():
+        next_workload[node_id] = max(
+            next_workload.get(node_id, 0.0),
+            max(0.0, completion_s - duration),
+        )
+    return next_workload
+
+
 def _stable_id_key(value: str) -> tuple[int, int | str]:
     text = str(value)
     return (0, int(text)) if text.isdigit() else (1, text)
@@ -127,6 +170,7 @@ def evaluate_matching_candidate(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    queue_workload_s: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
     """薄 adapter：Matching层 LOCAL:v -> KKT层 LOCAL。"""
 
@@ -138,6 +182,7 @@ def evaluate_matching_candidate(
         project_cfg,
         cache_nodes,
         cache_config,
+        queue_workload_s=queue_workload_s,
     )
 
 
@@ -191,6 +236,7 @@ def enumerate_best_operation(
     tolerance: float,
     evaluate_only: bool = False,
     evaluation_mode: str = "incremental",
+    queue_workload_s: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
     """枚举全部合法transfer/exchange，返回本轮最大增益候选。"""
 
@@ -223,6 +269,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    queue_workload_s=queue_workload_s,
                 )
             else:
                 evaluation = evaluate_matching_candidate_incremental(
@@ -236,6 +283,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    queue_workload_s=queue_workload_s,
                 )
             stats["candidate_evaluations_total"] += 1
             stats["transfer_candidates_evaluated"] += 1
@@ -277,6 +325,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    queue_workload_s=queue_workload_s,
                 )
             else:
                 evaluation = evaluate_matching_candidate_incremental(
@@ -290,6 +339,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    queue_workload_s=queue_workload_s,
                 )
             stats["candidate_evaluations_total"] += 1
             stats["exchange_candidates_evaluated"] += 1
@@ -356,8 +406,9 @@ def optimize_task_matching(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     evaluation_mode: str = "incremental",
+    queue_workload_s: dict[str, float] | None = None,
 ) -> TransferExchangeMatchingResult:
-    """Transfer-Exchange local stable matching under actual state."""
+    """在当前缓存、无线状态和显式跨时隙队列下执行稳定匹配。"""
 
     if evaluation_mode not in {"full", "incremental"}:
         raise ValueError(f"未知 Matching candidate evaluation mode：{evaluation_mode}")
@@ -400,6 +451,7 @@ def optimize_task_matching(
         project_cfg,
         cache_nodes,
         cache_config,
+        queue_workload_s=queue_workload_s,
     )
     if not current_eval.resource_feasible:
         raise AssertionError("全Cloud初始matching应资源可行。")
@@ -430,6 +482,7 @@ def optimize_task_matching(
             cache_config,
             tolerance,
             evaluation_mode=evaluation_mode,
+            queue_workload_s=queue_workload_s,
         )
         for key, value in stats.items():
             counters[key] += value
@@ -472,6 +525,7 @@ def optimize_task_matching(
             tolerance,
             evaluate_only=True,
             evaluation_mode=evaluation_mode,
+            queue_workload_s=queue_workload_s,
         )
         # 复检也是候选评价的一部分，便于复杂度记录。
         for key, value in check_stats.items():
@@ -1209,8 +1263,9 @@ def evaluate_matching_with_kkt(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    queue_workload_s: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
-    """评价给定 matching 的 J(mu)=sum_v Q_v。"""
+    """评价给定 matching，并把上一时隙遗留工作量计入任务等待时延。"""
 
     if not tasks:
         return KKTMatchingEvaluation(True, "", 0.0, {}, {}, {}, {}, {}, {}, {}, {}, {})
@@ -1250,6 +1305,13 @@ def evaluate_matching_with_kkt(
         if cache_config.cloud_resource_sharing
         else 1
     )
+
+    normalized_queue = {
+        str(node_id): float(workload_s)
+        for node_id, workload_s in (queue_workload_s or {}).items()
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in normalized_queue.values()):
+        raise ValueError("queue_workload_s 必须是非负 finite 秒数。")
 
     for task in tasks:
         target = matching[task.task_id]
@@ -1294,6 +1356,10 @@ def evaluate_matching_with_kkt(
             )
             delay = float(edge["total_delay_s"])
             energy = float(edge["vehicle_energy_j"])
+        # Local 资源按任务车辆区分；公共 edge/Cloud 直接使用执行节点 ID。
+        queue_target = local_target(task.task_id) if target == LOCAL else target
+        queue_wait_s = float(normalized_queue.get(queue_target, 0.0))
+        delay += queue_wait_s
         utility = float(
             system_model.task_utility(
                 delay,
@@ -1336,6 +1402,7 @@ def evaluate_matching_candidate_incremental(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    queue_workload_s: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
     """只重算 candidate 受影响 edge nodes，返回完整 KKT matching evaluation。"""
 
@@ -1430,6 +1497,7 @@ def evaluate_matching_candidate_incremental(
             project_cfg,
             cache_nodes,
             cache_config,
+            queue_workload_s=queue_workload_s,
         )
         if not node_evaluation.resource_feasible:
             return infeasible(
@@ -1462,6 +1530,7 @@ def evaluate_matching_candidate_incremental(
             project_cfg,
             cache_nodes,
             cache_config,
+            queue_workload_s=queue_workload_s,
         )
         if not non_edge_evaluation.resource_feasible:
             return infeasible(

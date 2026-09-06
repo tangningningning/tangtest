@@ -303,6 +303,8 @@ def list_unresolved_parameters(config: dict[str, Any]) -> dict[str, str]:
 # 检查类型和取值范围，但不要求伪装成“文献物理校准参数”。
 FORMAL_SYSTEM_PARAMETER_KEYS = {
     "simulation.dt_s",
+    "execution.cross_slot_task_model",
+    "execution.slot_duration_source",
     "simulation.warmup_time_s",
     "simulation.episode_time_s",
     "simulation.num_research_vehicles",
@@ -731,6 +733,12 @@ def validate_config(config: dict[str, Any]) -> None:
     episode_s = float(get_config_value(config, "simulation.episode_time_s"))
     if dt_s <= 0.0 or warmup_s < 0.0 or episode_s <= 0.0:
         raise ValueError("simulation.dt_s/warmup_time_s/episode_time_s 数值范围无效。")
+    if str(get_config_value(config, "execution.cross_slot_task_model")) != "deterministic_batch_fifo":
+        raise ValueError(
+            "execution.cross_slot_task_model 必须为 deterministic_batch_fifo。"
+        )
+    if str(get_config_value(config, "execution.slot_duration_source")) != "simulation.dt_s":
+        raise ValueError("execution.slot_duration_source 必须唯一指向 simulation.dt_s。")
     for label, duration in (("warmup_time_s", warmup_s), ("episode_time_s", episode_s)):
         steps = duration / dt_s
         if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
@@ -837,6 +845,14 @@ def validate_config(config: dict[str, Any]) -> None:
         get_config_value(config, "nodes.cloud.uplink_rate_bps")
     ):
         raise ValueError("communication.cloud.uplink_rate_bps 必须与 nodes.cloud.uplink_rate_bps 一致。")
+    if float(get_config_value(config, "nodes.cloud.cpu_cycles_per_s")) != float(
+        get_config_value(config, "nodes.cloud.total_cpu_cycles_per_s")
+    ):
+        raise ValueError("Cloud legacy CPU 字段必须与唯一总 CPU 容量一致。")
+    if float(get_config_value(config, "nodes.cloud.uplink_rate_bps")) != float(
+        get_config_value(config, "nodes.cloud.total_bandwidth_bps")
+    ):
+        raise ValueError("Cloud legacy uplink 字段必须与唯一总带宽容量一致。")
 
     for key, status in config.get("parameter_status", {}).items():
         if status not in {

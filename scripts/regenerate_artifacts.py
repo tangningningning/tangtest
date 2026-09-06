@@ -112,6 +112,19 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def recorded_hash_mismatch(
+    metadata: dict[str, Any],
+    artifact_name: str,
+    path: Path,
+) -> bool:
+    """若 metadata 已记录哈希，则检测 artifact 是否被外部修改。"""
+
+    recorded = metadata.get("artifact_sha256", {})
+    if not isinstance(recorded, dict) or artifact_name not in recorded:
+        return False
+    return not path.is_file() or str(recorded[artifact_name]) != sha256_file(path)
+
+
 def validate_input_config(config: dict[str, Any]) -> None:
     """检查本次 baseline 的规模、任务范围和缓存比例关系。"""
 
@@ -219,20 +232,47 @@ def current_signature(
             "SV": float(find_value(config, "nodes.sv.cpu_cycles_per_s")),
             "RSU": float(find_value(config, "nodes.rsu.cpu_cycles_per_s")),
             "UAV": float(find_value(config, "nodes.uav.cpu_cycles_per_s")),
-            "Cloud": float(find_value(config, "nodes.cloud.cpu_cycles_per_s")),
+            "Cloud": float(find_value(config, "nodes.cloud.total_cpu_cycles_per_s")),
         },
         "prediction": {
-            "vehicle_horizon": int(find_value(prediction, "vehicle.horizon")),
-            "popularity_history_length": int(
-                find_value(popularity_prediction, "history_length")
+            "vehicle": json.loads(json.dumps(find_value(prediction, "vehicle", {}))),
+            "popularity": json.loads(json.dumps(popularity_prediction)),
+            "scenario": json.loads(json.dumps(scenario)),
+        },
+        "node_placement": {
+            "sumo_net": str(find_value(config, "paths.sumo_net")),
+            "rsu_altitude_m": float(find_value(config, "nodes.rsu.deployment_altitude_m")),
+            "uav_altitude_m": float(find_value(config, "nodes.uav.deployment_altitude_m")),
+            "uav_offset_fraction": float(
+                find_value(config, "nodes.uav.deployment_offset_fraction")
             ),
-            "popularity_hidden_size": int(
-                find_value(popularity_prediction, "hidden_size")
-            ),
-            "scenario_count": int(find_value(scenario, "num_scenarios")),
         },
         "roles_sha256": roles_hash,
     }
+
+
+def prediction_signature_matches(
+    previous: Any,
+    current: dict[str, Any],
+) -> bool:
+    """比较预测配置，并兼容旧 metadata 的四字段签名。"""
+
+    if previous == current:
+        return True
+    if not isinstance(previous, dict):
+        return False
+    if {"vehicle", "popularity", "scenario"}.issubset(previous):
+        return False
+    return (
+        int(previous.get("vehicle_horizon", -1))
+        == int(find_value(current, "vehicle.horizon", -2))
+        and int(previous.get("popularity_history_length", -1))
+        == int(find_value(current, "popularity.history_length", -2))
+        and int(previous.get("popularity_hidden_size", -1))
+        == int(find_value(current, "popularity.hidden_size", -2))
+        and int(previous.get("scenario_count", -1))
+        == int(find_value(current, "scenario.num_scenarios", -2))
+    )
 
 
 def artifact_paths(config: dict[str, Any], project_root: Path) -> dict[str, Path]:
@@ -368,18 +408,38 @@ def regenerate_roles(config: dict[str, Any], paths: dict[str, Path]) -> None:
 
 
 def node_positions_need_regeneration(config: dict[str, Any], path: Path) -> bool:
-    """检查节点位置文件的 RSU/UAV ID 是否与当前配置一致。"""
+    """按当前路网和部署配置重算期望结果，检查完整节点位置 artifact。"""
 
     if not path.is_file():
         return True
     try:
+        from scenario import node_placement
+
         payload = load_json(path)
-        expected = {
-            "rsu": {f"RSU_{index}" for index in range(int(find_value(config, "nodes.rsu.count")))},
-            "uav": {f"UAV_{index}" for index in range(int(find_value(config, "nodes.uav.count")))},
-        }
-        return any(set(payload.get(role, {})) != ids for role, ids in expected.items())
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        net_file = resolve_path(PROJECT_ROOT, find_value(config, "paths.sumo_net"))
+        network, boundary = node_placement.read_sumo_network(net_file)
+        candidates = node_placement.extract_junction_candidates(network)
+        selected = node_placement.select_rsu_candidates(
+            candidates,
+            int(find_value(config, "nodes.rsu.count")),
+        )
+        uav_positions = node_placement.generate_uav_positions(
+            selected,
+            int(find_value(config, "nodes.uav.count")),
+            boundary,
+            float(find_value(config, "nodes.uav.deployment_offset_fraction")),
+            float(find_value(config, "nodes.uav.deployment_altitude_m")),
+        )
+        expected = node_placement.build_node_positions_payload(
+            net_file,
+            PROJECT_ROOT,
+            boundary,
+            selected,
+            uav_positions,
+            float(find_value(config, "nodes.rsu.deployment_altitude_m")),
+        )
+        return payload != expected
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, ModuleNotFoundError):
         return True
 
 
@@ -404,7 +464,7 @@ def deterministic_catalog_from_config(config: dict[str, Any]) -> list[dict[str, 
 
 
 def catalog_is_current(config: dict[str, Any], path: Path) -> bool:
-    """检查服务数量、服务大小、输入范围和计算密度是否属于当前配置。"""
+    """按当前 seed 重建期望服务目录，避免仅凭“落在范围内”误判为最新。"""
 
     if not path.is_file():
         return False
@@ -419,7 +479,12 @@ def catalog_is_current(config: dict[str, Any], path: Path) -> bool:
         expected_ids = set(range(int(find_value(config, "service.count"))))
         if {int(row["service_id"]) for row in services} != expected_ids:
             return False
-        for row in services:
+        expected_services = sorted(
+            deterministic_catalog_from_config(config),
+            key=lambda row: int(row["service_id"]),
+        )
+        actual_services = sorted(services, key=lambda row: int(row["service_id"]))
+        for row, expected_row in zip(actual_services, expected_services):
             raw_size_gb = row.get("service_size_gb")
             if raw_size_gb is None:
                 raw_size_gb = row.get("service_size")
@@ -446,6 +511,18 @@ def catalog_is_current(config: dict[str, Any], path: Path) -> bool:
                 )
             ):
                 return False
+            for key, expected_value in expected_row.items():
+                actual_value = row.get(key)
+                if isinstance(expected_value, (int, float)) and not isinstance(expected_value, bool):
+                    if actual_value is None or not math.isclose(
+                        float(actual_value),
+                        float(expected_value),
+                        rel_tol=1.0e-12,
+                        abs_tol=FLOAT_TOLERANCE,
+                    ):
+                        return False
+                elif actual_value != expected_value:
+                    return False
         return True
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -562,42 +639,65 @@ def update_capacity_config(
     return True
 
 
+def deterministic_task_artifacts_from_config(
+    config: dict[str, Any],
+    paths: dict[str, Path],
+) -> dict[str, Any]:
+    """使用当前正式 seed 在内存中重建任务链，不写入任何 artifact。"""
+
+    roles = load_json(paths["roles"])
+    task_vehicles = [str(value) for value in roles.get("task_vehicles", [])]
+    task_config = task_scenario.task_config_from_project_config(config)
+    task_config.validate(len(task_vehicles))
+    simulation = find_value(config, "simulation", {})
+    return task_scenario.build_artifacts(
+        task_vehicles,
+        float(simulation["dt_s"]),
+        float(simulation["warmup_time_s"]),
+        float(simulation["episode_time_s"]),
+        int(find_value(config, "task.master_seed")),
+        task_config,
+    )
+
+
 def tasks_are_current(config: dict[str, Any], paths: dict[str, Path]) -> bool:
-    """检查 tasks.csv 的 TV 集合、时隙覆盖和服务 ID 范围。"""
+    """逐行比较当前 seed 的确定性期望任务，覆盖全部任务生成参数。"""
 
     if not paths["tasks"].is_file() or not paths["roles"].is_file():
         return False
     try:
-        roles = load_json(paths["roles"])
-        tv_ids = {str(value) for value in roles.get("task_vehicles", [])}
-        simulation = find_value(config, "simulation", {})
-        num_slots = int(round(float(simulation["episode_time_s"]) / float(simulation["dt_s"])))
-        service_count = int(find_value(config, "service.count"))
+        expected_rows = deterministic_task_artifacts_from_config(config, paths)[
+            "task_rows"
+        ]
         with paths["tasks"].open("r", encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
-            required = {
-                "slot",
-                "vehicle_id",
-                "arrival",
-                "service_id",
-                "input_size",
-                "cpu_cycles",
-            }
-            if not required.issubset(reader.fieldnames or set()):
+            if tuple(reader.fieldnames or ()) != task_scenario.TASK_FIELDS:
                 return False
             rows = list(reader)
-        if len(rows) != len(tv_ids) * num_slots:
+        if len(rows) != len(expected_rows):
             return False
-        by_slot: dict[int, set[str]] = {slot: set() for slot in range(num_slots)}
-        for row in rows:
-            vehicle_id = str(row["vehicle_id"])
-            slot = int(row["slot"])
-            if vehicle_id not in tv_ids or slot not in by_slot:
-                return False
-            by_slot[slot].add(vehicle_id)
-            if int(row["arrival"]) == 1 and not 0 <= int(row["service_id"]) < service_count:
-                return False
-        return all(values == tv_ids for values in by_slot.values())
+        integer_fields = {"slot", "arrival", "service_id"}
+        text_fields = {"vehicle_id"}
+        for row, expected in zip(rows, expected_rows):
+            for field in task_scenario.TASK_FIELDS:
+                actual_text = "" if row[field] is None else str(row[field])
+                expected_text = "" if expected[field] is None else str(expected[field])
+                if actual_text == "" or expected_text == "":
+                    equal = actual_text == expected_text
+                elif field in text_fields:
+                    equal = str(row[field]) == str(expected[field])
+                elif field in integer_fields:
+                    equal = int(row[field]) == int(expected[field])
+                else:
+                    equal = math.isclose(
+                        float(row[field]),
+                        float(expected[field]),
+                        rel_tol=1.0e-12,
+                        abs_tol=FLOAT_TOLERANCE,
+                    )
+                if not equal:
+                    return False
+        return True
     except (OSError, KeyError, TypeError, ValueError, csv.Error):
         return False
 
@@ -626,7 +726,7 @@ def cache_is_current(config: dict[str, Any], paths: dict[str, Path]) -> bool:
 
 
 def prediction_artifacts_are_current(config: dict[str, Any], paths: dict[str, Path]) -> bool:
-    """只用 NumPy/CSV 检查预测场景的服务和车辆维度。"""
+    """检查预测 CSV/NPZ 的完整维度、时间轴、seed 与模型元数据。"""
 
     if not all(paths[name].is_file() for name in ("popularity_predictions", "prediction_scenarios", "vehicle_predictions")):
         return False
@@ -636,27 +736,86 @@ def prediction_artifacts_are_current(config: dict[str, Any], paths: dict[str, Pa
         tv_ids = {str(value) for value in roles.get("task_vehicles", [])}
         sv_ids = {str(value) for value in roles.get("service_vehicles", [])}
         service_count = int(find_value(config, "service.count"))
+        simulation = find_value(config, "simulation", {})
+        num_slots = int(
+            round(float(simulation["episode_time_s"]) / float(simulation["dt_s"]))
+        )
+        horizon = int(find_value(config, "prediction.vehicle.horizon"))
+        scenario_count = int(find_value(config, "scenario.num_scenarios"))
         prediction_rows: list[dict[str, str]] = []
         with paths["popularity_predictions"].open("r", encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             if not {"service_id", "origin_slot", "target_slot", "rho_pred"}.issubset(reader.fieldnames or set()):
                 return False
             prediction_rows.extend(reader)
-        if not prediction_rows or {int(row["service_id"]) for row in prediction_rows} != set(range(service_count)):
+        if len(prediction_rows) != num_slots * horizon * service_count:
+            return False
+        popularity_keys = {
+            (int(row["origin_slot"]), int(row["target_slot"]), int(row["service_id"]))
+            for row in prediction_rows
+        }
+        expected_popularity_keys = {
+            (origin, origin + step, service_id)
+            for origin in range(num_slots)
+            for step in range(horizon)
+            for service_id in range(service_count)
+        }
+        if popularity_keys != expected_popularity_keys:
             return False
         with paths["vehicle_predictions"].open("r", encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
-            if "vehicle_id" not in (reader.fieldnames or set()):
+            required_vehicle_fields = {
+                "vehicle_id",
+                "origin_slot",
+                "observation_cutoff_slot",
+                "horizon",
+                "target_slot",
+                "x_pred",
+                "y_pred",
+            }
+            if not required_vehicle_fields.issubset(reader.fieldnames or set()):
                 return False
-            vehicle_ids = {str(row["vehicle_id"]) for row in reader}
-        if vehicle_ids != research_ids:
+            vehicle_rows = list(reader)
+        if len(vehicle_rows) != num_slots * horizon * len(research_ids):
+            return False
+        vehicle_keys = {
+            (str(row["vehicle_id"]), int(row["origin_slot"]), int(row["horizon"]))
+            for row in vehicle_rows
+        }
+        expected_vehicle_keys = {
+            (vehicle_id, origin, step)
+            for vehicle_id in research_ids
+            for origin in range(num_slots)
+            for step in range(horizon)
+        }
+        if vehicle_keys != expected_vehicle_keys:
+            return False
+        if any(
+            int(row["target_slot"]) != int(row["origin_slot"]) + int(row["horizon"])
+            or int(row["observation_cutoff_slot"]) != int(row["origin_slot"]) - 1
+            for row in vehicle_rows
+        ):
             return False
         import numpy as np
 
         loaded = np.load(paths["prediction_scenarios"], allow_pickle=False)
         try:
             metadata = json.loads(str(loaded["metadata_json"].item()))
-            if int(metadata["F"]) != service_count:
+            if (
+                int(metadata["F"]) != service_count
+                or int(metadata["S"]) != scenario_count
+                or int(metadata["H_p"]) != horizon
+                or int(metadata["scenario_seed"]) != int(find_value(config, "scenario.master_seed"))
+                or not math.isclose(
+                    float(metadata["lambda"]),
+                    float(find_value(config, "task.arrival_probability")),
+                    rel_tol=0.0,
+                    abs_tol=FLOAT_TOLERANCE,
+                )
+                or int(metadata["formal_time_slot_count"]) != num_slots
+                or int(metadata["max_resample_attempts"])
+                != int(find_value(config, "scenario.max_resample_attempts"))
+            ):
                 return False
             if set(loaded["vehicle_ids"].astype(str)) != research_ids:
                 return False
@@ -664,9 +823,60 @@ def prediction_artifacts_are_current(config: dict[str, Any], paths: dict[str, Pa
                 return False
             if set(loaded["service_vehicle_ids"].astype(str)) != sv_ids:
                 return False
-            if loaded["rho_hat"].shape[-1] != service_count:
+            expected_position_shape = (
+                num_slots,
+                scenario_count,
+                horizon,
+                len(research_ids),
+                2,
+            )
+            expected_task_shape = (
+                num_slots,
+                scenario_count,
+                horizon,
+                len(tv_ids),
+            )
+            if loaded["positions_xy"].shape != expected_position_shape:
                 return False
-            if loaded["arrival"].shape[-1] != len(tv_ids):
+            if any(
+                loaded[name].shape != expected_task_shape
+                for name in ("arrival", "service_id", "input_size", "cpu_cycles")
+            ):
+                return False
+            if loaded["rho_hat"].shape != (num_slots, horizon, service_count):
+                return False
+            if loaded["origin_slots"].astype(int).tolist() != list(range(num_slots)):
+                return False
+            if loaded["scenario_ids"].astype(int).tolist() != list(range(scenario_count)):
+                return False
+            if loaded["horizons"].astype(int).tolist() != list(range(horizon)):
+                return False
+            noise = metadata.get("noise_related_metadata_reference", {})
+            if (
+                not math.isclose(
+                    float(noise.get("sigma_position_m", float("nan"))),
+                    float(find_value(config, "prediction.vehicle.sigma_position_m")),
+                    rel_tol=0.0,
+                    abs_tol=FLOAT_TOLERANCE,
+                )
+                or not math.isclose(
+                    float(noise.get("sigma_speed_mps", float("nan"))),
+                    float(find_value(config, "prediction.vehicle.sigma_speed_mps")),
+                    rel_tol=0.0,
+                    abs_tol=FLOAT_TOLERANCE,
+                )
+                or int(noise.get("observation_noise_seed", -1))
+                != int(find_value(config, "prediction.vehicle.observation_noise_seed"))
+            ):
+                return False
+            gru = metadata.get("GRU checkpoint metadata reference", {})
+            if (
+                int(gru.get("H_p", -1)) != horizon
+                or int(gru.get("L_rho", -1))
+                != int(find_value(config, "prediction.popularity.history_length"))
+                or int(gru.get("hidden_size", -1))
+                != int(find_value(config, "prediction.popularity.hidden_size"))
+            ):
                 return False
             return True
         finally:
@@ -675,10 +885,10 @@ def prediction_artifacts_are_current(config: dict[str, Any], paths: dict[str, Pa
         return False
 
 
-def run_task_generation() -> None:
+def run_task_generation(config_path: Path) -> None:
     """调用现有任务生成器，重生成 service/popularity/tasks/TV cache。"""
 
-    result = task_scenario.main([])
+    result = task_scenario.main(["--config", str(config_path)])
     if result != 0:
         raise RuntimeError("task_scenario.py 生成失败。")
 
@@ -700,7 +910,7 @@ def regenerate_tv_cache(config: dict[str, Any], paths: dict[str, Path]) -> None:
     write_json_atomic(paths["tv_local_cache"], cache)
 
 
-def run_prediction_generation(project_root: Path) -> None:
+def run_prediction_generation(project_root: Path, config_path: Path) -> None:
     """调用现有 GRU 和预测场景生成器，不启动 SUMO 或 PPO。"""
 
     if importlib.util.find_spec("torch") is None:
@@ -721,7 +931,7 @@ def run_prediction_generation(project_root: Path) -> None:
     for script_name in ("popularity_prediction.py", "scenario_generator.py"):
         script = project_root / "src/scenario" / script_name
         subprocess.run(
-            [sys.executable, str(script)],
+            [sys.executable, str(script), "--config", str(config_path)],
             cwd=project_root,
             env=environment,
             check=True,
@@ -788,6 +998,7 @@ def build_metadata(
     capacities_mb: dict[str, float],
     total_size_mb: float,
     stages: dict[str, str],
+    config_path: Path,
 ) -> dict[str, Any]:
     """组装当前 artifact 的正式元数据。"""
 
@@ -799,10 +1010,20 @@ def build_metadata(
         for name, path in paths.items()
         if path.exists()
     }
+    artifact_hashes = {
+        name: sha256_file(path)
+        for name, path in paths.items()
+        if path.is_file()
+    }
     return {
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "config_source": "system_config.toml",
+        "config_source": str(
+            config_path.relative_to(PROJECT_ROOT).as_posix()
+            if config_path.is_relative_to(PROJECT_ROOT)
+            else config_path
+        ),
+        "config_sha256": sha256_file(config_path),
         "vehicles": {
             "research": signature["vehicles"]["research"],
             "SV": signature["vehicles"]["SV"],
@@ -827,6 +1048,7 @@ def build_metadata(
         "service_catalog_total_mb": total_size_mb,
         "configuration": signature,
         "artifacts": relative_paths,
+        "artifact_sha256": artifact_hashes,
         "stages": stages,
         "vehicle_predictions_depend_on": "trajectory.csv + current vehicle_roles.json",
         "prediction_note": "预测 artifact 只在车辆/服务/任务/预测维度变化时重生成。",
@@ -849,7 +1071,93 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="忽略 generation_metadata.json，重生成全部依赖 artifact。",
     )
+    parser.add_argument(
+        "--allow-predictor-training",
+        action="store_true",
+        help="显式允许在预测 artifact 失效时重新训练 popularity GRU。",
+    )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="只读检查配置、metadata 和 artifact，不写入或重新生成文件。",
+    )
     return parser
+
+
+def read_only_consistency_checks(
+    config_path: Path,
+    config: dict[str, Any],
+    paths: dict[str, Path],
+    metadata: dict[str, Any],
+) -> tuple[dict[str, bool], dict[str, float], float]:
+    """执行统一入口的只读一致性检查，不修改配置和 artifact。"""
+
+    total_size_mb = catalog_total_size_mb(config, paths["catalog"])
+    capacities_mb = calculate_capacity_targets(config, total_size_mb)
+    configured_capacities = {
+        "TV": float(find_value(config, "nodes.vehicle.local_cache_capacity_mb")),
+        "SV": float(find_value(config, "nodes.sv.cache_capacity_mb")),
+        "RSU": float(find_value(config, "nodes.rsu.cache_capacity_mb")),
+        "UAV": float(find_value(config, "nodes.uav.cache_capacity_mb")),
+    }
+    expected_roles = {
+        "research": int(find_value(config, "simulation.num_research_vehicles")),
+        "SV": int(find_value(config, "simulation.num_service_vehicles")),
+        "TV": int(find_value(config, "simulation.num_task_vehicles")),
+    }
+    roles_hash = sha256_file(paths["roles"]) if paths["roles"].is_file() else None
+    expected_signature = current_signature(config, capacities_mb, roles_hash)
+    recorded_hashes = metadata.get("artifact_sha256", {})
+    artifact_hashes_match = isinstance(recorded_hashes, dict) and all(
+        path.is_file()
+        and name in recorded_hashes
+        and str(recorded_hashes[name]) == sha256_file(path)
+        for name, path in paths.items()
+    )
+    config_source = (
+        str(config_path.relative_to(PROJECT_ROOT).as_posix())
+        if config_path.is_relative_to(PROJECT_ROOT)
+        else str(config_path)
+    )
+    checks = {
+        "正式配置可解析": True,
+        "派生缓存容量与配置一致": all(
+            math.isclose(
+                configured_capacities[role],
+                capacities_mb[role],
+                rel_tol=0.0,
+                abs_tol=FLOAT_TOLERANCE,
+            )
+            for role in EXPECTED_CACHE_ROLES
+        ),
+        "vehicle_roles 与配置一致": (
+            paths["roles"].is_file()
+            and load_roles_counts(paths["roles"]) == expected_roles
+        ),
+        "service_catalog 与配置和 seed 一致": catalog_is_current(
+            config,
+            paths["catalog"],
+        ),
+        "tasks.csv 与当前角色和任务配置一致": tasks_are_current(config, paths),
+        "TV 初始缓存与容量约束一致": cache_is_current(config, paths),
+        "node_positions 与路网和节点配置一致": not node_positions_need_regeneration(
+            config,
+            paths["node_positions"],
+        ),
+        "预测 artifact 维度和元数据一致": prediction_artifacts_are_current(
+            config,
+            paths,
+        ),
+        "generation metadata 配置签名一致": (
+            metadata.get("configuration") == expected_signature
+        ),
+        "generation metadata 配置文件哈希一致": (
+            metadata.get("config_source") == config_source
+            and metadata.get("config_sha256") == sha256_file(config_path)
+        ),
+        "generation metadata artifact 哈希完整且一致": artifact_hashes_match,
+    }
+    return checks, capacities_mb, total_size_mb
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -873,10 +1181,49 @@ def main(argv: list[str] | None = None) -> int:
         paths = artifact_paths(config, PROJECT_ROOT)
         previous = load_json(metadata_path) if metadata_path.is_file() else {}
 
+        if bool(args.check_only):
+            # 先调用正式加载器，确保节点实例、参数状态和唯一配置入口均可通过。
+            project_config.load_config(config_path)
+            checks, capacities_mb, total_size_mb = read_only_consistency_checks(
+                config_path,
+                config,
+                paths,
+                previous,
+            )
+            print(
+                json.dumps(
+                    {
+                        "mode": "check_only",
+                        "writes_performed": 0,
+                        "checks": checks,
+                        "all_passed": all(checks.values()),
+                        "service_catalog_total_mb": total_size_mb,
+                        "derived_cache_capacity_mb": capacities_mb,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                )
+            )
+            return 0 if all(checks.values()) else 1
+
         force_regeneration = bool(args.force)
-        role_change = force_regeneration or roles_need_regeneration(config, paths["roles"])
-        node_change = force_regeneration or node_positions_need_regeneration(config, paths["node_positions"])
-        catalog_change = force_regeneration or not catalog_is_current(config, paths["catalog"])
+        role_change = (
+            force_regeneration
+            or roles_need_regeneration(config, paths["roles"])
+            or recorded_hash_mismatch(previous, "roles", paths["roles"])
+            or recorded_hash_mismatch(previous, "trajectory", paths["trajectory"])
+        )
+        node_change = (
+            force_regeneration
+            or node_positions_need_regeneration(config, paths["node_positions"])
+            or recorded_hash_mismatch(previous, "node_positions", paths["node_positions"])
+        )
+        catalog_change = (
+            force_regeneration
+            or not catalog_is_current(config, paths["catalog"])
+            or recorded_hash_mismatch(previous, "catalog", paths["catalog"])
+        )
         previous_signature = previous.get("configuration")
         no_previous_metadata = not isinstance(previous_signature, dict)
         if no_previous_metadata:
@@ -889,10 +1236,17 @@ def main(argv: list[str] | None = None) -> int:
                 "RSU": float(find_value(config, "nodes.rsu.cache_capacity_mb")),
                 "UAV": float(find_value(config, "nodes.uav.cache_capacity_mb")),
             },
-        )["task"]
+        )
         task_signature_change = (
             not no_previous_metadata
-            and previous_signature.get("task") != task_signature
+            and previous_signature.get("task") != task_signature["task"]
+        )
+        prediction_signature_change = (
+            not no_previous_metadata
+            and not prediction_signature_matches(
+                previous_signature.get("prediction"),
+                task_signature["prediction"],
+            )
         )
         service_change = catalog_change
         task_change = (
@@ -900,8 +1254,33 @@ def main(argv: list[str] | None = None) -> int:
             or service_change
             or role_change
             or not tasks_are_current(config, paths)
+            or recorded_hash_mismatch(previous, "tasks", paths["tasks"])
             or task_signature_change
         )
+
+        prediction_change = (
+            force_regeneration
+            or role_change
+            or service_change
+            or task_change
+            or prediction_signature_change
+            or not prediction_artifacts_are_current(config, paths)
+            or any(
+                recorded_hash_mismatch(previous, name, paths[name])
+                for name in (
+                    "popularity_predictions",
+                    "vehicle_predictions",
+                    "prediction_scenarios",
+                    "popularity_gru",
+                )
+            )
+        )
+        if prediction_change and not bool(args.allow_predictor_training):
+            raise RuntimeError(
+                "预测 artifact 已失效，但训练保护处于开启状态；"
+                "未写入任何 artifact。确认需要重新训练 popularity GRU 后，"
+                "显式添加 --allow-predictor-training。"
+            )
 
         total_size_mb = catalog_total_size_mb(config, paths["catalog"])
         capacities_mb = calculate_capacity_targets(config, total_size_mb)
@@ -916,6 +1295,11 @@ def main(argv: list[str] | None = None) -> int:
             or capacity_config_changed
             or force_regeneration
             or not cache_is_current(config, paths)
+            or recorded_hash_mismatch(
+                previous,
+                "tv_local_cache",
+                paths["tv_local_cache"],
+            )
         )
 
         if role_change:
@@ -931,11 +1315,11 @@ def main(argv: list[str] | None = None) -> int:
             stages["node_positions"] = "跳过（RSU/UAV 数量一致）"
 
         # 角色和节点先就绪后，正式配置校验才能安全检查所有入口。
-        formal_config = project_config.load_config()
+        formal_config = project_config.load_config(config_path)
         del formal_config
 
         if task_change:
-            run_task_generation()
+            run_task_generation(config_path)
             stages["service_catalog"] = "由 task_scenario.py 重生成"
             stages["tasks"] = "由 task_scenario.py 重生成"
             stages["tv_local_cache"] = "由 task_scenario.py 重生成"
@@ -949,15 +1333,8 @@ def main(argv: list[str] | None = None) -> int:
             regenerate_tv_cache(config, paths)
             stages["tv_local_cache"] = "按新容量重生成"
 
-        prediction_change = (
-            force_regeneration
-            or role_change
-            or service_change
-            or task_change
-            or not prediction_artifacts_are_current(config, paths)
-        )
         if prediction_change:
-            run_prediction_generation(PROJECT_ROOT)
+            run_prediction_generation(PROJECT_ROOT, config_path)
             stages["prediction"] = "GRU 与 prediction_scenarios 重生成"
         else:
             stages["prediction"] = "跳过（与 metadata 一致）"
@@ -990,6 +1367,7 @@ def main(argv: list[str] | None = None) -> int:
             capacities_mb,
             total_size_mb,
             stages,
+            config_path,
         )
         write_json_atomic(metadata_path, metadata)
         write_report(

@@ -35,7 +35,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scenario.task_scenario import (
-    DEFAULT_CONFIG as TASK_DEFAULT_CONFIG,
     TaskConfig,
     build_observed_popularity,
     generate_tasks,
@@ -355,7 +354,7 @@ def generate_popularity_request_sequence(
     _, rho_star, _ = make_popularity_trace(
         task_config.num_services,
         num_slots,
-        TASK_DEFAULT_CONFIG.fallback_dt_s,
+        task_config.fallback_dt_s,
         0.0,
         task_config,
         rngs["popularity_evolution"],
@@ -366,7 +365,7 @@ def generate_popularity_request_sequence(
         catalog,
         rho_star,
         num_slots,
-        TASK_DEFAULT_CONFIG.fallback_dt_s,
+        task_config.fallback_dt_s,
         0.0,
         task_config,
         rngs["task_arrival"],
@@ -803,6 +802,7 @@ def verify_outputs(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="训练服务流行度 GRU 并预测 canonical episode。")
+    parser.add_argument("--config", default="system_config.toml")
     parser.add_argument("--popularity-file", default=None)
     parser.add_argument("--popularity-history-file", default=None)
     parser.add_argument("--service-catalog-file", default=None)
@@ -955,7 +955,7 @@ def main(argv: list[str] | None = None) -> int:
         project_root = find_project_root()
         from common import project_config as project_config_module
 
-        formal_config = project_config_module.load_config()
+        formal_config = project_config_module.load_config(args.config)
         config = config_from_args(args, formal_config)
         config.validate()
         device_name = args.device or "cpu"
