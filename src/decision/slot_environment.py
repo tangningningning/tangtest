@@ -83,10 +83,33 @@ def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) ->
     }
 
 
-def _configuration_summary(result: JointConfigurationResult) -> dict[str, Any]:
+def _configuration_summary(
+    result: JointConfigurationResult,
+    uav_tolerance_m: float = 1.0e-6,
+) -> dict[str, Any]:
+    actual_cache_update = np.any(
+        result.final_cache_state != result.previous_cache_state,
+        axis=1,
+    ).astype(int).tolist()
+    actual_uav_movement = {
+        uav_id: int(
+            float(
+                np.linalg.norm(
+                    np.asarray(result.final_uav_positions[uav_id], dtype=np.float64)
+                    - np.asarray(result.previous_uav_positions[uav_id], dtype=np.float64)
+                )
+            )
+            > float(uav_tolerance_m)
+        )
+        for uav_id in result.previous_uav_positions
+    }
     return {
         "trigger_feasible": result.trigger_feasible,
         "infeasible_reason": result.infeasible_reason,
+        "requested_cache_trigger": list(result.cache_triggers),
+        "actual_cache_update": actual_cache_update,
+        "requested_uav_trigger": dict(result.uav_triggers),
+        "actual_uav_movement": actual_uav_movement,
         "predictive_utility": result.predictive_utility,
         "predictive_objective": result.objective_value,
         "cache_cost": result.cache_cost,
@@ -95,6 +118,12 @@ def _configuration_summary(result: JointConfigurationResult) -> dict[str, Any]:
         "outer_rounds": result.outer_rounds,
         "accepted_cache_updates": result.accepted_cache_updates,
         "accepted_uav_updates": result.accepted_uav_updates,
+        "cache_candidate_diagnostics": result.cache_result_summary.get(
+            "candidate_diagnostics", {}
+        ),
+        "uav_candidate_diagnostics": result.uav_result_summary.get(
+            "candidate_diagnostics", {}
+        ),
         "stop_reason": result.stop_reason,
         "predictive_evaluation_skipped": (
             result.stop_reason == "no_trigger_prediction_skipped"
@@ -117,6 +146,36 @@ def _record_slot_performance_profile(
     profile["matching_kkt_seconds"] = float(profile.get("matching_kkt_seconds", 0.0)) + float(
         matching_kkt_seconds
     )
+
+
+def _assert_requested_actual_trigger_contract(
+    configuration: JointConfigurationResult,
+    requested_cache_trigger: np.ndarray,
+    requested_uav_trigger: dict[str, int],
+    uav_tolerance_m: float,
+) -> None:
+    actual_cache_update = np.any(
+        configuration.final_cache_state != configuration.previous_cache_state,
+        axis=1,
+    ).astype(np.int8)
+    if np.any(actual_cache_update > requested_cache_trigger):
+        raise AssertionError(
+            "cache actual update exceeds requested trigger in slot configuration"
+        )
+    for uav_id, requested in requested_uav_trigger.items():
+        actual = int(
+            float(
+                np.linalg.norm(
+                    np.asarray(configuration.final_uav_positions[uav_id], dtype=np.float64)
+                    - np.asarray(configuration.previous_uav_positions[uav_id], dtype=np.float64)
+                )
+            )
+            > float(uav_tolerance_m)
+        )
+        if actual > int(requested):
+            raise AssertionError(
+                f"UAV {uav_id} actual movement exceeds requested trigger in slot configuration"
+            )
 
 
 def execute_slot(
@@ -226,6 +285,16 @@ def execute_slot(
         if performance_profile is not None
         else 0.0
     )
+    _assert_requested_actual_trigger_contract(
+        configuration,
+        cache_trigger,
+        {key: int(value) for key, value in uav_triggers.items()},
+        float(project_config.get_config_value(
+            project_cfg,
+            "algorithm.uav.position_tolerance_m",
+            1.0e-6,
+        )),
+    )
     if not configuration.trigger_feasible:
         _record_slot_performance_profile(
             performance_profile,
@@ -256,7 +325,14 @@ def execute_slot(
             per_task_delay_s={},
             per_task_vehicle_energy_j={},
             per_task_utility={},
-            configuration_summary=_configuration_summary(configuration),
+            configuration_summary=_configuration_summary(
+                configuration,
+                float(project_config.get_config_value(
+                    project_cfg,
+                    "algorithm.uav.position_tolerance_m",
+                    1.0e-6,
+                )),
+            ),
             matching_summary={},
             next_cache_state=None,
             next_uav_positions=None,
@@ -315,7 +391,14 @@ def execute_slot(
             per_task_delay_s={},
             per_task_vehicle_energy_j={},
             per_task_utility={},
-            configuration_summary=_configuration_summary(configuration),
+            configuration_summary=_configuration_summary(
+                configuration,
+                float(project_config.get_config_value(
+                    project_cfg,
+                    "algorithm.uav.position_tolerance_m",
+                    1.0e-6,
+                )),
+            ),
             matching_summary=_matching_summary(matching),
             next_cache_state=None,
             next_uav_positions=None,
@@ -370,7 +453,14 @@ def execute_slot(
         per_task_delay_s=matching.per_task_delay_s,
         per_task_vehicle_energy_j=matching.per_task_vehicle_energy_j,
         per_task_utility=matching.per_task_utility,
-        configuration_summary=_configuration_summary(configuration),
+        configuration_summary=_configuration_summary(
+            configuration,
+            float(project_config.get_config_value(
+                project_cfg,
+                "algorithm.uav.position_tolerance_m",
+                1.0e-6,
+            )),
+        ),
         matching_summary=_matching_summary(matching),
         next_cache_state=final_cache.copy(),
         next_uav_positions=final_uav,
@@ -490,6 +580,15 @@ def run_slot20_validation(config_path: str = "system_config.toml") -> dict[str, 
 def _summary(result: SlotExecutionResult) -> dict[str, Any]:
     return {
         "step_feasible": result.step_feasible,
+        "requested_cache_trigger": result.input_cache_triggers,
+        "actual_cache_update": result.configuration_summary.get(
+            "actual_cache_update", []
+        ),
+        "requested_uav_trigger": result.input_uav_triggers,
+        "actual_uav_movement": result.configuration_summary.get(
+            "actual_uav_movement", {}
+        ),
+        # Legacy aliases retained for existing terminal consumers.
         "cache_triggers": result.input_cache_triggers,
         "uav_triggers": result.input_uav_triggers,
         "predictive_configuration_utility": result.predictive_configuration_utility,
@@ -723,6 +822,13 @@ def _cache_summary(result: dict[str, Any]) -> dict[str, Any]:
     stats = result.get("statistics", {})
     return {
         "trigger_feasible": bool(result.get("trigger_feasible", False)),
+        "requested_cache_trigger": list(
+            result.get("requested_cache_trigger", [])
+        ),
+        "actual_cache_update": np.asarray(
+            result.get("actual_cache_trigger", []),
+            dtype=np.int8,
+        ).astype(int).tolist(),
         "cache_update_cost": float(result.get("cache_update_cost", 0.0)),
         "predicted_utility": float(result.get("predicted_utility", 0.0)),
         "objective": float(result.get("objective", 0.0)),
@@ -730,12 +836,17 @@ def _cache_summary(result: dict[str, Any]) -> dict[str, Any]:
         "accepted_moves": int(stats.get("num_accepted_moves", 0)),
         "converged_by_no_improvement": bool(stats.get("converged_by_no_improvement", False)),
         "hit_max_rounds": bool(stats.get("hit_max_rounds", False)),
+        "candidate_diagnostics": stats.get("candidate_diagnostics", {}),
     }
 
 
 def _uav_summary(result: uav_configuration.UavOptimizationResult) -> dict[str, Any]:
     return {
         "trigger_feasible": result.trigger_feasible,
+        "requested_uav_trigger": {
+            str(item["uav_id"]): int(item["requested_trigger"])
+            for item in result.candidate_diagnostics.values()
+        },
         "actual_uav_triggers": result.actual_uav_triggers,
         "per_uav_displacement_m": result.per_uav_displacement_m,
         "movement_energy": result.movement_energy,
@@ -744,6 +855,7 @@ def _uav_summary(result: uav_configuration.UavOptimizationResult) -> dict[str, A
         "search_rounds": result.search_rounds,
         "accepted_improvements": result.accepted_improvements,
         "stop_reason": result.stop_reason,
+        "candidate_diagnostics": result.candidate_diagnostics,
     }
 
 
@@ -1222,8 +1334,33 @@ def validate_joint_optimizer_once(
 def _result_summary(result: JointConfigurationResult) -> dict[str, Any]:
     return {
         "trigger_feasible": result.trigger_feasible,
+        "requested_cache_trigger": result.cache_triggers,
+        "actual_cache_update": np.any(
+            result.final_cache_state != result.previous_cache_state,
+            axis=1,
+        ).astype(int).tolist(),
+        "requested_uav_trigger": result.uav_triggers,
+        "actual_uav_movement": {
+            uav_id: int(
+                float(
+                    np.linalg.norm(
+                        np.asarray(result.final_uav_positions[uav_id], dtype=np.float64)
+                        - np.asarray(result.previous_uav_positions[uav_id], dtype=np.float64)
+                    )
+                )
+                > 1.0e-6
+            )
+            for uav_id in result.previous_uav_positions
+        },
+        # Legacy aliases retained for existing validation consumers.
         "cache_trigger": result.cache_triggers,
         "uav_trigger": result.uav_triggers,
+        "cache_candidate_diagnostics": result.cache_result_summary.get(
+            "candidate_diagnostics", {}
+        ),
+        "uav_candidate_diagnostics": result.uav_result_summary.get(
+            "candidate_diagnostics", {}
+        ),
         "changed_cache_nodes": _changed_cache_nodes(
             result.previous_cache_state,
             result.final_cache_state,

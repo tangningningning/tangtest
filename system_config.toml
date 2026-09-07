@@ -166,11 +166,11 @@ cpu_cycles_per_s = 1.0e9
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
-# 参数状态：系统尺度校准实验基线。
+# 参数状态：provisional system-scale implementation calibration。
 # SV 触发固定配置成本 eta_ca；不是文献直接物理常数。
 # 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定控制成本。
 eta_ca = 0.20
-# 参数状态：系统尺度校准实验基线。
+# 参数状态：system-scale implementation baseline；xi_ca 仍需独立校准。
 # SV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
 # 当前项目不把 xi_ca 解释为严格 Joule/MB。
 xi_ca = 1.0e-3
@@ -193,10 +193,10 @@ cpu_cycles_per_s = 5.0e9
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
-# 参数状态：系统尺度校准实验基线。
+# 参数状态：provisional system-scale implementation calibration。
 # RSU 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数。
 eta_ca = 0.10
-# 参数状态：系统尺度校准实验基线。
+# 参数状态：system-scale implementation baseline；xi_ca 仍需独立校准。
 # RSU 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
 # 当前项目不把 xi_ca 解释为严格 Joule/MB。
 xi_ca = 0.7e-3
@@ -233,11 +233,11 @@ cpu_cycles_per_s = 5.0e9
 # 因此 10 MHz 直接换算为 10.0e6 Hz。
 # 这是文献校准实验基线，不代表硬件实测值。
 bandwidth_hz = 10.0e6
-# 参数状态：system-scale calibrated baseline。
+# 参数状态：provisional system-scale implementation calibration。
 # 依据 representative dry-run、sequential validation、300-slot continuous validation
 # 和 targeted causal validation；不是文献直接物理常数。
 eta_ca = 0.15
-# 参数状态：系统尺度校准实验基线。
+# 参数状态：system-scale implementation baseline；xi_ca 仍需独立校准。
 # UAV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
 # 当前项目不把 xi_ca 解释为严格 Joule/MB。
 xi_ca = 1.2e-3
@@ -270,7 +270,7 @@ min_safety_distance_m = 10.0
 # 因此在代表速度 V_ref=15m/s 处按 Li et al. 旋翼功率模型计算
 # P(15)/15 ≈ 14.73 J/m，并取整为 15 J/m 作为线性等效系数。
 movement_energy_coefficient_j_per_m = 15.0
-# 参数状态：system-scale calibrated baseline。
+# 参数状态：provisional system-scale implementation calibration。
 # 依据 sequential movement audit、300-slot continuous validation
 # 和 UAV targeted causal validation；不是文献直接物理常数。
 # 该成本保持 state-dependent，不强制每 slot 移动。
@@ -374,14 +374,14 @@ uav_ratio = 0.30
 
 [objective]
 # 主实验采用时延权重 0.6、车辆能耗权重 0.4。
-# 该值属于实验设计基线，不是硬件物理常数。
+# 该值属于 experiment-design baseline，不是硬件物理常数或 confirmed data。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_delay = 0.6
 # 主实验采用时延权重 0.6、车辆能耗权重 0.4。
-# 该值属于实验设计基线，不是硬件物理常数。
+# 该值属于 experiment-design baseline，不是硬件物理常数或 confirmed data。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_energy = 0.4
-# 参数状态：系统尺度校准基线。
+# 参数状态：provisional system-scale implementation calibration；不是文献直接物理常数。
 # Cache 配置成本权重 lambda_cache，是系统目标函数中唯一的 lambda^ca 入口。
 # 该参数不是文献直接给出的物理常数。
 # 它依据当前真实任务数据、已校准 T_ref/E_ref、
@@ -389,22 +389,23 @@ omega_energy = 0.4
 # 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
 # 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
 lambda_cache = 0.1
-# 参数状态：system-scale calibrated baseline。
+# 参数状态：provisional system-scale implementation calibration；不是文献直接物理常数。
 # 依据 sequential movement audit、300-slot continuous validation
 # 和 UAV targeted causal validation；不是文献直接物理常数。
 lambda_movement = 1.76e-5
-# T_ref/E_ref 采用当前正式 tasks.csv 中 arrival=1 任务在 TV local CPU 上的 P95 尺度。
+# T_ref/E_ref 采用正式 train origins（slot 0..239）中 arrival=1 任务在 TV local CPU
+# 上的 P95 尺度；test origins（slot 240..299）不参与参考值拟合。
+# 这样参考值主要由 train-only 任务工作负载和车辆本地计算能力决定，
+# 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
+# 因此适合作为不同算法统一使用的归一化基准。
+# train origins 共 3343 个到达任务；cpu_cycles P95=30,628,985,166.15863 cycle；
+# 在 1.0e9 cycle/s 的 TV CPU 上对应 30.6289851662 s。
+T_ref = 30.6289851662
 # 这样参考值主要由任务工作负载和车辆本地计算能力决定，
 # 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
 # 因此适合作为不同算法统一使用的归一化基准。
-# 4210 个到达任务的 cpu_cycles P95=30,790,093,469.931866 cycle；
-# 在 1.0e9 cycle/s 的 TV CPU 上对应 30.7900934699 s。
-T_ref = 30.79009347
-# 这样参考值主要由任务工作负载和车辆本地计算能力决定，
-# 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
-# 因此适合作为不同算法统一使用的归一化基准。
-# 使用同一 P95 工作负载和 kappa=1.0e-28，Local energy P95=3.07900934699 J。
-E_ref = 3.079009347
+# 使用同一 train-only P95 工作负载和 kappa=1.0e-28，Local energy P95=3.06289851662 J。
+E_ref = 3.06289851662
 
 [prediction.vehicle]
 # 车辆预测 horizon H_p。当前实际值 5；修改需重跑车辆预测、GRU、scenario。
@@ -474,6 +475,9 @@ enabled = true
 method = "cache_uav_coordinate"
 max_outer_rounds = 10
 objective_tolerance = 1.0e-9
+# Execution-only evaluator parallelism; 1 is the exact serial fallback. This
+# does not change candidate order, the configuration algorithm, or the system model.
+prediction_batch_parallel_workers = 8
 
 [algorithm.kkt]
 # 数值实现保护常数，不是物理参数，也不是文献硬件参数。
@@ -515,9 +519,9 @@ cf_batch_episodes = 4
 # 1 is the exact serial fallback; suffix slots remain strictly serial.
 cf_parallel_workers = 8
 reference_probability_drift_cap = 0.005
-# Direct-CF样本采样策略：每个Trigger各抽一个FREE decision；
-# 仍保留 uniform 作为旧V3 checkpoint/run 的兼容路径。
-cf_sampling_strategy = "uniform"
+# Formal hierarchical WHAT Direct-CF uses one capacity-1 reservoir per dynamic
+# Trigger; uniform remains available for legacy V3 checkpoint/run compatibility.
+cf_sampling_strategy = "trigger_stratified"
 hidden_sizes = [128, 128]
 autoregressive_hidden_size = 64
 # PPO算法超参数：仅用于discount return / GAE，不属于系统物理参数，
@@ -554,9 +558,11 @@ test_origin_start = 240
 test_origin_end = 299
 
 [parameter_status]
-# 参数状态只使用三类：
+# 参数状态：
 # CONFIRMED_DATA：由当前真实生成数据或明确软件设置确定。
-# PROVISIONAL_IMPLEMENTATION：当前为了代码连通性验证而设置，正式实验前必须校准。
+# TRAIN_ONLY_CALIBRATION：严格由 train origins 派生，可复现但不使用 test 数据。
+# EXPERIMENT_DESIGN：实验设计选择，不是数据或文献物理常数。
+# PROVISIONAL_IMPLEMENTATION：当前为实现连通性/系统尺度校准，正式实验前仍需校准。
 # TODO_LITERATURE_CALIBRATION：当前没有可靠依据，正式实验前必须补充文献/模型依据。
 "simulation.dt_s" = "CONFIRMED_DATA"
 "execution.cross_slot_task_model" = "CONFIRMED_DATA"
@@ -592,12 +598,12 @@ test_origin_end = 299
 "nodes.sv.cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.rsu.cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.uav.cache_capacity_mb" = "CONFIRMED_DATA"
-"nodes.sv.eta_ca" = "CONFIRMED_DATA"
-"nodes.rsu.eta_ca" = "CONFIRMED_DATA"
-"nodes.uav.eta_ca" = "CONFIRMED_DATA"
-"nodes.sv.xi_ca" = "CONFIRMED_DATA"
-"nodes.rsu.xi_ca" = "CONFIRMED_DATA"
-"nodes.uav.xi_ca" = "CONFIRMED_DATA"
+"nodes.sv.eta_ca" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.rsu.eta_ca" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.uav.eta_ca" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.sv.xi_ca" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.rsu.xi_ca" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.uav.xi_ca" = "PROVISIONAL_IMPLEMENTATION"
 "cache.discount_beta" = "PROVISIONAL_IMPLEMENTATION"
 "nodes.vehicle.local_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.vehicle.local_cache_capacity_mb" = "CONFIRMED_DATA"
@@ -622,8 +628,8 @@ test_origin_end = 299
 "nodes.uav.deployment_altitude_m" = "CONFIRMED_DATA"
 "nodes.uav.max_horizontal_speed_mps" = "CONFIRMED_DATA"
 "nodes.uav.min_safety_distance_m" = "CONFIRMED_DATA"
-"nodes.uav.movement.movement_energy_coefficient_j_per_m" = "CONFIRMED_DATA"
-"nodes.uav.movement.movement_fixed_cost" = "CONFIRMED_DATA"
+"nodes.uav.movement.movement_energy_coefficient_j_per_m" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.uav.movement.movement_fixed_cost" = "PROVISIONAL_IMPLEMENTATION"
 "communication.ground.channel_gain_at_1m" = "CONFIRMED_DATA"
 "communication.ground.pathloss_exponent" = "CONFIRMED_DATA"
 "communication.ground.bandwidth_hz" = "CONFIRMED_DATA"
@@ -636,9 +642,9 @@ test_origin_end = 299
 "communication.air.alpha_los" = "CONFIRMED_DATA"
 "communication.air.alpha_nlos" = "CONFIRMED_DATA"
 "communication.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
-"objective.omega_delay" = "CONFIRMED_DATA"
-"objective.omega_energy" = "CONFIRMED_DATA"
-"objective.lambda_cache" = "CONFIRMED_DATA"
-"objective.lambda_movement" = "CONFIRMED_DATA"
-"objective.T_ref" = "CONFIRMED_DATA"
-"objective.E_ref" = "CONFIRMED_DATA"
+"objective.omega_delay" = "EXPERIMENT_DESIGN"
+"objective.omega_energy" = "EXPERIMENT_DESIGN"
+"objective.lambda_cache" = "PROVISIONAL_IMPLEMENTATION"
+"objective.lambda_movement" = "PROVISIONAL_IMPLEMENTATION"
+"objective.T_ref" = "TRAIN_ONLY_CALIBRATION"
+"objective.E_ref" = "TRAIN_ONLY_CALIBRATION"

@@ -532,8 +532,8 @@ def _normalize_prediction_batch_workers(value: Any) -> int:
 def prediction_batch_parallel_workers(project_cfg: dict[str, Any]) -> int:
     """读取 prediction batch 的执行 worker 数。
 
-    当前不新增 formal 配置字段，复用已有的 execution-only
-    ``algorithm.ppo.cf_parallel_workers``。外层 CF worker 会由
+    优先读取 execution-only ``algorithm.configuration`` 字段；缺失时兼容
+    旧配置并回退到 ``algorithm.ppo.cf_parallel_workers``。外层 CF worker 会由
     ``PredictionBatchRuntime`` 强制退回单进程，避免 nested multiprocessing。
     """
 
@@ -1038,7 +1038,7 @@ def cache_update_energy(
     result = system_model.cache_update_cost(
         previous_cache,
         new_cache,
-        np.zeros(previous_cache.shape[0], dtype=np.int8),
+        np.any(previous_cache != new_cache, axis=1).astype(np.int8),
         service_sizes_mb,
         cache_nodes["eta_ca"],
         cache_nodes["xi_ca"],
@@ -1097,6 +1097,107 @@ def objective(
         config,
     )
     return float(utility - update_cost)
+
+
+def _cache_candidate_profile_template(
+    node_index: int,
+    node_id: str,
+    requested_trigger: int,
+    reference_objective: float,
+    reference_utility: float,
+    reference_cost: float,
+) -> dict[str, Any]:
+    """Create reporting-only gain diagnostics for one cache trigger."""
+
+    return {
+        "node_index": int(node_index),
+        "node_id": str(node_id),
+        "requested_trigger": int(requested_trigger),
+        "actual_update": 0,
+        "reference_objective": float(reference_objective),
+        "reference_predicted_utility": float(reference_utility),
+        "reference_cost": float(reference_cost),
+        "best_feasible_candidate_objective": float(reference_objective),
+        "best_candidate_predicted_utility": float(reference_utility),
+        "best_candidate_cost": float(reference_cost),
+        "best_delta_objective": 0.0,
+        "predicted_utility_delta": 0.0,
+        "cost_delta": 0.0,
+        "candidate_evaluations_recorded": 0,
+    }
+
+
+def _record_cache_candidate_profile(
+    diagnostics: dict[str, dict[str, Any]],
+    node_index: int,
+    node_id: str,
+    requested_trigger: int,
+    candidate_cache: np.ndarray,
+    candidate_objective: float,
+    previous_cache: np.ndarray,
+    cache_trigger: np.ndarray,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+) -> None:
+    """Record a candidate already evaluated by ``objective`` without re-evaluating utility."""
+
+    key = str(node_id)
+    if key not in diagnostics:
+        raise AssertionError(f"cache candidate diagnostic missing node: {key}")
+    diagnostic = diagnostics[key]
+    diagnostic["candidate_evaluations_recorded"] = int(
+        diagnostic["candidate_evaluations_recorded"]
+    ) + 1
+    candidate_cost, _ = cache_update_cost(
+        previous_cache,
+        candidate_cache,
+        cache_trigger,
+        service_catalog["service_sizes_mb"],
+        cache_nodes,
+        config,
+    )
+    candidate_utility = float(candidate_objective) + float(candidate_cost)
+    if float(candidate_objective) > float(diagnostic["best_feasible_candidate_objective"]):
+        diagnostic["best_feasible_candidate_objective"] = float(candidate_objective)
+        diagnostic["best_candidate_predicted_utility"] = float(candidate_utility)
+        diagnostic["best_candidate_cost"] = float(candidate_cost)
+        diagnostic["best_delta_objective"] = float(
+            candidate_objective - diagnostic["reference_objective"]
+        )
+        diagnostic["predicted_utility_delta"] = float(
+            candidate_utility - diagnostic["reference_predicted_utility"]
+        )
+        diagnostic["cost_delta"] = float(candidate_cost - diagnostic["reference_cost"])
+
+
+def _finalize_cache_candidate_profiles(
+    diagnostics: dict[str, dict[str, Any]],
+    previous_cache: np.ndarray,
+    final_cache: np.ndarray,
+    cache_trigger: np.ndarray,
+    config: CacheOptimizationConfig,
+) -> None:
+    """Attach actual update flags and enforce trigger permission semantics."""
+
+    actual = np.any(final_cache != previous_cache, axis=1).astype(np.int8)
+    for node_id, diagnostic in diagnostics.items():
+        node_index = int(diagnostic["node_index"])
+        actual_update = int(actual[node_index])
+        diagnostic["actual_update"] = actual_update
+        diagnostic["requested_trigger"] = int(cache_trigger[node_index])
+        if actual_update > int(cache_trigger[node_index]):
+            raise AssertionError(
+                f"cache node {node_id} actual update exceeds requested trigger"
+            )
+        if (
+            int(cache_trigger[node_index]) == 1
+            and actual_update == 0
+            and float(diagnostic["best_delta_objective"]) > config.tolerance
+        ):
+            raise AssertionError(
+                f"cache node {node_id} has a positive feasible candidate gain but no actual update"
+            )
 
 
 def evaluate_fixed_configuration(
@@ -1315,6 +1416,27 @@ def initialize_cache_for_triggers(
         config,
         evaluation_context=evaluation_context,
     )
+    reference_objective = float(current_objective)
+    reference_cost, _ = cache_update_cost(
+        previous_cache,
+        previous_cache,
+        cache_trigger,
+        service_catalog["service_sizes_mb"],
+        cache_nodes,
+        config,
+    )
+    candidate_diagnostics = {
+        str(node_id): _cache_candidate_profile_template(
+            node_index,
+            str(node_id),
+            int(cache_trigger[node_index]),
+            current_objective,
+            current_objective + reference_cost,
+            reference_cost,
+        )
+        for node_index, node_id in enumerate(cache_nodes["node_ids"])
+        if int(cache_trigger[node_index]) == 1
+    }
     for node_index, triggered in enumerate(cache_trigger.tolist()):
         if not triggered:
             continue
@@ -1336,6 +1458,19 @@ def initialize_cache_for_triggers(
             config,
             evaluation_context=evaluation_context,
         )
+        _record_cache_candidate_profile(
+            candidate_diagnostics,
+            node_index,
+            str(cache_nodes["node_ids"][node_index]),
+            int(triggered),
+            candidate_cache,
+            candidate_objective,
+            previous_cache,
+            cache_trigger,
+            service_catalog,
+            cache_nodes,
+            config,
+        )
         if candidate_objective > current_objective + config.tolerance:
             cache = candidate_cache
             current_objective = candidate_objective
@@ -1347,7 +1482,13 @@ def initialize_cache_for_triggers(
                 f"node {cache_nodes['node_ids'][node_index]} knapsack candidate not better; "
                 "kept current cache"
             )
-    return cache, {"trigger_feasible_by_node": trigger_feasible, "initialization_notes": notes}
+    return cache, {
+        "trigger_feasible_by_node": trigger_feasible,
+        "initialization_notes": notes,
+        "reference_objective": reference_objective,
+        "reference_cost": float(reference_cost),
+        "candidate_diagnostics": candidate_diagnostics,
+    }
 
 
 # ============================================================================
@@ -1412,8 +1553,28 @@ def optimize_cache(
             cache_nodes,
             config,
         )
+        reference_objective = float(utility - update_cost)
+        candidate_diagnostics = {
+            str(node_id): _cache_candidate_profile_template(
+                node_index,
+                str(node_id),
+                0,
+                reference_objective,
+                float(utility),
+                float(update_cost),
+            )
+            for node_index, node_id in enumerate(cache_nodes["node_ids"])
+        }
+        _finalize_cache_candidate_profiles(
+            candidate_diagnostics,
+            previous_cache,
+            unchanged,
+            cache_trigger,
+            config,
+        )
         return {
             "new_cache": unchanged,
+            "requested_cache_trigger": cache_trigger.astype(int).tolist(),
             "trigger_feasible": True,
             "trigger_feasible_by_node": np.ones_like(cache_trigger, dtype=bool),
             "actual_cache_trigger": np.any(
@@ -1435,6 +1596,7 @@ def optimize_cache(
                 "converged_by_no_improvement": True,
                 "hit_max_rounds": False,
                 "initialization_notes": ["all triggers are zero; cache unchanged"],
+                "candidate_diagnostics": candidate_diagnostics,
             },
         }
 
@@ -1450,6 +1612,10 @@ def optimize_cache(
             evaluation_context=evaluation_context,
         )
         trigger_feasible_by_node = init_info["trigger_feasible_by_node"]
+        candidate_diagnostics = {
+            str(node_id): dict(diagnostic)
+            for node_id, diagnostic in init_info["candidate_diagnostics"].items()
+        }
     else:
         current_cache = np.asarray(initial_cache_state, dtype=np.int8).copy()
         validate_cache_shape_and_capacity(current_cache, service_catalog, cache_nodes)
@@ -1505,6 +1671,45 @@ def optimize_cache(
             init_info["initialization_notes"].append(
                 "previous cache objective was not worse; kept previous cache"
             )
+        reference_objective = float(previous_objective)
+        reference_cost, _ = cache_update_cost(
+            previous_cache,
+            previous_cache,
+            cache_trigger,
+            service_catalog["service_sizes_mb"],
+            cache_nodes,
+            config,
+        )
+        candidate_diagnostics = {
+            str(node_id): _cache_candidate_profile_template(
+                node_index,
+                str(node_id),
+                int(cache_trigger[node_index]),
+                reference_objective,
+                reference_objective + reference_cost,
+                reference_cost,
+            )
+            for node_index, node_id in enumerate(cache_nodes["node_ids"])
+            if int(cache_trigger[node_index]) == 1
+        }
+        for node_index, triggered in enumerate(cache_trigger.tolist()):
+            if triggered:
+                _record_cache_candidate_profile(
+                    candidate_diagnostics,
+                    node_index,
+                    str(cache_nodes["node_ids"][node_index]),
+                    int(triggered),
+                    current_cache,
+                    initial_objective,
+                    previous_cache,
+                    cache_trigger,
+                    service_catalog,
+                    cache_nodes,
+                    config,
+                )
+    else:
+        reference_objective = float(init_info["reference_objective"])
+        reference_cost = float(init_info["reference_cost"])
     current_objective = initial_objective
     counts = {"add": 0, "delete": 0, "swap": 0}
     accepted_moves = 0
@@ -1535,6 +1740,19 @@ def optimize_cache(
                     cache_nodes,
                     config,
                     evaluation_context=evaluation_context,
+                )
+                _record_cache_candidate_profile(
+                    candidate_diagnostics,
+                    node_index,
+                    str(cache_nodes["node_ids"][node_index]),
+                    1,
+                    candidate_cache,
+                    value,
+                    previous_cache,
+                    cache_trigger,
+                    service_catalog,
+                    cache_nodes,
+                    config,
                 )
                 if value > current_objective + config.tolerance and (
                     best_move is None or value > best_move[2] + config.tolerance
@@ -1579,11 +1797,19 @@ def optimize_cache(
         current_cache != previous_cache,
         axis=1,
     ).astype(np.int8)
+    _finalize_cache_candidate_profiles(
+        candidate_diagnostics,
+        previous_cache,
+        current_cache,
+        cache_trigger,
+        config,
+    )
     final_objective = float(predicted_utility - update_cost)
     if not math.isfinite(final_objective):
         raise AssertionError("objective 非 finite。")
     return {
         "new_cache": current_cache,
+        "requested_cache_trigger": cache_trigger.astype(int).tolist(),
         "trigger_feasible": True,
         "trigger_feasible_by_node": trigger_feasible_by_node,
         "actual_cache_trigger": actual_cache_trigger,
@@ -1602,6 +1828,7 @@ def optimize_cache(
             "converged_by_no_improvement": converged,
             "hit_max_rounds": hit_max_rounds,
             "initialization_notes": init_info["initialization_notes"],
+            "candidate_diagnostics": candidate_diagnostics,
         },
     }
 

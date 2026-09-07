@@ -79,6 +79,7 @@ class UavOptimizationResult:
     converged: bool
     stop_reason: str
     actual_uav_triggers: dict[str, int] = field(default_factory=dict)
+    candidate_diagnostics: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
@@ -441,6 +442,95 @@ def evaluate_uav_configuration(
     }
 
 
+def _uav_candidate_profile_template(
+    uav_id: str,
+    requested_trigger: int,
+    reference_evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    reference_objective = float(reference_evaluation["objective_value"])
+    reference_utility = float(reference_evaluation["predictive_utility"])
+    reference_cost = float(reference_evaluation["movement_cost"])
+    return {
+        "uav_id": str(uav_id),
+        "requested_trigger": int(requested_trigger),
+        "actual_update": 0,
+        "reference_objective": reference_objective,
+        "reference_predicted_utility": reference_utility,
+        "reference_cost": reference_cost,
+        "best_feasible_candidate_objective": reference_objective,
+        "best_candidate_predicted_utility": reference_utility,
+        "best_candidate_cost": reference_cost,
+        "best_delta_objective": 0.0,
+        "predicted_utility_delta": 0.0,
+        "cost_delta": 0.0,
+        "candidate_evaluations_recorded": 0,
+    }
+
+
+def _record_uav_candidate_profile(
+    diagnostics: dict[str, dict[str, Any]],
+    uav_id: str,
+    evaluated: dict[str, Any],
+) -> None:
+    key = str(uav_id)
+    if key not in diagnostics:
+        raise AssertionError(f"UAV candidate diagnostic missing UAV: {key}")
+    diagnostic = diagnostics[key]
+    diagnostic["candidate_evaluations_recorded"] = int(
+        diagnostic["candidate_evaluations_recorded"]
+    ) + 1
+    candidate_objective = float(evaluated["objective_value"])
+    if candidate_objective > float(diagnostic["best_feasible_candidate_objective"]):
+        diagnostic["best_feasible_candidate_objective"] = candidate_objective
+        diagnostic["best_candidate_predicted_utility"] = float(
+            evaluated["predictive_utility"]
+        )
+        diagnostic["best_candidate_cost"] = float(evaluated["movement_cost"])
+        diagnostic["best_delta_objective"] = float(
+            candidate_objective - diagnostic["reference_objective"]
+        )
+        diagnostic["predicted_utility_delta"] = float(
+            evaluated["predictive_utility"]
+            - diagnostic["reference_predicted_utility"]
+        )
+        diagnostic["cost_delta"] = float(
+            evaluated["movement_cost"] - diagnostic["reference_cost"]
+        )
+
+
+def _finalize_uav_candidate_profiles(
+    diagnostics: dict[str, dict[str, Any]],
+    positions: dict[str, np.ndarray],
+    old_positions: dict[str, np.ndarray],
+    triggers: dict[str, int],
+    search_config: UavSearchConfig,
+) -> dict[str, int]:
+    actual = {
+        uav_id: int(
+            float(np.linalg.norm(positions[uav_id] - old_positions[uav_id]))
+            > search_config.position_tolerance_m
+        )
+        for uav_id in old_positions
+    }
+    for uav_id, diagnostic in diagnostics.items():
+        actual_update = int(actual[uav_id])
+        diagnostic["actual_update"] = actual_update
+        diagnostic["requested_trigger"] = int(triggers[uav_id])
+        if actual_update > int(triggers[uav_id]):
+            raise AssertionError(
+                f"UAV {uav_id} actual movement exceeds requested trigger"
+            )
+        if (
+            int(triggers[uav_id]) == 1
+            and actual_update == 0
+            and float(diagnostic["best_delta_objective"]) > search_config.objective_tolerance
+        ):
+            raise AssertionError(
+                f"UAV {uav_id} has a positive feasible candidate gain but no actual update"
+            )
+    return actual
+
+
 def _result_from_positions(
     positions: dict[str, np.ndarray],
     old_positions: dict[str, np.ndarray],
@@ -459,6 +549,7 @@ def _result_from_positions(
     stop_reason: str,
     cache_cost_constant: float,
     evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
+    candidate_diagnostics: dict[str, dict[str, Any]] | None = None,
 ) -> UavOptimizationResult:
     evaluated = evaluate_uav_configuration(
         positions,
@@ -473,13 +564,26 @@ def _result_from_positions(
         cache_cost_constant,
         evaluation_context=evaluation_context,
     )
-    actual_uav_triggers = {
-        uav_id: int(
-            float(np.linalg.norm(positions[uav_id] - old_positions[uav_id]))
-            > search_config.position_tolerance_m
-        )
-        for uav_id in old_positions
+    diagnostics = {
+        str(uav_id): dict(value)
+        for uav_id, value in (candidate_diagnostics or {}).items()
     }
+    if not diagnostics:
+        diagnostics = {
+            str(uav_id): _uav_candidate_profile_template(
+                uav_id,
+                int(triggers[uav_id]),
+                evaluated,
+            )
+            for uav_id in old_positions
+        }
+    actual_uav_triggers = _finalize_uav_candidate_profiles(
+        diagnostics,
+        positions,
+        old_positions,
+        triggers,
+        search_config,
+    )
     return UavOptimizationResult(
         final_positions={
             uav_id: (float(xy[0]), float(xy[1])) for uav_id, xy in positions.items()
@@ -499,6 +603,7 @@ def _result_from_positions(
         converged=converged,
         stop_reason=stop_reason,
         actual_uav_triggers=actual_uav_triggers,
+        candidate_diagnostics=diagnostics,
     )
 
 
@@ -655,6 +760,29 @@ def optimize_uav_configuration(
         cache_cost_constant,
         evaluation_context=evaluation_context,
     )
+    reference_eval = evaluate_uav_configuration(
+        old_positions,
+        old_positions,
+        triggers,
+        scenario_slice,
+        cache_state,
+        local_cache_state,
+        cache_nodes,
+        cache_config,
+        search_config,
+        cache_cost_constant,
+        evaluation_context=evaluation_context,
+    )
+    candidate_diagnostics = {
+        str(uav_id): _uav_candidate_profile_template(
+            uav_id,
+            int(triggers[uav_id]),
+            reference_eval,
+        )
+        for uav_id in uav_ids
+    }
+    for uav_id in triggered_ids:
+        _record_uav_candidate_profile(candidate_diagnostics, uav_id, current_eval)
     current_objective = float(current_eval["objective_value"])
 
     if initial_candidate_positions is None:
@@ -675,21 +803,21 @@ def optimize_uav_configuration(
                     search_config,
                 ):
                     continue
-                value = float(
-                    evaluate_uav_configuration(
-                        trial_positions,
-                        old_positions,
-                        triggers,
-                        scenario_slice,
-                        cache_state,
-                        local_cache_state,
-                        cache_nodes,
-                        cache_config,
-                        search_config,
-                        cache_cost_constant,
-                        evaluation_context=evaluation_context,
-                    )["objective_value"]
+                trial_eval = evaluate_uav_configuration(
+                    trial_positions,
+                    old_positions,
+                    triggers,
+                    scenario_slice,
+                    cache_state,
+                    local_cache_state,
+                    cache_nodes,
+                    cache_config,
+                    search_config,
+                    cache_cost_constant,
+                    evaluation_context=evaluation_context,
                 )
+                _record_uav_candidate_profile(candidate_diagnostics, uav_id, trial_eval)
+                value = float(trial_eval["objective_value"])
                 if value > best_objective + search_config.objective_tolerance:
                     best_objective = value
                     best_position = candidate.copy()
@@ -723,21 +851,21 @@ def optimize_uav_configuration(
                     search_config,
                 ):
                     continue
-                value = float(
-                    evaluate_uav_configuration(
-                        trial_positions,
-                        old_positions,
-                        triggers,
-                        scenario_slice,
-                        cache_state,
-                        local_cache_state,
-                        cache_nodes,
-                        cache_config,
-                        search_config,
-                        cache_cost_constant,
-                        evaluation_context=evaluation_context,
-                    )["objective_value"]
+                trial_eval = evaluate_uav_configuration(
+                    trial_positions,
+                    old_positions,
+                    triggers,
+                    scenario_slice,
+                    cache_state,
+                    local_cache_state,
+                    cache_nodes,
+                    cache_config,
+                    search_config,
+                    cache_cost_constant,
+                    evaluation_context=evaluation_context,
                 )
+                _record_uav_candidate_profile(candidate_diagnostics, uav_id, trial_eval)
+                value = float(trial_eval["objective_value"])
                 if value > best_objective + search_config.objective_tolerance:
                     best_objective = value
                     best_position = candidate.copy()
@@ -765,6 +893,7 @@ def optimize_uav_configuration(
                 "converged_by_no_improvement",
                 cache_cost_constant,
                 evaluation_context=evaluation_context,
+                candidate_diagnostics=candidate_diagnostics,
             )
 
     return _result_from_positions(
@@ -785,6 +914,7 @@ def optimize_uav_configuration(
         "stopped_by_max_rounds",
         cache_cost_constant,
         evaluation_context=evaluation_context,
+        candidate_diagnostics=candidate_diagnostics,
     )
 
 
@@ -806,6 +936,7 @@ def _result_to_dict(result: UavOptimizationResult) -> dict[str, Any]:
         "converged": result.converged,
         "stop_reason": result.stop_reason,
         "actual_uav_triggers": result.actual_uav_triggers,
+        "candidate_diagnostics": result.candidate_diagnostics,
     }
 
 

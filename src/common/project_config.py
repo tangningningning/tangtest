@@ -285,6 +285,8 @@ def list_unresolved_parameters(config: dict[str, Any]) -> dict[str, str]:
     statuses = config.get("parameter_status", {})
     allowed = {
         "CONFIRMED_DATA",
+        "TRAIN_ONLY_CALIBRATION",
+        "EXPERIMENT_DESIGN",
         "PROVISIONAL_IMPLEMENTATION",
         "TODO_LITERATURE_CALIBRATION",
     }
@@ -701,6 +703,19 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.ppo.cf_parallel_workers 必须是正整数。")
     if int(cf_parallel_workers) <= 0:
         raise ValueError("algorithm.ppo.cf_parallel_workers 必须是正整数。")
+    prediction_batch_parallel_workers = get_config_value(
+        config,
+        "algorithm.configuration.prediction_batch_parallel_workers",
+        1,
+    )
+    if (
+        isinstance(prediction_batch_parallel_workers, bool)
+        or int(prediction_batch_parallel_workers) != prediction_batch_parallel_workers
+        or int(prediction_batch_parallel_workers) <= 0
+    ):
+        raise ValueError(
+            "algorithm.configuration.prediction_batch_parallel_workers 必须是正整数。"
+        )
     reference_drift_cap = get_config_value(config, "algorithm.ppo.reference_probability_drift_cap")
     if ppo_method in {
         "proposed_sparse_direct_cf_frozen_policy_batch_refdrift",
@@ -946,6 +961,8 @@ def validate_config(config: dict[str, Any]) -> None:
     for key, status in config.get("parameter_status", {}).items():
         if status not in {
             "CONFIRMED_DATA",
+            "TRAIN_ONLY_CALIBRATION",
+            "EXPERIMENT_DESIGN",
             "PROVISIONAL_IMPLEMENTATION",
             "TODO_LITERATURE_CALIBRATION",
         }:

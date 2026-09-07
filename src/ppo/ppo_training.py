@@ -1405,13 +1405,16 @@ def _build_direct_cf_reservoir(
     sampling_rng: np.random.Generator,
     sampling_strategy: str,
 ) -> ppo_rollout.DirectCFReservoir:
-    """按配置选择V3 reservoir；两条路径共享同一snapshot/branch接口。"""
+    """按配置选择V3 reservoir；两条路径共享同一snapshot/branch接口。
+
+    In trigger-stratified mode ``capacity`` remains the legacy uniform-mode
+    compatibility setting; the effective per-episode capacity is the dynamic
+    action-spec size, with one independent capacity-1 stratum per trigger.
+    """
 
     if sampling_strategy == "trigger_stratified":
-        if int(capacity) != int(action_spec.action_dim):
-            raise ValueError(
-                "trigger_stratified 当前要求cf_samples_per_episode等于 dynamic Trigger 数量。"
-            )
+        if isinstance(capacity, bool) or int(capacity) <= 0:
+            raise ValueError("trigger_stratified 仍要求正的兼容性 cf_samples_per_episode。")
         return ppo_rollout.TriggerStratifiedDirectCFReservoir(
             tuple(action_spec.labels),
             sampling_rng,
@@ -1424,6 +1427,35 @@ def _build_direct_cf_reservoir(
             trigger_labels=tuple(action_spec.labels),
         )
     raise ValueError(f"未知Direct-CF sampling strategy：{sampling_strategy}")
+
+
+def _apply_direct_cf_batch_sampling_weights(
+    samples: list[ppo_rollout.DirectCFCreditSample],
+    sampling_strategy: str,
+) -> list[ppo_rollout.DirectCFCreditSample]:
+    """Assign the Batch4 estimator weights without changing selected samples."""
+
+    if not samples:
+        return []
+    if sampling_strategy == "uniform":
+        weights = [1.0 / float(len(samples)) for _ in samples]
+    elif sampling_strategy == "trigger_stratified":
+        trigger_free_counts = [int(item.trigger_free_count) for item in samples]
+        if any(count <= 0 for count in trigger_free_counts):
+            raise AssertionError(
+                "trigger_stratified Direct-CF sample缺少正的trigger_free_count。"
+            )
+        total_free_count = math.fsum(trigger_free_counts)
+        if total_free_count <= 0.0 or not math.isfinite(total_free_count):
+            raise AssertionError("trigger_stratified Direct-CF N_total必须为正且finite。")
+        weights = [float(count / total_free_count) for count in trigger_free_counts]
+    else:
+        raise ValueError(f"未知Direct-CF sampling strategy：{sampling_strategy}")
+    if any(not math.isfinite(weight) or weight < 0.0 for weight in weights):
+        raise AssertionError("Direct-CF Batch4 sampling weights必须finite且非负。")
+    if not math.isclose(math.fsum(weights), 1.0, rel_tol=1.0e-12, abs_tol=1.0e-12):
+        raise AssertionError("Direct-CF Batch4 sampling weights之和必须为1。")
+    return [replace(item, sampling_weight=weight) for item, weight in zip(samples, weights)]
 
 
 def _direct_cf_reservoir_reporting(
@@ -6656,10 +6688,10 @@ def _hierarchical_gate_formal_training(
                     "hierarchical Gate WHAT coverage为0，无法执行existing WHAT Direct-CF update；"
                     "不会伪造g=0 WHAT samples。"
                 )
-            batch_what_samples = [
-                replace(item, sampling_weight=1.0 / float(len(pending_direct_cf_samples)))
-                for item in pending_direct_cf_samples
-            ]
+            batch_what_samples = _apply_direct_cf_batch_sampling_weights(
+                pending_direct_cf_samples,
+                sampling_strategy,
+            )
             if any(
                 int(item.collection_policy_version) != collection_policy_version
                 for item in (pending_gate_cf_samples + batch_what_samples + pending_reference_records)
@@ -6947,7 +6979,14 @@ def _hierarchical_gate_formal_training(
             gate_policy_version_after=gate_policy_version,
             actor_policy_version_before=collection_policy_version,
             actor_policy_version_after=policy_version,
-            what_cf_coverage=float(len(direct_cf_samples) / float(configured_cf_samples)),
+            what_cf_coverage=float(
+                len(direct_cf_samples)
+                / float(
+                    ctx.action_spec.action_dim
+                    if sampling_strategy == "trigger_stratified"
+                    else configured_cf_samples
+                )
+            ),
         )
         episode_summaries.append(episode_summary)
         records.append(_training_episode_history_record(episode_summary, update, ppo_update.HIERARCHICAL_GATE_CREDIT_ASSIGNMENT))
@@ -7624,11 +7663,6 @@ def run_formal_ppo_training(
         if frozen_batch_family_mode or hierarchical_gate_mode
         else 1
     )
-    if (_is_sparse_direct_cf_mode(ctx.cfg) or hierarchical_gate_mode) and sampling_strategy == "trigger_stratified":
-        if configured_cf_samples != int(ctx.action_spec.action_dim):
-            raise ValueError(
-                "trigger_stratified 当前要求cf_samples_per_episode等于 dynamic Trigger 数量。"
-            )
     plan = _build_formal_training_plan(
         protocol,
         num_episodes,
@@ -8039,13 +8073,10 @@ def run_formal_ppo_training(
                         "frozen_policy_batch不得混合collection policy version："
                         f"{sorted(batch_versions)}"
                     )
-                batch_samples = [
-                    replace(
-                        item,
-                        sampling_weight=1.0 / float(expected_batch_sample_count),
-                    )
-                    for item in pending_direct_cf_samples
-                ]
+                batch_samples = _apply_direct_cf_batch_sampling_weights(
+                    pending_direct_cf_samples,
+                    sampling_strategy,
+                )
                 if reference_drift_mode:
                     if cf_sampling_rng is None:
                         raise AssertionError("refdrift causal artifact缺少cf_sampling_rng。")

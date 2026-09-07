@@ -283,6 +283,12 @@ def cache_update_cost(
     old = old_values.astype(np.int8)
     new = new_values.astype(np.int8)
     actual_trigger = np.any(old != new, axis=1).astype(np.int8)
+    if np.any(actual_trigger > trigger_values.astype(np.int8)):
+        offending = np.flatnonzero(actual_trigger > trigger_values.astype(np.int8)).tolist()
+        raise AssertionError(
+            "cache actual update exceeds requested trigger for node indices: "
+            f"{offending}"
+        )
     additions = np.maximum(new - old, 0)
     loaded_mb = additions @ sizes
     loading_energy = xi * loaded_mb
@@ -328,6 +334,8 @@ def uav_movement_cost(
         raise ValueError("UAV movement 参数范围无效。")
     raw_distance = float(np.linalg.norm(new - old))
     actual_z = int(raw_distance > tolerance)
+    if actual_z > int(z_value):
+        raise AssertionError("UAV actual movement exceeds requested trigger z_q=0。")
     effective_distance = raw_distance if actual_z == 1 else 0.0
     speed_feasible = effective_distance <= actual_z * vmax * dt + tolerance
     if not speed_feasible:
