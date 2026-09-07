@@ -511,6 +511,9 @@ cf_samples_per_episode = 8
 # Collect four episodes under one frozen policy, then perform one full-batch
 # Direct-CF update on the resulting 32 samples.
 cf_batch_episodes = 4
+# CPU-only parallelism across independent Gate-CF/WHAT-CF samples.  A value of
+# 1 is the exact serial fallback; suffix slots remain strictly serial.
+cf_parallel_workers = 8
 reference_probability_drift_cap = 0.005
 # Direct-CF样本采样策略：每个Trigger各抽一个FREE decision；
 # 仍保留 uniform 作为旧V3 checkpoint/run 的兼容路径。

@@ -17,8 +17,10 @@ import copy
 import csv
 import json
 import math
+import multiprocessing
 import random
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -232,6 +234,28 @@ class GateDecisionSnapshot:
     final_action_vector: np.ndarray
     baseline_rng_before: dict[str, Any]
     baseline_rng_after_slot: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _CFSuffixBaselineTransition:
+    """Pickle-minimal baseline metrics needed by a CF suffix worker."""
+
+    reward: float
+    actual_task_utility: float
+    cache_cost: float
+    movement_cost: float
+
+
+@dataclass(frozen=True)
+class _CFSuffixBaselineBatch:
+    """Pickle-minimal baseline batch facade used by existing CF helpers."""
+
+    transitions: tuple[_CFSuffixBaselineTransition, ...]
+
+
+# Windows ``spawn`` workers receive a compact, read-only context through the
+# initializer.  The live training policy and parent RNG are never shared.
+_CF_WORKER_STATE: dict[str, Any] | None = None
 
 
 class GateCFReservoir:
@@ -651,6 +675,306 @@ def direct_cf_rng_states_equal(left: dict[str, Any], right: dict[str, Any]) -> b
     return len(left_cuda) == len(right_cuda) and all(
         bool(torch.equal(a, b)) for a, b in zip(left_cuda, right_cuda)
     )
+
+
+def _normalize_cf_parallel_workers(value: Any) -> int:
+    """Validate the CPU CF worker count without changing config semantics."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError("cf_parallel_workers 必须是正整数。")
+    workers = int(value)
+    if workers <= 0:
+        raise ValueError("cf_parallel_workers 必须是正整数。")
+    return workers
+
+
+def _cf_policy_worker_spec(policy: Any) -> dict[str, Any] | None:
+    """Build a minimal CPU policy spec for a Windows spawn worker."""
+
+    if torch is None or not hasattr(policy, "state_dict") or not hasattr(policy, "parameters"):
+        return None
+    parameters = list(policy.parameters())
+    if not parameters or any(parameter.device.type != "cpu" for parameter in parameters):
+        # The formal project is CPU-only.  Do not silently move a live GPU
+        # policy and change its numerical execution path.
+        return None
+    what_policy = getattr(policy, "sub_policy", policy)
+    encoder = getattr(what_policy, "encoder", None)
+    hidden_sizes = tuple(
+        int(layer.out_features)
+        for layer in ([] if encoder is None else encoder)
+        if isinstance(layer, torch.nn.Linear)
+    )
+    if not hidden_sizes:
+        return None
+    state_dict = {
+        str(name): value.detach().cpu().clone()
+        for name, value in policy.state_dict().items()
+    }
+    spec: dict[str, Any] = {
+        "observation_dim": int(getattr(policy, "observation_dim")),
+        "action_spec": getattr(policy, "action_spec"),
+        "hidden_sizes": hidden_sizes,
+        "autoregressive_hidden_size": int(getattr(what_policy, "autoregressive_hidden_size")),
+        "action_embedding_dim": int(
+            getattr(getattr(what_policy, "previous_action_embedding"), "embedding_dim", 8)
+        ),
+        "index_embedding_dim": int(
+            getattr(getattr(what_policy, "action_index_embedding"), "embedding_dim", 8)
+        ),
+        "state_dict": state_dict,
+        "training": bool(policy.training),
+    }
+    if _is_hierarchical_policy(policy):
+        spec.update(
+            {
+                "kind": "hierarchical",
+                "gate_hidden_sizes": tuple(int(value) for value in policy.gate.hidden_sizes),
+            }
+        )
+    elif isinstance(policy, ppo_trigger_policy.FullSharedActorCritic):
+        spec["kind"] = "full_shared"
+    elif isinstance(policy, ppo_trigger_policy.ConditionalTriggerActorCritic):
+        spec["kind"] = "conditional"
+    else:
+        return None
+    return spec
+
+
+def _rebuild_cf_worker_policy(spec: dict[str, Any]) -> Any:
+    """Rebuild a frozen CPU policy from the explicit worker spec."""
+
+    kind = str(spec["kind"])
+    if kind == "hierarchical":
+        from ppo import hierarchical_reconfiguration_gate
+
+        policy = hierarchical_reconfiguration_gate.build_hierarchical_policy(
+            int(spec["observation_dim"]),
+            spec["action_spec"],
+            subpolicy_hidden_sizes=tuple(int(value) for value in spec["hidden_sizes"]),
+            autoregressive_hidden_size=int(spec["autoregressive_hidden_size"]),
+            gate_hidden_sizes=tuple(int(value) for value in spec["gate_hidden_sizes"]),
+        )
+    else:
+        policy_class = (
+            ppo_trigger_policy.FullSharedActorCritic
+            if kind == "full_shared"
+            else ppo_trigger_policy.ConditionalTriggerActorCritic
+        )
+        policy = policy_class(
+            int(spec["observation_dim"]),
+            spec["action_spec"],
+            hidden_sizes=tuple(int(value) for value in spec["hidden_sizes"]),
+            autoregressive_hidden_size=int(spec["autoregressive_hidden_size"]),
+            action_embedding_dim=int(spec["action_embedding_dim"]),
+            index_embedding_dim=int(spec["index_embedding_dim"]),
+        )
+    policy.load_state_dict(spec["state_dict"], strict=True)
+    policy.train(bool(spec["training"]))
+    return policy
+
+
+def _initialize_cf_worker(worker_payload: dict[str, Any]) -> None:
+    """Initialize one isolated CPU worker; never starts the training CLI."""
+
+    global _CF_WORKER_STATE
+    if torch is not None:
+        torch.set_num_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # Some embedded runtimes initialize inter-op threads before the
+            # worker initializer.  In that case the existing setting is safe.
+            pass
+    _CF_WORKER_STATE = {
+        "policy": _rebuild_cf_worker_policy(worker_payload["policy_spec"]),
+        "context": worker_payload,
+    }
+
+
+def _worker_context() -> tuple[Any, dict[str, Any]]:
+    if _CF_WORKER_STATE is None:
+        raise RuntimeError("CF worker尚未完成initializer。")
+    return _CF_WORKER_STATE["policy"], _CF_WORKER_STATE["context"]
+
+
+def _single_direct_cf_reservoir(
+    snapshot: DirectCFDecisionSnapshot,
+    action_spec: ppo_trigger_policy.TriggerActionSpec,
+    total_seen: int,
+    trigger_free_counts: tuple[int, ...],
+) -> DirectCFReservoir:
+    """Create a one-item facade while reusing the serial CF helper exactly."""
+
+    reservoir = DirectCFReservoir(
+        1,
+        np.random.default_rng(0),
+        trigger_count=int(action_spec.action_dim),
+        trigger_labels=tuple(action_spec.labels),
+    )
+    reservoir.items = [snapshot]
+    reservoir.total_seen = int(total_seen)
+    reservoir._trigger_free_counts = [int(value) for value in trigger_free_counts]
+    return reservoir
+
+
+def _cf_worker_direct_job(sample_index: int) -> DirectCFCreditSample:
+    """ProcessPool job for one WHAT Direct-CF sample."""
+
+    policy, context = _worker_context()
+    action_spec = context["action_spec"]
+    snapshot = context["snapshots"][int(sample_index)]
+    reservoir = _single_direct_cf_reservoir(
+        snapshot,
+        action_spec,
+        int(context["direct_total_seen"]),
+        tuple(context["direct_trigger_free_counts"]),
+    )
+    samples = run_direct_cf_branches(
+        policy,
+        reservoir,
+        context["aligned_steps"],
+        context["baseline_batch"],
+        context["local_cache_state"],
+        context["service_catalog"],
+        context["project_cfg"],
+        context["cache_nodes"],
+        context["cache_config"],
+        context["flight_boundary"],
+        context["observation_spec"],
+        action_spec,
+        int(context["terminal_slot"]),
+        collection_policy_version=int(context["collection_policy_version"]),
+        episode_index=int(context["episode_index"]),
+    )
+    if len(samples) != 1:
+        raise RuntimeError("Direct-CF worker必须恰好返回一个sample。")
+    original_index = int(sample_index)
+    snapshot_trigger = int(snapshot.trigger_index)
+    return replace(
+        samples[0],
+        sample_index_in_episode=original_index,
+        sampling_weight=float(context["direct_sampling_weights"][original_index]),
+        trigger_free_count=int(context["direct_trigger_free_counts"][snapshot_trigger]),
+    )
+
+
+def _cf_worker_gate_job(sample_index: int) -> Any:
+    """ProcessPool job for one paired Gate CONFIG/NULL sample."""
+
+    policy, context = _worker_context()
+    reservoir = GateCFReservoir(1, np.random.default_rng(0))
+    reservoir.items = [context["snapshots"][int(sample_index)]]
+    samples = run_gate_cf_branches(
+        policy,
+        reservoir,
+        context["aligned_steps"],
+        context["baseline_batch"],
+        context["local_cache_state"],
+        context["service_catalog"],
+        context["project_cfg"],
+        context["cache_nodes"],
+        context["cache_config"],
+        context["flight_boundary"],
+        context["observation_spec"],
+        context["action_spec"],
+        int(context["terminal_slot"]),
+        collection_policy_version=int(context["collection_policy_version"]),
+        episode_index=int(context["episode_index"]),
+    )
+    if len(samples) != 1:
+        raise RuntimeError("Gate-CF worker必须恰好返回一个paired sample。")
+    return samples[0]
+
+
+def _compact_cf_baseline_batch(
+    baseline_batch: RolloutBatch,
+) -> _CFSuffixBaselineBatch:
+    return _CFSuffixBaselineBatch(
+        transitions=tuple(
+            _CFSuffixBaselineTransition(
+                reward=float(item.reward),
+                actual_task_utility=float(item.actual_task_utility),
+                cache_cost=float(item.cache_cost),
+                movement_cost=float(item.movement_cost),
+            )
+            for item in baseline_batch.transitions
+        )
+    )
+
+
+def _run_cf_process_pool(
+    *,
+    stage: str,
+    policy: Any,
+    snapshots: list[Any],
+    aligned_steps: list[AlignedRolloutStep],
+    baseline_batch: RolloutBatch,
+    local_cache_state: dict[str, set[int]],
+    service_catalog: dict[str, Any],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    flight_boundary: tuple[float, float, float, float],
+    observation_spec: ppo_trigger_policy.ConfigurationObservationSpec,
+    action_spec: ppo_trigger_policy.TriggerActionSpec,
+    terminal_slot: int,
+    collection_policy_version: int,
+    episode_index: int,
+    parallel_workers: int,
+    direct_total_seen: int = 0,
+    direct_trigger_free_counts: tuple[int, ...] = (),
+    direct_sampling_weights: tuple[float, ...] = (),
+) -> list[Any] | None:
+    """Run independent CF jobs in input order; return None when CPU parallelism is unavailable."""
+
+    workers = _normalize_cf_parallel_workers(parallel_workers)
+    if workers <= 1 or len(snapshots) <= 1:
+        return None
+    policy_spec = _cf_policy_worker_spec(policy)
+    if policy_spec is None:
+        return None
+    if stage not in {"direct", "gate"}:
+        raise ValueError(f"未知 CF parallel stage：{stage}")
+    worker_payload = {
+        "stage": stage,
+        "policy_spec": policy_spec,
+        "snapshots": tuple(snapshots),
+        "aligned_steps": tuple(aligned_steps),
+        "baseline_batch": _compact_cf_baseline_batch(baseline_batch),
+        "local_cache_state": local_cache_state,
+        "service_catalog": service_catalog,
+        "project_cfg": project_cfg,
+        "cache_nodes": cache_nodes,
+        "cache_config": cache_config,
+        "flight_boundary": flight_boundary,
+        "observation_spec": observation_spec,
+        "action_spec": action_spec,
+        "terminal_slot": int(terminal_slot),
+        "collection_policy_version": int(collection_policy_version),
+        "episode_index": int(episode_index),
+        "direct_total_seen": int(direct_total_seen),
+        "direct_trigger_free_counts": tuple(int(value) for value in direct_trigger_free_counts),
+        "direct_sampling_weights": tuple(float(value) for value in direct_sampling_weights),
+    }
+    worker_count = min(workers, len(snapshots))
+    caller_rng_state = capture_direct_cf_rng_state()
+    try:
+        mp_context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=mp_context,
+            initializer=_initialize_cf_worker,
+            initargs=(worker_payload,),
+        ) as executor:
+            worker = _cf_worker_direct_job if stage == "direct" else _cf_worker_gate_job
+            # executor.map guarantees input-order results even when jobs finish
+            # out of order; chunksize=1 keeps the sample boundary explicit.
+            return list(executor.map(worker, range(len(snapshots)), chunksize=1))
+    finally:
+        # Child processes have isolated RNGs; restore the parent explicitly so
+        # pool startup/serialization can never alter training RNG semantics.
+        restore_direct_cf_rng_state(caller_rng_state)
 
 
 # 这是实现边界而非待调优的训练超参数：central critic 最多保留最近两个完整
@@ -1441,6 +1765,7 @@ def run_direct_cf_branches(
     terminal_slot: int,
     collection_policy_version: int = 0,
     episode_index: int = 0,
+    cf_parallel_workers: int = 1,
 ) -> list[DirectCFCreditSample]:
     """执行 selected FREE decisions 的 same-state frozen-old-policy continuation。
 
@@ -1470,6 +1795,34 @@ def run_direct_cf_branches(
     # Actor directly; sampling the outer Gate again would be both semantically
     # wrong and capable of turning a valid target into NULL/all-zero.
     what_policy = getattr(policy, "sub_policy", policy)
+
+    parallel_samples = _run_cf_process_pool(
+        stage="direct",
+        policy=policy,
+        snapshots=list(reservoir.items),
+        aligned_steps=aligned_steps,
+        baseline_batch=baseline_batch,
+        local_cache_state=local_cache_state,
+        service_catalog=service_catalog,
+        project_cfg=project_cfg,
+        cache_nodes=cache_nodes,
+        cache_config=cache_config,
+        flight_boundary=flight_boundary,
+        observation_spec=observation_spec,
+        action_spec=action_spec,
+        terminal_slot=terminal_slot,
+        collection_policy_version=collection_policy_version,
+        episode_index=episode_index,
+        parallel_workers=cf_parallel_workers,
+        direct_total_seen=int(reservoir.total_seen),
+        direct_trigger_free_counts=reservoir.trigger_free_counts,
+        direct_sampling_weights=tuple(
+            float(reservoir.sampling_weight_for(snapshot.trigger_index))
+            for snapshot in reservoir.items
+        ),
+    )
+    if parallel_samples is not None:
+        return [sample for sample in parallel_samples]
 
     caller_rng_state = capture_direct_cf_rng_state()
     samples: list[DirectCFCreditSample] = []
@@ -1660,6 +2013,7 @@ def run_gate_cf_branches(
     terminal_slot: int,
     collection_policy_version: int = 0,
     episode_index: int = 0,
+    cf_parallel_workers: int = 1,
 ) -> list[Any]:
     """Run the formal Gate Joint-Null paired branches.
 
@@ -1687,6 +2041,28 @@ def run_gate_cf_branches(
     episode_index = int(episode_index)
     if collection_policy_version < 0 or episode_index < 0:
         raise ValueError("Gate-CF collection policy version/episode index不能为负。")
+
+    parallel_samples = _run_cf_process_pool(
+        stage="gate",
+        policy=policy,
+        snapshots=list(reservoir.items),
+        aligned_steps=aligned_steps,
+        baseline_batch=baseline_batch,
+        local_cache_state=local_cache_state,
+        service_catalog=service_catalog,
+        project_cfg=project_cfg,
+        cache_nodes=cache_nodes,
+        cache_config=cache_config,
+        flight_boundary=flight_boundary,
+        observation_spec=observation_spec,
+        action_spec=action_spec,
+        terminal_slot=terminal_slot,
+        collection_policy_version=collection_policy_version,
+        episode_index=episode_index,
+        parallel_workers=cf_parallel_workers,
+    )
+    if parallel_samples is not None:
+        return [sample for sample in parallel_samples]
 
     caller_rng_state = capture_direct_cf_rng_state()
     samples: list[Any] = []

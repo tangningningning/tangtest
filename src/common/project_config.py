@@ -696,6 +696,11 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.ppo.cf_batch_episodes 必须是正整数。")
     if int(cf_batch_episodes) <= 0:
         raise ValueError("algorithm.ppo.cf_batch_episodes 必须是正整数。")
+    cf_parallel_workers = get_config_value(config, "algorithm.ppo.cf_parallel_workers", 8)
+    if isinstance(cf_parallel_workers, bool) or int(cf_parallel_workers) != cf_parallel_workers:
+        raise ValueError("algorithm.ppo.cf_parallel_workers 必须是正整数。")
+    if int(cf_parallel_workers) <= 0:
+        raise ValueError("algorithm.ppo.cf_parallel_workers 必须是正整数。")
     reference_drift_cap = get_config_value(config, "algorithm.ppo.reference_probability_drift_cap")
     if ppo_method in {
         "proposed_sparse_direct_cf_frozen_policy_batch_refdrift",

@@ -959,6 +959,17 @@ def _cf_batch_episodes(project_cfg: dict[str, Any]) -> int:
     return result
 
 
+def _cf_parallel_workers(project_cfg: dict[str, Any]) -> int:
+    value = project_config.get_config_value(
+        project_cfg,
+        "algorithm.ppo.cf_parallel_workers",
+        8,
+    )
+    if isinstance(value, bool) or int(value) != value or int(value) <= 0:
+        raise ValueError("algorithm.ppo.cf_parallel_workers 必须是正整数。")
+    return int(value)
+
+
 def _cf_sampling_strategy(project_cfg: dict[str, Any]) -> str:
     """读取V3 Direct-CF采样策略；缺省保持旧uniform语义。"""
 
@@ -6451,6 +6462,7 @@ def _hierarchical_gate_formal_training(
     }
 
     episode_summaries: list[TrainingEpisodeSummary] = []
+    cf_parallel_workers = _cf_parallel_workers(ctx.cfg)
     print(
         f"[PPO] {'resume' if resume else 'training'} hierarchical Gate: episodes "
         f"{completed_episodes} -> {num_episodes}, run_dir={formal_run_dir}",
@@ -6514,8 +6526,14 @@ def _hierarchical_gate_formal_training(
             gate_cf_reservoir=gate_cf_reservoir,
         )
         raw_stats = _formal_raw_rollout_statistics(batch)
+        print(
+            f"[PPO] episode {episode_index + 1}/{num_episodes} rollout done | "
+            f"steps={len(batch.transitions)} | time={time.perf_counter() - episode_start_time:.1f}s",
+            flush=True,
+        )
         if gate_cf_reservoir.sample_count != HIERARCHICAL_GATE_CF_SAMPLES_PER_EPISODE:
             raise RuntimeError("hierarchical Gate每个formal episode必须选出8个Gate-CF slots。")
+        gate_cf_start_time = time.perf_counter()
         gate_cf_samples = ppo_rollout.run_gate_cf_branches(
             policy,
             gate_cf_reservoir,
@@ -6532,6 +6550,7 @@ def _hierarchical_gate_formal_training(
             ctx.terminal_slot,
             collection_policy_version=collection_policy_version,
             episode_index=episode_index,
+            cf_parallel_workers=cf_parallel_workers,
         )
         if len(gate_cf_samples) != HIERARCHICAL_GATE_CF_SAMPLES_PER_EPISODE:
             raise RuntimeError("hierarchical Gate-CF branch数量必须为8。")
@@ -6539,7 +6558,14 @@ def _hierarchical_gate_formal_training(
             raise RuntimeError("hierarchical Gate-CF decision_id必须唯一。")
         if {int(item.collection_policy_version) for item in gate_cf_samples} != {collection_policy_version}:
             raise RuntimeError("hierarchical Gate-CF collection_policy_version写入不一致。")
+        print(
+            f"[PPO] episode {episode_index + 1}/{num_episodes} Gate-CF done | "
+            f"samples={len(gate_cf_samples)} | workers={min(cf_parallel_workers, len(gate_cf_samples))} | "
+            f"time={time.perf_counter() - gate_cf_start_time:.1f}s",
+            flush=True,
+        )
 
+        direct_cf_start_time = time.perf_counter()
         direct_cf_samples = ppo_rollout.run_direct_cf_branches(
             policy,
             direct_cf_reservoir,
@@ -6556,6 +6582,7 @@ def _hierarchical_gate_formal_training(
             ctx.terminal_slot,
             collection_policy_version=collection_policy_version,
             episode_index=episode_index,
+            cf_parallel_workers=cf_parallel_workers,
         )
         if len(direct_cf_samples) != direct_cf_reservoir.sample_count:
             raise RuntimeError("hierarchical WHAT Direct-CF branch数量与reservoir不一致。")
@@ -6567,6 +6594,12 @@ def _hierarchical_gate_formal_training(
         ]
         if identity_errors and max(identity_errors) > 1.0e-9:
             raise AssertionError("hierarchical WHAT Direct-CF Delta identity失败。")
+        print(
+            f"[PPO] episode {episode_index + 1}/{num_episodes} WHAT Direct-CF done | "
+            f"samples={len(direct_cf_samples)} | workers={min(cf_parallel_workers, len(direct_cf_samples))} | "
+            f"time={time.perf_counter() - direct_cf_start_time:.1f}s",
+            flush=True,
+        )
 
         if not batch.reference_decisions:
             raise RuntimeError("hierarchical Gate WHAT RefDrift rollout缺少R_all reference decisions。")
@@ -7884,6 +7917,7 @@ def run_formal_ppo_training(
                 ctx.terminal_slot,
                 collection_policy_version=collection_policy_version,
                 episode_index=episode_index,
+                cf_parallel_workers=_cf_parallel_workers(ctx.cfg),
             )
             if len(direct_cf_samples) != direct_cf_reservoir.sample_count:
                 raise RuntimeError("Direct-CF branch成功样本数与reservoir数量不一致。")
