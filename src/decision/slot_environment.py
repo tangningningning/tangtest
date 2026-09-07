@@ -136,6 +136,7 @@ def execute_slot(
     slot_id: int | None = None,
     time_s: float | None = None,
     performance_profile: dict[str, Any] | None = None,
+    configuration_profile: cache_configuration.ConfigurationEvaluationProfile | None = None,
 ) -> SlotExecutionResult:
     """Execute one slot from external trigger to actual system utility.
 
@@ -198,6 +199,7 @@ def execute_slot(
             local_cache_state,
             cache_nodes,
             cache_config,
+            profile=configuration_profile,
         )
         configuration = optimize_joint_configuration(
             previous_cache,
@@ -673,6 +675,7 @@ def evaluate_joint_configuration(
         nodes,
         cache_config,
         evaluation_context=evaluation_context,
+        profile_source="joint",
     )["predicted_utility"]
     cache_cost, cache_energy = _cache_cost(
         previous_cache_state,

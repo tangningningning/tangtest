@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -416,6 +417,48 @@ class SurrogateEvent:
     predicted_tv_position: np.ndarray
 
 
+_CONFIGURATION_PROFILE_SOURCES = ("cache", "uav", "joint")
+
+
+def _new_configuration_profile_source_stats() -> dict[str, dict[str, int]]:
+    return {
+        source: {
+            "requests": 0,
+            "unique": 0,
+            "hits": 0,
+            "misses": 0,
+            "predictive_batches": 0,
+            "matching_calls": 0,
+            "candidate_evaluations_total": 0,
+        }
+        for source in _CONFIGURATION_PROFILE_SOURCES
+    }
+
+
+@dataclass
+class ConfigurationEvaluationProfile:
+    """Optional observation-only counters for one trigger configuration run."""
+
+    utility_requests: int = 0
+    unique_configurations: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    predictive_batch_evaluations: int = 0
+    predictive_matching_calls: int = 0
+    matching_candidate_evaluations_total: int = 0
+    utility_evaluation_seconds: float = 0.0
+    matching_seconds: float = 0.0
+    source_stats: dict[str, dict[str, int]] = field(
+        default_factory=_new_configuration_profile_source_stats
+    )
+
+    def source_bucket(self, source: str | None) -> dict[str, int]:
+        source_key = str(source or "joint").lower()
+        if source_key not in _CONFIGURATION_PROFILE_SOURCES:
+            source_key = "joint"
+        return self.source_stats[source_key]
+
+
 @dataclass
 class SurrogateEvaluationContext:
     """时隙级预测评价上下文。
@@ -436,6 +479,7 @@ class SurrogateEvaluationContext:
     configuration_utility_cache: dict[tuple[bytes, tuple[tuple[str, float, float], ...]], float] = field(
         default_factory=dict
     )
+    profile: ConfigurationEvaluationProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -473,6 +517,7 @@ def build_surrogate_evaluation_context(
     local_cache_state: dict[str, set[int]],
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    profile: ConfigurationEvaluationProfile | None = None,
 ) -> SurrogateEvaluationContext:
     """把预测切片整理成与实际执行模型一致的并发任务批次。"""
 
@@ -554,6 +599,7 @@ def build_surrogate_evaluation_context(
             for vehicle_id, services in local_cache_state.items()
         },
         matching_project_config=_matching_project_config(config),
+        profile=profile,
     )
 
 
@@ -562,11 +608,19 @@ def evaluate_surrogate_context(
     context: SurrogateEvaluationContext,
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    profile_source: str = "joint",
 ) -> float:
     """用实际 Matching/KKT 链评价候选配置的预测效用。"""
 
     # 局部导入用于避免 cache_configuration 与 task_allocation 的模块级循环依赖。
     from decision import task_allocation
+
+    profile = context.profile
+    source_bucket = profile.source_bucket(profile_source) if profile is not None else None
+    utility_started_at = time.perf_counter() if profile is not None else 0.0
+    if profile is not None and source_bucket is not None:
+        profile.utility_requests += 1
+        source_bucket["requests"] += 1
 
     candidate_cache = np.ascontiguousarray(cache, dtype=np.int8)
     uav_positions = tuple(
@@ -581,7 +635,18 @@ def evaluate_surrogate_context(
     cache_key = (candidate_cache.tobytes(), uav_positions)
     cached = context.configuration_utility_cache.get(cache_key)
     if cached is not None:
+        if profile is not None and source_bucket is not None:
+            profile.cache_hits += 1
+            source_bucket["hits"] += 1
+            profile.utility_evaluation_seconds += time.perf_counter() - utility_started_at
+
         return float(cached)
+
+    if profile is not None and source_bucket is not None:
+        profile.cache_misses += 1
+        profile.unique_configurations += 1
+        source_bucket["misses"] += 1
+        source_bucket["unique"] += 1
 
     local_cache = {
         vehicle_id: set(services)
@@ -593,6 +658,12 @@ def evaluate_surrogate_context(
     }
     total = 0.0
     for batch in context.batches:
+        if profile is not None and source_bucket is not None:
+            profile.predictive_batch_evaluations += 1
+            profile.predictive_matching_calls += 1
+            source_bucket["predictive_batches"] += 1
+            source_bucket["matching_calls"] += 1
+        matching_started_at = time.perf_counter() if profile is not None else 0.0
         tasks = [
             task_allocation.Task(
                 task_id=event.tv_id,
@@ -618,6 +689,11 @@ def evaluate_surrogate_context(
             cache_nodes,
             config,
         )
+        if profile is not None and source_bucket is not None:
+            profile.matching_seconds += time.perf_counter() - matching_started_at
+            candidate_evaluations = int(result.candidate_evaluations_total)
+            profile.matching_candidate_evaluations_total += candidate_evaluations
+            source_bucket["candidate_evaluations_total"] += candidate_evaluations
         if not result.resource_feasible:
             raise AssertionError(
                 "预测配置的实际 Matching/KKT 评价不可行："
@@ -626,7 +702,42 @@ def evaluate_surrogate_context(
         total += batch.discount * float(result.task_utility_sum)
     utility = float(total / max(context.num_scenarios, 1))
     context.configuration_utility_cache[cache_key] = utility
+    if profile is not None:
+        profile.utility_evaluation_seconds += time.perf_counter() - utility_started_at
     return utility
+
+
+def print_configuration_profile(profile: ConfigurationEvaluationProfile) -> None:
+    """Print compact terminal-only counters for one bounded configuration run."""
+
+    hit_rate = (
+        100.0 * profile.cache_hits / profile.utility_requests
+        if profile.utility_requests
+        else 0.0
+    )
+    print("[CONFIG PROFILE]", flush=True)
+    print(
+        f"utility_requests={profile.utility_requests} | "
+        f"unique_configs={profile.unique_configurations} | "
+        f"cache_hits={profile.cache_hits} | "
+        f"cache_misses={profile.cache_misses} | "
+        f"cache_hit_rate={hit_rate:.1f}% | "
+        f"predictive_batches={profile.predictive_batch_evaluations} | "
+        f"predictive_matching_calls={profile.predictive_matching_calls} | "
+        f"matching_candidate_evals={profile.matching_candidate_evaluations_total} | "
+        f"utility_time={profile.utility_evaluation_seconds:.3f}s | "
+        f"matching_time={profile.matching_seconds:.3f}s",
+        flush=True,
+    )
+    for label, source in (("CACHE", "cache"), ("UAV", "uav"), ("JOINT", "joint")):
+        stats = profile.source_stats[source]
+        print(
+            f"[{label} PROFILE] requests={stats['requests']} | "
+            f"unique={stats['unique']} | "
+            f"matching_calls={stats['matching_calls']} | "
+            f"candidate_evals={stats['candidate_evaluations_total']}",
+            flush=True,
+        )
 
 
 def predicted_service_utility(
@@ -636,6 +747,7 @@ def predicted_service_utility(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
     evaluation_context: SurrogateEvaluationContext | None = None,
+    profile_source: str = "joint",
 ) -> float:
     context = evaluation_context
     if context is None:
@@ -645,7 +757,13 @@ def predicted_service_utility(
             cache_nodes,
             config,
         )
-    return evaluate_surrogate_context(cache, context, cache_nodes, config)
+    return evaluate_surrogate_context(
+        cache,
+        context,
+        cache_nodes,
+        config,
+        profile_source=profile_source,
+    )
 
 
 def cache_update_energy(
@@ -696,6 +814,7 @@ def objective(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
     evaluation_context: SurrogateEvaluationContext | None = None,
+    profile_source: str = "cache",
 ) -> float:
     utility = predicted_service_utility(
         cache,
@@ -704,6 +823,7 @@ def objective(
         cache_nodes,
         config,
         evaluation_context=evaluation_context,
+        profile_source=profile_source,
     )
     update_cost, _ = cache_update_cost(
         previous_cache,
@@ -723,6 +843,7 @@ def evaluate_fixed_configuration(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
     evaluation_context: SurrogateEvaluationContext | None = None,
+    profile_source: str = "joint",
 ) -> dict[str, float]:
     """评估给定 cache + 节点位置下的预测 utility。
 
@@ -738,6 +859,7 @@ def evaluate_fixed_configuration(
         cache_nodes,
         config,
         evaluation_context=evaluation_context,
+        profile_source=profile_source,
     )
     if not math.isfinite(utility):
         raise AssertionError("fixed configuration predicted utility 非 finite。")
@@ -1017,6 +1139,7 @@ def optimize_cache(
             cache_nodes,
             config,
             evaluation_context=evaluation_context,
+            profile_source="cache",
         )
         update_cost, energy = cache_update_cost(
             previous_cache,
@@ -1179,6 +1302,7 @@ def optimize_cache(
         cache_nodes,
         config,
         evaluation_context=evaluation_context,
+        profile_source="cache",
     )
     update_cost, energy = cache_update_cost(
         previous_cache,

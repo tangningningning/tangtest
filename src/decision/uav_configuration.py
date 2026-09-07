@@ -401,6 +401,7 @@ def evaluate_uav_configuration(
     search_config: UavSearchConfig,
     cache_cost_constant: float = 0.0,
     evaluation_context: cache_configuration.SurrogateEvaluationContext | None = None,
+    profile_source: str = "uav",
 ) -> dict[str, Any]:
     """评估固定 UAV configuration 的预测目标。
 
@@ -418,6 +419,7 @@ def evaluate_uav_configuration(
         nodes,
         cache_config,
         evaluation_context=evaluation_context,
+        profile_source=profile_source,
     )["predicted_utility"]
     energy, move_cost, displacement, energy_by_uav, cost_by_uav = movement_summary(
         old_positions,
