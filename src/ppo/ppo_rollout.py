@@ -19,6 +19,7 @@ import json
 import math
 import multiprocessing
 import random
+import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1301,6 +1302,81 @@ def build_trigger_action_mask_provider(
     return provider
 
 
+def _initialize_rollout_profile(
+    profile: dict[str, Any],
+    total_steps: int,
+) -> None:
+    profile.clear()
+    profile.update(
+        {
+            "started_at": time.perf_counter(),
+            "total_steps": int(total_steps),
+            "slot_count": 0,
+            "total_seconds": 0.0,
+            "config_seconds": 0.0,
+            "matching_kkt_seconds": 0.0,
+            "other_seconds": 0.0,
+            "max_slot_seconds": 0.0,
+            "max_slot_id": None,
+        }
+    )
+
+
+def _record_rollout_profile_slot(
+    profile: dict[str, Any],
+    slot_started_at: float,
+    slot_id: int,
+    config_seconds_before: float,
+    matching_kkt_seconds_before: float,
+) -> None:
+    slot_seconds = max(0.0, time.perf_counter() - float(slot_started_at))
+    config_delta = max(
+        0.0,
+        float(profile.get("config_seconds", 0.0)) - float(config_seconds_before),
+    )
+    matching_delta = max(
+        0.0,
+        float(profile.get("matching_kkt_seconds", 0.0))
+        - float(matching_kkt_seconds_before),
+    )
+    profile["total_seconds"] = float(profile["total_seconds"]) + slot_seconds
+    profile["other_seconds"] = float(profile["other_seconds"]) + max(
+        0.0,
+        slot_seconds - config_delta - matching_delta,
+    )
+    profile["slot_count"] = int(profile["slot_count"]) + 1
+    if slot_seconds > float(profile["max_slot_seconds"]):
+        profile["max_slot_seconds"] = slot_seconds
+        profile["max_slot_id"] = int(slot_id)
+
+
+def _print_rollout_profile(profile: dict[str, Any]) -> None:
+    elapsed = max(0.0, time.perf_counter() - float(profile["started_at"]))
+    slot_count = int(profile["slot_count"])
+    total_steps = int(profile["total_steps"])
+    average = elapsed / slot_count if slot_count else 0.0
+    print(
+        f"[PPO] rollout progress | step={slot_count}/{total_steps} | "
+        f"elapsed={elapsed:.1f}s | avg={average:.3f}s/slot",
+        flush=True,
+    )
+    config_seconds = float(profile["config_seconds"])
+    matching_kkt_seconds = float(profile["matching_kkt_seconds"])
+    other_seconds = float(profile["other_seconds"])
+    profiled_total = config_seconds + matching_kkt_seconds + other_seconds
+
+    def percentage(value: float) -> float:
+        return 100.0 * value / profiled_total if profiled_total > 0.0 else 0.0
+
+    print(
+        f"[PPO] rollout profile | config={config_seconds:.1f}s ({percentage(config_seconds):.1f}%) | "
+        f"matching_kkt={matching_kkt_seconds:.1f}s ({percentage(matching_kkt_seconds):.1f}%) | "
+        f"other={other_seconds:.1f}s ({percentage(other_seconds):.1f}%) | "
+        f"max_slot={profile['max_slot_id']} ({float(profile['max_slot_seconds']):.1f}s)",
+        flush=True,
+    )
+
+
 def collect_on_policy_rollout(
     policy: Any,
     initial_cache_state: np.ndarray,
@@ -1324,6 +1400,7 @@ def collect_on_policy_rollout(
     gate_cf_reservoir: GateCFReservoir | None = None,
     forced_gate_action: int | None = None,
     force_noop_configuration: bool = False,
+    rollout_profile: dict[str, Any] | None = None,
 ) -> RolloutBatch:
     """收集连续 on-policy rollout；核心逻辑不读磁盘、不重置 RNG。"""
 
@@ -1362,8 +1439,21 @@ def collect_on_policy_rollout(
     )
     if not execution_steps:
         raise ValueError("aligned_steps 至少需要一个可执行 step。")
+    if rollout_profile is not None:
+        _initialize_rollout_profile(rollout_profile, len(execution_steps))
 
     for step_index, step in enumerate(execution_steps):
+        slot_started_at = time.perf_counter() if rollout_profile is not None else 0.0
+        config_seconds_before = (
+            float(rollout_profile["config_seconds"])
+            if rollout_profile is not None
+            else 0.0
+        )
+        matching_kkt_seconds_before = (
+            float(rollout_profile["matching_kkt_seconds"])
+            if rollout_profile is not None
+            else 0.0
+        )
         if step_index > 0:
             prev = transitions[-1]
             state_propagation_ok = state_propagation_ok and np.array_equal(
@@ -1429,6 +1519,12 @@ def collect_on_policy_rollout(
         if forced_gate_action is not None:
             sample_kwargs["force_gate_action"] = int(forced_gate_action)
         sample = _sample_action_without_grad(policy, observation, **sample_kwargs)
+        execute_kwargs: dict[str, Any] = {
+            "slot_id": step.slot,
+            "time_s": step.time_s,
+        }
+        if rollout_profile is not None:
+            execute_kwargs["performance_profile"] = rollout_profile
         result = slot_environment.execute_slot(
             previous_cache,
             previous_uav,
@@ -1443,8 +1539,7 @@ def collect_on_policy_rollout(
             cache_nodes,
             cache_config,
             flight_boundary,
-            slot_id=step.slot,
-            time_s=step.time_s,
+            **execute_kwargs,
         )
         if not result.step_feasible:
             raise InfeasibleActionBlocker(
@@ -1601,6 +1696,26 @@ def collect_on_policy_rollout(
         old_per_action_probability_tables.append(transition.old_per_action_probability_table.copy())
         previous_cache = transition.next_cache_state.copy()
         previous_uav = dict(transition.next_uav_positions)
+        if rollout_profile is not None:
+            config_seconds_after = float(rollout_profile["config_seconds"])
+            matching_kkt_seconds_after = float(rollout_profile["matching_kkt_seconds"])
+            if (
+                config_seconds_after < config_seconds_before
+                or matching_kkt_seconds_after < matching_kkt_seconds_before
+            ):
+                raise AssertionError("rollout profile stage timing cannot move backwards")
+            _record_rollout_profile_slot(
+                rollout_profile,
+                slot_started_at,
+                int(step.slot),
+                config_seconds_before,
+                matching_kkt_seconds_before,
+            )
+        if rollout_profile is not None and (
+            int(rollout_profile["slot_count"]) % 20 == 0
+            or int(rollout_profile["slot_count"]) == int(rollout_profile["total_steps"])
+        ):
+            _print_rollout_profile(rollout_profile)
         if done:
             break
 

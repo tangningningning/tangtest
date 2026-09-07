@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,23 @@ def _configuration_summary(result: JointConfigurationResult) -> dict[str, Any]:
     }
 
 
+def _record_slot_performance_profile(
+    profile: dict[str, Any] | None,
+    configuration_seconds: float,
+    matching_kkt_seconds: float,
+) -> None:
+    """Accumulate optional diagnostic timing without changing slot semantics."""
+
+    if profile is None:
+        return
+    profile["config_seconds"] = float(profile.get("config_seconds", 0.0)) + float(
+        configuration_seconds
+    )
+    profile["matching_kkt_seconds"] = float(profile.get("matching_kkt_seconds", 0.0)) + float(
+        matching_kkt_seconds
+    )
+
+
 def execute_slot(
     previous_cache_state: np.ndarray,
     previous_uav_positions: dict[str, Any],
@@ -117,6 +135,7 @@ def execute_slot(
     flight_boundary: tuple[float, float, float, float],
     slot_id: int | None = None,
     time_s: float | None = None,
+    performance_profile: dict[str, Any] | None = None,
 ) -> SlotExecutionResult:
     """Execute one slot from external trigger to actual system utility.
 
@@ -146,6 +165,7 @@ def execute_slot(
         int(cache_trigger.sum()) == 0
         and not any(int(value) == 1 for value in uav_triggers.values())
     )
+    configuration_started_at = time.perf_counter() if performance_profile is not None else 0.0
     if no_configuration_trigger:
         # Gate=NULL 时配置状态严格保持不变；预测目标既不参与 Matching，也不参与
         # 当前 reward，因此不执行昂贵且无决策作用的场景配置评价。
@@ -193,7 +213,17 @@ def execute_slot(
             flight_boundary,
             evaluation_context=evaluation_context,
         )
+    configuration_seconds = (
+        time.perf_counter() - configuration_started_at
+        if performance_profile is not None
+        else 0.0
+    )
     if not configuration.trigger_feasible:
+        _record_slot_performance_profile(
+            performance_profile,
+            configuration_seconds,
+            0.0,
+        )
         return SlotExecutionResult(
             slot_id=slot_id,
             time_s=time_s,
@@ -224,6 +254,7 @@ def execute_slot(
             next_uav_positions=None,
         )
 
+    matching_started_at = time.perf_counter() if performance_profile is not None else 0.0
     final_cache = np.asarray(configuration.final_cache_state, dtype=np.int8).copy()
     final_uav = dict(configuration.final_uav_positions)
     service_positions = task_allocation.build_service_node_positions(
@@ -241,7 +272,17 @@ def execute_slot(
         cache_nodes,
         cache_config,
     )
+    matching_kkt_seconds = (
+        time.perf_counter() - matching_started_at
+        if performance_profile is not None
+        else 0.0
+    )
     if not matching.resource_feasible:
+        _record_slot_performance_profile(
+            performance_profile,
+            configuration_seconds,
+            matching_kkt_seconds,
+        )
         return SlotExecutionResult(
             slot_id=slot_id,
             time_s=time_s,
@@ -284,6 +325,11 @@ def execute_slot(
     ):
         raise AssertionError("G(t)=Q(t)-C_ca(t)-C_q(t) 恒等式失败。")
 
+    _record_slot_performance_profile(
+        performance_profile,
+        configuration_seconds,
+        matching_kkt_seconds,
+    )
     return SlotExecutionResult(
         slot_id=slot_id,
         time_s=time_s,

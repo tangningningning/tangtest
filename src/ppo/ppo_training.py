@@ -4798,6 +4798,7 @@ def collect_formal_episode_rollout(
     """
 
     steps = _formal_aligned_steps(ctx, protocol)
+    rollout_profile: dict[str, Any] = {}
     batch = ppo_rollout.collect_on_policy_rollout(
         policy,
         ctx.initial_cache,
@@ -4819,6 +4820,7 @@ def collect_formal_episode_rollout(
         collection_policy_version,
         collect_reference_states,
         gate_cf_reservoir,
+        rollout_profile=rollout_profile,
     )
     if batch.truncated or not bool(batch.metadata.get("true_terminal", False)):
         raise RuntimeError("正式完整episode rollout必须以true terminal结束，且bootstrap必须为0。")
