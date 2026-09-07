@@ -77,12 +77,13 @@ def plot_training_convergence(
     output_path: str | Path,
     moving_average_window: int = 10,
 ) -> Path:
-    """绘制训练 episode 平均真实系统效用及其滑动平均。
+    """绘制训练 episode 的原始真实系统效用曲线。
 
     ``rollout_reward_mean`` 已由训练 episode 汇总定义为
     ``mean_t G(t)``，其中 ``G(t)=Q_actual-C_ca-C_q``；本函数直接使用该
     字段，不重新计算 reward，也不把 PPO loss/value loss 放到图1中。
-    moving average 只用于可视化，不是 system_config 或 PPO 训练参数。
+    ``moving_average_window`` 保留用于兼容已有调用，但不再绘制额外的
+    moving-average 曲线。
     """
 
     records = _records(episode_summaries, "episode_summaries")
@@ -95,10 +96,6 @@ def plot_training_convergence(
         raise ValueError("moving_average_window 必须是大于等于1的整数。") from exc
     if window < 1 or window != moving_average_window:
         raise ValueError("moving_average_window 必须是大于等于1的整数。")
-    # 第一阶段可能只有少于10轮；使用已有episode数作为有效窗口，仍保留
-    # 原始曲线和moving average，不让绘图阻断训练完成后的reporting。
-    window = min(window, len(records))
-
     episode_indices = np.asarray(
         [_finite_float(_field(record, "episode_index", index), "episode_index", index)
          for index, record in enumerate(records)],
@@ -117,10 +114,6 @@ def plot_training_convergence(
          for index, record in enumerate(records)],
         dtype=np.float64,
     )
-    prefix = np.concatenate(([0.0], np.cumsum(rewards, dtype=np.float64)))
-    moving_average = (prefix[window:] - prefix[:-window]) / float(window)
-    moving_episode_indices = episode_indices[window - 1:]
-
     figure, axis = plt.subplots(figsize=(6.4, 4.2))
     try:
         axis.plot(
@@ -130,12 +123,6 @@ def plot_training_convergence(
             markersize=3.5,
             linewidth=1.2,
             label="Mean System Utility G",
-        )
-        axis.plot(
-            moving_episode_indices,
-            moving_average,
-            linewidth=2.0,
-            label=f"{window}-Episode Moving Average",
         )
         axis.set_title("PPO Training Convergence")
         axis.set_xlabel("Training Episode")
@@ -212,4 +199,3 @@ def plot_execution_location_ratios(
     finally:
         plt.close(figure)
     return output
-

@@ -200,21 +200,27 @@ def execute_slot(
             cache_nodes,
             cache_config,
             profile=configuration_profile,
+            prediction_batch_parallel_workers=(
+                cache_configuration.prediction_batch_parallel_workers(project_cfg)
+            ),
         )
-        configuration = optimize_joint_configuration(
-            previous_cache,
-            previous_uav,
-            cache_trigger,
-            dict(uav_triggers),
-            scenario_slice,
-            local_cache_state,
-            service_catalog,
-            project_cfg,
-            cache_nodes,
-            cache_config,
-            flight_boundary,
-            evaluation_context=evaluation_context,
-        )
+        try:
+            configuration = optimize_joint_configuration(
+                previous_cache,
+                previous_uav,
+                cache_trigger,
+                dict(uav_triggers),
+                scenario_slice,
+                local_cache_state,
+                service_catalog,
+                project_cfg,
+                cache_nodes,
+                cache_config,
+                flight_boundary,
+                evaluation_context=evaluation_context,
+            )
+        finally:
+            cache_configuration.close_prediction_batch_pool(evaluation_context)
     configuration_seconds = (
         time.perf_counter() - configuration_started_at
         if performance_profile is not None

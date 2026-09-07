@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -448,6 +450,10 @@ class ConfigurationEvaluationProfile:
     matching_candidate_evaluations_total: int = 0
     utility_evaluation_seconds: float = 0.0
     matching_seconds: float = 0.0
+    prediction_batch_mode: str = "serial"
+    prediction_batch_workers: int = 1
+    prediction_batch_requested_workers: int = 1
+    batch_results: list[tuple[int, float, int]] = field(default_factory=list)
     source_stats: dict[str, dict[str, int]] = field(
         default_factory=_new_configuration_profile_source_stats
     )
@@ -480,6 +486,21 @@ class SurrogateEvaluationContext:
         default_factory=dict
     )
     profile: ConfigurationEvaluationProfile | None = None
+    base_cache_nodes: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    prediction_batch_parallel_workers: int = field(
+        default=1,
+        repr=False,
+        compare=False,
+    )
+    prediction_batch_runtime: "PredictionBatchRuntime | None" = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -491,6 +512,214 @@ class SurrogateBatch:
     discount: float
     events: tuple[SurrogateEvent, ...]
     vehicle_positions: dict[str, np.ndarray]
+
+
+_PREDICTION_BATCH_WORKER_STATE: dict[str, Any] | None = None
+
+
+def _normalize_prediction_batch_workers(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("prediction batch worker 数必须是正整数。")
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prediction batch worker 数必须是正整数。") from exc
+    if workers != value or workers <= 0:
+        raise ValueError("prediction batch worker 数必须是正整数。")
+    return workers
+
+
+def prediction_batch_parallel_workers(project_cfg: dict[str, Any]) -> int:
+    """读取 prediction batch 的执行 worker 数。
+
+    当前不新增 formal 配置字段，复用已有的 execution-only
+    ``algorithm.ppo.cf_parallel_workers``。外层 CF worker 会由
+    ``PredictionBatchRuntime`` 强制退回单进程，避免 nested multiprocessing。
+    """
+
+    configured = project_config.get_config_value(
+        project_cfg,
+        "algorithm.configuration.prediction_batch_parallel_workers",
+        None,
+    )
+    if configured is None:
+        configured = project_config.get_config_value(
+            project_cfg,
+            "algorithm.ppo.cf_parallel_workers",
+            1,
+        )
+    return _normalize_prediction_batch_workers(configured)
+
+
+@dataclass
+class PredictionBatchRuntime:
+    """Runtime-only holder for one context's reusable prediction batch pool."""
+
+    requested_workers: int
+    effective_workers: int
+    mode: str
+    executor: ProcessPoolExecutor | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    @classmethod
+    def for_batch_count(cls, requested_workers: Any, batch_count: int) -> "PredictionBatchRuntime":
+        requested = _normalize_prediction_batch_workers(requested_workers)
+        # ProcessPoolExecutor cannot be nested safely under the existing CF
+        # worker pool.  All non-MainProcess contexts therefore stay serial.
+        in_child_process = multiprocessing.current_process().name != "MainProcess"
+        if in_child_process or requested <= 1 or int(batch_count) <= 1:
+            return cls(requested, 1, "serial")
+        return cls(requested, min(requested, int(batch_count)), "parallel")
+
+    def bind_profile(self, profile: ConfigurationEvaluationProfile | None) -> None:
+        if profile is None:
+            return
+        profile.prediction_batch_mode = self.mode
+        profile.prediction_batch_workers = self.effective_workers
+        profile.prediction_batch_requested_workers = self.requested_workers
+
+    def ensure_executor(
+        self,
+        context: SurrogateEvaluationContext,
+        config: CacheOptimizationConfig,
+    ) -> ProcessPoolExecutor | None:
+        if self.mode != "parallel":
+            return None
+        if self.executor is None:
+            base_cache_nodes = context.base_cache_nodes
+            if not base_cache_nodes:
+                raise ValueError("prediction batch pool 缺少 base cache nodes。")
+            worker_payload = {
+                "batches": context.batches,
+                "local_cache_state": context.local_cache_state,
+                "matching_project_config": context.matching_project_config,
+                "base_cache_nodes": base_cache_nodes,
+                "config": config,
+            }
+            self.executor = ProcessPoolExecutor(
+                max_workers=self.effective_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_prediction_batch_worker,
+                initargs=(worker_payload,),
+            )
+        return self.executor
+
+    def close(self) -> None:
+        executor = self.executor
+        self.executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The executor is execution-only state and must never be serialized into
+        # a checkpoint, worker payload, or history object.
+        state = dict(self.__dict__)
+        state["executor"] = None
+        return state
+
+
+def _initialize_prediction_batch_worker(worker_payload: dict[str, Any]) -> None:
+    """Initialize one Windows-spawned prediction batch worker."""
+
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except (ImportError, RuntimeError):
+        pass
+    global _PREDICTION_BATCH_WORKER_STATE
+    _PREDICTION_BATCH_WORKER_STATE = worker_payload
+
+
+def _evaluate_prediction_batch(
+    batch: SurrogateBatch,
+    candidate_cache: np.ndarray,
+    cache_nodes: dict[str, Any],
+    uav_position_map: dict[str, np.ndarray],
+    local_cache: dict[str, set[int]],
+    matching_project_config: dict[str, Any],
+    config: CacheOptimizationConfig,
+) -> tuple[float, bool, int]:
+    """Evaluate one prediction batch with the unchanged Matching/KKT path."""
+
+    from decision import task_allocation
+
+    tasks = [
+        task_allocation.Task(
+            task_id=event.tv_id,
+            vehicle_id=event.tv_id,
+            service_id=event.service_id,
+            input_bits=event.input_bits,
+            cpu_cycles=event.cpu_cycles,
+        )
+        for event in batch.events
+    ]
+    service_positions = task_allocation.build_service_node_positions(
+        cache_nodes,
+        batch.vehicle_positions,
+        uav_position_map,
+    )
+    result = task_allocation.optimize_task_matching(
+        tasks,
+        batch.vehicle_positions,
+        service_positions,
+        local_cache,
+        candidate_cache,
+        matching_project_config,
+        cache_nodes,
+        config,
+    )
+    return (
+        float(result.task_utility_sum),
+        bool(result.resource_feasible),
+        int(result.candidate_evaluations_total),
+    )
+
+
+def _prediction_batch_worker_job(
+    job: tuple[int, np.ndarray, tuple[tuple[str, float, float], ...]]
+) -> tuple[int, float, bool, int, float]:
+    """Evaluate one batch in a persistent worker and return compact results."""
+
+    state = _PREDICTION_BATCH_WORKER_STATE
+    if state is None:
+        raise RuntimeError("prediction batch worker 未初始化。")
+    batch_index, candidate_cache, uav_positions = job
+    from decision import uav_configuration
+
+    uav_position_map = {
+        node_id: np.asarray([x_m, y_m], dtype=np.float64)
+        for node_id, x_m, y_m in uav_positions
+    }
+    candidate_nodes = uav_configuration.cache_nodes_with_uav_positions(
+        state["base_cache_nodes"],
+        uav_position_map,
+    )
+    local_cache = {
+        vehicle_id: set(services)
+        for vehicle_id, services in state["local_cache_state"].items()
+    }
+    started_at = time.perf_counter()
+    utility, feasible, candidate_evaluations = _evaluate_prediction_batch(
+        state["batches"][batch_index],
+        candidate_cache,
+        candidate_nodes,
+        uav_position_map,
+        local_cache,
+        state["matching_project_config"],
+        state["config"],
+    )
+    return (
+        int(batch_index),
+        utility,
+        feasible,
+        candidate_evaluations,
+        time.perf_counter() - started_at,
+    )
 
 
 def _matching_project_config(config: CacheOptimizationConfig) -> dict[str, Any]:
@@ -518,6 +747,7 @@ def build_surrogate_evaluation_context(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
     profile: ConfigurationEvaluationProfile | None = None,
+    prediction_batch_parallel_workers: int = 1,
 ) -> SurrogateEvaluationContext:
     """把预测切片整理成与实际执行模型一致的并发任务批次。"""
 
@@ -588,7 +818,7 @@ def build_surrogate_evaluation_context(
 
     node_roles = tuple(str(role) for role in cache_nodes["node_roles"])
     node_ids = tuple(str(node_id) for node_id in cache_nodes["node_ids"])
-    return SurrogateEvaluationContext(
+    context = SurrogateEvaluationContext(
         events=tuple(events),
         batches=tuple(batches),
         num_scenarios=int(num_scenarios),
@@ -600,7 +830,24 @@ def build_surrogate_evaluation_context(
         },
         matching_project_config=_matching_project_config(config),
         profile=profile,
+        base_cache_nodes=cache_nodes,
+        prediction_batch_parallel_workers=_normalize_prediction_batch_workers(
+            prediction_batch_parallel_workers
+        ),
     )
+    context.prediction_batch_runtime = PredictionBatchRuntime.for_batch_count(
+        context.prediction_batch_parallel_workers,
+        len(context.batches),
+    )
+    context.prediction_batch_runtime.bind_profile(profile)
+    return context
+
+
+def close_prediction_batch_pool(context: SurrogateEvaluationContext | None) -> None:
+    """Close one context's execution-only prediction batch pool."""
+
+    if context is not None and context.prediction_batch_runtime is not None:
+        context.prediction_batch_runtime.close()
 
 
 def evaluate_surrogate_context(
@@ -611,9 +858,6 @@ def evaluate_surrogate_context(
     profile_source: str = "joint",
 ) -> float:
     """用实际 Matching/KKT 链评价候选配置的预测效用。"""
-
-    # 局部导入用于避免 cache_configuration 与 task_allocation 的模块级循环依赖。
-    from decision import task_allocation
 
     profile = context.profile
     source_bucket = profile.source_bucket(profile_source) if profile is not None else None
@@ -656,50 +900,67 @@ def evaluate_surrogate_context(
         node_id: np.asarray([x_m, y_m], dtype=np.float64)
         for node_id, x_m, y_m in uav_positions
     }
+    runtime = context.prediction_batch_runtime
+    if runtime is None:
+        runtime = PredictionBatchRuntime.for_batch_count(
+            context.prediction_batch_parallel_workers,
+            len(context.batches),
+        )
+        context.prediction_batch_runtime = runtime
+        runtime.bind_profile(profile)
+
+    executor = runtime.ensure_executor(context, config)
     total = 0.0
-    for batch in context.batches:
+    if executor is None:
+        batch_results = []
+        for batch_index, batch in enumerate(context.batches):
+            matching_started_at = time.perf_counter()
+            result = _evaluate_prediction_batch(
+                batch,
+                candidate_cache,
+                cache_nodes,
+                uav_position_map,
+                local_cache,
+                context.matching_project_config,
+                config,
+            )
+            batch_results.append(
+                (
+                    batch_index,
+                    result[0],
+                    result[1],
+                    result[2],
+                    time.perf_counter() - matching_started_at,
+                )
+            )
+    else:
+        jobs = [
+            (batch_index, candidate_cache, uav_positions)
+            for batch_index in range(len(context.batches))
+        ]
+        # executor.map preserves the original batch order; the parent performs
+        # the floating-point reduction below in that same order.
+        batch_results = list(executor.map(_prediction_batch_worker_job, jobs, chunksize=1))
+
+    for batch_index, raw_utility, resource_feasible, candidate_evaluations, matching_seconds in batch_results:
+        batch = context.batches[batch_index]
         if profile is not None and source_bucket is not None:
             profile.predictive_batch_evaluations += 1
             profile.predictive_matching_calls += 1
+            profile.matching_seconds += float(matching_seconds)
             source_bucket["predictive_batches"] += 1
             source_bucket["matching_calls"] += 1
-        matching_started_at = time.perf_counter() if profile is not None else 0.0
-        tasks = [
-            task_allocation.Task(
-                task_id=event.tv_id,
-                vehicle_id=event.tv_id,
-                service_id=event.service_id,
-                input_bits=event.input_bits,
-                cpu_cycles=event.cpu_cycles,
+            profile.matching_candidate_evaluations_total += int(candidate_evaluations)
+            source_bucket["candidate_evaluations_total"] += int(candidate_evaluations)
+            profile.batch_results.append(
+                (int(batch_index), float(raw_utility), int(candidate_evaluations))
             )
-            for event in batch.events
-        ]
-        service_positions = task_allocation.build_service_node_positions(
-            cache_nodes,
-            batch.vehicle_positions,
-            uav_position_map,
-        )
-        result = task_allocation.optimize_task_matching(
-            tasks,
-            batch.vehicle_positions,
-            service_positions,
-            local_cache,
-            candidate_cache,
-            context.matching_project_config,
-            cache_nodes,
-            config,
-        )
-        if profile is not None and source_bucket is not None:
-            profile.matching_seconds += time.perf_counter() - matching_started_at
-            candidate_evaluations = int(result.candidate_evaluations_total)
-            profile.matching_candidate_evaluations_total += candidate_evaluations
-            source_bucket["candidate_evaluations_total"] += candidate_evaluations
-        if not result.resource_feasible:
+        if not resource_feasible:
             raise AssertionError(
                 "预测配置的实际 Matching/KKT 评价不可行："
                 f"scenario={batch.scenario_index}, horizon={batch.horizon}"
             )
-        total += batch.discount * float(result.task_utility_sum)
+        total += batch.discount * float(raw_utility)
     utility = float(total / max(context.num_scenarios, 1))
     context.configuration_utility_cache[cache_key] = utility
     if profile is not None:
@@ -725,6 +986,8 @@ def print_configuration_profile(profile: ConfigurationEvaluationProfile) -> None
         f"predictive_batches={profile.predictive_batch_evaluations} | "
         f"predictive_matching_calls={profile.predictive_matching_calls} | "
         f"matching_candidate_evals={profile.matching_candidate_evaluations_total} | "
+        f"prediction_batch_mode={profile.prediction_batch_mode} | "
+        f"prediction_batch_workers={profile.prediction_batch_workers} | "
         f"utility_time={profile.utility_evaluation_seconds:.3f}s | "
         f"matching_time={profile.matching_seconds:.3f}s",
         flush=True,
