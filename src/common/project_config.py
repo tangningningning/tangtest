@@ -742,6 +742,66 @@ def validate_config(config: dict[str, Any]) -> None:
         steps = duration / dt_s
         if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
             raise ValueError(f"simulation.{label} 必须是 dt_s 的整数倍。")
+
+    # PPO 只允许一个连续 train 区间和一个紧邻的 held-out test 区间。
+    # 具体边界只从 TOML 读取；这里仅校验区间关系、正式 episode 覆盖范围
+    # 和当前 PPO minibatch 协议，不在代码中复制某个实验的 end index。
+    data_protocol = get_config_value(config, "algorithm.ppo.data_protocol")
+    if not isinstance(data_protocol, dict):
+        raise ValueError("缺少 algorithm.ppo.data_protocol 配置表。")
+    required_origin_keys = (
+        "train_origin_start",
+        "train_origin_end",
+        "test_origin_start",
+        "test_origin_end",
+    )
+    missing_origin_keys = [
+        key for key in required_origin_keys if key not in data_protocol
+    ]
+    if missing_origin_keys:
+        raise ValueError(
+            "algorithm.ppo.data_protocol 缺少边界："
+            f"{', '.join(missing_origin_keys)}"
+        )
+    origin_bounds: dict[str, int] = {}
+    for key in required_origin_keys:
+        value = data_protocol[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"algorithm.ppo.data_protocol.{key} 必须是整数。"
+            )
+        origin_bounds[key] = int(value)
+    train_start = origin_bounds["train_origin_start"]
+    train_end = origin_bounds["train_origin_end"]
+    test_start = origin_bounds["test_origin_start"]
+    test_end = origin_bounds["test_origin_end"]
+    if train_start != 0:
+        raise ValueError(
+            "algorithm.ppo.data_protocol.train_origin_start 必须为正式 origin 的起点0。"
+        )
+    if train_end < train_start:
+        raise ValueError("PPO train origin 区间必须非空且按升序排列。")
+    if test_start != train_end + 1:
+        raise ValueError(
+            "PPO train/test origin 区间必须连续、无重叠且无空洞。"
+        )
+    if test_end < test_start:
+        raise ValueError("PPO test origin 区间必须非空且按升序排列。")
+    formal_origin_count = int(round(episode_s / dt_s))
+    if test_end != formal_origin_count - 1:
+        raise ValueError(
+            "PPO train/test origin 区间必须完整覆盖正式 episode："
+            f"test_origin_end={test_end}, expected={formal_origin_count - 1}。"
+        )
+    train_origin_count = train_end - train_start + 1
+    test_origin_count = test_end - test_start + 1
+    if train_origin_count < ppo_num_minibatches or train_origin_count % ppo_num_minibatches != 0:
+        raise ValueError(
+            "PPO train origin 数量必须为正并可被 algorithm.ppo.num_minibatches 整除："
+            f"count={train_origin_count}, num_minibatches={ppo_num_minibatches}。"
+        )
+    if test_origin_count <= 0:
+        raise ValueError("PPO test origin 数量必须大于0。")
     research_count = int(get_config_value(config, "simulation.num_research_vehicles"))
     service_count = int(get_config_value(config, "simulation.num_service_vehicles"))
     task_count = int(get_config_value(config, "simulation.num_task_vehicles"))

@@ -1970,8 +1970,14 @@ def prepare_aligned_rollout_steps(
     popularity_prediction_file: Path,
     tasks_file: Path,
     trajectory_file: Path,
+    include_bootstrap_step: bool = True,
 ) -> list[AlignedRolloutStep]:
-    """从正式 artifact 构造已对齐 steps；不重新预测/生成场景。"""
+    """从正式 artifact 构造已对齐 steps；不重新预测/生成场景。
+
+    ``include_bootstrap_step`` 保留旧的 truncation bootstrap 语义。正式
+    train/test 区间使用 ``False``，避免为了 bootstrap 读取或执行区间外的
+    actual task/reward。
+    """
 
     if max_steps <= 0:
         raise ValueError("max_steps 必须大于 0。")
@@ -1983,7 +1989,8 @@ def prepare_aligned_rollout_steps(
         raise IndexError("origin_start_index 越界。")
 
     # 多准备一步，用于 rollout truncation bootstrap。
-    stop = min(n_origin, origin_start_index + max_steps + 1)
+    extra_step = 1 if include_bootstrap_step else 0
+    stop = min(n_origin, origin_start_index + max_steps + extra_step)
     steps: list[AlignedRolloutStep] = []
     for origin_index in range(origin_start_index, stop):
         scenario = cache_configuration.scenario_at_origin(scenarios, origin_index)

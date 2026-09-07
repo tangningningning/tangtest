@@ -542,6 +542,14 @@ max_grad_norm = 0.5
 update_epochs = 1
 num_minibatches = 4
 
+[algorithm.ppo.data_protocol]
+# PPO 只使用 train/test 两个 origin 区间；不设置 PPO validation 区间。
+# origin 边界由正式 prediction_scenarios 的 origin index 校验，不能在代码中另写一份。
+train_origin_start = 0
+train_origin_end = 239
+test_origin_start = 240
+test_origin_end = 299
+
 [parameter_status]
 # 参数状态只使用三类：
 # CONFIRMED_DATA：由当前真实生成数据或明确软件设置确定。

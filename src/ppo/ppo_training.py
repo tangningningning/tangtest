@@ -233,18 +233,41 @@ class BoundedTrainingSanityResult:
 
 
 @dataclass(frozen=True)
-class FormalTrainingProtocol:
-    """正式PPO单episode训练协议定义；只描述协议，不执行训练。
+class PPOOriginSplit:
+    """Single source of truth for the PPO train/test origin protocol."""
 
-    当前项目采用 SINGLE-TRACE TRAINING BASELINE：每个训练episode复用同一套
-    SUMO/tasks/prediction artifacts；episode之间 reset C/Q，但 policy、optimizer
-    和训练RNG在同一个training run中持续推进。
+    train_origin_start: int
+    train_origin_end: int
+    test_origin_start: int
+    test_origin_end: int
+
+    @property
+    def train_count(self) -> int:
+        return int(self.train_origin_end - self.train_origin_start + 1)
+
+    @property
+    def test_count(self) -> int:
+        return int(self.test_origin_end - self.test_origin_start + 1)
+
+
+@dataclass(frozen=True)
+class FormalTrainingProtocol:
+    """正式PPO训练/held-out test协议定义；只描述协议，不执行训练。
+
+    每个训练episode只使用配置中的 train origin 区间；held-out test 使用同一
+    artifact 的独立 test origin 区间。两者均在自己的区间内顺序传播 C/Q，
+    test 从与正式训练相同的共同初始 C/Q reset，且不执行 optimizer。
     """
 
+    origin_split: PPOOriginSplit
     episode_origin_indices: np.ndarray
     episode_slots: np.ndarray
     episode_times_s: np.ndarray
+    test_origin_indices: np.ndarray
+    test_slots: np.ndarray
+    test_times_s: np.ndarray
     steps_per_episode: int
+    test_steps_per_evaluation: int
     update_epochs: int
     num_minibatches: int
     minibatch_size: int
@@ -252,6 +275,9 @@ class FormalTrainingProtocol:
     true_terminal_origin: int
     true_terminal_slot: int
     true_terminal_time_s: float
+    test_true_terminal_origin: int
+    test_true_terminal_slot: int
+    test_true_terminal_time_s: float
     single_trace_training: bool
     initial_cache_source: str
     initial_uav_source: str
@@ -268,6 +294,57 @@ class FormalTrainingProtocol:
         return scale
 
 
+def _ppo_origin_split_from_project_config(
+    project_cfg: dict[str, Any],
+    total_origin_count: int | None = None,
+) -> PPOOriginSplit:
+    """读取并严格校验 PPO train/test origin 边界。
+
+    该函数不复制实验边界常量；具体 start/end 全部来自
+    ``algorithm.ppo.data_protocol``。``total_origin_count`` 只用于确认区间
+    覆盖当前 prediction scenario artifact 的完整正式 origin 集合。
+    """
+
+    raw = project_config.get_config_value(project_cfg, "algorithm.ppo.data_protocol")
+    if not isinstance(raw, dict):
+        raise ValueError("缺少 algorithm.ppo.data_protocol 配置表。")
+    keys = (
+        "train_origin_start",
+        "train_origin_end",
+        "test_origin_start",
+        "test_origin_end",
+    )
+    values: dict[str, int] = {}
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"algorithm.ppo.data_protocol.{key} 必须是整数。"
+            )
+        values[key] = int(value)
+    split = PPOOriginSplit(**values)
+    if split.train_origin_start != 0:
+        raise ValueError("PPO train_origin_start 必须为正式 origin 的起点0。")
+    if split.train_origin_end < split.train_origin_start:
+        raise ValueError("PPO train origin 区间必须非空且按升序排列。")
+    if split.test_origin_start != split.train_origin_end + 1:
+        raise ValueError("PPO train/test origin 区间必须连续、无重叠且无空洞。")
+    if split.test_origin_end < split.test_origin_start:
+        raise ValueError("PPO test origin 区间必须非空且按升序排列。")
+    if total_origin_count is not None:
+        total = int(total_origin_count)
+        if total <= 0:
+            raise ValueError("prediction scenario origin 数量必须大于0。")
+        if split.test_origin_end != total - 1:
+            raise ValueError(
+                "PPO train/test origin 区间必须完整覆盖 prediction scenario origins："
+                f"test_end={split.test_origin_end}, expected={total - 1}。"
+            )
+        if split.train_origin_start < 0 or split.test_origin_end >= total:
+            raise ValueError("PPO train/test origin 边界超出 prediction scenario origins。")
+    return split
+
+
 @dataclass(frozen=True)
 class FormalTrainingDryRunResult:
     protocol: FormalTrainingProtocol
@@ -279,7 +356,7 @@ class FormalTrainingDryRunResult:
     formal_rollout_executor_available: bool
     ppo_update_executor_available: bool
     formal_training_api_available: bool
-    deterministic_evaluation_api_available: bool
+    held_out_test_evaluation_api_available: bool
     sample_num_episodes: int
     planned_environment_steps: int
     planned_optimizer_steps: int
@@ -305,6 +382,13 @@ class FormalTrainingDryRunResult:
     gate_cf_samples_per_episode: int = 0
     planned_gate_counterfactual_branch_steps: int = 0
     planned_gate_optimizer_steps: int = 0
+    gate_optimizer_instances_planned: int = 0
+    # Human-readable algorithm identity/semantics for CLI and experiment logs.
+    # This is reporting metadata only; training dispatch continues to use the
+    # existing credit_assignment/method helpers below.
+    algorithm_reporting: dict[str, Any] | None = None
+    planned_total_optimizer_steps: int | None = None
+    planned_total_backward_calls: int | None = None
 
 
 @dataclass(frozen=True)
@@ -600,6 +684,10 @@ class FormalTrainingRunPlan:
     execute: bool
     single_trace_training: bool
     no_default_long_training_budget: bool
+    train_origin_start: int
+    train_origin_end: int
+    test_origin_start: int
+    test_origin_end: int
     credit_assignment: str = ppo_update.LEGACY_CREDIT_ASSIGNMENT
     planned_q_optimizer_steps: int = 0
     planned_q_backward_calls: int = 0
@@ -639,9 +727,13 @@ class FormalTrainingRunResult:
 
 @dataclass(frozen=True)
 class DeterministicEvaluationSummary:
-    """in-trace deterministic evaluation 的episode级指标。"""
+    """held-out test deterministic evaluation 的区间级指标。"""
 
     num_steps: int
+    evaluation_origin_start: int
+    evaluation_origin_end: int
+    evaluation_slot_start: int
+    evaluation_slot_end: int
     cumulative_system_utility: float
     mean_system_utility: float
     cumulative_actual_task_utility: float
@@ -713,6 +805,142 @@ def _is_what_reference_drift_mode(project_cfg: dict[str, Any]) -> bool:
 
 def _is_frozen_batch_family(project_cfg: dict[str, Any]) -> bool:
     return _is_frozen_policy_batch_mode(project_cfg) or _is_reference_drift_mode(project_cfg)
+
+
+def _configured_ppo_method_id(
+    project_cfg: dict[str, Any],
+    credit_assignment: str,
+) -> str:
+    """Resolve the method identity used by dry-run reporting.
+
+    Older configs may omit ``algorithm.ppo.method`` and rely on the
+    credit-assignment fallback.  Keep that fallback aligned with the actual
+    dispatch instead of inventing a V3 method from ``cf_batch_episodes``.
+    """
+
+    configured = project_config.get_config_value(project_cfg, "algorithm.ppo.method")
+    if configured is not None:
+        return str(configured)
+    return {
+        ppo_update.HIERARCHICAL_GATE_CREDIT_ASSIGNMENT: hierarchical_reconfiguration_gate.HIERARCHICAL_GATE_METHOD,
+        ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT: "proposed_per_trigger_q",
+        ppo_update.CENTRALIZED_COUNTERFACTUAL_CREDIT_ASSIGNMENT: "proposed_centralized_cf_q",
+        ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT: "proposed_sparse_direct_cf_ppo",
+    }.get(credit_assignment, "trigger_actor_critic")
+
+
+def _dry_run_algorithm_reporting(
+    project_cfg: dict[str, Any],
+    credit_assignment: str,
+) -> dict[str, Any]:
+    """Return accurate method/optimizer/credit labels without changing dispatch."""
+
+    method_id = _configured_ppo_method_id(project_cfg, credit_assignment)
+    configured_actor_architecture = str(
+        project_config.get_config_value(
+            project_cfg,
+            "algorithm.ppo.actor_architecture",
+            ppo_trigger_policy.LEGACY_SHARED_HEAD_ARCHITECTURE_ID,
+        )
+    )
+
+    if credit_assignment == ppo_update.HIERARCHICAL_GATE_CREDIT_ASSIGNMENT:
+        # The top-level policy is hierarchical; its WHAT sub-policy is the
+        # existing Full Shared Actor.  Report both identities explicitly.
+        return {
+            "method_id": hierarchical_reconfiguration_gate.HIERARCHICAL_GATE_METHOD,
+            "architecture_id": hierarchical_reconfiguration_gate.HIERARCHICAL_GATE_ARCHITECTURE_ID,
+            "actor_architecture_id": ppo_trigger_policy.FULL_SHARED_ACTOR_ARCHITECTURE_ID,
+            "actor_optimizer_mode": "independent_gate_and_what_optimizers",
+            "actor_credit_semantics": (
+                "WHAT Direct-CF A_cf=(a-p_old)*Delta_G; "
+                "Gate PPO A_gate=(g-p_old_gate)*Delta_gate"
+            ),
+            "gate_optimizer_mode": "gate_first_then_what_direct_cf",
+            "gate_credit_semantics": "A_gate=(g-p_old_gate)*Delta_gate",
+            "what_credit_semantics": "A_cf=(a-p_old)*Delta_G",
+            "learned_critic_for_actor_credit": False,
+            "value_loss_in_actor_update": False,
+            "direct_cf_minibatches_per_epoch": 1,
+            "direct_cf_expected_optimizer_steps_per_batch": 1,
+            "direct_cf_uses_scalar_gae_advantage": False,
+        }
+
+    if credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT:
+        actor_architecture = (
+            ppo_trigger_policy.FULL_SHARED_ACTOR_ARCHITECTURE_ID
+            if _is_frozen_batch_family(project_cfg)
+            else configured_actor_architecture
+        )
+        return {
+            "method_id": method_id,
+            "architecture_id": actor_architecture,
+            "actor_architecture_id": actor_architecture,
+            "actor_optimizer_mode": (
+                "actor_only_full_shared_encoder_autoregressive_shared_head_frozen_value"
+                if actor_architecture == ppo_trigger_policy.FULL_SHARED_ACTOR_ARCHITECTURE_ID
+                else "actor_only_trigger_heads_encoder_frozen_autoregressive_value"
+            ),
+            "actor_credit_semantics": "sparse_direct_cf A_cf=(a-p_old)*Delta_G",
+            "gate_optimizer_mode": None,
+            "gate_credit_semantics": None,
+            "what_credit_semantics": "A_cf=(a-p_old)*Delta_G",
+            "learned_critic_for_actor_credit": False,
+            "value_loss_in_actor_update": False,
+            "direct_cf_minibatches_per_epoch": 1,
+            "direct_cf_expected_optimizer_steps_per_batch": 1,
+            "direct_cf_uses_scalar_gae_advantage": False,
+        }
+
+    if credit_assignment == ppo_update.PER_TRIGGER_Q_CREDIT_ASSIGNMENT:
+        return {
+            "method_id": method_id,
+            "architecture_id": configured_actor_architecture,
+            "actor_architecture_id": configured_actor_architecture,
+            "actor_optimizer_mode": "actor_plus_independent_per_trigger_q_optimizer",
+            "actor_credit_semantics": "per_trigger_q_conditional_ppo",
+            "gate_optimizer_mode": None,
+            "gate_credit_semantics": None,
+            "what_credit_semantics": None,
+            "learned_critic_for_actor_credit": True,
+            "value_loss_in_actor_update": None,
+            "direct_cf_minibatches_per_epoch": None,
+            "direct_cf_expected_optimizer_steps_per_batch": None,
+            "direct_cf_uses_scalar_gae_advantage": None,
+        }
+
+    if credit_assignment == ppo_update.CENTRALIZED_COUNTERFACTUAL_CREDIT_ASSIGNMENT:
+        return {
+            "method_id": method_id,
+            "architecture_id": configured_actor_architecture,
+            "actor_architecture_id": configured_actor_architecture,
+            "actor_optimizer_mode": "actor_plus_independent_centralized_q_optimizer",
+            "actor_credit_semantics": "centralized_counterfactual_q",
+            "gate_optimizer_mode": None,
+            "gate_credit_semantics": None,
+            "what_credit_semantics": None,
+            "learned_critic_for_actor_credit": True,
+            "value_loss_in_actor_update": None,
+            "direct_cf_minibatches_per_epoch": None,
+            "direct_cf_expected_optimizer_steps_per_batch": None,
+            "direct_cf_uses_scalar_gae_advantage": None,
+        }
+
+    return {
+        "method_id": method_id,
+        "architecture_id": configured_actor_architecture,
+        "actor_architecture_id": configured_actor_architecture,
+        "actor_optimizer_mode": "legacy_actor_critic_optimizer",
+        "actor_credit_semantics": "legacy_scalar_gae",
+        "gate_optimizer_mode": None,
+        "gate_credit_semantics": None,
+        "what_credit_semantics": None,
+        "learned_critic_for_actor_credit": None,
+        "value_loss_in_actor_update": True,
+        "direct_cf_minibatches_per_epoch": None,
+        "direct_cf_expected_optimizer_steps_per_batch": None,
+        "direct_cf_uses_scalar_gae_advantage": None,
+    }
 
 
 def _cf_batch_episodes(project_cfg: dict[str, Any]) -> int:
@@ -2848,15 +3076,11 @@ def _seed_new_formal_run(seed: int, rng_generator: Any) -> None:
     rng_generator.manual_seed(int(seed))
 
 
-def _build_formal_training_components(
-    ctx: TrainingSanityContext,
-) -> tuple[Any, Any, Any | None, Any | None]:
-    """按当前 mode 构造 Actor/scalar-V 与独立 Q optimizer。"""
+def _build_formal_policy_only(ctx: TrainingSanityContext) -> Any:
+    """按当前配置构造 policy，不创建 optimizer。"""
 
     _require_torch()
-    training_cfg = ppo_update.ppo_training_config_status(ctx.cfg)
-    if not training_cfg.can_run_optimizer_step or training_cfg.learning_rate is None:
-        raise RuntimeError(f"PPO update超参数缺失：{training_cfg.missing_required_for_step}")
+    network_cfg = ppo_trigger_policy.ppo_network_config_from_project(ctx.cfg)
     configured_architecture = str(
         project_config.get_config_value(
             ctx.cfg,
@@ -2864,6 +3088,20 @@ def _build_formal_training_components(
             ppo_trigger_policy.TRIGGER_HEADS_ARCHITECTURE_ID,
         )
     )
+    if _is_hierarchical_gate_mode(ctx.cfg):
+        if configured_architecture != ppo_trigger_policy.FULL_SHARED_ACTOR_ARCHITECTURE_ID:
+            raise RuntimeError(
+                "hierarchical Gate held-out test policy必须使用现有 Full Shared Actor："
+                f"{ppo_trigger_policy.FULL_SHARED_ACTOR_ARCHITECTURE_ID}，"
+                f"当前为{configured_architecture}。"
+            )
+        return hierarchical_reconfiguration_gate.build_hierarchical_policy(
+            ctx.observation_spec.observation_dim,
+            ctx.action_spec,
+            subpolicy_hidden_sizes=tuple(int(value) for value in network_cfg["hidden_sizes"]),
+            autoregressive_hidden_size=int(network_cfg["autoregressive_hidden_size"]),
+        )
+
     policy_class = (
         ppo_trigger_policy.FullSharedActorCritic
         if configured_architecture == ppo_trigger_policy.FULL_SHARED_ACTOR_ARCHITECTURE_ID
@@ -2872,7 +3110,7 @@ def _build_formal_training_components(
     policy = policy_class(
         ctx.observation_spec.observation_dim,
         ctx.action_spec,
-        **ppo_trigger_policy.ppo_network_config_from_project(ctx.cfg),
+        **network_cfg,
     )
     if _is_sparse_direct_cf_mode(ctx.cfg):
         expected_architecture = (
@@ -2886,6 +3124,20 @@ def _build_formal_training_components(
                 f"actor_architecture={expected_architecture}，"
                 f"当前为{configured_architecture}。"
             )
+    return policy
+
+
+def _build_formal_training_components(
+    ctx: TrainingSanityContext,
+) -> tuple[Any, Any, Any | None, Any | None]:
+    """按当前 mode 构造 Actor/scalar-V 与独立 Q optimizer。"""
+
+    _require_torch()
+    training_cfg = ppo_update.ppo_training_config_status(ctx.cfg)
+    if not training_cfg.can_run_optimizer_step or training_cfg.learning_rate is None:
+        raise RuntimeError(f"PPO update超参数缺失：{training_cfg.missing_required_for_step}")
+    policy = _build_formal_policy_only(ctx)
+    if _is_sparse_direct_cf_mode(ctx.cfg):
         actor_parameters = ppo_trigger_policy.sparse_direct_cf_actor_parameters(policy)
         if not actor_parameters:
             raise RuntimeError("sparse_direct_cf Actor optimizer参数为空。")
@@ -2986,6 +3238,20 @@ def _formal_compatibility_metadata(
             "vehicle_ids": list(ctx.observation_spec.vehicle_ids),
         },
         "formal_protocol": {
+            "data_protocol_schema": "ppo_train_test_origin_split_v1",
+            "train_origin_range": [
+                int(protocol.origin_split.train_origin_start),
+                int(protocol.origin_split.train_origin_end),
+            ],
+            "test_origin_range": [
+                int(protocol.origin_split.test_origin_start),
+                int(protocol.origin_split.test_origin_end),
+            ],
+            "train_origin_start": int(protocol.origin_split.train_origin_start),
+            "train_origin_end": int(protocol.origin_split.train_origin_end),
+            "test_origin_start": int(protocol.origin_split.test_origin_start),
+            "test_origin_end": int(protocol.origin_split.test_origin_end),
+            "test_steps_per_evaluation": int(protocol.test_steps_per_evaluation),
             "steps_per_episode": int(protocol.steps_per_episode),
             "first_origin": int(protocol.episode_origin_indices[0]),
             "last_origin": int(protocol.episode_origin_indices[-1]),
@@ -2996,6 +3262,9 @@ def _formal_compatibility_metadata(
             "update_epochs": int(protocol.update_epochs),
             "num_minibatches": int(protocol.num_minibatches),
             "minibatch_size": int(protocol.minibatch_size),
+            "test_true_terminal_origin": int(protocol.test_true_terminal_origin),
+            "test_true_terminal_slot": int(protocol.test_true_terminal_slot),
+            "test_true_terminal_time_s": float(protocol.test_true_terminal_time_s),
         },
         "ppo_hyperparameters": {
             "gamma": float(ctx.gamma),
@@ -4089,10 +4358,17 @@ def _build_context(config_path: str) -> TrainingSanityContext:
     scenarios = cache_configuration.load_prediction_scenarios(
         cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.prediction_scenarios"))
     )
+    origin_split = _ppo_origin_split_from_project_config(
+        cfg,
+        int(scenarios["origin_slots"].shape[0]),
+    )
     service_catalog = cache_configuration.load_service_catalog(
         cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
     )
-    first_origin = cache_configuration.scenario_at_origin(scenarios, 0)
+    first_origin = cache_configuration.scenario_at_origin(
+        scenarios,
+        origin_split.train_origin_start,
+    )
     cache_nodes = cache_configuration.build_cache_nodes(first_origin, cache_cfg)
     local_cache = task_scenario.load_tv_local_cache(
         cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.tv_local_cache"))
@@ -4123,7 +4399,7 @@ def _build_context(config_path: str) -> TrainingSanityContext:
         observation_spec=observation_spec,
         gamma=gamma,
         gae_lambda=gae_lambda,
-        terminal_slot=int(scenarios["origin_slots"][-1]),
+        terminal_slot=int(scenarios["origin_slots"][origin_split.train_origin_end]),
         initial_cache=initial_cache,
         initial_uav=initial_uav,
     )
@@ -4133,19 +4409,40 @@ def build_formal_training_protocol(
     scenarios: dict[str, Any],
     project_cfg: dict[str, Any],
 ) -> FormalTrainingProtocol:
-    """由 prediction_scenarios metadata 构造正式单episode PPO训练协议。
+    """由 prediction_scenarios metadata 构造正式 train/test PPO协议。
 
     纯协议函数：不创建policy、不调用execute_slot、不创建optimizer、不训练。
     """
 
-    origin_indices = np.arange(int(scenarios["origin_slots"].shape[0]), dtype=np.int64)
+    total_origin_count = int(scenarios["origin_slots"].shape[0])
+    origin_split = _ppo_origin_split_from_project_config(
+        project_cfg,
+        total_origin_count,
+    )
+    origin_indices = np.arange(
+        origin_split.train_origin_start,
+        origin_split.train_origin_end + 1,
+        dtype=np.int64,
+    )
     slots = np.asarray(scenarios["origin_slots"], dtype=np.int64)
     times = np.asarray(scenarios["origin_times_s"], dtype=np.float64)
+    test_origin_indices = np.arange(
+        origin_split.test_origin_start,
+        origin_split.test_origin_end + 1,
+        dtype=np.int64,
+    )
+    if slots.shape[0] != total_origin_count or times.shape[0] != total_origin_count:
+        raise ValueError("prediction_scenarios origin_slots/origin_times_s 长度不一致。")
+    if not np.all(np.isfinite(times)):
+        raise ValueError("prediction_scenarios origin_times_s 不能包含 NaN/Inf。")
     steps_per_episode = int(len(origin_indices))
+    test_steps_per_evaluation = int(len(test_origin_indices))
     update_epochs = int(project_config.get_config_value(project_cfg, "algorithm.ppo.update_epochs"))
     num_minibatches = int(project_config.get_config_value(project_cfg, "algorithm.ppo.num_minibatches"))
     if steps_per_episode <= 0:
         raise ValueError("正式episode没有可执行configuration origin。")
+    if test_steps_per_evaluation <= 0:
+        raise ValueError("held-out test没有可执行origin。")
     if steps_per_episode % num_minibatches != 0:
         raise ValueError(
             f"steps_per_episode={steps_per_episode} 不能被 num_minibatches={num_minibatches} 整除。"
@@ -4154,17 +4451,25 @@ def build_formal_training_protocol(
     if minibatch_size <= 0:
         raise ValueError("推导得到的 minibatch_size 必须大于0。")
     return FormalTrainingProtocol(
+        origin_split=origin_split,
         episode_origin_indices=origin_indices,
-        episode_slots=slots,
-        episode_times_s=times,
+        episode_slots=slots[origin_indices],
+        episode_times_s=times[origin_indices],
+        test_origin_indices=test_origin_indices,
+        test_slots=slots[test_origin_indices],
+        test_times_s=times[test_origin_indices],
         steps_per_episode=steps_per_episode,
+        test_steps_per_evaluation=test_steps_per_evaluation,
         update_epochs=update_epochs,
         num_minibatches=num_minibatches,
         minibatch_size=minibatch_size,
         expected_optimizer_steps_per_rollout=update_epochs * num_minibatches,
         true_terminal_origin=int(origin_indices[-1]),
-        true_terminal_slot=int(slots[-1]),
-        true_terminal_time_s=float(times[-1]),
+        true_terminal_slot=int(slots[origin_indices[-1]]),
+        true_terminal_time_s=float(times[origin_indices[-1]]),
+        test_true_terminal_origin=int(test_origin_indices[-1]),
+        test_true_terminal_slot=int(slots[test_origin_indices[-1]]),
+        test_true_terminal_time_s=float(times[test_origin_indices[-1]]),
         single_trace_training=True,
         initial_cache_source=(
             "cache_configuration.popularity_aware_initial_cache(service_catalog, cache_nodes, "
@@ -4173,8 +4478,9 @@ def build_formal_training_protocol(
         initial_uav_source="uav_configuration.initial_uav_positions_from_project(system_config)",
         tv_local_cache_source=str(project_config.get_config_value(project_cfg, "paths.tv_local_cache")),
         evaluation_semantics=(
-            "in-trace deterministic evaluation: deterministic=True, no network update, "
-            "reset C/Q to formal initial state, execute first to last origin, report raw G(t)"
+            "held-out test deterministic evaluation: deterministic=True, torch.no_grad, "
+            "no optimizer, reset C/Q to formal initial state, execute test origin range only, "
+            "report raw G(t)"
         ),
     )
 
@@ -4185,14 +4491,65 @@ def validate_formal_training_protocol(protocol: FormalTrainingProtocol) -> dict[
     origins = protocol.episode_origin_indices
     slots = protocol.episode_slots
     times = protocol.episode_times_s
+    test_origins = protocol.test_origin_indices
+    test_slots = protocol.test_slots
+    test_times = protocol.test_times_s
+    split = protocol.origin_split
     checks = {
-        "origins_contiguous": bool(np.array_equal(origins, np.arange(len(origins), dtype=np.int64))),
+        "origins_contiguous": bool(
+            np.array_equal(
+                origins,
+                np.arange(
+                    split.train_origin_start,
+                    split.train_origin_end + 1,
+                    dtype=np.int64,
+                ),
+            )
+        ),
+        "origins_in_train_range": bool(
+            np.all(
+                (origins >= split.train_origin_start)
+                & (origins <= split.train_origin_end)
+            )
+        ),
+        "test_origins_contiguous": bool(
+            np.array_equal(
+                test_origins,
+                np.arange(
+                    split.test_origin_start,
+                    split.test_origin_end + 1,
+                    dtype=np.int64,
+                ),
+            )
+        ),
+        "test_origins_in_test_range": bool(
+            np.all(
+                (test_origins >= split.test_origin_start)
+                & (test_origins <= split.test_origin_end)
+            )
+        ),
+        "train_step_count_matches_range": bool(
+            protocol.steps_per_episode == split.train_count == len(origins)
+        ),
+        "test_step_count_matches_range": bool(
+            protocol.test_steps_per_evaluation == split.test_count == len(test_origins)
+        ),
+        "train_test_disjoint": bool(set(origins.tolist()).isdisjoint(test_origins.tolist())),
+        "train_test_adjacent": bool(
+            int(origins[-1]) + 1 == int(test_origins[0])
+        ),
         "slots_strictly_increasing": bool(np.all(np.diff(slots) > 0)),
         "times_strictly_increasing": bool(np.all(np.diff(times) > 0.0)),
+        "test_slots_strictly_increasing": bool(np.all(np.diff(test_slots) > 0)),
+        "test_times_strictly_increasing": bool(np.all(np.diff(test_times) > 0.0)),
         "rollout_size_positive": bool(protocol.steps_per_episode > 0),
+        "test_size_positive": bool(protocol.test_steps_per_evaluation > 0),
         "minibatch_divisible": bool(protocol.steps_per_episode % protocol.num_minibatches == 0),
         "minibatch_size_positive": bool(protocol.minibatch_size > 0),
         "true_terminal_is_last_origin": bool(protocol.true_terminal_origin == int(origins[-1])),
+        "test_true_terminal_is_last_origin": bool(
+            protocol.test_true_terminal_origin == int(test_origins[-1])
+        ),
         "middle_origins_not_terminal": bool(np.all(origins[:-1] < protocol.true_terminal_origin)),
         "reset_state_resolved": bool(
             protocol.initial_cache_source
@@ -4214,10 +4571,15 @@ def run_training_dry_run(config_path: str = "system_config.toml") -> FormalTrain
     checks = validate_formal_training_protocol(protocol)
     credit_assignment = ppo_update.credit_assignment_from_project(ctx.cfg)
     credit_phase = (
-        ppo_update.credit_phase_from_project(ctx.cfg)
-        if credit_assignment == ppo_update.CENTRALIZED_COUNTERFACTUAL_CREDIT_ASSIGNMENT
-        else "legacy"
+        ppo_update.HIERARCHICAL_GATE_CREDIT_ASSIGNMENT
+        if credit_assignment == ppo_update.HIERARCHICAL_GATE_CREDIT_ASSIGNMENT
+        else (
+            ppo_update.credit_phase_from_project(ctx.cfg)
+            if credit_assignment == ppo_update.CENTRALIZED_COUNTERFACTUAL_CREDIT_ASSIGNMENT
+            else "legacy"
+        )
     )
+    algorithm_reporting = _dry_run_algorithm_reporting(ctx.cfg, credit_assignment)
     hierarchical_gate_mode = _is_hierarchical_gate_mode(ctx.cfg)
     cf_samples = (
         _cf_samples_per_episode(ctx.cfg)
@@ -4269,12 +4631,14 @@ def run_training_dry_run(config_path: str = "system_config.toml") -> FormalTrain
         formal_rollout_executor_available=callable(collect_formal_episode_rollout),
         ppo_update_executor_available=callable(update_policy_on_rollout),
         formal_training_api_available=callable(run_formal_ppo_training),
-        deterministic_evaluation_api_available=callable(evaluate_formal_episode),
+        held_out_test_evaluation_api_available=callable(evaluate_held_out_test),
         sample_num_episodes=sample_num_episodes,
         planned_environment_steps=sample_num_episodes * protocol.steps_per_episode,
         planned_optimizer_steps=planned_actor_optimizer_steps,
         planned_backward_calls=planned_actor_optimizer_steps,
-        optimizer_instances_planned=(2 if planned_q_optimizer_steps > 0 else 1),
+        optimizer_instances_planned=(
+            2 if planned_q_optimizer_steps > 0 or hierarchical_gate_mode else 1
+        ),
         executor_dry_run_only=True,
         formal_validation=True,
         environment_steps_executed=0,
@@ -4291,7 +4655,7 @@ def run_training_dry_run(config_path: str = "system_config.toml") -> FormalTrain
         cf_samples_per_episode=cf_samples,
         planned_counterfactual_branch_steps=(
             sample_num_episodes * cf_samples * protocol.steps_per_episode
-            if _is_sparse_direct_cf_mode(ctx.cfg)
+            if _is_sparse_direct_cf_mode(ctx.cfg) or hierarchical_gate_mode
             else 0
         ),
         cf_sampling_strategy=cf_sampling_strategy,
@@ -4309,6 +4673,26 @@ def run_training_dry_run(config_path: str = "system_config.toml") -> FormalTrain
         planned_gate_optimizer_steps=(
             planned_actor_optimizer_steps if hierarchical_gate_mode else 0
         ),
+        gate_optimizer_instances_planned=(1 if hierarchical_gate_mode else 0),
+        algorithm_reporting=algorithm_reporting,
+        planned_total_optimizer_steps=(
+            planned_actor_optimizer_steps
+            + planned_q_optimizer_steps
+            + (
+                planned_actor_optimizer_steps
+                if hierarchical_gate_mode
+                else 0
+            )
+        ),
+        planned_total_backward_calls=(
+            planned_actor_optimizer_steps
+            + planned_q_optimizer_steps
+            + (
+                planned_actor_optimizer_steps
+                if hierarchical_gate_mode
+                else 0
+            )
+        ),
     )
 
 
@@ -4316,7 +4700,7 @@ def _formal_aligned_steps(
     ctx: TrainingSanityContext,
     protocol: FormalTrainingProtocol,
 ) -> list[ppo_rollout.AlignedRolloutStep]:
-    """构造完整正式episode输入；只在正式执行器被显式调用时使用。"""
+    """构造 train origin 区间的完整正式episode输入。"""
 
     root = Path(ctx.cfg["_meta"]["project_root"])
     steps = ppo_rollout.prepare_aligned_rollout_steps(
@@ -4328,6 +4712,7 @@ def _formal_aligned_steps(
         root / "data/generated/popularity_predictions.csv",
         root / "data/generated/tasks.csv",
         root / "data/generated/trajectory.csv",
+        include_bootstrap_step=False,
     )
     if len(steps) != protocol.steps_per_episode:
         raise RuntimeError(
@@ -4335,6 +4720,45 @@ def _formal_aligned_steps(
         )
     if int(steps[-1].origin_index) != int(protocol.true_terminal_origin):
         raise RuntimeError("完整episode最后一个origin不是FormalTrainingProtocol定义的true terminal。")
+    expected_origins = protocol.episode_origin_indices.astype(np.int64).tolist()
+    actual_origins = [int(step.origin_index) for step in steps]
+    if actual_origins != expected_origins:
+        raise RuntimeError(
+            "正式训练 aligned steps 越过 train/test 边界："
+            f"expected={expected_origins[0]}..{expected_origins[-1]}, "
+            f"actual={actual_origins[0]}..{actual_origins[-1]}"
+        )
+    return steps
+
+
+def _held_out_test_aligned_steps(
+    ctx: TrainingSanityContext,
+    protocol: FormalTrainingProtocol,
+) -> list[ppo_rollout.AlignedRolloutStep]:
+    """构造 held-out test origin 区间，不加载区间外的 actual task。"""
+
+    root = Path(ctx.cfg["_meta"]["project_root"])
+    steps = ppo_rollout.prepare_aligned_rollout_steps(
+        root,
+        ctx.scenarios,
+        int(protocol.origin_split.test_origin_start),
+        int(protocol.test_steps_per_evaluation),
+        root / "data/generated/vehicle_predictions.csv",
+        root / "data/generated/popularity_predictions.csv",
+        root / "data/generated/tasks.csv",
+        root / "data/generated/trajectory.csv",
+        include_bootstrap_step=False,
+    )
+    expected_origins = protocol.test_origin_indices.astype(np.int64).tolist()
+    actual_origins = [int(step.origin_index) for step in steps]
+    if actual_origins != expected_origins:
+        raise RuntimeError(
+            "held-out test aligned steps 不在 test origin 区间内："
+            f"expected={expected_origins[0]}..{expected_origins[-1]}, "
+            f"actual={actual_origins[0]}..{actual_origins[-1]}"
+        )
+    if int(steps[-1].origin_index) != int(protocol.test_true_terminal_origin):
+        raise RuntimeError("held-out test 最后一个origin不是test true terminal。")
     return steps
 
 
@@ -7058,6 +7482,10 @@ def _build_formal_training_plan(
         execute=bool(execute),
         single_trace_training=bool(protocol.single_trace_training),
         no_default_long_training_budget=True,
+        train_origin_start=int(protocol.origin_split.train_origin_start),
+        train_origin_end=int(protocol.origin_split.train_origin_end),
+        test_origin_start=int(protocol.origin_split.test_origin_start),
+        test_origin_end=int(protocol.origin_split.test_origin_end),
         credit_assignment=credit_assignment,
         planned_q_optimizer_steps=q_steps,
         planned_q_backward_calls=q_steps,
@@ -8148,22 +8576,26 @@ def _execution_location_statistics(
     return dict(counts), ratios
 
 
-def evaluate_formal_episode(
+def evaluate_held_out_test(
     policy: Any,
     ctx: TrainingSanityContext,
     protocol: FormalTrainingProtocol,
 ) -> DeterministicEvaluationSummary:
-    """执行 in-trace deterministic evaluation。
+    """执行独立 held-out test evaluation。
 
-    当前evaluation使用与single-trace training相同的external trace，因此只能称为
-    in-trace deterministic evaluation，不是held-out/generalization evaluation。
-    本函数不计算gradient、不调用optimizer、不更新network；episode开始 reset 到正式 C/Q。
+    只执行 protocol 的 test origin 区间，使用 ``torch.no_grad``，不接收或调用
+    optimizer，也不修改 policy。测试开始 reset 到正式共同初始 C/Q，并在 test
+    区间内顺序传播状态；train origin 的 actual task/reward 不会进入本函数。
 
-    注意：这是正式评估执行器。本阶段CLI dry-run不会调用该函数。
+    注意：这是正式 held-out test 执行器；CLI protocol-check 不会调用环境。
     """
 
     _require_torch()
-    steps = _formal_aligned_steps(ctx, protocol)
+    steps = _held_out_test_aligned_steps(ctx, protocol)
+    policy_state_before = {
+        str(name): value.detach().cpu().clone()
+        for name, value in policy.state_dict().items()
+    }
     previous_cache = np.asarray(ctx.initial_cache, dtype=np.int8).copy()
     previous_uav = {
         str(uav_id): (float(np.asarray(xy)[0]), float(np.asarray(xy)[1]))
@@ -8300,6 +8732,18 @@ def evaluate_formal_episode(
             previous_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
             previous_uav = dict(result.next_uav_positions or {})
 
+    policy_state_after = {
+        str(name): value.detach().cpu()
+        for name, value in policy.state_dict().items()
+    }
+    if set(policy_state_before) != set(policy_state_after) or any(
+        not torch.equal(policy_state_before[name], policy_state_after[name])
+        for name in policy_state_before
+    ):
+        raise AssertionError(
+            "held-out test 不得修改 policy 参数或 buffer；检测到 state_dict 变化。"
+        )
+
     cumulative_g = float(math.fsum(rewards))
     actual_q_sum = float(math.fsum(actual_q_values))
     cache_cost_sum = float(math.fsum(cache_cost_values))
@@ -8341,6 +8785,10 @@ def evaluate_formal_episode(
     )
     return DeterministicEvaluationSummary(
         num_steps=len(rewards),
+        evaluation_origin_start=int(protocol.test_origin_indices[0]),
+        evaluation_origin_end=int(protocol.test_origin_indices[-1]),
+        evaluation_slot_start=int(protocol.test_slots[0]),
+        evaluation_slot_end=int(protocol.test_slots[-1]),
         cumulative_system_utility=cumulative_g,
         mean_system_utility=float(cumulative_g / len(rewards)),
         cumulative_actual_task_utility=float(actual_q_sum),
@@ -8357,16 +8805,98 @@ def evaluate_formal_episode(
         execution_location_ratios=execution_location_ratios,
         all_steps_feasible=all_steps_feasible,
         reward_identity_error=float(identity_error),
-        evaluation_semantics="in-trace deterministic evaluation",
+        evaluation_semantics="held-out test deterministic evaluation",
     )
 
 
-def save_deterministic_evaluation_report(
+def evaluate_formal_episode(
+    policy: Any,
+    ctx: TrainingSanityContext,
+    protocol: FormalTrainingProtocol,
+) -> DeterministicEvaluationSummary:
+    """Compatibility alias; historical callers now execute held-out test only."""
+
+    return evaluate_held_out_test(policy, ctx, protocol)
+
+
+def evaluate_held_out_test_from_checkpoint(
+    checkpoint_path: str | Path,
+    config_path: str = "system_config.toml",
+) -> DeterministicEvaluationSummary:
+    """Load a current-compatible policy and run held-out test only.
+
+    This entrypoint intentionally constructs no optimizer and never calls a
+    training or checkpoint-resume path.  Compatibility is checked against the
+    current action/observation and train/test origin metadata before weights
+    are loaded, so old checkpoints fail closed.
+    """
+
+    _require_torch()
+    ctx = _build_context(config_path)
+    protocol = build_formal_training_protocol(ctx.scenarios, ctx.cfg)
+    validate_formal_training_protocol(protocol)
+    policy = _build_formal_policy_only(ctx)
+    checkpoint = Path(checkpoint_path)
+    if not checkpoint.is_absolute():
+        checkpoint = Path(ctx.cfg["_meta"]["project_root"]) / checkpoint
+    checkpoint = checkpoint.resolve(strict=False)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"held-out test checkpoint不存在：{checkpoint}")
+    try:
+        payload = torch.load(
+            checkpoint,
+            map_location=_policy_device(policy),
+            weights_only=False,
+        )
+    except TypeError:  # pragma: no cover - compatibility with older PyTorch
+        payload = torch.load(checkpoint, map_location=_policy_device(policy))
+    if not isinstance(payload, dict):
+        raise RuntimeError("HELD_OUT_TEST_CHECKPOINT_ERROR: checkpoint顶层必须是dict。")
+    expected_compatibility = _formal_compatibility_metadata(ctx, protocol, policy)
+    actual_compatibility = payload.get("compatibility")
+    mismatch = _metadata_mismatch(
+        expected_compatibility,
+        actual_compatibility,
+        "checkpoint.compatibility",
+    )
+    if mismatch:
+        raise RuntimeError(
+            "CHECKPOINT_COMPATIBILITY_ERROR: held-out test拒绝不匹配checkpoint："
+            f"{mismatch}"
+        )
+    if "policy_state_dict" not in payload:
+        raise RuntimeError("HELD_OUT_TEST_CHECKPOINT_ERROR: checkpoint缺少policy_state_dict。")
+    try:
+        policy.load_state_dict(payload["policy_state_dict"], strict=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"CHECKPOINT_COMPATIBILITY_ERROR: held-out test policy state不兼容：{exc}"
+        ) from exc
+    return evaluate_held_out_test(policy, ctx, protocol)
+
+
+def run_held_out_test_evaluation(
+    checkpoint_path: str | Path,
+    config_path: str = "system_config.toml",
+    report_path: str | Path | None = None,
+) -> DeterministicEvaluationSummary:
+    """Public held-out test entrypoint with optional JSON reporting."""
+
+    summary = evaluate_held_out_test_from_checkpoint(
+        checkpoint_path,
+        config_path,
+    )
+    if report_path is not None:
+        save_held_out_test_report(summary, report_path)
+    return summary
+
+
+def save_held_out_test_report(
     summary: DeterministicEvaluationSummary,
     output_path: str | Path,
     figure_output_path: str | Path | None = None,
 ) -> Path:
-    """保存deterministic evaluation JSON，并在JSON成功后生成Figure 2。
+    """保存 held-out test JSON，并在JSON成功后生成Figure 2。
 
     该函数只消费已经完成的evaluation summary；不会加载checkpoint、执行环境、
     采样动作或修改policy。绘图失败只发出warning，已保存的evaluation JSON
@@ -8375,7 +8905,7 @@ def save_deterministic_evaluation_report(
 
     output = Path(output_path)
     if output.suffix.lower() != ".json":
-        raise ValueError("deterministic evaluation report必须输出为.json。")
+        raise ValueError("held-out test report必须输出为.json。")
     expected_counts, expected_ratios = _execution_location_statistics(
         summary.execution_location_task_counts,
         summary.arrived_task_count,
@@ -8389,7 +8919,7 @@ def save_deterministic_evaluation_report(
         )
         for location in EXECUTION_LOCATION_ORDER
     ):
-        raise ValueError("deterministic evaluation execution location reporting不一致。")
+        raise ValueError("held-out test execution location reporting不一致。")
     _atomic_json_save(summary_to_builtin(summary), output)
 
     figure_path = (
@@ -8403,31 +8933,44 @@ def save_deterministic_evaluation_report(
         plot_execution_location_ratios(summary.execution_location_ratios, figure_path)
     except Exception as exc:  # JSON已落盘，reporting故障不回滚evaluation
         warnings.warn(
-            f"DETERMINISTIC_EXECUTION_LOCATION_PLOT_FAILED: {exc}",
+            f"HELD_OUT_TEST_EXECUTION_LOCATION_PLOT_FAILED: {exc}",
             RuntimeWarning,
             stacklevel=2,
         )
     return output
 
 
-def evaluate_formal_episode_with_trigger_diagnostics(
+def save_deterministic_evaluation_report(
+    summary: DeterministicEvaluationSummary,
+    output_path: str | Path,
+    figure_output_path: str | Path | None = None,
+) -> Path:
+    """Compatibility alias for :func:`save_held_out_test_report`."""
+
+    return save_held_out_test_report(summary, output_path, figure_output_path)
+
+
+def evaluate_held_out_test_with_trigger_diagnostics(
     policy: Any,
     ctx: TrainingSanityContext,
     protocol: FormalTrainingProtocol,
 ) -> tuple[DeterministicEvaluationSummary, list[dict[str, Any]]]:
-    """在原始deterministic evaluation上附加轻量Trigger概率记录。
+    """在 held-out test evaluation 上附加轻量 Trigger 概率记录。
 
     该reporting wrapper不复制evaluation loop，也不改变policy action、action mask、
     environment执行或状态传播；它只记录原``sample_action()``返回的概率、logit、
-    deterministic action和mask，随后仍由``evaluate_formal_episode()``完成正式执行。
+    deterministic action和mask，随后仍由``evaluate_held_out_test()``完成正式执行。
     """
 
-    steps = _formal_aligned_steps(ctx, protocol)
+    steps = _held_out_test_aligned_steps(ctx, protocol)
     captured_samples: list[dict[str, Any]] = []
 
     class _TriggerSampleCapture:
         def __init__(self, wrapped_policy: Any) -> None:
             self.wrapped_policy = wrapped_policy
+
+        def state_dict(self) -> Any:
+            return self.wrapped_policy.state_dict()
 
         def sample_action(self, *args: Any, **kwargs: Any) -> Any:
             if not bool(kwargs.get("deterministic", False)):
@@ -8447,7 +8990,7 @@ def evaluate_formal_episode_with_trigger_diagnostics(
             )
             return sample
 
-    summary = evaluate_formal_episode(_TriggerSampleCapture(policy), ctx, protocol)
+    summary = evaluate_held_out_test(_TriggerSampleCapture(policy), ctx, protocol)
     if len(captured_samples) != len(steps):
         raise RuntimeError(
             "trigger probability diagnostic 记录数量与formal deterministic steps不一致："
@@ -8498,6 +9041,16 @@ def evaluate_formal_episode_with_trigger_diagnostics(
             }
         )
     return summary, trajectory
+
+
+def evaluate_formal_episode_with_trigger_diagnostics(
+    policy: Any,
+    ctx: TrainingSanityContext,
+    protocol: FormalTrainingProtocol,
+) -> tuple[DeterministicEvaluationSummary, list[dict[str, Any]]]:
+    """Compatibility alias for held-out test trigger diagnostics."""
+
+    return evaluate_held_out_test_with_trigger_diagnostics(policy, ctx, protocol)
 
 
 def _aligned_steps(ctx: TrainingSanityContext, origin_start_index: int) -> list[ppo_rollout.AlignedRolloutStep]:
@@ -8661,6 +9214,8 @@ def _normalized_xy(xy: Any, boundary: tuple[float, float, float, float]) -> np.n
 def _run_once(config_path: str) -> BoundedTrainingSanityResult:
     _require_torch()
     ctx = _build_context(config_path)
+    protocol = build_formal_training_protocol(ctx.scenarios, ctx.cfg)
+    protocol_checks = validate_formal_training_protocol(protocol)
     training_cfg = ppo_update.ppo_training_config_status(ctx.cfg)
     if not training_cfg.can_run_optimizer_step:
         raise RuntimeError("PPO update 超参数缺失，不能执行 bounded sanity。")
@@ -8685,7 +9240,7 @@ def _run_once(config_path: str) -> BoundedTrainingSanityResult:
     batch1, rollout1 = _collect_rollout(
         policy,
         ctx,
-        0,
+        int(protocol.episode_origin_indices[0]),
         ctx.initial_cache,
         ctx.initial_uav,
         policy_version,
@@ -8762,7 +9317,7 @@ def _run_once(config_path: str) -> BoundedTrainingSanityResult:
         rollout_2_first_uav_matches_rollout_1_final=uav_continuity,
         reward_is_system_utility=True,
         repeated_bounded_sanity_deterministic=None,
-        formal_validation=True,
+        formal_validation=bool(all(protocol_checks.values())),
         blocker="",
     )
 
@@ -8866,6 +9421,7 @@ def _summary(result: BoundedTrainingSanityResult) -> dict[str, Any]:
 
 def _dry_run_summary(result: FormalTrainingDryRunResult) -> dict[str, Any]:
     protocol = result.protocol
+    algorithm_reporting = result.algorithm_reporting or {}
     formal_training_signature = inspect.signature(run_formal_ppo_training)
     num_episodes_parameter = formal_training_signature.parameters["num_episodes"]
     return {
@@ -8875,7 +9431,7 @@ def _dry_run_summary(result: FormalTrainingDryRunResult) -> dict[str, Any]:
         "formal_rollout_executor_available": result.formal_rollout_executor_available,
         "ppo_update_executor_available": result.ppo_update_executor_available,
         "formal_training_api_available": result.formal_training_api_available,
-        "deterministic_evaluation_api_available": result.deterministic_evaluation_api_available,
+        "held_out_test_evaluation_api_available": result.held_out_test_evaluation_api_available,
         "run_formal_ppo_training_num_episodes_required": (
             num_episodes_parameter.default is inspect.Parameter.empty
         ),
@@ -8884,6 +9440,12 @@ def _dry_run_summary(result: FormalTrainingDryRunResult) -> dict[str, Any]:
         "planned_environment_steps": result.planned_environment_steps,
         "planned_optimizer_steps": result.planned_optimizer_steps,
         "planned_backward_calls": result.planned_backward_calls,
+        "planned_total_optimizer_steps": result.planned_total_optimizer_steps,
+        "planned_total_backward_calls": result.planned_total_backward_calls,
+        "optimizer_plan_semantics": (
+            "planned_optimizer_steps/planned_backward_calls are Actor-side counts; "
+            "component and total counts are reported separately"
+        ),
         "optimizer_instances_planned": result.optimizer_instances_planned,
         "credit_assignment": result.credit_assignment,
         "credit_phase": result.credit_phase,
@@ -8896,41 +9458,60 @@ def _dry_run_summary(result: FormalTrainingDryRunResult) -> dict[str, Any]:
         "cf_batch_episodes": result.cf_batch_episodes,
         "cf_sampling_strategy": result.cf_sampling_strategy,
         "planned_counterfactual_branch_steps": result.planned_counterfactual_branch_steps,
-        "actor_optimizer_mode": (
-            "actor_only_full_shared_encoder_autoregressive_shared_head_frozen_value"
-            if result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
-            else "legacy_or_configured_mode"
+        "gate_cf_samples_per_episode": result.gate_cf_samples_per_episode,
+        "planned_gate_counterfactual_branch_steps": result.planned_gate_counterfactual_branch_steps,
+        "planned_gate_optimizer_steps": result.planned_gate_optimizer_steps,
+        "gate_optimizer_instances_planned": result.gate_optimizer_instances_planned,
+        "method_id": algorithm_reporting.get("method_id"),
+        "architecture_id": algorithm_reporting.get("architecture_id"),
+        "actor_architecture_id": algorithm_reporting.get("actor_architecture_id"),
+        "actor_optimizer_mode": algorithm_reporting.get("actor_optimizer_mode"),
+        "actor_credit_semantics": algorithm_reporting.get("actor_credit_semantics"),
+        "gate_optimizer_mode": algorithm_reporting.get("gate_optimizer_mode"),
+        "gate_credit_semantics": algorithm_reporting.get("gate_credit_semantics"),
+        "what_credit_semantics": algorithm_reporting.get("what_credit_semantics"),
+        "learned_critic_for_actor_credit": algorithm_reporting.get(
+            "learned_critic_for_actor_credit"
         ),
-        "method_id": "proposed_sparse_direct_cf_frozen_policy_batch"
-        if result.cf_batch_episodes > 1
-        else None,
-        "architecture_id": (
-            ppo_trigger_policy.FULL_SHARED_ACTOR_ARCHITECTURE_ID
-            if result.cf_batch_episodes > 1
-            else None
+        "value_loss_in_actor_update": algorithm_reporting.get(
+            "value_loss_in_actor_update"
         ),
-        "learned_critic_for_actor_credit": (
-            False
-            if result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
-            else None
-        ),
-        "value_loss_in_actor_update": (
-            False
-            if result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
-            else None
-        ),
-        "direct_cf_minibatches_per_epoch": (
-            1
-            if result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
-            else None
+        "direct_cf_minibatches_per_epoch": algorithm_reporting.get(
+            "direct_cf_minibatches_per_epoch"
         ),
         "direct_cf_expected_optimizer_steps_per_episode": (
-            (int(protocol.update_epochs) if result.cf_batch_episodes == 1 else 0)
-            if result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
-            else None
+            int(protocol.update_epochs)
+            if (
+                result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
+                and result.cf_batch_episodes == 1
+            )
+            else (
+                0
+                if result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT
+                else None
+            )
         ),
-        "direct_cf_uses_scalar_gae_advantage": False if result.credit_assignment == ppo_update.SPARSE_DIRECT_CF_CREDIT_ASSIGNMENT else None,
+        "direct_cf_expected_optimizer_steps_per_batch": algorithm_reporting.get(
+            "direct_cf_expected_optimizer_steps_per_batch"
+        ),
+        "direct_cf_uses_scalar_gae_advantage": algorithm_reporting.get(
+            "direct_cf_uses_scalar_gae_advantage"
+        ),
         "executor_dry_run_only": result.executor_dry_run_only,
+        "data_protocol": {
+            "schema": "ppo_train_test_origin_split_v1",
+            "train_origin_range": [
+                int(protocol.origin_split.train_origin_start),
+                int(protocol.origin_split.train_origin_end),
+            ],
+            "test_origin_range": [
+                int(protocol.origin_split.test_origin_start),
+                int(protocol.origin_split.test_origin_end),
+            ],
+            "train_steps_per_episode": int(protocol.steps_per_episode),
+            "test_steps_per_evaluation": int(protocol.test_steps_per_evaluation),
+            "validation_origin_range": None,
+        },
         "episode_origin_count": int(protocol.steps_per_episode),
         "first_origin": int(protocol.episode_origin_indices[0]),
         "last_origin": int(protocol.episode_origin_indices[-1]),
@@ -8947,6 +9528,9 @@ def _dry_run_summary(result: FormalTrainingDryRunResult) -> dict[str, Any]:
         "true_terminal_origin": int(protocol.true_terminal_origin),
         "true_terminal_slot": int(protocol.true_terminal_slot),
         "true_terminal_time_s": float(protocol.true_terminal_time_s),
+        "test_true_terminal_origin": int(protocol.test_true_terminal_origin),
+        "test_true_terminal_slot": int(protocol.test_true_terminal_slot),
+        "test_true_terminal_time_s": float(protocol.test_true_terminal_time_s),
         "single_trace_training": bool(protocol.single_trace_training),
         "initial_cache_source": protocol.initial_cache_source,
         "initial_uav_source": protocol.initial_uav_source,
@@ -8988,6 +9572,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Execute formal PPO training; requires --episodes and --run-dir.",
     )
+    mode_group.add_argument(
+        "--held-out-test",
+        "--test-eval",
+        dest="held_out_test",
+        action="store_true",
+        help="Run read-only held-out test on --checkpoint using origins from the configured test range.",
+    )
+    mode_group.add_argument(
+        "--protocol-check",
+        action="store_true",
+        help="Validate the configured train/test protocol without training or environment execution.",
+    )
     parser.add_argument(
         "--episodes",
         type=_positive_episode_count,
@@ -9002,6 +9598,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume formal training from --run-dir; --episodes is the target total episode count.",
     )
+    parser.add_argument(
+        "--checkpoint",
+        help="Current-compatible policy checkpoint for --held-out-test.",
+    )
+    parser.add_argument(
+        "--test-report",
+        help="Optional JSON output path for --held-out-test; no checkpoint/history is written.",
+    )
     parser.add_argument("--skip-repeat-check", action="store_true")
     return parser
 
@@ -9009,6 +9613,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.held_out_test:
+        if not args.checkpoint:
+            parser.error("--held-out-test 必须同时提供 --checkpoint PATH。")
+        if args.episodes is not None or args.run_dir or args.resume or args.skip_repeat_check:
+            parser.error("--held-out-test 只接受 --config、--checkpoint 和可选 --test-report。")
+        summary = run_held_out_test_evaluation(
+            args.checkpoint,
+            config_path=args.config,
+            report_path=args.test_report,
+        )
+        output = summary_to_builtin(summary)
+        if args.test_report:
+            output["report_path"] = str(Path(args.test_report).resolve())
+        print(json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False))
+        return 0
+
+    if args.checkpoint or args.test_report:
+        parser.error("--checkpoint/--test-report 仅适用于 --held-out-test。")
     if args.formal_train:
         if args.episodes is None:
             parser.error("--formal-train 必须同时提供 --episodes N，且 N > 0。")
@@ -9032,6 +9654,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--episodes 仅适用于 --formal-train。")
     if args.run_dir:
         parser.error("--run-dir 仅适用于 --formal-train。")
+    if args.protocol_check:
+        result = run_training_dry_run(args.config)
+        print(json.dumps(_dry_run_summary(result), ensure_ascii=False, indent=2))
+        return 0
     if args.bounded_sanity:
         result = run_bounded_training_sanity(args.config, repeat_check=not args.skip_repeat_check)
         print(json.dumps(_summary(result), ensure_ascii=False, indent=2))

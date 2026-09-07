@@ -2,7 +2,7 @@
   "schema_version": 1,
   "generated_at_utc": "2026-09-06T09:37:46.254563+00:00",
   "config_source": "system_config.toml",
-  "config_sha256": "6f3587f4b583748047bc67dde5014569f2e365baaef3c1d8fc354b389249b5e0",
+  "config_sha256": "79d11b7fee839874a7e061512a7ac1c1edb2fa007a5c2b7acea9701a6e02a74d",
   "vehicles": {
     "research": 25,
     "SV": 5,
@@ -25,9 +25,9 @@
   ],
   "cache_capacity": {
     "TV": 5581.583441571016,
-    "SV": 16744.750324713044,
+    "SV": 16744.750324713048,
     "RSU": 44652.66753256813,
-    "UAV": 33489.50064942609
+    "UAV": 33489.500649426096
   },
   "service_catalog_total_mb": 111631.6688314203,
   "configuration": {
@@ -72,9 +72,9 @@
     },
     "cache_capacity_mb": {
       "TV": 5581.583441571016,
-      "SV": 16744.750324713044,
+      "SV": 16744.750324713048,
       "RSU": 44652.66753256813,
-      "UAV": 33489.50064942609
+      "UAV": 33489.500649426096
     },
     "compute": {
       "TV": 1000000000.0,
