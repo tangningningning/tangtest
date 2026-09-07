@@ -624,13 +624,6 @@ class PredictionBatchRuntime:
 def _initialize_prediction_batch_worker(worker_payload: dict[str, Any]) -> None:
     """Initialize one Windows-spawned prediction batch worker."""
 
-    try:
-        import torch
-
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-    except (ImportError, RuntimeError):
-        pass
     global _PREDICTION_BATCH_WORKER_STATE
     _PREDICTION_BATCH_WORKER_STATE = worker_payload
 
