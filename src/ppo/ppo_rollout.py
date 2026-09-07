@@ -258,6 +258,17 @@ class _CFSuffixBaselineBatch:
 _CF_WORKER_STATE: dict[str, Any] | None = None
 
 
+def _record_cf_execution_status(
+    status: dict[str, Any] | None,
+    *,
+    mode: str,
+    workers: int,
+) -> None:
+    if status is not None:
+        status.clear()
+        status.update({"mode": str(mode), "workers": int(workers)})
+
+
 class GateCFReservoir:
     """Uniform sparse reservoir over legal formal slots.
 
@@ -922,6 +933,7 @@ def _run_cf_process_pool(
     collection_policy_version: int,
     episode_index: int,
     parallel_workers: int,
+    execution_status: dict[str, Any] | None = None,
     direct_total_seen: int = 0,
     direct_trigger_free_counts: tuple[int, ...] = (),
     direct_sampling_weights: tuple[float, ...] = (),
@@ -930,9 +942,11 @@ def _run_cf_process_pool(
 
     workers = _normalize_cf_parallel_workers(parallel_workers)
     if workers <= 1 or len(snapshots) <= 1:
+        _record_cf_execution_status(execution_status, mode="serial", workers=1)
         return None
     policy_spec = _cf_policy_worker_spec(policy)
     if policy_spec is None:
+        _record_cf_execution_status(execution_status, mode="serial", workers=1)
         return None
     if stage not in {"direct", "gate"}:
         raise ValueError(f"未知 CF parallel stage：{stage}")
@@ -958,6 +972,7 @@ def _run_cf_process_pool(
         "direct_sampling_weights": tuple(float(value) for value in direct_sampling_weights),
     }
     worker_count = min(workers, len(snapshots))
+    _record_cf_execution_status(execution_status, mode="parallel", workers=worker_count)
     caller_rng_state = capture_direct_cf_rng_state()
     try:
         mp_context = multiprocessing.get_context("spawn")
@@ -1766,6 +1781,7 @@ def run_direct_cf_branches(
     collection_policy_version: int = 0,
     episode_index: int = 0,
     cf_parallel_workers: int = 1,
+    execution_status: dict[str, Any] | None = None,
 ) -> list[DirectCFCreditSample]:
     """执行 selected FREE decisions 的 same-state frozen-old-policy continuation。
 
@@ -1814,6 +1830,7 @@ def run_direct_cf_branches(
         collection_policy_version=collection_policy_version,
         episode_index=episode_index,
         parallel_workers=cf_parallel_workers,
+        execution_status=execution_status,
         direct_total_seen=int(reservoir.total_seen),
         direct_trigger_free_counts=reservoir.trigger_free_counts,
         direct_sampling_weights=tuple(
@@ -2014,6 +2031,7 @@ def run_gate_cf_branches(
     collection_policy_version: int = 0,
     episode_index: int = 0,
     cf_parallel_workers: int = 1,
+    execution_status: dict[str, Any] | None = None,
 ) -> list[Any]:
     """Run the formal Gate Joint-Null paired branches.
 
@@ -2060,6 +2078,7 @@ def run_gate_cf_branches(
         collection_policy_version=collection_policy_version,
         episode_index=episode_index,
         parallel_workers=cf_parallel_workers,
+        execution_status=execution_status,
     )
     if parallel_samples is not None:
         return [sample for sample in parallel_samples]
@@ -2233,12 +2252,6 @@ def run_gate_cf_branches(
                         "slot": int(snapshot.slot),
                         "origin_index": int(snapshot.origin_index),
                         "baseline_gate_action": int(snapshot.gate_action),
-                        "config_target_step_rng_aligned": bool(
-                            target_rng_aligned.get("CONFIG", False)
-                        ),
-                        "null_target_step_rng_aligned": bool(
-                            target_rng_aligned.get("NULL", False)
-                        ),
                     },
                 )
             finally:
@@ -2250,6 +2263,12 @@ def run_gate_cf_branches(
                 {
                     "config_branch_environment_steps": int(config_return.environment_steps),
                     "null_branch_environment_steps": int(null_return.environment_steps),
+                    "config_target_step_rng_aligned": bool(
+                        target_rng_aligned.get("CONFIG", False)
+                    ),
+                    "null_target_step_rng_aligned": bool(
+                        target_rng_aligned.get("NULL", False)
+                    ),
                 }
             )
             delta_q = float(config_return.return_q - null_return.return_q)

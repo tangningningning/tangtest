@@ -6488,6 +6488,10 @@ def _hierarchical_gate_formal_training(
         collection_policy_version = int(policy_version)
         batch_id = int(episode_index // HIERARCHICAL_GATE_CF_BATCH_EPISODES + 1)
         batch_episode_index = int(episode_index % HIERARCHICAL_GATE_CF_BATCH_EPISODES + 1)
+        print(
+            f"[PPO] episode {episode_index + 1}/{num_episodes} start",
+            flush=True,
+        )
         causal_artifacts.persist_episode_start_artifact(
             run_dir=formal_run_dir,
             episode=episode_index + 1,
@@ -6515,6 +6519,7 @@ def _hierarchical_gate_formal_training(
             HIERARCHICAL_GATE_CF_SAMPLES_PER_EPISODE,
             gate_sampling_rng,
         )
+        rollout_start_time = time.perf_counter()
         batch = collect_formal_episode_rollout(
             policy,
             ctx,
@@ -6528,12 +6533,13 @@ def _hierarchical_gate_formal_training(
         raw_stats = _formal_raw_rollout_statistics(batch)
         print(
             f"[PPO] episode {episode_index + 1}/{num_episodes} rollout done | "
-            f"steps={len(batch.transitions)} | time={time.perf_counter() - episode_start_time:.1f}s",
+            f"steps={len(batch.transitions)} | time={time.perf_counter() - rollout_start_time:.1f}s",
             flush=True,
         )
         if gate_cf_reservoir.sample_count != HIERARCHICAL_GATE_CF_SAMPLES_PER_EPISODE:
             raise RuntimeError("hierarchical Gate每个formal episode必须选出8个Gate-CF slots。")
         gate_cf_start_time = time.perf_counter()
+        gate_cf_execution_status: dict[str, Any] = {}
         gate_cf_samples = ppo_rollout.run_gate_cf_branches(
             policy,
             gate_cf_reservoir,
@@ -6551,6 +6557,7 @@ def _hierarchical_gate_formal_training(
             collection_policy_version=collection_policy_version,
             episode_index=episode_index,
             cf_parallel_workers=cf_parallel_workers,
+            execution_status=gate_cf_execution_status,
         )
         if len(gate_cf_samples) != HIERARCHICAL_GATE_CF_SAMPLES_PER_EPISODE:
             raise RuntimeError("hierarchical Gate-CF branch数量必须为8。")
@@ -6560,12 +6567,14 @@ def _hierarchical_gate_formal_training(
             raise RuntimeError("hierarchical Gate-CF collection_policy_version写入不一致。")
         print(
             f"[PPO] episode {episode_index + 1}/{num_episodes} Gate-CF done | "
-            f"samples={len(gate_cf_samples)} | workers={min(cf_parallel_workers, len(gate_cf_samples))} | "
+            f"samples={len(gate_cf_samples)} | mode={gate_cf_execution_status.get('mode', 'serial')} | "
+            f"workers={int(gate_cf_execution_status.get('workers', 1))} | "
             f"time={time.perf_counter() - gate_cf_start_time:.1f}s",
             flush=True,
         )
 
         direct_cf_start_time = time.perf_counter()
+        direct_cf_execution_status: dict[str, Any] = {}
         direct_cf_samples = ppo_rollout.run_direct_cf_branches(
             policy,
             direct_cf_reservoir,
@@ -6583,6 +6592,7 @@ def _hierarchical_gate_formal_training(
             collection_policy_version=collection_policy_version,
             episode_index=episode_index,
             cf_parallel_workers=cf_parallel_workers,
+            execution_status=direct_cf_execution_status,
         )
         if len(direct_cf_samples) != direct_cf_reservoir.sample_count:
             raise RuntimeError("hierarchical WHAT Direct-CF branch数量与reservoir不一致。")
@@ -6596,7 +6606,8 @@ def _hierarchical_gate_formal_training(
             raise AssertionError("hierarchical WHAT Direct-CF Delta identity失败。")
         print(
             f"[PPO] episode {episode_index + 1}/{num_episodes} WHAT Direct-CF done | "
-            f"samples={len(direct_cf_samples)} | workers={min(cf_parallel_workers, len(direct_cf_samples))} | "
+            f"samples={len(direct_cf_samples)} | mode={direct_cf_execution_status.get('mode', 'serial')} | "
+            f"workers={int(direct_cf_execution_status.get('workers', 1))} | "
             f"time={time.perf_counter() - direct_cf_start_time:.1f}s",
             flush=True,
         )
