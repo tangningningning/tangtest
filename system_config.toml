@@ -166,13 +166,13 @@ cpu_cycles_per_s = 1.0e9
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
-# 参数状态：provisional system-scale implementation calibration。
-# SV 触发固定配置成本 eta_ca；不是文献直接物理常数。
-# 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定控制成本。
+# 参数状态：EXPERIMENT_DESIGN。
+# SV 触发固定配置成本 eta_ca；不是文献直接物理常数或实测能耗。
+# 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
 eta_ca = 0.20
-# 参数状态：system-scale implementation baseline；xi_ca 仍需独立校准。
-# SV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
-# 当前项目不把 xi_ca 解释为严格 Joule/MB。
+# 参数状态：EXPERIMENT_DESIGN。
+# SV 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
+# 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
 xi_ca = 1.0e-3
 # Legacy compatibility parameter.
 # 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
@@ -193,12 +193,13 @@ cpu_cycles_per_s = 5.0e9
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
-# 参数状态：provisional system-scale implementation calibration。
-# RSU 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数。
+# 参数状态：EXPERIMENT_DESIGN。
+# RSU 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数或实测能耗。
+# 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
 eta_ca = 0.10
-# 参数状态：system-scale implementation baseline；xi_ca 仍需独立校准。
-# RSU 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
-# 当前项目不把 xi_ca 解释为严格 Joule/MB。
+# 参数状态：EXPERIMENT_DESIGN。
+# RSU 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
+# 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
 xi_ca = 0.7e-3
 # Legacy compatibility parameter.
 # 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
@@ -233,13 +234,14 @@ cpu_cycles_per_s = 5.0e9
 # 因此 10 MHz 直接换算为 10.0e6 Hz。
 # 这是文献校准实验基线，不代表硬件实测值。
 bandwidth_hz = 10.0e6
-# 参数状态：provisional system-scale implementation calibration。
-# 依据 representative dry-run、sequential validation、300-slot continuous validation
-# 和 targeted causal validation；不是文献直接物理常数。
+# 参数状态：EXPERIMENT_DESIGN。
+# UAV 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数或实测能耗。
+# 该值是固定系统目标设计成本；已有 validation 只作为行为可执行性证据，
+# 不将其解释为独立物理能耗标定。
 eta_ca = 0.15
-# 参数状态：system-scale implementation baseline；xi_ca 仍需独立校准。
-# UAV 每 MB 新加载服务对应的等效 cache loading coefficient，单位 cost/MB。
-# 当前项目不把 xi_ca 解释为严格 Joule/MB。
+# 参数状态：EXPERIMENT_DESIGN。
+# UAV 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
+# 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
 xi_ca = 1.2e-3
 # Legacy compatibility parameter.
 # 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
@@ -262,7 +264,7 @@ max_horizontal_speed_mps = 15.0
 min_safety_distance_m = 10.0
 
 [nodes.uav.movement]
-# 参数状态：literature rotor-model equivalent mapping。
+# 参数状态：LITERATURE_DERIVED；literature rotor-model equivalent mapping。
 # 等效单位水平移动距离能耗，单位 J/m。
 # Li et al., DOI 10.1186/s13638-020-01861-8，Table 1 给出旋翼 UAV 功率模型参数，
 # 但论文并未直接给出“15 J/m”作为物理常数。
@@ -270,10 +272,9 @@ min_safety_distance_m = 10.0
 # 因此在代表速度 V_ref=15m/s 处按 Li et al. 旋翼功率模型计算
 # P(15)/15 ≈ 14.73 J/m，并取整为 15 J/m 作为线性等效系数。
 movement_energy_coefficient_j_per_m = 15.0
-# 参数状态：provisional system-scale implementation calibration。
-# 依据 sequential movement audit、300-slot continuous validation
-# 和 UAV targeted causal validation；不是文献直接物理常数。
-# 该成本保持 state-dependent，不强制每 slot 移动。
+# 参数状态：EXPERIMENT_DESIGN。
+# 人为设定的 UAV actual reconfiguration fixed penalty；不是文献直接物理常数。
+# 该成本保持 state-dependent，不强制每 slot 移动；已有 train-only probe 仅用于尺度核对。
 movement_fixed_cost = 0.00176
 
 [nodes.cloud]
@@ -359,7 +360,8 @@ noise_power_w = 3.16227766e-13
 uplink_rate_bps = 200.0e6
 
 [cache]
-# cache surrogate 的 horizon 折扣 beta。PROVISIONAL。
+# Cache/UAV prediction/configuration surrogate 的 horizon 折扣 beta；
+# 这是 ALGORITHM_DESIGN 参数，不属于用户确认的 system-model 物理合同。
 discount_beta = 0.95
 # 正式 episode 初始 cache 使用 uniform feasible initialization。
 knapsack_initialization = "uniform_feasible"
@@ -381,17 +383,24 @@ omega_delay = 0.6
 # 该值属于 experiment-design baseline，不是硬件物理常数或 confirmed data。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_energy = 0.4
-# 参数状态：provisional system-scale implementation calibration；不是文献直接物理常数。
+# 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
 # Cache 配置成本权重 lambda_cache，是系统目标函数中唯一的 lambda^ca 入口。
-# 该参数不是文献直接给出的物理常数。
-# 它依据当前真实任务数据、已校准 T_ref/E_ref、
-# normal-slot aggregate utility 尺度进行定标。
-# 主实验以典型单节点配置动作约占 normal-slot utility 约 10% 作为中心尺度。
-# 后续通过 5%/10%/20% 成本敏感性实验检查算法对配置成本强度的鲁棒性。
+# 它只把 cache loading energy 映射为 objective cost，
+# 用于人为控制 reconfiguration energy 相对于 task utility 的惩罚尺度。
+# 当前 0.1 是固定的 objective trade-off baseline，不声称为 physical 或 literature calibration。
+# 既有配置说明曾把典型单节点配置动作约占 normal-slot utility 约 10% 作为设计假设；
+# 本轮将其明确为 experiment-design interpretation，不使用 accepted action 反向选择它。
+# 后续正式实验只做 one-factor-at-a-time 的 0.5x/1x/2x sensitivity；本轮不运行。
+# 正成本口径：C_ca = eta_ca*z_actual + lambda_cache*xi_ca*loaded_mb；
+# C_q = eta_q*z_q_actual + lambda_movement*xi_mov*distance；
+# G = Q - C_ca - C_q；负号只出现在 G 中，不写入 C_ca/C_q。
 lambda_cache = 0.1
-# 参数状态：provisional system-scale implementation calibration；不是文献直接物理常数。
-# 依据 sequential movement audit、300-slot continuous validation
-# 和 UAV targeted causal validation；不是文献直接物理常数。
+# 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
+# 它只把 UAV movement energy 映射为 objective cost，
+# 用于人为控制 movement energy 相对于 task utility 的惩罚尺度。
+# 当前 1.76e-5 是固定的 objective trade-off baseline，不声称为 physical 或 literature calibration。
+# 不使用 accepted movement 或 optimizer 最终位置反向选择它；后续正式实验只做
+# one-factor-at-a-time 的 0.5x/1x/2x sensitivity，本轮不运行。
 lambda_movement = 1.76e-5
 # T_ref/E_ref 采用正式 train origins（slot 0..239）中 arrival=1 任务在 TV local CPU
 # 上的 P95 尺度；test origins（slot 240..299）不参与参考值拟合。
@@ -562,6 +571,8 @@ test_origin_end = 299
 # CONFIRMED_DATA：由当前真实生成数据或明确软件设置确定。
 # TRAIN_ONLY_CALIBRATION：严格由 train origins 派生，可复现但不使用 test 数据。
 # EXPERIMENT_DESIGN：实验设计选择，不是数据或文献物理常数。
+# ALGORITHM_DESIGN：预测/配置算法的设计参数，不属于 system-model 物理合同。
+# LITERATURE_DERIVED：由明确文献模型推导的等效参数；不是文献直接测量或直接表格常数。
 # PROVISIONAL_IMPLEMENTATION：当前为实现连通性/系统尺度校准，正式实验前仍需校准。
 # TODO_LITERATURE_CALIBRATION：当前没有可靠依据，正式实验前必须补充文献/模型依据。
 "simulation.dt_s" = "CONFIRMED_DATA"
@@ -598,13 +609,13 @@ test_origin_end = 299
 "nodes.sv.cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.rsu.cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.uav.cache_capacity_mb" = "CONFIRMED_DATA"
-"nodes.sv.eta_ca" = "PROVISIONAL_IMPLEMENTATION"
-"nodes.rsu.eta_ca" = "PROVISIONAL_IMPLEMENTATION"
-"nodes.uav.eta_ca" = "PROVISIONAL_IMPLEMENTATION"
-"nodes.sv.xi_ca" = "PROVISIONAL_IMPLEMENTATION"
-"nodes.rsu.xi_ca" = "PROVISIONAL_IMPLEMENTATION"
-"nodes.uav.xi_ca" = "PROVISIONAL_IMPLEMENTATION"
-"cache.discount_beta" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.sv.eta_ca" = "EXPERIMENT_DESIGN"
+"nodes.rsu.eta_ca" = "EXPERIMENT_DESIGN"
+"nodes.uav.eta_ca" = "EXPERIMENT_DESIGN"
+"nodes.sv.xi_ca" = "EXPERIMENT_DESIGN"
+"nodes.rsu.xi_ca" = "EXPERIMENT_DESIGN"
+"nodes.uav.xi_ca" = "EXPERIMENT_DESIGN"
+"cache.discount_beta" = "ALGORITHM_DESIGN"
 "nodes.vehicle.local_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.vehicle.local_cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.vehicle.kappa" = "CONFIRMED_DATA"
@@ -628,8 +639,8 @@ test_origin_end = 299
 "nodes.uav.deployment_altitude_m" = "CONFIRMED_DATA"
 "nodes.uav.max_horizontal_speed_mps" = "CONFIRMED_DATA"
 "nodes.uav.min_safety_distance_m" = "CONFIRMED_DATA"
-"nodes.uav.movement.movement_energy_coefficient_j_per_m" = "PROVISIONAL_IMPLEMENTATION"
-"nodes.uav.movement.movement_fixed_cost" = "PROVISIONAL_IMPLEMENTATION"
+"nodes.uav.movement.movement_energy_coefficient_j_per_m" = "LITERATURE_DERIVED"
+"nodes.uav.movement.movement_fixed_cost" = "EXPERIMENT_DESIGN"
 "communication.ground.channel_gain_at_1m" = "CONFIRMED_DATA"
 "communication.ground.pathloss_exponent" = "CONFIRMED_DATA"
 "communication.ground.bandwidth_hz" = "CONFIRMED_DATA"
@@ -644,7 +655,7 @@ test_origin_end = 299
 "communication.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
 "objective.omega_delay" = "EXPERIMENT_DESIGN"
 "objective.omega_energy" = "EXPERIMENT_DESIGN"
-"objective.lambda_cache" = "PROVISIONAL_IMPLEMENTATION"
-"objective.lambda_movement" = "PROVISIONAL_IMPLEMENTATION"
+"objective.lambda_cache" = "EXPERIMENT_DESIGN"
+"objective.lambda_movement" = "EXPERIMENT_DESIGN"
 "objective.T_ref" = "TRAIN_ONLY_CALIBRATION"
 "objective.E_ref" = "TRAIN_ONLY_CALIBRATION"

@@ -19,7 +19,7 @@ import argparse
 import csv
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -161,6 +161,7 @@ def evaluate_matching_candidate(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    kkt_cache: KKTResourceAllocationCache | None = None,
 ) -> KKTMatchingEvaluation:
     """薄 adapter：Matching层 LOCAL:v -> KKT层 LOCAL。"""
 
@@ -172,6 +173,7 @@ def evaluate_matching_candidate(
         project_cfg,
         cache_nodes,
         cache_config,
+        kkt_cache=kkt_cache,
     )
 
 
@@ -225,6 +227,7 @@ def enumerate_best_operation(
     tolerance: float,
     evaluate_only: bool = False,
     evaluation_mode: str = "incremental",
+    kkt_cache: KKTResourceAllocationCache | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
     """枚举全部合法transfer/exchange，返回本轮最大增益候选。"""
 
@@ -257,6 +260,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    kkt_cache=kkt_cache,
                 )
             else:
                 evaluation = evaluate_matching_candidate_incremental(
@@ -270,6 +274,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    kkt_cache=kkt_cache,
                 )
             stats["candidate_evaluations_total"] += 1
             stats["transfer_candidates_evaluated"] += 1
@@ -311,6 +316,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    kkt_cache=kkt_cache,
                 )
             else:
                 evaluation = evaluate_matching_candidate_incremental(
@@ -324,6 +330,7 @@ def enumerate_best_operation(
                     project_cfg,
                     cache_nodes,
                     cache_config,
+                    kkt_cache=kkt_cache,
                 )
             stats["candidate_evaluations_total"] += 1
             stats["exchange_candidates_evaluated"] += 1
@@ -441,6 +448,7 @@ def optimize_task_matching(
         task.task_id: feasible_targets[task.task_id][0]
         for task in tasks
     }
+    kkt_cache = KKTResourceAllocationCache()
     current_eval = evaluate_matching_candidate(
         tasks,
         current_matching,
@@ -449,6 +457,7 @@ def optimize_task_matching(
         project_cfg,
         cache_nodes,
         cache_config,
+        kkt_cache=kkt_cache,
     )
     if not current_eval.resource_feasible:
         raise AssertionError("Cloud门控后的初始matching应资源可行。")
@@ -479,6 +488,7 @@ def optimize_task_matching(
             cache_config,
             tolerance,
             evaluation_mode=evaluation_mode,
+            kkt_cache=kkt_cache,
         )
         for key, value in stats.items():
             counters[key] += value
@@ -521,6 +531,7 @@ def optimize_task_matching(
             tolerance,
             evaluate_only=True,
             evaluation_mode=evaluation_mode,
+            kkt_cache=kkt_cache,
         )
         # 复检也是候选评价的一部分，便于复杂度记录。
         for key, value in check_stats.items():
@@ -980,6 +991,44 @@ class KKTResourceAllocationResult:
     bandwidth_multipliers: dict[str, float]
 
 
+def _kkt_node_cache_key(
+    node_id: str,
+    node_tasks: list[Task],
+) -> tuple[str, tuple[str, ...]]:
+    return (
+        str(node_id),
+        tuple(sorted((str(task.task_id) for task in node_tasks), key=_stable_id_key)),
+    )
+
+
+@dataclass
+class KKTResourceAllocationCache:
+    """Exact node-level KKT cache scoped to one Matching optimization."""
+
+    entries: dict[tuple[str, tuple[str, ...]], KKTResourceAllocationResult] = field(
+        default_factory=dict
+    )
+    requests: int = 0
+    hits: int = 0
+    misses: int = 0
+
+    def get_or_compute(
+        self,
+        node_id: str,
+        node_tasks: list[Task],
+        compute: Any,
+    ) -> KKTResourceAllocationResult:
+        key = _kkt_node_cache_key(node_id, node_tasks)
+        self.requests += 1
+        if key in self.entries:
+            self.hits += 1
+            return self.entries[key]
+        self.misses += 1
+        result = compute()
+        self.entries[key] = result
+        return result
+
+
 @dataclass(frozen=True)
 class KKTMatchingEvaluation:
     resource_feasible: bool
@@ -1215,6 +1264,7 @@ def allocate_resources_kkt(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    kkt_cache: KKTResourceAllocationCache | None = None,
 ) -> KKTResourceAllocationResult:
     """给定 matching 后，只为 edge 节点分配 KKT 的 w/b。"""
 
@@ -1228,62 +1278,84 @@ def allocate_resources_kkt(
     bw_nu: dict[str, float] = {}
 
     for node_id, node_tasks in grouped.items():
-        role = _edge_node_role(node_id, cache_nodes)
-        assert role is not None
-        n = len(node_tasks)
-        if kkt_cfg.min_cpu_fraction * n > 1.0:
-            return KKTResourceAllocationResult(False, f"{node_id} CPU epsilon infeasible", {}, {}, {}, {}, {}, {})
-        if kkt_cfg.min_bandwidth_fraction * n > 1.0:
-            return KKTResourceAllocationResult(False, f"{node_id} bandwidth epsilon infeasible", {}, {}, {}, {}, {}, {})
-        node_cpu = _node_cpu(role, cache_config)
-        cpu_coeff = [
-            cache_config.omega_t * task.cpu_cycles / (cache_config.time_ref_s * node_cpu)
-            for task in node_tasks
-        ]
-        cpu_values, mu, ok, reason = solve_kkt_fraction_allocation(
-            cpu_coeff,
-            kkt_cfg.min_cpu_fraction,
-            kkt_cfg.bisection_tolerance,
-            kkt_cfg.max_bisection_iterations,
-        )
-        if not ok:
-            return KKTResourceAllocationResult(False, f"{node_id} CPU infeasible: {reason}", {}, {}, {}, {}, {}, {})
-
-        bw_coeff = []
-        for task in node_tasks:
-            tv_xy = vehicle_positions[task.vehicle_id]
-            node_xy = service_node_positions[node_id]
-            base_rate = _base_rate(role, tv_xy, node_xy, cache_config)
-            if base_rate <= 0.0:
-                return KKTResourceAllocationResult(False, f"{node_id} base rate <= 0", {}, {}, {}, {}, {}, {})
-            # bandwidth_loss_coefficient = D/Rbar * (omega_T/T_ref + omega_E*p/E_ref)
-            bw_coeff.append(
-                task.input_bits
-                / base_rate
-                * (
-                    cache_config.omega_t / cache_config.time_ref_s
-                    + cache_config.omega_e * cache_config.tx_power_w / cache_config.energy_ref_j
-                )
+        def compute_node_result() -> KKTResourceAllocationResult:
+            role = _edge_node_role(node_id, cache_nodes)
+            assert role is not None
+            n = len(node_tasks)
+            if kkt_cfg.min_cpu_fraction * n > 1.0:
+                return KKTResourceAllocationResult(False, f"{node_id} CPU epsilon infeasible", {}, {}, {}, {}, {}, {})
+            if kkt_cfg.min_bandwidth_fraction * n > 1.0:
+                return KKTResourceAllocationResult(False, f"{node_id} bandwidth epsilon infeasible", {}, {}, {}, {}, {}, {})
+            node_cpu = _node_cpu(role, cache_config)
+            cpu_coeff = [
+                cache_config.omega_t * task.cpu_cycles / (cache_config.time_ref_s * node_cpu)
+                for task in node_tasks
+            ]
+            cpu_values, mu, ok, reason = solve_kkt_fraction_allocation(
+                cpu_coeff,
+                kkt_cfg.min_cpu_fraction,
+                kkt_cfg.bisection_tolerance,
+                kkt_cfg.max_bisection_iterations,
             )
-        bw_values, nu, ok, reason = solve_kkt_fraction_allocation(
-            bw_coeff,
-            kkt_cfg.min_bandwidth_fraction,
-            kkt_cfg.bisection_tolerance,
-            kkt_cfg.max_bisection_iterations,
-        )
-        if not ok:
-            return KKTResourceAllocationResult(False, f"{node_id} bandwidth infeasible: {reason}", {}, {}, {}, {}, {}, {})
+            if not ok:
+                return KKTResourceAllocationResult(False, f"{node_id} CPU infeasible: {reason}", {}, {}, {}, {}, {}, {})
 
-        cpu_alloc[node_id] = {
-            task.task_id: float(value) for task, value in zip(node_tasks, cpu_values)
-        }
-        bw_alloc[node_id] = {
-            task.task_id: float(value) for task, value in zip(node_tasks, bw_values)
-        }
-        cpu_sums[node_id] = float(sum(cpu_values))
-        bw_sums[node_id] = float(sum(bw_values))
-        cpu_mu[node_id] = float(mu)
-        bw_nu[node_id] = float(nu)
+            bw_coeff = []
+            for task in node_tasks:
+                tv_xy = vehicle_positions[task.vehicle_id]
+                node_xy = service_node_positions[node_id]
+                base_rate = _base_rate(role, tv_xy, node_xy, cache_config)
+                if base_rate <= 0.0:
+                    return KKTResourceAllocationResult(False, f"{node_id} base rate <= 0", {}, {}, {}, {}, {}, {})
+                # bandwidth_loss_coefficient = D/Rbar * (omega_T/T_ref + omega_E*p/E_ref)
+                bw_coeff.append(
+                    task.input_bits
+                    / base_rate
+                    * (
+                        cache_config.omega_t / cache_config.time_ref_s
+                        + cache_config.omega_e * cache_config.tx_power_w / cache_config.energy_ref_j
+                    )
+                )
+            bw_values, nu, ok, reason = solve_kkt_fraction_allocation(
+                bw_coeff,
+                kkt_cfg.min_bandwidth_fraction,
+                kkt_cfg.bisection_tolerance,
+                kkt_cfg.max_bisection_iterations,
+            )
+            if not ok:
+                return KKTResourceAllocationResult(False, f"{node_id} bandwidth infeasible: {reason}", {}, {}, {}, {}, {}, {})
+
+            return KKTResourceAllocationResult(
+                True,
+                "",
+                {
+                    node_id: {
+                        task.task_id: float(value) for task, value in zip(node_tasks, cpu_values)
+                    }
+                },
+                {
+                    node_id: {
+                        task.task_id: float(value) for task, value in zip(node_tasks, bw_values)
+                    }
+                },
+                {node_id: float(sum(cpu_values))},
+                {node_id: float(sum(bw_values))},
+                {node_id: float(mu)},
+                {node_id: float(nu)},
+            )
+
+        if kkt_cache is None:
+            node_result = compute_node_result()
+        else:
+            node_result = kkt_cache.get_or_compute(node_id, node_tasks, compute_node_result)
+        if not node_result.feasible:
+            return node_result
+        cpu_alloc.update(node_result.cpu_allocations)
+        bw_alloc.update(node_result.bandwidth_allocations)
+        cpu_sums.update(node_result.per_node_cpu_sum)
+        bw_sums.update(node_result.per_node_bandwidth_sum)
+        cpu_mu.update(node_result.cpu_multipliers)
+        bw_nu.update(node_result.bandwidth_multipliers)
 
     # Cloud uses fixed per-task resources and is intentionally absent from the
     # SV/RSU/UAV KKT allocation maps and fraction constraints.
@@ -1308,6 +1380,7 @@ def evaluate_matching_with_kkt(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    kkt_cache: KKTResourceAllocationCache | None = None,
 ) -> KKTMatchingEvaluation:
     """评价当前 slot 的 matching、KKT 资源、完成时延和车辆能耗。"""
 
@@ -1321,6 +1394,7 @@ def evaluate_matching_with_kkt(
         project_cfg,
         cache_nodes,
         cache_config,
+        kkt_cache=kkt_cache,
     )
     if not allocation.feasible:
         return KKTMatchingEvaluation(
@@ -1428,6 +1502,7 @@ def evaluate_matching_candidate_incremental(
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    kkt_cache: KKTResourceAllocationCache | None = None,
 ) -> KKTMatchingEvaluation:
     """只重算 candidate 受影响 edge nodes，返回完整 KKT matching evaluation。"""
 
@@ -1516,6 +1591,7 @@ def evaluate_matching_candidate_incremental(
             project_cfg,
             cache_nodes,
             cache_config,
+            kkt_cache=kkt_cache,
         )
         if not node_evaluation.resource_feasible:
             return infeasible(
@@ -1548,6 +1624,7 @@ def evaluate_matching_candidate_incremental(
             project_cfg,
             cache_nodes,
             cache_config,
+            kkt_cache=kkt_cache,
         )
         if not non_edge_evaluation.resource_feasible:
             return infeasible(

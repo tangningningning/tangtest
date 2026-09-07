@@ -287,6 +287,8 @@ def list_unresolved_parameters(config: dict[str, Any]) -> dict[str, str]:
         "CONFIRMED_DATA",
         "TRAIN_ONLY_CALIBRATION",
         "EXPERIMENT_DESIGN",
+        "ALGORITHM_DESIGN",
+        "LITERATURE_DERIVED",
         "PROVISIONAL_IMPLEMENTATION",
         "TODO_LITERATURE_CALIBRATION",
     }
@@ -963,6 +965,8 @@ def validate_config(config: dict[str, Any]) -> None:
             "CONFIRMED_DATA",
             "TRAIN_ONLY_CALIBRATION",
             "EXPERIMENT_DESIGN",
+            "ALGORITHM_DESIGN",
+            "LITERATURE_DERIVED",
             "PROVISIONAL_IMPLEMENTATION",
             "TODO_LITERATURE_CALIBRATION",
         }:
