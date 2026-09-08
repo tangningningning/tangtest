@@ -14,9 +14,10 @@ import argparse
 import json
 import math
 import multiprocessing
+import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -515,6 +516,20 @@ class SurrogateBatch:
 
 
 _PREDICTION_BATCH_WORKER_STATE: dict[str, Any] | None = None
+_PREDICTION_WORKER_THREAD_ENV = (
+    ("OPENBLAS_NUM_THREADS", "1"),
+    ("OMP_NUM_THREADS", "1"),
+    ("MKL_NUM_THREADS", "1"),
+    ("NUMEXPR_NUM_THREADS", "1"),
+    ("BLIS_NUM_THREADS", "1"),
+)
+
+
+def _configure_prediction_worker_thread_environment() -> None:
+    """Set inherited BLAS/OpenMP limits before Windows spawn starts workers."""
+
+    for name, value in _PREDICTION_WORKER_THREAD_ENV:
+        os.environ[name] = value
 
 
 def _normalize_prediction_batch_workers(value: Any) -> int:
@@ -599,6 +614,7 @@ class PredictionBatchRuntime:
                 "base_cache_nodes": base_cache_nodes,
                 "config": config,
             }
+            _configure_prediction_worker_thread_environment()
             self.executor = ProcessPoolExecutor(
                 max_workers=self.effective_workers,
                 mp_context=multiprocessing.get_context("spawn"),
@@ -612,6 +628,14 @@ class PredictionBatchRuntime:
         self.executor = None
         if executor is not None:
             executor.shutdown(wait=True)
+
+    def abort(self) -> None:
+        """Break a failed pool without waiting for unfinished worker jobs."""
+
+        executor = self.executor
+        self.executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def __getstate__(self) -> dict[str, Any]:
         # The executor is execution-only state and must never be serialized into
@@ -931,9 +955,49 @@ def evaluate_surrogate_context(
             (batch_index, candidate_cache, uav_positions)
             for batch_index in range(len(context.batches))
         ]
-        # executor.map preserves the original batch order; the parent performs
-        # the floating-point reduction below in that same order.
-        batch_results = list(executor.map(_prediction_batch_worker_job, jobs, chunksize=1))
+        futures = []
+        try:
+            futures = [
+                executor.submit(_prediction_batch_worker_job, job)
+                for job in jobs
+            ]
+            done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+            failed = next(
+                (
+                    future
+                    for future in done
+                    if not future.cancelled() and future.exception() is not None
+                ),
+                None,
+            )
+            if failed is not None:
+                for future in futures:
+                    future.cancel()
+                runtime.abort()
+                try:
+                    failed.result()
+                except BaseException as exc:
+                    raise RuntimeError(
+                        "PREDICTION_BATCH_WORKER_FAILED: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                raise RuntimeError(
+                    "PREDICTION_BATCH_WORKER_FAILED: prediction worker future failed."
+                )
+            # Keep the original batch order for the existing deterministic
+            # floating-point reduction, regardless of completion order.
+            batch_results = [future.result() for future in futures]
+        except RuntimeError:
+            runtime.abort()
+            raise
+        except BaseException as exc:
+            for future in futures:
+                future.cancel()
+            runtime.abort()
+            raise RuntimeError(
+                "PREDICTION_BATCH_WORKER_FAILED: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     for batch_index, raw_utility, resource_feasible, candidate_evaluations, matching_seconds in batch_results:
         batch = context.batches[batch_index]
@@ -1171,7 +1235,13 @@ def _finalize_cache_candidate_profiles(
     cache_trigger: np.ndarray,
     config: CacheOptimizationConfig,
 ) -> None:
-    """Attach actual update flags and enforce trigger permission semantics."""
+    """Attach final update flags and enforce trigger permission semantics.
+
+    Candidate diagnostics may contain a positive gain relative to an earlier
+    reference state even when the candidate was not accepted against the
+    current coordinate-search objective.  Therefore those diagnostics do not
+    imply that the final node state must differ from ``previous_cache``.
+    """
 
     actual = np.any(final_cache != previous_cache, axis=1).astype(np.int8)
     for node_id, diagnostic in diagnostics.items():
@@ -1182,14 +1252,6 @@ def _finalize_cache_candidate_profiles(
         if actual_update > int(cache_trigger[node_index]):
             raise AssertionError(
                 f"cache node {node_id} actual update exceeds requested trigger"
-            )
-        if (
-            int(cache_trigger[node_index]) == 1
-            and actual_update == 0
-            and float(diagnostic["best_delta_objective"]) > config.tolerance
-        ):
-            raise AssertionError(
-                f"cache node {node_id} has a positive feasible candidate gain but no actual update"
             )
 
 
