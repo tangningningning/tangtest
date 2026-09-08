@@ -51,6 +51,15 @@ class TransferExchangeMatchingResult:
     exchange_candidates_evaluated: int
     resource_infeasible_candidates: int
     feasibility_rejected_without_kkt: int
+    candidate_definitions_total: int
+    upper_bound_screen_calls: int
+    upper_bound_pruned_candidates: int
+    transfer_upper_bound_pruned: int
+    exchange_upper_bound_pruned: int
+    full_evaluator_calls: int
+    kkt_cache_requests: int
+    kkt_cache_hits: int
+    kkt_cache_misses: int
     stop_reason: str
     transfer_exchange_stable: bool
     stable_check_passed: bool
@@ -214,6 +223,40 @@ def _better_candidate(
     return current_best
 
 
+def _candidate_impact_scope(
+    tasks: list[Task],
+    current_kkt: dict[str, str],
+    candidate_kkt: dict[str, str],
+    affected_task_ids: list[str],
+    cache_nodes: dict[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Return the exact affected edge nodes and impacted task IDs.
+
+    This is shared by strict candidate screening and the incremental evaluator;
+    the scope must include every task sharing a current or candidate edge node.
+    """
+
+    affected_edge_nodes: set[str] = set()
+    for task_id in affected_task_ids:
+        for target in (current_kkt[task_id], candidate_kkt[task_id]):
+            if target == CLOUD:
+                # Cloud resources are fixed per task and do not couple unrelated
+                # Cloud tasks in the formal model.
+                continue
+            if target != LOCAL:
+                _edge_node_role(target, cache_nodes)
+                affected_edge_nodes.add(target)
+
+    impacted_task_ids = set(affected_task_ids)
+    for task in tasks:
+        if (
+            current_kkt[task.task_id] in affected_edge_nodes
+            or candidate_kkt[task.task_id] in affected_edge_nodes
+        ):
+            impacted_task_ids.add(task.task_id)
+    return affected_edge_nodes, impacted_task_ids
+
+
 def enumerate_best_operation(
     tasks: list[Task],
     current_matching: dict[str, str],
@@ -229,20 +272,62 @@ def enumerate_best_operation(
     evaluation_mode: str = "incremental",
     kkt_cache: KKTResourceAllocationCache | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
-    """枚举全部合法transfer/exchange，返回本轮最大增益候选。"""
+    """枚举全部合法 transfer/exchange，返回本轮最大增益候选。
+
+    Candidate generation and semantic selection remain in the original order.
+    In incremental mode, exact evaluation is scheduled separately: every
+    candidate is first assigned the existing strict ideal-resource upper bound,
+    the largest-bound candidate establishes an exact incumbent, and only then
+    are candidates that cannot beat that incumbent evaluated. Exact results
+    are replayed through ``_better_candidate`` in generator order so the
+    operation-key tie break remains unchanged.
+    """
 
     if evaluation_mode not in {"full", "incremental"}:
         raise ValueError(f"未知 Matching candidate evaluation mode：{evaluation_mode}")
     task_ids = _sorted_ids([task.task_id for task in tasks])
     stats = {
+        "candidate_definitions_total": 0,
         "candidate_evaluations_total": 0,
         "transfer_candidates_evaluated": 0,
         "exchange_candidates_evaluated": 0,
         "resource_infeasible_candidates": 0,
         "feasibility_rejected_without_kkt": 0,
+        "upper_bound_screen_calls": 0,
+        "upper_bound_pruned_candidates": 0,
+        "transfer_upper_bound_pruned": 0,
+        "exchange_upper_bound_pruned": 0,
+        "full_evaluator_calls": 0,
     }
-    best: dict[str, Any] | None = None
-    max_delta = float("-inf")
+    current_kkt = (
+        _to_kkt_matching(current_matching)
+        if evaluation_mode == "incremental"
+        else None
+    )
+
+    candidate_metadata: list[dict[str, Any]] = []
+    original_index = 0
+
+    def append_candidate(
+        operation_type: str,
+        affected_tasks: list[str],
+        old_targets: list[str],
+        new_targets: list[str],
+        candidate_matching: dict[str, str],
+    ) -> None:
+        nonlocal original_index
+        candidate_metadata.append(
+            {
+                "original_index": int(original_index),
+                "operation_type": str(operation_type),
+                "affected_tasks": list(affected_tasks),
+                "old_targets": list(old_targets),
+                "new_targets": list(new_targets),
+                "matching": candidate_matching,
+                "upper_delta": None,
+            }
+        )
+        original_index += 1
 
     for task_id in task_ids:
         old_target = current_matching[task_id]
@@ -251,49 +336,14 @@ def enumerate_best_operation(
                 continue
             candidate_matching = dict(current_matching)
             candidate_matching[task_id] = target
-            if evaluation_mode == "full":
-                evaluation = evaluate_matching_candidate(
-                    tasks,
-                    candidate_matching,
-                    vehicle_positions,
-                    service_node_positions,
-                    project_cfg,
-                    cache_nodes,
-                    cache_config,
-                    kkt_cache=kkt_cache,
-                )
-            else:
-                evaluation = evaluate_matching_candidate_incremental(
-                    tasks,
-                    current_matching,
-                    current_evaluation,
-                    candidate_matching,
-                    [task_id],
-                    vehicle_positions,
-                    service_node_positions,
-                    project_cfg,
-                    cache_nodes,
-                    cache_config,
-                    kkt_cache=kkt_cache,
-                )
-            stats["candidate_evaluations_total"] += 1
-            stats["transfer_candidates_evaluated"] += 1
-            if not evaluation.resource_feasible:
-                stats["resource_infeasible_candidates"] += 1
-                continue
-            delta = evaluation.task_utility_sum - current_evaluation.task_utility_sum
-            max_delta = max(max_delta, delta)
-            candidate = {
-                "operation_type": "transfer",
-                "affected_tasks": [task_id],
-                "old_targets": [old_target],
-                "new_targets": [target],
-                "delta_J": float(delta),
-                "J_after": float(evaluation.task_utility_sum),
-                "matching": candidate_matching,
-                "evaluation": evaluation,
-            }
-            best = _better_candidate(best, candidate, tolerance * 0.1)
+            stats["candidate_definitions_total"] += 1
+            append_candidate(
+                "transfer",
+                [task_id],
+                [old_target],
+                [target],
+                candidate_matching,
+            )
 
     for left_index, left_task in enumerate(task_ids):
         for right_task in task_ids[left_index + 1 :]:
@@ -301,55 +351,155 @@ def enumerate_best_operation(
             right_target = current_matching[right_task]
             if left_target == right_target:
                 continue
+            stats["candidate_definitions_total"] += 1
             if right_target not in feasible_targets[left_task] or left_target not in feasible_targets[right_task]:
                 stats["feasibility_rejected_without_kkt"] += 1
                 continue
             candidate_matching = dict(current_matching)
             candidate_matching[left_task] = right_target
             candidate_matching[right_task] = left_target
-            if evaluation_mode == "full":
-                evaluation = evaluate_matching_candidate(
-                    tasks,
-                    candidate_matching,
-                    vehicle_positions,
-                    service_node_positions,
-                    project_cfg,
-                    cache_nodes,
-                    cache_config,
-                    kkt_cache=kkt_cache,
-                )
-            else:
-                evaluation = evaluate_matching_candidate_incremental(
-                    tasks,
-                    current_matching,
-                    current_evaluation,
-                    candidate_matching,
-                    [left_task, right_task],
-                    vehicle_positions,
-                    service_node_positions,
-                    project_cfg,
-                    cache_nodes,
-                    cache_config,
-                    kkt_cache=kkt_cache,
-                )
-            stats["candidate_evaluations_total"] += 1
+            append_candidate(
+                "exchange",
+                [left_task, right_task],
+                [left_target, right_target],
+                [right_target, left_target],
+                candidate_matching,
+            )
+
+    tie_tolerance = tolerance * 0.1
+    if evaluation_mode == "incremental":
+        if current_kkt is None:
+            raise AssertionError("incremental candidate screening requires current KKT matching")
+        # Calculate the existing strict UB exactly once per candidate. This
+        # pass is separate from both execution order and semantic selection.
+        for metadata in candidate_metadata:
+            stats["upper_bound_screen_calls"] += 1
+            candidate_matching = metadata["matching"]
+            candidate_kkt = _to_kkt_matching(candidate_matching)
+            _, impacted_task_ids = _candidate_impact_scope(
+                tasks,
+                current_kkt,
+                candidate_kkt,
+                metadata["affected_tasks"],
+                cache_nodes,
+            )
+            metadata["upper_delta"] = _strict_ideal_resource_upper_delta(
+                tasks,
+                candidate_matching,
+                current_evaluation,
+                impacted_task_ids,
+                vehicle_positions,
+                service_node_positions,
+                cache_nodes,
+                cache_config,
+            )
+
+    exact_records: dict[int, KKTMatchingEvaluation] = {}
+    global_exact_lower_bound = float("-inf")
+    max_delta = float("-inf")
+
+    def evaluate_exact(metadata: dict[str, Any]) -> None:
+        nonlocal global_exact_lower_bound, max_delta
+        candidate_matching = metadata["matching"]
+        stats["full_evaluator_calls"] += 1
+        if evaluation_mode == "full":
+            evaluation = evaluate_matching_candidate(
+                tasks,
+                candidate_matching,
+                vehicle_positions,
+                service_node_positions,
+                project_cfg,
+                cache_nodes,
+                cache_config,
+                kkt_cache=kkt_cache,
+            )
+        else:
+            evaluation = evaluate_matching_candidate_incremental(
+                tasks,
+                current_matching,
+                current_evaluation,
+                candidate_matching,
+                metadata["affected_tasks"],
+                vehicle_positions,
+                service_node_positions,
+                project_cfg,
+                cache_nodes,
+                cache_config,
+                kkt_cache=kkt_cache,
+            )
+        exact_records[int(metadata["original_index"])] = evaluation
+        stats["candidate_evaluations_total"] += 1
+        if metadata["operation_type"] == "transfer":
+            stats["transfer_candidates_evaluated"] += 1
+        else:
             stats["exchange_candidates_evaluated"] += 1
-            if not evaluation.resource_feasible:
-                stats["resource_infeasible_candidates"] += 1
+        if not evaluation.resource_feasible:
+            stats["resource_infeasible_candidates"] += 1
+            return
+        delta = float(evaluation.task_utility_sum - current_evaluation.task_utility_sum)
+        metadata["exact_delta"] = delta
+        max_delta = max(max_delta, delta)
+        global_exact_lower_bound = max(global_exact_lower_bound, delta)
+
+    if evaluation_mode == "incremental" and candidate_metadata:
+        finite_bound_indices = [
+            index
+            for index, metadata in enumerate(candidate_metadata)
+            if metadata["upper_delta"] is not None
+        ]
+        if finite_bound_indices:
+            seed_index = max(
+                finite_bound_indices,
+                key=lambda index: float(candidate_metadata[index]["upper_delta"]),
+            )
+            # The seed is evaluated first solely to establish an exact lower
+            # bound. It is reused during original-order replay below.
+            evaluate_exact(candidate_metadata[seed_index])
+        else:
+            seed_index = None
+
+        for index, metadata in enumerate(candidate_metadata):
+            if index == seed_index:
                 continue
-            delta = evaluation.task_utility_sum - current_evaluation.task_utility_sum
-            max_delta = max(max_delta, delta)
-            candidate = {
-                "operation_type": "exchange",
-                "affected_tasks": [left_task, right_task],
-                "old_targets": [left_target, right_target],
-                "new_targets": [right_target, left_target],
-                "delta_J": float(delta),
-                "J_after": float(evaluation.task_utility_sum),
-                "matching": candidate_matching,
-                "evaluation": evaluation,
-            }
-            best = _better_candidate(best, candidate, tolerance * 0.1)
+            upper_delta = metadata["upper_delta"]
+            if (
+                upper_delta is not None
+                and global_exact_lower_bound != float("-inf")
+                and float(upper_delta) < global_exact_lower_bound - tie_tolerance
+            ):
+                stats["upper_bound_pruned_candidates"] += 1
+                if metadata["operation_type"] == "transfer":
+                    stats["transfer_upper_bound_pruned"] += 1
+                else:
+                    stats["exchange_upper_bound_pruned"] += 1
+                continue
+            evaluate_exact(metadata)
+    else:
+        # Full mode retains the original execution order and has no strict UB
+        # screen. This is also the safe fallback for an empty candidate set.
+        for metadata in candidate_metadata:
+            evaluate_exact(metadata)
+
+    # Replay semantic selection in generator order. Exact results are never
+    # evaluated a second time here.
+    best: dict[str, Any] | None = None
+    for metadata in candidate_metadata:
+        index = int(metadata["original_index"])
+        evaluation = exact_records.get(index)
+        if evaluation is None or not evaluation.resource_feasible:
+            continue
+        delta = float(metadata["exact_delta"])
+        candidate = {
+            "operation_type": metadata["operation_type"],
+            "affected_tasks": metadata["affected_tasks"],
+            "old_targets": metadata["old_targets"],
+            "new_targets": metadata["new_targets"],
+            "delta_J": delta,
+            "J_after": float(evaluation.task_utility_sum),
+            "matching": metadata["matching"],
+            "evaluation": evaluation,
+        }
+        best = _better_candidate(best, candidate, tie_tolerance)
 
     if max_delta == float("-inf"):
         max_delta = 0.0
@@ -427,6 +577,15 @@ def optimize_task_matching(
             exchange_candidates_evaluated=0,
             resource_infeasible_candidates=0,
             feasibility_rejected_without_kkt=0,
+            candidate_definitions_total=0,
+            upper_bound_screen_calls=0,
+            upper_bound_pruned_candidates=0,
+            transfer_upper_bound_pruned=0,
+            exchange_upper_bound_pruned=0,
+            full_evaluator_calls=0,
+            kkt_cache_requests=0,
+            kkt_cache_hits=0,
+            kkt_cache_misses=0,
             stop_reason="no_tasks",
             transfer_exchange_stable=True,
             stable_check_passed=True,
@@ -463,11 +622,17 @@ def optimize_task_matching(
         raise AssertionError("Cloud门控后的初始matching应资源可行。")
 
     counters = {
+        "candidate_definitions_total": 0,
         "candidate_evaluations_total": 0,
         "transfer_candidates_evaluated": 0,
         "exchange_candidates_evaluated": 0,
         "resource_infeasible_candidates": 0,
         "feasibility_rejected_without_kkt": 0,
+        "upper_bound_screen_calls": 0,
+        "upper_bound_pruned_candidates": 0,
+        "transfer_upper_bound_pruned": 0,
+        "exchange_upper_bound_pruned": 0,
+        "full_evaluator_calls": 0,
     }
     history: list[dict[str, Any]] = []
     transfer_updates = 0
@@ -564,6 +729,15 @@ def optimize_task_matching(
         exchange_candidates_evaluated=counters["exchange_candidates_evaluated"],
         resource_infeasible_candidates=counters["resource_infeasible_candidates"],
         feasibility_rejected_without_kkt=counters["feasibility_rejected_without_kkt"],
+        candidate_definitions_total=counters["candidate_definitions_total"],
+        upper_bound_screen_calls=counters["upper_bound_screen_calls"],
+        upper_bound_pruned_candidates=counters["upper_bound_pruned_candidates"],
+        transfer_upper_bound_pruned=counters["transfer_upper_bound_pruned"],
+        exchange_upper_bound_pruned=counters["exchange_upper_bound_pruned"],
+        full_evaluator_calls=counters["full_evaluator_calls"],
+        kkt_cache_requests=int(kkt_cache.requests),
+        kkt_cache_hits=int(kkt_cache.hits),
+        kkt_cache_misses=int(kkt_cache.misses),
         stop_reason=stop_reason,
         transfer_exchange_stable=transfer_exchange_stable,
         stable_check_passed=stable_check_passed,
@@ -898,6 +1072,15 @@ def _summary(result: TransferExchangeMatchingResult) -> dict[str, Any]:
         "exchange_candidates_evaluated": result.exchange_candidates_evaluated,
         "resource_infeasible_candidates": result.resource_infeasible_candidates,
         "feasibility_rejected_without_kkt": result.feasibility_rejected_without_kkt,
+        "candidate_definitions_total": result.candidate_definitions_total,
+        "upper_bound_screen_calls": result.upper_bound_screen_calls,
+        "upper_bound_pruned_candidates": result.upper_bound_pruned_candidates,
+        "transfer_upper_bound_pruned": result.transfer_upper_bound_pruned,
+        "exchange_upper_bound_pruned": result.exchange_upper_bound_pruned,
+        "full_evaluator_calls": result.full_evaluator_calls,
+        "kkt_cache_requests": result.kkt_cache_requests,
+        "kkt_cache_hits": result.kkt_cache_hits,
+        "kkt_cache_misses": result.kkt_cache_misses,
         "stop_reason": result.stop_reason,
         "stable": result.transfer_exchange_stable,
         "stable_check_passed": result.stable_check_passed,
@@ -1183,6 +1366,113 @@ def _edge_path_is_feasible(
         return False
 
 
+def _ideal_task_utility(
+    task: Task,
+    target: str,
+    vehicle_positions: dict[str, np.ndarray],
+    service_node_positions: dict[str, np.ndarray],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+) -> float:
+    """Evaluate one task at the no-sharing ideal resource point.
+
+    Local and Cloud use their exact formal per-task model.  Edge targets use
+    CPU/BW fractions of one only for an upper bound; this helper never calls
+    the KKT allocator.
+    """
+
+    if target == LOCAL or target == local_target(task.task_id):
+        result = system_model.local_execution(
+            task.cpu_cycles,
+            cache_config.local_cpu_cycles_per_s,
+            cache_config.local_energy_per_cycle_j,
+        )
+        delay = float(result["delay_s"])
+        energy = float(result["vehicle_energy_j"])
+    elif target == CLOUD:
+        result = system_model.cloud_execution(
+            task.input_bits,
+            task.cpu_cycles,
+            cache_config.cloud_total_bandwidth_bps,
+            cache_config.cloud_total_cpu_cycles_per_s,
+            cache_config.cloud_delay_factor,
+            cache_config.tx_power_w,
+        )
+        delay = float(result["total_delay_s"])
+        energy = float(result["vehicle_energy_j"])
+    else:
+        role = _edge_node_role(target, cache_nodes)
+        if role is None:
+            raise ValueError(f"未知 ideal-resource target：{target}")
+        edge = system_model.edge_execution(
+            task.input_bits,
+            task.cpu_cycles,
+            _node_bandwidth(role, cache_config),
+            1.0,
+            cache_config.tx_power_w,
+            _channel_gain(
+                role,
+                vehicle_positions[task.vehicle_id],
+                service_node_positions[target],
+                cache_config,
+            ),
+            cache_config.noise_power_w,
+            _node_cpu(role, cache_config),
+            1.0,
+        )
+        delay = float(edge["total_delay_s"])
+        energy = float(edge["vehicle_energy_j"])
+
+    return float(
+        system_model.task_utility(
+            delay,
+            energy,
+            cache_config.time_ref_s,
+            cache_config.energy_ref_j,
+            cache_config.omega_t,
+            cache_config.omega_e,
+        )
+    )
+
+
+def _strict_ideal_resource_upper_delta(
+    tasks: list[Task],
+    candidate_matching: dict[str, str],
+    current_evaluation: KKTMatchingEvaluation,
+    impacted_task_ids: set[str],
+    vehicle_positions: dict[str, np.ndarray],
+    service_node_positions: dict[str, np.ndarray],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+) -> float | None:
+    """Return a conservative strict upper bound for candidate ``delta_J``."""
+
+    terms: list[float] = []
+    current_utilities = current_evaluation.per_task_utility
+    for task in tasks:
+        if task.task_id not in impacted_task_ids:
+            continue
+        current_utility = float(current_utilities[task.task_id])
+        ideal_utility = _ideal_task_utility(
+            task,
+            candidate_matching[task.task_id],
+            vehicle_positions,
+            service_node_positions,
+            cache_nodes,
+            cache_config,
+        )
+        if not math.isfinite(current_utility) or not math.isfinite(ideal_utility):
+            return None
+        terms.append(ideal_utility - current_utility)
+    upper_delta = math.fsum(terms)
+    if not math.isfinite(upper_delta):
+        return None
+    # Round the bound upward so floating-point summation cannot make a
+    # mathematically safe upper bound infinitesimally too small at the prune
+    # boundary.  The pruning comparison itself remains strict '<'.
+    return float(math.nextafter(upper_delta, math.inf))
+
+
 def solve_kkt_fraction_allocation(
     coefficients: list[float],
     epsilon: float,
@@ -1209,11 +1499,18 @@ def solve_kkt_fraction_allocation(
     positive = coeff > 0.0
     if not bool(np.any(positive)):
         return [1.0 / n] * n, 0.0, True, ""
+    positive_coeff = coeff[positive]
+    allocation_scratch = np.zeros(n, dtype=np.float64)
+    clipped_allocation = np.empty(n, dtype=np.float64)
 
     def alloc_for(lam: float) -> np.ndarray:
-        result = np.full(n, epsilon, dtype=np.float64)
-        result[positive] = np.sqrt(coeff[positive] / lam)
-        return np.clip(result, epsilon, 1.0)
+        allocation_scratch[positive] = np.sqrt(positive_coeff / lam)
+        return np.clip(
+            allocation_scratch,
+            epsilon,
+            1.0,
+            out=clipped_allocation,
+        )
 
     low = 0.0
     high = 1.0
@@ -1519,33 +1816,16 @@ def evaluate_matching_candidate_incremental(
     if not set(affected_ids).issubset(task_ids):
         raise ValueError("affected_task_ids 包含未知任务。")
 
-    affected_edge_nodes: set[str] = set()
-    for task_id in affected_ids:
-        for target in (current_kkt[task_id], candidate_kkt[task_id]):
-            if target == CLOUD:
-                # Fixed per-task Cloud resources do not couple unrelated Cloud
-                # tasks in incremental reevaluation.
-                continue
-            elif target != LOCAL:
-                _edge_node_role(target, cache_nodes)
-                affected_edge_nodes.add(target)
+    affected_edge_nodes, impacted_task_ids = _candidate_impact_scope(
+        tasks,
+        current_kkt,
+        candidate_kkt,
+        affected_ids,
+        cache_nodes,
+    )
 
-    impacted_task_ids = set(affected_ids)
-    for task in tasks:
-        if (
-            current_kkt[task.task_id] in affected_edge_nodes
-            or candidate_kkt[task.task_id] in affected_edge_nodes
-        ):
-            impacted_task_ids.add(task.task_id)
-
-    cpu_allocations = {
-        node_id: dict(values)
-        for node_id, values in current_evaluation.cpu_allocations.items()
-    }
-    bandwidth_allocations = {
-        node_id: dict(values)
-        for node_id, values in current_evaluation.bandwidth_allocations.items()
-    }
+    cpu_allocations = dict(current_evaluation.cpu_allocations)
+    bandwidth_allocations = dict(current_evaluation.bandwidth_allocations)
     cpu_resource_sums = dict(current_evaluation.cpu_resource_sums)
     bandwidth_resource_sums = dict(current_evaluation.bandwidth_resource_sums)
     nodes_to_clear = set(affected_edge_nodes)

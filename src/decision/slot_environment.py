@@ -75,6 +75,15 @@ def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) ->
         "transfer_updates": result.transfer_updates,
         "exchange_updates": result.exchange_updates,
         "candidate_evaluations_total": result.candidate_evaluations_total,
+        "candidate_definitions_total": result.candidate_definitions_total,
+        "upper_bound_screen_calls": result.upper_bound_screen_calls,
+        "upper_bound_pruned_candidates": result.upper_bound_pruned_candidates,
+        "transfer_upper_bound_pruned": result.transfer_upper_bound_pruned,
+        "exchange_upper_bound_pruned": result.exchange_upper_bound_pruned,
+        "full_evaluator_calls": result.full_evaluator_calls,
+        "kkt_cache_requests": result.kkt_cache_requests,
+        "kkt_cache_hits": result.kkt_cache_hits,
+        "kkt_cache_misses": result.kkt_cache_misses,
         "stop_reason": result.stop_reason,
         "transfer_exchange_stable": result.transfer_exchange_stable,
         "stable_check_passed": result.stable_check_passed,
@@ -103,6 +112,10 @@ def _configuration_summary(
         )
         for uav_id in result.previous_uav_positions
     }
+    prediction_skipped = result.stop_reason in {
+        "no_trigger_prediction_skipped",
+        "policy_primitive_prediction_skipped",
+    }
     return {
         "trigger_feasible": result.trigger_feasible,
         "infeasible_reason": result.infeasible_reason,
@@ -110,8 +123,8 @@ def _configuration_summary(
         "actual_cache_update": actual_cache_update,
         "requested_uav_trigger": dict(result.uav_triggers),
         "actual_uav_movement": actual_uav_movement,
-        "predictive_utility": result.predictive_utility,
-        "predictive_objective": result.objective_value,
+        "predictive_utility": None if prediction_skipped else result.predictive_utility,
+        "predictive_objective": None if prediction_skipped else result.objective_value,
         "cache_cost": result.cache_cost,
         "movement_energy": result.movement_energy,
         "movement_cost": result.movement_cost,
@@ -125,9 +138,7 @@ def _configuration_summary(
             "candidate_diagnostics", {}
         ),
         "stop_reason": result.stop_reason,
-        "predictive_evaluation_skipped": (
-            result.stop_reason == "no_trigger_prediction_skipped"
-        ),
+        "predictive_evaluation_skipped": prediction_skipped,
     }
 
 
@@ -196,6 +207,7 @@ def execute_slot(
     time_s: float | None = None,
     performance_profile: dict[str, Any] | None = None,
     configuration_profile: cache_configuration.ConfigurationEvaluationProfile | None = None,
+    configuration_override: JointConfigurationResult | None = None,
 ) -> SlotExecutionResult:
     """Execute one slot from external trigger to actual system utility.
 
@@ -225,8 +237,28 @@ def execute_slot(
         int(cache_trigger.sum()) == 0
         and not any(int(value) == 1 for value in uav_triggers.values())
     )
+    configuration_requests_before = (
+        int(configuration_profile.utility_requests)
+        if configuration_profile is not None
+        else 0
+    )
+    prediction_evaluation_skipped = False
     configuration_started_at = time.perf_counter() if performance_profile is not None else 0.0
-    if no_configuration_trigger:
+    if configuration_override is not None:
+        configuration = _validated_configuration_override(
+            configuration_override,
+            previous_cache,
+            previous_uav,
+            cache_trigger,
+            {key: int(value) for key, value in uav_triggers.items()},
+            service_catalog,
+            cache_nodes,
+            cache_config,
+            project_cfg,
+            flight_boundary,
+        )
+        prediction_evaluation_skipped = True
+    elif no_configuration_trigger:
         # Gate=NULL 时配置状态严格保持不变；预测目标既不参与 Matching，也不参与
         # 当前 reward，因此不执行昂贵且无决策作用的场景配置评价。
         configuration = JointConfigurationResult(
@@ -252,6 +284,7 @@ def execute_slot(
             cache_result_summary={},
             uav_result_summary={},
         )
+        prediction_evaluation_skipped = True
     else:
         evaluation_context = cache_configuration.build_surrogate_evaluation_context(
             scenario_slice,
@@ -280,6 +313,15 @@ def execute_slot(
             )
         finally:
             cache_configuration.close_prediction_batch_pool(evaluation_context)
+    if performance_profile is not None:
+        configuration_requests_after = (
+            int(configuration_profile.utility_requests)
+            if configuration_profile is not None
+            else configuration_requests_before
+        )
+        performance_profile["online_k100_configuration_calls"] = int(
+            performance_profile.get("online_k100_configuration_calls", 0)
+        ) + max(configuration_requests_after - configuration_requests_before, 0)
     configuration_seconds = (
         time.perf_counter() - configuration_started_at
         if performance_profile is not None
@@ -434,12 +476,12 @@ def execute_slot(
         final_uav_positions=final_uav,
         predictive_configuration_utility=(
             None
-            if no_configuration_trigger
+            if prediction_evaluation_skipped
             else float(configuration.predictive_utility)
         ),
         predictive_configuration_objective=(
             None
-            if no_configuration_trigger
+            if prediction_evaluation_skipped
             else float(configuration.objective_value)
         ),
         cache_cost=cache_cost,
@@ -737,6 +779,149 @@ def _movement_cost(
         cache_cost_constant=0.0,
         evaluation_context=evaluation_context,
     )
+
+
+def build_policy_primitive_configuration(
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    final_cache_state: np.ndarray,
+    final_uav_positions: dict[str, Any],
+    cache_triggers: np.ndarray,
+    uav_triggers: dict[str, int],
+    service_catalog: dict[str, Any],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    flight_boundary: tuple[float, float, float, float],
+    cache_actions: tuple[dict[str, Any], ...] = (),
+    uav_actions: tuple[dict[str, Any], ...] = (),
+) -> JointConfigurationResult:
+    """Build the direct-policy configuration result without a prediction solve."""
+
+    previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
+    final_cache = np.asarray(final_cache_state, dtype=np.int8).copy()
+    previous_uav = _position_arrays(previous_uav_positions)
+    final_uav = _position_arrays(final_uav_positions)
+    cache_trigger = np.asarray(cache_triggers, dtype=np.int8).copy()
+    cache_configuration.validate_cache_shape_and_capacity(
+        previous_cache, service_catalog, cache_nodes
+    )
+    cache_configuration.validate_cache_shape_and_capacity(
+        final_cache, service_catalog, cache_nodes
+    )
+    if cache_trigger.shape != (previous_cache.shape[0],) or not np.all(
+        np.isin(cache_trigger, [0, 1])
+    ):
+        raise ValueError("policy primitive cache triggers 非法。")
+    actual_cache = np.any(final_cache != previous_cache, axis=1).astype(np.int8)
+    if np.any(actual_cache > cache_trigger):
+        raise ValueError("policy primitive cache state 违反 trigger=0 保持不变语义。")
+    uav_configuration.validate_uav_configuration_transition(
+        previous_uav,
+        final_uav,
+        uav_triggers,
+        project_cfg,
+        flight_boundary,
+    )
+    cache_cost, _ = _cache_cost(
+        previous_cache,
+        final_cache,
+        cache_trigger,
+        service_catalog,
+        cache_nodes,
+        cache_config,
+    )
+    search = uav_configuration.uav_search_config_from_project(project_cfg)
+    movement_energy, movement_cost, _, _, _ = uav_configuration.movement_summary(
+        previous_uav,
+        final_uav,
+        {key: int(value) for key, value in uav_triggers.items()},
+        search,
+    )
+    actual_uav = sum(
+        int(
+            np.linalg.norm(final_uav[uav_id] - previous_uav[uav_id])
+            > search.position_tolerance_m
+        )
+        for uav_id in previous_uav
+    )
+    return JointConfigurationResult(
+        previous_cache_state=previous_cache,
+        final_cache_state=final_cache,
+        previous_uav_positions=_position_tuples(previous_uav),
+        final_uav_positions=_position_tuples(final_uav),
+        cache_triggers=cache_trigger.astype(int).tolist(),
+        uav_triggers={key: int(value) for key, value in uav_triggers.items()},
+        trigger_feasible=True,
+        infeasible_reason="",
+        predictive_utility=0.0,
+        cache_cost=float(cache_cost),
+        movement_energy=float(movement_energy),
+        movement_cost=float(movement_cost),
+        objective_value=0.0,
+        initial_objective=0.0,
+        objective_history=[],
+        outer_rounds=0,
+        accepted_cache_updates=int(actual_cache.sum()),
+        accepted_uav_updates=int(actual_uav),
+        stop_reason="policy_primitive_prediction_skipped",
+        cache_result_summary={"primitive_actions": [dict(value) for value in cache_actions]},
+        uav_result_summary={"primitive_actions": [dict(value) for value in uav_actions]},
+    )
+
+
+def _validated_configuration_override(
+    configuration: JointConfigurationResult,
+    previous_cache: np.ndarray,
+    previous_uav: dict[str, tuple[float, float]],
+    cache_trigger: np.ndarray,
+    uav_triggers: dict[str, int],
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+) -> JointConfigurationResult:
+    """Reject any override that is not an authoritative direct-policy transition."""
+
+    if not isinstance(configuration, JointConfigurationResult):
+        raise TypeError("configuration_override 必须是 JointConfigurationResult。")
+    if configuration.stop_reason != "policy_primitive_prediction_skipped":
+        raise ValueError("configuration_override 仅接受 policy_primitive result。")
+    if not np.array_equal(configuration.previous_cache_state, previous_cache):
+        raise ValueError("configuration_override previous cache 不匹配。")
+    if configuration.cache_triggers != cache_trigger.astype(int).tolist():
+        raise ValueError("configuration_override cache triggers 不匹配。")
+    if configuration.uav_triggers != uav_triggers:
+        raise ValueError("configuration_override UAV triggers 不匹配。")
+    for uav_id, xy in previous_uav.items():
+        if not np.array_equal(
+            np.asarray(configuration.previous_uav_positions[uav_id], dtype=np.float64),
+            np.asarray(xy, dtype=np.float64),
+        ):
+            raise ValueError("configuration_override previous UAV state 不匹配。")
+    rebuilt = build_policy_primitive_configuration(
+        previous_cache,
+        previous_uav,
+        configuration.final_cache_state,
+        configuration.final_uav_positions,
+        cache_trigger,
+        uav_triggers,
+        service_catalog,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+        flight_boundary,
+        cache_actions=tuple(configuration.cache_result_summary.get("primitive_actions", [])),
+        uav_actions=tuple(configuration.uav_result_summary.get("primitive_actions", [])),
+    )
+    if not math.isclose(rebuilt.cache_cost, configuration.cache_cost, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("configuration_override cache cost 不匹配。")
+    if not math.isclose(
+        rebuilt.movement_cost, configuration.movement_cost, rel_tol=0.0, abs_tol=0.0
+    ):
+        raise ValueError("configuration_override movement cost 不匹配。")
+    return rebuilt
 
 
 def evaluate_joint_configuration(

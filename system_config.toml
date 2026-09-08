@@ -510,6 +510,9 @@ objective_tolerance = 1.0e-9
 # Standard PPO v2 training path for binary Cache/UAV requests.
 enabled = true
 method = "ppo_simple_v2"
+# legacy_exact keeps the K=100 iterative reference path. policy_primitive uses
+# the adaptive_primitive_v1 policy and applies at most one primitive per trigger.
+configuration_control_mode = "policy_primitive"
 hidden_sizes = [128, 128]
 # PPO algorithm parameters; these do not belong to the physical system model.
 gamma = 1.0

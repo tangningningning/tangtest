@@ -433,6 +433,16 @@ def _new_configuration_profile_source_stats() -> dict[str, dict[str, int]]:
             "predictive_batches": 0,
             "matching_calls": 0,
             "candidate_evaluations_total": 0,
+            "candidate_definitions_total": 0,
+            "existing_feasibility_rejects": 0,
+            "upper_bound_screen_calls": 0,
+            "upper_bound_pruned_candidates": 0,
+            "transfer_upper_bound_pruned": 0,
+            "exchange_upper_bound_pruned": 0,
+            "full_evaluator_calls": 0,
+            "kkt_cache_requests": 0,
+            "kkt_cache_hits": 0,
+            "kkt_cache_misses": 0,
         }
         for source in _CONFIGURATION_PROFILE_SOURCES
     }
@@ -449,6 +459,16 @@ class ConfigurationEvaluationProfile:
     predictive_batch_evaluations: int = 0
     predictive_matching_calls: int = 0
     matching_candidate_evaluations_total: int = 0
+    matching_candidate_definitions_total: int = 0
+    matching_existing_feasibility_rejects: int = 0
+    matching_upper_bound_screen_calls: int = 0
+    matching_upper_bound_pruned_candidates: int = 0
+    matching_transfer_upper_bound_pruned: int = 0
+    matching_exchange_upper_bound_pruned: int = 0
+    matching_full_evaluator_calls: int = 0
+    matching_kkt_cache_requests: int = 0
+    matching_kkt_cache_hits: int = 0
+    matching_kkt_cache_misses: int = 0
     utility_evaluation_seconds: float = 0.0
     matching_seconds: float = 0.0
     prediction_batch_mode: str = "serial"
@@ -655,7 +675,7 @@ def _evaluate_prediction_batch(
     local_cache: dict[str, set[int]],
     matching_project_config: dict[str, Any],
     config: CacheOptimizationConfig,
-) -> tuple[float, bool, int]:
+) -> tuple[float, bool, int, dict[str, int]]:
     """Evaluate one prediction batch with the unchanged Matching/KKT path."""
 
     from decision import task_allocation
@@ -689,12 +709,24 @@ def _evaluate_prediction_batch(
         float(result.task_utility_sum),
         bool(result.resource_feasible),
         int(result.candidate_evaluations_total),
+        {
+            "candidate_definitions_total": int(result.candidate_definitions_total),
+            "existing_feasibility_rejects": int(result.feasibility_rejected_without_kkt),
+            "upper_bound_screen_calls": int(result.upper_bound_screen_calls),
+            "upper_bound_pruned_candidates": int(result.upper_bound_pruned_candidates),
+            "transfer_upper_bound_pruned": int(result.transfer_upper_bound_pruned),
+            "exchange_upper_bound_pruned": int(result.exchange_upper_bound_pruned),
+            "full_evaluator_calls": int(result.full_evaluator_calls),
+            "kkt_cache_requests": int(result.kkt_cache_requests),
+            "kkt_cache_hits": int(result.kkt_cache_hits),
+            "kkt_cache_misses": int(result.kkt_cache_misses),
+        },
     )
 
 
 def _prediction_batch_worker_job(
     job: tuple[int, np.ndarray, tuple[tuple[str, float, float], ...]]
-) -> tuple[int, float, bool, int, float]:
+) -> tuple[int, float, bool, int, dict[str, int], float]:
     """Evaluate one batch in a persistent worker and return compact results."""
 
     state = _PREDICTION_BATCH_WORKER_STATE
@@ -716,7 +748,7 @@ def _prediction_batch_worker_job(
         for vehicle_id, services in state["local_cache_state"].items()
     }
     started_at = time.perf_counter()
-    utility, feasible, candidate_evaluations = _evaluate_prediction_batch(
+    utility, feasible, candidate_evaluations, matching_counters = _evaluate_prediction_batch(
         state["batches"][batch_index],
         candidate_cache,
         candidate_nodes,
@@ -730,6 +762,7 @@ def _prediction_batch_worker_job(
         utility,
         feasible,
         candidate_evaluations,
+        matching_counters,
         time.perf_counter() - started_at,
     )
 
@@ -942,6 +975,7 @@ def evaluate_surrogate_context(
                     result[0],
                     result[1],
                     result[2],
+                    result[3],
                     time.perf_counter() - matching_started_at,
                 )
             )
@@ -994,7 +1028,14 @@ def evaluate_surrogate_context(
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
-    for batch_index, raw_utility, resource_feasible, candidate_evaluations, matching_seconds in batch_results:
+    for (
+        batch_index,
+        raw_utility,
+        resource_feasible,
+        candidate_evaluations,
+        matching_counters,
+        matching_seconds,
+    ) in batch_results:
         batch = context.batches[batch_index]
         if profile is not None and source_bucket is not None:
             profile.predictive_batch_evaluations += 1
@@ -1004,6 +1045,38 @@ def evaluate_surrogate_context(
             source_bucket["matching_calls"] += 1
             profile.matching_candidate_evaluations_total += int(candidate_evaluations)
             source_bucket["candidate_evaluations_total"] += int(candidate_evaluations)
+            profile.matching_candidate_definitions_total += int(
+                matching_counters["candidate_definitions_total"]
+            )
+            profile.matching_existing_feasibility_rejects += int(
+                matching_counters["existing_feasibility_rejects"]
+            )
+            profile.matching_upper_bound_screen_calls += int(
+                matching_counters["upper_bound_screen_calls"]
+            )
+            profile.matching_upper_bound_pruned_candidates += int(
+                matching_counters["upper_bound_pruned_candidates"]
+            )
+            profile.matching_transfer_upper_bound_pruned += int(
+                matching_counters["transfer_upper_bound_pruned"]
+            )
+            profile.matching_exchange_upper_bound_pruned += int(
+                matching_counters["exchange_upper_bound_pruned"]
+            )
+            profile.matching_full_evaluator_calls += int(
+                matching_counters["full_evaluator_calls"]
+            )
+            profile.matching_kkt_cache_requests += int(
+                matching_counters["kkt_cache_requests"]
+            )
+            profile.matching_kkt_cache_hits += int(
+                matching_counters["kkt_cache_hits"]
+            )
+            profile.matching_kkt_cache_misses += int(
+                matching_counters["kkt_cache_misses"]
+            )
+            for key, value in matching_counters.items():
+                source_bucket[key] += int(value)
             profile.batch_results.append(
                 (int(batch_index), float(raw_utility), int(candidate_evaluations))
             )
@@ -1038,6 +1111,10 @@ def print_configuration_profile(profile: ConfigurationEvaluationProfile) -> None
         f"predictive_batches={profile.predictive_batch_evaluations} | "
         f"predictive_matching_calls={profile.predictive_matching_calls} | "
         f"matching_candidate_evals={profile.matching_candidate_evaluations_total} | "
+        f"matching_ub_pruned={profile.matching_upper_bound_pruned_candidates} | "
+        f"matching_kkt_requests={profile.matching_kkt_cache_requests} | "
+        f"matching_kkt_hits={profile.matching_kkt_cache_hits} | "
+        f"matching_kkt_misses={profile.matching_kkt_cache_misses} | "
         f"prediction_batch_mode={profile.prediction_batch_mode} | "
         f"prediction_batch_workers={profile.prediction_batch_workers} | "
         f"utility_time={profile.utility_evaluation_seconds:.3f}s | "
@@ -1295,6 +1372,134 @@ def is_node_feasible(
     capacity_mb: float,
 ) -> bool:
     return node_used_capacity_mb(node_cache, service_sizes_mb) <= capacity_mb + 1e-9
+
+
+@dataclass(frozen=True)
+class CachePrimitiveCandidate:
+    """One score-free, capacity-feasible cache state transition for one node."""
+
+    operation_type: str
+    node_index: int
+    node_id: str
+    before_node_cache: np.ndarray
+    after_node_cache: np.ndarray
+    added_service_ids: tuple[int, ...]
+    removed_service_ids: tuple[int, ...]
+
+
+def _cache_primitive_metadata(
+    before_node_cache: np.ndarray,
+    after_node_cache: np.ndarray,
+) -> tuple[str, tuple[int, ...], tuple[int, ...]]:
+    before = np.asarray(before_node_cache, dtype=np.int8).reshape(-1)
+    after = np.asarray(after_node_cache, dtype=np.int8).reshape(-1)
+    if before.shape != after.shape or not np.all(np.isin(before, [0, 1])) or not np.all(
+        np.isin(after, [0, 1])
+    ):
+        raise ValueError("cache primitive before/after 必须是同形状的 binary vector。")
+    added = tuple(int(index) for index in np.flatnonzero((before == 0) & (after == 1)))
+    removed = tuple(int(index) for index in np.flatnonzero((before == 1) & (after == 0)))
+    if not added and not removed:
+        operation = "NO_CHANGE"
+    elif len(added) == 1 and not removed:
+        operation = "ADD"
+    elif len(removed) == 1 and not added:
+        operation = "DELETE"
+    elif len(added) == 1 and len(removed) == 1:
+        operation = "SWAP"
+    else:
+        operation = "UNKNOWN_PRIMITIVE"
+    return operation, added, removed
+
+
+def enumerate_cache_primitive_actions(
+    current_cache_state: np.ndarray,
+    node_index: int,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+) -> list[CachePrimitiveCandidate]:
+    """Return NO_CHANGE plus the production Add/Delete/Swap neighborhood.
+
+    This routine performs only binary/capacity checks.  It never evaluates the
+    prediction surrogate, Matching, or KKT.
+    """
+
+    current_cache = np.asarray(current_cache_state, dtype=np.int8)
+    validate_cache_shape_and_capacity(current_cache, service_catalog, cache_nodes)
+    index = int(node_index)
+    if index < 0 or index >= current_cache.shape[0]:
+        raise IndexError("cache primitive node_index 越界。")
+    node_id = str(cache_nodes["node_ids"][index])
+    before = current_cache[index].copy()
+    raw_candidates: list[tuple[str, np.ndarray]] = [("NO_CHANGE", before.copy())]
+    raw_candidates.extend(
+        generate_node_neighbors(
+            before,
+            np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64),
+            float(cache_nodes["capacities_mb"][index]),
+        )
+    )
+    candidates: list[CachePrimitiveCandidate] = []
+    for generator_operation, after in raw_candidates:
+        operation, added, removed = _cache_primitive_metadata(before, after)
+        expected = str(generator_operation).upper()
+        if expected != operation:
+            raise AssertionError(
+                "generate_node_neighbors() operation 与 before/after primitive diff 不一致："
+                f"generator={expected}, derived={operation}。"
+            )
+        candidates.append(
+            CachePrimitiveCandidate(
+                operation_type=operation,
+                node_index=index,
+                node_id=node_id,
+                before_node_cache=before.copy(),
+                after_node_cache=np.asarray(after, dtype=np.int8).copy(),
+                added_service_ids=added,
+                removed_service_ids=removed,
+            )
+        )
+    return candidates
+
+
+def apply_cache_candidate(
+    current_cache_state: np.ndarray,
+    node_index: int,
+    after_node_cache: np.ndarray,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and apply one selected node vector to a mutable cache state."""
+
+    current_cache = np.asarray(current_cache_state)
+    if current_cache.dtype != np.int8:
+        raise ValueError("current_cache_state 必须使用 int8 状态格式。")
+    validate_cache_shape_and_capacity(current_cache, service_catalog, cache_nodes)
+    index = int(node_index)
+    if index < 0 or index >= current_cache.shape[0]:
+        raise IndexError("cache candidate node_index 越界。")
+    before = current_cache[index].copy()
+    after = np.asarray(after_node_cache, dtype=np.int8).reshape(-1)
+    if after.shape != before.shape or not np.all(np.isin(after, [0, 1])):
+        raise ValueError("cache candidate after vector 形状或 binary 值非法。")
+    if not is_node_feasible(
+        after,
+        np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64),
+        float(cache_nodes["capacities_mb"][index]),
+    ):
+        raise ValueError("cache candidate 违反节点容量约束。")
+    operation, added, removed = _cache_primitive_metadata(before, after)
+    current_cache[index] = after
+    return {
+        "node_index": index,
+        "node_id": str(cache_nodes["node_ids"][index]),
+        "operation_type": operation,
+        "before_node_cache": before,
+        "after_node_cache": current_cache[index].copy(),
+        "added_service_ids": added,
+        "removed_service_ids": removed,
+        "actual_changed": bool(not np.array_equal(before, current_cache[index])),
+    }
 
 
 def validate_cache_shape_and_capacity(
@@ -1810,7 +2015,13 @@ def optimize_cache(
                     best_move = (move, node_candidate, value)
             if best_move is not None:
                 move, node_candidate, value = best_move
-                current_cache[node_index] = node_candidate
+                apply_cache_candidate(
+                    current_cache,
+                    node_index,
+                    node_candidate,
+                    service_catalog,
+                    cache_nodes,
+                )
                 current_objective = value
                 counts[move] += 1
                 accepted_moves += 1

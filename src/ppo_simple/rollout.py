@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
 import numpy as np
 
-from decision import slot_environment
+from decision import cache_configuration, slot_environment
 
 from . import interface
 from .interface import _copy_uav_positions
-from .policy import BernoulliActorCritic
+from .policy import AdaptivePrimitiveActorCritic, BernoulliActorCritic
+from .primitive_control import PrimitiveTensorSpec, sample_and_apply_primitive_configuration
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,26 @@ class SimpleTransition:
     movement_cost: float
     actual_cache_update_count: int
     actual_uav_movement_count: int
+    cache_contexts: np.ndarray
+    cache_candidate_features: np.ndarray
+    cache_candidate_masks: np.ndarray
+    cache_selected_indices: np.ndarray
+    cache_old_log_probs: np.ndarray
+    uav_contexts: np.ndarray
+    uav_candidate_features: np.ndarray
+    uav_candidate_masks: np.ndarray
+    uav_selected_indices: np.ndarray
+    uav_old_log_probs: np.ndarray
+    cache_conditional_actions: tuple[dict[str, Any], ...]
+    uav_conditional_actions: tuple[dict[str, Any], ...]
+    cache_candidate_counts: np.ndarray
+    uav_candidate_counts: np.ndarray
+    policy_selection_seconds: float
+    configuration_seconds: float
+    actual_matching_seconds: float
+    online_k100_configuration_calls: int
+    matching_summary: dict[str, Any]
+    origin_runtime_seconds: float
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
 
@@ -44,6 +66,14 @@ class SimpleRollout:
     old_values: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
+    cache_contexts: np.ndarray
+    cache_candidate_features: np.ndarray
+    cache_candidate_masks: np.ndarray
+    cache_selected_indices: np.ndarray
+    uav_contexts: np.ndarray
+    uav_candidate_features: np.ndarray
+    uav_candidate_masks: np.ndarray
+    uav_selected_indices: np.ndarray
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
     bootstrap_observation: np.ndarray | None
@@ -97,7 +127,7 @@ def _check_request_contract(
 
 
 def collect_rollout(
-    policy: BernoulliActorCritic,
+    policy: BernoulliActorCritic | AdaptivePrimitiveActorCritic,
     context: Any,
     aligned_steps: list[Any],
     *,
@@ -129,8 +159,10 @@ def collect_rollout(
         raise ValueError("initial_cache shape 与 environment context 不一致。")
     uav_source = context.initial_uav if initial_uav is None else initial_uav
     previous_uav = _copy_uav_positions(uav_source)
+    tensor_spec = PrimitiveTensorSpec.create(context)
     transitions: list[SimpleTransition] = []
     for step_index, step in enumerate(execution_steps):
+        origin_started_at = time.perf_counter()
         observation = _observation(
             previous_cache,
             previous_uav,
@@ -149,10 +181,102 @@ def collect_rollout(
             context.flight_boundary,
             context.action_spec,
         )
+        selection_started_at = time.perf_counter()
         sample = policy.sample(observation, action_mask=action_mask_provider)
         if sample.action.shape != (int(context.action_spec.action_dim),):
             raise AssertionError("PPO v2 action 不符合 action_spec。")
         cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(sample.action)
+        cache_contexts = np.zeros(
+            (tensor_spec.num_cache_heads, tensor_spec.observation_dim), dtype=np.float32
+        )
+        cache_candidate_features = np.zeros(
+            (
+                tensor_spec.num_cache_heads,
+                tensor_spec.cache_max_candidates,
+                tensor_spec.cache_feature_dim,
+            ),
+            dtype=np.float32,
+        )
+        cache_candidate_masks = np.zeros(
+            (tensor_spec.num_cache_heads, tensor_spec.cache_max_candidates), dtype=bool
+        )
+        cache_candidate_masks[:, 0] = True
+        cache_selected_indices = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+        cache_old_log_probs = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+        uav_contexts = np.zeros(
+            (tensor_spec.num_uav_heads, tensor_spec.observation_dim), dtype=np.float32
+        )
+        uav_candidate_features = np.zeros(
+            (
+                tensor_spec.num_uav_heads,
+                tensor_spec.uav_max_candidates,
+                tensor_spec.uav_feature_dim,
+            ),
+            dtype=np.float32,
+        )
+        uav_candidate_masks = np.zeros(
+            (tensor_spec.num_uav_heads, tensor_spec.uav_max_candidates), dtype=bool
+        )
+        uav_candidate_masks[:, 0] = True
+        uav_selected_indices = np.zeros(tensor_spec.num_uav_heads, dtype=np.int64)
+        uav_old_log_probs = np.zeros(tensor_spec.num_uav_heads, dtype=np.float32)
+        cache_conditional_actions: tuple[dict[str, Any], ...] = ()
+        uav_conditional_actions: tuple[dict[str, Any], ...] = ()
+        cache_candidate_counts = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+        uav_candidate_counts = np.zeros(tensor_spec.num_uav_heads, dtype=np.int64)
+        total_log_prob = sample.log_prob
+        configuration_override = None
+        if context.configuration_control_mode == "policy_primitive":
+            if not isinstance(policy, AdaptivePrimitiveActorCritic):
+                raise TypeError("policy_primitive mode requires AdaptivePrimitiveActorCritic。")
+            primitive = sample_and_apply_primitive_configuration(
+                policy,
+                sample,
+                previous_cache,
+                previous_uav,
+                cache_triggers,
+                uav_triggers,
+                step,
+                context,
+                tensor_spec,
+            )
+            total_log_prob = primitive.total_log_prob
+            cache_contexts = primitive.cache_contexts
+            cache_candidate_features = primitive.cache_candidate_features
+            cache_candidate_masks = primitive.cache_candidate_masks
+            cache_selected_indices = primitive.cache_selected_indices
+            cache_old_log_probs = primitive.cache_old_log_probs
+            uav_contexts = primitive.uav_contexts
+            uav_candidate_features = primitive.uav_candidate_features
+            uav_candidate_masks = primitive.uav_candidate_masks
+            uav_selected_indices = primitive.uav_selected_indices
+            uav_old_log_probs = primitive.uav_old_log_probs
+            cache_conditional_actions = primitive.cache_conditional_actions
+            uav_conditional_actions = primitive.uav_conditional_actions
+            cache_candidate_counts = primitive.cache_candidate_counts
+            uav_candidate_counts = primitive.uav_candidate_counts
+            configuration_override = slot_environment.build_policy_primitive_configuration(
+                previous_cache,
+                previous_uav,
+                primitive.final_cache_state,
+                primitive.final_uav_positions,
+                cache_triggers,
+                uav_triggers,
+                context.service_catalog,
+                context.cfg,
+                context.cache_nodes,
+                context.cache_cfg,
+                context.flight_boundary,
+                cache_actions=cache_conditional_actions,
+                uav_actions=uav_conditional_actions,
+            )
+        elif context.configuration_control_mode != "legacy_exact":
+            raise ValueError(
+                f"unknown configuration_control_mode={context.configuration_control_mode}"
+            )
+        policy_selection_seconds = time.perf_counter() - selection_started_at
+        performance_profile: dict[str, Any] = {}
+        configuration_profile = cache_configuration.ConfigurationEvaluationProfile()
         result = slot_environment.execute_slot(
             previous_cache,
             previous_uav,
@@ -169,6 +293,9 @@ def collect_rollout(
             context.flight_boundary,
             slot_id=step.slot,
             time_s=step.time_s,
+            performance_profile=performance_profile,
+            configuration_profile=configuration_profile,
+            configuration_override=configuration_override,
         )
         if not result.step_feasible:
             raise RuntimeError(
@@ -200,7 +327,7 @@ def collect_rollout(
                 observation=np.asarray(observation, dtype=np.float32).copy(),
                 action=np.asarray(sample.action, dtype=np.int8).copy(),
                 action_mask=np.asarray(sample.action_mask, dtype=bool).copy(),
-                old_log_prob=float(sample.log_prob.detach().cpu()),
+                old_log_prob=float(total_log_prob.detach().cpu()),
                 old_value=float(sample.value.detach().cpu()),
                 reward=reward,
                 done=done,
@@ -211,6 +338,32 @@ def collect_rollout(
                 movement_cost=float(result.movement_cost),
                 actual_cache_update_count=actual_cache_update_count,
                 actual_uav_movement_count=actual_uav_movement_count,
+                cache_contexts=cache_contexts.copy(),
+                cache_candidate_features=cache_candidate_features.copy(),
+                cache_candidate_masks=cache_candidate_masks.copy(),
+                cache_selected_indices=cache_selected_indices.copy(),
+                cache_old_log_probs=cache_old_log_probs.copy(),
+                uav_contexts=uav_contexts.copy(),
+                uav_candidate_features=uav_candidate_features.copy(),
+                uav_candidate_masks=uav_candidate_masks.copy(),
+                uav_selected_indices=uav_selected_indices.copy(),
+                uav_old_log_probs=uav_old_log_probs.copy(),
+                cache_conditional_actions=cache_conditional_actions,
+                uav_conditional_actions=uav_conditional_actions,
+                cache_candidate_counts=cache_candidate_counts.copy(),
+                uav_candidate_counts=uav_candidate_counts.copy(),
+                policy_selection_seconds=float(policy_selection_seconds),
+                configuration_seconds=float(performance_profile.get("config_seconds", 0.0)),
+                actual_matching_seconds=float(
+                    performance_profile.get("matching_kkt_seconds", 0.0)
+                ),
+                online_k100_configuration_calls=int(
+                    performance_profile.get("online_k100_configuration_calls", 0)
+                ),
+                matching_summary=dict(result.matching_summary),
+                origin_runtime_seconds=float(
+                    time.perf_counter() - origin_started_at
+                ),
                 next_cache_state=next_cache.copy(),
                 next_uav_positions=dict(next_uav),
             )
@@ -241,6 +394,26 @@ def collect_rollout(
         old_values=np.asarray([item.old_value for item in transitions], dtype=np.float32),
         rewards=np.asarray([item.reward for item in transitions], dtype=np.float32),
         dones=np.asarray([item.done for item in transitions], dtype=bool),
+        cache_contexts=np.stack([item.cache_contexts for item in transitions]).astype(np.float32),
+        cache_candidate_features=np.stack(
+            [item.cache_candidate_features for item in transitions]
+        ).astype(np.float32),
+        cache_candidate_masks=np.stack(
+            [item.cache_candidate_masks for item in transitions]
+        ).astype(bool),
+        cache_selected_indices=np.stack(
+            [item.cache_selected_indices for item in transitions]
+        ).astype(np.int64),
+        uav_contexts=np.stack([item.uav_contexts for item in transitions]).astype(np.float32),
+        uav_candidate_features=np.stack(
+            [item.uav_candidate_features for item in transitions]
+        ).astype(np.float32),
+        uav_candidate_masks=np.stack(
+            [item.uav_candidate_masks for item in transitions]
+        ).astype(bool),
+        uav_selected_indices=np.stack(
+            [item.uav_selected_indices for item in transitions]
+        ).astype(np.int64),
         next_cache_state=previous_cache.copy(),
         next_uav_positions=dict(previous_uav),
         bootstrap_observation=bootstrap_observation,

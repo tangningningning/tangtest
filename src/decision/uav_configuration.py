@@ -357,6 +357,166 @@ def coordinate_candidates(
     return candidates
 
 
+@dataclass(frozen=True)
+class UavPrimitiveCandidate:
+    """One score-free, physically feasible UAV state transition."""
+
+    operation_type: str
+    uav_id: str
+    before_position: np.ndarray
+    after_position: np.ndarray
+
+
+def enumerate_uav_primitive_actions(
+    current_uav_positions: dict[str, Any],
+    previous_uav_positions: dict[str, Any],
+    uav_id: str,
+    uav_triggers: dict[str, int],
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+) -> list[UavPrimitiveCandidate]:
+    """Return STAY plus legal one-step production coordinate candidates.
+
+    Candidate generation and filtering use only geometry and configured movement
+    constraints; no prediction utility, Matching, or KKT evaluation occurs.
+    """
+
+    uav_ids = uav_ids_from_project(project_cfg)
+    current = _as_position_dict(current_uav_positions, uav_ids)
+    previous = _as_position_dict(previous_uav_positions, uav_ids)
+    triggers = _trigger_dict(uav_triggers, uav_ids)
+    target = str(uav_id)
+    if target not in current:
+        raise KeyError(f"未知 UAV ID：{target}")
+    if triggers[target] != 1:
+        raise ValueError("只有 trigger=1 的 UAV 才枚举 conditional primitive action。")
+    search_config = uav_search_config_from_project(project_cfg)
+    before = current[target].copy()
+    raw_candidates = coordinate_candidates(before, before, search_config)
+    candidates: list[UavPrimitiveCandidate] = []
+    seen: set[bytes] = set()
+    for raw_candidate in raw_candidates:
+        candidate = np.asarray(raw_candidate, dtype=np.float64).reshape(-1)
+        if candidate.shape != (2,):
+            continue
+        key = np.ascontiguousarray(candidate, dtype=np.float64).tobytes()
+        if key in seen:
+            continue
+        trial = {key_id: xy.copy() for key_id, xy in current.items()}
+        trial[target] = candidate.copy()
+        if not _candidate_is_feasible(
+            target,
+            candidate,
+            previous,
+            trial,
+            triggers,
+            flight_boundary,
+            search_config,
+        ):
+            continue
+        seen.add(key)
+        operation = (
+            "STAY"
+            if _same_position(candidate, before, search_config.position_tolerance_m)
+            else "MOVE"
+        )
+        candidates.append(
+            UavPrimitiveCandidate(
+                operation_type=operation,
+                uav_id=target,
+                before_position=before.copy(),
+                after_position=candidate.copy(),
+            )
+        )
+    if not candidates or candidates[0].operation_type != "STAY":
+        raise AssertionError("UAV primitive candidate list 必须以 STAY 开始。")
+    return candidates
+
+
+def apply_uav_candidate(
+    current_uav_positions: dict[str, np.ndarray],
+    previous_uav_positions: dict[str, Any],
+    uav_id: str,
+    candidate_position: np.ndarray,
+    uav_triggers: dict[str, int],
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+) -> dict[str, Any]:
+    """Validate and apply one selected position to a mutable UAV state."""
+
+    uav_ids = uav_ids_from_project(project_cfg)
+    if list(current_uav_positions) != uav_ids:
+        raise ValueError("current_uav_positions 必须保持 configured UAV ID order。")
+    previous = _as_position_dict(previous_uav_positions, uav_ids)
+    current = _as_position_dict(current_uav_positions, uav_ids)
+    triggers = _trigger_dict(uav_triggers, uav_ids)
+    target = str(uav_id)
+    if target not in current:
+        raise KeyError(f"未知 UAV ID：{target}")
+    candidate = np.asarray(candidate_position, dtype=np.float64).reshape(-1)
+    trial = {key: value.copy() for key, value in current.items()}
+    if candidate.shape == (2,):
+        trial[target] = candidate.copy()
+    search_config = uav_search_config_from_project(project_cfg)
+    if not _candidate_is_feasible(
+        target,
+        candidate,
+        previous,
+        trial,
+        triggers,
+        flight_boundary,
+        search_config,
+    ):
+        raise ValueError(f"UAV candidate 不满足 boundary/displacement/separation：{target}")
+    before = current[target].copy()
+    current_uav_positions[target] = candidate.copy()
+    return {
+        "uav_id": target,
+        "operation_type": (
+            "STAY"
+            if _same_position(candidate, before, search_config.position_tolerance_m)
+            else "MOVE"
+        ),
+        "before_position": before,
+        "after_position": candidate.copy(),
+        "distance_m": float(np.linalg.norm(candidate - before)),
+        "actual_moved": bool(
+            not _same_position(candidate, before, search_config.position_tolerance_m)
+        ),
+    }
+
+
+def validate_uav_configuration_transition(
+    previous_uav_positions: dict[str, Any],
+    final_uav_positions: dict[str, Any],
+    uav_triggers: dict[str, int],
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+) -> None:
+    """Validate a complete one-slot UAV transition with production constraints."""
+
+    uav_ids = uav_ids_from_project(project_cfg)
+    previous = _as_position_dict(previous_uav_positions, uav_ids)
+    final = _as_position_dict(final_uav_positions, uav_ids)
+    triggers = _trigger_dict(uav_triggers, uav_ids)
+    search_config = uav_search_config_from_project(project_cfg)
+    for uav_id in uav_ids:
+        if triggers[uav_id] == 0 and not _same_position(
+            previous[uav_id], final[uav_id], search_config.position_tolerance_m
+        ):
+            raise ValueError(f"UAV {uav_id} trigger=0 但位置发生变化。")
+        if not _candidate_is_feasible(
+            uav_id,
+            final[uav_id],
+            previous,
+            final,
+            triggers,
+            flight_boundary,
+            search_config,
+        ):
+            raise ValueError(f"UAV {uav_id} final position 违反正式移动约束。")
+
+
 def movement_summary(
     old_positions: dict[str, np.ndarray],
     new_positions: dict[str, np.ndarray],
@@ -822,7 +982,15 @@ def optimize_uav_configuration(
                     best_objective = value
                     best_position = candidate.copy()
             if best_position is not None:
-                final_positions[uav_id] = best_position
+                apply_uav_candidate(
+                    final_positions,
+                    old_positions,
+                    uav_id,
+                    best_position,
+                    triggers,
+                    project_cfg,
+                    flight_boundary,
+                )
                 current_objective = best_objective
 
     accepted = 0
@@ -870,7 +1038,15 @@ def optimize_uav_configuration(
                     best_objective = value
                     best_position = candidate.copy()
             if best_position is not None:
-                final_positions[uav_id] = best_position
+                apply_uav_candidate(
+                    final_positions,
+                    old_positions,
+                    uav_id,
+                    best_position,
+                    triggers,
+                    project_cfg,
+                    flight_boundary,
+                )
                 current_objective = best_objective
                 accepted += 1
                 round_improved = True

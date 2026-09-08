@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,13 +24,15 @@ from scenario import task_scenario
 
 from . import interface
 from .interface import _copy_uav_positions
-from .policy import BernoulliActorCritic
+from .policy import AdaptivePrimitiveActorCritic, BernoulliActorCritic
+from .primitive_control import PrimitiveTensorSpec
 from .rollout import SimpleRollout, collect_rollout, compute_gae
 
 
 PPO_V2_METHOD = "ppo_simple_v2"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 CHECKPOINT_VERSION = 2
+PRIMITIVE_CHECKPOINT_VERSION = 3
 DEFAULT_ROLLOUT_STEPS = 16
 
 
@@ -53,6 +57,7 @@ class EnvironmentContext:
     initial_uav: dict[str, np.ndarray]
     train_origin_start: int
     train_origin_end: int
+    configuration_control_mode: str
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,17 @@ class UpdateResult:
     clip_fraction: float
     total_loss: float
     gradient_finite: bool
+    returns_finite: bool
+    advantages_finite: bool
+    gradient_norm: float
+    policy_loss_min: float
+    policy_loss_max: float
+    value_loss_min: float
+    value_loss_max: float
+    approximate_kl_min: float
+    approximate_kl_max: float
+    gradient_norm_min: float
+    gradient_norm_max: float
     parameter_delta_norm: float
     optimizer_steps: int
 
@@ -92,6 +108,15 @@ class TrainingCursor:
 
 def _project_path(root: Path, value: Any) -> Path:
     return cache_configuration.resolve_path(root, value)
+
+
+def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    """Append one finite, structured training metric record."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        json.dump(record, stream, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        stream.write("\n")
 
 
 def load_environment_context(config_path: str = "system_config.toml") -> EnvironmentContext:
@@ -128,6 +153,13 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
         cache_cfg,
     )
     initial_uav = uav_configuration.initial_uav_positions_from_project(cfg)
+    configuration_control_mode = str(
+        project_config.get_config_value(
+            cfg,
+            "algorithm.ppo.configuration_control_mode",
+            "legacy_exact",
+        )
+    )
     return EnvironmentContext(
         cfg=cfg,
         root=root,
@@ -143,6 +175,7 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
         initial_uav=initial_uav,
         train_origin_start=train_start,
         train_origin_end=train_end,
+        configuration_control_mode=configuration_control_mode,
     )
 
 
@@ -208,18 +241,32 @@ def aligned_train_steps(
 
 
 class PPOV2Trainer:
-    """PPO core independent from the environment's configuration decisions."""
+    """PPO core for legacy trigger-only and adaptive primitive control modes."""
 
     def __init__(self, context: EnvironmentContext, device: str = "cpu") -> None:
         _require_torch()
         self.context = context
         self.hyperparameters = hyperparameters_from_project(context.cfg)
         self.device = torch.device(device)
-        self.policy = BernoulliActorCritic(
-            int(context.observation_spec.observation_dim),
-            int(context.action_spec.action_dim),
-            self.hyperparameters.hidden_sizes,
-        ).to(self.device)
+        if context.configuration_control_mode == "policy_primitive":
+            primitive_spec = PrimitiveTensorSpec.create(context)
+            self.policy = AdaptivePrimitiveActorCritic(
+                int(context.observation_spec.observation_dim),
+                int(context.action_spec.action_dim),
+                primitive_spec.cache_feature_dim,
+                primitive_spec.uav_feature_dim,
+                self.hyperparameters.hidden_sizes,
+            ).to(self.device)
+        elif context.configuration_control_mode == "legacy_exact":
+            self.policy = BernoulliActorCritic(
+                int(context.observation_spec.observation_dim),
+                int(context.action_spec.action_dim),
+                self.hyperparameters.hidden_sizes,
+            ).to(self.device)
+        else:
+            raise ValueError(
+                f"unknown configuration_control_mode={context.configuration_control_mode}"
+            )
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(),
             lr=self.hyperparameters.learning_rate,
@@ -290,12 +337,40 @@ class PPOV2Trainer:
             hyper.gamma,
             hyper.gae_lambda,
         )
+        returns_finite = bool(np.all(np.isfinite(returns)))
+        advantages_finite = bool(np.all(np.isfinite(advantages)))
+        if not returns_finite or not advantages_finite:
+            raise FloatingPointError("PPO v2 return/advantage 非 finite。")
         sample_count = int(rollout.observations.shape[0])
         if sample_count < hyper.num_minibatches or sample_count % hyper.num_minibatches != 0:
             raise ValueError("PPO v2 rollout length 必须可被 num_minibatches 整除。")
         observations = torch.as_tensor(rollout.observations, dtype=torch.float32, device=self.device)
         actions = torch.as_tensor(rollout.actions, dtype=torch.long, device=self.device)
         masks = torch.as_tensor(rollout.action_masks, dtype=torch.bool, device=self.device)
+        cache_contexts = torch.as_tensor(
+            rollout.cache_contexts, dtype=torch.float32, device=self.device
+        )
+        cache_candidate_features = torch.as_tensor(
+            rollout.cache_candidate_features, dtype=torch.float32, device=self.device
+        )
+        cache_candidate_masks = torch.as_tensor(
+            rollout.cache_candidate_masks, dtype=torch.bool, device=self.device
+        )
+        cache_selected_indices = torch.as_tensor(
+            rollout.cache_selected_indices, dtype=torch.long, device=self.device
+        )
+        uav_contexts = torch.as_tensor(
+            rollout.uav_contexts, dtype=torch.float32, device=self.device
+        )
+        uav_candidate_features = torch.as_tensor(
+            rollout.uav_candidate_features, dtype=torch.float32, device=self.device
+        )
+        uav_candidate_masks = torch.as_tensor(
+            rollout.uav_candidate_masks, dtype=torch.bool, device=self.device
+        )
+        uav_selected_indices = torch.as_tensor(
+            rollout.uav_selected_indices, dtype=torch.long, device=self.device
+        )
         old_log_probs = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=self.device)
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
@@ -309,17 +384,39 @@ class PPOV2Trainer:
         approximate_kl_value = 0.0
         clip_fraction_value = 0.0
         total_loss_value = 0.0
+        policy_loss_values: list[float] = []
+        value_loss_values: list[float] = []
+        approximate_kl_values: list[float] = []
+        gradient_norm_values: list[float] = []
         gradient_finite = True
         minibatch_size = sample_count // hyper.num_minibatches
         for _ in range(hyper.update_epochs):
             permutation = torch.randperm(sample_count, device=self.device)
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
-                evaluation = self.policy.evaluate(
-                    observations[indices],
-                    actions[indices],
-                    masks[indices],
-                )
+                if self.context.configuration_control_mode == "policy_primitive":
+                    if not isinstance(self.policy, AdaptivePrimitiveActorCritic):
+                        raise TypeError("policy_primitive update requires adaptive policy。")
+                    evaluation = self.policy.evaluate_primitive(
+                        observations[indices],
+                        actions[indices],
+                        masks[indices],
+                        cache_contexts[indices],
+                        cache_candidate_features[indices],
+                        cache_candidate_masks[indices],
+                        cache_selected_indices[indices],
+                        uav_contexts[indices],
+                        uav_candidate_features[indices],
+                        uav_candidate_masks[indices],
+                        uav_selected_indices[indices],
+                        len(self.context.action_spec.cache_node_ids),
+                    )
+                else:
+                    evaluation = self.policy.evaluate(
+                        observations[indices],
+                        actions[indices],
+                        masks[indices],
+                    )
                 ratio = torch.exp(evaluation.log_prob - old_log_probs[indices])
                 unclipped = ratio * advantages_t[indices]
                 clipped = torch.clamp(
@@ -348,7 +445,12 @@ class PPOV2Trainer:
                         gradient_finite = False
                 if not gradient_finite:
                     raise FloatingPointError("PPO v2 gradient 非 finite。")
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), hyper.max_grad_norm)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), hyper.max_grad_norm
+                )
+                gradient_norm_value = float(gradient_norm.detach().cpu())
+                if not np.isfinite(gradient_norm_value):
+                    raise FloatingPointError("PPO v2 gradient norm 非 finite。")
                 self.optimizer.step()
                 self.optimizer_steps += 1
                 policy_loss_value = float(policy_loss.detach().cpu())
@@ -357,6 +459,10 @@ class PPOV2Trainer:
                 approximate_kl_value = float(approximate_kl.detach().cpu())
                 clip_fraction_value = float(clip_fraction.detach().cpu())
                 total_loss_value = float(total_loss.detach().cpu())
+                policy_loss_values.append(policy_loss_value)
+                value_loss_values.append(value_loss_value)
+                approximate_kl_values.append(approximate_kl_value)
+                gradient_norm_values.append(gradient_norm_value)
         delta_squared = 0.0
         for old_parameter, new_parameter in zip(before, self.policy.parameters()):
             delta_squared += float(torch.sum((new_parameter.detach() - old_parameter) ** 2).cpu())
@@ -368,6 +474,17 @@ class PPOV2Trainer:
             clip_fraction=clip_fraction_value,
             total_loss=total_loss_value,
             gradient_finite=gradient_finite,
+            returns_finite=returns_finite,
+            advantages_finite=advantages_finite,
+            gradient_norm=gradient_norm_values[-1],
+            policy_loss_min=float(min(policy_loss_values)),
+            policy_loss_max=float(max(policy_loss_values)),
+            value_loss_min=float(min(value_loss_values)),
+            value_loss_max=float(max(value_loss_values)),
+            approximate_kl_min=float(min(approximate_kl_values)),
+            approximate_kl_max=float(max(approximate_kl_values)),
+            gradient_norm_min=float(min(gradient_norm_values)),
+            gradient_norm_max=float(max(gradient_norm_values)),
             parameter_delta_norm=float(np.sqrt(delta_squared)),
             optimizer_steps=self.optimizer_steps,
         )
@@ -382,8 +499,14 @@ class PPOV2Trainer:
         rollout_steps: int,
     ) -> dict[str, Any]:
         return {
-            "checkpoint_version": CHECKPOINT_VERSION,
+            "checkpoint_version": (
+                PRIMITIVE_CHECKPOINT_VERSION
+                if self.context.configuration_control_mode == "policy_primitive"
+                else CHECKPOINT_VERSION
+            ),
             "method": PPO_V2_METHOD,
+            "policy_schema": self.policy.architecture_id,
+            "configuration_control_mode": self.context.configuration_control_mode,
             "episode": int(completed_episodes),
             "completed_episodes": int(completed_episodes),
             "current_train_origin": int(current_train_origin),
@@ -430,8 +553,26 @@ class PPOV2Trainer:
 
     def load_checkpoint(self, checkpoint: Path, config_hash: str) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
-        if int(payload.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
+        expected_version = (
+            PRIMITIVE_CHECKPOINT_VERSION
+            if self.context.configuration_control_mode == "policy_primitive"
+            else CHECKPOINT_VERSION
+        )
+        if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
+        expected_schema = self.policy.architecture_id
+        checkpoint_schema = payload.get("policy_schema")
+        if checkpoint_schema is None and expected_schema == BernoulliActorCritic.architecture_id:
+            checkpoint_schema = BernoulliActorCritic.architecture_id
+        if checkpoint_schema != expected_schema:
+            raise ValueError(
+                "PPO checkpoint policy schema incompatible: "
+                f"checkpoint={checkpoint_schema}, expected={expected_schema}。"
+            )
+        if payload.get("configuration_control_mode", "legacy_exact") != (
+            self.context.configuration_control_mode
+        ):
+            raise ValueError("PPO checkpoint configuration_control_mode 不匹配。")
         if payload.get("method") != PPO_V2_METHOD or payload.get("config_sha256") != config_hash:
             raise ValueError("PPO v2 checkpoint method/config hash 不匹配。")
         if int(payload.get("observation_dim")) != int(self.context.observation_spec.observation_dim):
@@ -494,7 +635,10 @@ def run_training(
     current_train_origin = context.train_origin_start
     current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
     current_uav_positions = _copy_uav_positions(context.initial_uav)
-    checkpoint = Path(run_dir) / CHECKPOINT_FILENAME
+    run_path = Path(run_dir)
+    checkpoint = run_path / CHECKPOINT_FILENAME
+    episode_metrics_path = run_path / "episode_metrics.jsonl"
+    update_metrics_path = run_path / "update_metrics.jsonl"
     if resume:
         if not checkpoint.exists():
             raise FileNotFoundError(f"resume checkpoint 不存在：{checkpoint}")
@@ -506,11 +650,50 @@ def run_training(
         if completed_episodes > int(episodes):
             raise ValueError("checkpoint completed_episodes 超过本次 episodes。")
 
+    episode_started_at = time.perf_counter()
+    episode_optimizer_start = trainer.optimizer_steps
+    episode_rewards: list[float] = []
+    episode_g_values: list[float] = []
+    episode_cache_requests = 0
+    episode_actual_cache_updates = 0
+    episode_uav_requests = 0
+    episode_actual_uav_movements = 0
+    episode_cache_cost = 0.0
+    episode_movement_cost = 0.0
+    episode_update_count = 0
+    episode_policy_loss_mins: list[float] = []
+    episode_policy_loss_maxs: list[float] = []
+    episode_value_loss_mins: list[float] = []
+    episode_value_loss_maxs: list[float] = []
+    episode_kl_mins: list[float] = []
+    episode_kl_maxs: list[float] = []
+    episode_gradient_norm_mins: list[float] = []
+    episode_gradient_norm_maxs: list[float] = []
+
     while completed_episodes < int(episodes):
         if current_train_origin > context.train_origin_end:
             current_train_origin = context.train_origin_start
             current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
             current_uav_positions = _copy_uav_positions(context.initial_uav)
+            episode_started_at = time.perf_counter()
+            episode_optimizer_start = trainer.optimizer_steps
+            episode_rewards = []
+            episode_g_values = []
+            episode_cache_requests = 0
+            episode_actual_cache_updates = 0
+            episode_uav_requests = 0
+            episode_actual_uav_movements = 0
+            episode_cache_cost = 0.0
+            episode_movement_cost = 0.0
+            episode_update_count = 0
+            episode_policy_loss_mins = []
+            episode_policy_loss_maxs = []
+            episode_value_loss_mins = []
+            episode_value_loss_maxs = []
+            episode_kl_mins = []
+            episode_kl_maxs = []
+            episode_gradient_norm_mins = []
+            episode_gradient_norm_maxs = []
         episode_number = completed_episodes + 1
         chunk_origin_start = current_train_origin
         rollout = trainer.collect_chunk(
@@ -543,6 +726,75 @@ def run_training(
         actual_uav_movements = int(
             sum(item.actual_uav_movement_count for item in rollout.transitions)
         )
+        transition_rewards = np.asarray(
+            [item.reward for item in rollout.transitions], dtype=np.float64
+        )
+        transition_g_values = np.asarray(
+            [
+                float(item.actual_task_utility)
+                - float(item.cache_cost)
+                - float(item.movement_cost)
+                for item in rollout.transitions
+            ],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(transition_rewards)):
+            raise FloatingPointError("PPO v2 reward 非 finite。")
+        if not np.all(np.isfinite(transition_g_values)):
+            raise FloatingPointError("PPO v2 G(t) 非 finite。")
+        if not np.allclose(transition_rewards, transition_g_values, rtol=1e-12, atol=1e-12):
+            raise AssertionError("PPO v2 reward 与 actual G(t) 不一致。")
+
+        episode_rewards.extend(transition_rewards.tolist())
+        episode_g_values.extend(transition_g_values.tolist())
+        episode_cache_requests += cache_requests
+        episode_actual_cache_updates += actual_cache_updates
+        episode_uav_requests += uav_requests
+        episode_actual_uav_movements += actual_uav_movements
+        episode_cache_cost += float(sum(item.cache_cost for item in rollout.transitions))
+        episode_movement_cost += float(sum(item.movement_cost for item in rollout.transitions))
+        episode_update_count += 1
+        episode_policy_loss_mins.append(update.policy_loss_min)
+        episode_policy_loss_maxs.append(update.policy_loss_max)
+        episode_value_loss_mins.append(update.value_loss_min)
+        episode_value_loss_maxs.append(update.value_loss_max)
+        episode_kl_mins.append(update.approximate_kl_min)
+        episode_kl_maxs.append(update.approximate_kl_max)
+        episode_gradient_norm_mins.append(update.gradient_norm_min)
+        episode_gradient_norm_maxs.append(update.gradient_norm_max)
+        _append_jsonl(
+            update_metrics_path,
+            {
+                "record_type": "update",
+                "seed": seed,
+                "episode": episode_number,
+                "origin_start": int(chunk_origin_start),
+                "origin_end": int(next_train_origin - 1),
+                "num_transitions": transition_count,
+                "terminal": bool(terminal),
+                "optimizer_steps": int(update.optimizer_steps),
+                "policy_loss": float(update.policy_loss),
+                "policy_loss_min": float(update.policy_loss_min),
+                "policy_loss_max": float(update.policy_loss_max),
+                "value_loss": float(update.value_loss),
+                "value_loss_min": float(update.value_loss_min),
+                "value_loss_max": float(update.value_loss_max),
+                "entropy": float(update.entropy),
+                "approximate_kl": float(update.approximate_kl),
+                "approximate_kl_min": float(update.approximate_kl_min),
+                "approximate_kl_max": float(update.approximate_kl_max),
+                "clip_fraction": float(update.clip_fraction),
+                "gradient_norm": float(update.gradient_norm),
+                "gradient_norm_min": float(update.gradient_norm_min),
+                "gradient_norm_max": float(update.gradient_norm_max),
+                "gradient_finite": bool(update.gradient_finite),
+                "returns_finite": bool(update.returns_finite),
+                "advantages_finite": bool(update.advantages_finite),
+                "total_loss": float(update.total_loss),
+                "total_loss_finite": bool(np.isfinite(update.total_loss)),
+                "checkpoint": str(checkpoint_path),
+            },
+        )
         print(
             f"[PPO-v2] update={update.optimizer_steps} episode={episode_number} "
             f"completed_episodes={completed_episodes} "
@@ -565,6 +817,77 @@ def run_training(
             f"next_origin={next_train_origin}",
             flush=True,
         )
+        if terminal:
+            episode_reward_array = np.asarray(episode_rewards, dtype=np.float64)
+            episode_g_array = np.asarray(episode_g_values, dtype=np.float64)
+            if not np.all(np.isfinite(episode_reward_array)):
+                raise FloatingPointError("PPO v2 episode reward 非 finite。")
+            if not np.all(np.isfinite(episode_g_array)):
+                raise FloatingPointError("PPO v2 episode G(t) 非 finite。")
+            episode_finite = {
+                "reward": bool(np.all(np.isfinite(episode_reward_array))),
+                "return": bool(np.isfinite(float(episode_reward_array.sum()))),
+                "G": bool(np.all(np.isfinite(episode_g_array))),
+                "loss": bool(
+                    np.isfinite(episode_policy_loss_mins).all()
+                    and np.isfinite(episode_policy_loss_maxs).all()
+                    and np.isfinite(episode_value_loss_mins).all()
+                    and np.isfinite(episode_value_loss_maxs).all()
+                    and np.isfinite(episode_kl_mins).all()
+                    and np.isfinite(episode_kl_maxs).all()
+                ),
+                "gradient": bool(
+                    np.isfinite(episode_gradient_norm_mins).all()
+                    and np.isfinite(episode_gradient_norm_maxs).all()
+                    and update.gradient_finite
+                ),
+                "returns": bool(update.returns_finite),
+                "advantages": bool(update.advantages_finite),
+            }
+            if not all(episode_finite.values()):
+                raise FloatingPointError("PPO v2 episode metrics 非 finite。")
+            _append_jsonl(
+                episode_metrics_path,
+                {
+                    "record_type": "episode",
+                    "seed": seed,
+                    "episode": int(episode_number),
+                    "completed_episodes": int(completed_episodes),
+                    "num_transitions": int(len(episode_reward_array)),
+                    "episode_return": float(episode_reward_array.sum()),
+                    "mean_reward": float(episode_reward_array.mean()),
+                    "mean_G": float(episode_g_array.mean()),
+                    "reward_std": float(episode_reward_array.std()),
+                    "cache_request_count": int(episode_cache_requests),
+                    "actual_cache_update_count": int(episode_actual_cache_updates),
+                    "uav_request_count": int(episode_uav_requests),
+                    "actual_uav_movement_count": int(episode_actual_uav_movements),
+                    "cache_cost": float(episode_cache_cost),
+                    "movement_cost": float(episode_movement_cost),
+                    "ppo_updates": int(episode_update_count),
+                    "optimizer_steps": int(update.optimizer_steps),
+                    "episode_optimizer_steps": int(update.optimizer_steps - episode_optimizer_start),
+                    "policy_loss_range": {
+                        "min": float(min(episode_policy_loss_mins)),
+                        "max": float(max(episode_policy_loss_maxs)),
+                    },
+                    "value_loss_range": {
+                        "min": float(min(episode_value_loss_mins)),
+                        "max": float(max(episode_value_loss_maxs)),
+                    },
+                    "approximate_kl_range": {
+                        "min": float(min(episode_kl_mins)),
+                        "max": float(max(episode_kl_maxs)),
+                    },
+                    "gradient_norm_range": {
+                        "min": float(min(episode_gradient_norm_mins)),
+                        "max": float(max(episode_gradient_norm_maxs)),
+                    },
+                    "finite_checks": episode_finite,
+                    "checkpoint": str(checkpoint_path),
+                    "wall_clock_runtime_seconds": float(time.perf_counter() - episode_started_at),
+                },
+            )
         current_train_origin = next_train_origin
         current_cache_state = np.asarray(rollout.next_cache_state, dtype=np.int8).copy()
         current_uav_positions = _copy_uav_positions(rollout.next_uav_positions)

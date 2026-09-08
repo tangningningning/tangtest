@@ -599,6 +599,18 @@ def validate_config(config: dict[str, Any]) -> None:
     ppo_method = str(get_config_value(config, "algorithm.ppo.method", "ppo_simple_v2"))
     if ppo_method != "ppo_simple_v2":
         raise ValueError("algorithm.ppo.method 当前只支持 ppo_simple_v2。")
+    configuration_control_mode = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.configuration_control_mode",
+            "legacy_exact",
+        )
+    )
+    if configuration_control_mode not in {"legacy_exact", "policy_primitive"}:
+        raise ValueError(
+            "algorithm.ppo.configuration_control_mode 只支持 "
+            "legacy_exact/policy_primitive。"
+        )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
         raise ValueError("algorithm.ppo.hidden_sizes 必须是非空列表。")
