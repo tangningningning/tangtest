@@ -10,13 +10,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - CLI help/import-only environments
+    torch = None  # type: ignore[assignment]
 
 from common import project_config
 from decision import cache_configuration, uav_configuration
-from ppo import ppo_rollout, ppo_trigger_policy
 from scenario import task_scenario
 
+from . import interface
+from .interface import _copy_uav_positions
 from .policy import BernoulliActorCritic
 from .rollout import SimpleRollout, collect_rollout, compute_gae
 
@@ -25,6 +30,11 @@ PPO_V2_METHOD = "ppo_simple_v2"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 CHECKPOINT_VERSION = 2
 DEFAULT_ROLLOUT_STEPS = 16
+
+
+def _require_torch() -> None:
+    if torch is None:
+        raise ImportError("PPO v2 training requires PyTorch.")
 
 
 @dataclass(frozen=True)
@@ -37,8 +47,8 @@ class EnvironmentContext:
     cache_nodes: dict[str, Any]
     local_cache: dict[str, set[int]]
     flight_boundary: tuple[float, float, float, float]
-    action_spec: ppo_trigger_policy.TriggerActionSpec
-    observation_spec: ppo_trigger_policy.ConfigurationObservationSpec
+    action_spec: interface.TriggerActionSpec
+    observation_spec: interface.ConfigurationObservationSpec
     initial_cache: np.ndarray
     initial_uav: dict[str, np.ndarray]
     train_origin_start: int
@@ -105,8 +115,8 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
     local_cache = task_scenario.load_tv_local_cache(
         _project_path(root, project_config.get_config_value(cfg, "paths.tv_local_cache"))
     )
-    action_spec = ppo_trigger_policy.TriggerActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
-    observation_spec = ppo_trigger_policy.ConfigurationObservationSpec.from_cache_nodes(
+    action_spec = interface.TriggerActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
+    observation_spec = interface.ConfigurationObservationSpec.from_cache_nodes(
         cache_nodes,
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
@@ -166,13 +176,6 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
     return values
 
 
-def _copy_uav_positions(positions: dict[str, Any]) -> dict[str, tuple[float, float]]:
-    return {
-        str(uav_id): (float(np.asarray(xy)[0]), float(np.asarray(xy)[1]))
-        for uav_id, xy in positions.items()
-    }
-
-
 def aligned_train_steps(
     context: EnvironmentContext,
     origin_start: int | None = None,
@@ -191,7 +194,7 @@ def aligned_train_steps(
         step_count = min(available_steps, int(max_steps))
     if include_bootstrap_step and start + step_count > context.train_origin_end:
         raise ValueError("train terminal 后不允许读取 test origin 作为 bootstrap step。")
-    return ppo_rollout.prepare_aligned_rollout_steps(
+    return interface.prepare_aligned_rollout_steps(
         context.root,
         context.scenarios,
         start,
@@ -208,6 +211,7 @@ class PPOV2Trainer:
     """PPO core independent from the environment's configuration decisions."""
 
     def __init__(self, context: EnvironmentContext, device: str = "cpu") -> None:
+        _require_torch()
         self.context = context
         self.hyperparameters = hyperparameters_from_project(context.cfg)
         self.device = torch.device(device)
@@ -474,6 +478,7 @@ def run_training(
     rollout_steps: int = DEFAULT_ROLLOUT_STEPS,
     resume: bool = False,
 ) -> None:
+    _require_torch()
     if int(episodes) <= 0:
         raise ValueError("episodes 必须大于0。")
     if int(rollout_steps) <= 0:

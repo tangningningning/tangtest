@@ -9,12 +9,12 @@ description = "Adaptive cache and MEC research environment"
 requires-python = ">=3.10"
 
 [project.scripts]
-ppo-train = "ppo.ppo_training:main"
+ppo-train = "ppo_simple.trainer:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["common*", "scenario*", "decision*", "ppo*"]
+include = ["common*", "scenario*", "decision*", "ppo_simple*"]
 namespaces = true

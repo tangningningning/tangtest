@@ -547,8 +547,7 @@ def _normalize_prediction_batch_workers(value: Any) -> int:
 def prediction_batch_parallel_workers(project_cfg: dict[str, Any]) -> int:
     """读取 prediction batch 的执行 worker 数。
 
-    优先读取 execution-only ``algorithm.configuration`` 字段；缺失时兼容
-    旧配置并回退到 ``algorithm.ppo.cf_parallel_workers``。外层 CF worker 会由
+    读取 execution-only ``algorithm.configuration`` 字段。外层 worker 会由
     ``PredictionBatchRuntime`` 强制退回单进程，避免 nested multiprocessing。
     """
 
@@ -558,11 +557,7 @@ def prediction_batch_parallel_workers(project_cfg: dict[str, Any]) -> int:
         None,
     )
     if configured is None:
-        configured = project_config.get_config_value(
-            project_cfg,
-            "algorithm.ppo.cf_parallel_workers",
-            1,
-        )
+        configured = 1
     return _normalize_prediction_batch_workers(configured)
 
 

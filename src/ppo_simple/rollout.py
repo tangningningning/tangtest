@@ -8,8 +8,9 @@ from typing import Any
 import numpy as np
 
 from decision import slot_environment
-from ppo import ppo_rollout, ppo_trigger_policy
 
+from . import interface
+from .interface import _copy_uav_positions
 from .policy import BernoulliActorCritic
 
 
@@ -48,21 +49,14 @@ class SimpleRollout:
     bootstrap_observation: np.ndarray | None
 
 
-def _copy_uav_positions(positions: dict[str, Any]) -> dict[str, tuple[float, float]]:
-    return {
-        str(uav_id): (float(np.asarray(xy)[0]), float(np.asarray(xy)[1]))
-        for uav_id, xy in positions.items()
-    }
-
-
 def _observation(
     previous_cache: np.ndarray,
     previous_uav: dict[str, Any],
     step: Any,
-    observation_spec: ppo_trigger_policy.ConfigurationObservationSpec,
+    observation_spec: interface.ConfigurationObservationSpec,
     flight_boundary: tuple[float, float, float, float],
 ) -> np.ndarray:
-    return ppo_trigger_policy.build_configuration_observation(
+    return interface.build_configuration_observation(
         previous_cache,
         previous_uav,
         step.predicted_vehicle_positions,
@@ -85,7 +79,7 @@ def _check_request_contract(
     previous_cache: np.ndarray,
     previous_uav: dict[str, Any],
     result: slot_environment.SlotExecutionResult,
-    action_spec: ppo_trigger_policy.TriggerActionSpec,
+    action_spec: interface.TriggerActionSpec,
 ) -> None:
     if result.next_cache_state is None or result.next_uav_positions is None:
         raise AssertionError("可行 environment transition 缺少 next state。")
@@ -146,7 +140,7 @@ def collect_rollout(
         )
         if observation.shape != (int(context.observation_spec.observation_dim),):
             raise AssertionError("PPO v2 observation 不符合 observation_spec。")
-        action_mask_provider = ppo_rollout.build_trigger_action_mask_provider(
+        action_mask_provider = interface.build_trigger_action_mask_provider(
             previous_cache,
             previous_uav,
             context.service_catalog,

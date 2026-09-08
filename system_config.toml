@@ -507,51 +507,19 @@ max_updates = 100
 objective_tolerance = 1.0e-9
 
 [algorithm.ppo]
-# Trigger-only PPO 结构入口；当前正式主线为 V3 sparse direct counterfactual PPO。
-# 旧配置缺少 credit_assignment 时仍按 legacy scalar PPO 解析。
+# Standard PPO v2 training path for binary Cache/UAV requests.
 enabled = true
-method = "proposed_hierarchical_reconfiguration_gate_direct_cf_refdrift"
-credit_assignment = "hierarchical_gate_direct_cf"
-# Formal V3 candidate: shared encoder + shared autoregressive block + one
-# shared logit head; value_head remains frozen during Direct-CF updates.
-actor_architecture = "v3_full_shared_actor_frozen_policy_batch_v1"
-# V3 不使用 learned Q critic；该字段保留供 legacy/V1/V2 配置兼容。
-q_target = "monte_carlo"
-# V3 不使用 critic_phase；该字段保留供 V2 配置兼容。
-credit_phase = "critic_warmup"
-# 每个 episode 的 counterfactual environment budget；不是系统物理参数。
-cf_samples_per_episode = 8
-# Collect four episodes under one frozen policy, then perform one full-batch
-# Direct-CF update on the resulting 32 samples.
-cf_batch_episodes = 4
-# CPU-only parallelism across independent Gate-CF/WHAT-CF samples.  A value of
-# 1 is the exact serial fallback; suffix slots remain strictly serial.
-cf_parallel_workers = 8
-reference_probability_drift_cap = 0.005
-# Formal hierarchical WHAT Direct-CF uses one capacity-1 reservoir per dynamic
-# Trigger; uniform remains available for legacy V3 checkpoint/run compatibility.
-cf_sampling_strategy = "trigger_stratified"
+method = "ppo_simple_v2"
 hidden_sizes = [128, 128]
-autoregressive_hidden_size = 64
-# PPO算法超参数：仅用于discount return / GAE，不属于系统物理参数，
-# 不进入 FORMAL_SYSTEM_PARAMETER_KEYS。
+# PPO algorithm parameters; these do not belong to the physical system model.
 gamma = 1.0
 gae_lambda = 0.95
-# V2/legacy 正式训练 baseline：gamma=1、lambda=.95、cV=.5。V3 Direct-CF
-# Actor loss 不使用 GAE/value loss；gamma/lambda 仅保留 legacy/return reporting 兼容。
-# 继续使用 lambda=.95 GAE return；centralized Q critic 使用 full terminal
-# Monte-Carlo return，不把两类 target 混用。credit_phase 由实验配置显式决定，
-# 不根据 episode 数自动切换。
-# 不是系统物理参数，也不声称为本任务最优值。
-# 后续正式实验如需要，仅通过有限敏感性实验评估，当前不进行超参数搜索。
 clip_epsilon = 0.2
 learning_rate = 3.0e-4
 value_loss_coefficient = 0.5
 entropy_coefficient = 0.0
 max_grad_norm = 0.5
-# PPO更新算法baseline。
-# 第一版采用每批on-policy数据4个optimization epochs、
-# 每epoch划分4个minibatches。
+# PPO update baseline: one optimization epoch with four minibatches.
 # 参考经典OpenAI Baselines PPO2实现的默认训练结构。
 # 不是系统物理参数，也不声称为当前任务最优值。
 # 后续实验如需要再进行有限敏感性分析。

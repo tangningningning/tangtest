@@ -8,6 +8,8 @@
 # =========================
 .runs/
 
+adaptive_cache_mec.zip
+
 .reports/
 
 __pycache__/
