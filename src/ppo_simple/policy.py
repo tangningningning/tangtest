@@ -547,3 +547,10 @@ class AdaptivePrimitiveGroupedV2ActorCritic(AdaptivePrimitiveV2ActorCritic):
                 raise ValueError("UAV candidate feature dimension 缺少 UAV identity one-hot。")
             return slice(1 + uav_count, 3 + uav_count)
         raise ValueError(f"unknown candidate kind={candidate_kind}")
+
+
+class AdaptivePrimitiveHorizonGroupedV3ActorCritic(AdaptivePrimitiveGroupedV2ActorCritic):
+    """Grouped primitive policy using the explicit full prediction-horizon state."""
+
+    architecture_id = "adaptive_primitive_v3_horizon_grouped"
+    architecture_version = 1

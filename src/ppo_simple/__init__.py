@@ -3,6 +3,7 @@
 from .policy import (
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
+    AdaptivePrimitiveHorizonGroupedV3ActorCritic,
     AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
@@ -10,6 +11,7 @@ from .policy import (
 __all__ = [
     "AdaptivePrimitiveActorCritic",
     "AdaptivePrimitiveGroupedV2ActorCritic",
+    "AdaptivePrimitiveHorizonGroupedV3ActorCritic",
     "AdaptivePrimitiveV2ActorCritic",
     "BernoulliActorCritic",
 ]

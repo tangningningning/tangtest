@@ -28,6 +28,7 @@ from .interface import _copy_uav_positions
 from .policy import (
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
+    AdaptivePrimitiveHorizonGroupedV3ActorCritic,
     AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
@@ -52,6 +53,10 @@ V2_POLICY_SCHEMAS = frozenset(
         AdaptivePrimitiveGroupedV2ActorCritic.architecture_id,
     }
 )
+V3_POLICY_SCHEMAS = frozenset(
+    {AdaptivePrimitiveHorizonGroupedV3ActorCritic.architecture_id}
+)
+MODERN_POLICY_SCHEMAS = V2_POLICY_SCHEMAS | V3_POLICY_SCHEMAS
 
 
 def _require_torch() -> None:
@@ -203,6 +208,35 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         stream.write("\n")
 
 
+def _critic_episode_metrics(
+    old_values: list[float],
+    raw_targets: list[float],
+) -> tuple[float | None, float, float]:
+    """Summarize collection-time critic values against production GAE targets."""
+
+    values = np.asarray(old_values, dtype=np.float64)
+    targets = np.asarray(raw_targets, dtype=np.float64)
+    if values.shape != targets.shape or values.ndim != 1 or not len(values):
+        raise ValueError("critic episode metric arrays must be aligned and non-empty")
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(targets)):
+        raise FloatingPointError("critic episode metrics contain NaN/Inf")
+    target_variance = float(np.var(targets))
+    value_std = float(np.std(values))
+    target_std = float(np.std(targets))
+    if not all(np.isfinite(value) for value in (target_variance, value_std, target_std)):
+        raise FloatingPointError("critic episode metric summary is non-finite")
+    explained_variance: float | None
+    if target_variance <= 1.0e-12:
+        explained_variance = None
+    else:
+        explained_variance = float(
+            1.0 - float(np.var(targets - values)) / target_variance
+        )
+        if not np.isfinite(explained_variance):
+            raise FloatingPointError("critic explained variance is non-finite")
+    return explained_variance, value_std, target_std
+
+
 def _append_critic_diagnostics(
     path: Path,
     *,
@@ -288,12 +322,20 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
             "adaptive_primitive_v1",
         )
     )
+    horizon_policy = policy_schema in V3_POLICY_SCHEMAS
+    prediction_horizon = (
+        int(project_config.get_config_value(cfg, "prediction.vehicle.horizon"))
+        if horizon_policy
+        else 1
+    )
     observation_spec = interface.ConfigurationObservationSpec.from_cache_nodes(
         cache_nodes,
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
-        include_time_to_go=policy_schema in V2_POLICY_SCHEMAS,
+        include_time_to_go=policy_schema in MODERN_POLICY_SCHEMAS,
+        prediction_horizon=prediction_horizon,
+        include_prediction_horizon_mask=horizon_policy,
     )
     initial_cache = cache_configuration.popularity_aware_initial_cache(
         service_catalog,
@@ -421,6 +463,16 @@ def aligned_train_steps(
         _project_path(context.root, project_config.get_config_value(context.cfg, "paths.tasks")),
         _project_path(context.root, project_config.get_config_value(context.cfg, "paths.trajectory")),
         include_bootstrap_step=bool(include_bootstrap_step),
+        prediction_horizon=int(context.observation_spec.prediction_horizon),
+        prediction_dt_s=float(
+            project_config.get_config_value(context.cfg, "simulation.dt_s")
+        ),
+        prediction_terminal_origin=int(context.train_origin_end),
+        expected_vehicle_ids=context.observation_spec.vehicle_ids,
+        expected_service_ids=context.observation_spec.service_ids,
+        include_prediction_horizon_mask=(
+            context.observation_spec.horizon_mask_slice is not None
+        ),
     )
 
 
@@ -441,6 +493,8 @@ class PPOV2Trainer:
                 policy_class = AdaptivePrimitiveV2ActorCritic
             elif context.policy_schema == AdaptivePrimitiveGroupedV2ActorCritic.architecture_id:
                 policy_class = AdaptivePrimitiveGroupedV2ActorCritic
+            elif context.policy_schema == AdaptivePrimitiveHorizonGroupedV3ActorCritic.architecture_id:
+                policy_class = AdaptivePrimitiveHorizonGroupedV3ActorCritic
             else:
                 raise ValueError(
                     "unknown policy_primitive policy_schema="
@@ -765,7 +819,7 @@ class PPOV2Trainer:
                 "torch": torch.get_rng_state(),
             },
         }
-        if self.policy.architecture_id in V2_POLICY_SCHEMAS:
+        if self.policy.architecture_id in MODERN_POLICY_SCHEMAS:
             payload["best_epoch"] = int(best_epoch)
             payload["best_epoch_return"] = (
                 None if best_epoch_return is None else float(best_epoch_return)
@@ -984,6 +1038,8 @@ def run_training(
     episode_actual_uav_movements = 0
     episode_cache_cost = 0.0
     episode_movement_cost = 0.0
+    episode_critic_values: list[float] = []
+    episode_critic_targets: list[float] = []
     episode_update_count = 0
     episode_policy_loss_mins: list[float] = []
     episode_policy_loss_maxs: list[float] = []
@@ -1011,6 +1067,8 @@ def run_training(
             episode_actual_uav_movements = 0
             episode_cache_cost = 0.0
             episode_movement_cost = 0.0
+            episode_critic_values = []
+            episode_critic_targets = []
             episode_update_count = 0
             episode_policy_loss_mins = []
             episode_policy_loss_maxs = []
@@ -1083,6 +1141,12 @@ def run_training(
         episode_actual_uav_movements += actual_uav_movements
         episode_cache_cost += float(sum(item.cache_cost for item in rollout.transitions))
         episode_movement_cost += float(sum(item.movement_cost for item in rollout.transitions))
+        episode_critic_values.extend(
+            np.asarray(rollout.old_values, dtype=np.float64).tolist()
+        )
+        episode_critic_targets.extend(
+            np.asarray(update.raw_returns, dtype=np.float64).tolist()
+        )
         episode_update_count += 1
         episode_policy_loss_mins.append(update.policy_loss_min)
         episode_policy_loss_maxs.append(update.policy_loss_max)
@@ -1094,7 +1158,7 @@ def run_training(
         episode_gradient_norm_maxs.append(update.gradient_norm_max)
         episode_entropies.append(update.entropy)
         episode_approximate_kls.append(update.approximate_kl)
-        if context.policy_schema in V2_POLICY_SCHEMAS:
+        if context.policy_schema in MODERN_POLICY_SCHEMAS:
             _append_critic_diagnostics(
                 critic_diagnostics_path,
                 seed=seed,
@@ -1197,6 +1261,14 @@ def run_training(
                 raise FloatingPointError("PPO v2 episode metrics 非 finite。")
             epoch_runtime_seconds = float(time.perf_counter() - episode_started_at)
             epoch_return = float(episode_reward_array.sum())
+            (
+                critic_explained_variance,
+                critic_value_std,
+                critic_target_std,
+            ) = _critic_episode_metrics(
+                episode_critic_values,
+                episode_critic_targets,
+            )
             cache_change_rate = float(episode_actual_cache_updates) / float(
                 len(episode_reward_array) * cache_count
             )
@@ -1206,7 +1278,7 @@ def run_training(
             epoch_entropy = float(np.mean(episode_entropies))
             epoch_approximate_kl = float(np.mean(episode_approximate_kls))
             if (
-                context.policy_schema in V2_POLICY_SCHEMAS
+                context.policy_schema in MODERN_POLICY_SCHEMAS
                 and (best_epoch_return is None or epoch_return > best_epoch_return)
             ):
                 best_epoch = int(episode_number)
@@ -1248,6 +1320,9 @@ def run_training(
                     "mean_reward": float(episode_reward_array.mean()),
                     "mean_G": float(episode_g_array.mean()),
                     "reward_std": float(episode_reward_array.std()),
+                    "critic_explained_variance": critic_explained_variance,
+                    "critic_value_std": critic_value_std,
+                    "critic_target_std": critic_target_std,
                     "cache_request_count": int(episode_cache_requests),
                     "actual_cache_update_count": int(episode_actual_cache_updates),
                     "uav_request_count": int(episode_uav_requests),

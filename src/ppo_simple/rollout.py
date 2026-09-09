@@ -88,23 +88,14 @@ def _observation(
     train_origin_start: int,
     train_origin_end: int,
 ) -> np.ndarray:
-    time_to_go = (
-        interface.normalized_time_to_go(
-            step.origin_index,
-            train_origin_start,
-            train_origin_end,
-        )
-        if observation_spec.time_to_go_slice is not None
-        else None
-    )
-    return interface.build_configuration_observation(
+    return interface.build_step_observation(
         previous_cache,
         previous_uav,
-        step.predicted_vehicle_positions,
-        step.predicted_service_popularity,
+        step,
         observation_spec,
         flight_boundary,
-        time_to_go=time_to_go,
+        train_origin_start,
+        train_origin_end,
     )
 
 

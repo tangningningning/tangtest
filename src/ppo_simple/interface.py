@@ -109,8 +109,10 @@ class ConfigurationObservationSpec:
     uav_position_slice: slice
     predicted_vehicle_slice: slice
     popularity_slice: slice
+    horizon_mask_slice: slice | None
     time_to_go_slice: slice | None
     observation_dim: int
+    prediction_horizon: int = 1
 
     @classmethod
     def create(
@@ -121,6 +123,8 @@ class ConfigurationObservationSpec:
         vehicle_ids: list[str] | tuple[str, ...],
         *,
         include_time_to_go: bool = False,
+        prediction_horizon: int = 1,
+        include_prediction_horizon_mask: bool = False,
     ) -> "ConfigurationObservationSpec":
         cache_node_ids_t = tuple(str(value) for value in cache_node_ids)
         service_ids_t = tuple(int(value) for value in service_ids)
@@ -134,6 +138,11 @@ class ConfigurationObservationSpec:
             raise ValueError("uav_ids 不能为空且不能重复。")
         if len(set(vehicle_ids_t)) != len(vehicle_ids_t) or not vehicle_ids_t:
             raise ValueError("vehicle_ids 不能为空且不能重复。")
+        prediction_horizon_i = int(prediction_horizon)
+        if prediction_horizon_i <= 0:
+            raise ValueError("prediction_horizon 必须大于0。")
+        if include_prediction_horizon_mask and prediction_horizon_i <= 1:
+            raise ValueError("prediction_horizon mask 需要 prediction_horizon > 1。")
 
         start = 0
         cache_len = len(cache_node_ids_t) * len(service_ids_t)
@@ -142,12 +151,16 @@ class ConfigurationObservationSpec:
         uav_len = len(uav_ids_t) * 2
         uav_position_slice = slice(start, start + uav_len)
         start += uav_len
-        vehicle_len = len(vehicle_ids_t) * 2
+        vehicle_len = len(vehicle_ids_t) * 2 * prediction_horizon_i
         predicted_vehicle_slice = slice(start, start + vehicle_len)
         start += vehicle_len
-        popularity_len = len(service_ids_t)
+        popularity_len = len(service_ids_t) * prediction_horizon_i
         popularity_slice = slice(start, start + popularity_len)
         start += popularity_len
+        horizon_mask_slice = None
+        if include_prediction_horizon_mask:
+            horizon_mask_slice = slice(start, start + prediction_horizon_i)
+            start += prediction_horizon_i
         time_to_go_slice = None
         if include_time_to_go:
             time_to_go_slice = slice(start, start + 1)
@@ -161,8 +174,10 @@ class ConfigurationObservationSpec:
             uav_position_slice=uav_position_slice,
             predicted_vehicle_slice=predicted_vehicle_slice,
             popularity_slice=popularity_slice,
+            horizon_mask_slice=horizon_mask_slice,
             time_to_go_slice=time_to_go_slice,
             observation_dim=start,
+            prediction_horizon=prediction_horizon_i,
         )
 
     @classmethod
@@ -174,6 +189,8 @@ class ConfigurationObservationSpec:
         vehicle_ids: list[str] | tuple[str, ...],
         *,
         include_time_to_go: bool = False,
+        prediction_horizon: int = 1,
+        include_prediction_horizon_mask: bool = False,
     ) -> "ConfigurationObservationSpec":
         return cls.create(
             cache_nodes["node_ids"],
@@ -181,6 +198,8 @@ class ConfigurationObservationSpec:
             uav_ids,
             vehicle_ids,
             include_time_to_go=include_time_to_go,
+            prediction_horizon=prediction_horizon,
+            include_prediction_horizon_mask=include_prediction_horizon_mask,
         )
 
 
@@ -251,6 +270,84 @@ def _ordered_popularity_array(
     return values.astype(np.float64)
 
 
+def _prediction_horizon_mask(
+    observation_spec: ConfigurationObservationSpec,
+    value: Any,
+) -> np.ndarray:
+    horizon = int(observation_spec.prediction_horizon)
+    if observation_spec.horizon_mask_slice is None:
+        if value is not None:
+            raise ValueError("v1/v2 observation 不接受 prediction horizon mask。")
+        return np.ones(horizon, dtype=bool)
+    if value is None:
+        raise ValueError("v3 observation requires prediction horizon mask")
+    mask = np.asarray(value, dtype=np.int8).reshape(-1)
+    if mask.shape != (horizon,) or not np.all(np.isin(mask, [0, 1])):
+        raise ValueError(f"prediction_horizon_mask shape/value 非法：{mask}")
+    return mask.astype(bool)
+
+
+def _ordered_vehicle_horizon_array(
+    positions: dict[str, Any] | Any,
+    ids: tuple[str, ...],
+    horizon: int,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    if horizon == 1 and isinstance(positions, dict):
+        return _ordered_position_array(positions, ids, "predicted_vehicle_positions")[None, ...]
+    try:
+        sequence = list(positions)
+    except TypeError as exc:
+        raise ValueError("predicted_vehicle_positions horizon 输入不可迭代。") from exc
+    if len(sequence) != horizon:
+        raise ValueError(
+            f"predicted_vehicle_positions horizon 数量={len(sequence)}，期望 {horizon}。"
+        )
+    arrays: list[np.ndarray] = []
+    for horizon_index, item in enumerate(sequence):
+        if valid_mask[horizon_index]:
+            arrays.append(
+                _ordered_position_array(
+                    item,
+                    ids,
+                    f"predicted_vehicle_positions[h={horizon_index}]",
+                )
+            )
+        else:
+            arrays.append(np.zeros((len(ids), 2), dtype=np.float64))
+    return np.stack(arrays, axis=0)
+
+
+def _ordered_popularity_horizon_array(
+    popularity: dict[int | str, float] | Any,
+    service_ids: tuple[int, ...],
+    horizon: int,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    if horizon == 1 and isinstance(popularity, dict):
+        return _ordered_popularity_array(popularity, service_ids)[None, ...]
+    try:
+        sequence = list(popularity)
+    except TypeError as exc:
+        raise ValueError("predicted_service_popularity horizon 输入不可迭代。") from exc
+    if len(sequence) != horizon:
+        raise ValueError(
+            f"predicted_service_popularity horizon 数量={len(sequence)}，期望 {horizon}。"
+        )
+    arrays: list[np.ndarray] = []
+    for horizon_index, item in enumerate(sequence):
+        if valid_mask[horizon_index]:
+            arrays.append(
+                _ordered_popularity_array(
+                    item,
+                    service_ids,
+                )
+            )
+        else:
+            arrays.append(np.zeros(len(service_ids), dtype=np.float64))
+    return np.stack(arrays, axis=0)
+
+
 def normalized_time_to_go(
     origin_index: int,
     train_origin_start: int,
@@ -280,6 +377,7 @@ def build_configuration_observation(
     flight_boundary: tuple[float, float, float, float],
     *,
     time_to_go: float | None = None,
+    prediction_horizon_mask: Any = None,
 ) -> np.ndarray:
     """构造只包含 state/prediction 字段的 configuration observation。"""
 
@@ -296,14 +394,21 @@ def build_configuration_observation(
         observation_spec.uav_ids,
         "previous_uav_positions",
     )
-    vehicle_positions = _ordered_position_array(
+    valid_horizon_mask = _prediction_horizon_mask(
+        observation_spec,
+        prediction_horizon_mask,
+    )
+    vehicle_positions = _ordered_vehicle_horizon_array(
         predicted_vehicle_positions,
         observation_spec.vehicle_ids,
-        "predicted_vehicle_positions",
+        int(observation_spec.prediction_horizon),
+        valid_horizon_mask,
     )
-    popularity = _ordered_popularity_array(
+    popularity = _ordered_popularity_horizon_array(
         predicted_service_popularity,
         observation_spec.service_ids,
+        int(observation_spec.prediction_horizon),
+        valid_horizon_mask,
     )
     cache_features = previous_cache.reshape(-1).astype(np.float64)
     uav_features = np.concatenate(
@@ -312,11 +417,31 @@ def build_configuration_observation(
             for index, uav_id in enumerate(observation_spec.uav_ids)
         ]
     )
-    vehicle_features = np.concatenate(
-        [
-            _normalize_xy(vehicle_positions[index], flight_boundary, f"vehicle {vehicle_id}")
-            for index, vehicle_id in enumerate(observation_spec.vehicle_ids)
-        ]
+    vehicle_feature_parts: list[np.ndarray] = []
+    for horizon_index in range(int(observation_spec.prediction_horizon)):
+        if not bool(valid_horizon_mask[horizon_index]):
+            vehicle_feature_parts.append(
+                np.zeros(len(observation_spec.vehicle_ids) * 2, dtype=np.float64)
+            )
+            continue
+        vehicle_feature_parts.append(
+            np.concatenate(
+                [
+                    _normalize_xy(
+                        vehicle_positions[horizon_index, index],
+                        flight_boundary,
+                        f"vehicle {vehicle_id} h={horizon_index}",
+                    )
+                    for index, vehicle_id in enumerate(observation_spec.vehicle_ids)
+                ]
+            )
+        )
+    vehicle_features = np.concatenate(vehicle_feature_parts)
+    popularity_features = popularity.reshape(-1)
+    horizon_mask_features = (
+        valid_horizon_mask.astype(np.float64)
+        if observation_spec.horizon_mask_slice is not None
+        else np.empty(0, dtype=np.float64)
     )
     if observation_spec.time_to_go_slice is None:
         if time_to_go is not None:
@@ -331,13 +456,60 @@ def build_configuration_observation(
         time_features = np.asarray([time_value], dtype=np.float64)
 
     observation = np.concatenate(
-        [cache_features, uav_features, vehicle_features, popularity, time_features]
+        [
+            cache_features,
+            uav_features,
+            vehicle_features,
+            popularity_features,
+            horizon_mask_features,
+            time_features,
+        ]
     )
     if observation.shape != (observation_spec.observation_dim,):
         raise AssertionError("observation length 与 spec 不一致。")
     if not np.all(np.isfinite(observation)):
         raise ValueError("observation 包含 NaN/Inf。")
     return observation.astype(np.float32)
+
+
+def build_step_observation(
+    previous_cache_state: Any,
+    previous_uav_positions: dict[str, Any] | Any,
+    step: Any,
+    observation_spec: ConfigurationObservationSpec,
+    flight_boundary: tuple[float, float, float, float],
+    train_origin_start: int,
+    train_origin_end: int,
+) -> np.ndarray:
+    """Build the single authoritative observation for trigger and primitive heads."""
+
+    time_to_go = (
+        normalized_time_to_go(
+            step.origin_index,
+            train_origin_start,
+            train_origin_end,
+        )
+        if observation_spec.time_to_go_slice is not None
+        else None
+    )
+    if int(observation_spec.prediction_horizon) > 1:
+        predicted_vehicle_positions = step.predicted_vehicle_positions_horizon
+        predicted_service_popularity = step.predicted_service_popularity_horizon
+        prediction_horizon_mask = step.prediction_horizon_mask
+    else:
+        predicted_vehicle_positions = step.predicted_vehicle_positions
+        predicted_service_popularity = step.predicted_service_popularity
+        prediction_horizon_mask = None
+    return build_configuration_observation(
+        previous_cache_state,
+        previous_uav_positions,
+        predicted_vehicle_positions,
+        predicted_service_popularity,
+        observation_spec,
+        flight_boundary,
+        time_to_go=time_to_go,
+        prediction_horizon_mask=prediction_horizon_mask,
+    )
 
 
 def build_trigger_action_mask_provider(
@@ -415,12 +587,16 @@ class AlignedRolloutStep:
     scenario_slice: dict[str, Any]
     predicted_vehicle_positions: dict[str, np.ndarray]
     predicted_service_popularity: dict[int, float]
+    predicted_vehicle_positions_horizon: tuple[dict[str, np.ndarray], ...]
+    predicted_service_popularity_horizon: tuple[dict[int, float], ...]
+    prediction_horizon_mask: np.ndarray | None
     actual_tasks: list[task_allocation.Task]
     actual_vehicle_positions: dict[str, np.ndarray]
 
 
 def _load_vehicle_prediction_h0(
     path: Path,
+    allowed_origins: set[int] | None = None,
 ) -> dict[int, dict[str, tuple[float, float, int, float]]]:
     by_origin: dict[int, dict[str, tuple[float, float, int, float]]] = {}
     with path.open("r", encoding="utf-8", newline="") as stream:
@@ -429,6 +605,8 @@ def _load_vehicle_prediction_h0(
             if int(row["horizon"]) != 0:
                 continue
             origin = int(row["origin_slot"])
+            if allowed_origins is not None and origin not in allowed_origins:
+                continue
             by_origin.setdefault(origin, {})[str(row["vehicle_id"])] = (
                 float(row["x_pred"]),
                 float(row["y_pred"]),
@@ -440,6 +618,7 @@ def _load_vehicle_prediction_h0(
 
 def _load_popularity_prediction_h0(
     path: Path,
+    allowed_origins: set[int] | None = None,
 ) -> dict[int, dict[int, tuple[float, int, float]]]:
     by_origin: dict[int, dict[int, tuple[float, int, float]]] = {}
     with path.open("r", encoding="utf-8", newline="") as stream:
@@ -448,6 +627,8 @@ def _load_popularity_prediction_h0(
             if int(row["horizon"]) != 0:
                 continue
             origin = int(row["origin_slot"])
+            if allowed_origins is not None and origin not in allowed_origins:
+                continue
             service_id = int(row["service_id"])
             by_origin.setdefault(origin, {})[service_id] = (
                 float(row["rho_pred"]),
@@ -457,12 +638,92 @@ def _load_popularity_prediction_h0(
     return by_origin
 
 
-def _load_task_time_by_slot(path: Path) -> dict[int, float]:
+def _load_vehicle_prediction_horizon(
+    path: Path,
+    prediction_horizon: int,
+    allowed_origins: set[int] | None = None,
+) -> dict[int, dict[int, dict[str, tuple[float, float, int, float]]]]:
+    """Load only predicted x/y values for every requested prediction horizon."""
+
+    horizon = int(prediction_horizon)
+    if horizon <= 0:
+        raise ValueError("prediction_horizon 必须大于0。")
+    by_origin: dict[int, dict[int, dict[str, tuple[float, float, int, float]]]] = {}
+    seen: set[tuple[int, int, str]] = set()
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        for row in reader:
+            origin = int(row["origin_slot"])
+            if allowed_origins is not None and origin not in allowed_origins:
+                continue
+            horizon_index = int(row["horizon"])
+            if not 0 <= horizon_index < horizon:
+                continue
+            vehicle_id = str(row["vehicle_id"])
+            key = (origin, horizon_index, vehicle_id)
+            if key in seen:
+                raise ValueError(
+                    "vehicle_predictions.csv duplicate prediction row: "
+                    f"origin={origin}, horizon={horizon_index}, vehicle_id={vehicle_id}"
+                )
+            seen.add(key)
+            by_origin.setdefault(origin, {}).setdefault(horizon_index, {})[vehicle_id] = (
+                float(row["x_pred"]),
+                float(row["y_pred"]),
+                int(row["target_slot"]),
+                float(row["target_time_s"]),
+            )
+    return by_origin
+
+
+def _load_popularity_prediction_horizon(
+    path: Path,
+    prediction_horizon: int,
+    allowed_origins: set[int] | None = None,
+) -> dict[int, dict[int, dict[int, tuple[float, int, float]]]]:
+    """Load rho_pred for every requested prediction horizon; never true labels."""
+
+    horizon = int(prediction_horizon)
+    if horizon <= 0:
+        raise ValueError("prediction_horizon 必须大于0。")
+    by_origin: dict[int, dict[int, dict[int, tuple[float, int, float]]]] = {}
+    seen: set[tuple[int, int, int]] = set()
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        for row in reader:
+            origin = int(row["origin_slot"])
+            if allowed_origins is not None and origin not in allowed_origins:
+                continue
+            horizon_index = int(row["horizon"])
+            if not 0 <= horizon_index < horizon:
+                continue
+            service_id = int(row["service_id"])
+            key = (origin, horizon_index, service_id)
+            if key in seen:
+                raise ValueError(
+                    "popularity_predictions.csv duplicate prediction row: "
+                    f"origin={origin}, horizon={horizon_index}, service_id={service_id}"
+                )
+            seen.add(key)
+            by_origin.setdefault(origin, {}).setdefault(horizon_index, {})[service_id] = (
+                float(row["rho_pred"]),
+                int(row["target_slot"]),
+                float(row["target_time_s"]),
+            )
+    return by_origin
+
+
+def _load_task_time_by_slot(
+    path: Path,
+    allowed_slots: set[int] | None = None,
+) -> dict[int, float]:
     result: dict[int, float] = {}
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         for row in reader:
             slot = int(row["slot"])
+            if allowed_slots is not None and slot not in allowed_slots:
+                continue
             time_s = float(row["time_s"])
             if slot in result and not math.isclose(
                 result[slot], time_s, rel_tol=0.0, abs_tol=1e-9
@@ -482,23 +743,85 @@ def prepare_aligned_rollout_steps(
     tasks_file: Path,
     trajectory_file: Path,
     include_bootstrap_step: bool = True,
+    *,
+    prediction_horizon: int = 1,
+    prediction_dt_s: float = 1.0,
+    prediction_terminal_origin: int | None = None,
+    expected_vehicle_ids: tuple[str, ...] | list[str] | None = None,
+    expected_service_ids: tuple[int, ...] | list[int] | None = None,
+    include_prediction_horizon_mask: bool = False,
 ) -> list[AlignedRolloutStep]:
     """从正式 artifact 构造已对齐 steps；不重新预测或生成场景。"""
 
     del project_root  # retained for the stable caller-facing interface
     if max_steps <= 0:
         raise ValueError("max_steps 必须大于 0。")
-    vehicle_pred = _load_vehicle_prediction_h0(vehicle_prediction_file)
-    popularity_pred = _load_popularity_prediction_h0(popularity_prediction_file)
-    task_time_by_slot = _load_task_time_by_slot(tasks_file)
+    horizon = int(prediction_horizon)
+    if horizon <= 0:
+        raise ValueError("prediction_horizon 必须大于0。")
+    prediction_dt = float(prediction_dt_s)
+    if not math.isfinite(prediction_dt) or prediction_dt <= 0.0:
+        raise ValueError("prediction_dt_s 必须是正的有限数。")
+    if horizon > 1:
+        if prediction_terminal_origin is None:
+            raise ValueError("full-horizon alignment requires prediction_terminal_origin")
+        if not include_prediction_horizon_mask:
+            raise ValueError("full-horizon alignment requires prediction horizon mask")
+    elif include_prediction_horizon_mask:
+        raise ValueError("prediction horizon mask 只能用于 prediction_horizon > 1")
+
     n_origin = int(scenarios["origin_slots"].shape[0])
     if origin_start_index < 0 or origin_start_index >= n_origin:
         raise IndexError("origin_start_index 越界。")
 
     extra_step = 1 if include_bootstrap_step else 0
     stop = min(n_origin, origin_start_index + max_steps + extra_step)
+    selected_origin_indices = list(range(origin_start_index, stop))
+    selected_origin_slots = {
+        int(cache_configuration.scenario_at_origin(scenarios, index)["origin_slot"])
+        for index in selected_origin_indices
+    }
+    task_time_by_slot = _load_task_time_by_slot(
+        tasks_file,
+        allowed_slots=selected_origin_slots,
+    )
+    if horizon > 1:
+        vehicle_pred_horizon = _load_vehicle_prediction_horizon(
+            vehicle_prediction_file,
+            horizon,
+            allowed_origins=selected_origin_slots,
+        )
+        popularity_pred_horizon = _load_popularity_prediction_horizon(
+            popularity_prediction_file,
+            horizon,
+            allowed_origins=selected_origin_slots,
+        )
+        vehicle_pred = None
+        popularity_pred = None
+    else:
+        vehicle_pred = _load_vehicle_prediction_h0(
+            vehicle_prediction_file,
+            allowed_origins=selected_origin_slots,
+        )
+        popularity_pred = _load_popularity_prediction_h0(
+            popularity_prediction_file,
+            allowed_origins=selected_origin_slots,
+        )
+        vehicle_pred_horizon = None
+        popularity_pred_horizon = None
+
+    expected_vehicle_ids_t = (
+        None
+        if expected_vehicle_ids is None
+        else tuple(str(value) for value in expected_vehicle_ids)
+    )
+    expected_service_ids_t = (
+        None
+        if expected_service_ids is None
+        else tuple(int(value) for value in expected_service_ids)
+    )
     steps: list[AlignedRolloutStep] = []
-    for origin_index in range(origin_start_index, stop):
+    for origin_index in selected_origin_indices:
         scenario = cache_configuration.scenario_at_origin(scenarios, origin_index)
         slot = int(scenario["origin_slot"])
         time_s = float(scenario["origin_time_s"])
@@ -512,44 +835,151 @@ def prepare_aligned_rollout_steps(
         if int(scenario["horizons"][0]) != 0:
             raise ValueError("scenario horizons[0] 必须为0，表示当前调度slot。")
 
-        vehicle_ids = [str(value) for value in scenario["vehicle_ids"].tolist()]
-        raw_vehicle = vehicle_pred.get(slot)
-        if raw_vehicle is None or set(raw_vehicle) != set(vehicle_ids):
-            raise ValueError(f"vehicle_predictions.csv 缺少 origin slot={slot} 的完整车辆预测。")
-        predicted_positions: dict[str, np.ndarray] = {}
-        for vehicle_id in vehicle_ids:
-            x_pred, y_pred, target_slot, target_time = raw_vehicle[vehicle_id]
-            if target_slot != slot or not math.isclose(
-                target_time,
-                time_s,
-                rel_tol=0.0,
-                abs_tol=1e-9,
-            ):
-                raise ValueError(f"vehicle prediction target 与 slot/time 不一致：slot={slot}")
-            predicted_positions[vehicle_id] = np.asarray([x_pred, y_pred], dtype=np.float64)
+        vehicle_ids = tuple(str(value) for value in scenario["vehicle_ids"].tolist())
+        if horizon > 1 and expected_vehicle_ids_t is not None:
+            if vehicle_ids != expected_vehicle_ids_t:
+                raise ValueError(
+                    "scenario vehicle IDs/order 与 observation spec 不一致："
+                    f"origin={origin_index}"
+                )
+        observation_vehicle_ids = expected_vehicle_ids_t or vehicle_ids
+        if set(observation_vehicle_ids) != set(vehicle_ids):
+            raise ValueError("observation vehicle IDs 与 scenario vehicle IDs 不一致。")
 
-        service_ids = list(range(int(scenario["rho_hat"].shape[1])))
-        raw_popularity = popularity_pred.get(slot)
-        if raw_popularity is None or set(raw_popularity) != set(service_ids):
-            raise ValueError(f"popularity_predictions.csv 缺少 origin slot={slot} 的完整服务预测。")
-        predicted_popularity: dict[int, float] = {}
-        for service_id in service_ids:
-            rho, target_slot, target_time = raw_popularity[service_id]
-            if target_slot != slot or not math.isclose(
-                target_time,
-                time_s,
-                rel_tol=0.0,
-                abs_tol=1e-9,
+        service_ids = tuple(range(int(scenario["rho_hat"].shape[1])))
+        if horizon > 1 and expected_service_ids_t is not None:
+            if service_ids != expected_service_ids_t:
+                raise ValueError(
+                    "scenario service IDs/order 与 observation spec 不一致："
+                    f"origin={origin_index}"
+                )
+        observation_service_ids = expected_service_ids_t or service_ids
+        if observation_service_ids != tuple(range(len(observation_service_ids))):
+            raise ValueError("observation service IDs 必须严格为 0..F-1。")
+
+        if horizon > 1:
+            assert vehicle_pred_horizon is not None
+            assert popularity_pred_horizon is not None
+            valid_mask = np.asarray(
+                [
+                    int(origin_index + horizon_index <= int(prediction_terminal_origin))
+                    for horizon_index in range(horizon)
+                ],
+                dtype=np.int8,
+            )
+            predicted_vehicle_horizon: list[dict[str, np.ndarray]] = []
+            predicted_popularity_horizon: list[dict[int, float]] = []
+            origin_vehicle_rows = vehicle_pred_horizon.get(slot, {})
+            origin_popularity_rows = popularity_pred_horizon.get(slot, {})
+            for horizon_index in range(horizon):
+                if not bool(valid_mask[horizon_index]):
+                    predicted_vehicle_horizon.append({})
+                    predicted_popularity_horizon.append({})
+                    continue
+                expected_slot = slot + horizon_index
+                expected_time = time_s + horizon_index * prediction_dt
+                raw_vehicle = origin_vehicle_rows.get(horizon_index)
+                if raw_vehicle is None or set(raw_vehicle) != set(vehicle_ids):
+                    raise ValueError(
+                        "vehicle_predictions.csv 缺少完整 horizon 预测："
+                        f"origin slot={slot}, horizon={horizon_index}"
+                    )
+                positions: dict[str, np.ndarray] = {}
+                for vehicle_id in observation_vehicle_ids:
+                    x_pred, y_pred, target_slot, target_time = raw_vehicle[vehicle_id]
+                    if target_slot != expected_slot or not math.isclose(
+                        target_time,
+                        expected_time,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ):
+                        raise ValueError(
+                            "vehicle prediction target 与 slot/time 不一致："
+                            f"slot={slot}, horizon={horizon_index}"
+                        )
+                    if not math.isfinite(x_pred) or not math.isfinite(y_pred):
+                        raise ValueError("vehicle prediction x_pred/y_pred 必须有限。")
+                    positions[vehicle_id] = np.asarray([x_pred, y_pred], dtype=np.float64)
+                predicted_vehicle_horizon.append(positions)
+
+                raw_popularity = origin_popularity_rows.get(horizon_index)
+                if raw_popularity is None or set(raw_popularity) != set(service_ids):
+                    raise ValueError(
+                        "popularity_predictions.csv 缺少完整 horizon 预测："
+                        f"origin slot={slot}, horizon={horizon_index}"
+                    )
+                popularity: dict[int, float] = {}
+                for service_id in observation_service_ids:
+                    rho, target_slot, target_time = raw_popularity[service_id]
+                    if target_slot != expected_slot or not math.isclose(
+                        target_time,
+                        expected_time,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ):
+                        raise ValueError(
+                            "popularity prediction target 与 slot/time 不一致："
+                            f"slot={slot}, horizon={horizon_index}"
+                        )
+                    if not math.isfinite(rho) or rho < -1e-8:
+                        raise ValueError("popularity rho_pred 必须是有限非负值。")
+                    popularity[service_id] = rho
+                if not math.isclose(
+                    sum(popularity.values()),
+                    1.0,
+                    rel_tol=1e-5,
+                    abs_tol=1e-5,
+                ):
+                    raise ValueError(
+                        f"slot={slot}, horizon={horizon_index} popularity rho_pred 未归一化。"
+                    )
+                predicted_popularity_horizon.append(popularity)
+            predicted_vehicle_horizon_t = tuple(predicted_vehicle_horizon)
+            predicted_popularity_horizon_t = tuple(predicted_popularity_horizon)
+            predicted_positions = predicted_vehicle_horizon_t[0]
+            predicted_popularity = predicted_popularity_horizon_t[0]
+            prediction_horizon_mask: np.ndarray | None = valid_mask
+        else:
+            assert vehicle_pred is not None
+            assert popularity_pred is not None
+            raw_vehicle = vehicle_pred.get(slot)
+            if raw_vehicle is None or set(raw_vehicle) != set(vehicle_ids):
+                raise ValueError(f"vehicle_predictions.csv 缺少 origin slot={slot} 的完整车辆预测。")
+            predicted_positions = {}
+            for vehicle_id in vehicle_ids:
+                x_pred, y_pred, target_slot, target_time = raw_vehicle[vehicle_id]
+                if target_slot != slot or not math.isclose(
+                    target_time,
+                    time_s,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ):
+                    raise ValueError(f"vehicle prediction target 与 slot/time 不一致：slot={slot}")
+                predicted_positions[vehicle_id] = np.asarray([x_pred, y_pred], dtype=np.float64)
+            raw_popularity = popularity_pred.get(slot)
+            if raw_popularity is None or set(raw_popularity) != set(service_ids):
+                raise ValueError(f"popularity_predictions.csv 缺少 origin slot={slot} 的完整服务预测。")
+            predicted_popularity = {}
+            for service_id in service_ids:
+                rho, target_slot, target_time = raw_popularity[service_id]
+                if target_slot != slot or not math.isclose(
+                    target_time,
+                    time_s,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ):
+                    raise ValueError(f"popularity prediction target 与 slot/time 不一致：slot={slot}")
+                predicted_popularity[service_id] = rho
+            if not math.isclose(
+                sum(predicted_popularity.values()),
+                1.0,
+                rel_tol=1e-5,
+                abs_tol=1e-5,
             ):
-                raise ValueError(f"popularity prediction target 与 slot/time 不一致：slot={slot}")
-            predicted_popularity[service_id] = rho
-        if not math.isclose(
-            sum(predicted_popularity.values()),
-            1.0,
-            rel_tol=1e-5,
-            abs_tol=1e-5,
-        ):
-            raise ValueError(f"slot={slot} popularity rho_pred 未归一化。")
+                raise ValueError(f"slot={slot} popularity rho_pred 未归一化。")
+            predicted_vehicle_horizon_t = (predicted_positions,)
+            predicted_popularity_horizon_t = (predicted_popularity,)
+            prediction_horizon_mask = None
 
         actual_tasks = task_allocation.load_actual_tasks(tasks_file, slot)
         sv_ids = {str(value) for value in scenario["service_vehicle_ids"].tolist()}
@@ -567,6 +997,9 @@ def prepare_aligned_rollout_steps(
                 scenario_slice=scenario,
                 predicted_vehicle_positions=predicted_positions,
                 predicted_service_popularity=predicted_popularity,
+                predicted_vehicle_positions_horizon=predicted_vehicle_horizon_t,
+                predicted_service_popularity_horizon=predicted_popularity_horizon_t,
+                prediction_horizon_mask=prediction_horizon_mask,
                 actual_tasks=actual_tasks,
                 actual_vehicle_positions=actual_positions,
             )

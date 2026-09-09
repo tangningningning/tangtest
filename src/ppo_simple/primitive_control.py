@@ -71,23 +71,14 @@ def _intermediate_observation(
     step: Any,
     context: Any,
 ) -> np.ndarray:
-    time_to_go = (
-        interface.normalized_time_to_go(
-            step.origin_index,
-            context.train_origin_start,
-            context.train_origin_end,
-        )
-        if context.observation_spec.time_to_go_slice is not None
-        else None
-    )
-    return interface.build_configuration_observation(
+    return interface.build_step_observation(
         cache_state,
         uav_positions,
-        step.predicted_vehicle_positions,
-        step.predicted_service_popularity,
+        step,
         context.observation_spec,
         context.flight_boundary,
-        time_to_go=time_to_go,
+        context.train_origin_start,
+        context.train_origin_end,
     )
 
 
