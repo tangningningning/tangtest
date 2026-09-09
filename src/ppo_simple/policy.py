@@ -204,10 +204,14 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
         obs, single = self._observations(observations)
         hidden = self.encoder(obs)
         logits = self.actor_head(hidden)
-        values = self.critic_head(hidden).squeeze(-1)
+        values = self._critic_values(obs, hidden)
         if single:
             return logits.squeeze(0), values.squeeze(0)
         return logits, values
+
+    def _critic_values(self, observations: Any, actor_hidden: Any) -> Any:
+        del observations
+        return self.critic_head(actor_hidden).squeeze(-1)
 
     def _masked_distribution(self, logits: Any, masks: Any) -> Any:
         binary_logits = torch.stack([torch.zeros_like(logits), logits], dim=-1)
@@ -264,7 +268,7 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
         obs, _ = self._observations(observations)
         hidden = self.encoder(obs)
         logits = self.actor_head(hidden)
-        values = self.critic_head(hidden).squeeze(-1)
+        values = self._critic_values(obs, hidden)
         action_values = _validate_binary_actions(actions, self.action_dim).to(logits.device)
         masks = _normalize_masks(action_masks, int(obs.shape[0]), self.action_dim, logits.device)
         distribution = self._masked_distribution(logits, masks)
@@ -554,3 +558,39 @@ class AdaptivePrimitiveHorizonGroupedV3ActorCritic(AdaptivePrimitiveGroupedV2Act
 
     architecture_id = "adaptive_primitive_v3_horizon_grouped"
     architecture_version = 1
+
+
+class AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic(
+    AdaptivePrimitiveHorizonGroupedV3ActorCritic
+):
+    """V3 horizon/grouped policy with an independent critic representation."""
+
+    architecture_id = "adaptive_primitive_v4_horizon_grouped_separate_critic"
+    architecture_version = 1
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        cache_feature_dim: int,
+        uav_feature_dim: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(
+            observation_dim,
+            action_dim,
+            cache_feature_dim,
+            uav_feature_dim,
+            hidden_sizes,
+        )
+        critic_layers: list[Any] = []
+        last_dim = self.observation_dim
+        for hidden_size in hidden_sizes:
+            critic_layers.extend([nn.Linear(last_dim, int(hidden_size)), nn.Tanh()])
+            last_dim = int(hidden_size)
+        self.critic_encoder = nn.Sequential(*critic_layers)
+        self.critic_head = nn.Linear(last_dim, 1)
+
+    def _critic_values(self, observations: Any, actor_hidden: Any) -> Any:
+        del actor_hidden
+        return self.critic_head(self.critic_encoder(observations)).squeeze(-1)

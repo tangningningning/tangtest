@@ -619,12 +619,14 @@ def validate_config(config: dict[str, Any]) -> None:
         "adaptive_primitive_v2",
         "adaptive_primitive_v2_grouped",
         "adaptive_primitive_v3_horizon_grouped",
+        "adaptive_primitive_v4_horizon_grouped_separate_critic",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
             "adaptive_primitive_v1/adaptive_primitive_v2/"
             "adaptive_primitive_v2_grouped/"
-            "adaptive_primitive_v3_horizon_grouped."
+            "adaptive_primitive_v3_horizon_grouped/"
+            "adaptive_primitive_v4_horizon_grouped_separate_critic."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:

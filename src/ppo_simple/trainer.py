@@ -29,6 +29,7 @@ from .policy import (
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
     AdaptivePrimitiveHorizonGroupedV3ActorCritic,
+    AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic,
     AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
@@ -56,7 +57,11 @@ V2_POLICY_SCHEMAS = frozenset(
 V3_POLICY_SCHEMAS = frozenset(
     {AdaptivePrimitiveHorizonGroupedV3ActorCritic.architecture_id}
 )
-MODERN_POLICY_SCHEMAS = V2_POLICY_SCHEMAS | V3_POLICY_SCHEMAS
+V4_POLICY_SCHEMAS = frozenset(
+    {AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic.architecture_id}
+)
+HORIZON_POLICY_SCHEMAS = V3_POLICY_SCHEMAS | V4_POLICY_SCHEMAS
+MODERN_POLICY_SCHEMAS = V2_POLICY_SCHEMAS | HORIZON_POLICY_SCHEMAS
 
 
 def _require_torch() -> None:
@@ -322,7 +327,7 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
             "adaptive_primitive_v1",
         )
     )
-    horizon_policy = policy_schema in V3_POLICY_SCHEMAS
+    horizon_policy = policy_schema in HORIZON_POLICY_SCHEMAS
     prediction_horizon = (
         int(project_config.get_config_value(cfg, "prediction.vehicle.horizon"))
         if horizon_policy
@@ -495,6 +500,11 @@ class PPOV2Trainer:
                 policy_class = AdaptivePrimitiveGroupedV2ActorCritic
             elif context.policy_schema == AdaptivePrimitiveHorizonGroupedV3ActorCritic.architecture_id:
                 policy_class = AdaptivePrimitiveHorizonGroupedV3ActorCritic
+            elif (
+                context.policy_schema
+                == AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic.architecture_id
+            ):
+                policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic
             else:
                 raise ValueError(
                     "unknown policy_primitive policy_schema="
