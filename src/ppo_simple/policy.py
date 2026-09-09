@@ -76,6 +76,85 @@ def _normalize_masks(action_masks: Any, batch_size: int, action_dim: int, device
     return masks
 
 
+def _group_balance_candidate_logits(
+    raw_scores: Any,
+    candidate_features: Any,
+    candidate_masks: Any,
+    operation_slice: slice,
+    active_heads: Any | None = None,
+) -> Any:
+    """Return masked logits with equal-score probability balanced by operation group."""
+
+    scores = torch.as_tensor(raw_scores)
+    features = torch.as_tensor(
+        candidate_features,
+        dtype=torch.float32,
+        device=scores.device,
+    )
+    if scores.ndim < 1 or features.ndim != scores.ndim + 1:
+        raise ValueError("raw_scores/candidate_features 维度不匹配。")
+    if tuple(features.shape[:-1]) != tuple(scores.shape):
+        raise ValueError("candidate_features 必须与 raw_scores 对齐。")
+    candidate_count = int(scores.shape[-1])
+    start = 0 if operation_slice.start is None else int(operation_slice.start)
+    stop = int(features.shape[-1]) if operation_slice.stop is None else int(operation_slice.stop)
+    if start < 0 or stop <= start or stop > int(features.shape[-1]):
+        raise ValueError("operation_slice 超出 candidate feature 范围。")
+    masks = (
+        torch.ones_like(scores, dtype=torch.bool)
+        if candidate_masks is None
+        else torch.as_tensor(candidate_masks, dtype=torch.bool, device=scores.device)
+    )
+    if tuple(masks.shape) != tuple(scores.shape):
+        raise ValueError("candidate_masks 必须与 raw_scores 对齐。")
+    if not bool(torch.all(torch.any(masks, dim=-1)).item()):
+        raise ValueError("每个 conditional head 至少需要一个 valid candidate。")
+    if not bool(torch.all(torch.isfinite(scores)).item()):
+        raise ValueError("candidate scores 包含 NaN/Inf。")
+    if active_heads is None:
+        active = torch.ones(scores.shape[:-1], dtype=torch.bool, device=scores.device)
+    else:
+        active = torch.as_tensor(active_heads, dtype=torch.bool, device=scores.device)
+        if tuple(active.shape) != tuple(scores.shape[:-1]):
+            raise ValueError("active_heads 必须与 candidate head 维度对齐。")
+
+    flat_scores = scores.reshape(-1, candidate_count)
+    flat_features = features.reshape(-1, candidate_count, int(features.shape[-1]))
+    flat_masks = masks.reshape(-1, candidate_count)
+    flat_active = active.reshape(-1)
+    operation_values = flat_features[..., start:stop]
+    if not bool(torch.all(torch.isfinite(operation_values)).item()):
+        raise ValueError("candidate operation feature 包含 NaN/Inf。")
+    group_ids = torch.argmax(operation_values, dim=-1)
+    flat_balanced = flat_scores.clone()
+    for row_index in range(int(flat_scores.shape[0])):
+        if not bool(flat_active[row_index].item()):
+            continue
+        valid_operations = operation_values[row_index][flat_masks[row_index]]
+        if valid_operations.ndim != 2 or not int(valid_operations.shape[0]):
+            raise ValueError("active head 没有 valid operation candidate。")
+        if not bool(torch.all((valid_operations == 0.0) | (valid_operations == 1.0)).item()):
+            raise ValueError("active candidate operation 必须是 one-hot。")
+        if not bool(torch.all(valid_operations.sum(dim=-1) == 1.0).item()):
+            raise ValueError("active candidate 必须属于唯一 operation group。")
+        row_groups = group_ids[row_index]
+        group_counts = torch.zeros(
+            (stop - start,), dtype=torch.long, device=scores.device
+        )
+        group_counts.scatter_add_(
+            0,
+            row_groups[flat_masks[row_index]],
+            torch.ones_like(row_groups[flat_masks[row_index]], dtype=torch.long),
+        )
+        valid_counts = group_counts.gather(0, row_groups)
+        if bool(torch.any(valid_counts[flat_masks[row_index]] < 1).item()):
+            raise ValueError("valid candidate 的 group_count 必须至少为1。")
+        flat_balanced[row_index] = flat_scores[row_index] - torch.log(
+            valid_counts.to(dtype=flat_scores.dtype)
+        )
+    return flat_balanced.reshape(scores.shape).masked_fill(~masks, -float("inf"))
+
+
 class BernoulliActorCritic(nn.Module if nn is not None else object):
     """Dimension-driven MLP actor-critic with independent binary requests."""
 
@@ -261,6 +340,10 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         scores = scorer(torch.cat([expanded_hidden, features], dim=-1)).squeeze(-1)
         return scores, single
 
+    def _candidate_operation_slice(self, candidate_kind: str) -> slice | None:
+        del candidate_kind
+        return None
+
     def _sample_candidate(
         self,
         observation: Any,
@@ -268,6 +351,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         feature_dim: int,
         scorer: Any,
         deterministic: bool,
+        operation_slice: slice | None = None,
     ) -> CandidatePolicySample:
         scores, single = self._candidate_scores(
             observation,
@@ -277,7 +361,15 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         )
         if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
             raise ValueError("conditional candidate sampling 需要单个 context。")
-        distribution = torch.distributions.Categorical(logits=scores.squeeze(0))
+        distribution_logits = scores.squeeze(0)
+        if operation_slice is not None:
+            distribution_logits = _group_balance_candidate_logits(
+                distribution_logits,
+                candidate_features,
+                None,
+                operation_slice,
+            )
+        distribution = torch.distributions.Categorical(logits=distribution_logits)
         selected = (
             int(torch.argmax(distribution.logits).item())
             if deterministic
@@ -288,7 +380,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             selected_index=selected,
             log_prob=distribution.log_prob(selected_tensor),
             entropy=distribution.entropy(),
-            logits=scores.squeeze(0),
+            logits=distribution_logits,
         )
 
     def sample_cache_candidate(
@@ -303,6 +395,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             self.cache_feature_dim,
             self.cache_candidate_scorer,
             deterministic,
+            self._candidate_operation_slice("cache"),
         )
 
     def sample_uav_candidate(
@@ -317,6 +410,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             self.uav_feature_dim,
             self.uav_candidate_scorer,
             deterministic,
+            self._candidate_operation_slice("uav"),
         )
 
     def _evaluate_conditional_heads(
@@ -328,6 +422,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         active_heads: Any,
         feature_dim: int,
         scorer: Any,
+        operation_slice: slice | None = None,
     ) -> tuple[Any, Any]:
         contexts_t = torch.as_tensor(contexts, dtype=torch.float32)
         features_t = torch.as_tensor(candidate_features, dtype=torch.float32)
@@ -367,9 +462,16 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         selected_valid = masks_t.gather(-1, selected_t.unsqueeze(-1)).squeeze(-1)
         if not bool(torch.all(selected_valid).item()):
             raise ValueError("conditional selected index 被 candidate mask 屏蔽。")
-        distribution = torch.distributions.Categorical(
-            logits=scores.masked_fill(~masks_t, -float("inf"))
-        )
+        distribution_logits = scores.masked_fill(~masks_t.to(scores.device), -float("inf"))
+        if operation_slice is not None:
+            distribution_logits = _group_balance_candidate_logits(
+                scores,
+                features_t,
+                masks_t,
+                operation_slice,
+                active_heads=active_t,
+            )
+        distribution = torch.distributions.Categorical(logits=distribution_logits)
         active_float = active_t.to(torch.float32)
         log_prob = (distribution.log_prob(selected_t) * active_float).sum(dim=-1)
         entropy = (distribution.entropy() * active_float).sum(dim=-1)
@@ -404,6 +506,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             cache_active,
             self.cache_feature_dim,
             self.cache_candidate_scorer,
+            self._candidate_operation_slice("cache"),
         )
         uav_log_prob, uav_entropy = self._evaluate_conditional_heads(
             uav_contexts,
@@ -413,6 +516,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             uav_active,
             self.uav_feature_dim,
             self.uav_candidate_scorer,
+            self._candidate_operation_slice("uav"),
         )
         return PolicyEvaluation(
             log_prob=trigger.log_prob + cache_log_prob + uav_log_prob,
@@ -426,3 +530,20 @@ class AdaptivePrimitiveV2ActorCritic(AdaptivePrimitiveActorCritic):
     """Scheme B policy with the v2 finite-horizon observation schema."""
 
     architecture_id = "adaptive_primitive_v2"
+
+
+class AdaptivePrimitiveGroupedV2ActorCritic(AdaptivePrimitiveV2ActorCritic):
+    """v2 policy with operation-group-balanced conditional candidate logits."""
+
+    architecture_id = "adaptive_primitive_v2_grouped"
+    architecture_version = 1
+
+    def _candidate_operation_slice(self, candidate_kind: str) -> slice:
+        if candidate_kind == "cache":
+            return slice(4, 8)
+        if candidate_kind == "uav":
+            uav_count = int(self.uav_feature_dim) - 16
+            if uav_count <= 0:
+                raise ValueError("UAV candidate feature dimension 缺少 UAV identity one-hot。")
+            return slice(1 + uav_count, 3 + uav_count)
+        raise ValueError(f"unknown candidate kind={candidate_kind}")

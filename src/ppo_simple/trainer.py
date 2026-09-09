@@ -27,6 +27,7 @@ from . import interface
 from .interface import _copy_uav_positions
 from .policy import (
     AdaptivePrimitiveActorCritic,
+    AdaptivePrimitiveGroupedV2ActorCritic,
     AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
@@ -45,6 +46,12 @@ CRITIC_VALUE_SCALE_NONE = "none"
 CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
 DEFAULT_CRITIC_VALUE_SCALE_EPSILON = 1.0e-8
 DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES = 64
+V2_POLICY_SCHEMAS = frozenset(
+    {
+        AdaptivePrimitiveV2ActorCritic.architecture_id,
+        AdaptivePrimitiveGroupedV2ActorCritic.architecture_id,
+    }
+)
 
 
 def _require_torch() -> None:
@@ -286,9 +293,7 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
-        include_time_to_go=(
-            policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id
-        ),
+        include_time_to_go=policy_schema in V2_POLICY_SCHEMAS,
     )
     initial_cache = cache_configuration.popularity_aware_initial_cache(
         service_catalog,
@@ -434,6 +439,8 @@ class PPOV2Trainer:
                 policy_class = AdaptivePrimitiveActorCritic
             elif context.policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id:
                 policy_class = AdaptivePrimitiveV2ActorCritic
+            elif context.policy_schema == AdaptivePrimitiveGroupedV2ActorCritic.architecture_id:
+                policy_class = AdaptivePrimitiveGroupedV2ActorCritic
             else:
                 raise ValueError(
                     "unknown policy_primitive policy_schema="
@@ -758,7 +765,7 @@ class PPOV2Trainer:
                 "torch": torch.get_rng_state(),
             },
         }
-        if self.policy.architecture_id == AdaptivePrimitiveV2ActorCritic.architecture_id:
+        if self.policy.architecture_id in V2_POLICY_SCHEMAS:
             payload["best_epoch"] = int(best_epoch)
             payload["best_epoch_return"] = (
                 None if best_epoch_return is None else float(best_epoch_return)
@@ -1087,7 +1094,7 @@ def run_training(
         episode_gradient_norm_maxs.append(update.gradient_norm_max)
         episode_entropies.append(update.entropy)
         episode_approximate_kls.append(update.approximate_kl)
-        if context.policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id:
+        if context.policy_schema in V2_POLICY_SCHEMAS:
             _append_critic_diagnostics(
                 critic_diagnostics_path,
                 seed=seed,
@@ -1199,7 +1206,7 @@ def run_training(
             epoch_entropy = float(np.mean(episode_entropies))
             epoch_approximate_kl = float(np.mean(episode_approximate_kls))
             if (
-                context.policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id
+                context.policy_schema in V2_POLICY_SCHEMAS
                 and (best_epoch_return is None or epoch_return > best_epoch_return)
             ):
                 best_epoch = int(episode_number)
