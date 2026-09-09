@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -38,7 +39,12 @@ CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 CHECKPOINT_VERSION = 2
 PRIMITIVE_CHECKPOINT_VERSION = 3
+VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
 DEFAULT_ROLLOUT_STEPS = 16
+CRITIC_VALUE_SCALE_NONE = "none"
+CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
+DEFAULT_CRITIC_VALUE_SCALE_EPSILON = 1.0e-8
+DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES = 64
 
 
 def _require_torch() -> None:
@@ -78,12 +84,72 @@ class PPOV2Hyperparameters:
     update_epochs: int
     num_minibatches: int
     hidden_sizes: tuple[int, ...]
+    critic_value_scale_mode: str
+    critic_value_scale_epsilon: float
+    critic_value_scale_warmup_samples: int
+
+
+@dataclass
+class RunningReturnStatistics:
+    """Population Welford statistics for completed training raw returns."""
+
+    count: int = 0
+    mean: float = 0.0
+    m2: float = 0.0
+
+    def scale(self, epsilon: float, warmup_samples: int) -> float:
+        minimum_count = max(2, int(warmup_samples))
+        if self.count < minimum_count:
+            return 1.0
+        variance = self.m2 / float(self.count)
+        if not math.isfinite(variance) or variance <= float(epsilon):
+            return 1.0
+        scale = math.sqrt(variance + float(epsilon))
+        if not math.isfinite(scale) or scale <= 0.0:
+            return 1.0
+        return float(scale)
+
+    def update(self, values: Any) -> None:
+        values_a = np.asarray(values, dtype=np.float64).reshape(-1)
+        if not len(values_a) or not np.all(np.isfinite(values_a)):
+            raise ValueError("running return statistics requires finite non-empty values")
+        for value in values_a:
+            self.count += 1
+            delta = float(value) - self.mean
+            self.mean += delta / float(self.count)
+            delta_after = float(value) - self.mean
+            self.m2 += delta * delta_after
+        if (
+            self.count < 0
+            or not math.isfinite(self.mean)
+            or not math.isfinite(self.m2)
+            or self.m2 < 0.0
+        ):
+            raise FloatingPointError("running return statistics became non-finite")
+
+    @classmethod
+    def from_checkpoint(cls, count: Any, mean: Any, m2: Any) -> "RunningReturnStatistics":
+        count_i = int(count)
+        mean_f = float(mean)
+        m2_f = float(m2)
+        if (
+            count_i < 0
+            or not math.isfinite(mean_f)
+            or not math.isfinite(m2_f)
+            or m2_f < 0.0
+        ):
+            raise ValueError("checkpoint running return statistics are invalid")
+        if count_i == 0 and (mean_f != 0.0 or m2_f != 0.0):
+            raise ValueError("empty checkpoint running return statistics must be zero")
+        return cls(count=count_i, mean=mean_f, m2=m2_f)
 
 
 @dataclass(frozen=True)
 class UpdateResult:
     policy_loss: float
     value_loss: float
+    raw_value_loss: float
+    critic_return_scale: float
     entropy: float
     approximate_kl: float
     clip_fraction: float
@@ -158,6 +224,7 @@ def _append_critic_diagnostics(
         old_value = float(transition.old_value)
         target = float(raw_return)
         residual = old_value - target
+        normalized_residual = residual / float(update.critic_return_scale)
         values = (old_value, float(raw_advantage), target, update.bootstrap_value, residual)
         if not all(np.isfinite(value) for value in values):
             raise FloatingPointError("critic diagnostics contain non-finite values")
@@ -179,6 +246,8 @@ def _append_critic_diagnostics(
                 "bootstrap_value": float(update.bootstrap_value),
                 "value_residual": residual,
                 "abs_value_residual": abs(residual),
+                "critic_return_scale": float(update.critic_return_scale),
+                "normalized_value_residual": normalized_residual,
             },
         )
 
@@ -268,6 +337,27 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         update_epochs=int(get(cfg, "algorithm.ppo.update_epochs")),
         num_minibatches=int(get(cfg, "algorithm.ppo.num_minibatches")),
         hidden_sizes=hidden_sizes,
+        critic_value_scale_mode=str(
+            get(
+                cfg,
+                "algorithm.ppo.critic_value_scale_mode",
+                CRITIC_VALUE_SCALE_NONE,
+            )
+        ),
+        critic_value_scale_epsilon=float(
+            get(
+                cfg,
+                "algorithm.ppo.critic_value_scale_epsilon",
+                DEFAULT_CRITIC_VALUE_SCALE_EPSILON,
+            )
+        ),
+        critic_value_scale_warmup_samples=int(
+            get(
+                cfg,
+                "algorithm.ppo.critic_value_scale_warmup_samples",
+                DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES,
+            )
+        ),
     )
     if values.gamma < 0.0 or values.gamma > 1.0:
         raise ValueError("gamma 必须位于 [0,1]。")
@@ -281,6 +371,20 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         raise ValueError("PPO v2 entropy/max_grad_norm 非法。")
     if values.update_epochs <= 0 or values.num_minibatches <= 0:
         raise ValueError("PPO v2 update_epochs/num_minibatches 必须为正整数。")
+    if values.critic_value_scale_mode not in {
+        CRITIC_VALUE_SCALE_NONE,
+        CRITIC_VALUE_SCALE_RUNNING_RETURN_STD,
+    }:
+        raise ValueError(
+            "critic_value_scale_mode 只支持 none/running_return_std。"
+        )
+    if (
+        not math.isfinite(values.critic_value_scale_epsilon)
+        or values.critic_value_scale_epsilon <= 0.0
+    ):
+        raise ValueError("critic_value_scale_epsilon 必须是正的有限数。")
+    if values.critic_value_scale_warmup_samples < 0:
+        raise ValueError("critic_value_scale_warmup_samples 必须为非负整数。")
     return values
 
 
@@ -357,6 +461,27 @@ class PPOV2Trainer:
             lr=self.hyperparameters.learning_rate,
         )
         self.optimizer_steps = 0
+        self.critic_return_statistics = RunningReturnStatistics()
+
+    def _critic_return_scale(self) -> float:
+        if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_NONE:
+            return 1.0
+        return self.critic_return_statistics.scale(
+            self.hyperparameters.critic_value_scale_epsilon,
+            self.hyperparameters.critic_value_scale_warmup_samples,
+        )
+
+    def _expected_checkpoint_version(self) -> int:
+        if (
+            self.hyperparameters.critic_value_scale_mode
+            == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD
+        ):
+            return VALUE_NORMALIZED_CHECKPOINT_VERSION
+        return (
+            PRIMITIVE_CHECKPOINT_VERSION
+            if self.context.configuration_control_mode == "policy_primitive"
+            else CHECKPOINT_VERSION
+        )
 
     def collect_chunk(
         self,
@@ -426,6 +551,9 @@ class PPOV2Trainer:
         advantages_finite = bool(np.all(np.isfinite(advantages)))
         if not returns_finite or not advantages_finite:
             raise FloatingPointError("PPO v2 return/advantage 非 finite。")
+        critic_return_scale = self._critic_return_scale()
+        if not np.isfinite(critic_return_scale) or critic_return_scale <= 0.0:
+            raise FloatingPointError("PPO v2 critic return scale 非 finite。")
         sample_count = int(rollout.observations.shape[0])
         if sample_count < hyper.num_minibatches or sample_count % hyper.num_minibatches != 0:
             raise ValueError("PPO v2 rollout length 必须可被 num_minibatches 整除。")
@@ -465,6 +593,7 @@ class PPOV2Trainer:
         before = [parameter.detach().clone() for parameter in self.policy.parameters()]
         policy_loss_value = 0.0
         value_loss_value = 0.0
+        raw_value_loss_value = 0.0
         entropy_value = 0.0
         approximate_kl_value = 0.0
         clip_fraction_value = 0.0
@@ -514,14 +643,19 @@ class PPOV2Trainer:
                     (torch.abs(ratio - 1.0) > hyper.clip_epsilon).to(torch.float32)
                 )
                 policy_loss = -torch.minimum(unclipped, clipped).mean()
-                value_loss = 0.5 * torch.mean((evaluation.value - returns_t[indices]) ** 2)
+                value_residual = evaluation.value - returns_t[indices]
+                raw_value_loss = 0.5 * torch.mean(value_residual**2)
+                normalized_value_residual = value_residual / critic_return_scale
+                value_loss = 0.5 * torch.mean(normalized_value_residual**2)
                 entropy = evaluation.entropy.mean()
                 total_loss = (
                     policy_loss
                     + hyper.value_loss_coefficient * value_loss
                     - hyper.entropy_coefficient * entropy
                 )
-                if not bool(torch.isfinite(total_loss).item()):
+                if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
+                    torch.isfinite(value_loss).item()
+                ) or not bool(torch.isfinite(total_loss).item()):
                     raise FloatingPointError("PPO v2 total loss 非 finite。")
                 self.optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
@@ -540,6 +674,7 @@ class PPOV2Trainer:
                 self.optimizer_steps += 1
                 policy_loss_value = float(policy_loss.detach().cpu())
                 value_loss_value = float(value_loss.detach().cpu())
+                raw_value_loss_value = float(raw_value_loss.detach().cpu())
                 entropy_value = float(entropy.detach().cpu())
                 approximate_kl_value = float(approximate_kl.detach().cpu())
                 clip_fraction_value = float(clip_fraction.detach().cpu())
@@ -548,12 +683,16 @@ class PPOV2Trainer:
                 value_loss_values.append(value_loss_value)
                 approximate_kl_values.append(approximate_kl_value)
                 gradient_norm_values.append(gradient_norm_value)
+        if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
+            self.critic_return_statistics.update(returns)
         delta_squared = 0.0
         for old_parameter, new_parameter in zip(before, self.policy.parameters()):
             delta_squared += float(torch.sum((new_parameter.detach() - old_parameter) ** 2).cpu())
         return UpdateResult(
             policy_loss=policy_loss_value,
             value_loss=value_loss_value,
+            raw_value_loss=raw_value_loss_value,
+            critic_return_scale=critic_return_scale,
             entropy=entropy_value,
             approximate_kl=approximate_kl_value,
             clip_fraction=clip_fraction_value,
@@ -589,14 +728,18 @@ class PPOV2Trainer:
         best_epoch_return: float | None = None,
     ) -> dict[str, Any]:
         payload = {
-            "checkpoint_version": (
-                PRIMITIVE_CHECKPOINT_VERSION
-                if self.context.configuration_control_mode == "policy_primitive"
-                else CHECKPOINT_VERSION
-            ),
+            "checkpoint_version": self._expected_checkpoint_version(),
             "method": PPO_V2_METHOD,
             "policy_schema": self.policy.architecture_id,
             "configuration_control_mode": self.context.configuration_control_mode,
+            "critic_value_scale_mode": self.hyperparameters.critic_value_scale_mode,
+            "critic_value_scale_epsilon": self.hyperparameters.critic_value_scale_epsilon,
+            "critic_value_scale_warmup_samples": (
+                self.hyperparameters.critic_value_scale_warmup_samples
+            ),
+            "critic_return_scale_count": int(self.critic_return_statistics.count),
+            "critic_return_scale_mean": float(self.critic_return_statistics.mean),
+            "critic_return_scale_m2": float(self.critic_return_statistics.m2),
             "episode": int(completed_episodes),
             "completed_episodes": int(completed_episodes),
             "current_train_origin": int(current_train_origin),
@@ -655,13 +798,39 @@ class PPOV2Trainer:
 
     def load_checkpoint(self, checkpoint: Path, config_hash: str) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
-        expected_version = (
-            PRIMITIVE_CHECKPOINT_VERSION
-            if self.context.configuration_control_mode == "policy_primitive"
-            else CHECKPOINT_VERSION
+        expected_scale_mode = self.hyperparameters.critic_value_scale_mode
+        checkpoint_scale_mode = str(
+            payload.get("critic_value_scale_mode", CRITIC_VALUE_SCALE_NONE)
         )
+        if checkpoint_scale_mode != expected_scale_mode:
+            raise ValueError(
+                "PPO checkpoint critic_value_scale_mode mismatch; refusing silent "
+                f"cross-mode resume: checkpoint={checkpoint_scale_mode}, "
+                f"expected={expected_scale_mode}."
+            )
+        expected_version = self._expected_checkpoint_version()
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
+        restored_statistics = RunningReturnStatistics()
+        if expected_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
+            checkpoint_epsilon = float(
+                payload.get("critic_value_scale_epsilon", float("nan"))
+            )
+            checkpoint_warmup = int(
+                payload.get("critic_value_scale_warmup_samples", -1)
+            )
+            if not math.isclose(
+                checkpoint_epsilon,
+                self.hyperparameters.critic_value_scale_epsilon,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            ) or checkpoint_warmup != self.hyperparameters.critic_value_scale_warmup_samples:
+                raise ValueError("PPO checkpoint critic scale configuration mismatch.")
+            restored_statistics = RunningReturnStatistics.from_checkpoint(
+                payload.get("critic_return_scale_count", -1),
+                payload.get("critic_return_scale_mean", float("nan")),
+                payload.get("critic_return_scale_m2", float("nan")),
+            )
         checkpoint_observation_dim = int(payload.get("observation_dim", -1))
         expected_observation_dim = int(self.context.observation_spec.observation_dim)
         if checkpoint_observation_dim != expected_observation_dim:
@@ -689,6 +858,7 @@ class PPOV2Trainer:
         self.policy.load_state_dict(payload["policy_state_dict"], strict=True)
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         self.optimizer_steps = int(payload.get("optimizer_steps", 0))
+        self.critic_return_statistics = restored_statistics
         rng_state = payload.get("rng_state", {})
         if "python" in rng_state:
             random.setstate(rng_state["python"])
@@ -944,6 +1114,10 @@ def run_training(
                 "policy_loss_min": float(update.policy_loss_min),
                 "policy_loss_max": float(update.policy_loss_max),
                 "value_loss": float(update.value_loss),
+                "normalized_value_loss": float(update.value_loss),
+                "raw_value_loss": float(update.raw_value_loss),
+                "critic_return_scale": float(update.critic_return_scale),
+                "critic_return_scale_count": int(trainer.critic_return_statistics.count),
                 "value_loss_min": float(update.value_loss_min),
                 "value_loss_max": float(update.value_loss_max),
                 "entropy": float(update.entropy),

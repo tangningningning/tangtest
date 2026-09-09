@@ -229,6 +229,7 @@ def cache_update_cost(
     eta_ca: np.ndarray,
     xi_ca_per_mb: np.ndarray,
     lambda_ca: float,
+    cache_cost_weight: float = 1.0,
 ) -> dict[str, Any]:
     raw_old = np.asarray(previous_cache)
     raw_new = np.asarray(new_cache)
@@ -278,8 +279,9 @@ def cache_update_cost(
     if np.any(xi < 0.0):
         raise ValueError("xi_ca_per_mb 不能为负数。")
     lam = _require_finite("lambda_ca", lambda_ca)
-    if lam < 0.0:
-        raise ValueError("lambda_ca 不能为负数。")
+    cost_weight = _require_finite("cache_cost_weight", cache_cost_weight)
+    if lam < 0.0 or cost_weight < 0.0:
+        raise ValueError("lambda_ca/cache_cost_weight 不能为负数。")
     old = old_values.astype(np.int8)
     new = new_values.astype(np.int8)
     actual_trigger = np.any(old != new, axis=1).astype(np.int8)
@@ -292,7 +294,9 @@ def cache_update_cost(
     additions = np.maximum(new - old, 0)
     loaded_mb = additions @ sizes
     loading_energy = xi * loaded_mb
-    cost_by_node = actual_trigger.astype(float) * eta + lam * loading_energy
+    cost_by_node = cost_weight * (
+        actual_trigger.astype(float) * eta + lam * loading_energy
+    )
     return {
         "actual_trigger": actual_trigger,
         "loaded_mb": loaded_mb,
@@ -312,6 +316,7 @@ def uav_movement_cost(
     movement_fixed_cost: float,
     lambda_movement: float,
     tolerance_m: float = 1e-9,
+    movement_cost_weight: float = 1.0,
 ) -> dict[str, float | bool | int]:
     old = np.asarray(q_old_xy, dtype=float)
     new = np.asarray(q_new_xy, dtype=float)
@@ -328,9 +333,17 @@ def uav_movement_cost(
     eta = _require_finite("movement_fixed_cost", movement_fixed_cost)
     lam = _require_finite("lambda_movement", lambda_movement)
     tolerance = _require_finite("tolerance_m", tolerance_m)
+    cost_weight = _require_finite("movement_cost_weight", movement_cost_weight)
     if tolerance < 0.0:
         raise ValueError("tolerance_m 不能为负数。")
-    if dt <= 0.0 or vmax < 0.0 or xi < 0.0 or eta < 0.0 or lam < 0.0:
+    if (
+        dt <= 0.0
+        or vmax < 0.0
+        or xi < 0.0
+        or eta < 0.0
+        or lam < 0.0
+        or cost_weight < 0.0
+    ):
         raise ValueError("UAV movement 参数范围无效。")
     raw_distance = float(np.linalg.norm(new - old))
     actual_z = int(raw_distance > tolerance)
@@ -346,7 +359,7 @@ def uav_movement_cost(
         "raw_distance_m": raw_distance,
         "speed_feasible": speed_feasible,
         "movement_energy_j": energy,
-        "movement_cost": actual_z * eta + lam * energy,
+        "movement_cost": cost_weight * (actual_z * eta + lam * energy),
         "actual_z_q": actual_z,
         "actual_update": bool(actual_z),
     }

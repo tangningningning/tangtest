@@ -640,6 +640,34 @@ def validate_config(config: dict[str, Any]) -> None:
     ppo_max_grad_norm = float(get_config_value(config, "algorithm.ppo.max_grad_norm"))
     ppo_update_epochs = int(get_config_value(config, "algorithm.ppo.update_epochs"))
     ppo_num_minibatches = int(get_config_value(config, "algorithm.ppo.num_minibatches"))
+    critic_value_scale_mode = str(
+        get_config_value(config, "algorithm.ppo.critic_value_scale_mode", "none")
+    )
+    if critic_value_scale_mode not in {"none", "running_return_std"}:
+        raise ValueError(
+            "algorithm.ppo.critic_value_scale_mode 只支持 none/running_return_std。"
+        )
+    critic_value_scale_epsilon = float(
+        get_config_value(config, "algorithm.ppo.critic_value_scale_epsilon", 1.0e-8)
+    )
+    critic_value_scale_warmup_samples = get_config_value(
+        config, "algorithm.ppo.critic_value_scale_warmup_samples", 64
+    )
+    if (
+        not math.isfinite(critic_value_scale_epsilon)
+        or critic_value_scale_epsilon <= 0.0
+    ):
+        raise ValueError(
+            "algorithm.ppo.critic_value_scale_epsilon 必须是正的有限数。"
+        )
+    if (
+        isinstance(critic_value_scale_warmup_samples, bool)
+        or not isinstance(critic_value_scale_warmup_samples, int)
+        or critic_value_scale_warmup_samples < 0
+    ):
+        raise ValueError(
+            "algorithm.ppo.critic_value_scale_warmup_samples 必须是非负整数。"
+        )
     if not 0.0 < ppo_clip_epsilon < 1.0:
         raise ValueError("algorithm.ppo.clip_epsilon 必须位于 (0,1)。")
     if ppo_learning_rate <= 0.0:
@@ -824,6 +852,16 @@ def validate_config(config: dict[str, Any]) -> None:
             "objective.omega_delay 和 objective.omega_energy "
             "必须位于 [0,1] 且总和等于 1。"
         )
+    uav_movement_cost_weight = float(
+        get_config_value(config, "objective.uav_movement_cost_weight", 1.0)
+    )
+    if not math.isfinite(uav_movement_cost_weight) or uav_movement_cost_weight < 0.0:
+        raise ValueError("objective.uav_movement_cost_weight 必须是非负有限数。")
+    cache_cost_weight = float(
+        get_config_value(config, "objective.cache_cost_weight", 1.0)
+    )
+    if not math.isfinite(cache_cost_weight) or cache_cost_weight < 0.0:
+        raise ValueError("objective.cache_cost_weight 必须是非负有限数。")
     _require_positive(config, "objective.T_ref")
     _require_positive(config, "objective.E_ref")
     cloud_delay_factor = float(get_config_value(config, "nodes.cloud.cloud_delay_factor"))

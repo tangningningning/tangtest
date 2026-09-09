@@ -93,6 +93,7 @@ class CacheOptimizationConfig:
     kkt_min_bandwidth_fraction: float
     kkt_bisection_tolerance: float
     kkt_max_bisection_iterations: int
+    cache_cost_weight: float = 1.0
     def validate(self) -> None:
         values = [
             self.num_rsu,
@@ -124,6 +125,8 @@ class CacheOptimizationConfig:
             raise ValueError("beta_discount 必须位于 (0, 1]。")
         if self.tolerance < 0.0:
             raise ValueError("tolerance 不能为负数。")
+        if not math.isfinite(self.cache_cost_weight) or self.cache_cost_weight < 0.0:
+            raise ValueError("cache_cost_weight 必须是非负有限数。")
         if self.num_rsu != len(self.rsu_instances):
             raise ValueError("RSU instance 数量必须等于 num_rsu。")
         if self.num_uav != len(self.uav_instances):
@@ -230,6 +233,7 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         kkt_max_bisection_iterations=int(
             get(config, "algorithm.kkt.max_bisection_iterations")
         ),
+        cache_cost_weight=float(get(config, "objective.cache_cost_weight", 1.0)),
     )
 
 
@@ -1192,6 +1196,7 @@ def cache_update_cost(
         cache_nodes["eta_ca"],
         cache_nodes["xi_ca"],
         config.lambda_cache,
+        cache_cost_weight=config.cache_cost_weight,
     )
     return float(result["total_cost"]), np.asarray(result["loading_energy"], dtype=np.float64)
 
