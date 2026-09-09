@@ -5,6 +5,7 @@ from .policy import (
     AdaptivePrimitiveGroupedV2ActorCritic,
     AdaptivePrimitiveHorizonGroupedV3ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic,
+    AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "AdaptivePrimitiveGroupedV2ActorCritic",
     "AdaptivePrimitiveHorizonGroupedV3ActorCritic",
     "AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic",
+    "AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic",
     "AdaptivePrimitiveV2ActorCritic",
     "BernoulliActorCritic",
 ]

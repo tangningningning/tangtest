@@ -594,3 +594,50 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic(
     def _critic_values(self, observations: Any, actor_hidden: Any) -> Any:
         del actor_hidden
         return self.critic_head(self.critic_encoder(observations)).squeeze(-1)
+
+
+class AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic(
+    AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic
+):
+    """V4 network with explicit disjoint actor/critic parameter groups for V5."""
+
+    architecture_id = "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization"
+    architecture_version = 1
+
+    def actor_parameters(self) -> tuple[Any, ...]:
+        """Return only parameters updated by the actor optimizer."""
+
+        modules = (
+            self.encoder,
+            self.actor_head,
+            self.cache_candidate_scorer,
+            self.uav_candidate_scorer,
+        )
+        parameters = tuple(
+            parameter
+            for module in modules
+            for parameter in module.parameters()
+        )
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise RuntimeError("V5 actor parameter group contains duplicate parameters.")
+        return parameters
+
+    def critic_parameters(self) -> tuple[Any, ...]:
+        """Return only parameters updated by the critic optimizer."""
+
+        modules = (self.critic_encoder, self.critic_head)
+        parameters = tuple(
+            parameter
+            for module in modules
+            for parameter in module.parameters()
+        )
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise RuntimeError("V5 critic parameter group contains duplicate parameters.")
+        return parameters
+
+    def critic_value(self, observations: Any) -> Any:
+        """Evaluate the independent critic without building an actor graph."""
+
+        obs, single = self._observations(observations)
+        values = self.critic_head(self.critic_encoder(obs)).squeeze(-1)
+        return values.squeeze(0) if single else values

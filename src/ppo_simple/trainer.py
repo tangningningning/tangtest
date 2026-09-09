@@ -25,11 +25,17 @@ from scenario import task_scenario
 
 from . import interface
 from .interface import _copy_uav_positions
+from .plotting import (
+    SLOT_METRICS_FILENAME,
+    append_training_slot_metrics,
+    update_training_slot_reward_plot,
+)
 from .policy import (
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
     AdaptivePrimitiveHorizonGroupedV3ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic,
+    AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
@@ -43,6 +49,7 @@ BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 CHECKPOINT_VERSION = 2
 PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
+SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION = 5
 DEFAULT_ROLLOUT_STEPS = 16
 CRITIC_VALUE_SCALE_NONE = "none"
 CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
@@ -60,7 +67,12 @@ V3_POLICY_SCHEMAS = frozenset(
 V4_POLICY_SCHEMAS = frozenset(
     {AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic.architecture_id}
 )
-HORIZON_POLICY_SCHEMAS = V3_POLICY_SCHEMAS | V4_POLICY_SCHEMAS
+V5_POLICY_SCHEMAS = frozenset(
+    {
+        AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic.architecture_id
+    }
+)
+HORIZON_POLICY_SCHEMAS = V3_POLICY_SCHEMAS | V4_POLICY_SCHEMAS | V5_POLICY_SCHEMAS
 MODERN_POLICY_SCHEMAS = V2_POLICY_SCHEMAS | HORIZON_POLICY_SCHEMAS
 
 
@@ -183,8 +195,16 @@ class UpdateResult:
     approximate_kl_max: float
     gradient_norm_min: float
     gradient_norm_max: float
+    actor_gradient_norm: float
+    actor_gradient_norm_min: float
+    actor_gradient_norm_max: float
+    critic_gradient_norm: float
+    critic_gradient_norm_min: float
+    critic_gradient_norm_max: float
     parameter_delta_norm: float
     optimizer_steps: int
+    actor_optimizer_steps: int
+    critic_optimizer_steps: int
     raw_advantages: np.ndarray
     raw_returns: np.ndarray
     bootstrap_value: float
@@ -505,6 +525,11 @@ class PPOV2Trainer:
                 == AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic.architecture_id
             ):
                 policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic
+            elif (
+                context.policy_schema
+                == AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic.architecture_id
+            ):
+                policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic
             else:
                 raise ValueError(
                     "unknown policy_primitive policy_schema="
@@ -527,12 +552,43 @@ class PPOV2Trainer:
             raise ValueError(
                 f"unknown configuration_control_mode={context.configuration_control_mode}"
             )
-        self.optimizer = torch.optim.Adam(
-            self.policy.parameters(),
-            lr=self.hyperparameters.learning_rate,
-        )
         self.optimizer_steps = 0
+        self.actor_optimizer_steps = 0
+        self.critic_optimizer_steps = 0
+        if self._uses_separate_optimization():
+            if not isinstance(
+                self.policy,
+                AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
+            ):
+                raise TypeError("V5 separate optimization requires the V5 actor-critic policy.")
+            actor_parameters = list(self.policy.actor_parameters())
+            critic_parameters = list(self.policy.critic_parameters())
+            actor_ids = {id(parameter) for parameter in actor_parameters}
+            critic_ids = {id(parameter) for parameter in critic_parameters}
+            if len(actor_ids) != len(actor_parameters) or len(critic_ids) != len(critic_parameters):
+                raise RuntimeError("V5 actor/critic optimizer parameter groups contain duplicates.")
+            if actor_ids & critic_ids:
+                raise RuntimeError("V5 actor/critic optimizer parameter groups overlap.")
+            self.actor_optimizer = torch.optim.Adam(
+                actor_parameters,
+                lr=self.hyperparameters.learning_rate,
+            )
+            self.critic_optimizer = torch.optim.Adam(
+                critic_parameters,
+                lr=self.hyperparameters.learning_rate,
+            )
+            self.optimizer = None
+        else:
+            self.optimizer = torch.optim.Adam(
+                self.policy.parameters(),
+                lr=self.hyperparameters.learning_rate,
+            )
+            self.actor_optimizer = None
+            self.critic_optimizer = None
         self.critic_return_statistics = RunningReturnStatistics()
+
+    def _uses_separate_optimization(self) -> bool:
+        return self.policy.architecture_id in V5_POLICY_SCHEMAS
 
     def _critic_return_scale(self) -> float:
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_NONE:
@@ -543,6 +599,8 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
+        if self.policy.architecture_id in V5_POLICY_SCHEMAS:
+            return SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION
         if (
             self.hyperparameters.critic_value_scale_mode
             == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD
@@ -673,7 +731,21 @@ class PPOV2Trainer:
         value_loss_values: list[float] = []
         approximate_kl_values: list[float] = []
         gradient_norm_values: list[float] = []
+        actor_gradient_norm_values: list[float] = []
+        critic_gradient_norm_values: list[float] = []
         gradient_finite = True
+        actor_parameters: list[Any] | None = None
+        critic_parameters: list[Any] | None = None
+        if self._uses_separate_optimization():
+            if not isinstance(
+                self.policy,
+                AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
+            ):
+                raise TypeError("V5 separate optimization requires the V5 actor-critic policy.")
+            actor_parameters = list(self.policy.actor_parameters())
+            critic_parameters = list(self.policy.critic_parameters())
+            if self.actor_optimizer is None or self.critic_optimizer is None:
+                raise RuntimeError("V5 actor/critic optimizers are not initialized.")
         minibatch_size = sample_count // hyper.num_minibatches
         for _ in range(hyper.update_epochs):
             permutation = torch.randperm(sample_count, device=self.device)
@@ -714,35 +786,132 @@ class PPOV2Trainer:
                     (torch.abs(ratio - 1.0) > hyper.clip_epsilon).to(torch.float32)
                 )
                 policy_loss = -torch.minimum(unclipped, clipped).mean()
-                value_residual = evaluation.value - returns_t[indices]
+                value_residual = (
+                    evaluation.value.detach() - returns_t[indices]
+                    if self._uses_separate_optimization()
+                    else evaluation.value - returns_t[indices]
+                )
                 raw_value_loss = 0.5 * torch.mean(value_residual**2)
                 normalized_value_residual = value_residual / critic_return_scale
                 value_loss = 0.5 * torch.mean(normalized_value_residual**2)
                 entropy = evaluation.entropy.mean()
-                total_loss = (
-                    policy_loss
-                    + hyper.value_loss_coefficient * value_loss
-                    - hyper.entropy_coefficient * entropy
-                )
-                if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
-                    torch.isfinite(value_loss).item()
-                ) or not bool(torch.isfinite(total_loss).item()):
-                    raise FloatingPointError("PPO v2 total loss 非 finite。")
-                self.optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
-                for parameter in self.policy.parameters():
-                    if parameter.grad is not None and not bool(torch.all(torch.isfinite(parameter.grad)).item()):
-                        gradient_finite = False
-                if not gradient_finite:
-                    raise FloatingPointError("PPO v2 gradient 非 finite。")
-                gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), hyper.max_grad_norm
-                )
-                gradient_norm_value = float(gradient_norm.detach().cpu())
-                if not np.isfinite(gradient_norm_value):
-                    raise FloatingPointError("PPO v2 gradient norm 非 finite。")
-                self.optimizer.step()
-                self.optimizer_steps += 1
+                if self._uses_separate_optimization():
+                    assert actor_parameters is not None
+                    assert critic_parameters is not None
+                    assert self.actor_optimizer is not None
+                    assert self.critic_optimizer is not None
+                    actor_loss = (
+                        policy_loss - hyper.entropy_coefficient * entropy
+                    )
+                    if not all(
+                        bool(torch.all(torch.isfinite(value)).item())
+                        for value in (
+                            ratio,
+                            approximate_kl,
+                            clip_fraction,
+                            policy_loss,
+                            entropy,
+                            actor_loss,
+                        )
+                    ):
+                        raise FloatingPointError("PPO v5 actor metrics/loss 非 finite。")
+
+                    # Clear both disjoint groups before the actor backward so a
+                    # stale critic gradient cannot be mistaken for actor output.
+                    self.critic_optimizer.zero_grad(set_to_none=True)
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                    actor_loss.backward()
+                    if any(parameter.grad is not None for parameter in critic_parameters):
+                        raise RuntimeError("PPO v5 actor backward touched critic parameters.")
+                    for parameter in actor_parameters:
+                        if parameter.grad is not None and not bool(
+                            torch.all(torch.isfinite(parameter.grad)).item()
+                        ):
+                            gradient_finite = False
+                    if not gradient_finite:
+                        raise FloatingPointError("PPO v5 actor gradient 非 finite。")
+                    actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        actor_parameters, hyper.max_grad_norm
+                    )
+                    actor_gradient_norm_value = float(actor_gradient_norm.detach().cpu())
+                    if not np.isfinite(actor_gradient_norm_value):
+                        raise FloatingPointError("PPO v5 actor gradient norm 非 finite。")
+                    self.actor_optimizer.step()
+                    self.actor_optimizer_steps += 1
+                    self.optimizer_steps = self.actor_optimizer_steps
+
+                    # Rebuild the critic graph after the actor step.  No graph
+                    # is retained and the actor group is cleared before critic
+                    # backward to enforce the reverse disjointness invariant.
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                    critic_values = self.policy.critic_value(observations[indices])
+                    critic_value_residual = critic_values - returns_t[indices]
+                    raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
+                    normalized_value_residual = critic_value_residual / critic_return_scale
+                    value_loss = 0.5 * torch.mean(normalized_value_residual**2)
+                    critic_loss = raw_value_loss
+                    if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
+                        torch.isfinite(value_loss).item()
+                    ) or not bool(torch.isfinite(critic_loss).item()):
+                        raise FloatingPointError("PPO v5 critic loss 非 finite。")
+                    critic_loss.backward()
+                    if any(parameter.grad is not None for parameter in actor_parameters):
+                        raise RuntimeError("PPO v5 critic backward touched actor parameters.")
+                    for parameter in critic_parameters:
+                        if parameter.grad is not None and not bool(
+                            torch.all(torch.isfinite(parameter.grad)).item()
+                        ):
+                            gradient_finite = False
+                    if not gradient_finite:
+                        raise FloatingPointError("PPO v5 critic gradient 非 finite。")
+                    critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        critic_parameters, hyper.max_grad_norm
+                    )
+                    critic_gradient_norm_value = float(critic_gradient_norm.detach().cpu())
+                    if not np.isfinite(critic_gradient_norm_value):
+                        raise FloatingPointError("PPO v5 critic gradient norm 非 finite。")
+                    self.critic_optimizer.step()
+                    self.critic_optimizer_steps += 1
+                    total_loss = actor_loss.detach() + critic_loss.detach()
+                    if not bool(torch.isfinite(total_loss).item()):
+                        raise FloatingPointError("PPO v5 monitor total loss 非 finite。")
+                    gradient_norm_value = max(
+                        actor_gradient_norm_value,
+                        critic_gradient_norm_value,
+                    )
+                else:
+                    total_loss = (
+                        policy_loss
+                        + hyper.value_loss_coefficient * value_loss
+                        - hyper.entropy_coefficient * entropy
+                    )
+                    if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
+                        torch.isfinite(value_loss).item()
+                    ) or not bool(torch.isfinite(total_loss).item()):
+                        raise FloatingPointError("PPO v2 total loss 非 finite。")
+                    if self.optimizer is None:
+                        raise RuntimeError("PPO v2 optimizer is not initialized.")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    total_loss.backward()
+                    for parameter in self.policy.parameters():
+                        if parameter.grad is not None and not bool(
+                            torch.all(torch.isfinite(parameter.grad)).item()
+                        ):
+                            gradient_finite = False
+                    if not gradient_finite:
+                        raise FloatingPointError("PPO v2 gradient 非 finite。")
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        self.policy.parameters(), hyper.max_grad_norm
+                    )
+                    gradient_norm_value = float(gradient_norm.detach().cpu())
+                    if not np.isfinite(gradient_norm_value):
+                        raise FloatingPointError("PPO v2 gradient norm 非 finite。")
+                    self.optimizer.step()
+                    self.optimizer_steps += 1
+                    self.actor_optimizer_steps = self.optimizer_steps
+                    self.critic_optimizer_steps = self.optimizer_steps
+                    actor_gradient_norm_value = gradient_norm_value
+                    critic_gradient_norm_value = gradient_norm_value
                 policy_loss_value = float(policy_loss.detach().cpu())
                 value_loss_value = float(value_loss.detach().cpu())
                 raw_value_loss_value = float(raw_value_loss.detach().cpu())
@@ -754,6 +923,8 @@ class PPOV2Trainer:
                 value_loss_values.append(value_loss_value)
                 approximate_kl_values.append(approximate_kl_value)
                 gradient_norm_values.append(gradient_norm_value)
+                actor_gradient_norm_values.append(actor_gradient_norm_value)
+                critic_gradient_norm_values.append(critic_gradient_norm_value)
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
             self.critic_return_statistics.update(returns)
         delta_squared = 0.0
@@ -780,8 +951,16 @@ class PPOV2Trainer:
             approximate_kl_max=float(max(approximate_kl_values)),
             gradient_norm_min=float(min(gradient_norm_values)),
             gradient_norm_max=float(max(gradient_norm_values)),
+            actor_gradient_norm=actor_gradient_norm_values[-1],
+            actor_gradient_norm_min=float(min(actor_gradient_norm_values)),
+            actor_gradient_norm_max=float(max(actor_gradient_norm_values)),
+            critic_gradient_norm=critic_gradient_norm_values[-1],
+            critic_gradient_norm_min=float(min(critic_gradient_norm_values)),
+            critic_gradient_norm_max=float(max(critic_gradient_norm_values)),
             parameter_delta_norm=float(np.sqrt(delta_squared)),
             optimizer_steps=self.optimizer_steps,
+            actor_optimizer_steps=self.actor_optimizer_steps,
+            critic_optimizer_steps=self.critic_optimizer_steps,
             raw_advantages=advantages.copy(),
             raw_returns=returns.copy(),
             bootstrap_value=bootstrap_value,
@@ -821,14 +1000,32 @@ class PPOV2Trainer:
             "observation_dim": int(self.context.observation_spec.observation_dim),
             "action_dim": int(self.context.action_spec.action_dim),
             "policy_state_dict": self.policy.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "optimizer_steps": int(self.optimizer_steps),
             "rng_state": {
                 "python": random.getstate(),
                 "numpy": np.random.get_state(),
                 "torch": torch.get_rng_state(),
             },
         }
+        if self._uses_separate_optimization():
+            if self.actor_optimizer is None or self.critic_optimizer is None:
+                raise RuntimeError("V5 actor/critic optimizers are not initialized.")
+            payload.update(
+                {
+                    "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
+                    "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
+                    "actor_optimizer_steps": int(self.actor_optimizer_steps),
+                    "critic_optimizer_steps": int(self.critic_optimizer_steps),
+                }
+            )
+        else:
+            if self.optimizer is None:
+                raise RuntimeError("PPO optimizer is not initialized.")
+            payload.update(
+                {
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "optimizer_steps": int(self.optimizer_steps),
+                }
+            )
         if self.policy.architecture_id in MODERN_POLICY_SCHEMAS:
             payload["best_epoch"] = int(best_epoch)
             payload["best_epoch_return"] = (
@@ -927,8 +1124,30 @@ class PPOV2Trainer:
         if int(payload.get("action_dim")) != int(self.context.action_spec.action_dim):
             raise ValueError("PPO v2 checkpoint action_dim 不匹配。")
         self.policy.load_state_dict(payload["policy_state_dict"], strict=True)
-        self.optimizer.load_state_dict(payload["optimizer_state_dict"])
-        self.optimizer_steps = int(payload.get("optimizer_steps", 0))
+        if self._uses_separate_optimization():
+            if self.actor_optimizer is None or self.critic_optimizer is None:
+                raise RuntimeError("V5 actor/critic optimizers are not initialized.")
+            if (
+                "actor_optimizer_state_dict" not in payload
+                or "critic_optimizer_state_dict" not in payload
+            ):
+                raise ValueError(
+                    "V5 checkpoint must contain separate actor/critic optimizer state."
+                )
+            self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
+            self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
+            self.actor_optimizer_steps = int(payload.get("actor_optimizer_steps", 0))
+            self.critic_optimizer_steps = int(payload.get("critic_optimizer_steps", 0))
+            if self.actor_optimizer_steps < 0 or self.critic_optimizer_steps < 0:
+                raise ValueError("V5 checkpoint optimizer steps must be non-negative.")
+            self.optimizer_steps = self.actor_optimizer_steps
+        else:
+            if self.optimizer is None:
+                raise RuntimeError("PPO optimizer is not initialized.")
+            self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+            self.optimizer_steps = int(payload.get("optimizer_steps", 0))
+            self.actor_optimizer_steps = self.optimizer_steps
+            self.critic_optimizer_steps = self.optimizer_steps
         self.critic_return_statistics = restored_statistics
         rng_state = payload.get("rng_state", {})
         if "python" in rng_state:
@@ -999,6 +1218,7 @@ def run_training(
     episode_metrics_path = run_path / "episode_metrics.jsonl"
     update_metrics_path = run_path / "update_metrics.jsonl"
     critic_diagnostics_path = run_path / "critic_diagnostics.jsonl"
+    slot_metrics_path = run_path / SLOT_METRICS_FILENAME
     best_epoch = 0
     best_epoch_return: float | None = None
     if resume:
@@ -1040,6 +1260,8 @@ def run_training(
 
     episode_started_at = time.perf_counter()
     episode_optimizer_start = trainer.optimizer_steps
+    episode_actor_optimizer_start = trainer.actor_optimizer_steps
+    episode_critic_optimizer_start = trainer.critic_optimizer_steps
     episode_rewards: list[float] = []
     episode_g_values: list[float] = []
     episode_cache_requests = 0
@@ -1059,6 +1281,10 @@ def run_training(
     episode_kl_maxs: list[float] = []
     episode_gradient_norm_mins: list[float] = []
     episode_gradient_norm_maxs: list[float] = []
+    episode_actor_gradient_norm_mins: list[float] = []
+    episode_actor_gradient_norm_maxs: list[float] = []
+    episode_critic_gradient_norm_mins: list[float] = []
+    episode_critic_gradient_norm_maxs: list[float] = []
     episode_entropies: list[float] = []
     episode_approximate_kls: list[float] = []
 
@@ -1069,6 +1295,8 @@ def run_training(
             current_uav_positions = _copy_uav_positions(context.initial_uav)
             episode_started_at = time.perf_counter()
             episode_optimizer_start = trainer.optimizer_steps
+            episode_actor_optimizer_start = trainer.actor_optimizer_steps
+            episode_critic_optimizer_start = trainer.critic_optimizer_steps
             episode_rewards = []
             episode_g_values = []
             episode_cache_requests = 0
@@ -1088,6 +1316,10 @@ def run_training(
             episode_kl_maxs = []
             episode_gradient_norm_mins = []
             episode_gradient_norm_maxs = []
+            episode_actor_gradient_norm_mins = []
+            episode_actor_gradient_norm_maxs = []
+            episode_critic_gradient_norm_mins = []
+            episode_critic_gradient_norm_maxs = []
             episode_entropies = []
             episode_approximate_kls = []
         episode_number = completed_episodes + 1
@@ -1166,6 +1398,10 @@ def run_training(
         episode_kl_maxs.append(update.approximate_kl_max)
         episode_gradient_norm_mins.append(update.gradient_norm_min)
         episode_gradient_norm_maxs.append(update.gradient_norm_max)
+        episode_actor_gradient_norm_mins.append(update.actor_gradient_norm_min)
+        episode_actor_gradient_norm_maxs.append(update.actor_gradient_norm_max)
+        episode_critic_gradient_norm_mins.append(update.critic_gradient_norm_min)
+        episode_critic_gradient_norm_maxs.append(update.critic_gradient_norm_max)
         episode_entropies.append(update.entropy)
         episode_approximate_kls.append(update.approximate_kl)
         if context.policy_schema in MODERN_POLICY_SCHEMAS:
@@ -1191,6 +1427,8 @@ def run_training(
                 "num_transitions": transition_count,
                 "terminal": bool(terminal),
                 "optimizer_steps": int(update.optimizer_steps),
+                "actor_optimizer_steps": int(update.actor_optimizer_steps),
+                "critic_optimizer_steps": int(update.critic_optimizer_steps),
                 "policy_loss": float(update.policy_loss),
                 "policy_loss_min": float(update.policy_loss_min),
                 "policy_loss_max": float(update.policy_loss_max),
@@ -1209,6 +1447,12 @@ def run_training(
                 "gradient_norm": float(update.gradient_norm),
                 "gradient_norm_min": float(update.gradient_norm_min),
                 "gradient_norm_max": float(update.gradient_norm_max),
+                "actor_gradient_norm": float(update.actor_gradient_norm),
+                "actor_gradient_norm_min": float(update.actor_gradient_norm_min),
+                "actor_gradient_norm_max": float(update.actor_gradient_norm_max),
+                "critic_gradient_norm": float(update.critic_gradient_norm),
+                "critic_gradient_norm_min": float(update.critic_gradient_norm_min),
+                "critic_gradient_norm_max": float(update.critic_gradient_norm_max),
                 "gradient_finite": bool(update.gradient_finite),
                 "returns_finite": bool(update.returns_finite),
                 "advantages_finite": bool(update.advantages_finite),
@@ -1342,6 +1586,14 @@ def run_training(
                     "ppo_updates": int(episode_update_count),
                     "optimizer_steps": int(update.optimizer_steps),
                     "episode_optimizer_steps": int(update.optimizer_steps - episode_optimizer_start),
+                    "actor_optimizer_steps": int(update.actor_optimizer_steps),
+                    "critic_optimizer_steps": int(update.critic_optimizer_steps),
+                    "episode_actor_optimizer_steps": int(
+                        update.actor_optimizer_steps - episode_actor_optimizer_start
+                    ),
+                    "episode_critic_optimizer_steps": int(
+                        update.critic_optimizer_steps - episode_critic_optimizer_start
+                    ),
                     "best_epoch": int(best_epoch),
                     "best_epoch_return": best_epoch_return,
                     "entropy_mean": epoch_entropy,
@@ -1364,11 +1616,31 @@ def run_training(
                         "min": float(min(episode_gradient_norm_mins)),
                         "max": float(max(episode_gradient_norm_maxs)),
                     },
+                    "actor_gradient_norm_range": {
+                        "min": float(min(episode_actor_gradient_norm_mins)),
+                        "max": float(max(episode_actor_gradient_norm_maxs)),
+                    },
+                    "critic_gradient_norm_range": {
+                        "min": float(min(episode_critic_gradient_norm_mins)),
+                        "max": float(max(episode_critic_gradient_norm_maxs)),
+                    },
                     "finite_checks": episode_finite,
                     "checkpoint": str(checkpoint_path),
                     "wall_clock_runtime_seconds": epoch_runtime_seconds,
                 },
             )
+            append_training_slot_metrics(
+                slot_metrics_path,
+                epoch=episode_number,
+                rewards=episode_reward_array.tolist(),
+                episode_return=epoch_return,
+            )
+            try:
+                plot_path = update_training_slot_reward_plot(run_path)
+            except Exception as exc:  # plotting must not interrupt PPO training
+                print(f"[PLOT] Warning: {exc}", flush=True)
+            else:
+                print(f"[PLOT] Updated: {plot_path}", flush=True)
             print(
                 f"[PPO] Epoch {completed_episodes}/{target_epochs} | "
                 f"Return={epoch_return:.2f} | "
@@ -1382,6 +1654,16 @@ def run_training(
         current_train_origin = next_train_origin
         current_cache_state = np.asarray(rollout.next_cache_state, dtype=np.int8).copy()
         current_uav_positions = _copy_uav_positions(rollout.next_uav_positions)
+
+    final_plot_path = run_path / "plots" / "training_slot_reward.png"
+    if completed_episodes >= target_epochs:
+        if final_plot_path.exists():
+            print(f"[PLOT] Final: {final_plot_path}", flush=True)
+        else:
+            print(
+                f"[PLOT] Warning: final plot was not created: {final_plot_path}",
+                flush=True,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
