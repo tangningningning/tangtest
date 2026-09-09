@@ -24,13 +24,18 @@ from scenario import task_scenario
 
 from . import interface
 from .interface import _copy_uav_positions
-from .policy import AdaptivePrimitiveActorCritic, BernoulliActorCritic
+from .policy import (
+    AdaptivePrimitiveActorCritic,
+    AdaptivePrimitiveV2ActorCritic,
+    BernoulliActorCritic,
+)
 from .primitive_control import PrimitiveTensorSpec
 from .rollout import SimpleRollout, collect_rollout, compute_gae
 
 
 PPO_V2_METHOD = "ppo_simple_v2"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
+BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 CHECKPOINT_VERSION = 2
 PRIMITIVE_CHECKPOINT_VERSION = 3
 DEFAULT_ROLLOUT_STEPS = 16
@@ -58,6 +63,7 @@ class EnvironmentContext:
     train_origin_start: int
     train_origin_end: int
     configuration_control_mode: str
+    policy_schema: str
 
 
 @dataclass(frozen=True)
@@ -96,6 +102,9 @@ class UpdateResult:
     gradient_norm_max: float
     parameter_delta_norm: float
     optimizer_steps: int
+    raw_advantages: np.ndarray
+    raw_returns: np.ndarray
+    bootstrap_value: float
 
 
 @dataclass(frozen=True)
@@ -104,6 +113,8 @@ class TrainingCursor:
     current_train_origin: int
     current_cache_state: np.ndarray
     current_uav_positions: dict[str, tuple[float, float]]
+    best_epoch: int
+    best_epoch_return: float | None
 
 
 def _project_path(root: Path, value: Any) -> Path:
@@ -117,6 +128,59 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         json.dump(record, stream, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         stream.write("\n")
+
+
+def _append_critic_diagnostics(
+    path: Path,
+    *,
+    seed: int,
+    epoch: int,
+    chunk_origin_start: int,
+    optimizer_steps: int,
+    rollout: SimpleRollout,
+    update: UpdateResult,
+) -> None:
+    """Append v2 raw critic targets already computed by the PPO update."""
+
+    transitions = rollout.transitions
+    if not (
+        len(transitions)
+        == len(update.raw_advantages)
+        == len(update.raw_returns)
+    ):
+        raise AssertionError("critic diagnostics length mismatch")
+    for transition, raw_advantage, raw_return in zip(
+        transitions,
+        update.raw_advantages,
+        update.raw_returns,
+        strict=True,
+    ):
+        old_value = float(transition.old_value)
+        target = float(raw_return)
+        residual = old_value - target
+        values = (old_value, float(raw_advantage), target, update.bootstrap_value, residual)
+        if not all(np.isfinite(value) for value in values):
+            raise FloatingPointError("critic diagnostics contain non-finite values")
+        _append_jsonl(
+            path,
+            {
+                "record_type": "critic_transition",
+                "seed": int(seed),
+                "episode": int(epoch),
+                "epoch": int(epoch),
+                "chunk_origin_start": int(chunk_origin_start),
+                "optimizer_steps": int(optimizer_steps),
+                "origin": int(transition.origin_index),
+                "done": bool(transition.done),
+                "old_value": old_value,
+                "raw_advantage": float(raw_advantage),
+                "raw_return": target,
+                "value_target": target,
+                "bootstrap_value": float(update.bootstrap_value),
+                "value_residual": residual,
+                "abs_value_residual": abs(residual),
+            },
+        )
 
 
 def load_environment_context(config_path: str = "system_config.toml") -> EnvironmentContext:
@@ -141,11 +205,21 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
         _project_path(root, project_config.get_config_value(cfg, "paths.tv_local_cache"))
     )
     action_spec = interface.TriggerActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
+    policy_schema = str(
+        project_config.get_config_value(
+            cfg,
+            "algorithm.ppo.policy_schema",
+            "adaptive_primitive_v1",
+        )
+    )
     observation_spec = interface.ConfigurationObservationSpec.from_cache_nodes(
         cache_nodes,
         service_catalog["service_ids"].tolist(),
         action_spec.uav_ids,
         [str(value) for value in first_origin["vehicle_ids"].tolist()],
+        include_time_to_go=(
+            policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id
+        ),
     )
     initial_cache = cache_configuration.popularity_aware_initial_cache(
         service_catalog,
@@ -176,6 +250,7 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
         train_origin_start=train_start,
         train_origin_end=train_end,
         configuration_control_mode=configuration_control_mode,
+        policy_schema=policy_schema,
     )
 
 
@@ -250,7 +325,17 @@ class PPOV2Trainer:
         self.device = torch.device(device)
         if context.configuration_control_mode == "policy_primitive":
             primitive_spec = PrimitiveTensorSpec.create(context)
-            self.policy = AdaptivePrimitiveActorCritic(
+            policy_class: type[AdaptivePrimitiveActorCritic]
+            if context.policy_schema == AdaptivePrimitiveActorCritic.architecture_id:
+                policy_class = AdaptivePrimitiveActorCritic
+            elif context.policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id:
+                policy_class = AdaptivePrimitiveV2ActorCritic
+            else:
+                raise ValueError(
+                    "unknown policy_primitive policy_schema="
+                    f"{context.policy_schema}"
+                )
+            self.policy = policy_class(
                 int(context.observation_spec.observation_dim),
                 int(context.action_spec.action_dim),
                 primitive_spec.cache_feature_dim,
@@ -487,6 +572,9 @@ class PPOV2Trainer:
             gradient_norm_max=float(max(gradient_norm_values)),
             parameter_delta_norm=float(np.sqrt(delta_squared)),
             optimizer_steps=self.optimizer_steps,
+            raw_advantages=advantages.copy(),
+            raw_returns=returns.copy(),
+            bootstrap_value=bootstrap_value,
         )
 
     def checkpoint_payload(
@@ -497,8 +585,10 @@ class PPOV2Trainer:
         current_uav_positions: dict[str, Any],
         config_hash: str,
         rollout_steps: int,
+        best_epoch: int = 0,
+        best_epoch_return: float | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "checkpoint_version": (
                 PRIMITIVE_CHECKPOINT_VERSION
                 if self.context.configuration_control_mode == "policy_primitive"
@@ -525,6 +615,12 @@ class PPOV2Trainer:
                 "torch": torch.get_rng_state(),
             },
         }
+        if self.policy.architecture_id == AdaptivePrimitiveV2ActorCritic.architecture_id:
+            payload["best_epoch"] = int(best_epoch)
+            payload["best_epoch_return"] = (
+                None if best_epoch_return is None else float(best_epoch_return)
+            )
+        return payload
 
     def save_checkpoint(
         self,
@@ -535,9 +631,13 @@ class PPOV2Trainer:
         current_uav_positions: dict[str, Any],
         config_hash: str,
         rollout_steps: int,
+        *,
+        filename: str = CHECKPOINT_FILENAME,
+        best_epoch: int = 0,
+        best_epoch_return: float | None = None,
     ) -> Path:
         run_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint = run_dir / CHECKPOINT_FILENAME
+        checkpoint = run_dir / filename
         torch.save(
             self.checkpoint_payload(
                 completed_episodes,
@@ -546,6 +646,8 @@ class PPOV2Trainer:
                 current_uav_positions,
                 config_hash,
                 rollout_steps,
+                best_epoch,
+                best_epoch_return,
             ),
             checkpoint,
         )
@@ -560,6 +662,13 @@ class PPOV2Trainer:
         )
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
+        checkpoint_observation_dim = int(payload.get("observation_dim", -1))
+        expected_observation_dim = int(self.context.observation_spec.observation_dim)
+        if checkpoint_observation_dim != expected_observation_dim:
+            raise ValueError(
+                "PPO checkpoint observation_dim incompatible; refusing silent schema resume: "
+                f"checkpoint={checkpoint_observation_dim}, expected={expected_observation_dim}."
+            )
         expected_schema = self.policy.architecture_id
         checkpoint_schema = payload.get("policy_schema")
         if checkpoint_schema is None and expected_schema == BernoulliActorCritic.architecture_id:
@@ -567,16 +676,14 @@ class PPOV2Trainer:
         if checkpoint_schema != expected_schema:
             raise ValueError(
                 "PPO checkpoint policy schema incompatible: "
-                f"checkpoint={checkpoint_schema}, expected={expected_schema}。"
+                f"checkpoint={checkpoint_schema}, expected={expected_schema}."
             )
         if payload.get("configuration_control_mode", "legacy_exact") != (
             self.context.configuration_control_mode
         ):
-            raise ValueError("PPO checkpoint configuration_control_mode 不匹配。")
+            raise ValueError("PPO checkpoint configuration_control_mode mismatch.")
         if payload.get("method") != PPO_V2_METHOD or payload.get("config_sha256") != config_hash:
-            raise ValueError("PPO v2 checkpoint method/config hash 不匹配。")
-        if int(payload.get("observation_dim")) != int(self.context.observation_spec.observation_dim):
-            raise ValueError("PPO v2 checkpoint observation_dim 不匹配。")
+            raise ValueError("PPO v2 checkpoint method/config hash mismatch.")
         if int(payload.get("action_dim")) != int(self.context.action_spec.action_dim):
             raise ValueError("PPO v2 checkpoint action_dim 不匹配。")
         self.policy.load_state_dict(payload["policy_state_dict"], strict=True)
@@ -598,11 +705,20 @@ class PPOV2Trainer:
         current_train_origin = int(payload["current_train_origin"])
         if not self.context.train_origin_start <= current_train_origin <= self.context.train_origin_end + 1:
             raise ValueError("checkpoint current_train_origin 超出 formal train range。")
+        best_epoch = int(payload.get("best_epoch", 0))
+        raw_best_epoch_return = payload.get("best_epoch_return")
+        best_epoch_return = (
+            None if raw_best_epoch_return is None else float(raw_best_epoch_return)
+        )
+        if best_epoch_return is not None and not np.isfinite(best_epoch_return):
+            raise ValueError("checkpoint best_epoch_return must be finite when present")
         return TrainingCursor(
             completed_episodes=int(payload["completed_episodes"]),
             current_train_origin=current_train_origin,
             current_cache_state=current_cache_state,
             current_uav_positions=current_uav_positions,
+            best_epoch=best_epoch,
+            best_epoch_return=best_epoch_return,
         )
 
 
@@ -618,10 +734,12 @@ def run_training(
     *,
     rollout_steps: int = DEFAULT_ROLLOUT_STEPS,
     resume: bool = False,
+    verbose: bool = False,
 ) -> None:
     _require_torch()
-    if int(episodes) <= 0:
-        raise ValueError("episodes 必须大于0。")
+    target_epochs = int(episodes)
+    if target_epochs <= 0:
+        raise ValueError("epochs must be greater than zero")
     if int(rollout_steps) <= 0:
         raise ValueError("rollout_steps 必须大于0。")
     context = load_environment_context(config_path)
@@ -639,6 +757,9 @@ def run_training(
     checkpoint = run_path / CHECKPOINT_FILENAME
     episode_metrics_path = run_path / "episode_metrics.jsonl"
     update_metrics_path = run_path / "update_metrics.jsonl"
+    critic_diagnostics_path = run_path / "critic_diagnostics.jsonl"
+    best_epoch = 0
+    best_epoch_return: float | None = None
     if resume:
         if not checkpoint.exists():
             raise FileNotFoundError(f"resume checkpoint 不存在：{checkpoint}")
@@ -647,8 +768,34 @@ def run_training(
         current_train_origin = cursor.current_train_origin
         current_cache_state = cursor.current_cache_state
         current_uav_positions = cursor.current_uav_positions
-        if completed_episodes > int(episodes):
-            raise ValueError("checkpoint completed_episodes 超过本次 episodes。")
+        best_epoch = cursor.best_epoch
+        best_epoch_return = cursor.best_epoch_return
+        if completed_episodes > target_epochs:
+            raise ValueError("checkpoint completed epochs exceed target epochs")
+
+    origins_per_epoch = context.train_origin_end - context.train_origin_start + 1
+    if resume:
+        displayed_origin = (
+            0
+            if current_train_origin > context.train_origin_end
+            else current_train_origin - context.train_origin_start
+        )
+        print(
+            "[PPO] Resume\n"
+            f"Completed Epochs: {completed_episodes}\n"
+            f"Next Epoch: {completed_episodes + 1}\n"
+            f"Current Origin: {displayed_origin}/{origins_per_epoch}\n"
+            f"Target Epochs: {target_epochs}",
+            flush=True,
+        )
+    else:
+        print(
+            "[PPO] Training start\n"
+            f"Target Epochs: {target_epochs}\n"
+            f"Origins per Epoch: {origins_per_epoch}\n"
+            f"Rollout Steps: {int(rollout_steps)}",
+            flush=True,
+        )
 
     episode_started_at = time.perf_counter()
     episode_optimizer_start = trainer.optimizer_steps
@@ -669,8 +816,10 @@ def run_training(
     episode_kl_maxs: list[float] = []
     episode_gradient_norm_mins: list[float] = []
     episode_gradient_norm_maxs: list[float] = []
+    episode_entropies: list[float] = []
+    episode_approximate_kls: list[float] = []
 
-    while completed_episodes < int(episodes):
+    while completed_episodes < target_epochs:
         if current_train_origin > context.train_origin_end:
             current_train_origin = context.train_origin_start
             current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
@@ -694,6 +843,8 @@ def run_training(
             episode_kl_maxs = []
             episode_gradient_norm_mins = []
             episode_gradient_norm_maxs = []
+            episode_entropies = []
+            episode_approximate_kls = []
         episode_number = completed_episodes + 1
         chunk_origin_start = current_train_origin
         rollout = trainer.collect_chunk(
@@ -715,6 +866,8 @@ def run_training(
             rollout.next_uav_positions,
             config_hash,
             int(rollout_steps),
+            best_epoch=best_epoch,
+            best_epoch_return=best_epoch_return,
         )
         cache_count = len(context.action_spec.cache_node_ids)
         transition_count = len(rollout.transitions)
@@ -762,12 +915,26 @@ def run_training(
         episode_kl_maxs.append(update.approximate_kl_max)
         episode_gradient_norm_mins.append(update.gradient_norm_min)
         episode_gradient_norm_maxs.append(update.gradient_norm_max)
+        episode_entropies.append(update.entropy)
+        episode_approximate_kls.append(update.approximate_kl)
+        if context.policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id:
+            _append_critic_diagnostics(
+                critic_diagnostics_path,
+                seed=seed,
+                epoch=episode_number,
+                chunk_origin_start=chunk_origin_start,
+                optimizer_steps=update.optimizer_steps,
+                rollout=rollout,
+                update=update,
+            )
         _append_jsonl(
             update_metrics_path,
             {
                 "record_type": "update",
                 "seed": seed,
                 "episode": episode_number,
+                "epoch": episode_number,
+                "completed_epochs": int(completed_episodes),
                 "origin_start": int(chunk_origin_start),
                 "origin_end": int(next_train_origin - 1),
                 "num_transitions": transition_count,
@@ -795,28 +962,29 @@ def run_training(
                 "checkpoint": str(checkpoint_path),
             },
         )
-        print(
-            f"[PPO-v2] update={update.optimizer_steps} episode={episode_number} "
-            f"completed_episodes={completed_episodes} "
-            f"origins={chunk_origin_start}:{next_train_origin - 1} "
-            f"steps={len(rollout.transitions)} terminal={terminal} "
-            f"reward_mean={float(rollout.rewards.mean()):.6f} "
-            f"reward_min={float(rollout.rewards.min()):.6f} "
-            f"reward_max={float(rollout.rewards.max()):.6f} "
-            f"cache_requests={cache_requests}/{transition_count * cache_count} "
-            f"uav_requests={uav_requests}/{transition_count * len(context.action_spec.uav_ids)} "
-            f"actual_cache_updates={actual_cache_updates} "
-            f"actual_uav_movements={actual_uav_movements} "
-            f"policy_loss={update.policy_loss:.6f} "
-            f"value_loss={update.value_loss:.6f} "
-            f"entropy={update.entropy:.6f} "
-            f"approx_kl={update.approximate_kl:.6f} "
-            f"clip_fraction={update.clip_fraction:.6f} "
-            f"parameter_delta={update.parameter_delta_norm:.6e} "
-            f"checkpoint={checkpoint_path} "
-            f"next_origin={next_train_origin}",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[PPO] optimizer_step={update.optimizer_steps} "
+                f"epoch={episode_number} completed_epochs={completed_episodes} "
+                f"origins={chunk_origin_start}:{next_train_origin - 1} "
+                f"steps={len(rollout.transitions)} terminal={terminal} "
+                f"reward_mean={float(rollout.rewards.mean()):.6f} "
+                f"reward_min={float(rollout.rewards.min()):.6f} "
+                f"reward_max={float(rollout.rewards.max()):.6f} "
+                f"cache_requests={cache_requests}/{transition_count * cache_count} "
+                f"uav_requests={uav_requests}/{transition_count * len(context.action_spec.uav_ids)} "
+                f"actual_cache_updates={actual_cache_updates} "
+                f"actual_uav_movements={actual_uav_movements} "
+                f"policy_loss={update.policy_loss:.6f} "
+                f"value_loss={update.value_loss:.6f} "
+                f"entropy={update.entropy:.6f} "
+                f"approx_kl={update.approximate_kl:.6f} "
+                f"clip_fraction={update.clip_fraction:.6f} "
+                f"gradient_norm={update.gradient_norm:.6f} "
+                f"parameter_delta={update.parameter_delta_norm:.6e} "
+                f"checkpoint={checkpoint_path} next_origin={next_train_origin}",
+                flush=True,
+            )
         if terminal:
             episode_reward_array = np.asarray(episode_rewards, dtype=np.float64)
             episode_g_array = np.asarray(episode_g_values, dtype=np.float64)
@@ -846,15 +1014,56 @@ def run_training(
             }
             if not all(episode_finite.values()):
                 raise FloatingPointError("PPO v2 episode metrics 非 finite。")
+            epoch_runtime_seconds = float(time.perf_counter() - episode_started_at)
+            epoch_return = float(episode_reward_array.sum())
+            cache_change_rate = float(episode_actual_cache_updates) / float(
+                len(episode_reward_array) * cache_count
+            )
+            uav_move_rate = float(episode_actual_uav_movements) / float(
+                len(episode_reward_array) * len(context.action_spec.uav_ids)
+            )
+            epoch_entropy = float(np.mean(episode_entropies))
+            epoch_approximate_kl = float(np.mean(episode_approximate_kls))
+            if (
+                context.policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id
+                and (best_epoch_return is None or epoch_return > best_epoch_return)
+            ):
+                best_epoch = int(episode_number)
+                best_epoch_return = epoch_return
+                trainer.save_checkpoint(
+                    run_path,
+                    completed_episodes,
+                    next_train_origin,
+                    rollout.next_cache_state,
+                    rollout.next_uav_positions,
+                    config_hash,
+                    int(rollout_steps),
+                    filename=BEST_TRAIN_RETURN_CHECKPOINT_FILENAME,
+                    best_epoch=best_epoch,
+                    best_epoch_return=best_epoch_return,
+                )
+                checkpoint_path = trainer.save_checkpoint(
+                    run_path,
+                    completed_episodes,
+                    next_train_origin,
+                    rollout.next_cache_state,
+                    rollout.next_uav_positions,
+                    config_hash,
+                    int(rollout_steps),
+                    best_epoch=best_epoch,
+                    best_epoch_return=best_epoch_return,
+                )
             _append_jsonl(
                 episode_metrics_path,
                 {
                     "record_type": "episode",
                     "seed": seed,
                     "episode": int(episode_number),
+                    "epoch": int(episode_number),
                     "completed_episodes": int(completed_episodes),
+                    "completed_epochs": int(completed_episodes),
                     "num_transitions": int(len(episode_reward_array)),
-                    "episode_return": float(episode_reward_array.sum()),
+                    "episode_return": epoch_return,
                     "mean_reward": float(episode_reward_array.mean()),
                     "mean_G": float(episode_g_array.mean()),
                     "reward_std": float(episode_reward_array.std()),
@@ -867,6 +1076,12 @@ def run_training(
                     "ppo_updates": int(episode_update_count),
                     "optimizer_steps": int(update.optimizer_steps),
                     "episode_optimizer_steps": int(update.optimizer_steps - episode_optimizer_start),
+                    "best_epoch": int(best_epoch),
+                    "best_epoch_return": best_epoch_return,
+                    "entropy_mean": epoch_entropy,
+                    "approximate_kl_mean": epoch_approximate_kl,
+                    "cache_actual_change_rate": cache_change_rate,
+                    "uav_actual_movement_rate": uav_move_rate,
                     "policy_loss_range": {
                         "min": float(min(episode_policy_loss_mins)),
                         "max": float(max(episode_policy_loss_maxs)),
@@ -885,8 +1100,18 @@ def run_training(
                     },
                     "finite_checks": episode_finite,
                     "checkpoint": str(checkpoint_path),
-                    "wall_clock_runtime_seconds": float(time.perf_counter() - episode_started_at),
+                    "wall_clock_runtime_seconds": epoch_runtime_seconds,
                 },
+            )
+            print(
+                f"[PPO] Epoch {completed_episodes}/{target_epochs} | "
+                f"Return={epoch_return:.2f} | "
+                f"CacheChange={cache_change_rate:.1%} | "
+                f"UAVMove={uav_move_rate:.1%} | "
+                f"Entropy={epoch_entropy:.2f} | "
+                f"KL={epoch_approximate_kl:.4f} | "
+                f"Time={epoch_runtime_seconds:.1f}s",
+                flush=True,
             )
         current_train_origin = next_train_origin
         current_cache_state = np.asarray(rollout.next_cache_state, dtype=np.int8).copy()
@@ -894,28 +1119,60 @@ def run_training(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Minimal PPO v2 Cache/UAV request trainer")
+    parser = argparse.ArgumentParser(
+        description="PPO v2 Cache/UAV trainer (1 Epoch = one complete train-origin pass)"
+    )
     parser.add_argument("--config", default="system_config.toml")
-    parser.add_argument("--episodes", type=int, required=True)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        help="total target Epochs; 1 Epoch = train origins 0..239",
+    )
+    parser.add_argument("--episodes", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
         "--rollout-steps",
         type=int,
         default=DEFAULT_ROLLOUT_STEPS,
-        help=f"连续 train slots per PPO update (default: {DEFAULT_ROLLOUT_STEPS})",
+        help=f"consecutive train origins per PPO optimizer step (default: {DEFAULT_ROLLOUT_STEPS})",
     )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show detailed metrics for each rollout chunk",
+    )
     return parser
 
 
+def _target_epochs_from_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> int:
+    epochs = args.epochs
+    legacy_episodes = args.episodes
+    if epochs is None and legacy_episodes is None:
+        parser.error("--epochs EPOCHS is required")
+    if (
+        epochs is not None
+        and legacy_episodes is not None
+        and int(epochs) != int(legacy_episodes)
+    ):
+        parser.error("--epochs and legacy --episodes have conflicting values")
+    return int(epochs if epochs is not None else legacy_episodes)
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    target_epochs = _target_epochs_from_args(parser, args)
     run_training(
         args.config,
-        args.episodes,
+        target_epochs,
         args.run_dir,
         rollout_steps=args.rollout_steps,
         resume=bool(args.resume),
+        verbose=bool(args.verbose),
     )
     return 0
 

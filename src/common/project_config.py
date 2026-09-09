@@ -611,6 +611,17 @@ def validate_config(config: dict[str, Any]) -> None:
             "algorithm.ppo.configuration_control_mode 只支持 "
             "legacy_exact/policy_primitive。"
         )
+    policy_schema = str(
+        get_config_value(config, "algorithm.ppo.policy_schema", "adaptive_primitive_v1")
+    )
+    if configuration_control_mode == "policy_primitive" and policy_schema not in {
+        "adaptive_primitive_v1",
+        "adaptive_primitive_v2",
+    }:
+        raise ValueError(
+            "algorithm.ppo.policy_schema for policy_primitive must be "
+            "adaptive_primitive_v1/adaptive_primitive_v2."
+        )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
         raise ValueError("algorithm.ppo.hidden_sizes 必须是非空列表。")

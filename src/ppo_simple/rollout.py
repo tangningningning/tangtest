@@ -85,7 +85,18 @@ def _observation(
     step: Any,
     observation_spec: interface.ConfigurationObservationSpec,
     flight_boundary: tuple[float, float, float, float],
+    train_origin_start: int,
+    train_origin_end: int,
 ) -> np.ndarray:
+    time_to_go = (
+        interface.normalized_time_to_go(
+            step.origin_index,
+            train_origin_start,
+            train_origin_end,
+        )
+        if observation_spec.time_to_go_slice is not None
+        else None
+    )
     return interface.build_configuration_observation(
         previous_cache,
         previous_uav,
@@ -93,6 +104,7 @@ def _observation(
         step.predicted_service_popularity,
         observation_spec,
         flight_boundary,
+        time_to_go=time_to_go,
     )
 
 
@@ -169,6 +181,8 @@ def collect_rollout(
             step,
             context.observation_spec,
             context.flight_boundary,
+            context.train_origin_start,
+            context.train_origin_end,
         )
         if observation.shape != (int(context.observation_spec.observation_dim),):
             raise AssertionError("PPO v2 observation 不符合 observation_spec。")
@@ -383,6 +397,8 @@ def collect_rollout(
             bootstrap_step,
             context.observation_spec,
             context.flight_boundary,
+            context.train_origin_start,
+            context.train_origin_end,
         )
 
     return SimpleRollout(

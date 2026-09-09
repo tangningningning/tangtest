@@ -420,3 +420,9 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             value=trigger.value,
             logits=trigger.logits,
         )
+
+
+class AdaptivePrimitiveV2ActorCritic(AdaptivePrimitiveActorCritic):
+    """Scheme B policy with the v2 finite-horizon observation schema."""
+
+    architecture_id = "adaptive_primitive_v2"

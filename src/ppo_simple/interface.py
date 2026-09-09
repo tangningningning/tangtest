@@ -109,6 +109,7 @@ class ConfigurationObservationSpec:
     uav_position_slice: slice
     predicted_vehicle_slice: slice
     popularity_slice: slice
+    time_to_go_slice: slice | None
     observation_dim: int
 
     @classmethod
@@ -118,6 +119,8 @@ class ConfigurationObservationSpec:
         service_ids: list[int] | tuple[int, ...],
         uav_ids: list[str] | tuple[str, ...],
         vehicle_ids: list[str] | tuple[str, ...],
+        *,
+        include_time_to_go: bool = False,
     ) -> "ConfigurationObservationSpec":
         cache_node_ids_t = tuple(str(value) for value in cache_node_ids)
         service_ids_t = tuple(int(value) for value in service_ids)
@@ -145,6 +148,10 @@ class ConfigurationObservationSpec:
         popularity_len = len(service_ids_t)
         popularity_slice = slice(start, start + popularity_len)
         start += popularity_len
+        time_to_go_slice = None
+        if include_time_to_go:
+            time_to_go_slice = slice(start, start + 1)
+            start += 1
         return cls(
             cache_node_ids=cache_node_ids_t,
             service_ids=service_ids_t,
@@ -154,6 +161,7 @@ class ConfigurationObservationSpec:
             uav_position_slice=uav_position_slice,
             predicted_vehicle_slice=predicted_vehicle_slice,
             popularity_slice=popularity_slice,
+            time_to_go_slice=time_to_go_slice,
             observation_dim=start,
         )
 
@@ -164,12 +172,15 @@ class ConfigurationObservationSpec:
         service_ids: list[int] | tuple[int, ...],
         uav_ids: list[str] | tuple[str, ...],
         vehicle_ids: list[str] | tuple[str, ...],
+        *,
+        include_time_to_go: bool = False,
     ) -> "ConfigurationObservationSpec":
         return cls.create(
             cache_nodes["node_ids"],
             service_ids,
             uav_ids,
             vehicle_ids,
+            include_time_to_go=include_time_to_go,
         )
 
 
@@ -240,6 +251,26 @@ def _ordered_popularity_array(
     return values.astype(np.float64)
 
 
+def normalized_time_to_go(
+    origin_index: int,
+    train_origin_start: int,
+    train_origin_end: int,
+) -> float:
+    """Return the finite-horizon state feature (end - origin) / (end - start)."""
+
+    start = int(train_origin_start)
+    end = int(train_origin_end)
+    origin = int(origin_index)
+    if end <= start:
+        raise ValueError("time_to_go requires train_origin_end > train_origin_start")
+    if origin < start or origin > end:
+        raise ValueError("time_to_go origin is outside the formal train range")
+    value = (end - origin) / (end - start)
+    if not 0.0 <= value <= 1.0:
+        raise AssertionError("time_to_go must be within [0, 1]")
+    return float(value)
+
+
 def build_configuration_observation(
     previous_cache_state: Any,
     previous_uav_positions: dict[str, Any] | Any,
@@ -247,6 +278,8 @@ def build_configuration_observation(
     predicted_service_popularity: dict[int | str, float] | Any,
     observation_spec: ConfigurationObservationSpec,
     flight_boundary: tuple[float, float, float, float],
+    *,
+    time_to_go: float | None = None,
 ) -> np.ndarray:
     """构造只包含 state/prediction 字段的 configuration observation。"""
 
@@ -285,7 +318,21 @@ def build_configuration_observation(
             for index, vehicle_id in enumerate(observation_spec.vehicle_ids)
         ]
     )
-    observation = np.concatenate([cache_features, uav_features, vehicle_features, popularity])
+    if observation_spec.time_to_go_slice is None:
+        if time_to_go is not None:
+            raise ValueError("v1 observation must not receive time_to_go")
+        time_features = np.empty(0, dtype=np.float64)
+    else:
+        if time_to_go is None:
+            raise ValueError("v2 observation requires time_to_go")
+        time_value = float(time_to_go)
+        if not np.isfinite(time_value) or not 0.0 <= time_value <= 1.0:
+            raise ValueError("time_to_go must be finite and within [0, 1]")
+        time_features = np.asarray([time_value], dtype=np.float64)
+
+    observation = np.concatenate(
+        [cache_features, uav_features, vehicle_features, popularity, time_features]
+    )
     if observation.shape != (observation_spec.observation_dim,):
         raise AssertionError("observation length 与 spec 不一致。")
     if not np.all(np.isfinite(observation)):
