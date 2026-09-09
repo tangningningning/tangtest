@@ -849,7 +849,9 @@ class PPOV2Trainer:
                     raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
                     normalized_value_residual = critic_value_residual / critic_return_scale
                     value_loss = 0.5 * torch.mean(normalized_value_residual**2)
-                    critic_loss = raw_value_loss
+                    # V5 backpropagates the configured scaled loss.  The raw
+                    # value loss remains a diagnostic-only metric.
+                    critic_loss = value_loss
                     if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
                         torch.isfinite(value_loss).item()
                     ) or not bool(torch.isfinite(critic_loss).item()):
