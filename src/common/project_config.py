@@ -643,6 +643,20 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.ppo.gae_lambda 必须位于 [0,1]。")
     ppo_clip_epsilon = float(get_config_value(config, "algorithm.ppo.clip_epsilon"))
     ppo_learning_rate = float(get_config_value(config, "algorithm.ppo.learning_rate"))
+    ppo_actor_learning_rate = float(
+        get_config_value(
+            config,
+            "algorithm.ppo.actor_learning_rate",
+            ppo_learning_rate,
+        )
+    )
+    ppo_critic_learning_rate = float(
+        get_config_value(
+            config,
+            "algorithm.ppo.critic_learning_rate",
+            ppo_learning_rate,
+        )
+    )
     ppo_value_coef = float(get_config_value(config, "algorithm.ppo.value_loss_coefficient"))
     ppo_entropy_coef = float(get_config_value(config, "algorithm.ppo.entropy_coefficient"))
     ppo_max_grad_norm = float(get_config_value(config, "algorithm.ppo.max_grad_norm"))
@@ -691,6 +705,12 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("algorithm.ppo.clip_epsilon 必须位于 (0,1)。")
     if ppo_learning_rate <= 0.0:
         raise ValueError("algorithm.ppo.learning_rate 必须大于 0。")
+    for dotted_key, learning_rate in (
+        ("algorithm.ppo.actor_learning_rate", ppo_actor_learning_rate),
+        ("algorithm.ppo.critic_learning_rate", ppo_critic_learning_rate),
+    ):
+        if not math.isfinite(learning_rate) or learning_rate <= 0.0:
+            raise ValueError(f"{dotted_key} 必须是正的有限数。")
     if ppo_value_coef < 0.0:
         raise ValueError("algorithm.ppo.value_loss_coefficient 不能为负。")
     if ppo_entropy_coef < 0.0:

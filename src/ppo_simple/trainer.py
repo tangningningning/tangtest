@@ -117,6 +117,8 @@ class PPOV2Hyperparameters:
     gae_lambda: float
     clip_epsilon: float
     learning_rate: float
+    actor_learning_rate: float
+    critic_learning_rate: float
     value_loss_coefficient: float
     entropy_coefficient: float
     max_grad_norm: float
@@ -409,11 +411,18 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
 def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
     get = project_config.get_config_value
     hidden_sizes = tuple(int(value) for value in get(cfg, "algorithm.ppo.hidden_sizes"))
+    learning_rate = float(get(cfg, "algorithm.ppo.learning_rate"))
     values = PPOV2Hyperparameters(
         gamma=float(get(cfg, "algorithm.ppo.gamma")),
         gae_lambda=float(get(cfg, "algorithm.ppo.gae_lambda")),
         clip_epsilon=float(get(cfg, "algorithm.ppo.clip_epsilon")),
-        learning_rate=float(get(cfg, "algorithm.ppo.learning_rate")),
+        learning_rate=learning_rate,
+        actor_learning_rate=float(
+            get(cfg, "algorithm.ppo.actor_learning_rate", learning_rate)
+        ),
+        critic_learning_rate=float(
+            get(cfg, "algorithm.ppo.critic_learning_rate", learning_rate)
+        ),
         value_loss_coefficient=float(get(cfg, "algorithm.ppo.value_loss_coefficient")),
         entropy_coefficient=float(get(cfg, "algorithm.ppo.entropy_coefficient")),
         max_grad_norm=float(get(cfg, "algorithm.ppo.max_grad_norm")),
@@ -455,6 +464,13 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         raise ValueError("gae_lambda 必须位于 [0,1]。")
     if values.clip_epsilon < 0.0 or values.clip_epsilon >= 1.0:
         raise ValueError("clip_epsilon 必须位于 [0,1)。")
+    if (
+        not math.isfinite(values.actor_learning_rate)
+        or values.actor_learning_rate <= 0.0
+        or not math.isfinite(values.critic_learning_rate)
+        or values.critic_learning_rate <= 0.0
+    ):
+        raise ValueError("actor/critic learning rate 必须是正的有限数。")
     if values.learning_rate <= 0.0 or values.value_loss_coefficient < 0.0:
         raise ValueError("PPO v2 learning/value coefficient 非法。")
     if values.entropy_coefficient < 0.0 or values.max_grad_norm <= 0.0:
@@ -596,11 +612,11 @@ class PPOV2Trainer:
                 raise RuntimeError("V5 actor/critic optimizer parameter groups overlap.")
             self.actor_optimizer = torch.optim.Adam(
                 actor_parameters,
-                lr=self.hyperparameters.learning_rate,
+                lr=self.hyperparameters.actor_learning_rate,
             )
             self.critic_optimizer = torch.optim.Adam(
                 critic_parameters,
-                lr=self.hyperparameters.learning_rate,
+                lr=self.hyperparameters.critic_learning_rate,
             )
             self.optimizer = None
         else:
