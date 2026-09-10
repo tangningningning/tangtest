@@ -14,6 +14,15 @@ SLOTS_PER_EPOCH = 240
 SLOT_METRICS_FILENAME = "slot_metrics.jsonl"
 TRAINING_SLOT_REWARD_PLOT_FILENAME = "training_slot_reward.png"
 MA_WINDOW = 240
+SLOT_DETAIL_FIELDS = (
+    "q",
+    "cache_cost",
+    "movement_cost",
+    "cache_trigger_count",
+    "cache_change_count",
+    "uav_trigger_count",
+    "uav_movement_count",
+)
 
 
 def _finite_float(value: Any, field: str) -> float:
@@ -24,6 +33,14 @@ def _finite_float(value: Any, field: str) -> float:
     if not math.isfinite(converted):
         raise ValueError(f"slot_metrics {field} must be finite")
     return converted
+
+
+def _nonnegative_int(value: Any, field: str) -> int:
+    converted = _finite_float(value, field)
+    integer = int(converted)
+    if converted != integer or integer < 0:
+        raise ValueError(f"slot_metrics {field} must be a non-negative integer")
+    return integer
 
 
 def _read_slot_metrics(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
@@ -69,17 +86,60 @@ def _read_slot_metrics(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
                     f"line {line_number}: {global_slot} != {expected_global_slot}"
                 )
             reward = _finite_float(record["reward"], "reward")
+            present_detail_fields = [field for field in SLOT_DETAIL_FIELDS if field in record]
+            if present_detail_fields and len(present_detail_fields) != len(SLOT_DETAIL_FIELDS):
+                missing_detail_fields = sorted(set(SLOT_DETAIL_FIELDS) - set(present_detail_fields))
+                raise ValueError(
+                    f"slot_metrics line {line_number} missing detail fields: "
+                    f"{missing_detail_fields}"
+                )
             key = (epoch, origin)
             if key in records:
                 raise ValueError(
                     f"slot_metrics duplicate (epoch, origin)={key}"
                 )
-            records[key] = {
+            parsed = {
                 "epoch": epoch,
                 "origin": origin,
                 "global_training_slot": global_slot,
                 "reward": reward,
             }
+            if present_detail_fields:
+                parsed.update(
+                    {
+                        "q": _finite_float(record["q"], "q"),
+                        "cache_cost": _finite_float(record["cache_cost"], "cache_cost"),
+                        "movement_cost": _finite_float(
+                            record["movement_cost"], "movement_cost"
+                        ),
+                        "cache_trigger_count": _nonnegative_int(
+                            record["cache_trigger_count"], "cache_trigger_count"
+                        ),
+                        "cache_change_count": _nonnegative_int(
+                            record["cache_change_count"], "cache_change_count"
+                        ),
+                        "uav_trigger_count": _nonnegative_int(
+                            record["uav_trigger_count"], "uav_trigger_count"
+                        ),
+                        "uav_movement_count": _nonnegative_int(
+                            record["uav_movement_count"], "uav_movement_count"
+                        ),
+                    }
+                )
+                expected_reward = (
+                    parsed["q"]
+                    - parsed["cache_cost"]
+                    - parsed["movement_cost"]
+                )
+                if not bool(
+                    np.isclose(reward, expected_reward, rtol=1.0e-12, atol=1.0e-9)
+                ):
+                    raise ValueError(
+                        "slot_metrics reward contract mismatch at "
+                        f"(epoch, origin)={key}: reward={reward}, "
+                        f"q-cache_cost-movement_cost={expected_reward}"
+                    )
+            records[key] = parsed
     return records
 
 
@@ -89,6 +149,13 @@ def append_training_slot_metrics(
     epoch: int,
     rewards: Iterable[float],
     episode_return: float,
+    q_values: Iterable[float] | None = None,
+    cache_costs: Iterable[float] | None = None,
+    movement_costs: Iterable[float] | None = None,
+    cache_trigger_counts: Iterable[int] | None = None,
+    cache_change_counts: Iterable[int] | None = None,
+    uav_trigger_counts: Iterable[int] | None = None,
+    uav_movement_counts: Iterable[int] | None = None,
 ) -> int:
     """Append or safely complete one epoch of raw transition rewards.
 
@@ -122,6 +189,71 @@ def append_training_slot_metrics(
             f"{float(reward_array.sum())} != {episode_return_f}"
         )
 
+    detail_inputs = (
+        q_values,
+        cache_costs,
+        movement_costs,
+        cache_trigger_counts,
+        cache_change_counts,
+        uav_trigger_counts,
+        uav_movement_counts,
+    )
+    detailed = any(value is not None for value in detail_inputs)
+    if detailed and not all(value is not None for value in detail_inputs):
+        raise ValueError(
+            "slot_metrics detailed fields must be supplied together"
+        )
+    detail_arrays: dict[str, np.ndarray] = {}
+    if detailed:
+        detail_arrays = {
+            "q": np.asarray(list(q_values), dtype=np.float64).reshape(-1),  # type: ignore[arg-type]
+            "cache_cost": np.asarray(list(cache_costs), dtype=np.float64).reshape(-1),  # type: ignore[arg-type]
+            "movement_cost": np.asarray(list(movement_costs), dtype=np.float64).reshape(-1),  # type: ignore[arg-type]
+            "cache_trigger_count": np.asarray(
+                list(cache_trigger_counts), dtype=np.float64  # type: ignore[arg-type]
+            ).reshape(-1),
+            "cache_change_count": np.asarray(
+                list(cache_change_counts), dtype=np.float64  # type: ignore[arg-type]
+            ).reshape(-1),
+            "uav_trigger_count": np.asarray(
+                list(uav_trigger_counts), dtype=np.float64  # type: ignore[arg-type]
+            ).reshape(-1),
+            "uav_movement_count": np.asarray(
+                list(uav_movement_counts), dtype=np.float64  # type: ignore[arg-type]
+            ).reshape(-1),
+        }
+        for field, values in detail_arrays.items():
+            if values.shape != (SLOTS_PER_EPOCH,):
+                raise ValueError(
+                    f"slot_metrics {field} requires {SLOTS_PER_EPOCH} values; "
+                    f"received {values.size}"
+                )
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"slot_metrics {field} must be finite")
+        for field in (
+            "cache_trigger_count",
+            "cache_change_count",
+            "uav_trigger_count",
+            "uav_movement_count",
+        ):
+            values = detail_arrays[field]
+            if np.any(values < 0.0) or np.any(values != np.floor(values)):
+                raise ValueError(f"slot_metrics {field} must be non-negative integers")
+        expected_rewards = (
+            detail_arrays["q"]
+            - detail_arrays["cache_cost"]
+            - detail_arrays["movement_cost"]
+        )
+        if not np.allclose(reward_array, expected_rewards, rtol=1.0e-12, atol=1.0e-9):
+            mismatch = int(np.flatnonzero(~np.isclose(
+                reward_array, expected_rewards, rtol=1.0e-12, atol=1.0e-9
+            ))[0])
+            raise ValueError(
+                "slot reward contract mismatch at origin "
+                f"{mismatch}: reward={reward_array[mismatch]}, "
+                f"q-cache_cost-movement_cost={expected_rewards[mismatch]}"
+            )
+
     records = _read_slot_metrics(path)
     epoch_counts: dict[int, int] = {}
     for existing_epoch, _ in records:
@@ -149,15 +281,29 @@ def append_training_slot_metrics(
                     "existing slot reward conflicts with the completed episode at "
                     f"(epoch, origin)={key}"
                 )
+            if detailed and all(field in existing for field in SLOT_DETAIL_FIELDS):
+                for field in SLOT_DETAIL_FIELDS:
+                    expected = (
+                        int(detail_arrays[field][origin])
+                        if field.endswith("_count")
+                        else float(detail_arrays[field][origin])
+                    )
+                    if existing[field] != expected:
+                        raise ValueError(
+                            f"existing slot {field} conflicts at (epoch, origin)={key}"
+                        )
             continue
-        to_append.append(
-            {
-                "epoch": epoch_i,
-                "origin": origin,
-                "global_training_slot": (epoch_i - 1) * SLOTS_PER_EPOCH + origin,
-                "reward": float(reward),
-            }
-        )
+        record = {
+            "epoch": epoch_i,
+            "origin": origin,
+            "global_training_slot": (epoch_i - 1) * SLOTS_PER_EPOCH + origin,
+            "reward": float(reward),
+        }
+        if detailed:
+            for field in SLOT_DETAIL_FIELDS:
+                value = detail_arrays[field][origin]
+                record[field] = int(value) if field.endswith("_count") else float(value)
+        to_append.append(record)
     for record in to_append:
         _append_jsonl(path, record)
     return len(to_append)

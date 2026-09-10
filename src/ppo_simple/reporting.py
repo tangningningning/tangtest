@@ -1,0 +1,448 @@
+"""Run provenance and compact summary reporting for PPO experiments."""
+
+from __future__ import annotations
+
+import json
+import math
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from common import project_config
+
+from .plotting import SLOTS_PER_EPOCH, _read_slot_metrics
+
+
+RUN_MANIFEST_FILENAME = "run_manifest.json"
+RUN_SUMMARY_FILENAME = "run_summary.json"
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump(
+            payload,
+            stream,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        stream.write("\n")
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream, parse_constant=_parse_nonfinite)
+    if not isinstance(payload, dict):
+        raise ValueError(f"reporting JSON root must be an object: {path}")
+    return payload
+
+
+def _parse_nonfinite(value: str) -> float:
+    return float(value)
+
+
+def _contains_nonfinite(value: Any) -> bool:
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_contains_nonfinite(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_nonfinite(item) for item in value)
+    return False
+
+
+def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], bool]:
+    records: list[dict[str, Any]] = []
+    nan_inf_detected = False
+    if not path.exists():
+        return records, nan_inf_detected
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                raise ValueError(f"reporting JSONL contains a blank line: {path}:{line_number}")
+            try:
+                record = json.loads(line, parse_constant=_parse_nonfinite)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"reporting JSONL contains invalid JSON: {path}:{line_number}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"reporting JSONL line must be an object: {path}:{line_number}"
+                )
+            nan_inf_detected = nan_inf_detected or _contains_nonfinite(record)
+            records.append(record)
+    return records, nan_inf_detected
+
+
+def _finite_float(value: Any, field: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        converted = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"reporting field {field} must be numeric or null") from exc
+    return converted if math.isfinite(converted) else None
+
+
+def _git_identity(project_root: Path) -> tuple[str | None, bool | None]:
+    try:
+        sha_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        dirty_result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if sha_result.returncode != 0 or dirty_result.returncode != 0:
+            raise RuntimeError(
+                f"git command failed: sha={sha_result.returncode}, "
+                f"dirty={dirty_result.returncode}"
+            )
+        sha = sha_result.stdout.strip()
+        if not sha:
+            raise RuntimeError("git rev-parse HEAD returned an empty SHA")
+        return sha, bool(dirty_result.stdout.strip())
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"[REPORTING] Warning: unable to read git identity: {exc}", flush=True)
+        return None, None
+
+
+def _optimizer_learning_rate(optimizer: Any, label: str) -> float:
+    if optimizer is None:
+        raise ValueError(f"{label} optimizer is not initialized")
+    groups = list(getattr(optimizer, "param_groups", ()))
+    if not groups:
+        raise ValueError(f"{label} optimizer has no parameter groups")
+    rates = []
+    for group in groups:
+        rate = float(group["lr"])
+        if not math.isfinite(rate) or rate <= 0.0:
+            raise ValueError(f"{label} optimizer learning rate is invalid: {rate}")
+        rates.append(rate)
+    if any(rate != rates[0] for rate in rates[1:]):
+        raise ValueError(
+            f"{label} optimizer has multiple learning rates; manifest field is scalar"
+        )
+    return rates[0]
+
+
+def _actual_optimizers(trainer: Any) -> tuple[Any, Any]:
+    actor_optimizer = getattr(trainer, "actor_optimizer", None)
+    critic_optimizer = getattr(trainer, "critic_optimizer", None)
+    shared_optimizer = getattr(trainer, "optimizer", None)
+    if actor_optimizer is None:
+        actor_optimizer = shared_optimizer
+    if critic_optimizer is None:
+        critic_optimizer = shared_optimizer
+    return actor_optimizer, critic_optimizer
+
+
+def build_run_manifest(
+    *,
+    config_path: str | Path,
+    config_sha256: str,
+    seed: int,
+    trainer: Any,
+    context: Any,
+    target_epochs: int,
+    rollout_steps: int,
+) -> dict[str, Any]:
+    """Build a manifest from the live trainer, policy, optimizers, and config."""
+
+    get = project_config.get_config_value
+    hyper = trainer.hyperparameters
+    actor_optimizer, critic_optimizer = _actual_optimizers(trainer)
+    train_origin_start = int(context.train_origin_start)
+    train_origin_end = int(context.train_origin_end)
+    test_origin_start = int(
+        get(context.cfg, "algorithm.ppo.data_protocol.test_origin_start")
+    )
+    test_origin_end = int(
+        get(context.cfg, "algorithm.ppo.data_protocol.test_origin_end")
+    )
+    policy_schema = str(getattr(trainer.policy, "architecture_id", context.policy_schema))
+    git_sha, git_dirty = _git_identity(Path(context.root))
+    resolved_config_path = Path(
+        context.cfg.get("_meta", {}).get("config_path", config_path)
+    ).resolve()
+    return {
+        "experiment_type": "main_training",
+        "git_commit_sha": git_sha,
+        "git_dirty": git_dirty,
+        "config_path": str(resolved_config_path),
+        "config_sha256": str(config_sha256),
+        "seed": int(seed),
+        "device": str(trainer.device),
+        "policy_schema": policy_schema,
+        "configuration_control_mode": str(context.configuration_control_mode),
+        "advantage_normalization_mode": str(hyper.advantage_normalization_mode),
+        "critic_value_scale_mode": str(hyper.critic_value_scale_mode),
+        "critic_value_scale_epsilon": float(hyper.critic_value_scale_epsilon),
+        "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),
+        "observation_dim": int(context.observation_spec.observation_dim),
+        "action_dim": int(context.action_spec.action_dim),
+        "train_origin_start": train_origin_start,
+        "train_origin_end": train_origin_end,
+        "test_origin_start": test_origin_start,
+        "test_origin_end": test_origin_end,
+        "target_epochs": int(target_epochs),
+        "rollout_steps": int(rollout_steps),
+        "origins_per_epoch": train_origin_end - train_origin_start + 1,
+        "gamma": float(hyper.gamma),
+        "gae_lambda": float(hyper.gae_lambda),
+        "clip_epsilon": float(hyper.clip_epsilon),
+        "update_epochs": int(hyper.update_epochs),
+        "num_minibatches": int(hyper.num_minibatches),
+        "actor_learning_rate": _optimizer_learning_rate(
+            actor_optimizer, "actor"
+        ),
+        "critic_learning_rate": _optimizer_learning_rate(
+            critic_optimizer, "critic"
+        ),
+        "max_grad_norm": float(hyper.max_grad_norm),
+        "entropy_coefficient": float(hyper.entropy_coefficient),
+    }
+
+
+def validate_run_manifest_for_resume(
+    existing: dict[str, Any], current: dict[str, Any]
+) -> None:
+    """Reject a resume when immutable experiment identity differs."""
+
+    required_match_fields = (
+        "config_sha256",
+        "policy_schema",
+        "advantage_normalization_mode",
+        "critic_value_scale_mode",
+        "observation_dim",
+        "rollout_steps",
+    )
+    mismatches = {
+        field: (existing.get(field), current.get(field))
+        for field in required_match_fields
+        if existing.get(field) != current.get(field)
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{field}: existing={old!r}, current={new!r}"
+            for field, (old, new) in mismatches.items()
+        )
+        raise ValueError(f"PPO resume run_manifest mismatch: {details}")
+
+
+def write_run_manifest(
+    path: Path,
+    *,
+    config_path: str | Path,
+    config_sha256: str,
+    seed: int,
+    trainer: Any,
+    context: Any,
+    target_epochs: int,
+    rollout_steps: int,
+    resume: bool,
+) -> dict[str, Any]:
+    """Create a fresh manifest or validate/update one for a resume."""
+
+    current = build_run_manifest(
+        config_path=config_path,
+        config_sha256=config_sha256,
+        seed=seed,
+        trainer=trainer,
+        context=context,
+        target_epochs=target_epochs,
+        rollout_steps=rollout_steps,
+    )
+    if resume and path.exists():
+        existing = _read_json(path)
+        validate_run_manifest_for_resume(existing, current)
+        initial_target_epochs = int(
+            existing.get("initial_target_epochs", existing.get("target_epochs", target_epochs))
+        )
+        merged = dict(existing)
+        merged["initial_target_epochs"] = initial_target_epochs
+        merged["current_target_epochs"] = int(target_epochs)
+        merged["target_epochs"] = int(target_epochs)
+        _write_json(path, merged)
+        return merged
+
+    current["initial_target_epochs"] = int(target_epochs)
+    current["current_target_epochs"] = int(target_epochs)
+    _write_json(path, current)
+    return current
+
+
+def _episode_records(path: Path) -> tuple[list[dict[str, Any]], bool]:
+    raw_records, nan_inf_detected = _read_jsonl(path)
+    by_epoch: dict[int, dict[str, Any]] = {}
+    for record in raw_records:
+        if record.get("record_type", "episode") != "episode":
+            continue
+        try:
+            epoch = int(record["epoch"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"episode_metrics record has invalid epoch: {record}") from exc
+        if epoch < 1:
+            raise ValueError(f"episode_metrics epoch must be >=1: {epoch}")
+        if epoch in by_epoch:
+            raise ValueError(f"episode_metrics duplicate epoch: {epoch}")
+        by_epoch[epoch] = record
+    ordered = [by_epoch[epoch] for epoch in sorted(by_epoch)]
+    return ordered, nan_inf_detected
+
+
+def _metric_values(
+    records: list[dict[str, Any]], field: str, *, allow_null: bool = True
+) -> list[float]:
+    values: list[float] = []
+    for record in records:
+        value = _finite_float(record.get(field), field)
+        if value is None:
+            if not allow_null:
+                raise ValueError(f"episode_metrics field {field} is missing or null")
+            continue
+        values.append(value)
+    return values
+
+
+def _mean(values: list[float]) -> float | None:
+    return None if not values else float(sum(values) / len(values))
+
+
+def _rolling_mean(
+    returns: list[float], epochs: list[int], window: int
+) -> tuple[float | None, float | None]:
+    if not returns:
+        return None, None
+    actual_window = min(int(window), len(returns))
+    return float(sum(returns[-actual_window:]) / actual_window), None
+
+
+def _rolling_max(
+    returns: list[float], epochs: list[int], window: int
+) -> tuple[float | None, int | None]:
+    if len(returns) < int(window):
+        return None, None
+    candidates = [
+        (
+            float(sum(returns[index - window + 1 : index + 1]) / window),
+            int(epochs[index]),
+        )
+        for index in range(window - 1, len(returns))
+    ]
+    best = max(candidates, key=lambda item: item[0])
+    return best
+
+
+def update_run_summary(
+    path: Path,
+    *,
+    episode_metrics_path: Path,
+    slot_metrics_path: Path,
+    completed_epochs: int,
+    target_epochs: int,
+    status: str,
+) -> dict[str, Any]:
+    """Write the current compact summary from already-written metrics."""
+
+    if status not in {"running", "completed"}:
+        raise ValueError(f"invalid run summary status: {status}")
+    episodes, episode_nan_inf = _episode_records(episode_metrics_path)
+    slot_records = _read_slot_metrics(slot_metrics_path)
+    epochs = [int(record["epoch"]) for record in episodes]
+    returns = [
+        value
+        for value in (_finite_float(record.get("episode_return"), "episode_return") for record in episodes)
+        if value is not None
+    ]
+    if len(returns) != len(episodes):
+        episode_nan_inf = True
+    final_window_count = min(20, len(episodes))
+    final_episodes = episodes[-final_window_count:] if final_window_count else []
+    final_epoch = epochs[-1] if epochs else None
+    final_return = returns[-1] if returns else None
+    best_epoch = 0
+    best_return: float | None = None
+    if returns:
+        best_index = max(range(len(returns)), key=lambda index: returns[index])
+        best_epoch = epochs[best_index]
+        best_return = returns[best_index]
+
+    ma20, _ = _rolling_mean(returns, epochs, 20)
+    ma50, _ = _rolling_mean(returns, epochs, 50)
+    ma20_max, ma20_max_epoch = _rolling_max(returns, epochs, 20)
+    ma50_max, ma50_max_epoch = _rolling_max(returns, epochs, 50)
+
+    critic_ev = _metric_values(final_episodes, "critic_explained_variance")
+    all_critic_ev = _metric_values(episodes, "critic_explained_variance")
+    max_critic_ev = None
+    max_critic_ev_epoch = None
+    if all_critic_ev:
+        max_index = max(
+            (index for index, record in enumerate(episodes)
+             if _finite_float(record.get("critic_explained_variance"), "critic_explained_variance") is not None),
+            key=lambda index: float(episodes[index]["critic_explained_variance"]),
+        )
+        max_critic_ev = float(episodes[max_index]["critic_explained_variance"])
+        max_critic_ev_epoch = int(episodes[max_index]["epoch"])
+
+    final_epoch_set = {int(record["epoch"]) for record in final_episodes}
+    final_slot_records = [
+        record
+        for (epoch, _), record in slot_records.items()
+        if epoch in final_epoch_set
+    ]
+
+    def region_mean(start: int) -> float | None:
+        values = [
+            float(record["reward"])
+            for record in final_slot_records
+            if start <= int(record["origin"]) < start + 60
+        ]
+        return _mean(values)
+
+    summary = {
+        "status": status,
+        "completed_epochs": int(completed_epochs),
+        "target_epochs": int(target_epochs),
+        "best_epoch": int(best_epoch),
+        "best_return": best_return,
+        "final_epoch": final_epoch,
+        "final_return": final_return,
+        "final20_window_count": int(final_window_count),
+        "final20_mean_return": _mean(returns[-final_window_count:]) if final_window_count else None,
+        "ma20": ma20,
+        "ma20_max": ma20_max,
+        "ma20_max_epoch": ma20_max_epoch,
+        "ma50": ma50,
+        "ma50_max": ma50_max,
+        "ma50_max_epoch": ma50_max_epoch,
+        "final20_mean_critic_ev": _mean(critic_ev),
+        "max_critic_ev": max_critic_ev,
+        "max_critic_ev_epoch": max_critic_ev_epoch,
+        "final20_cache_change_rate": _mean(
+            _metric_values(final_episodes, "cache_actual_change_rate")
+        ),
+        "final20_uav_movement_rate": _mean(
+            _metric_values(final_episodes, "uav_actual_movement_rate")
+        ),
+        "final20_reward_origin_0_59": region_mean(0),
+        "final20_reward_origin_60_119": region_mean(60),
+        "final20_reward_origin_120_179": region_mean(120),
+        "final20_reward_origin_180_239": region_mean(180),
+        "nan_inf_detected": bool(episode_nan_inf),
+    }
+    _write_json(path, summary)
+    return summary

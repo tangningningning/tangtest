@@ -30,6 +30,12 @@ from .plotting import (
     append_training_slot_metrics,
     update_training_slot_reward_plot,
 )
+from .reporting import (
+    RUN_MANIFEST_FILENAME,
+    RUN_SUMMARY_FILENAME,
+    update_run_summary,
+    write_run_manifest,
+)
 from .policy import (
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
@@ -1032,6 +1038,7 @@ class PPOV2Trainer:
             "critic_return_scale_m2": float(self.critic_return_statistics.m2),
             "episode": int(completed_episodes),
             "completed_episodes": int(completed_episodes),
+            "completed_epochs": int(completed_episodes),
             "current_train_origin": int(current_train_origin),
             "current_cache_state": np.asarray(current_cache_state, dtype=np.int8).copy(),
             "current_uav_positions": _copy_uav_positions(current_uav_positions),
@@ -1263,16 +1270,27 @@ def run_training(
     torch.manual_seed(seed)
     trainer = PPOV2Trainer(context)
     config_hash = _config_hash(config_path)
+    run_path = Path(run_dir)
     completed_episodes = 0
     current_train_origin = context.train_origin_start
     current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
     current_uav_positions = _copy_uav_positions(context.initial_uav)
-    run_path = Path(run_dir)
     checkpoint = run_path / CHECKPOINT_FILENAME
     episode_metrics_path = run_path / "episode_metrics.jsonl"
     update_metrics_path = run_path / "update_metrics.jsonl"
     critic_diagnostics_path = run_path / "critic_diagnostics.jsonl"
     slot_metrics_path = run_path / SLOT_METRICS_FILENAME
+    manifest = write_run_manifest(
+        run_path / RUN_MANIFEST_FILENAME,
+        config_path=config_path,
+        config_sha256=config_hash,
+        seed=seed,
+        trainer=trainer,
+        context=context,
+        target_epochs=target_epochs,
+        rollout_steps=int(rollout_steps),
+        resume=resume,
+    )
     best_epoch = 0
     best_epoch_return: float | None = None
     if resume:
@@ -1289,6 +1307,24 @@ def run_training(
             raise ValueError("checkpoint completed epochs exceed target epochs")
 
     origins_per_epoch = context.train_origin_end - context.train_origin_start + 1
+    update_run_summary(
+        run_path / RUN_SUMMARY_FILENAME,
+        episode_metrics_path=episode_metrics_path,
+        slot_metrics_path=slot_metrics_path,
+        completed_epochs=completed_episodes,
+        target_epochs=target_epochs,
+        status="completed" if completed_episodes >= target_epochs else "running",
+    )
+    git_sha_display = manifest.get("git_commit_sha") or "null"
+    if len(git_sha_display) > 12:
+        git_sha_display = git_sha_display[:12]
+    identity_output = (
+        f"Policy Schema: {manifest['policy_schema']}\n"
+        f"Advantage Mode: {manifest['advantage_normalization_mode']}\n"
+        f"Critic Scale Mode: {manifest['critic_value_scale_mode']}\n"
+        f"Config SHA256: {str(config_hash)[:12]}\n"
+        f"Git Commit: {git_sha_display}"
+    )
     if resume:
         displayed_origin = (
             0
@@ -1300,7 +1336,8 @@ def run_training(
             f"Completed Epochs: {completed_episodes}\n"
             f"Next Epoch: {completed_episodes + 1}\n"
             f"Current Origin: {displayed_origin}/{origins_per_epoch}\n"
-            f"Target Epochs: {target_epochs}",
+            f"Target Epochs: {target_epochs}\n"
+            f"{identity_output}",
             flush=True,
         )
     else:
@@ -1308,7 +1345,8 @@ def run_training(
             "[PPO] Training start\n"
             f"Target Epochs: {target_epochs}\n"
             f"Origins per Epoch: {origins_per_epoch}\n"
-            f"Rollout Steps: {int(rollout_steps)}",
+            f"Rollout Steps: {int(rollout_steps)}\n"
+            f"{identity_output}",
             flush=True,
         )
 
@@ -1318,6 +1356,13 @@ def run_training(
     episode_critic_optimizer_start = trainer.critic_optimizer_steps
     episode_rewards: list[float] = []
     episode_g_values: list[float] = []
+    episode_q_values: list[float] = []
+    episode_cache_costs: list[float] = []
+    episode_movement_costs: list[float] = []
+    episode_cache_trigger_counts: list[int] = []
+    episode_cache_change_counts: list[int] = []
+    episode_uav_trigger_counts: list[int] = []
+    episode_uav_movement_counts: list[int] = []
     episode_cache_requests = 0
     episode_actual_cache_updates = 0
     episode_uav_requests = 0
@@ -1353,6 +1398,13 @@ def run_training(
             episode_critic_optimizer_start = trainer.critic_optimizer_steps
             episode_rewards = []
             episode_g_values = []
+            episode_q_values = []
+            episode_cache_costs = []
+            episode_movement_costs = []
+            episode_cache_trigger_counts = []
+            episode_cache_change_counts = []
+            episode_uav_trigger_counts = []
+            episode_uav_movement_counts = []
             episode_cache_requests = 0
             episode_actual_cache_updates = 0
             episode_uav_requests = 0
@@ -1431,6 +1483,27 @@ def run_training(
 
         episode_rewards.extend(transition_rewards.tolist())
         episode_g_values.extend(transition_g_values.tolist())
+        episode_q_values.extend(
+            float(item.actual_task_utility) for item in rollout.transitions
+        )
+        episode_cache_costs.extend(float(item.cache_cost) for item in rollout.transitions)
+        episode_movement_costs.extend(
+            float(item.movement_cost) for item in rollout.transitions
+        )
+        episode_cache_trigger_counts.extend(
+            int(np.asarray(item.action[:cache_count], dtype=np.int64).sum())
+            for item in rollout.transitions
+        )
+        episode_cache_change_counts.extend(
+            int(item.actual_cache_update_count) for item in rollout.transitions
+        )
+        episode_uav_trigger_counts.extend(
+            int(np.asarray(item.action[cache_count:], dtype=np.int64).sum())
+            for item in rollout.transitions
+        )
+        episode_uav_movement_counts.extend(
+            int(item.actual_uav_movement_count) for item in rollout.transitions
+        )
         episode_cache_requests += cache_requests
         episode_actual_cache_updates += actual_cache_updates
         episode_uav_requests += uav_requests
@@ -1572,6 +1645,33 @@ def run_training(
                 raise FloatingPointError("PPO v2 episode metrics 非 finite。")
             epoch_runtime_seconds = float(time.perf_counter() - episode_started_at)
             epoch_return = float(episode_reward_array.sum())
+            episode_q_array = np.asarray(episode_q_values, dtype=np.float64)
+            episode_cache_cost_array = np.asarray(
+                episode_cache_costs, dtype=np.float64
+            )
+            episode_movement_cost_array = np.asarray(
+                episode_movement_costs, dtype=np.float64
+            )
+            if not (
+                episode_q_array.shape
+                == episode_cache_cost_array.shape
+                == episode_movement_cost_array.shape
+                == episode_reward_array.shape
+            ):
+                raise AssertionError("PPO v2 episode slot metric arrays are misaligned")
+            if not np.all(
+                np.isfinite(episode_q_array)
+                & np.isfinite(episode_cache_cost_array)
+                & np.isfinite(episode_movement_cost_array)
+            ):
+                raise FloatingPointError("PPO v2 episode slot metrics 非 finite。")
+            if not np.allclose(
+                episode_reward_array,
+                episode_q_array - episode_cache_cost_array - episode_movement_cost_array,
+                rtol=1.0e-12,
+                atol=1.0e-9,
+            ):
+                raise AssertionError("PPO v2 episode slot reward contract mismatch")
             (
                 critic_explained_variance,
                 critic_value_std,
@@ -1585,6 +1685,24 @@ def run_training(
             )
             uav_move_rate = float(episode_actual_uav_movements) / float(
                 len(episode_reward_array) * len(context.action_spec.uav_ids)
+            )
+            cache_trigger_rate = float(episode_cache_requests) / float(
+                len(episode_reward_array) * cache_count
+            )
+            cache_change_given_trigger = (
+                None
+                if episode_cache_requests == 0
+                else float(episode_actual_cache_updates)
+                / float(episode_cache_requests)
+            )
+            uav_trigger_rate = float(episode_uav_requests) / float(
+                len(episode_reward_array) * len(context.action_spec.uav_ids)
+            )
+            uav_move_given_trigger = (
+                None
+                if episode_uav_requests == 0
+                else float(episode_actual_uav_movements)
+                / float(episode_uav_requests)
             )
             epoch_entropy = float(np.mean(episode_entropies))
             epoch_approximate_kl = float(np.mean(episode_approximate_kls))
@@ -1631,6 +1749,9 @@ def run_training(
                     "mean_reward": float(episode_reward_array.mean()),
                     "mean_G": float(episode_g_array.mean()),
                     "reward_std": float(episode_reward_array.std()),
+                    "q_total": float(episode_q_array.sum()),
+                    "critic_value_mean": float(np.mean(episode_critic_values)),
+                    "critic_target_mean": float(np.mean(episode_critic_targets)),
                     "critic_explained_variance": critic_explained_variance,
                     "critic_value_std": critic_value_std,
                     "critic_target_std": critic_target_std,
@@ -1655,6 +1776,10 @@ def run_training(
                     "best_epoch_return": best_epoch_return,
                     "entropy_mean": epoch_entropy,
                     "approximate_kl_mean": epoch_approximate_kl,
+                    "cache_trigger_rate": cache_trigger_rate,
+                    "cache_change_given_trigger": cache_change_given_trigger,
+                    "uav_trigger_rate": uav_trigger_rate,
+                    "uav_move_given_trigger": uav_move_given_trigger,
                     "cache_actual_change_rate": cache_change_rate,
                     "uav_actual_movement_rate": uav_move_rate,
                     "policy_loss_range": {
@@ -1691,6 +1816,13 @@ def run_training(
                 epoch=episode_number,
                 rewards=episode_reward_array.tolist(),
                 episode_return=epoch_return,
+                q_values=episode_q_array.tolist(),
+                cache_costs=episode_cache_cost_array.tolist(),
+                movement_costs=episode_movement_cost_array.tolist(),
+                cache_trigger_counts=episode_cache_trigger_counts,
+                cache_change_counts=episode_cache_change_counts,
+                uav_trigger_counts=episode_uav_trigger_counts,
+                uav_movement_counts=episode_uav_movement_counts,
             )
             try:
                 plot_path = update_training_slot_reward_plot(run_path)
@@ -1698,6 +1830,18 @@ def run_training(
                 print(f"[PLOT] Warning: {exc}", flush=True)
             else:
                 print(f"[PLOT] Updated: {plot_path}", flush=True)
+            update_run_summary(
+                run_path / RUN_SUMMARY_FILENAME,
+                episode_metrics_path=episode_metrics_path,
+                slot_metrics_path=slot_metrics_path,
+                completed_epochs=completed_episodes,
+                target_epochs=target_epochs,
+                status=(
+                    "completed"
+                    if completed_episodes >= target_epochs
+                    else "running"
+                ),
+            )
             print(
                 f"[PPO] Epoch {completed_episodes}/{target_epochs} | "
                 f"Return={epoch_return:.2f} | "
