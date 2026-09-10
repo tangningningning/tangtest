@@ -621,6 +621,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "adaptive_primitive_v3_horizon_grouped",
         "adaptive_primitive_v4_horizon_grouped_separate_critic",
         "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization",
+        "adaptive_primitive_v6_horizon_grouped_separate_critic_popart",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -628,7 +629,8 @@ def validate_config(config: dict[str, Any]) -> None:
             "adaptive_primitive_v2_grouped/"
             "adaptive_primitive_v3_horizon_grouped/"
             "adaptive_primitive_v4_horizon_grouped_separate_critic/"
-            "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization."
+            "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization/"
+            "adaptive_primitive_v6_horizon_grouped_separate_critic_popart."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
@@ -676,9 +678,14 @@ def validate_config(config: dict[str, Any]) -> None:
     critic_value_scale_mode = str(
         get_config_value(config, "algorithm.ppo.critic_value_scale_mode", "none")
     )
-    if critic_value_scale_mode not in {"none", "running_return_std"}:
+    if critic_value_scale_mode not in {
+        "none",
+        "running_return_std",
+        "popart_normalized",
+    }:
         raise ValueError(
-            "algorithm.ppo.critic_value_scale_mode 只支持 none/running_return_std。"
+            "algorithm.ppo.critic_value_scale_mode 只支持 "
+            "none/running_return_std/popart_normalized。"
         )
     critic_value_scale_epsilon = float(
         get_config_value(config, "algorithm.ppo.critic_value_scale_epsilon", 1.0e-8)

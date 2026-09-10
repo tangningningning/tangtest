@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Callable
 
 import numpy as np
@@ -641,3 +642,74 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic(
         obs, single = self._observations(observations)
         values = self.critic_head(self.critic_encoder(obs)).squeeze(-1)
         return values.squeeze(0) if single else values
+
+
+class AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic(
+    AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic
+):
+    """V5 policy whose independent critic predicts a PopArt-normalized value."""
+
+    architecture_id = "adaptive_primitive_v6_horizon_grouped_separate_critic_popart"
+    architecture_version = 1
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        cache_feature_dim: int,
+        uav_feature_dim: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(
+            observation_dim,
+            action_dim,
+            cache_feature_dim,
+            uav_feature_dim,
+            hidden_sizes,
+        )
+        self.register_buffer("popart_mean", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("popart_std", torch.ones((), dtype=torch.float32))
+
+    @staticmethod
+    def _validate_popart_statistics(mean: Any, std: Any) -> tuple[float, float]:
+        mean_f = float(mean)
+        std_f = float(std)
+        if not math.isfinite(mean_f) or not math.isfinite(std_f) or std_f <= 0.0:
+            raise ValueError("PopArt mean/std must be finite and std must be positive.")
+        return mean_f, std_f
+
+    def popart_statistics(self) -> tuple[float, float]:
+        """Return the active raw-value mean and standard deviation."""
+
+        return (
+            float(self.popart_mean.detach().cpu().item()),
+            float(self.popart_std.detach().cpu().item()),
+        )
+
+    def critic_normalized_value(self, observations: Any) -> Any:
+        """Return the critic's internal normalized value z(s)."""
+
+        obs, single = self._observations(observations)
+        values = self.critic_head(self.critic_encoder(obs)).squeeze(-1)
+        return values.squeeze(0) if single else values
+
+    def critic_value(self, observations: Any) -> Any:
+        """Return the raw value V(s) exposed to rollout, GAE, and PPO."""
+
+        normalized_values = self.critic_normalized_value(observations)
+        return self.popart_mean + self.popart_std * normalized_values
+
+    def _critic_values(self, observations: Any, actor_hidden: Any) -> Any:
+        del actor_hidden
+        return self.critic_value(observations)
+
+    def update_popart_statistics(self, mean: Any, std: Any) -> None:
+        """Transform only the critic output head while preserving raw values."""
+
+        mean_new, std_new = self._validate_popart_statistics(mean, std)
+        mean_old, std_old = self.popart_statistics()
+        with torch.no_grad():
+            self.critic_head.weight.mul_(std_old / std_new)
+            self.critic_head.bias.mul_(std_old).add_(mean_old - mean_new).div_(std_new)
+            self.popart_mean.fill_(mean_new)
+            self.popart_std.fill_(std_new)

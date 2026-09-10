@@ -44,6 +44,7 @@ from .policy import (
     AdaptivePrimitiveHorizonGroupedV3ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
+    AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
     AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
@@ -58,6 +59,7 @@ CHECKPOINT_VERSION = 2
 PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
 SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION = 5
+POPART_CHECKPOINT_VERSION = 6
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
@@ -65,6 +67,7 @@ ADVANTAGE_NORMALIZATION_STD_ONLY = "std_only"
 DEFAULT_ADVANTAGE_NORMALIZATION_MODE = ADVANTAGE_NORMALIZATION_CENTERED_STD
 CRITIC_VALUE_SCALE_NONE = "none"
 CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
+CRITIC_VALUE_SCALE_POPART_NORMALIZED = "popart_normalized"
 DEFAULT_CRITIC_VALUE_SCALE_EPSILON = 1.0e-8
 DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES = 64
 V2_POLICY_SCHEMAS = frozenset(
@@ -84,7 +87,13 @@ V5_POLICY_SCHEMAS = frozenset(
         AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic.architecture_id
     }
 )
-HORIZON_POLICY_SCHEMAS = V3_POLICY_SCHEMAS | V4_POLICY_SCHEMAS | V5_POLICY_SCHEMAS
+V6_POLICY_SCHEMAS = frozenset(
+    {AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id}
+)
+SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = V5_POLICY_SCHEMAS | V6_POLICY_SCHEMAS
+HORIZON_POLICY_SCHEMAS = (
+    V3_POLICY_SCHEMAS | V4_POLICY_SCHEMAS | SEPARATE_OPTIMIZATION_POLICY_SCHEMAS
+)
 MODERN_POLICY_SCHEMAS = V2_POLICY_SCHEMAS | HORIZON_POLICY_SCHEMAS
 
 
@@ -152,6 +161,19 @@ class RunningReturnStatistics:
         if not math.isfinite(scale) or scale <= 0.0:
             return 1.0
         return float(scale)
+
+    def active_statistics(self, epsilon: float, warmup_samples: int) -> tuple[float, float]:
+        """Return the active PopArt raw-return mean and standard deviation."""
+
+        if self.count < int(warmup_samples) or self.count <= 0:
+            return 0.0, 1.0
+        variance = self.m2 / float(self.count)
+        if not math.isfinite(variance) or variance < 0.0:
+            raise FloatingPointError("running return statistics variance is non-finite")
+        scale = math.sqrt(variance + float(epsilon))
+        if not math.isfinite(self.mean) or not math.isfinite(scale) or scale <= 0.0:
+            raise FloatingPointError("active PopArt statistics are non-finite")
+        return float(self.mean), float(scale)
 
     def update(self, values: Any) -> None:
         values_a = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -489,9 +511,10 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
     if values.critic_value_scale_mode not in {
         CRITIC_VALUE_SCALE_NONE,
         CRITIC_VALUE_SCALE_RUNNING_RETURN_STD,
+        CRITIC_VALUE_SCALE_POPART_NORMALIZED,
     }:
         raise ValueError(
-            "critic_value_scale_mode 只支持 none/running_return_std。"
+            "critic_value_scale_mode 只支持 none/running_return_std/popart_normalized。"
         )
     if (
         not math.isfinite(values.critic_value_scale_epsilon)
@@ -573,6 +596,11 @@ class PPOV2Trainer:
                 == AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic.architecture_id
             ):
                 policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic
+            elif (
+                context.policy_schema
+                == AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id
+            ):
+                policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
             else:
                 raise ValueError(
                     "unknown policy_primitive policy_schema="
@@ -595,6 +623,16 @@ class PPOV2Trainer:
             raise ValueError(
                 f"unknown configuration_control_mode={context.configuration_control_mode}"
             )
+        if (
+            self.policy.architecture_id in V6_POLICY_SCHEMAS
+        ) != (
+            self.hyperparameters.critic_value_scale_mode
+            == CRITIC_VALUE_SCALE_POPART_NORMALIZED
+        ):
+            raise ValueError(
+                "V6 PopArt policy requires critic_value_scale_mode=popart_normalized, "
+                "and popart_normalized is reserved for the V6 policy."
+            )
         self.optimizer_steps = 0
         self.actor_optimizer_steps = 0
         self.critic_optimizer_steps = 0
@@ -603,7 +641,7 @@ class PPOV2Trainer:
                 self.policy,
                 AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
             ):
-                raise TypeError("V5 separate optimization requires the V5 actor-critic policy.")
+                raise TypeError("separate optimization requires a V5/V6 actor-critic policy.")
             actor_parameters = list(self.policy.actor_parameters())
             critic_parameters = list(self.policy.critic_parameters())
             actor_ids = {id(parameter) for parameter in actor_parameters}
@@ -631,17 +669,26 @@ class PPOV2Trainer:
         self.critic_return_statistics = RunningReturnStatistics()
 
     def _uses_separate_optimization(self) -> bool:
-        return self.policy.architecture_id in V5_POLICY_SCHEMAS
+        return self.policy.architecture_id in SEPARATE_OPTIMIZATION_POLICY_SCHEMAS
+
+    def _uses_popart_critic(self) -> bool:
+        return self.policy.architecture_id in V6_POLICY_SCHEMAS
 
     def _critic_return_scale(self) -> float:
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_NONE:
             return 1.0
+        if self._uses_popart_critic():
+            if not isinstance(self.policy, AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic):
+                raise TypeError("PopArt scaling requires the V6 actor-critic policy.")
+            return self.policy.popart_statistics()[1]
         return self.critic_return_statistics.scale(
             self.hyperparameters.critic_value_scale_epsilon,
             self.hyperparameters.critic_value_scale_warmup_samples,
         )
 
     def _expected_checkpoint_version(self) -> int:
+        if self.policy.architecture_id in V6_POLICY_SCHEMAS:
+            return POPART_CHECKPOINT_VERSION
         if self.policy.architecture_id in V5_POLICY_SCHEMAS:
             return SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION
         if (
@@ -723,12 +770,40 @@ class PPOV2Trainer:
         advantages_finite = bool(np.all(np.isfinite(advantages)))
         if not returns_finite or not advantages_finite:
             raise FloatingPointError("PPO v2 return/advantage 非 finite。")
-        critic_return_scale = self._critic_return_scale()
-        if not np.isfinite(critic_return_scale) or critic_return_scale <= 0.0:
-            raise FloatingPointError("PPO v2 critic return scale 非 finite。")
+        popart_critic = self._uses_popart_critic()
+        critic_target_mean = 0.0
+        if not popart_critic:
+            critic_return_scale = self._critic_return_scale()
+            if not np.isfinite(critic_return_scale) or critic_return_scale <= 0.0:
+                raise FloatingPointError("PPO v2 critic return scale 非 finite。")
         sample_count = int(rollout.observations.shape[0])
         if sample_count < hyper.num_minibatches or sample_count % hyper.num_minibatches != 0:
             raise ValueError("PPO v2 rollout length 必须可被 num_minibatches 整除。")
+        if popart_critic:
+            if not isinstance(
+                self.policy,
+                AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
+            ):
+                raise TypeError("PopArt update requires the V6 actor-critic policy.")
+            expected_mean, expected_std = self.critic_return_statistics.active_statistics(
+                hyper.critic_value_scale_epsilon,
+                hyper.critic_value_scale_warmup_samples,
+            )
+            active_mean, active_std = self.policy.popart_statistics()
+            if not math.isclose(active_mean, expected_mean, rel_tol=1.0e-6, abs_tol=1.0e-6) or not math.isclose(
+                active_std, expected_std, rel_tol=1.0e-6, abs_tol=1.0e-6
+            ):
+                raise RuntimeError("V6 PopArt policy statistics are out of sync with Welford state.")
+            # The trainer's Welford state is the sole statistics source.  This
+            # is the one and only update for this completed raw-return batch.
+            self.critic_return_statistics.update(returns)
+            critic_target_mean, critic_return_scale = self.critic_return_statistics.active_statistics(
+                hyper.critic_value_scale_epsilon,
+                hyper.critic_value_scale_warmup_samples,
+            )
+            self.policy.update_popart_statistics(critic_target_mean, critic_return_scale)
+            if not np.isfinite(critic_return_scale) or critic_return_scale <= 0.0:
+                raise FloatingPointError("PPO v2 critic return scale 非 finite。")
         observations = torch.as_tensor(rollout.observations, dtype=torch.float32, device=self.device)
         actions = torch.as_tensor(rollout.actions, dtype=torch.long, device=self.device)
         masks = torch.as_tensor(rollout.action_masks, dtype=torch.bool, device=self.device)
@@ -759,6 +834,11 @@ class PPOV2Trainer:
         old_log_probs = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=self.device)
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+        critic_targets_t = (
+            (returns_t - critic_target_mean) / critic_return_scale
+            if popart_critic
+            else returns_t
+        )
         if sample_count > 1:
             advantage_std = advantages_t.std(unbiased=False) + 1.0e-8
             if (
@@ -852,7 +932,13 @@ class PPOV2Trainer:
                     else evaluation.value - returns_t[indices]
                 )
                 raw_value_loss = 0.5 * torch.mean(value_residual**2)
-                normalized_value_residual = value_residual / critic_return_scale
+                if popart_critic:
+                    normalized_value_residual = (
+                        self.policy.critic_normalized_value(observations[indices]).detach()
+                        - critic_targets_t[indices]
+                    )
+                else:
+                    normalized_value_residual = value_residual / critic_return_scale
                 value_loss = 0.5 * torch.mean(normalized_value_residual**2)
                 entropy = evaluation.entropy.mean()
                 if self._uses_separate_optimization():
@@ -904,13 +990,28 @@ class PPOV2Trainer:
                     # is retained and the actor group is cleared before critic
                     # backward to enforce the reverse disjointness invariant.
                     self.actor_optimizer.zero_grad(set_to_none=True)
-                    critic_values = self.policy.critic_value(observations[indices])
-                    critic_value_residual = critic_values - returns_t[indices]
-                    raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
-                    normalized_value_residual = critic_value_residual / critic_return_scale
+                    if popart_critic:
+                        critic_normalized_values = self.policy.critic_normalized_value(
+                            observations[indices]
+                        )
+                        critic_values = (
+                            self.policy.popart_mean
+                            + self.policy.popart_std * critic_normalized_values
+                        )
+                        critic_value_residual = critic_values.detach() - returns_t[indices]
+                        raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
+                        normalized_value_residual = (
+                            critic_normalized_values - critic_targets_t[indices]
+                        )
+                    else:
+                        critic_values = self.policy.critic_value(observations[indices])
+                        critic_value_residual = critic_values - returns_t[indices]
+                        raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
+                        normalized_value_residual = critic_value_residual / critic_return_scale
                     value_loss = 0.5 * torch.mean(normalized_value_residual**2)
-                    # V5 backpropagates the configured scaled loss.  The raw
-                    # value loss remains a diagnostic-only metric.
+                    # V5 backpropagates the configured scaled loss.  V6
+                    # backpropagates normalized-space loss.  In both cases
+                    # raw value loss remains a diagnostic-only metric.
                     critic_loss = value_loss
                     if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
                         torch.isfinite(value_loss).item()
@@ -1160,7 +1261,10 @@ class PPOV2Trainer:
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
         restored_statistics = RunningReturnStatistics()
-        if expected_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
+        if expected_scale_mode in {
+            CRITIC_VALUE_SCALE_RUNNING_RETURN_STD,
+            CRITIC_VALUE_SCALE_POPART_NORMALIZED,
+        }:
             checkpoint_epsilon = float(
                 payload.get("critic_value_scale_epsilon", float("nan"))
             )
@@ -1229,6 +1333,23 @@ class PPOV2Trainer:
             self.actor_optimizer_steps = self.optimizer_steps
             self.critic_optimizer_steps = self.optimizer_steps
         self.critic_return_statistics = restored_statistics
+        if self._uses_popart_critic():
+            if not isinstance(
+                self.policy,
+                AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
+            ):
+                raise TypeError("PopArt checkpoint restore requires the V6 actor-critic policy.")
+            expected_mean, expected_std = self.critic_return_statistics.active_statistics(
+                self.hyperparameters.critic_value_scale_epsilon,
+                self.hyperparameters.critic_value_scale_warmup_samples,
+            )
+            active_mean, active_std = self.policy.popart_statistics()
+            if not math.isclose(active_mean, expected_mean, rel_tol=1.0e-6, abs_tol=1.0e-6) or not math.isclose(
+                active_std, expected_std, rel_tol=1.0e-6, abs_tol=1.0e-6
+            ):
+                raise ValueError(
+                    "PPO V6 checkpoint PopArt statistics do not match Welford state."
+                )
         rng_state = payload.get("rng_state", {})
         if "python" in rng_state:
             random.setstate(rng_state["python"])
