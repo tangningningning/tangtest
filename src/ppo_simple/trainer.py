@@ -59,6 +59,7 @@ PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
 SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION = 5
 DEFAULT_ROLLOUT_STEPS = 16
+PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
 ADVANTAGE_NORMALIZATION_STD_ONLY = "std_only"
 DEFAULT_ADVANTAGE_NORMALIZATION_MODE = ADVANTAGE_NORMALIZATION_CENTERED_STD
@@ -1856,12 +1857,17 @@ def run_training(
                     else "running"
                 ),
             )
-            try:
-                plot_path = update_training_epoch_return_plot(run_path)
-            except Exception as exc:  # plotting must not interrupt PPO training
-                print(f"[PLOT] Warning: {exc}", flush=True)
-            else:
-                print(f"[PLOT] Updated: {plot_path}", flush=True)
+            should_update_plot = (
+                completed_episodes % PLOT_UPDATE_INTERVAL_EPOCHS == 0
+                or completed_episodes == target_epochs
+            )
+            if should_update_plot:
+                try:
+                    plot_path = update_training_epoch_return_plot(run_path)
+                except Exception as exc:  # plotting must not interrupt PPO training
+                    print(f"[PLOT] Warning: {exc}", flush=True)
+                else:
+                    print(f"[PLOT] Updated: {plot_path}", flush=True)
             print(
                 f"[PPO] Epoch {completed_episodes}/{target_epochs} | "
                 f"Return={epoch_return:.2f} | "
