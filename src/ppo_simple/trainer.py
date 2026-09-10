@@ -27,8 +27,9 @@ from . import interface
 from .interface import _copy_uav_positions
 from .plotting import (
     SLOT_METRICS_FILENAME,
+    TRAINING_EPOCH_RETURN_PLOT_FILENAME,
     append_training_slot_metrics,
-    update_training_slot_reward_plot,
+    update_training_epoch_return_plot,
 )
 from .reporting import (
     RUN_MANIFEST_FILENAME,
@@ -1843,12 +1844,6 @@ def run_training(
                 uav_trigger_counts=episode_uav_trigger_counts,
                 uav_movement_counts=episode_uav_movement_counts,
             )
-            try:
-                plot_path = update_training_slot_reward_plot(run_path)
-            except Exception as exc:  # plotting must not interrupt PPO training
-                print(f"[PLOT] Warning: {exc}", flush=True)
-            else:
-                print(f"[PLOT] Updated: {plot_path}", flush=True)
             update_run_summary(
                 run_path / RUN_SUMMARY_FILENAME,
                 episode_metrics_path=episode_metrics_path,
@@ -1861,6 +1856,12 @@ def run_training(
                     else "running"
                 ),
             )
+            try:
+                plot_path = update_training_epoch_return_plot(run_path)
+            except Exception as exc:  # plotting must not interrupt PPO training
+                print(f"[PLOT] Warning: {exc}", flush=True)
+            else:
+                print(f"[PLOT] Updated: {plot_path}", flush=True)
             print(
                 f"[PPO] Epoch {completed_episodes}/{target_epochs} | "
                 f"Return={epoch_return:.2f} | "
@@ -1875,7 +1876,7 @@ def run_training(
         current_cache_state = np.asarray(rollout.next_cache_state, dtype=np.int8).copy()
         current_uav_positions = _copy_uav_positions(rollout.next_uav_positions)
 
-    final_plot_path = run_path / "plots" / "training_slot_reward.png"
+    final_plot_path = run_path / "plots" / TRAINING_EPOCH_RETURN_PLOT_FILENAME
     if completed_episodes >= target_epochs:
         if final_plot_path.exists():
             print(f"[PLOT] Final: {final_plot_path}", flush=True)

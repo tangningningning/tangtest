@@ -10,7 +10,12 @@ from typing import Any
 
 from common import project_config
 
-from .plotting import SLOTS_PER_EPOCH, _read_slot_metrics
+from .plotting import (
+    SLOTS_PER_EPOCH,
+    TRAINING_EPOCH_RETURN_PLOT_FILENAME,
+    TRAINING_SLOT_REWARD_PLOT_FILENAME,
+    _read_slot_metrics,
+)
 
 
 RUN_MANIFEST_FILENAME = "run_manifest.json"
@@ -24,7 +29,8 @@ FRESH_RUN_ARTIFACTS = (
     "slot_metrics.jsonl",
     "latest_checkpoint.pt",
     "best_train_return_checkpoint.pt",
-    "plots/training_slot_reward.png",
+    f"plots/{TRAINING_EPOCH_RETURN_PLOT_FILENAME}",
+    f"plots/{TRAINING_SLOT_REWARD_PLOT_FILENAME}",
 )
 
 

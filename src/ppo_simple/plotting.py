@@ -1,4 +1,4 @@
-"""Minimal training-slot reward logging and plotting for PPO runs."""
+"""Minimal training metrics logging and plotting for PPO runs."""
 
 from __future__ import annotations
 
@@ -12,8 +12,10 @@ import numpy as np
 
 SLOTS_PER_EPOCH = 240
 SLOT_METRICS_FILENAME = "slot_metrics.jsonl"
+EPISODE_METRICS_FILENAME = "episode_metrics.jsonl"
+TRAINING_EPOCH_RETURN_PLOT_FILENAME = "training_epoch_return.png"
+# Kept only as a legacy artifact name for fresh-run contamination checks.
 TRAINING_SLOT_REWARD_PLOT_FILENAME = "training_slot_reward.png"
-MA_WINDOW = 240
 SLOT_DETAIL_FIELDS = (
     "q",
     "cache_cost",
@@ -316,8 +318,92 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         stream.write("\n")
 
 
-def update_training_slot_reward_plot(run_dir: Path) -> Path:
-    """Render the only supported PPO training plot from raw slot metrics."""
+def _finite_episode_return(value: Any) -> float:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("episode_metrics episode_return must be numeric") from exc
+    if not math.isfinite(converted):
+        raise ValueError("episode_metrics episode_return must be finite")
+    return converted
+
+
+def _read_episode_returns(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read one finite raw return for every contiguous completed Epoch."""
+
+    records: dict[int, float] = {}
+    if not path.exists():
+        raise ValueError("episode_metrics.jsonl is empty or does not exist")
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                raise ValueError(
+                    f"episode_metrics contains a blank line at {line_number}"
+                )
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"episode_metrics contains invalid JSON at line {line_number}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"episode_metrics line {line_number} is not an object"
+                )
+            if record.get("record_type", "episode") != "episode":
+                continue
+            if "epoch" not in record:
+                raise ValueError(
+                    f"episode_metrics line {line_number} is missing epoch"
+                )
+            raw_epoch = record["epoch"]
+            try:
+                epoch = int(raw_epoch)
+                epoch_as_float = float(raw_epoch)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"episode_metrics line {line_number} has invalid epoch"
+                ) from exc
+            if (
+                isinstance(raw_epoch, bool)
+                or not math.isfinite(epoch_as_float)
+                or epoch_as_float != epoch
+                or epoch < 1
+            ):
+                raise ValueError(
+                    f"episode_metrics line {line_number} has invalid epoch: {raw_epoch!r}"
+                )
+            if epoch in records:
+                raise ValueError(f"episode_metrics duplicate epoch: {epoch}")
+            records[epoch] = _finite_episode_return(record.get("episode_return"))
+
+    if not records:
+        raise ValueError("episode_metrics.jsonl has no episode records")
+    epochs = sorted(records)
+    expected_epochs = list(range(1, len(epochs) + 1))
+    if epochs != expected_epochs:
+        raise ValueError(
+            "episode_metrics epochs are not contiguous from 1: "
+            f"expected {expected_epochs}, got {epochs}"
+        )
+    return (
+        np.asarray(epochs, dtype=np.int64),
+        np.asarray([records[epoch] for epoch in epochs], dtype=np.float64),
+    )
+
+
+def _full_window_moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    if int(window) <= 0:
+        raise ValueError("moving-average window must be positive")
+    moving = np.full(values.shape, np.nan, dtype=np.float64)
+    if values.size >= int(window):
+        for index in range(int(window) - 1, values.size):
+            moving[index] = float(np.mean(values[index - int(window) + 1 : index + 1]))
+    return moving
+
+
+def update_training_epoch_return_plot(run_dir: Path) -> Path:
+    """Render the only supported PPO training plot from Epoch returns."""
 
     import matplotlib
 
@@ -325,56 +411,34 @@ def update_training_slot_reward_plot(run_dir: Path) -> Path:
     import matplotlib.pyplot as plt
 
     run_path = Path(run_dir)
-    records = _read_slot_metrics(run_path / SLOT_METRICS_FILENAME)
-    if not records:
-        raise ValueError("slot_metrics.jsonl is empty or does not exist")
-
-    ordered = sorted(records.values(), key=lambda item: item["global_training_slot"])
-    global_slots = np.asarray(
-        [item["global_training_slot"] for item in ordered], dtype=np.int64
+    epochs, returns = _read_episode_returns(
+        run_path / EPISODE_METRICS_FILENAME
     )
-    rewards = np.asarray([item["reward"] for item in ordered], dtype=np.float64)
-    if not np.all(np.diff(global_slots) == 1):
-        raise ValueError("slot_metrics global_training_slot sequence is not contiguous")
-    if not np.all(np.isfinite(rewards)):
-        raise ValueError("slot_metrics rewards contain NaN/Inf")
-
-    cumulative = np.cumsum(rewards, dtype=np.float64)
-    rolling = np.empty_like(rewards)
-    for index in range(rewards.size):
-        start = max(0, index + 1 - MA_WINDOW)
-        total = cumulative[index] - (cumulative[start - 1] if start else 0.0)
-        rolling[index] = total / float(index + 1 - start)
+    ma20 = _full_window_moving_average(returns, 20)
+    ma50 = _full_window_moving_average(returns, 50)
 
     figure, axis = plt.subplots(figsize=(12, 6))
     try:
         axis.plot(
-            global_slots,
-            rewards,
-            label="Raw Slot Reward",
-            linewidth=0.7,
-            alpha=0.55,
+            epochs,
+            returns,
+            label="Raw Epoch Return",
+            linewidth=0.9,
+            marker=".",
+            markersize=3.0,
+            alpha=0.7,
         )
-        axis.plot(
-            global_slots,
-            rolling,
-            label="MA240",
-            linewidth=1.8,
-        )
-        final_slot_exclusive = int(global_slots[-1]) + 1
-        for boundary in range(
-            SLOTS_PER_EPOCH,
-            final_slot_exclusive + 1,
-            SLOTS_PER_EPOCH,
-        ):
-            axis.axvline(boundary, linestyle="--", linewidth=0.7, alpha=0.35)
-        axis.set_xlabel("Global Training Slot")
-        axis.set_ylabel("Reward G(t)")
-        axis.set_title("PPO Training Reward per Slot")
+        for moving, label in ((ma20, "MA20"), (ma50, "MA50")):
+            valid = np.isfinite(moving)
+            if np.any(valid):
+                axis.plot(epochs[valid], moving[valid], label=label, linewidth=1.8)
+        axis.set_xlabel("Epoch")
+        axis.set_ylabel("Return")
+        axis.set_title("PPO Training Return per Epoch")
         axis.grid(True, alpha=0.3)
         axis.legend()
         figure.tight_layout()
-        output_path = run_path / "plots" / TRAINING_SLOT_REWARD_PLOT_FILENAME
+        output_path = run_path / "plots" / TRAINING_EPOCH_RETURN_PLOT_FILENAME
         output_path.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(output_path, dpi=180)
     finally:
