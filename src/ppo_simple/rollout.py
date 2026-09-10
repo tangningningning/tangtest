@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -87,6 +87,8 @@ def _observation(
     flight_boundary: tuple[float, float, float, float],
     train_origin_start: int,
     train_origin_end: int,
+    *,
+    time_to_go_override: float | None = None,
 ) -> np.ndarray:
     return interface.build_step_observation(
         previous_cache,
@@ -96,6 +98,7 @@ def _observation(
         flight_boundary,
         train_origin_start,
         train_origin_end,
+        time_to_go_override=time_to_go_override,
     )
 
 
@@ -138,6 +141,8 @@ def collect_rollout(
     initial_uav: dict[str, Any] | None = None,
     bootstrap_step: Any | None = None,
     terminal_origin_index: int | None = None,
+    observation_time_to_go: Callable[[int], float] | None = None,
+    deterministic: bool = False,
 ) -> SimpleRollout:
     """Collect one contiguous request rollout from a supplied environment state.
 
@@ -166,6 +171,11 @@ def collect_rollout(
     transitions: list[SimpleTransition] = []
     for step_index, step in enumerate(execution_steps):
         origin_started_at = time.perf_counter()
+        time_to_go_override = (
+            None
+            if observation_time_to_go is None
+            else float(observation_time_to_go(int(step.origin_index)))
+        )
         observation = _observation(
             previous_cache,
             previous_uav,
@@ -174,6 +184,7 @@ def collect_rollout(
             context.flight_boundary,
             context.train_origin_start,
             context.train_origin_end,
+            time_to_go_override=time_to_go_override,
         )
         if observation.shape != (int(context.observation_spec.observation_dim),):
             raise AssertionError("PPO v2 observation 不符合 observation_spec。")
@@ -187,7 +198,14 @@ def collect_rollout(
             context.action_spec,
         )
         selection_started_at = time.perf_counter()
-        sample = policy.sample(observation, action_mask=action_mask_provider)
+        if deterministic:
+            sample = policy.sample(
+                observation,
+                action_mask=action_mask_provider,
+                deterministic=True,
+            )
+        else:
+            sample = policy.sample(observation, action_mask=action_mask_provider)
         if sample.action.shape != (int(context.action_spec.action_dim),):
             raise AssertionError("PPO v2 action 不符合 action_spec。")
         cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(sample.action)
@@ -244,6 +262,7 @@ def collect_rollout(
                 step,
                 context,
                 tensor_spec,
+                deterministic=bool(deterministic),
             )
             total_log_prob = primitive.total_log_prob
             cache_contexts = primitive.cache_contexts
@@ -382,6 +401,11 @@ def collect_rollout(
             raise ValueError("非 terminal rollout chunk 缺少 bootstrap step。")
         if int(bootstrap_step.origin_index) != int(execution_steps[-1].origin_index) + 1:
             raise ValueError("bootstrap step 必须紧跟 rollout chunk 的最后 origin。")
+        time_to_go_override = (
+            None
+            if observation_time_to_go is None
+            else float(observation_time_to_go(int(bootstrap_step.origin_index)))
+        )
         bootstrap_observation = _observation(
             previous_cache,
             previous_uav,
@@ -390,6 +414,7 @@ def collect_rollout(
             context.flight_boundary,
             context.train_origin_start,
             context.train_origin_end,
+            time_to_go_override=time_to_go_override,
         )
 
     return SimpleRollout(

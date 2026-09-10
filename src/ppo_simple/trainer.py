@@ -10,7 +10,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -120,6 +120,7 @@ class EnvironmentContext:
     train_origin_end: int
     configuration_control_mode: str
     policy_schema: str
+    observation_time_to_go: Callable[[int], float] | None = None
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 
 [project.scripts]
 ppo-train = "ppo_simple.trainer:main"
+ppo-eval = "ppo_simple.evaluator:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

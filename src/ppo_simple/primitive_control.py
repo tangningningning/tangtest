@@ -71,6 +71,12 @@ def _intermediate_observation(
     step: Any,
     context: Any,
 ) -> np.ndarray:
+    observation_time_to_go = getattr(context, "observation_time_to_go", None)
+    time_to_go_override = (
+        None
+        if observation_time_to_go is None
+        else float(observation_time_to_go(int(step.origin_index)))
+    )
     return interface.build_step_observation(
         cache_state,
         uav_positions,
@@ -79,6 +85,7 @@ def _intermediate_observation(
         context.flight_boundary,
         context.train_origin_start,
         context.train_origin_end,
+        time_to_go_override=time_to_go_override,
     )
 
 
@@ -250,6 +257,8 @@ def sample_and_apply_primitive_configuration(
     step: Any,
     context: Any,
     tensor_spec: PrimitiveTensorSpec,
+    *,
+    deterministic: bool = False,
 ) -> PrimitiveSelectionResult:
     """Sequentially sample and apply at most one primitive per triggered head."""
 
@@ -327,7 +336,14 @@ def sample_and_apply_primitive_configuration(
         count = len(candidates)
         if count > tensor_spec.cache_max_candidates:
             raise AssertionError("cache candidate count exceeds padded tensor capacity。")
-        sampled = policy.sample_cache_candidate(conditional_context, candidate_features)
+        if deterministic:
+            sampled = policy.sample_cache_candidate(
+                conditional_context,
+                candidate_features,
+                deterministic=True,
+            )
+        else:
+            sampled = policy.sample_cache_candidate(conditional_context, candidate_features)
         selected_index = int(sampled.selected_index)
         selected = candidates[selected_index]
         applied = cache_configuration.apply_cache_candidate(
@@ -387,7 +403,14 @@ def sample_and_apply_primitive_configuration(
         count = len(candidates)
         if count > tensor_spec.uav_max_candidates:
             raise AssertionError("UAV candidate count exceeds padded tensor capacity。")
-        sampled = policy.sample_uav_candidate(conditional_context, candidate_features)
+        if deterministic:
+            sampled = policy.sample_uav_candidate(
+                conditional_context,
+                candidate_features,
+                deterministic=True,
+            )
+        else:
+            sampled = policy.sample_uav_candidate(conditional_context, candidate_features)
         selected_index = int(sampled.selected_index)
         selected = candidates[selected_index]
         applied = uav_configuration.apply_uav_candidate(

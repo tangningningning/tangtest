@@ -480,11 +480,15 @@ def build_step_observation(
     flight_boundary: tuple[float, float, float, float],
     train_origin_start: int,
     train_origin_end: int,
+    *,
+    time_to_go_override: float | None = None,
 ) -> np.ndarray:
     """Build the single authoritative observation for trigger and primitive heads."""
 
     time_to_go = (
-        normalized_time_to_go(
+        float(time_to_go_override)
+        if time_to_go_override is not None
+        else normalized_time_to_go(
             step.origin_index,
             train_origin_start,
             train_origin_end,
