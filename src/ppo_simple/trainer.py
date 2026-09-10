@@ -51,6 +51,9 @@ PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
 SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION = 5
 DEFAULT_ROLLOUT_STEPS = 16
+ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
+ADVANTAGE_NORMALIZATION_STD_ONLY = "std_only"
+DEFAULT_ADVANTAGE_NORMALIZATION_MODE = ADVANTAGE_NORMALIZATION_CENTERED_STD
 CRITIC_VALUE_SCALE_NONE = "none"
 CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
 DEFAULT_CRITIC_VALUE_SCALE_EPSILON = 1.0e-8
@@ -113,6 +116,7 @@ class PPOV2Hyperparameters:
     update_epochs: int
     num_minibatches: int
     hidden_sizes: tuple[int, ...]
+    advantage_normalization_mode: str
     critic_value_scale_mode: str
     critic_value_scale_epsilon: float
     critic_value_scale_warmup_samples: int
@@ -409,6 +413,13 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         update_epochs=int(get(cfg, "algorithm.ppo.update_epochs")),
         num_minibatches=int(get(cfg, "algorithm.ppo.num_minibatches")),
         hidden_sizes=hidden_sizes,
+        advantage_normalization_mode=str(
+            get(
+                cfg,
+                "algorithm.ppo.advantage_normalization_mode",
+                DEFAULT_ADVANTAGE_NORMALIZATION_MODE,
+            )
+        ),
         critic_value_scale_mode=str(
             get(
                 cfg,
@@ -443,6 +454,13 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         raise ValueError("PPO v2 entropy/max_grad_norm 非法。")
     if values.update_epochs <= 0 or values.num_minibatches <= 0:
         raise ValueError("PPO v2 update_epochs/num_minibatches 必须为正整数。")
+    if values.advantage_normalization_mode not in {
+        ADVANTAGE_NORMALIZATION_CENTERED_STD,
+        ADVANTAGE_NORMALIZATION_STD_ONLY,
+    }:
+        raise ValueError(
+            "advantage_normalization_mode 只支持 centered_std/std_only。"
+        )
     if values.critic_value_scale_mode not in {
         CRITIC_VALUE_SCALE_NONE,
         CRITIC_VALUE_SCALE_RUNNING_RETURN_STD,
@@ -717,7 +735,24 @@ class PPOV2Trainer:
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
         if sample_count > 1:
-            advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std(unbiased=False) + 1.0e-8)
+            advantage_std = advantages_t.std(unbiased=False) + 1.0e-8
+            if (
+                hyper.advantage_normalization_mode
+                == ADVANTAGE_NORMALIZATION_CENTERED_STD
+            ):
+                advantages_t = (advantages_t - advantages_t.mean()) / advantage_std
+            elif (
+                hyper.advantage_normalization_mode
+                == ADVANTAGE_NORMALIZATION_STD_ONLY
+            ):
+                # std_only divides by a positive scale and therefore preserves
+                # every raw advantage sign, including exact zeros.
+                advantages_t = advantages_t / advantage_std
+            else:  # pragma: no cover - validated by hyperparameters_from_project
+                raise ValueError(
+                    "unsupported advantage_normalization_mode: "
+                    f"{hyper.advantage_normalization_mode}"
+                )
 
         before = [parameter.detach().clone() for parameter in self.policy.parameters()]
         policy_loss_value = 0.0
@@ -984,6 +1019,9 @@ class PPOV2Trainer:
             "method": PPO_V2_METHOD,
             "policy_schema": self.policy.architecture_id,
             "configuration_control_mode": self.context.configuration_control_mode,
+            "advantage_normalization_mode": (
+                self.hyperparameters.advantage_normalization_mode
+            ),
             "critic_value_scale_mode": self.hyperparameters.critic_value_scale_mode,
             "critic_value_scale_epsilon": self.hyperparameters.critic_value_scale_epsilon,
             "critic_value_scale_warmup_samples": (
@@ -1069,6 +1107,20 @@ class PPOV2Trainer:
     def load_checkpoint(self, checkpoint: Path, config_hash: str) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
         expected_scale_mode = self.hyperparameters.critic_value_scale_mode
+        expected_advantage_mode = self.hyperparameters.advantage_normalization_mode
+        checkpoint_advantage_mode = str(
+            payload.get(
+                "advantage_normalization_mode",
+                DEFAULT_ADVANTAGE_NORMALIZATION_MODE,
+            )
+        )
+        if checkpoint_advantage_mode != expected_advantage_mode:
+            raise ValueError(
+                "PPO checkpoint advantage_normalization_mode mismatch; refusing "
+                "silent cross-mode resume: "
+                f"checkpoint={checkpoint_advantage_mode}, "
+                f"expected={expected_advantage_mode}."
+            )
         checkpoint_scale_mode = str(
             payload.get("critic_value_scale_mode", CRITIC_VALUE_SCALE_NONE)
         )
@@ -1428,6 +1480,9 @@ def run_training(
                 "origin_end": int(next_train_origin - 1),
                 "num_transitions": transition_count,
                 "terminal": bool(terminal),
+                "advantage_normalization_mode": (
+                    trainer.hyperparameters.advantage_normalization_mode
+                ),
                 "optimizer_steps": int(update.optimizer_steps),
                 "actor_optimizer_steps": int(update.actor_optimizer_steps),
                 "critic_optimizer_steps": int(update.critic_optimizer_steps),

@@ -648,6 +648,17 @@ def validate_config(config: dict[str, Any]) -> None:
     ppo_max_grad_norm = float(get_config_value(config, "algorithm.ppo.max_grad_norm"))
     ppo_update_epochs = int(get_config_value(config, "algorithm.ppo.update_epochs"))
     ppo_num_minibatches = int(get_config_value(config, "algorithm.ppo.num_minibatches"))
+    advantage_normalization_mode = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.advantage_normalization_mode",
+            "centered_std",
+        )
+    )
+    if advantage_normalization_mode not in {"centered_std", "std_only"}:
+        raise ValueError(
+            "algorithm.ppo.advantage_normalization_mode 只支持 centered_std/std_only。"
+        )
     critic_value_scale_mode = str(
         get_config_value(config, "algorithm.ppo.critic_value_scale_mode", "none")
     )
