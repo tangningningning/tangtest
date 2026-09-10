@@ -33,6 +33,7 @@ from .plotting import (
 from .reporting import (
     RUN_MANIFEST_FILENAME,
     RUN_SUMMARY_FILENAME,
+    ensure_fresh_run_dir_is_clean,
     update_run_summary,
     write_run_manifest,
 )
@@ -1271,6 +1272,8 @@ def run_training(
     trainer = PPOV2Trainer(context)
     config_hash = _config_hash(config_path)
     run_path = Path(run_dir)
+    if not resume:
+        ensure_fresh_run_dir_is_clean(run_path)
     completed_episodes = 0
     current_train_origin = context.train_origin_start
     current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()

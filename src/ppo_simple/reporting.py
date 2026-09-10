@@ -15,6 +15,40 @@ from .plotting import SLOTS_PER_EPOCH, _read_slot_metrics
 
 RUN_MANIFEST_FILENAME = "run_manifest.json"
 RUN_SUMMARY_FILENAME = "run_summary.json"
+FRESH_RUN_ARTIFACTS = (
+    RUN_MANIFEST_FILENAME,
+    RUN_SUMMARY_FILENAME,
+    "episode_metrics.jsonl",
+    "update_metrics.jsonl",
+    "critic_diagnostics.jsonl",
+    "slot_metrics.jsonl",
+    "latest_checkpoint.pt",
+    "best_train_return_checkpoint.pt",
+    "plots/training_slot_reward.png",
+)
+
+
+def ensure_fresh_run_dir_is_clean(run_dir: Path) -> None:
+    """Reject fresh runs that would mix with an existing experiment."""
+
+    run_path = Path(run_dir)
+    if not run_path.exists():
+        return
+    if not run_path.is_dir():
+        raise RuntimeError(
+            "fresh PPO run-dir already exists but is not a directory; "
+            "use a new --run-dir or --resume"
+        )
+    existing_artifacts = [
+        relative_path
+        for relative_path in FRESH_RUN_ARTIFACTS
+        if (run_path / relative_path).exists()
+    ]
+    if existing_artifacts:
+        raise RuntimeError(
+            "fresh PPO run-dir already contains experiment artifacts; "
+            "use a new --run-dir or --resume"
+        )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -240,6 +274,27 @@ def validate_run_manifest_for_resume(
             for field, (old, new) in mismatches.items()
         )
         raise ValueError(f"PPO resume run_manifest mismatch: {details}")
+
+    existing_git_sha = existing.get("git_commit_sha")
+    current_git_sha = current.get("git_commit_sha")
+    if existing_git_sha is not None:
+        existing_git_sha = str(existing_git_sha).strip() or None
+    if current_git_sha is not None:
+        current_git_sha = str(current_git_sha).strip() or None
+    if (
+        existing_git_sha is not None
+        and current_git_sha is not None
+        and existing_git_sha != current_git_sha
+    ):
+        raise ValueError(
+            "PPO resume git_commit_sha mismatch; refusing cross-code-version resume"
+        )
+    if existing_git_sha is None or current_git_sha is None:
+        print(
+            "[REPORTING] Warning: Git provenance unavailable for resume; "
+            "allowing resume without cross-code-version verification.",
+            flush=True,
+        )
 
 
 def write_run_manifest(
