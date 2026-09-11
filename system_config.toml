@@ -48,6 +48,7 @@ vehicle_roles = "data/generated/vehicle_roles.json"
 trajectory = "data/generated/trajectory.csv"
 vehicle_predictions = "data/generated/vehicle_predictions.csv"
 popularity = "data/generated/popularity.csv"
+popularity_predictions = "data/generated/popularity_predictions.csv"
 tasks = "data/generated/tasks.csv"
 # 当前预测场景文件。cache optimizer 只能读取该预测输入，不能读取未来真实任务。
 prediction_scenarios = "data/generated/prediction_scenarios.npz"

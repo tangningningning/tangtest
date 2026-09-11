@@ -24,6 +24,11 @@ from typing import Any
 
 import numpy as np
 
+try:
+    from scenario.realization import derive_episode_seeds
+except ModuleNotFoundError:  # direct ``python src/scenario/task_scenario.py``
+    from realization import derive_episode_seeds
+
 
 # ============================================================================
 # 本阶段集中配置区
@@ -234,6 +239,8 @@ def resolve_time_metadata(
     args: argparse.Namespace,
     defaults: TaskConfig,
     project_config: dict[str, Any] | None = None,
+    *,
+    check_role_seed: bool = True,
 ) -> tuple[float, float, float, int]:
     """读取正式时间轴；TOML 默认值和 CLI 覆盖优先于 artifact 元数据。"""
     if project_config is not None:
@@ -288,7 +295,7 @@ def resolve_time_metadata(
                 raise ValueError(
                     f"vehicle_roles.json 的 {label}={roles[key]} 与正式配置 {selected} 不一致。"
                 )
-        if "seed" in roles and int(roles["seed"]) != master_seed:
+        if check_role_seed and "seed" in roles and int(roles["seed"]) != master_seed:
             raise ValueError(
                 f"vehicle_roles.json 的 seed={roles['seed']} 与正式 task.master_seed="
                 f"{master_seed} 不一致。"
@@ -1216,6 +1223,96 @@ def build_artifacts(
     }
 
 
+def build_episode_artifacts(
+    task_vehicles: list[str],
+    service_catalog: dict[str, Any],
+    dt_s: float,
+    warmup_s: float,
+    episode_s: float,
+    config: TaskConfig,
+    named_seeds: dict[str, int],
+) -> dict[str, Any]:
+    """Generate one episode's task data from explicit named streams.
+
+    The service catalog is read-only input.  Popularity prehistory and the formal
+    episode are generated as one continuous process, matching legacy semantics.
+    """
+
+    required = {
+        "popularity_evolution",
+        "task_arrival",
+        "service_request",
+        "workload_variation",
+    }
+    missing = sorted(required - set(named_seeds))
+    if missing:
+        raise ValueError("missing named task seed streams: " + ", ".join(missing))
+    catalog = service_catalog.get("services")
+    if not isinstance(catalog, list):
+        raise ValueError("service_catalog.json 缺少 services list。")
+    catalog = [dict(row) for row in catalog]
+    if len(catalog) != config.num_services:
+        raise ValueError("service catalog 的 service_count 与配置不一致。")
+
+    num_slots = int(round(episode_s / dt_s))
+    history_slots = int(config.popularity_history_length)
+    (
+        popularity_rows,
+        popularity_history_rows,
+        probabilities,
+        combined_probabilities,
+        schedule,
+    ) = make_popularity_trace_with_history(
+        config.num_services,
+        num_slots,
+        history_slots,
+        dt_s,
+        warmup_s,
+        config,
+        np.random.default_rng(int(named_seeds["popularity_evolution"])),
+    )
+    combined_task_rows, combined_request_counts = generate_tasks(
+        task_vehicles,
+        catalog,
+        combined_probabilities,
+        history_slots + num_slots,
+        dt_s,
+        warmup_s - history_slots * dt_s,
+        config,
+        np.random.default_rng(int(named_seeds["task_arrival"])),
+        np.random.default_rng(int(named_seeds["service_request"])),
+        np.random.default_rng(int(named_seeds["workload_variation"])),
+        slot_offset=-history_slots,
+    )
+    task_rows = [row for row in combined_task_rows if int(row["slot"]) >= 0]
+    history_request_counts = combined_request_counts[:history_slots].copy()
+    request_counts = combined_request_counts[history_slots:].copy()
+    combined_rho_obs = build_observed_popularity(combined_request_counts)
+    history_rho_obs = combined_rho_obs[:history_slots].copy()
+    rho_obs = combined_rho_obs[history_slots:].copy()
+    attach_observed_counts(popularity_rows, request_counts, rho_obs)
+    attach_history_observed_counts(
+        popularity_history_rows,
+        history_request_counts,
+        history_rho_obs,
+    )
+    return {
+        "catalog": catalog,
+        "popularity_rows": popularity_rows,
+        "popularity_history_rows": popularity_history_rows,
+        "task_rows": task_rows,
+        "probabilities": probabilities,
+        "combined_probabilities": combined_probabilities,
+        "combined_rho_obs": combined_rho_obs,
+        "request_counts": request_counts,
+        "history_request_counts": history_request_counts,
+        "schedule": schedule,
+        "child_seeds": {name: int(named_seeds[name]) for name in sorted(required)},
+        "num_slots": num_slots,
+        "history_slots": history_slots,
+    }
+
+
 def validate_artifacts(
     artifacts: dict[str, Any],
     task_vehicles: list[str],
@@ -1525,6 +1622,28 @@ def output_artifacts(
     return catalog_file, popularity_history_file, popularity_file, tasks_file
 
 
+def output_realization_artifacts(
+    output_dir: Path,
+    popularity_history_rows: list[dict[str, Any]],
+    popularity_rows: list[dict[str, Any]],
+    task_rows: list[dict[str, Any]],
+) -> tuple[Path, Path, Path]:
+    """Write only realization-varying outputs; the catalog remains shared."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    popularity_history_file = output_dir / "popularity_history.csv"
+    popularity_file = output_dir / "popularity.csv"
+    tasks_file = output_dir / "tasks.csv"
+    write_csv_atomic(
+        popularity_history_file,
+        POPULARITY_HISTORY_FIELDS,
+        popularity_history_rows,
+    )
+    write_csv_atomic(popularity_file, POPULARITY_FIELDS, popularity_rows)
+    write_csv_atomic(tasks_file, TASK_FIELDS, task_rows)
+    return popularity_history_file, popularity_file, tasks_file
+
+
 def task_config_from_project_config(
     project_config: dict[str, Any],
     fallback: TaskConfig | None = None,
@@ -1664,6 +1783,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="生成真实动态 rho_star、TV 任务到达和服务相关 D/L。"
     )
     parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument(
+        "--episode-seed",
+        type=int,
+        default=None,
+        help="Derive independent task/popularity/cache streams for one episode.",
+    )
     parser.add_argument("--roles-file", default=None)
     parser.add_argument("--trajectory-file", default=None)
     parser.add_argument("--output-dir", default=None)
@@ -1775,8 +1900,16 @@ def main(argv: list[str] | None = None) -> int:
         project_root = find_project_root()
         from common import project_config as project_config_module
 
-        formal_config = project_config_module.load_config(args.config)
+        formal_config = project_config_module.load_config(
+            args.config,
+            require_artifacts=args.episode_seed is None,
+        )
         config = config_from_args(args, formal_config)
+        episode_seeds = (
+            derive_episode_seeds(args.episode_seed)
+            if args.episode_seed is not None
+            else None
+        )
         roles_file = resolve_path(
             project_root,
             args.roles_file or "data/generated/vehicle_roles.json",
@@ -1832,6 +1965,7 @@ def main(argv: list[str] | None = None) -> int:
             args,
             config,
             formal_config,
+            check_role_seed=episode_seeds is None,
         )
         num_slots, _ = read_formal_trajectory_alignment(
             trajectory_file,
@@ -1846,14 +1980,42 @@ def main(argv: list[str] | None = None) -> int:
                 "角色元数据 formal_time_slot_count 与 dt/warmup/episode 不一致。"
             )
 
-        artifacts = build_artifacts(
-            task_vehicles,
-            dt_s,
-            warmup_s,
-            episode_s,
-            master_seed,
-            config,
-        )
+        if episode_seeds is not None:
+            named_seeds = {
+                "popularity_evolution": episode_seeds["popularity_seed"],
+                "task_arrival": episode_seeds["task_arrival_seed"],
+                "service_request": episode_seeds["service_request_seed"],
+                "workload_variation": episode_seeds["workload_seed"],
+            }
+            episode_catalog = load_json(
+                project_config_module.resolve_path(
+                    project_root,
+                    project_config_module.get_config_value(
+                        formal_config,
+                        "paths.service_catalog",
+                    ),
+                )
+            )
+            artifacts = build_episode_artifacts(
+                task_vehicles,
+                episode_catalog,
+                dt_s,
+                warmup_s,
+                episode_s,
+                config,
+                named_seeds,
+            )
+        else:
+            named_seeds = {}
+            episode_catalog = {}
+            artifacts = build_artifacts(
+                task_vehicles,
+                dt_s,
+                warmup_s,
+                episode_s,
+                master_seed,
+                config,
+            )
         validation = validate_artifacts(
             artifacts,
             task_vehicles,
@@ -1862,13 +2024,25 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # 不重新写文件，只在内存中重复生成一次，验证所有独立 RNG 的完全复现。
-        repeated = build_artifacts(
-            task_vehicles,
-            dt_s,
-            warmup_s,
-            episode_s,
-            master_seed,
-            config,
+        repeated = (
+            build_episode_artifacts(
+                task_vehicles,
+                episode_catalog,
+                dt_s,
+                warmup_s,
+                episode_s,
+                config,
+                named_seeds,
+            )
+            if episode_seeds is not None
+            else build_artifacts(
+                task_vehicles,
+                dt_s,
+                warmup_s,
+                episode_s,
+                master_seed,
+                config,
+            )
         )
         if json_canonical(artifacts["catalog"]) != json_canonical(repeated["catalog"]):
             raise AssertionError("相同 seed 重复生成的 service catalog 不一致。")
@@ -1883,19 +2057,23 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise AssertionError("相同 seed 重复生成的 popularity history 不一致。")
 
-        rngs, child_seeds = make_rngs(master_seed, config.rng_stream_names)
-        del rngs
-        catalog_output = make_service_catalog_output(
-            artifacts,
-            config,
-            dt_s,
-            warmup_s,
-            episode_s,
-            master_seed,
-            child_seeds,
-            task_vehicles,
-            validation,
-        )
+        if episode_seeds is not None:
+            child_seeds = artifacts["child_seeds"]
+            catalog_output = episode_catalog
+        else:
+            rngs, child_seeds = make_rngs(master_seed, config.rng_stream_names)
+            del rngs
+            catalog_output = make_service_catalog_output(
+                artifacts,
+                config,
+                dt_s,
+                warmup_s,
+                episode_s,
+                master_seed,
+                child_seeds,
+                task_vehicles,
+                validation,
+            )
         local_cache_capacity_mb = float(
             project_config_module.get_config_value(
                 formal_config,
@@ -1913,7 +2091,9 @@ def main(argv: list[str] | None = None) -> int:
             task_vehicles,
             catalog_output,
             local_cache_capacity_mb,
-            master_seed,
+            int(episode_seeds["tv_cache_seed"])
+            if episode_seeds is not None
+            else master_seed,
         )
         tv_local_cache_validation = validate_tv_local_cache(
             tv_local_cache,
@@ -1922,12 +2102,21 @@ def main(argv: list[str] | None = None) -> int:
             local_cache_capacity_mb,
         )
         write_json_atomic(tv_local_cache_path, tv_local_cache)
-        files = output_artifacts(
-            output_dir,
-            catalog_output,
-            artifacts["popularity_history_rows"],
-            artifacts["popularity_rows"],
-            artifacts["task_rows"],
+        files = (
+            output_realization_artifacts(
+                output_dir,
+                artifacts["popularity_history_rows"],
+                artifacts["popularity_rows"],
+                artifacts["task_rows"],
+            )
+            if episode_seeds is not None
+            else output_artifacts(
+                output_dir,
+                catalog_output,
+                artifacts["popularity_history_rows"],
+                artifacts["popularity_rows"],
+                artifacts["task_rows"],
+            )
         )
 
         print("任务环境生成完成：")

@@ -752,6 +752,24 @@ def load_checkpoint_model(
     return model, metadata
 
 
+def run_frozen_inference(
+    checkpoint_path: Path,
+    inputs: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+    expected_metadata: dict[str, int],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Load a frozen GRU and predict; this path has no training/save operation."""
+
+    model, metadata = load_checkpoint_model(checkpoint_path, device)
+    for key, value in expected_metadata.items():
+        if int(metadata[key]) != int(value):
+            raise ValueError(
+                f"frozen GRU checkpoint {key}={metadata[key]} 与配置 {value} 不一致。"
+            )
+    return predict_probabilities(model, inputs, batch_size, device), metadata
+
+
 def verify_outputs(
     rows: list[dict[str, Any]],
     pred: np.ndarray,
@@ -803,11 +821,19 @@ def verify_outputs(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="训练服务流行度 GRU 并预测 canonical episode。")
     parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument(
+        "--mode",
+        choices=("train", "predict"),
+        default="train",
+        help="Legacy defaults to training; realization generation must use predict.",
+    )
     parser.add_argument("--popularity-file", default=None)
     parser.add_argument("--popularity-history-file", default=None)
     parser.add_argument("--service-catalog-file", default=None)
     parser.add_argument("--roles-file", default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--prediction-file", default=None)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--history-length", type=int, default=None)
     parser.add_argument("--hidden-size", type=int, default=None)
@@ -955,7 +981,10 @@ def main(argv: list[str] | None = None) -> int:
         project_root = find_project_root()
         from common import project_config as project_config_module
 
-        formal_config = project_config_module.load_config(args.config)
+        formal_config = project_config_module.load_config(
+            args.config,
+            require_artifacts=args.mode == "train",
+        )
         config = config_from_args(args, formal_config)
         config.validate()
         device_name = args.device or "cpu"
@@ -1005,8 +1034,24 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir
             or catalog_file.parent,
         )
-        checkpoint_file = output_dir / "popularity_gru.pt"
-        prediction_file = output_dir / "popularity_predictions.csv"
+        checkpoint_file = resolve_path(
+            project_root,
+            args.checkpoint
+            or (
+                config_path(formal_config, "paths.popularity_gru")
+                if args.mode == "predict"
+                else output_dir / "popularity_gru.pt"
+            ),
+        )
+        prediction_file = resolve_path(
+            project_root,
+            args.prediction_file
+            or config_path(
+                formal_config,
+                "paths.popularity_predictions",
+                output_dir / "popularity_predictions.csv",
+            ),
+        )
 
         service_catalog = load_json(catalog_file)
         roles = load_json(roles_file)
@@ -1081,6 +1126,50 @@ def main(argv: list[str] | None = None) -> int:
             ],
             axis=0,
         ).astype(np.float32)
+
+        if args.mode == "predict":
+            expected = {
+                "F": task_config.num_services,
+                "H_p": config.horizon_steps,
+                "L_rho": config.history_length,
+            }
+            pred_can, _ = run_frozen_inference(
+                checkpoint_file,
+                x_can,
+                config.batch_size,
+                device,
+                expected,
+            )
+            rows = canonical_prediction_rows(
+                pred_can,
+                canonical_rho_star,
+                origin_slots,
+                canonical_times,
+                dt_s=(canonical_times[1] - canonical_times[0])
+                if len(canonical_times) > 1
+                else 1.0,
+            )
+            repeat_pred, _ = run_frozen_inference(
+                checkpoint_file,
+                x_can,
+                config.batch_size,
+                device,
+                expected,
+            )
+            verify_outputs(
+                rows,
+                pred_can,
+                canonical_rho_star,
+                origin_slots,
+                config,
+                repeat_pred,
+            )
+            write_csv_atomic(prediction_file, rows)
+            print("服务流行度 frozen-GRU 推理完成：")
+            print(f"  checkpoint_unchanged=True")
+            print(f"  formal origins={len(origin_slots)}，canonical rows={len(rows)}")
+            print(f"  output: {prediction_file}")
+            return 0
 
         sequence_seeds = make_sequence_seeds(config)
         datasets = {

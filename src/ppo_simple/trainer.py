@@ -529,7 +529,13 @@ def aligned_train_steps(
         start,
         step_count,
         _project_path(context.root, project_config.get_config_value(context.cfg, "paths.vehicle_predictions")),
-        context.root / "data/generated/popularity_predictions.csv",
+        _project_path(
+            context.root,
+            project_config.get_config_value(
+                context.cfg,
+                "paths.popularity_predictions",
+            ),
+        ),
         _project_path(context.root, project_config.get_config_value(context.cfg, "paths.tasks")),
         _project_path(context.root, project_config.get_config_value(context.cfg, "paths.trajectory")),
         include_bootstrap_step=bool(include_bootstrap_step),

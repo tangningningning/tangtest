@@ -17,7 +17,7 @@ import csv
 import json
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,10 @@ from scenario.task_scenario import (
     load_json,
     task_config_from_project_config,
 )
+try:
+    from scenario.realization import derive_episode_seeds
+except ModuleNotFoundError:  # direct ``python src/scenario/scenario_generator.py``
+    from realization import derive_episode_seeds
 
 
 # ============================================================================
@@ -49,6 +53,7 @@ class ScenarioConfig:
     road_distance_tolerance_m: float = 15.0
     v2v_range_m: float = 100.0
     device: str = "cpu"
+    vehicle_observation_seed: int | None = None
 
     def validate(self) -> None:
         if self.horizon_steps <= 0:
@@ -226,6 +231,7 @@ def build_vehicle_nominal_predictions(
     origin_slots: np.ndarray,
     horizon_steps: int,
     prediction_rows: list[dict[str, Any]] | None = None,
+    observation_noise_seed: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, veh.RouteGeometry], dict[str, dict[int, veh.TruthSample]]]:
     dt_s = float(roles.get("dt", residual_bank["dt"]))
     warmup_s = float(roles.get("warmup_time", 100.0))
@@ -236,7 +242,11 @@ def build_vehicle_nominal_predictions(
         horizon_steps=horizon_steps,
         sigma_position_m=float(residual_bank["noise_sigma_q"]),
         sigma_speed_mps=float(residual_bank["noise_sigma_u"]),
-        observation_noise_seed=int(residual_bank["observation_noise_seed"]),
+        observation_noise_seed=int(
+            residual_bank["observation_noise_seed"]
+            if observation_noise_seed is None
+            else observation_noise_seed
+        ),
     )
     planned_routes = veh.load_planned_routes(roles, research_ids)
     truth = veh.load_truth_trajectories(trajectory_file, research_ids, dt_s)
@@ -790,6 +800,12 @@ def save_npz(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="生成 S 个未来预测场景 Xi_pred。")
     parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument(
+        "--episode-seed",
+        type=int,
+        default=None,
+        help="Derive independent observation and scenario streams for one episode.",
+    )
     parser.add_argument("--roles-file", default=None)
     parser.add_argument("--trajectory-file", default=None)
     parser.add_argument("--popularity-file", default=None)
@@ -804,6 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--num-scenarios", type=int, default=None)
     parser.add_argument("--scenario-seed", type=int, default=None)
+    parser.add_argument("--vehicle-observation-seed", type=int, default=None)
     parser.add_argument(
         "--max-resample-attempts",
         type=int,
@@ -859,6 +876,7 @@ def config_from_args(
             road_distance_tolerance_m=DEFAULT_CONFIG.road_distance_tolerance_m,
             v2v_range_m=DEFAULT_CONFIG.v2v_range_m,
             device=DEFAULT_CONFIG.device,
+            vehicle_observation_seed=None,
         )
 
     def choose(name: str, value: Any) -> Any:
@@ -874,6 +892,9 @@ def config_from_args(
         ),
         v2v_range_m=choose("v2v_range_m", args.v2v_range_m),
         device=choose("device", args.device),
+        vehicle_observation_seed=choose(
+            "vehicle_observation_seed", args.vehicle_observation_seed
+        ),
     )
 
 
@@ -881,8 +902,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         project_root = find_project_root()
-        formal_config = project_config_module.load_config(args.config)
+        formal_config = project_config_module.load_config(
+            args.config,
+            require_artifacts=args.episode_seed is None,
+        )
         config = config_from_args(args, formal_config)
+        episode_seeds = (
+            derive_episode_seeds(args.episode_seed)
+            if args.episode_seed is not None
+            else None
+        )
+        if episode_seeds is not None:
+            config = replace(
+                config,
+                scenario_seed=episode_seeds["scenario_seed"],
+                vehicle_observation_seed=episode_seeds[
+                    "vehicle_observation_seed"
+                ],
+            )
         config.validate()
         if config.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("请求 CUDA，但当前 PyTorch CUDA 不可用。")
@@ -1046,6 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
             origin_slots,
             config.horizon_steps,
             formal_vehicle_prediction_rows,
+            config.vehicle_observation_seed,
         )
         expected_vehicle_prediction_rows = (
             len(origin_slots)
@@ -1070,6 +1108,11 @@ def main(argv: list[str] | None = None) -> int:
             make_rng_streams(config.scenario_seed, int(origin_slot))
             for origin_slot in origin_slots.tolist()
         ]
+        position_seed = (
+            config.scenario_seed
+            if episode_seeds is not None
+            else np.random.SeedSequence([config.scenario_seed, 777])
+        )
         positions_xy, residual_stats = sample_positions(
             nominal_xy,
             tangents,
@@ -1077,9 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
             residual_bank,
             research_ids,
             config,
-            rng=np.random.default_rng(
-                np.random.SeedSequence([config.scenario_seed, 777])
-            ),
+            rng=np.random.default_rng(position_seed),
         )
         arrival, service_id, input_size, cpu_cycles, task_stats = sample_tasks(
             rho_hat,
@@ -1110,6 +1151,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # 同 seed 完全重放：重新生成 residual 和任务随机过程，检查 CRN 接口稳定。
+        repeat_position_seed = (
+            config.scenario_seed
+            if episode_seeds is not None
+            else np.random.SeedSequence([config.scenario_seed, 777])
+        )
         repeat_positions, _ = sample_positions(
             nominal_xy,
             tangents,
@@ -1117,9 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
             residual_bank,
             research_ids,
             config,
-            rng=np.random.default_rng(
-                np.random.SeedSequence([config.scenario_seed, 777])
-            ),
+            rng=np.random.default_rng(repeat_position_seed),
         )
         repeat_rngs_by_origin = [
             make_rng_streams(config.scenario_seed, int(origin_slot))
@@ -1156,6 +1200,11 @@ def main(argv: list[str] | None = None) -> int:
             "SV IDs": sv_ids,
             "research_vehicle_ids": research_ids,
             "scenario_seed": config.scenario_seed,
+            "vehicle_observation_seed": (
+                config.vehicle_observation_seed
+                if episode_seeds is not None
+                else int(residual_bank["observation_noise_seed"])
+            ),
             "lambda": task_config.arrival_probability,
             "residual_bank_source": "independent_calibration_artifact",
             "formal_time_slot_count": int(num_slots),

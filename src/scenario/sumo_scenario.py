@@ -31,9 +31,14 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    from scenario.realization import derive_episode_seeds
+except ModuleNotFoundError:  # direct ``python src/scenario/sumo_scenario.py``
+    from realization import derive_episode_seeds
 
 # ============================================================================
 # 主场景配置区
@@ -58,6 +63,8 @@ class ScenarioConfig:
     num_task_vehicles: int = 20
     random_seed: int = 4401
     traffic_seed: int = 4401
+    research_vehicle_role_seed: int | None = None
+    service_vehicle_role_seed: int | None = None
 
     # 仅在 data/ 下没有可直接运行的交通需求时使用官方 randomTrips.py。
     random_trips_period_s: float = 1.0
@@ -926,17 +933,27 @@ def build_role_assignments(
     config: ScenarioConfig,
 ) -> tuple[dict[str, Any], bool]:
     """先从完整候选中固定 seed 抽 research，再从 research 抽 SV。"""
+    research_seed = (
+        config.random_seed
+        if config.research_vehicle_role_seed is None
+        else int(config.research_vehicle_role_seed)
+    )
+    service_seed = (
+        config.random_seed + 1
+        if config.service_vehicle_role_seed is None
+        else int(config.service_vehicle_role_seed)
+    )
     research = fixed_seed_random_choice(
         complete_ids,
         config.num_research_vehicles,
-        config.random_seed,
+        research_seed,
     )
 
     # 同一个输入和 seed 重复选择，用于本次最小验证中的可复现性断言。
     research_repeat = fixed_seed_random_choice(
         complete_ids,
         config.num_research_vehicles,
-        config.random_seed,
+        research_seed,
     )
     if research != research_repeat:
         raise AssertionError("相同 seed 的研究车辆选择不一致。")
@@ -944,12 +961,12 @@ def build_role_assignments(
     service = fixed_seed_random_choice(
         research,
         config.num_service_vehicles,
-        config.random_seed + 1,
+        service_seed,
     )
     service_repeat = fixed_seed_random_choice(
         research,
         config.num_service_vehicles,
-        config.random_seed + 1,
+        service_seed,
     )
     if service != service_repeat:
         raise AssertionError("相同 seed 的 SV 选择不一致。")
@@ -984,8 +1001,8 @@ def build_role_assignments(
         "num_task_vehicles": config.num_task_vehicles,
         "formal_time_slot_count": len(_formal_step_keys(config)),
         "selection_method": "fixed_seed_random_choice",
-        "research_selection_seed": config.random_seed,
-        "service_selection_seed": config.random_seed + 1,
+        "research_selection_seed": research_seed,
+        "service_selection_seed": service_seed,
         "complete_candidate_count": len(complete_ids),
         "planned_routes": planned_routes,
     }
@@ -1166,6 +1183,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SUMO 完整交通生成、TraCI 轨迹采集和固定 TV/SV 角色划分。"
     )
+    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument(
+        "--episode-seed",
+        type=int,
+        default=None,
+        help="从一个 episode seed 派生交通、SUMO 和角色随机流。",
+    )
     parser.add_argument("--dt", type=float, default=None)
     parser.add_argument(
         "--warmup-time",
@@ -1196,10 +1220,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--random-seed",
+        "--sumo-dynamics-seed",
+        dest="random_seed",
         type=int,
         default=None,
     )
     parser.add_argument("--traffic-seed", type=int, default=None)
+    parser.add_argument("--research-vehicle-role-seed", type=int, default=None)
+    parser.add_argument("--service-vehicle-role-seed", type=int, default=None)
     parser.add_argument("--departure-begin", type=float, default=None)
     parser.add_argument("--departure-end", type=float, default=None)
     parser.add_argument("--random-trips-period", type=float, default=None)
@@ -1291,6 +1319,8 @@ def config_from_arguments(
                     DEFAULT_CONFIG.traffic_seed,
                 )
             ),
+            research_vehicle_role_seed=None,
+            service_vehicle_role_seed=None,
             random_trips_period_s=float(
                 get_value(
                     project_config,
@@ -1351,6 +1381,12 @@ def config_from_arguments(
         num_task_vehicles=choose("num_task_vehicles", args.num_task_vehicles),
         random_seed=choose("random_seed", args.random_seed),
         traffic_seed=choose("traffic_seed", args.traffic_seed),
+        research_vehicle_role_seed=choose(
+            "research_vehicle_role_seed", args.research_vehicle_role_seed
+        ),
+        service_vehicle_role_seed=choose(
+            "service_vehicle_role_seed", args.service_vehicle_role_seed
+        ),
         random_trips_period_s=choose(
             "random_trips_period_s", args.random_trips_period
         ),
@@ -1380,8 +1416,20 @@ def main(argv: list[str] | None = None) -> int:
         project_root = find_project_root()
         from common import project_config as project_config_module
 
-        formal_config = project_config_module.load_config()
+        formal_config = project_config_module.load_config(
+            args.config,
+            require_artifacts=args.episode_seed is None,
+        )
         config = config_from_arguments(args, formal_config)
+        if args.episode_seed is not None:
+            seeds = derive_episode_seeds(args.episode_seed)
+            config = replace(
+                config,
+                random_seed=seeds["sumo_seed"],
+                traffic_seed=seeds["traffic_seed"],
+                research_vehicle_role_seed=seeds["research_role_seed"],
+                service_vehicle_role_seed=seeds["service_role_seed"],
+            )
         config.validate()
 
         output_dir = _resolve_from_project(
@@ -1431,7 +1479,7 @@ def main(argv: list[str] | None = None) -> int:
         sumo_home = find_sumo_home(args.sumo_home)
         sumolib, traci = load_sumo_modules(sumo_home)
 
-        source = _choose_existing_source(
+        source = None if args.episode_seed is not None else _choose_existing_source(
             project_root=project_root,
             inventory=inventory,
             explicit_config=args.sumo_config,

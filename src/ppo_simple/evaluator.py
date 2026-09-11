@@ -228,7 +228,13 @@ def _prepare_heldout_steps(context: EnvironmentContext) -> list[Any]:
             root,
             get(context.cfg, "paths.vehicle_predictions"),
         ),
-        root / "data/generated/popularity_predictions.csv",
+        project_config.resolve_path(
+            root,
+            get(
+                context.cfg,
+                "paths.popularity_predictions",
+            ),
+        ),
         project_config.resolve_path(root, get(context.cfg, "paths.tasks")),
         project_config.resolve_path(root, get(context.cfg, "paths.trajectory")),
         include_bootstrap_step=False,

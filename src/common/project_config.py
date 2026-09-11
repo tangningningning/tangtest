@@ -39,7 +39,11 @@ def resolve_path(project_root: Path, value: str | Path) -> Path:
     return path.resolve(strict=False)
 
 
-def load_config(path: str | Path = "system_config.toml") -> dict[str, Any]:
+def load_config(
+    path: str | Path = "system_config.toml",
+    *,
+    require_artifacts: bool = True,
+) -> dict[str, Any]:
     project_root = find_project_root()
     config_path = resolve_path(project_root, path)
     with config_path.open("rb") as stream:
@@ -50,7 +54,7 @@ def load_config(path: str | Path = "system_config.toml") -> dict[str, Any]:
         "config_path": str(config_path),
         "project_root": str(project_root),
     }
-    validate_config(config)
+    validate_config(config, require_artifacts=require_artifacts)
     return config
 
 
@@ -443,12 +447,17 @@ def _require_path_exists(config: dict[str, Any], dotted_key: str) -> None:
         raise FileNotFoundError(f"{dotted_key} 指向的路径不存在：{path}")
 
 
-def validate_config(config: dict[str, Any]) -> None:
+def validate_config(
+    config: dict[str, Any],
+    *,
+    require_artifacts: bool = True,
+) -> None:
     project_root = Path(config.get("_meta", {}).get("project_root", find_project_root()))
     config.setdefault("_meta", {})
     config["_meta"].setdefault("project_root", str(project_root))
 
-    _materialise_node_instances(config)
+    if require_artifacts:
+        _materialise_node_instances(config)
     _walk_numbers(config)
 
     service_count_value = get_config_value(config, "service.count")
@@ -492,54 +501,55 @@ def validate_config(config: dict[str, Any]) -> None:
     uav_count = int(get_config_value(config, "nodes.uav.count"))
     if uav_count < 1:
         raise ValueError("nodes.uav.count 必须至少为1，请检查system_config.toml。")
-    uav_instances = get_config_value(config, "nodes.uav.instances", [])
-    if len(uav_instances) != uav_count:
-        raise ValueError("nodes.uav.instances 数量必须等于 nodes.uav.count。")
-    expected_uav_ids = [f"UAV_{index}" for index in range(uav_count)]
-    actual_uav_ids = [str(item.get("id")) for item in uav_instances]
-    if actual_uav_ids != expected_uav_ids:
-        raise ValueError("UAV ID 必须按 UAV_0, UAV_1, ... 连续命名。")
+    if require_artifacts:
+        uav_instances = get_config_value(config, "nodes.uav.instances", [])
+        if len(uav_instances) != uav_count:
+            raise ValueError("nodes.uav.instances 数量必须等于 nodes.uav.count。")
+        expected_uav_ids = [f"UAV_{index}" for index in range(uav_count)]
+        actual_uav_ids = [str(item.get("id")) for item in uav_instances]
+        if actual_uav_ids != expected_uav_ids:
+            raise ValueError("UAV ID 必须按 UAV_0, UAV_1, ... 连续命名。")
 
-    min_safety_distance_m = float(
-        get_config_value(config, "nodes.uav.min_safety_distance_m")
-    )
-    if min_safety_distance_m <= 0.0:
-        raise ValueError("nodes.uav.min_safety_distance_m 必须大于 0。")
-    for left_index, left in enumerate(uav_instances):
-        for right in uav_instances[left_index + 1 :]:
-            distance = math.hypot(
-                float(left["initial_x_m"]) - float(right["initial_x_m"]),
-                float(left["initial_y_m"]) - float(right["initial_y_m"]),
-            )
-            if distance + 1.0e-12 < min_safety_distance_m:
-                raise ValueError(
-                    "UAV 初始位置违反 nodes.uav.min_safety_distance_m："
-                    f"distance={distance:.12g}, required={min_safety_distance_m:.12g}。"
-                )
-
-    roles_path = resolve_path(project_root, get_config_value(config, "paths.vehicle_roles"))
-    with roles_path.open("r", encoding="utf-8") as stream:
-        roles = json.load(stream)
-    tv = [str(value) for value in roles.get("task_vehicles", [])]
-    sv = [str(value) for value in roles.get("service_vehicles", [])]
-    research = [str(value) for value in roles.get("research_vehicles", [])]
-    configured_research = int(
-        get_config_value(config, "simulation.num_research_vehicles")
-    )
-    configured_sv = int(get_config_value(config, "simulation.num_service_vehicles"))
-    configured_tv = int(get_config_value(config, "simulation.num_task_vehicles"))
-    if (len(research), len(sv), len(tv)) != (
-        configured_research,
-        configured_sv,
-        configured_tv,
-    ):
-        raise ValueError(
-            "vehicle_roles.json 车辆数量必须与 system_config.toml 的正式 baseline 一致。"
+        min_safety_distance_m = float(
+            get_config_value(config, "nodes.uav.min_safety_distance_m")
         )
-    if len(research) != len(set(research)) or len(sv) != len(set(sv)) or len(tv) != len(set(tv)):
-        raise ValueError("vehicle_roles.json 研究车辆角色列表不能包含重复 ID。")
-    if len(tv) + len(sv) != len(research) or set(tv) | set(sv) != set(research):
-        raise ValueError("TV+SV数量或集合与research vehicle不一致。")
+        if min_safety_distance_m <= 0.0:
+            raise ValueError("nodes.uav.min_safety_distance_m 必须大于 0。")
+        for left_index, left in enumerate(uav_instances):
+            for right in uav_instances[left_index + 1 :]:
+                distance = math.hypot(
+                    float(left["initial_x_m"]) - float(right["initial_x_m"]),
+                    float(left["initial_y_m"]) - float(right["initial_y_m"]),
+                )
+                if distance + 1.0e-12 < min_safety_distance_m:
+                    raise ValueError(
+                        "UAV 初始位置违反 nodes.uav.min_safety_distance_m："
+                        f"distance={distance:.12g}, required={min_safety_distance_m:.12g}。"
+                    )
+
+        roles_path = resolve_path(project_root, get_config_value(config, "paths.vehicle_roles"))
+        with roles_path.open("r", encoding="utf-8") as stream:
+            roles = json.load(stream)
+        tv = [str(value) for value in roles.get("task_vehicles", [])]
+        sv = [str(value) for value in roles.get("service_vehicles", [])]
+        research = [str(value) for value in roles.get("research_vehicles", [])]
+        configured_research = int(
+            get_config_value(config, "simulation.num_research_vehicles")
+        )
+        configured_sv = int(get_config_value(config, "simulation.num_service_vehicles"))
+        configured_tv = int(get_config_value(config, "simulation.num_task_vehicles"))
+        if (len(research), len(sv), len(tv)) != (
+            configured_research,
+            configured_sv,
+            configured_tv,
+        ):
+            raise ValueError(
+                "vehicle_roles.json 车辆数量必须与 system_config.toml 的正式 baseline 一致。"
+            )
+        if len(research) != len(set(research)) or len(sv) != len(set(sv)) or len(tv) != len(set(tv)):
+            raise ValueError("vehicle_roles.json 研究车辆角色列表不能包含重复 ID。")
+        if len(tv) + len(sv) != len(research) or set(tv) | set(sv) != set(research):
+            raise ValueError("TV+SV数量或集合与research vehicle不一致。")
 
     if int(get_config_value(config, "prediction.vehicle.horizon")) < 1:
         raise ValueError("prediction.vehicle.horizon 必须 >= 1。")
@@ -879,13 +889,14 @@ def validate_config(config: dict[str, Any]) -> None:
     rsu_count = int(get_config_value(config, "nodes.rsu.count"))
     if rsu_count < 1:
         raise ValueError("nodes.rsu.count 必须至少为1。")
-    rsu_instances = get_config_value(config, "nodes.rsu.instances", [])
-    if len(rsu_instances) != rsu_count:
-        raise ValueError("nodes.rsu.instances 数量必须等于 nodes.rsu.count。")
-    expected_rsu_ids = [f"RSU_{index}" for index in range(rsu_count)]
-    actual_rsu_ids = [str(item.get("id")) for item in rsu_instances]
-    if actual_rsu_ids != expected_rsu_ids:
-        raise ValueError("RSU ID 必须按 RSU_0, RSU_1, ... 连续命名。")
+    if require_artifacts:
+        rsu_instances = get_config_value(config, "nodes.rsu.instances", [])
+        if len(rsu_instances) != rsu_count:
+            raise ValueError("nodes.rsu.instances 数量必须等于 nodes.rsu.count。")
+        expected_rsu_ids = [f"RSU_{index}" for index in range(rsu_count)]
+        actual_rsu_ids = [str(item.get("id")) for item in rsu_instances]
+        if actual_rsu_ids != expected_rsu_ids:
+            raise ValueError("RSU ID 必须按 RSU_0, RSU_1, ... 连续命名。")
 
     omega_delay = float(get_config_value(config, "objective.omega_delay"))
     omega_energy = float(get_config_value(config, "objective.omega_energy"))
@@ -977,16 +988,17 @@ def validate_config(config: dict[str, Any]) -> None:
         }:
             raise ValueError(f"未知参数状态 {status}：{key}")
 
-    for key in (
-        "paths.service_catalog",
-        "paths.vehicle_roles",
-        "paths.prediction_scenarios",
-        "paths.sumo_net",
-        "paths.node_positions",
-        "paths.popularity_gru",
-        "paths.tv_local_cache",
-    ):
-        _require_path_exists(config, key)
+    if require_artifacts:
+        for key in (
+            "paths.service_catalog",
+            "paths.vehicle_roles",
+            "paths.prediction_scenarios",
+            "paths.sumo_net",
+            "paths.node_positions",
+            "paths.popularity_gru",
+            "paths.tv_local_cache",
+        ):
+            _require_path_exists(config, key)
 
 
 def main() -> int:
