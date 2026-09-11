@@ -74,6 +74,18 @@ SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
 HORIZON_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
 MODERN_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
 
+REALIZATION_ARTIFACT_FILENAMES = {
+    "trajectory": "trajectory.csv",
+    "vehicle_roles": "vehicle_roles.json",
+    "tasks": "tasks.csv",
+    "popularity": "popularity.csv",
+    "popularity_history": "popularity_history.csv",
+    "vehicle_predictions": "vehicle_predictions.csv",
+    "popularity_predictions": "popularity_predictions.csv",
+    "prediction_scenarios": "prediction_scenarios.npz",
+    "tv_local_cache": "tv_local_cache.json",
+}
+
 
 def _require_torch() -> None:
     if torch is None:
@@ -103,7 +115,24 @@ class EnvironmentContext:
     minibatch_size: int
     configuration_control_mode: str
     policy_schema: str
+    realization: "RealizationArtifacts | None" = None
     observation_time_to_go: Callable[[int], float] | None = None
+
+
+@dataclass(frozen=True)
+class RealizationArtifacts:
+    """Paths for one complete randomized episode realization."""
+
+    directory: Path
+    trajectory: Path
+    vehicle_roles: Path
+    tasks: Path
+    popularity: Path
+    popularity_history: Path
+    vehicle_predictions: Path
+    popularity_predictions: Path
+    prediction_scenarios: Path
+    tv_local_cache: Path
 
 
 @dataclass(frozen=True)
@@ -239,10 +268,166 @@ class TrainingCursor:
     current_uav_positions: dict[str, tuple[float, float]]
     best_epoch: int
     best_epoch_return: float | None
+    next_pool_index: int | None = None
 
 
 def _project_path(root: Path, value: Any) -> Path:
     return cache_configuration.resolve_path(root, value)
+
+
+def _configured_realization_artifacts(
+    cfg: dict[str, Any], root: Path
+) -> RealizationArtifacts:
+    get = project_config.get_config_value
+    paths = {
+        field: _project_path(root, get(cfg, f"paths.{field}"))
+        for field in REALIZATION_ARTIFACT_FILENAMES
+    }
+    return RealizationArtifacts(
+        directory=paths["trajectory"].parent,
+        trajectory=paths["trajectory"],
+        vehicle_roles=paths["vehicle_roles"],
+        tasks=paths["tasks"],
+        popularity=paths["popularity"],
+        popularity_history=paths["popularity_history"],
+        vehicle_predictions=paths["vehicle_predictions"],
+        popularity_predictions=paths["popularity_predictions"],
+        prediction_scenarios=paths["prediction_scenarios"],
+        tv_local_cache=paths["tv_local_cache"],
+    )
+
+
+def _realization_artifacts_from_directory(directory: Path) -> RealizationArtifacts:
+    realization_dir = Path(directory).expanduser().resolve(strict=False)
+    if not realization_dir.is_dir():
+        raise FileNotFoundError(
+            f"PPO episode realization directory does not exist: {realization_dir}"
+        )
+    paths = {
+        field: realization_dir / filename
+        for field, filename in REALIZATION_ARTIFACT_FILENAMES.items()
+    }
+    missing = [
+        filename
+        for field, filename in REALIZATION_ARTIFACT_FILENAMES.items()
+        if not paths[field].is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "PPO episode realization is missing required artifacts: "
+            f"directory={realization_dir}, missing={missing}"
+        )
+    return RealizationArtifacts(
+        directory=realization_dir,
+        trajectory=paths["trajectory"],
+        vehicle_roles=paths["vehicle_roles"],
+        tasks=paths["tasks"],
+        popularity=paths["popularity"],
+        popularity_history=paths["popularity_history"],
+        vehicle_predictions=paths["vehicle_predictions"],
+        popularity_predictions=paths["popularity_predictions"],
+        prediction_scenarios=paths["prediction_scenarios"],
+        tv_local_cache=paths["tv_local_cache"],
+    )
+
+
+def _load_episode_pool(
+    project_root: Path, episode_pool: str | Path
+) -> tuple[RealizationArtifacts, ...]:
+    pool_path = Path(episode_pool).expanduser()
+    if not pool_path.is_absolute():
+        pool_path = project_root / pool_path
+    pool_path = pool_path.resolve(strict=False)
+    if not pool_path.is_dir():
+        raise FileNotFoundError(
+            f"PPO episode pool directory does not exist: {pool_path}"
+        )
+
+    child_directories = sorted(
+        (child for child in pool_path.iterdir() if child.is_dir()),
+        key=lambda child: child.name,
+    )
+    if child_directories:
+        realization_directories = child_directories
+    elif any(
+        (pool_path / filename).exists()
+        for filename in REALIZATION_ARTIFACT_FILENAMES.values()
+    ):
+        # A directory containing one realization is a useful minimal pool and
+        # still follows the same no-reuse/exhaustion contract.
+        realization_directories = [pool_path]
+    else:
+        raise ValueError(
+            f"PPO episode pool contains no realization directories: {pool_path}"
+        )
+
+    realizations = tuple(
+        _realization_artifacts_from_directory(directory)
+        for directory in realization_directories
+    )
+    if not realizations:
+        raise ValueError(f"PPO episode pool is empty: {pool_path}")
+    return realizations
+
+
+def _assert_realization_context_compatible(
+    reference: EnvironmentContext,
+    candidate: EnvironmentContext,
+) -> None:
+    """Ensure a new realization has the same PPO tensor/protocol contract."""
+
+    scalar_fields = (
+        "data_protocol",
+        "episode_slots",
+        "train_origin_start",
+        "train_origin_end",
+        "terminal_origin",
+        "configured_rollout_steps",
+        "minibatch_size",
+        "configuration_control_mode",
+        "policy_schema",
+    )
+    for field in scalar_fields:
+        if getattr(reference, field) != getattr(candidate, field):
+            raise ValueError(
+                "PPO episode realization changes the fixed training contract: "
+                f"field={field}, reference={getattr(reference, field)!r}, "
+                f"candidate={getattr(candidate, field)!r}"
+            )
+    reference_observation = reference.observation_spec
+    candidate_observation = candidate.observation_spec
+    if (
+        reference_observation.observation_dim
+        != candidate_observation.observation_dim
+        or len(reference_observation.vehicle_ids)
+        != len(candidate_observation.vehicle_ids)
+        or reference_observation.service_ids != candidate_observation.service_ids
+        or reference_observation.uav_ids != candidate_observation.uav_ids
+        or reference_observation.prediction_horizon
+        != candidate_observation.prediction_horizon
+        or (reference_observation.horizon_mask_slice is None)
+        != (candidate_observation.horizon_mask_slice is None)
+    ):
+        raise ValueError(
+            "PPO episode realization changes the observation tensor contract: "
+            f"reference_dim={reference_observation.observation_dim}, "
+            f"candidate_dim={candidate_observation.observation_dim}"
+        )
+    if (
+        reference.action_spec.action_dim != candidate.action_spec.action_dim
+        or len(reference.action_spec.cache_node_ids)
+        != len(candidate.action_spec.cache_node_ids)
+        or reference.action_spec.uav_ids != candidate.action_spec.uav_ids
+    ):
+        raise ValueError(
+            "PPO episode realization changes the action tensor contract: "
+            f"reference_dim={reference.action_spec.action_dim}, "
+            f"candidate_dim={candidate.action_spec.action_dim}"
+        )
+    if np.asarray(reference.initial_cache).shape != np.asarray(candidate.initial_cache).shape:
+        raise ValueError("PPO episode realization changes the initial cache tensor shape")
+    if set(reference.initial_uav) != set(candidate.initial_uav):
+        raise ValueError("PPO episode realization changes the initial UAV ID set")
 
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -339,14 +524,26 @@ def _append_critic_diagnostics(
         )
 
 
-def load_environment_context(config_path: str = "system_config.toml") -> EnvironmentContext:
+def load_environment_context(
+    config_path: str = "system_config.toml",
+    realization_dir: str | Path | None = None,
+) -> EnvironmentContext:
     cfg = project_config.load_config(config_path)
     project_config.validate_for_formal_experiment(cfg)
     data_protocol = project_config.get_ppo_data_protocol(cfg)
     root = Path(cfg["_meta"]["project_root"])
+    realization = (
+        _configured_realization_artifacts(cfg, root)
+        if realization_dir is None
+        else _realization_artifacts_from_directory(
+            Path(realization_dir)
+            if Path(realization_dir).is_absolute()
+            else root / Path(realization_dir)
+        )
+    )
     cache_cfg = cache_configuration.cache_config_from_project(cfg)
     scenarios = cache_configuration.load_prediction_scenarios(
-        _project_path(root, project_config.get_config_value(cfg, "paths.prediction_scenarios"))
+        realization.prediction_scenarios
     )
     service_catalog = cache_configuration.load_service_catalog(
         _project_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
@@ -359,7 +556,7 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
     first_origin = cache_configuration.scenario_at_origin(scenarios, train_start)
     cache_nodes = cache_configuration.build_cache_nodes(first_origin, cache_cfg)
     local_cache = task_scenario.load_tv_local_cache(
-        _project_path(root, project_config.get_config_value(cfg, "paths.tv_local_cache"))
+        realization.tv_local_cache
     )
     action_spec = interface.TriggerActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
     policy_schema = str(
@@ -423,6 +620,7 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
         minibatch_size=int(data_protocol["minibatch_size"]),
         configuration_control_mode=configuration_control_mode,
         policy_schema=policy_schema,
+        realization=realization,
     )
 
 
@@ -543,16 +741,44 @@ def aligned_train_steps(
         context.scenarios,
         start,
         step_count,
-        _project_path(context.root, project_config.get_config_value(context.cfg, "paths.vehicle_predictions")),
-        _project_path(
-            context.root,
-            project_config.get_config_value(
-                context.cfg,
-                "paths.popularity_predictions",
-            ),
+        (
+            context.realization.vehicle_predictions
+            if context.realization is not None
+            else _project_path(
+                context.root,
+                project_config.get_config_value(
+                    context.cfg,
+                    "paths.vehicle_predictions",
+                ),
+            )
         ),
-        _project_path(context.root, project_config.get_config_value(context.cfg, "paths.tasks")),
-        _project_path(context.root, project_config.get_config_value(context.cfg, "paths.trajectory")),
+        (
+            context.realization.popularity_predictions
+            if context.realization is not None
+            else _project_path(
+                context.root,
+                project_config.get_config_value(
+                    context.cfg,
+                    "paths.popularity_predictions",
+                ),
+            )
+        ),
+        (
+            context.realization.tasks
+            if context.realization is not None
+            else _project_path(
+                context.root,
+                project_config.get_config_value(context.cfg, "paths.tasks"),
+            )
+        ),
+        (
+            context.realization.trajectory
+            if context.realization is not None
+            else _project_path(
+                context.root,
+                project_config.get_config_value(context.cfg, "paths.trajectory"),
+            )
+        ),
         include_bootstrap_step=bool(include_bootstrap_step),
         prediction_horizon=int(context.observation_spec.prediction_horizon),
         prediction_dt_s=float(
@@ -1142,7 +1368,18 @@ class PPOV2Trainer:
         rollout_steps: int,
         best_epoch: int = 0,
         best_epoch_return: float | None = None,
+        next_pool_index: int | None = None,
     ) -> dict[str, Any]:
+        completed_training_episodes = int(completed_episodes)
+        if completed_training_episodes < 0:
+            raise ValueError("completed_training_episodes must be non-negative")
+        resolved_pool_index = (
+            completed_training_episodes
+            if next_pool_index is None
+            else int(next_pool_index)
+        )
+        if resolved_pool_index < 0:
+            raise ValueError("next_pool_index must be non-negative")
         payload = {
             "checkpoint_version": self._expected_checkpoint_version(),
             "method": PPO_V2_METHOD,
@@ -1162,6 +1399,8 @@ class PPOV2Trainer:
             "episode": int(completed_episodes),
             "completed_episodes": int(completed_episodes),
             "completed_epochs": int(completed_episodes),
+            "completed_training_episodes": completed_training_episodes,
+            "next_pool_index": resolved_pool_index,
             "data_protocol": str(self.context.data_protocol),
             "episode_slots": int(self.context.episode_slots),
             "origin_start": int(self.context.train_origin_start),
@@ -1223,6 +1462,7 @@ class PPOV2Trainer:
         filename: str = CHECKPOINT_FILENAME,
         best_epoch: int = 0,
         best_epoch_return: float | None = None,
+        next_pool_index: int | None = None,
     ) -> Path:
         run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint = run_dir / filename
@@ -1236,6 +1476,7 @@ class PPOV2Trainer:
                 rollout_steps,
                 best_epoch,
                 best_epoch_return,
+                next_pool_index,
             ),
             checkpoint,
         )
@@ -1394,6 +1635,22 @@ class PPOV2Trainer:
             np.random.set_state(rng_state["numpy"])
         if "torch" in rng_state:
             torch.set_rng_state(rng_state["torch"])
+        completed_episodes = int(payload.get("completed_episodes", -1))
+        completed_training_episodes = int(
+            payload.get("completed_training_episodes", completed_episodes)
+        )
+        if (
+            completed_episodes < 0
+            or completed_training_episodes < 0
+            or completed_training_episodes != completed_episodes
+        ):
+            raise ValueError(
+                "PPO checkpoint completed_training_episodes is invalid or inconsistent."
+            )
+        raw_next_pool_index = payload.get("next_pool_index", completed_training_episodes)
+        next_pool_index = int(raw_next_pool_index)
+        if next_pool_index < 0:
+            raise ValueError("PPO checkpoint next_pool_index must be non-negative.")
         current_cache_state = np.asarray(payload["current_cache_state"], dtype=np.int8).copy()
         if current_cache_state.shape != np.asarray(self.context.initial_cache).shape:
             raise ValueError("checkpoint current_cache_state shape 不匹配。")
@@ -1411,12 +1668,13 @@ class PPOV2Trainer:
         if best_epoch_return is not None and not np.isfinite(best_epoch_return):
             raise ValueError("checkpoint best_epoch_return must be finite when present")
         return TrainingCursor(
-            completed_episodes=int(payload["completed_episodes"]),
+            completed_episodes=completed_episodes,
             current_train_origin=current_train_origin,
             current_cache_state=current_cache_state,
             current_uav_positions=current_uav_positions,
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
+            next_pool_index=next_pool_index,
         )
 
 
@@ -1447,6 +1705,7 @@ def run_training(
     run_dir: str,
     *,
     rollout_steps: int | None = None,
+    episode_pool: str | Path | None = None,
     resume: bool = False,
     verbose: bool = False,
 ) -> None:
@@ -1454,7 +1713,40 @@ def run_training(
     target_epochs = int(episodes)
     if target_epochs <= 0:
         raise ValueError("epochs must be greater than zero")
-    context = load_environment_context(config_path)
+    base_context = load_environment_context(config_path)
+    episode_pool_paths = (
+        None
+        if episode_pool is None
+        else _load_episode_pool(base_context.root, episode_pool)
+    )
+    if (
+        base_context.data_protocol
+        == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
+        and episode_pool_paths is None
+    ):
+        raise ValueError(
+            "full_episode_randomized PPO training requires --episode-pool; "
+            "the trainer never generates realizations during training."
+        )
+    if (
+        episode_pool_paths is not None
+        and not resume
+        and target_epochs > len(episode_pool_paths)
+    ):
+        raise RuntimeError(
+            "PPO episode pool exhausted before training could start: "
+            f"requested={target_epochs}, available={len(episode_pool_paths)}"
+        )
+    context = (
+        load_environment_context(
+            config_path,
+            realization_dir=episode_pool_paths[0].directory,
+        )
+        if episode_pool_paths is not None
+        else base_context
+    )
+    if episode_pool_paths is not None:
+        _assert_realization_context_compatible(base_context, context)
     if context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
         effective_rollout_steps = (
             context.configured_rollout_steps
@@ -1484,6 +1776,7 @@ def run_training(
     if not resume:
         ensure_fresh_run_dir_is_clean(run_path)
     completed_episodes = 0
+    next_pool_index = 0
     current_train_origin = context.train_origin_start
     current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
     current_uav_positions = _copy_uav_positions(context.initial_uav)
@@ -1516,8 +1809,41 @@ def run_training(
         current_uav_positions = cursor.current_uav_positions
         best_epoch = cursor.best_epoch
         best_epoch_return = cursor.best_epoch_return
+        next_pool_index = (
+            completed_episodes
+            if cursor.next_pool_index is None
+            else int(cursor.next_pool_index)
+        )
         if completed_episodes > target_epochs:
             raise ValueError("checkpoint completed epochs exceed target epochs")
+        if episode_pool_paths is not None:
+            if next_pool_index != completed_episodes:
+                raise ValueError(
+                    "PPO checkpoint next_pool_index must equal completed_training_episodes: "
+                    f"next_pool_index={next_pool_index}, "
+                    f"completed_training_episodes={completed_episodes}"
+                )
+            remaining_episodes = target_epochs - completed_episodes
+            if remaining_episodes > len(episode_pool_paths) - next_pool_index:
+                raise RuntimeError(
+                    "PPO episode pool exhausted before resume could complete: "
+                    f"requested_additional={remaining_episodes}, "
+                    f"available={len(episode_pool_paths) - next_pool_index}"
+                )
+            if remaining_episodes > 0:
+                next_context = load_environment_context(
+                    config_path,
+                    realization_dir=episode_pool_paths[next_pool_index].directory,
+                )
+                _assert_realization_context_compatible(context, next_context)
+                context = next_context
+                trainer.context = context
+                if current_train_origin > context.train_origin_end:
+                    current_train_origin = context.train_origin_start
+                    current_cache_state = np.asarray(
+                        context.initial_cache, dtype=np.int8
+                    ).copy()
+                    current_uav_positions = _copy_uav_positions(context.initial_uav)
 
     origins_per_epoch = context.train_origin_end - context.train_origin_start + 1
     update_run_summary(
@@ -1603,6 +1929,19 @@ def run_training(
 
     while completed_episodes < target_epochs:
         if current_train_origin > context.train_origin_end:
+            if episode_pool_paths is not None:
+                if next_pool_index >= len(episode_pool_paths):
+                    raise RuntimeError(
+                        "PPO episode pool exhausted; no realization is available "
+                        f"for training episode {completed_episodes + 1}."
+                    )
+                next_context = load_environment_context(
+                    config_path,
+                    realization_dir=episode_pool_paths[next_pool_index].directory,
+                )
+                _assert_realization_context_compatible(context, next_context)
+                context = next_context
+                trainer.context = context
             current_train_origin = context.train_origin_start
             current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
             current_uav_positions = _copy_uav_positions(context.initial_uav)
@@ -1643,18 +1982,36 @@ def run_training(
             episode_entropies = []
             episode_approximate_kls = []
         episode_number = completed_episodes + 1
+        active_pool_index = (
+            None if episode_pool_paths is None else int(next_pool_index)
+        )
         chunk_origin_start = current_train_origin
+        rollout_started_at = time.perf_counter()
         rollout = trainer.collect_chunk(
             current_train_origin,
             current_cache_state,
             current_uav_positions,
             int(rollout_steps),
         )
+        rollout_runtime_seconds = float(time.perf_counter() - rollout_started_at)
+        if context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+            if len(rollout.transitions) != context.episode_slots:
+                raise AssertionError(
+                    "full_episode_randomized rollout must contain one complete episode"
+                )
+            if not bool(rollout.dones[-1]) or bool(np.any(rollout.dones[:-1])):
+                raise AssertionError(
+                    "full_episode_randomized must terminate only at origin 299"
+                )
+        update_started_at = time.perf_counter()
         update = trainer.update(rollout)
+        update_runtime_seconds = float(time.perf_counter() - update_started_at)
         next_train_origin = current_train_origin + len(rollout.transitions)
         terminal = next_train_origin > context.train_origin_end
         if terminal:
             completed_episodes += 1
+            if episode_pool_paths is not None:
+                next_pool_index += 1
         checkpoint_path = trainer.save_checkpoint(
             Path(run_dir),
             completed_episodes,
@@ -1665,6 +2022,7 @@ def run_training(
             int(rollout_steps),
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
+            next_pool_index=next_pool_index,
         )
         cache_count = len(context.action_spec.cache_node_ids)
         transition_count = len(rollout.transitions)
@@ -1762,11 +2120,28 @@ def run_training(
                 "seed": seed,
                 "episode": episode_number,
                 "epoch": episode_number,
+                "training_episode_index": int(episode_number),
+                "realization_pool_index": active_pool_index,
+                "realization_directory": (
+                    None
+                    if context.realization is None
+                    else str(context.realization.directory)
+                ),
                 "completed_epochs": int(completed_episodes),
                 "origin_start": int(chunk_origin_start),
                 "origin_end": int(next_train_origin - 1),
+                "global_training_slot_start": int(
+                    (episode_number - 1) * context.episode_slots
+                    + (chunk_origin_start - context.train_origin_start)
+                ),
+                "global_training_slot_end": int(
+                    (episode_number - 1) * context.episode_slots
+                    + (next_train_origin - context.train_origin_start - 1)
+                ),
                 "num_transitions": transition_count,
                 "terminal": bool(terminal),
+                "rollout_runtime_seconds": rollout_runtime_seconds,
+                "update_runtime_seconds": update_runtime_seconds,
                 "advantage_normalization_mode": (
                     trainer.hyperparameters.advantage_normalization_mode
                 ),
@@ -1937,6 +2312,7 @@ def run_training(
                     filename=BEST_TRAIN_RETURN_CHECKPOINT_FILENAME,
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
+                    next_pool_index=next_pool_index,
                 )
                 checkpoint_path = trainer.save_checkpoint(
                     run_path,
@@ -1948,6 +2324,7 @@ def run_training(
                     int(rollout_steps),
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
+                    next_pool_index=next_pool_index,
                 )
             _append_jsonl(
                 episode_metrics_path,
@@ -1956,8 +2333,22 @@ def run_training(
                     "seed": seed,
                     "episode": int(episode_number),
                     "epoch": int(episode_number),
+                    "training_episode_index": int(episode_number),
+                    "realization_pool_index": active_pool_index,
+                    "realization_directory": (
+                        None
+                        if context.realization is None
+                        else str(context.realization.directory)
+                    ),
                     "completed_episodes": int(completed_episodes),
                     "completed_epochs": int(completed_episodes),
+                    "global_training_slot_start": int(
+                        (episode_number - 1) * context.episode_slots
+                    ),
+                    "global_training_slot_end": int(
+                        (episode_number - 1) * context.episode_slots
+                        + (context.train_origin_end - context.train_origin_start)
+                    ),
                     "num_transitions": int(len(episode_reward_array)),
                     "episode_return": epoch_return,
                     "mean_reward": float(episode_reward_array.mean()),
@@ -2023,6 +2414,8 @@ def run_training(
                     "finite_checks": episode_finite,
                     "checkpoint": str(checkpoint_path),
                     "wall_clock_runtime_seconds": epoch_runtime_seconds,
+                    "rollout_runtime_seconds": rollout_runtime_seconds,
+                    "update_runtime_seconds": update_runtime_seconds,
                 },
             )
             append_training_slot_metrics(
@@ -2110,6 +2503,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument(
+        "--episode-pool",
+        default=None,
+        help=(
+            "directory containing pre-generated episode realization directories; "
+            "one realization is consumed per full_episode_randomized episode"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--verbose",
@@ -2145,6 +2546,7 @@ def main(argv: list[str] | None = None) -> int:
         target_epochs,
         args.run_dir,
         rollout_steps=args.rollout_steps,
+        episode_pool=args.episode_pool,
         resume=bool(args.resume),
         verbose=bool(args.verbose),
     )
