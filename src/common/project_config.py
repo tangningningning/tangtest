@@ -67,6 +67,181 @@ def get_config_value(config: dict[str, Any], dotted_key: str, default: Any = Non
     return current
 
 
+PPO_DATA_PROTOCOL_LEGACY_SPLIT = "legacy_split"
+PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED = "full_episode_randomized"
+
+
+def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the validated PPO episode/data protocol from a project config.
+
+    The historical split remains the default when ``protocol`` is absent.  A
+    full-episode protocol is explicit so an old 240-origin run cannot be
+    silently reinterpreted as a 300-origin run.
+    """
+
+    raw_protocol = get_config_value(config, "algorithm.ppo.data_protocol")
+    if not isinstance(raw_protocol, dict):
+        raise ValueError("缺少 algorithm.ppo.data_protocol 配置表。")
+    protocol = str(raw_protocol.get("protocol", PPO_DATA_PROTOCOL_LEGACY_SPLIT))
+    if protocol not in {
+        PPO_DATA_PROTOCOL_LEGACY_SPLIT,
+        PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
+    }:
+        raise ValueError(
+            "algorithm.ppo.data_protocol.protocol 只支持 "
+            "legacy_split/full_episode_randomized。"
+        )
+
+    dt_s = float(get_config_value(config, "simulation.dt_s"))
+    episode_time_s = float(get_config_value(config, "simulation.episode_time_s"))
+    if not math.isfinite(dt_s) or dt_s <= 0.0:
+        raise ValueError("simulation.dt_s 必须是正的有限数。")
+    if not math.isfinite(episode_time_s) or episode_time_s <= 0.0:
+        raise ValueError("simulation.episode_time_s 必须是正的有限数。")
+    physical_episode_slots_f = episode_time_s / dt_s
+    physical_episode_slots = int(round(physical_episode_slots_f))
+    if physical_episode_slots <= 0 or not math.isclose(
+        physical_episode_slots_f,
+        float(physical_episode_slots),
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        raise ValueError("simulation.episode_time_s / simulation.dt_s 必须是正整数。")
+
+    def read_int(key: str, *, required: bool = True) -> int | None:
+        if key not in raw_protocol:
+            if required:
+                raise ValueError(
+                    f"algorithm.ppo.data_protocol 缺少 {key}。"
+                )
+            return None
+        value = raw_protocol[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"algorithm.ppo.data_protocol.{key} 必须是整数。"
+            )
+        return int(value)
+
+    train_start = read_int("train_origin_start")
+    assert train_start is not None
+    if train_start != 0:
+        raise ValueError(
+            "algorithm.ppo.data_protocol.train_origin_start 必须为正式 origin 的起点0。"
+        )
+
+    num_minibatches_value = get_config_value(
+        config, "algorithm.ppo.num_minibatches"
+    )
+    if (
+        isinstance(num_minibatches_value, bool)
+        or not isinstance(num_minibatches_value, int)
+        or int(num_minibatches_value) <= 0
+    ):
+        raise ValueError("algorithm.ppo.num_minibatches 必须是正整数。")
+    num_minibatches = int(num_minibatches_value)
+
+    if protocol == PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+        configured_episode_slots = read_int("episode_slots")
+        configured_train_end = read_int("train_origin_end")
+        configured_rollout_steps = read_int("rollout_steps")
+        configured_terminal = read_int("terminal_origin")
+        assert (
+            configured_episode_slots is not None
+            and configured_train_end is not None
+            and configured_rollout_steps is not None
+            and configured_terminal is not None
+        )
+        if configured_episode_slots != physical_episode_slots:
+            raise ValueError(
+                "full_episode_randomized episode_slots 必须等于 "
+                "simulation.episode_time_s / simulation.dt_s："
+                f"configured={configured_episode_slots}, "
+                f"expected={physical_episode_slots}。"
+            )
+        if configured_train_end != configured_episode_slots - 1:
+            raise ValueError(
+                "full_episode_randomized train_origin_end 必须等于 episode_slots-1。"
+            )
+        if configured_rollout_steps != configured_episode_slots:
+            raise ValueError(
+                "full_episode_randomized rollout_steps 必须等于 episode_slots。"
+            )
+        if configured_terminal != configured_episode_slots - 1:
+            raise ValueError(
+                "full_episode_randomized terminal_origin 必须等于 episode_slots-1。"
+            )
+        if "test_origin_start" in raw_protocol or "test_origin_end" in raw_protocol:
+            raise ValueError(
+                "full_episode_randomized 不允许设置同一 realization 内的 test split。"
+            )
+        train_end = configured_train_end
+        episode_slots = configured_episode_slots
+        configured_rollout = configured_rollout_steps
+        terminal_origin = configured_terminal
+        test_start = None
+        test_end = None
+    else:
+        train_end = read_int("train_origin_end")
+        test_start = read_int("test_origin_start")
+        test_end = read_int("test_origin_end")
+        assert train_end is not None and test_start is not None and test_end is not None
+        if train_end < train_start:
+            raise ValueError("PPO train origin 区间必须非空且按升序排列。")
+        if test_start != train_end + 1:
+            raise ValueError("PPO train/test origin 区间必须连续、无重叠且无空洞。")
+        if test_end < test_start:
+            raise ValueError("PPO test origin 区间必须非空且按升序排列。")
+        if test_end != physical_episode_slots - 1:
+            raise ValueError(
+                "PPO train/test origin 区间必须完整覆盖正式 episode："
+                f"test_origin_end={test_end}, expected={physical_episode_slots - 1}。"
+            )
+        episode_slots = train_end - train_start + 1
+        configured_rollout = read_int("rollout_steps", required=False)
+        terminal_origin = train_end
+
+    train_origin_count = train_end - train_start + 1
+    if train_origin_count <= 0 or train_origin_count % num_minibatches != 0:
+        raise ValueError(
+            "PPO train origin 数量必须为正并可被 algorithm.ppo.num_minibatches 整除："
+            f"count={train_origin_count}, num_minibatches={num_minibatches}。"
+        )
+    configured_minibatch_size = get_config_value(
+        config, "algorithm.ppo.minibatch_size", None
+    )
+    if configured_minibatch_size is None:
+        minibatch_size = train_origin_count // num_minibatches
+    else:
+        if (
+            isinstance(configured_minibatch_size, bool)
+            or not isinstance(configured_minibatch_size, int)
+            or int(configured_minibatch_size) <= 0
+        ):
+            raise ValueError("algorithm.ppo.minibatch_size 必须是正整数。")
+        minibatch_size = int(configured_minibatch_size)
+        expected_minibatch_size = train_origin_count // num_minibatches
+        if minibatch_size != expected_minibatch_size:
+            raise ValueError(
+                "algorithm.ppo.minibatch_size 必须等于完整 train episode 的 "
+                "transitions / num_minibatches："
+                f"configured={minibatch_size}, expected={expected_minibatch_size}。"
+            )
+
+    return {
+        "protocol": protocol,
+        "physical_episode_slots": physical_episode_slots,
+        "episode_slots": episode_slots,
+        "train_origin_start": train_start,
+        "train_origin_end": train_end,
+        "test_origin_start": test_start,
+        "test_origin_end": test_end,
+        "rollout_steps": configured_rollout,
+        "terminal_origin": terminal_origin,
+        "num_minibatches": num_minibatches,
+        "minibatch_size": minibatch_size,
+    }
+
+
 def _node_positions_path(config: dict[str, Any]) -> Path:
     project_root = Path(
         config.get("_meta", {}).get("project_root", find_project_root())
@@ -770,65 +945,9 @@ def validate_config(
         if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
             raise ValueError(f"simulation.{label} 必须是 dt_s 的整数倍。")
 
-    # PPO 只允许一个连续 train 区间和一个紧邻的 held-out test 区间。
-    # 具体边界只从 TOML 读取；这里仅校验区间关系、正式 episode 覆盖范围
-    # 和当前 PPO minibatch 协议，不在代码中复制某个实验的 end index。
-    data_protocol = get_config_value(config, "algorithm.ppo.data_protocol")
-    if not isinstance(data_protocol, dict):
-        raise ValueError("缺少 algorithm.ppo.data_protocol 配置表。")
-    required_origin_keys = (
-        "train_origin_start",
-        "train_origin_end",
-        "test_origin_start",
-        "test_origin_end",
-    )
-    missing_origin_keys = [
-        key for key in required_origin_keys if key not in data_protocol
-    ]
-    if missing_origin_keys:
-        raise ValueError(
-            "algorithm.ppo.data_protocol 缺少边界："
-            f"{', '.join(missing_origin_keys)}"
-        )
-    origin_bounds: dict[str, int] = {}
-    for key in required_origin_keys:
-        value = data_protocol[key]
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(
-                f"algorithm.ppo.data_protocol.{key} 必须是整数。"
-            )
-        origin_bounds[key] = int(value)
-    train_start = origin_bounds["train_origin_start"]
-    train_end = origin_bounds["train_origin_end"]
-    test_start = origin_bounds["test_origin_start"]
-    test_end = origin_bounds["test_origin_end"]
-    if train_start != 0:
-        raise ValueError(
-            "algorithm.ppo.data_protocol.train_origin_start 必须为正式 origin 的起点0。"
-        )
-    if train_end < train_start:
-        raise ValueError("PPO train origin 区间必须非空且按升序排列。")
-    if test_start != train_end + 1:
-        raise ValueError(
-            "PPO train/test origin 区间必须连续、无重叠且无空洞。"
-        )
-    if test_end < test_start:
-        raise ValueError("PPO test origin 区间必须非空且按升序排列。")
-    formal_origin_count = int(round(episode_s / dt_s))
-    if test_end != formal_origin_count - 1:
-        raise ValueError(
-            "PPO train/test origin 区间必须完整覆盖正式 episode："
-            f"test_origin_end={test_end}, expected={formal_origin_count - 1}。"
-        )
-    train_origin_count = train_end - train_start + 1
-    test_origin_count = test_end - test_start + 1
-    if train_origin_count < ppo_num_minibatches or train_origin_count % ppo_num_minibatches != 0:
-        raise ValueError(
-            "PPO train origin 数量必须为正并可被 algorithm.ppo.num_minibatches 整除："
-            f"count={train_origin_count}, num_minibatches={ppo_num_minibatches}。"
-        )
-    if test_origin_count <= 0:
-        raise ValueError("PPO test origin 数量必须大于0。")
+    # The historical split remains the default; the new full-episode mode has
+    # no same-realization test interval and validates its own terminal contract.
+    get_ppo_data_protocol(config)
     research_count = int(get_config_value(config, "simulation.num_research_vehicles"))
     service_count = int(get_config_value(config, "simulation.num_service_vehicles"))
     task_count = int(get_config_value(config, "simulation.num_task_vehicles"))

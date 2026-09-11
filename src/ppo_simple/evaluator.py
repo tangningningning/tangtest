@@ -1,8 +1,8 @@
-"""Frozen PPO V6 held-out evaluator.
+"""Frozen PPO V6 held-out and full-episode evaluators.
 
 This module deliberately contains no optimizer or training update path.  It
-loads the pinned Epoch-240 V6 checkpoint, reuses the production rollout and
-environment execution path, and writes isolated held-out test artifacts.
+loads frozen V6 policies, reuses the production rollout and environment
+execution path, and writes isolated evaluation artifacts.
 """
 
 from __future__ import annotations
@@ -57,6 +57,11 @@ TEST_SEGMENTS = (
     (270, 284),
     (285, 299),
 )
+FULL_EPISODE_CONFIG_PATH = "system_config_ppo_v6_full_episode_randomized.toml"
+FULL_EPISODE_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
+FULL_EPISODE_ORIGIN_START = 0
+FULL_EPISODE_ORIGIN_END = 299
+FULL_EPISODE_SLOT_COUNT = 300
 
 
 def _require_torch() -> None:
@@ -170,6 +175,43 @@ def _load_training_provenance(
     return EXPECTED_TRAINING_GIT_SHA
 
 
+def _load_full_episode_training_provenance(
+    checkpoint_path: Path,
+    config_sha256: str,
+) -> str | None:
+    """Validate provenance for a checkpoint produced by the full protocol."""
+
+    manifest_path = checkpoint_path.parent / "run_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"full-episode training run_manifest.json is required: {manifest_path}"
+        )
+    manifest = _read_json(manifest_path)
+    if manifest.get("config_sha256") != config_sha256:
+        raise ValueError("full-episode run_manifest config_sha256 mismatch")
+    if manifest.get("policy_schema") != EXPECTED_POLICY_SCHEMA:
+        raise ValueError("full-episode run_manifest policy_schema mismatch")
+    if manifest.get("data_protocol") != FULL_EPISODE_PROTOCOL:
+        raise ValueError("full-episode run_manifest data_protocol mismatch")
+    expected_fields = {
+        "episode_slots": FULL_EPISODE_SLOT_COUNT,
+        "origin_start": FULL_EPISODE_ORIGIN_START,
+        "origin_end": FULL_EPISODE_ORIGIN_END,
+        "terminal_origin": FULL_EPISODE_ORIGIN_END,
+        "rollout_steps": FULL_EPISODE_SLOT_COUNT,
+        "num_minibatches": 10,
+        "minibatch_size": 30,
+    }
+    for field, expected in expected_fields.items():
+        if manifest.get(field) != expected:
+            raise ValueError(
+                "full-episode run_manifest protocol mismatch: "
+                f"field={field}, value={manifest.get(field)!r}, expected={expected}."
+            )
+    raw_git_sha = manifest.get("git_commit_sha")
+    return None if raw_git_sha is None else str(raw_git_sha).strip() or None
+
+
 def _build_heldout_context(config_path: Path) -> EnvironmentContext:
     context = load_environment_context(str(config_path))
     get = project_config.get_config_value
@@ -257,11 +299,69 @@ def _prepare_heldout_steps(context: EnvironmentContext) -> list[Any]:
     return steps
 
 
+def _build_full_episode_context(config_path: Path) -> EnvironmentContext:
+    context = load_environment_context(str(config_path))
+    protocol = project_config.get_ppo_data_protocol(context.cfg)
+    if protocol["protocol"] != FULL_EPISODE_PROTOCOL:
+        raise ValueError(
+            "full-episode evaluation requires data_protocol="
+            f"{FULL_EPISODE_PROTOCOL}"
+        )
+    if (
+        context.train_origin_start != FULL_EPISODE_ORIGIN_START
+        or context.train_origin_end != FULL_EPISODE_ORIGIN_END
+        or context.episode_slots != FULL_EPISODE_SLOT_COUNT
+        or context.terminal_origin != FULL_EPISODE_ORIGIN_END
+    ):
+        raise ValueError("full-episode evaluation requires the 0..299 protocol")
+    if int(context.observation_spec.prediction_horizon) != 5:
+        raise ValueError("full-episode V6 evaluation requires prediction horizon H=5")
+    if context.observation_spec.horizon_mask_slice is None:
+        raise ValueError("full-episode V6 evaluation requires a prediction horizon mask")
+    return context
+
+
+def _prepare_full_episode_steps(context: EnvironmentContext) -> list[Any]:
+    get = project_config.get_config_value
+    root = Path(context.root)
+    steps = interface.prepare_aligned_rollout_steps(
+        root,
+        context.scenarios,
+        FULL_EPISODE_ORIGIN_START,
+        FULL_EPISODE_SLOT_COUNT,
+        project_config.resolve_path(root, get(context.cfg, "paths.vehicle_predictions")),
+        project_config.resolve_path(root, get(context.cfg, "paths.popularity_predictions")),
+        project_config.resolve_path(root, get(context.cfg, "paths.tasks")),
+        project_config.resolve_path(root, get(context.cfg, "paths.trajectory")),
+        include_bootstrap_step=False,
+        prediction_horizon=int(context.observation_spec.prediction_horizon),
+        prediction_dt_s=float(get(context.cfg, "simulation.dt_s")),
+        prediction_terminal_origin=FULL_EPISODE_ORIGIN_END,
+        expected_vehicle_ids=context.observation_spec.vehicle_ids,
+        expected_service_ids=context.observation_spec.service_ids,
+        include_prediction_horizon_mask=(
+            context.observation_spec.horizon_mask_slice is not None
+        ),
+    )
+    expected_origins = tuple(
+        range(FULL_EPISODE_ORIGIN_START, FULL_EPISODE_ORIGIN_END + 1)
+    )
+    actual_origins = tuple(int(step.origin_index) for step in steps)
+    if actual_origins != expected_origins:
+        raise ValueError(
+            "full-episode aligned steps must contain exactly origins 0..299"
+        )
+    return steps
+
+
 def _load_frozen_v6_policy(
     context: EnvironmentContext,
     checkpoint_path: Path,
     config_sha256: str,
     device: Any,
+    *,
+    expected_completed_epochs: int | None = 240,
+    expected_protocol: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     _require_torch()
     payload = torch.load(
@@ -279,12 +379,43 @@ def _load_frozen_v6_policy(
         )
     if payload.get("policy_schema") != EXPECTED_POLICY_SCHEMA:
         raise ValueError("formal PPO checkpoint policy_schema mismatch")
+    if expected_protocol is not None:
+        checkpoint_protocol = str(
+            payload.get(
+                "data_protocol",
+                project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
+            )
+        )
+        if checkpoint_protocol != expected_protocol:
+            raise ValueError(
+                "PPO checkpoint data_protocol mismatch; refusing cross-protocol evaluation: "
+                f"checkpoint={checkpoint_protocol}, expected={expected_protocol}."
+            )
+        if expected_protocol == FULL_EPISODE_PROTOCOL:
+            expected_protocol_fields = {
+                "episode_slots": context.episode_slots,
+                "origin_start": context.train_origin_start,
+                "origin_end": context.train_origin_end,
+                "terminal_origin": context.terminal_origin,
+                "rollout_steps": context.episode_slots,
+                "num_minibatches": project_config.get_ppo_data_protocol(
+                    context.cfg
+                )["num_minibatches"],
+                "minibatch_size": context.minibatch_size,
+            }
+            for field, expected in expected_protocol_fields.items():
+                if field not in payload or int(payload[field]) != int(expected):
+                    raise ValueError(
+                        "PPO full-episode checkpoint protocol mismatch: "
+                        f"field={field}, checkpoint={payload.get(field)!r}, expected={expected}."
+                    )
     completed_epochs = int(
         payload.get("completed_epochs", payload.get("completed_episodes", -1))
     )
-    if completed_epochs != 240:
+    if expected_completed_epochs is not None and completed_epochs != expected_completed_epochs:
         raise ValueError(
-            f"formal PPO checkpoint completed_epochs must be 240, got {completed_epochs}"
+            "formal PPO checkpoint completed_epochs must be "
+            f"{expected_completed_epochs}, got {completed_epochs}"
         )
     if payload.get("config_sha256") != config_sha256:
         raise ValueError("formal PPO checkpoint config_sha256 mismatch")
@@ -309,34 +440,44 @@ def _load_frozen_v6_policy(
     return policy, payload
 
 
-def _slot_records(
+def _slot_records_for_range(
     rollout: SimpleRollout,
     cache_count: int,
     uav_count: int,
+    *,
+    origin_start: int,
+    origin_end: int,
+    label: str,
 ) -> list[dict[str, Any]]:
-    if len(rollout.transitions) != TEST_SLOT_COUNT:
+    expected_slot_count = int(origin_end) - int(origin_start) + 1
+    if len(rollout.transitions) != expected_slot_count:
         raise ValueError(
-            f"held-out rollout must contain {TEST_SLOT_COUNT} transitions, "
+            f"{label} rollout must contain {expected_slot_count} transitions, "
             f"got {len(rollout.transitions)}"
         )
     records: list[dict[str, Any]] = []
     for transition in rollout.transitions:
         origin = int(transition.origin_index)
-        if origin < TEST_ORIGIN_START or origin > TEST_ORIGIN_END:
-            raise ValueError(f"held-out transition origin outside 240..299: {origin}")
+        if origin < origin_start or origin > origin_end:
+            raise ValueError(
+                f"{label} transition origin outside "
+                f"{origin_start}..{origin_end}: {origin}"
+            )
         q = float(transition.actual_task_utility)
         cache_cost = float(transition.cache_cost)
         movement_cost = float(transition.movement_cost)
         reward = float(transition.reward)
         values = (reward, q, cache_cost, movement_cost)
         if not all(math.isfinite(value) for value in values):
-            raise FloatingPointError(f"held-out slot {origin} contains non-finite metrics")
+            raise FloatingPointError(
+                f"{label} slot {origin} contains non-finite metrics"
+            )
         expected_reward = q - cache_cost - movement_cost
         if not np.isclose(reward, expected_reward, rtol=1.0e-12, atol=1.0e-9):
-            raise AssertionError(f"held-out slot {origin} reward contract mismatch")
+            raise AssertionError(f"{label} slot {origin} reward contract mismatch")
         action = np.asarray(transition.action, dtype=np.int64)
         if action.shape != (cache_count + uav_count,):
-            raise ValueError(f"held-out slot {origin} action shape mismatch")
+            raise ValueError(f"{label} slot {origin} action shape mismatch")
         records.append(
             {
                 "origin": origin,
@@ -352,9 +493,27 @@ def _slot_records(
         )
     records.sort(key=lambda record: int(record["origin"]))
     origins = tuple(int(record["origin"]) for record in records)
-    if origins != tuple(range(TEST_ORIGIN_START, TEST_ORIGIN_END + 1)):
-        raise ValueError(f"held-out slot origins are not continuous 240..299: {origins}")
+    if origins != tuple(range(origin_start, origin_end + 1)):
+        raise ValueError(
+            f"{label} slot origins are not continuous "
+            f"{origin_start}..{origin_end}: {origins}"
+        )
     return records
+
+
+def _slot_records(
+    rollout: SimpleRollout,
+    cache_count: int,
+    uav_count: int,
+) -> list[dict[str, Any]]:
+    return _slot_records_for_range(
+        rollout,
+        cache_count,
+        uav_count,
+        origin_start=TEST_ORIGIN_START,
+        origin_end=TEST_ORIGIN_END,
+        label="held-out",
+    )
 
 
 def _rate(numerator: int, denominator: int) -> float:
@@ -536,11 +695,209 @@ def evaluate_heldout(
     return manifest, summary
 
 
+def _full_episode_summary(
+    records: list[dict[str, Any]],
+    cache_count: int,
+    uav_count: int,
+) -> dict[str, Any]:
+    if len(records) != FULL_EPISODE_SLOT_COUNT:
+        raise ValueError("full-episode summary requires 300 slot records")
+    rewards = np.asarray([record["reward"] for record in records], dtype=np.float64)
+    q_values = np.asarray([record["q"] for record in records], dtype=np.float64)
+    cache_costs = np.asarray(
+        [record["cache_cost"] for record in records], dtype=np.float64
+    )
+    movement_costs = np.asarray(
+        [record["movement_cost"] for record in records], dtype=np.float64
+    )
+    cache_triggers = int(sum(record["cache_trigger_count"] for record in records))
+    cache_changes = int(sum(record["cache_change_count"] for record in records))
+    uav_triggers = int(sum(record["uav_trigger_count"] for record in records))
+    uav_movements = int(sum(record["uav_movement_count"] for record in records))
+    summary: dict[str, Any] = {
+        "data_protocol": FULL_EPISODE_PROTOCOL,
+        "origin_start": FULL_EPISODE_ORIGIN_START,
+        "origin_end": FULL_EPISODE_ORIGIN_END,
+        "episode_slots": FULL_EPISODE_SLOT_COUNT,
+        "total_return": float(rewards.sum()),
+        "mean_slot_reward": float(rewards.mean()),
+        "total_q": float(q_values.sum()),
+        "mean_q": float(q_values.mean()),
+        "total_cache_cost": float(cache_costs.sum()),
+        "total_movement_cost": float(movement_costs.sum()),
+        "cache_trigger_rate": _rate(
+            cache_triggers, FULL_EPISODE_SLOT_COUNT * cache_count
+        ),
+        "cache_change_rate": _rate(
+            cache_changes, FULL_EPISODE_SLOT_COUNT * cache_count
+        ),
+        "cache_change_given_trigger_rate": (
+            None if cache_triggers == 0 else _rate(cache_changes, cache_triggers)
+        ),
+        "uav_trigger_rate": _rate(
+            uav_triggers, FULL_EPISODE_SLOT_COUNT * uav_count
+        ),
+        "uav_movement_rate": _rate(
+            uav_movements, FULL_EPISODE_SLOT_COUNT * uav_count
+        ),
+        "uav_movement_given_trigger_rate": (
+            None if uav_triggers == 0 else _rate(uav_movements, uav_triggers)
+        ),
+        "segments": [],
+    }
+    base_segment_size = FULL_EPISODE_SLOT_COUNT // 4
+    segment_lengths = [base_segment_size] * 3 + [
+        FULL_EPISODE_SLOT_COUNT - (base_segment_size * 3)
+    ]
+    segment_start = FULL_EPISODE_ORIGIN_START
+    segments: list[dict[str, Any]] = []
+    for segment_length in segment_lengths:
+        segment_end = segment_start + segment_length - 1
+        segment_records = [
+            record
+            for record in records
+            if segment_start <= int(record["origin"]) <= segment_end
+        ]
+        segments.append(
+            {
+                "origin_start": segment_start,
+                "origin_end": segment_end,
+                "mean_reward": float(
+                    np.mean([record["reward"] for record in segment_records])
+                ),
+                "mean_q": float(np.mean([record["q"] for record in segment_records])),
+                "mean_cache_cost": float(
+                    np.mean([record["cache_cost"] for record in segment_records])
+                ),
+                "mean_movement_cost": float(
+                    np.mean([record["movement_cost"] for record in segment_records])
+                ),
+            }
+        )
+        segment_start = segment_end + 1
+    summary["segments"] = segments
+    return summary
+
+
+def evaluate_full_episode(
+    checkpoint_path: str | Path,
+    run_dir: str | Path,
+    config_path: str | Path = FULL_EPISODE_CONFIG_PATH,
+    device: str = "cpu",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Evaluate one specified full-episode input realization without training."""
+
+    _require_torch()
+    project_root = project_config.find_project_root()
+    resolved_config = project_config.resolve_path(project_root, config_path)
+    resolved_checkpoint = project_config.resolve_path(project_root, checkpoint_path)
+    output_dir = _resolve_output_dir(project_root, run_dir)
+    ensure_fresh_evaluation_dir(output_dir)
+
+    config_sha256 = _sha256(resolved_config)
+    context = _build_full_episode_context(resolved_config)
+    training_git_sha = _load_full_episode_training_provenance(
+        resolved_checkpoint,
+        config_sha256,
+    )
+    evaluation_git_sha, evaluation_git_dirty = _git_identity(project_root)
+    evaluation_device = torch.device(device)
+    steps = _prepare_full_episode_steps(context)
+    policy, checkpoint_payload = _load_frozen_v6_policy(
+        context,
+        resolved_checkpoint,
+        config_sha256,
+        evaluation_device,
+        expected_completed_epochs=None,
+        expected_protocol=FULL_EPISODE_PROTOCOL,
+    )
+    parameter_snapshot = [parameter.detach().clone() for parameter in policy.parameters()]
+    popart_snapshot = policy.popart_statistics()
+    with torch.inference_mode():
+        rollout = collect_rollout(
+            policy,
+            context,
+            steps,
+            initial_cache=np.asarray(context.initial_cache, dtype=np.int8).copy(),
+            initial_uav=_copy_uav_positions(context.initial_uav),
+            terminal_origin_index=FULL_EPISODE_ORIGIN_END,
+            deterministic=True,
+        )
+    policy_parameters_updated = any(
+        not torch.equal(before, after.detach())
+        for before, after in zip(parameter_snapshot, policy.parameters(), strict=True)
+    )
+    if policy_parameters_updated:
+        raise RuntimeError("full-episode evaluation modified policy parameters")
+    popart_statistics_updated = policy.popart_statistics() != popart_snapshot
+    if popart_statistics_updated:
+        raise RuntimeError("full-episode evaluation modified PopArt statistics")
+    records = _slot_records_for_range(
+        rollout,
+        len(context.action_spec.cache_node_ids),
+        len(context.action_spec.uav_ids),
+        origin_start=FULL_EPISODE_ORIGIN_START,
+        origin_end=FULL_EPISODE_ORIGIN_END,
+        label="full-episode",
+    )
+    summary = _full_episode_summary(
+        records,
+        len(context.action_spec.cache_node_ids),
+        len(context.action_spec.uav_ids),
+    )
+    manifest: dict[str, Any] = {
+        "experiment_type": "full_episode_evaluation",
+        "data_protocol": FULL_EPISODE_PROTOCOL,
+        "training_git_sha": training_git_sha,
+        "evaluation_git_sha": evaluation_git_sha,
+        "evaluation_git_dirty": evaluation_git_dirty,
+        "config_path": str(resolved_config),
+        "config_sha256": config_sha256,
+        "checkpoint_path": str(resolved_checkpoint),
+        "checkpoint_sha256": _sha256(resolved_checkpoint),
+        "checkpoint_completed_epochs": int(
+            checkpoint_payload.get(
+                "completed_epochs",
+                checkpoint_payload.get("completed_episodes", -1),
+            )
+        ),
+        "policy_schema": EXPECTED_POLICY_SCHEMA,
+        "episode_slots": FULL_EPISODE_SLOT_COUNT,
+        "origin_start": FULL_EPISODE_ORIGIN_START,
+        "origin_end": FULL_EPISODE_ORIGIN_END,
+        "rollout_steps": FULL_EPISODE_SLOT_COUNT,
+        "num_minibatches": int(
+            project_config.get_ppo_data_protocol(context.cfg)["num_minibatches"]
+        ),
+        "minibatch_size": int(context.minibatch_size),
+        "terminal_origin": FULL_EPISODE_ORIGIN_END,
+        "deterministic": True,
+        "policy_parameters_updated": bool(policy_parameters_updated),
+        "popart_statistics_updated": bool(popart_statistics_updated),
+        "optimizer_steps": 0,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(output_dir / "full_episode_manifest.json", manifest)
+    _write_json(output_dir / "full_episode_summary.json", summary)
+    with (output_dir / "full_episode_slot_metrics.jsonl").open(
+        "w", encoding="utf-8", newline="\n"
+    ) as stream:
+        for record in records:
+            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return manifest, summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate the frozen PPO V6 checkpoint on held-out origins 240..299."
+        description="Evaluate a frozen PPO V6 policy without optimizer updates."
     )
-    parser.add_argument("--config", default=FORMAL_CONFIG_PATH)
+    parser.add_argument(
+        "--mode",
+        choices=("heldout", "full_episode"),
+        default="heldout",
+        help="legacy held-out 240..299 or one full 0..299 episode",
+    )
+    parser.add_argument("--config", default=None)
     parser.add_argument("--checkpoint", default=str(FORMAL_CHECKPOINT_PATH))
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--device", default="cpu")
@@ -549,12 +906,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    evaluate_heldout(
-        config_path=args.config,
-        checkpoint_path=args.checkpoint,
-        run_dir=args.run_dir,
-        device=args.device,
-    )
+    if args.mode == "full_episode":
+        evaluate_full_episode(
+            checkpoint_path=args.checkpoint,
+            run_dir=args.run_dir,
+            config_path=args.config or FULL_EPISODE_CONFIG_PATH,
+            device=args.device,
+        )
+    else:
+        evaluate_heldout(
+            config_path=args.config or FORMAL_CONFIG_PATH,
+            checkpoint_path=args.checkpoint,
+            run_dir=args.run_dir,
+            device=args.device,
+        )
     return 0
 
 

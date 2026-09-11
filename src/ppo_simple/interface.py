@@ -368,6 +368,26 @@ def normalized_time_to_go(
     return float(value)
 
 
+def prediction_horizon_valid_mask(
+    origin_index: int,
+    prediction_horizon: int,
+    prediction_terminal_origin: int,
+) -> np.ndarray:
+    """Return the H-step validity mask without reading any prediction data."""
+
+    origin = int(origin_index)
+    horizon = int(prediction_horizon)
+    terminal = int(prediction_terminal_origin)
+    if horizon <= 0:
+        raise ValueError("prediction_horizon must be positive")
+    if origin < 0 or terminal < origin:
+        raise ValueError("prediction horizon origin/terminal bounds are invalid")
+    return np.asarray(
+        [int(origin + horizon_index <= terminal) for horizon_index in range(horizon)],
+        dtype=np.int8,
+    )
+
+
 def build_configuration_observation(
     previous_cache_state: Any,
     previous_uav_positions: dict[str, Any] | Any,
@@ -864,12 +884,10 @@ def prepare_aligned_rollout_steps(
         if horizon > 1:
             assert vehicle_pred_horizon is not None
             assert popularity_pred_horizon is not None
-            valid_mask = np.asarray(
-                [
-                    int(origin_index + horizon_index <= int(prediction_terminal_origin))
-                    for horizon_index in range(horizon)
-                ],
-                dtype=np.int8,
+            valid_mask = prediction_horizon_valid_mask(
+                origin_index,
+                horizon,
+                int(prediction_terminal_origin),
             )
             predicted_vehicle_horizon: list[dict[str, np.ndarray]] = []
             predicted_popularity_horizon: list[dict[int, float]] = []

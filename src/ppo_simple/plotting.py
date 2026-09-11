@@ -27,6 +27,57 @@ SLOT_DETAIL_FIELDS = (
 )
 
 
+def _load_slot_contract(run_dir: Path) -> tuple[int, int]:
+    """Read active episode slots/origin start, with the legacy 240 fallback."""
+
+    manifest_path = Path(run_dir) / "run_manifest.json"
+    if not manifest_path.exists():
+        return SLOTS_PER_EPOCH, 0
+    try:
+        with manifest_path.open("r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to read plotting protocol manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"plotting protocol manifest must be an object: {manifest_path}")
+    raw_slots = manifest.get(
+        "episode_slots",
+        manifest.get("origins_per_epoch", SLOTS_PER_EPOCH),
+    )
+    raw_start = manifest.get(
+        "origin_start",
+        manifest.get("train_origin_start", 0),
+    )
+    raw_end = manifest.get("origin_end", manifest.get("train_origin_end"))
+    try:
+        episode_slots = int(raw_slots)
+        origin_start = int(raw_start)
+        origin_end = (
+            origin_start + episode_slots - 1
+            if raw_end is None
+            else int(raw_end)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"plotting protocol manifest has invalid slot bounds: {manifest_path}") from exc
+    if episode_slots <= 0 or origin_end - origin_start + 1 != episode_slots:
+        raise ValueError(f"plotting protocol manifest has inconsistent slot bounds: {manifest_path}")
+    return episode_slots, origin_start
+
+
+def _resolve_slot_contract(
+    path: Path,
+    episode_slots: int | None,
+    origin_start: int | None,
+) -> tuple[int, int]:
+    if episode_slots is None:
+        return _load_slot_contract(path.parent)
+    slots = int(episode_slots)
+    start = 0 if origin_start is None else int(origin_start)
+    if slots <= 0:
+        raise ValueError("episode_slots must be positive")
+    return slots, start
+
+
 def _finite_float(value: Any, field: str) -> float:
     try:
         converted = float(value)
@@ -45,7 +96,15 @@ def _nonnegative_int(value: Any, field: str) -> int:
     return integer
 
 
-def _read_slot_metrics(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
+def _read_slot_metrics(
+    path: Path,
+    *,
+    episode_slots: int | None = None,
+    origin_start: int | None = None,
+) -> dict[tuple[int, int], dict[str, Any]]:
+    active_slots, active_origin_start = _resolve_slot_contract(
+        Path(path), episode_slots, origin_start
+    )
     records: dict[tuple[int, int], dict[str, Any]] = {}
     if not path.exists():
         return records
@@ -76,12 +135,14 @@ def _read_slot_metrics(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
             global_slot = int(record["global_training_slot"])
             if epoch < 1:
                 raise ValueError(f"slot_metrics epoch must be >=1 at line {line_number}")
-            if not 0 <= origin < SLOTS_PER_EPOCH:
+            origin_offset = origin - active_origin_start
+            if not 0 <= origin_offset < active_slots:
                 raise ValueError(
-                    f"slot_metrics origin must be in [0,{SLOTS_PER_EPOCH - 1}] "
+                    f"slot_metrics origin must be in "
+                    f"[{active_origin_start},{active_origin_start + active_slots - 1}] "
                     f"at line {line_number}"
                 )
-            expected_global_slot = (epoch - 1) * SLOTS_PER_EPOCH + origin
+            expected_global_slot = (epoch - 1) * active_slots + origin_offset
             if global_slot != expected_global_slot:
                 raise ValueError(
                     "slot_metrics global_training_slot mismatch at "
@@ -151,6 +212,8 @@ def append_training_slot_metrics(
     epoch: int,
     rewards: Iterable[float],
     episode_return: float,
+    episode_slots: int | None = None,
+    origin_start: int | None = None,
     q_values: Iterable[float] | None = None,
     cache_costs: Iterable[float] | None = None,
     movement_costs: Iterable[float] | None = None,
@@ -166,13 +229,17 @@ def append_training_slot_metrics(
     partial epoch is safely filled without creating duplicate keys.
     """
 
+    path = Path(path)
+    active_slots, active_origin_start = _resolve_slot_contract(
+        path, episode_slots, origin_start
+    )
     epoch_i = int(epoch)
     if epoch_i < 1:
         raise ValueError("slot_metrics epoch must be >=1")
     reward_array = np.asarray(list(rewards), dtype=np.float64).reshape(-1)
-    if reward_array.shape != (SLOTS_PER_EPOCH,):
+    if reward_array.shape != (active_slots,):
         raise ValueError(
-            "slot_metrics requires one complete 240-origin episode; "
+            "slot_metrics requires one complete episode; "
             f"received {reward_array.size} rewards"
         )
     if not np.all(np.isfinite(reward_array)):
@@ -225,9 +292,9 @@ def append_training_slot_metrics(
             ).reshape(-1),
         }
         for field, values in detail_arrays.items():
-            if values.shape != (SLOTS_PER_EPOCH,):
+            if values.shape != (active_slots,):
                 raise ValueError(
-                    f"slot_metrics {field} requires {SLOTS_PER_EPOCH} values; "
+                    f"slot_metrics {field} requires {active_slots} values; "
                     f"received {values.size}"
                 )
             if not np.all(np.isfinite(values)):
@@ -256,7 +323,11 @@ def append_training_slot_metrics(
                 f"q-cache_cost-movement_cost={expected_rewards[mismatch]}"
             )
 
-    records = _read_slot_metrics(path)
+    records = _read_slot_metrics(
+        path,
+        episode_slots=active_slots,
+        origin_start=active_origin_start,
+    )
     epoch_counts: dict[int, int] = {}
     for existing_epoch, _ in records:
         epoch_counts[existing_epoch] = epoch_counts.get(existing_epoch, 0) + 1
@@ -268,13 +339,14 @@ def append_training_slot_metrics(
             raise ValueError(
                 f"slot_metrics contains a future epoch {existing_epoch} while writing {epoch_i}"
             )
-        if existing_epoch < epoch_i and count != SLOTS_PER_EPOCH:
+        if existing_epoch < epoch_i and count != active_slots:
             raise ValueError(
                 f"slot_metrics epoch {existing_epoch} is incomplete ({count}/"
-                f"{SLOTS_PER_EPOCH} records)"
+                f"{active_slots} records)"
             )
     to_append: list[dict[str, Any]] = []
-    for origin, reward in enumerate(reward_array.tolist()):
+    for origin_offset, reward in enumerate(reward_array.tolist()):
+        origin = active_origin_start + origin_offset
         key = (epoch_i, origin)
         existing = records.get(key)
         if existing is not None:
@@ -286,9 +358,9 @@ def append_training_slot_metrics(
             if detailed and all(field in existing for field in SLOT_DETAIL_FIELDS):
                 for field in SLOT_DETAIL_FIELDS:
                     expected = (
-                        int(detail_arrays[field][origin])
+                        int(detail_arrays[field][origin_offset])
                         if field.endswith("_count")
-                        else float(detail_arrays[field][origin])
+                        else float(detail_arrays[field][origin_offset])
                     )
                     if existing[field] != expected:
                         raise ValueError(
@@ -298,12 +370,12 @@ def append_training_slot_metrics(
         record = {
             "epoch": epoch_i,
             "origin": origin,
-            "global_training_slot": (epoch_i - 1) * SLOTS_PER_EPOCH + origin,
+            "global_training_slot": (epoch_i - 1) * active_slots + origin_offset,
             "reward": float(reward),
         }
         if detailed:
             for field in SLOT_DETAIL_FIELDS:
-                value = detail_arrays[field][origin]
+                value = detail_arrays[field][origin_offset]
                 record[field] = int(value) if field.endswith("_count") else float(value)
         to_append.append(record)
     for record in to_append:

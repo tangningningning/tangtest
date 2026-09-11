@@ -13,6 +13,7 @@ from common import project_config
 from .plotting import (
     TRAINING_EPOCH_RETURN_PLOT_FILENAME,
     TRAINING_SLOT_REWARD_PLOT_FILENAME,
+    _load_slot_contract,
     _read_slot_metrics,
 )
 
@@ -203,14 +204,11 @@ def build_run_manifest(
     get = project_config.get_config_value
     hyper = trainer.hyperparameters
     actor_optimizer, critic_optimizer = _actual_optimizers(trainer)
+    protocol = project_config.get_ppo_data_protocol(context.cfg)
     train_origin_start = int(context.train_origin_start)
     train_origin_end = int(context.train_origin_end)
-    test_origin_start = int(
-        get(context.cfg, "algorithm.ppo.data_protocol.test_origin_start")
-    )
-    test_origin_end = int(
-        get(context.cfg, "algorithm.ppo.data_protocol.test_origin_end")
-    )
+    test_origin_start = protocol["test_origin_start"]
+    test_origin_end = protocol["test_origin_end"]
     policy_schema = str(getattr(trainer.policy, "architecture_id", context.policy_schema))
     git_sha, git_dirty = _git_identity(Path(context.root))
     resolved_config_path = Path(
@@ -232,18 +230,26 @@ def build_run_manifest(
         "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),
         "observation_dim": int(context.observation_spec.observation_dim),
         "action_dim": int(context.action_spec.action_dim),
+        "data_protocol": str(protocol["protocol"]),
+        "episode_slots": int(context.episode_slots),
+        "origin_start": train_origin_start,
+        "origin_end": train_origin_end,
+        "terminal_origin": int(context.terminal_origin),
         "train_origin_start": train_origin_start,
         "train_origin_end": train_origin_end,
-        "test_origin_start": test_origin_start,
-        "test_origin_end": test_origin_end,
+        "test_origin_start": (
+            None if test_origin_start is None else int(test_origin_start)
+        ),
+        "test_origin_end": None if test_origin_end is None else int(test_origin_end),
         "target_epochs": int(target_epochs),
         "rollout_steps": int(rollout_steps),
-        "origins_per_epoch": train_origin_end - train_origin_start + 1,
+        "origins_per_epoch": int(context.episode_slots),
         "gamma": float(hyper.gamma),
         "gae_lambda": float(hyper.gae_lambda),
         "clip_epsilon": float(hyper.clip_epsilon),
         "update_epochs": int(hyper.update_epochs),
         "num_minibatches": int(hyper.num_minibatches),
+        "minibatch_size": int(context.minibatch_size),
         "actor_learning_rate": _optimizer_learning_rate(
             actor_optimizer, "actor"
         ),
@@ -252,6 +258,74 @@ def build_run_manifest(
         ),
         "max_grad_norm": float(hyper.max_grad_norm),
         "entropy_coefficient": float(hyper.entropy_coefficient),
+    }
+
+
+def _manifest_protocol_identity(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Normalize protocol metadata while accepting old legacy manifests."""
+
+    protocol = str(
+        manifest.get(
+            "data_protocol",
+            project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
+        )
+    )
+    if protocol not in {
+        project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
+        project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
+    }:
+        raise ValueError(f"unknown PPO run_manifest data_protocol: {protocol}")
+    origin_start = int(
+        manifest.get("origin_start", manifest.get("train_origin_start", 0))
+    )
+    raw_origin_end = manifest.get(
+        "origin_end", manifest.get("train_origin_end")
+    )
+    raw_episode_slots = manifest.get(
+        "episode_slots", manifest.get("origins_per_epoch")
+    )
+    if raw_origin_end is None and raw_episode_slots is not None:
+        raw_origin_end = origin_start + int(raw_episode_slots) - 1
+    if raw_origin_end is None:
+        raise ValueError("PPO run_manifest is missing origin_end/episode_slots")
+    origin_end = int(raw_origin_end)
+    episode_slots = int(
+        raw_episode_slots
+        if raw_episode_slots is not None
+        else origin_end - origin_start + 1
+    )
+    if episode_slots <= 0 or origin_end - origin_start + 1 != episode_slots:
+        raise ValueError("PPO run_manifest has inconsistent episode slot bounds")
+    terminal_origin = int(manifest.get("terminal_origin", origin_end))
+    if terminal_origin != origin_end:
+        raise ValueError("PPO run_manifest terminal_origin must equal origin_end")
+
+    raw_rollout_steps = manifest.get("rollout_steps")
+    rollout_steps = None if raw_rollout_steps is None else int(raw_rollout_steps)
+    raw_num_minibatches = manifest.get("num_minibatches")
+    num_minibatches = (
+        None if raw_num_minibatches is None else int(raw_num_minibatches)
+    )
+    raw_minibatch_size = manifest.get("minibatch_size")
+    if raw_minibatch_size is None and num_minibatches is not None:
+        minibatch_size = (
+            episode_slots // num_minibatches
+            if num_minibatches > 0 and episode_slots % num_minibatches == 0
+            else None
+        )
+    else:
+        minibatch_size = (
+            None if raw_minibatch_size is None else int(raw_minibatch_size)
+        )
+    return {
+        "data_protocol": protocol,
+        "episode_slots": episode_slots,
+        "origin_start": origin_start,
+        "origin_end": origin_end,
+        "terminal_origin": terminal_origin,
+        "rollout_steps": rollout_steps,
+        "num_minibatches": num_minibatches,
+        "minibatch_size": minibatch_size,
     }
 
 
@@ -279,6 +353,29 @@ def validate_run_manifest_for_resume(
             for field, (old, new) in mismatches.items()
         )
         raise ValueError(f"PPO resume run_manifest mismatch: {details}")
+
+    existing_protocol = _manifest_protocol_identity(existing)
+    current_protocol = _manifest_protocol_identity(current)
+    protocol_mismatches = {
+        field: (existing_protocol[field], current_protocol[field])
+        for field in (
+            "data_protocol",
+            "episode_slots",
+            "origin_start",
+            "origin_end",
+            "terminal_origin",
+            "rollout_steps",
+            "num_minibatches",
+            "minibatch_size",
+        )
+        if existing_protocol[field] != current_protocol[field]
+    }
+    if protocol_mismatches:
+        details = ", ".join(
+            f"{field}: existing={old!r}, current={new!r}"
+            for field, (old, new) in protocol_mismatches.items()
+        )
+        raise ValueError(f"PPO resume protocol mismatch: {details}")
 
     existing_git_sha = existing.get("git_commit_sha")
     current_git_sha = current.get("git_commit_sha")
@@ -414,13 +511,35 @@ def update_run_summary(
     completed_epochs: int,
     target_epochs: int,
     status: str,
+    protocol_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the current compact summary from already-written metrics."""
 
     if status not in {"running", "completed"}:
         raise ValueError(f"invalid run summary status: {status}")
     episodes, episode_nan_inf = _episode_records(episode_metrics_path)
-    slot_records = _read_slot_metrics(slot_metrics_path)
+    if protocol_metadata is None:
+        episode_slots, origin_start = _load_slot_contract(slot_metrics_path.parent)
+        protocol_metadata = {
+            "data_protocol": project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
+            "episode_slots": episode_slots,
+            "origin_start": origin_start,
+            "origin_end": origin_start + episode_slots - 1,
+            "terminal_origin": origin_start + episode_slots - 1,
+        }
+    episode_slots = int(protocol_metadata["episode_slots"])
+    origin_start = int(protocol_metadata["origin_start"])
+    origin_end = int(protocol_metadata["origin_end"])
+    terminal_origin = int(protocol_metadata.get("terminal_origin", origin_end))
+    if origin_end - origin_start + 1 != episode_slots:
+        raise ValueError("run summary protocol has inconsistent episode slot bounds")
+    if terminal_origin != origin_end:
+        raise ValueError("run summary terminal_origin must equal origin_end")
+    slot_records = _read_slot_metrics(
+        slot_metrics_path,
+        episode_slots=episode_slots,
+        origin_start=origin_start,
+    )
     epochs = [int(record["epoch"]) for record in episodes]
     returns = [
         value
@@ -465,18 +584,43 @@ def update_run_summary(
         if epoch in final_epoch_set
     ]
 
-    def region_mean(start: int) -> float | None:
+    def region_mean(start: int, end: int) -> float | None:
         values = [
             float(record["reward"])
             for record in final_slot_records
-            if start <= int(record["origin"]) < start + 60
+            if start <= int(record["origin"]) <= end
         ]
         return _mean(values)
+
+    base_region_size = episode_slots // 4
+    region_lengths = [base_region_size] * 3 + [
+        episode_slots - (base_region_size * 3)
+    ]
+    region_values: dict[str, float | None] = {}
+    region_start = origin_start
+    for region_length in region_lengths:
+        region_end = region_start + region_length - 1
+        if region_length <= 0:
+            value = None
+        else:
+            value = region_mean(region_start, region_end)
+        region_values[
+            f"final20_reward_origin_{region_start}_{region_end}"
+        ] = value
+        region_start = region_end + 1
 
     summary = {
         "status": status,
         "completed_epochs": int(completed_epochs),
         "target_epochs": int(target_epochs),
+        "data_protocol": str(protocol_metadata["data_protocol"]),
+        "episode_slots": episode_slots,
+        "origin_start": origin_start,
+        "origin_end": origin_end,
+        "terminal_origin": terminal_origin,
+        "rollout_steps": protocol_metadata.get("rollout_steps"),
+        "num_minibatches": protocol_metadata.get("num_minibatches"),
+        "minibatch_size": protocol_metadata.get("minibatch_size"),
         "best_epoch": int(best_epoch),
         "best_return": best_return,
         "final_epoch": final_epoch,
@@ -498,11 +642,8 @@ def update_run_summary(
         "final20_uav_movement_rate": _mean(
             _metric_values(final_episodes, "uav_actual_movement_rate")
         ),
-        "final20_reward_origin_0_59": region_mean(0),
-        "final20_reward_origin_60_119": region_mean(60),
-        "final20_reward_origin_120_179": region_mean(120),
-        "final20_reward_origin_180_239": region_mean(180),
         "nan_inf_detected": bool(episode_nan_inf),
     }
+    summary.update(region_values)
     _write_json(path, summary)
     return summary

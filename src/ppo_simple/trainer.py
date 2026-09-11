@@ -96,6 +96,11 @@ class EnvironmentContext:
     initial_uav: dict[str, np.ndarray]
     train_origin_start: int
     train_origin_end: int
+    data_protocol: str
+    episode_slots: int
+    terminal_origin: int
+    configured_rollout_steps: int | None
+    minibatch_size: int
     configuration_control_mode: str
     policy_schema: str
     observation_time_to_go: Callable[[int], float] | None = None
@@ -337,6 +342,7 @@ def _append_critic_diagnostics(
 def load_environment_context(config_path: str = "system_config.toml") -> EnvironmentContext:
     cfg = project_config.load_config(config_path)
     project_config.validate_for_formal_experiment(cfg)
+    data_protocol = project_config.get_ppo_data_protocol(cfg)
     root = Path(cfg["_meta"]["project_root"])
     cache_cfg = cache_configuration.cache_config_from_project(cfg)
     scenarios = cache_configuration.load_prediction_scenarios(
@@ -345,8 +351,8 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
     service_catalog = cache_configuration.load_service_catalog(
         _project_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
     )
-    train_start = int(project_config.get_config_value(cfg, "algorithm.ppo.data_protocol.train_origin_start"))
-    train_end = int(project_config.get_config_value(cfg, "algorithm.ppo.data_protocol.train_origin_end"))
+    train_start = int(data_protocol["train_origin_start"])
+    train_end = int(data_protocol["train_origin_end"])
     origin_count = int(scenarios["origin_slots"].shape[0])
     if train_start < 0 or train_end < train_start or train_end >= origin_count:
         raise ValueError("PPO v2 train origin range 超出 prediction_scenarios。")
@@ -406,6 +412,15 @@ def load_environment_context(config_path: str = "system_config.toml") -> Environ
         initial_uav=initial_uav,
         train_origin_start=train_start,
         train_origin_end=train_end,
+        data_protocol=str(data_protocol["protocol"]),
+        episode_slots=int(data_protocol["episode_slots"]),
+        terminal_origin=int(data_protocol["terminal_origin"]),
+        configured_rollout_steps=(
+            None
+            if data_protocol["rollout_steps"] is None
+            else int(data_protocol["rollout_steps"])
+        ),
+        minibatch_size=int(data_protocol["minibatch_size"]),
         configuration_control_mode=configuration_control_mode,
         policy_schema=policy_schema,
     )
@@ -685,6 +700,15 @@ class PPOV2Trainer:
             raise ValueError("chunk origin_start 超出 formal train origins。")
         if int(rollout_steps) <= 0:
             raise ValueError("rollout_steps 必须大于0。")
+        if self.context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+            if start != self.context.train_origin_start:
+                raise ValueError(
+                    "full_episode_randomized 必须从 train_origin_start 开始收集完整 episode。"
+                )
+            if int(rollout_steps) != self.context.episode_slots:
+                raise ValueError(
+                    "full_episode_randomized rollout_steps 必须等于 episode_slots。"
+                )
         remaining = self.context.train_origin_end - start + 1
         chunk_size = min(int(rollout_steps), remaining)
         prepared_steps = aligned_train_steps(
@@ -746,6 +770,16 @@ class PPOV2Trainer:
             if not np.isfinite(critic_return_scale) or critic_return_scale <= 0.0:
                 raise FloatingPointError("PPO v2 critic return scale 非 finite。")
         sample_count = int(rollout.observations.shape[0])
+        if self.context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+            if sample_count != self.context.episode_slots:
+                raise ValueError(
+                    "full_episode_randomized PPO update 必须使用完整 episode："
+                    f"expected={self.context.episode_slots}, got={sample_count}。"
+                )
+            if sample_count // hyper.num_minibatches != self.context.minibatch_size:
+                raise ValueError(
+                    "full_episode_randomized minibatch_size 与 protocol 不一致。"
+                )
         if sample_count < hyper.num_minibatches or sample_count % hyper.num_minibatches != 0:
             raise ValueError("PPO v2 rollout length 必须可被 num_minibatches 整除。")
         if popart_critic:
@@ -1128,10 +1162,17 @@ class PPOV2Trainer:
             "episode": int(completed_episodes),
             "completed_episodes": int(completed_episodes),
             "completed_epochs": int(completed_episodes),
+            "data_protocol": str(self.context.data_protocol),
+            "episode_slots": int(self.context.episode_slots),
+            "origin_start": int(self.context.train_origin_start),
+            "origin_end": int(self.context.train_origin_end),
+            "terminal_origin": int(self.context.terminal_origin),
             "current_train_origin": int(current_train_origin),
             "current_cache_state": np.asarray(current_cache_state, dtype=np.int8).copy(),
             "current_uav_positions": _copy_uav_positions(current_uav_positions),
             "rollout_steps": int(rollout_steps),
+            "num_minibatches": int(self.hyperparameters.num_minibatches),
+            "minibatch_size": int(self.context.minibatch_size),
             "config_sha256": str(config_hash),
             "observation_dim": int(self.context.observation_spec.observation_dim),
             "action_dim": int(self.context.action_spec.action_dim),
@@ -1202,6 +1243,33 @@ class PPOV2Trainer:
 
     def load_checkpoint(self, checkpoint: Path, config_hash: str) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        checkpoint_protocol = str(
+            payload.get(
+                "data_protocol",
+                project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
+            )
+        )
+        if checkpoint_protocol != self.context.data_protocol:
+            raise ValueError(
+                "PPO checkpoint data_protocol mismatch; refusing cross-protocol resume: "
+                f"checkpoint={checkpoint_protocol}, expected={self.context.data_protocol}."
+            )
+        if self.context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+            expected_protocol_fields = {
+                "episode_slots": self.context.episode_slots,
+                "origin_start": self.context.train_origin_start,
+                "origin_end": self.context.train_origin_end,
+                "terminal_origin": self.context.terminal_origin,
+                "rollout_steps": self.context.episode_slots,
+                "num_minibatches": self.hyperparameters.num_minibatches,
+                "minibatch_size": self.context.minibatch_size,
+            }
+            for field, expected in expected_protocol_fields.items():
+                if field not in payload or int(payload[field]) != int(expected):
+                    raise ValueError(
+                        "PPO full_episode_randomized checkpoint protocol mismatch: "
+                        f"field={field}, checkpoint={payload.get(field)!r}, expected={expected}."
+                    )
         expected_scale_mode = self.hyperparameters.critic_value_scale_mode
         expected_advantage_mode = self.hyperparameters.advantage_normalization_mode
         checkpoint_advantage_mode = str(
@@ -1357,12 +1425,28 @@ def _config_hash(config_path: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _run_protocol_metadata(
+    context: EnvironmentContext,
+    rollout_steps: int,
+) -> dict[str, Any]:
+    return {
+        "data_protocol": str(context.data_protocol),
+        "episode_slots": int(context.episode_slots),
+        "origin_start": int(context.train_origin_start),
+        "origin_end": int(context.train_origin_end),
+        "terminal_origin": int(context.terminal_origin),
+        "rollout_steps": int(rollout_steps),
+        "num_minibatches": int(context.cfg["algorithm"]["ppo"]["num_minibatches"]),
+        "minibatch_size": int(context.minibatch_size),
+    }
+
+
 def run_training(
     config_path: str,
     episodes: int,
     run_dir: str,
     *,
-    rollout_steps: int = DEFAULT_ROLLOUT_STEPS,
+    rollout_steps: int | None = None,
     resume: bool = False,
     verbose: bool = False,
 ) -> None:
@@ -1370,9 +1454,26 @@ def run_training(
     target_epochs = int(episodes)
     if target_epochs <= 0:
         raise ValueError("epochs must be greater than zero")
-    if int(rollout_steps) <= 0:
-        raise ValueError("rollout_steps 必须大于0。")
     context = load_environment_context(config_path)
+    if context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+        effective_rollout_steps = (
+            context.configured_rollout_steps
+            if rollout_steps is None
+            else int(rollout_steps)
+        )
+        if effective_rollout_steps != context.episode_slots:
+            raise ValueError(
+                "full_episode_randomized requires rollout_steps == episode_slots; "
+                f"rollout_steps={effective_rollout_steps}, "
+                f"episode_slots={context.episode_slots}."
+            )
+    else:
+        effective_rollout_steps = (
+            DEFAULT_ROLLOUT_STEPS if rollout_steps is None else int(rollout_steps)
+        )
+    if effective_rollout_steps is None or int(effective_rollout_steps) <= 0:
+        raise ValueError("rollout_steps 必须大于0。")
+    rollout_steps = int(effective_rollout_steps)
     seed = int(project_config.get_config_value(context.cfg, "experiment.seed"))
     random.seed(seed)
     np.random.seed(seed)
@@ -1391,6 +1492,7 @@ def run_training(
     update_metrics_path = run_path / "update_metrics.jsonl"
     critic_diagnostics_path = run_path / "critic_diagnostics.jsonl"
     slot_metrics_path = run_path / SLOT_METRICS_FILENAME
+    protocol_metadata = _run_protocol_metadata(context, int(rollout_steps))
     manifest = write_run_manifest(
         run_path / RUN_MANIFEST_FILENAME,
         config_path=config_path,
@@ -1425,6 +1527,7 @@ def run_training(
         completed_epochs=completed_episodes,
         target_epochs=target_epochs,
         status="completed" if completed_episodes >= target_epochs else "running",
+        protocol_metadata=protocol_metadata,
     )
     git_sha_display = manifest.get("git_commit_sha") or "null"
     if len(git_sha_display) > 12:
@@ -1927,6 +2030,8 @@ def run_training(
                 epoch=episode_number,
                 rewards=episode_reward_array.tolist(),
                 episode_return=epoch_return,
+                episode_slots=context.episode_slots,
+                origin_start=context.train_origin_start,
                 q_values=episode_q_array.tolist(),
                 cache_costs=episode_cache_cost_array.tolist(),
                 movement_costs=episode_movement_cost_array.tolist(),
@@ -1946,6 +2051,7 @@ def run_training(
                     if completed_episodes >= target_epochs
                     else "running"
                 ),
+                protocol_metadata=protocol_metadata,
             )
             should_update_plot = (
                 completed_episodes % PLOT_UPDATE_INTERVAL_EPOCHS == 0
@@ -1991,14 +2097,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--epochs",
         type=int,
-        help="total target Epochs; 1 Epoch = train origins 0..239",
+        help="total target Epochs; one Epoch is one complete active train episode",
     )
     parser.add_argument("--episodes", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
         "--rollout-steps",
         type=int,
-        default=DEFAULT_ROLLOUT_STEPS,
-        help=f"consecutive train origins per PPO optimizer step (default: {DEFAULT_ROLLOUT_STEPS})",
+        default=None,
+        help=(
+            "consecutive train origins per PPO optimizer step; legacy default: "
+            f"{DEFAULT_ROLLOUT_STEPS}, full_episode_randomized is fixed by config"
+        ),
     )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--resume", action="store_true")
