@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import random
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +87,14 @@ REALIZATION_ARTIFACT_FILENAMES = {
     "prediction_scenarios": "prediction_scenarios.npz",
     "tv_local_cache": "tv_local_cache.json",
 }
+# These files are emitted by the existing single-episode generator alongside
+# the nine artifacts consumed by the trainer.  Keeping them in the completion
+# contract prevents a lazy run from treating a partial generator output as
+# reusable.
+GENERATOR_EXTRA_ARTIFACT_FILENAMES = (
+    "sumo_demand.rou.xml",
+    "sumo_demand.meta.json",
+)
 
 
 def _require_torch() -> None:
@@ -269,6 +279,7 @@ class TrainingCursor:
     best_epoch: int
     best_epoch_return: float | None
     next_pool_index: int | None = None
+    episode_seed_start: int | None = None
 
 
 def _project_path(root: Path, value: Any) -> Path:
@@ -368,6 +379,163 @@ def _load_episode_pool(
     if not realizations:
         raise ValueError(f"PPO episode pool is empty: {pool_path}")
     return realizations
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_episode_pool_directory(
+    project_root: Path,
+    episode_pool: str | Path,
+    *,
+    allow_missing: bool,
+) -> Path:
+    """Resolve a pool root and protect immutable project/formal artifacts."""
+
+    project_root = project_root.resolve(strict=False)
+    pool_path = Path(episode_pool).expanduser()
+    if not pool_path.is_absolute():
+        pool_path = project_root / pool_path
+    pool_path = pool_path.resolve(strict=False)
+    forbidden_subtrees = (
+        project_root / "data" / "generated",
+        project_root / "runs" / "ppo_v6_popart_actor1e4_fresh_20260910",
+    )
+    if pool_path == project_root or any(
+        pool_path == forbidden or _path_is_within(pool_path, forbidden)
+        for forbidden in forbidden_subtrees
+    ):
+        raise ValueError(
+            "PPO episode pool must not be the repository root, data/generated, "
+            "or the formal V6 run directory"
+        )
+    if pool_path.exists() and not pool_path.is_dir():
+        raise FileNotFoundError(
+            f"PPO episode pool path is not a directory: {pool_path}"
+        )
+    if not pool_path.exists():
+        if not allow_missing:
+            raise FileNotFoundError(
+                f"PPO episode pool directory does not exist: {pool_path}"
+            )
+        pool_path.mkdir(parents=True, exist_ok=True)
+    return pool_path
+
+
+def _resolve_config_file(project_root: Path, config_path: str | Path) -> Path:
+    config_file = Path(config_path).expanduser()
+    if not config_file.is_absolute():
+        config_file = project_root / config_file
+    return config_file.resolve(strict=False)
+
+
+def _load_single_episode_generator(project_root: Path) -> Any:
+    """Load the existing generator only when lazy generation is requested."""
+
+    generator_path = project_root / "scripts" / "generate_episode_realization.py"
+    if not generator_path.is_file():
+        raise FileNotFoundError(
+            f"single-episode generator is not available: {generator_path}"
+        )
+    module_name = "_adaptive_cache_mec_episode_generator"
+    spec = importlib.util.spec_from_file_location(module_name, generator_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load single-episode generator: {generator_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _validate_episode_realization_complete(
+    directory: Path,
+    context: EnvironmentContext,
+    generator_module: Any,
+) -> RealizationArtifacts:
+    required_names = (
+        *REALIZATION_ARTIFACT_FILENAMES.values(),
+        *GENERATOR_EXTRA_ARTIFACT_FILENAMES,
+    )
+    missing = [name for name in required_names if not (directory / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "PPO episode realization is incomplete: "
+            f"directory={directory}, missing={missing}"
+        )
+    artifacts = _realization_artifacts_from_directory(directory)
+    get = project_config.get_config_value
+    generator_module.validate_written_outputs(
+        directory,
+        task_vehicle_count=int(get(context.cfg, "simulation.num_task_vehicles")),
+        research_vehicle_count=int(
+            get(context.cfg, "simulation.num_research_vehicles")
+        ),
+        horizon_steps=int(get(context.cfg, "prediction.vehicle.horizon")),
+    )
+    return artifacts
+
+
+def _ensure_episode_realization(
+    context: EnvironmentContext,
+    config_path: str | Path,
+    directory: Path,
+    episode_seed: int,
+    *,
+    generate_missing: bool,
+    generation_device: str,
+    generator_module: Any,
+) -> tuple[RealizationArtifacts, str]:
+    """Load one complete realization or generate exactly one missing episode."""
+
+    realization_dir = Path(directory).expanduser().resolve(strict=False)
+    if realization_dir.exists():
+        if not realization_dir.is_dir():
+            raise RuntimeError(
+                "PPO episode realization path is not a directory; refusing to "
+                f"overwrite it: {realization_dir}"
+            )
+        try:
+            artifacts = _validate_episode_realization_complete(
+                realization_dir, context, generator_module
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "PPO episode realization exists but is incomplete or invalid; "
+                "refusing to regenerate or overwrite it: "
+                f"{realization_dir}"
+            ) from exc
+        return artifacts, "LOAD"
+
+    if not generate_missing:
+        raise FileNotFoundError(
+            "PPO episode realization is missing; use --generate-missing-episodes: "
+            f"{realization_dir}"
+        )
+
+    realization_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        generator_module.run_episode(
+            _resolve_config_file(context.root, config_path),
+            int(episode_seed),
+            realization_dir,
+            None,
+            generation_device,
+        )
+        artifacts = _validate_episode_realization_complete(
+            realization_dir, context, generator_module
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "lazy PPO episode realization generation failed; the partial "
+            "directory was left in place and will not be overwritten: "
+            f"{realization_dir}"
+        ) from exc
+    return artifacts, "GENERATE"
 
 
 def _assert_realization_context_compatible(
@@ -1369,6 +1537,7 @@ class PPOV2Trainer:
         best_epoch: int = 0,
         best_epoch_return: float | None = None,
         next_pool_index: int | None = None,
+        episode_seed_start: int | None = None,
     ) -> dict[str, Any]:
         completed_training_episodes = int(completed_episodes)
         if completed_training_episodes < 0:
@@ -1422,6 +1591,8 @@ class PPOV2Trainer:
                 "torch": torch.get_rng_state(),
             },
         }
+        if episode_seed_start is not None:
+            payload["episode_seed_start"] = int(episode_seed_start)
         if self._uses_separate_optimization():
             if self.actor_optimizer is None or self.critic_optimizer is None:
                 raise RuntimeError("V5 actor/critic optimizers are not initialized.")
@@ -1463,6 +1634,7 @@ class PPOV2Trainer:
         best_epoch: int = 0,
         best_epoch_return: float | None = None,
         next_pool_index: int | None = None,
+        episode_seed_start: int | None = None,
     ) -> Path:
         run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint = run_dir / filename
@@ -1477,6 +1649,7 @@ class PPOV2Trainer:
                 best_epoch,
                 best_epoch_return,
                 next_pool_index,
+                episode_seed_start,
             ),
             checkpoint,
         )
@@ -1651,6 +1824,12 @@ class PPOV2Trainer:
         next_pool_index = int(raw_next_pool_index)
         if next_pool_index < 0:
             raise ValueError("PPO checkpoint next_pool_index must be non-negative.")
+        raw_episode_seed_start = payload.get("episode_seed_start")
+        episode_seed_start = (
+            None
+            if raw_episode_seed_start is None
+            else int(raw_episode_seed_start)
+        )
         current_cache_state = np.asarray(payload["current_cache_state"], dtype=np.int8).copy()
         if current_cache_state.shape != np.asarray(self.context.initial_cache).shape:
             raise ValueError("checkpoint current_cache_state shape 不匹配。")
@@ -1675,6 +1854,7 @@ class PPOV2Trainer:
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
             next_pool_index=next_pool_index,
+            episode_seed_start=episode_seed_start,
         )
 
 
@@ -1706,6 +1886,9 @@ def run_training(
     *,
     rollout_steps: int | None = None,
     episode_pool: str | Path | None = None,
+    episode_seed_start: int | None = None,
+    generate_missing_episodes: bool = False,
+    episode_generation_device: str = "cpu",
     resume: bool = False,
     verbose: bool = False,
 ) -> None:
@@ -1713,20 +1896,61 @@ def run_training(
     target_epochs = int(episodes)
     if target_epochs <= 0:
         raise ValueError("epochs must be greater than zero")
+    if episode_generation_device not in {"cpu", "cuda"}:
+        raise ValueError(
+            "episode_generation_device must be either 'cpu' or 'cuda'"
+        )
     base_context = load_environment_context(config_path)
-    episode_pool_paths = (
-        None
-        if episode_pool is None
-        else _load_episode_pool(base_context.root, episode_pool)
-    )
-    if (
+    run_path = Path(run_dir)
+    if not resume:
+        ensure_fresh_run_dir_is_clean(run_path)
+    full_episode_protocol = (
         base_context.data_protocol
         == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
-        and episode_pool_paths is None
-    ):
+    )
+    if episode_seed_start is not None:
+        episode_seed_start = int(episode_seed_start)
+        if not full_episode_protocol:
+            raise ValueError(
+                "--episode-seed-start is supported only for "
+                "full_episode_randomized PPO training"
+            )
+    if generate_missing_episodes and not full_episode_protocol:
         raise ValueError(
-            "full_episode_randomized PPO training requires --episode-pool; "
-            "the trainer never generates realizations during training."
+            "--generate-missing-episodes is supported only for "
+            "full_episode_randomized PPO training"
+        )
+    if episode_pool is None and episode_seed_start is not None:
+        raise ValueError("--episode-seed-start requires --episode-pool")
+    if generate_missing_episodes and episode_pool is None:
+        raise ValueError(
+            "--generate-missing-episodes requires --episode-pool and "
+            "--episode-seed-start"
+        )
+    if generate_missing_episodes and episode_seed_start is None:
+        raise ValueError(
+            "--generate-missing-episodes requires --episode-seed-start"
+        )
+
+    seed_based_pool = episode_pool is not None and episode_seed_start is not None
+    episode_pool_directory: Path | None = None
+    episode_generator: Any | None = None
+    if seed_based_pool:
+        episode_pool_directory = _resolve_episode_pool_directory(
+            base_context.root,
+            episode_pool,
+            allow_missing=generate_missing_episodes,
+        )
+        episode_generator = _load_single_episode_generator(base_context.root)
+        episode_pool_paths = None
+    elif episode_pool is None:
+        episode_pool_paths = None
+    else:
+        episode_pool_paths = _load_episode_pool(base_context.root, episode_pool)
+
+    if full_episode_protocol and episode_pool is None:
+        raise ValueError(
+            "full_episode_randomized PPO training requires --episode-pool"
         )
     if (
         episode_pool_paths is not None
@@ -1737,15 +1961,37 @@ def run_training(
             "PPO episode pool exhausted before training could start: "
             f"requested={target_epochs}, available={len(episode_pool_paths)}"
         )
-    context = (
-        load_environment_context(
+    active_episode_seed: int | None = None
+    active_realization_action: str | None = None
+    if seed_based_pool and not resume:
+        assert episode_pool_directory is not None
+        assert episode_seed_start is not None
+        first_artifacts, active_realization_action = _ensure_episode_realization(
+            base_context,
+            config_path,
+            episode_pool_directory / f"episode_{episode_seed_start}",
+            episode_seed_start,
+            generate_missing=generate_missing_episodes,
+            generation_device=episode_generation_device,
+            generator_module=episode_generator,
+        )
+        active_episode_seed = int(episode_seed_start)
+        context = load_environment_context(
+            config_path,
+            realization_dir=first_artifacts.directory,
+        )
+    elif episode_pool_paths is not None:
+        context = load_environment_context(
             config_path,
             realization_dir=episode_pool_paths[0].directory,
         )
-        if episode_pool_paths is not None
-        else base_context
-    )
-    if episode_pool_paths is not None:
+        active_realization_action = "LOAD"
+    else:
+        # On a seed-mapped resume, use the static context only to construct the
+        # policy and restore the checkpoint.  The checkpoint cursor selects the
+        # next realization before any rollout begins.
+        context = base_context
+    if episode_pool_paths is not None or seed_based_pool:
         _assert_realization_context_compatible(base_context, context)
     if context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
         effective_rollout_steps = (
@@ -1772,9 +2018,6 @@ def run_training(
     torch.manual_seed(seed)
     trainer = PPOV2Trainer(context)
     config_hash = _config_hash(config_path)
-    run_path = Path(run_dir)
-    if not resume:
-        ensure_fresh_run_dir_is_clean(run_path)
     completed_episodes = 0
     next_pool_index = 0
     current_train_origin = context.train_origin_start
@@ -1816,7 +2059,26 @@ def run_training(
         )
         if completed_episodes > target_epochs:
             raise ValueError("checkpoint completed epochs exceed target epochs")
-        if episode_pool_paths is not None:
+        if seed_based_pool:
+            if (
+                cursor.episode_seed_start is not None
+                and cursor.episode_seed_start != episode_seed_start
+            ):
+                raise ValueError(
+                    "PPO checkpoint episode_seed_start mismatch; refusing to "
+                    "resume a different episode-seed sequence: "
+                    f"checkpoint={cursor.episode_seed_start}, "
+                    f"expected={episode_seed_start}"
+                )
+            if (
+                cursor.episode_seed_start is None
+                and completed_episodes > 0
+            ):
+                raise ValueError(
+                    "PPO checkpoint lacks episode_seed_start provenance; "
+                    "refusing to infer a resumed episode-seed sequence"
+                )
+        if episode_pool_paths is not None or seed_based_pool:
             if next_pool_index != completed_episodes:
                 raise ValueError(
                     "PPO checkpoint next_pool_index must equal completed_training_episodes: "
@@ -1824,17 +2086,46 @@ def run_training(
                     f"completed_training_episodes={completed_episodes}"
                 )
             remaining_episodes = target_epochs - completed_episodes
-            if remaining_episodes > len(episode_pool_paths) - next_pool_index:
+            if (
+                episode_pool_paths is not None
+                and remaining_episodes > len(episode_pool_paths) - next_pool_index
+            ):
                 raise RuntimeError(
                     "PPO episode pool exhausted before resume could complete: "
                     f"requested_additional={remaining_episodes}, "
                     f"available={len(episode_pool_paths) - next_pool_index}"
                 )
             if remaining_episodes > 0:
-                next_context = load_environment_context(
-                    config_path,
-                    realization_dir=episode_pool_paths[next_pool_index].directory,
-                )
+                if seed_based_pool:
+                    assert episode_pool_directory is not None
+                    assert episode_seed_start is not None
+                    next_episode_seed = int(
+                        episode_seed_start + next_pool_index
+                    )
+                    next_artifacts, active_realization_action = (
+                        _ensure_episode_realization(
+                            base_context,
+                            config_path,
+                            episode_pool_directory
+                            / f"episode_{next_episode_seed}",
+                            next_episode_seed,
+                            generate_missing=generate_missing_episodes,
+                            generation_device=episode_generation_device,
+                            generator_module=episode_generator,
+                        )
+                    )
+                    active_episode_seed = next_episode_seed
+                    next_context = load_environment_context(
+                        config_path,
+                        realization_dir=next_artifacts.directory,
+                    )
+                else:
+                    assert episode_pool_paths is not None
+                    next_context = load_environment_context(
+                        config_path,
+                        realization_dir=episode_pool_paths[next_pool_index].directory,
+                    )
+                    active_realization_action = "LOAD"
                 _assert_realization_context_compatible(context, next_context)
                 context = next_context
                 trainer.context = context
@@ -1929,7 +2220,31 @@ def run_training(
 
     while completed_episodes < target_epochs:
         if current_train_origin > context.train_origin_end:
-            if episode_pool_paths is not None:
+            if seed_based_pool:
+                assert episode_pool_directory is not None
+                assert episode_seed_start is not None
+                next_episode_seed = int(episode_seed_start + next_pool_index)
+                next_artifacts, active_realization_action = (
+                    _ensure_episode_realization(
+                        base_context,
+                        config_path,
+                        episode_pool_directory
+                        / f"episode_{next_episode_seed}",
+                        next_episode_seed,
+                        generate_missing=generate_missing_episodes,
+                        generation_device=episode_generation_device,
+                        generator_module=episode_generator,
+                    )
+                )
+                active_episode_seed = next_episode_seed
+                next_context = load_environment_context(
+                    config_path,
+                    realization_dir=next_artifacts.directory,
+                )
+                _assert_realization_context_compatible(context, next_context)
+                context = next_context
+                trainer.context = context
+            elif episode_pool_paths is not None:
                 if next_pool_index >= len(episode_pool_paths):
                     raise RuntimeError(
                         "PPO episode pool exhausted; no realization is available "
@@ -1942,6 +2257,8 @@ def run_training(
                 _assert_realization_context_compatible(context, next_context)
                 context = next_context
                 trainer.context = context
+                active_episode_seed = None
+                active_realization_action = "LOAD"
             current_train_origin = context.train_origin_start
             current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
             current_uav_positions = _copy_uav_positions(context.initial_uav)
@@ -1983,8 +2300,27 @@ def run_training(
             episode_approximate_kls = []
         episode_number = completed_episodes + 1
         active_pool_index = (
-            None if episode_pool_paths is None else int(next_pool_index)
+            None
+            if episode_pool_paths is None and not seed_based_pool
+            else int(next_pool_index)
         )
+        if seed_based_pool:
+            if active_episode_seed is None or active_realization_action is None:
+                raise RuntimeError(
+                    "PPO episode realization was not selected before rollout"
+                )
+            print(
+                f"[PPO] Episode {episode_number}/{target_epochs} | "
+                f"seed={active_episode_seed} | "
+                f"realization={active_realization_action}",
+                flush=True,
+            )
+        elif episode_pool_paths is not None:
+            print(
+                f"[PPO] Episode {episode_number}/{target_epochs} | "
+                "realization=LOAD",
+                flush=True,
+            )
         chunk_origin_start = current_train_origin
         rollout_started_at = time.perf_counter()
         rollout = trainer.collect_chunk(
@@ -2010,7 +2346,7 @@ def run_training(
         terminal = next_train_origin > context.train_origin_end
         if terminal:
             completed_episodes += 1
-            if episode_pool_paths is not None:
+            if episode_pool_paths is not None or seed_based_pool:
                 next_pool_index += 1
         checkpoint_path = trainer.save_checkpoint(
             Path(run_dir),
@@ -2023,6 +2359,7 @@ def run_training(
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
             next_pool_index=next_pool_index,
+            episode_seed_start=episode_seed_start,
         )
         cache_count = len(context.action_spec.cache_node_ids)
         transition_count = len(rollout.transitions)
@@ -2313,6 +2650,7 @@ def run_training(
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
                     next_pool_index=next_pool_index,
+                    episode_seed_start=episode_seed_start,
                 )
                 checkpoint_path = trainer.save_checkpoint(
                     run_path,
@@ -2325,6 +2663,7 @@ def run_training(
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
                     next_pool_index=next_pool_index,
+                    episode_seed_start=episode_seed_start,
                 )
             _append_jsonl(
                 episode_metrics_path,
@@ -2511,6 +2850,29 @@ def build_parser() -> argparse.ArgumentParser:
             "one realization is consumed per full_episode_randomized episode"
         ),
     )
+    parser.add_argument(
+        "--episode-seed-start",
+        type=int,
+        default=None,
+        help=(
+            "episode seed for training episode index 0; maps episode e to "
+            "episode_seed_start + e"
+        ),
+    )
+    parser.add_argument(
+        "--generate-missing-episodes",
+        action="store_true",
+        help=(
+            "lazily generate a missing full-episode realization in --episode-pool "
+            "before its PPO episode starts"
+        ),
+    )
+    parser.add_argument(
+        "--episode-generation-device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+        help="device used by the existing generator for missing episodes",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--verbose",
@@ -2547,6 +2909,9 @@ def main(argv: list[str] | None = None) -> int:
         args.run_dir,
         rollout_steps=args.rollout_steps,
         episode_pool=args.episode_pool,
+        episode_seed_start=args.episode_seed_start,
+        generate_missing_episodes=bool(args.generate_missing_episodes),
+        episode_generation_device=args.episode_generation_device,
         resume=bool(args.resume),
         verbose=bool(args.verbose),
     )
