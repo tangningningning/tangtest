@@ -57,11 +57,6 @@ TEST_SEGMENTS = (
     (270, 284),
     (285, 299),
 )
-EVALUATION_ARTIFACTS = (
-    "test_manifest.json",
-    "test_summary.json",
-    "test_slot_metrics.jsonl",
-)
 
 
 def _require_torch() -> None:

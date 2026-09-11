@@ -40,12 +40,8 @@ from .reporting import (
 )
 from .policy import (
     AdaptivePrimitiveActorCritic,
-    AdaptivePrimitiveGroupedV2ActorCritic,
-    AdaptivePrimitiveHorizonGroupedV3ActorCritic,
-    AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
-    AdaptivePrimitiveV2ActorCritic,
     BernoulliActorCritic,
 )
 from .primitive_control import PrimitiveTensorSpec
@@ -58,7 +54,6 @@ BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 CHECKPOINT_VERSION = 2
 PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
-SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION = 5
 POPART_CHECKPOINT_VERSION = 6
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
@@ -70,31 +65,14 @@ CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
 CRITIC_VALUE_SCALE_POPART_NORMALIZED = "popart_normalized"
 DEFAULT_CRITIC_VALUE_SCALE_EPSILON = 1.0e-8
 DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES = 64
-V2_POLICY_SCHEMAS = frozenset(
-    {
-        AdaptivePrimitiveV2ActorCritic.architecture_id,
-        AdaptivePrimitiveGroupedV2ActorCritic.architecture_id,
-    }
-)
-V3_POLICY_SCHEMAS = frozenset(
-    {AdaptivePrimitiveHorizonGroupedV3ActorCritic.architecture_id}
-)
-V4_POLICY_SCHEMAS = frozenset(
-    {AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic.architecture_id}
-)
-V5_POLICY_SCHEMAS = frozenset(
-    {
-        AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic.architecture_id
-    }
-)
+# V6 is the sole production schema.  Its V3/V4/V5 base classes remain in
+# policy.py because their module layout is part of the formal checkpoint.
 V6_POLICY_SCHEMAS = frozenset(
     {AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id}
 )
-SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = V5_POLICY_SCHEMAS | V6_POLICY_SCHEMAS
-HORIZON_POLICY_SCHEMAS = (
-    V3_POLICY_SCHEMAS | V4_POLICY_SCHEMAS | SEPARATE_OPTIMIZATION_POLICY_SCHEMAS
-)
-MODERN_POLICY_SCHEMAS = V2_POLICY_SCHEMAS | HORIZON_POLICY_SCHEMAS
+SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
+HORIZON_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
+MODERN_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
 
 
 def _require_torch() -> None:
@@ -569,7 +547,7 @@ def aligned_train_steps(
 
 
 class PPOV2Trainer:
-    """PPO core for legacy trigger-only and adaptive primitive control modes."""
+    """PPO core for the formal V6 path and retained base-config compatibility."""
 
     def __init__(self, context: EnvironmentContext, device: str = "cpu") -> None:
         _require_torch()
@@ -579,29 +557,15 @@ class PPOV2Trainer:
         if context.configuration_control_mode == "policy_primitive":
             primitive_spec = PrimitiveTensorSpec.create(context)
             policy_class: type[AdaptivePrimitiveActorCritic]
-            if context.policy_schema == AdaptivePrimitiveActorCritic.architecture_id:
-                policy_class = AdaptivePrimitiveActorCritic
-            elif context.policy_schema == AdaptivePrimitiveV2ActorCritic.architecture_id:
-                policy_class = AdaptivePrimitiveV2ActorCritic
-            elif context.policy_schema == AdaptivePrimitiveGroupedV2ActorCritic.architecture_id:
-                policy_class = AdaptivePrimitiveGroupedV2ActorCritic
-            elif context.policy_schema == AdaptivePrimitiveHorizonGroupedV3ActorCritic.architecture_id:
-                policy_class = AdaptivePrimitiveHorizonGroupedV3ActorCritic
-            elif (
-                context.policy_schema
-                == AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic.architecture_id
-            ):
-                policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic
-            elif (
-                context.policy_schema
-                == AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic.architecture_id
-            ):
-                policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic
-            elif (
+            if (
                 context.policy_schema
                 == AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id
             ):
                 policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
+            elif context.policy_schema == AdaptivePrimitiveActorCritic.architecture_id:
+                # system_config.toml intentionally retains the original primitive
+                # schema as a compatibility/default configuration.
+                policy_class = AdaptivePrimitiveActorCritic
             else:
                 raise ValueError(
                     "unknown policy_primitive policy_schema="
@@ -690,8 +654,6 @@ class PPOV2Trainer:
     def _expected_checkpoint_version(self) -> int:
         if self.policy.architecture_id in V6_POLICY_SCHEMAS:
             return POPART_CHECKPOINT_VERSION
-        if self.policy.architecture_id in V5_POLICY_SCHEMAS:
-            return SEPARATE_OPTIMIZATION_CHECKPOINT_VERSION
         if (
             self.hyperparameters.critic_value_scale_mode
             == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD

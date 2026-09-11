@@ -531,6 +531,9 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         )
 
 
+# The formal V6 network deliberately inherits through the following schema
+# generations.  This chain fixes its module hierarchy and state_dict keys; the
+# intermediate classes are implementation bases, not active experiment choices.
 class AdaptivePrimitiveV2ActorCritic(AdaptivePrimitiveActorCritic):
     """Scheme B policy with the v2 finite-horizon observation schema."""
 

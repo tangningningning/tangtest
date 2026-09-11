@@ -11,7 +11,6 @@ from typing import Any
 from common import project_config
 
 from .plotting import (
-    SLOTS_PER_EPOCH,
     TRAINING_EPOCH_RETURN_PLOT_FILENAME,
     TRAINING_SLOT_REWARD_PLOT_FILENAME,
     _read_slot_metrics,
