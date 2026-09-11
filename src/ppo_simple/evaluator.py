@@ -32,6 +32,9 @@ from .rollout import SimpleRollout, collect_rollout
 from .trainer import (
     CRITIC_VALUE_SCALE_POPART_NORMALIZED,
     EnvironmentContext,
+    GENERATOR_EXTRA_ARTIFACT_FILENAMES,
+    _assert_realization_context_compatible,
+    _realization_artifacts_from_directory,
     hyperparameters_from_project,
     load_environment_context,
 )
@@ -299,8 +302,80 @@ def _prepare_heldout_steps(context: EnvironmentContext) -> list[Any]:
     return steps
 
 
-def _build_full_episode_context(config_path: Path) -> EnvironmentContext:
-    context = load_environment_context(str(config_path))
+def _assert_service_catalog_compatible(
+    reference: EnvironmentContext,
+    candidate: EnvironmentContext,
+) -> None:
+    for field in (
+        "num_services",
+        "service_ids",
+        "service_sizes_mb",
+        "mean_input_size_bit",
+        "cycles_per_bit",
+    ):
+        reference_value = reference.service_catalog[field]
+        candidate_value = candidate.service_catalog[field]
+        if isinstance(reference_value, np.ndarray) or isinstance(
+            candidate_value, np.ndarray
+        ):
+            if not np.array_equal(reference_value, candidate_value):
+                raise ValueError(
+                    "full-episode realization service catalog mismatch: "
+                    f"field={field}"
+                )
+        elif reference_value != candidate_value:
+            raise ValueError(
+                "full-episode realization service catalog mismatch: "
+                f"field={field}"
+            )
+
+
+def _validate_full_episode_realization_files(
+    context: EnvironmentContext,
+    realization_dir: Path,
+) -> None:
+    _realization_artifacts_from_directory(realization_dir)
+    missing = [
+        filename
+        for filename in GENERATOR_EXTRA_ARTIFACT_FILENAMES
+        if not (realization_dir / filename).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "full-episode realization is incomplete: "
+            f"directory={realization_dir}, missing={missing}"
+        )
+    if context.realization is None or context.realization.directory != realization_dir:
+        raise AssertionError(
+            "full-episode realization context does not point at the requested directory"
+        )
+
+
+def _build_full_episode_context(
+    config_path: Path,
+    realization_dir: str | Path | None = None,
+) -> EnvironmentContext:
+    reference_context = load_environment_context(str(config_path))
+    context = (
+        reference_context
+        if realization_dir is None
+        else load_environment_context(str(config_path), realization_dir=realization_dir)
+    )
+    if realization_dir is not None:
+        resolved_realization_dir = Path(realization_dir)
+        if not resolved_realization_dir.is_absolute():
+            resolved_realization_dir = context.root / resolved_realization_dir
+        resolved_realization_dir = resolved_realization_dir.resolve(strict=False)
+        _validate_full_episode_realization_files(context, resolved_realization_dir)
+        _assert_realization_context_compatible(reference_context, context)
+        _assert_service_catalog_compatible(reference_context, context)
+    if context.configuration_control_mode != "policy_primitive":
+        raise ValueError("full-episode V6 evaluation requires policy_primitive control")
+    if context.policy_schema != EXPECTED_POLICY_SCHEMA:
+        raise ValueError(
+            "full-episode evaluator requires policy_schema="
+            f"{EXPECTED_POLICY_SCHEMA}, got {context.policy_schema}"
+        )
     protocol = project_config.get_ppo_data_protocol(context.cfg)
     if protocol["protocol"] != FULL_EPISODE_PROTOCOL:
         raise ValueError(
@@ -324,15 +399,38 @@ def _build_full_episode_context(config_path: Path) -> EnvironmentContext:
 def _prepare_full_episode_steps(context: EnvironmentContext) -> list[Any]:
     get = project_config.get_config_value
     root = Path(context.root)
+    realization = context.realization
     steps = interface.prepare_aligned_rollout_steps(
         root,
         context.scenarios,
         FULL_EPISODE_ORIGIN_START,
         FULL_EPISODE_SLOT_COUNT,
-        project_config.resolve_path(root, get(context.cfg, "paths.vehicle_predictions")),
-        project_config.resolve_path(root, get(context.cfg, "paths.popularity_predictions")),
-        project_config.resolve_path(root, get(context.cfg, "paths.tasks")),
-        project_config.resolve_path(root, get(context.cfg, "paths.trajectory")),
+        (
+            realization.vehicle_predictions
+            if realization is not None
+            else project_config.resolve_path(
+                root, get(context.cfg, "paths.vehicle_predictions")
+            )
+        ),
+        (
+            realization.popularity_predictions
+            if realization is not None
+            else project_config.resolve_path(
+                root, get(context.cfg, "paths.popularity_predictions")
+            )
+        ),
+        (
+            realization.tasks
+            if realization is not None
+            else project_config.resolve_path(root, get(context.cfg, "paths.tasks"))
+        ),
+        (
+            realization.trajectory
+            if realization is not None
+            else project_config.resolve_path(
+                root, get(context.cfg, "paths.trajectory")
+            )
+        ),
         include_bootstrap_step=False,
         prediction_horizon=int(context.observation_spec.prediction_horizon),
         prediction_dt_s=float(get(context.cfg, "simulation.dt_s")),
@@ -784,6 +882,7 @@ def evaluate_full_episode(
     run_dir: str | Path,
     config_path: str | Path = FULL_EPISODE_CONFIG_PATH,
     device: str = "cpu",
+    realization_dir: str | Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Evaluate one specified full-episode input realization without training."""
 
@@ -795,7 +894,10 @@ def evaluate_full_episode(
     ensure_fresh_evaluation_dir(output_dir)
 
     config_sha256 = _sha256(resolved_config)
-    context = _build_full_episode_context(resolved_config)
+    context = _build_full_episode_context(
+        resolved_config,
+        realization_dir=realization_dir,
+    )
     training_git_sha = _load_full_episode_training_provenance(
         resolved_checkpoint,
         config_sha256,
@@ -822,6 +924,10 @@ def evaluate_full_episode(
             initial_uav=_copy_uav_positions(context.initial_uav),
             terminal_origin_index=FULL_EPISODE_ORIGIN_END,
             deterministic=True,
+        )
+    if not bool(rollout.dones[-1]) or bool(np.any(rollout.dones[:-1])):
+        raise ValueError(
+            "full-episode evaluation must terminate only at origin 299"
         )
     policy_parameters_updated = any(
         not torch.equal(before, after.detach())
@@ -871,6 +977,11 @@ def evaluate_full_episode(
         ),
         "minibatch_size": int(context.minibatch_size),
         "terminal_origin": FULL_EPISODE_ORIGIN_END,
+        "realization_directory": (
+            None
+            if context.realization is None
+            else str(context.realization.directory)
+        ),
         "deterministic": True,
         "policy_parameters_updated": bool(policy_parameters_updated),
         "popart_statistics_updated": bool(popart_statistics_updated),
@@ -900,6 +1011,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None)
     parser.add_argument("--checkpoint", default=str(FORMAL_CHECKPOINT_PATH))
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument(
+        "--realization-dir",
+        default=None,
+        help="full-episode realization directory; omitted uses configured data",
+    )
     parser.add_argument("--device", default="cpu")
     return parser
 
@@ -912,6 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
             run_dir=args.run_dir,
             config_path=args.config or FULL_EPISODE_CONFIG_PATH,
             device=args.device,
+            realization_dir=args.realization_dir,
         )
     else:
         evaluate_heldout(
