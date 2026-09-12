@@ -19,6 +19,8 @@ from typing import Any
 
 import numpy as np
 
+from decision import cache_configuration, uav_configuration
+
 try:
     import torch
 except ModuleNotFoundError:  # pragma: no cover - CLI help/import-only environments
@@ -27,7 +29,10 @@ except ModuleNotFoundError:  # pragma: no cover - CLI help/import-only environme
 from common import project_config
 from . import interface
 from .interface import _copy_uav_positions
-from .policy import AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
+from .policy import (
+    AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
+    _group_balance_candidate_logits,
+)
 from .primitive_control import PrimitiveTensorSpec
 from .rollout import SimpleRollout, collect_rollout
 from .trainer import (
@@ -800,23 +805,523 @@ def _static_zero_payload(
     }
 
 
-def _deterministic_p50_static_zero_equivalence(
-    records: list[dict[str, Any]],
-    summary: dict[str, Any],
-    static_zero_summary: dict[str, Any],
-) -> bool:
-    cache_requests = int(sum(record["cache_trigger_count"] for record in records))
-    uav_requests = int(sum(record["uav_trigger_count"] for record in records))
-    cache_changes = int(sum(record["cache_change_count"] for record in records))
-    uav_movements = int(sum(record["uav_movement_count"] for record in records))
-    return bool(
-        cache_requests == 0
-        and uav_requests == 0
-        and cache_changes == 0
-        and uav_movements == 0
-        and float(summary["total_return"])
-        == float(static_zero_summary["total_return"])
+def _conditional_operation_names(head_type: str) -> tuple[str, ...]:
+    if head_type == "cache":
+        return ("NO_CHANGE", "ADD", "DELETE", "SWAP")
+    if head_type == "uav":
+        return ("STAY", "MOVE")
+    raise ValueError(f"unknown conditional head type: {head_type}")
+
+
+def _uav_state_arrays(context: EnvironmentContext, positions: Any) -> dict[str, np.ndarray]:
+    return {
+        str(uav_id): np.asarray(positions[uav_id], dtype=np.float64).copy()
+        for uav_id in context.action_spec.uav_ids
+    }
+
+
+def _replay_selected_conditional_candidates(
+    context: EnvironmentContext,
+    rollout: SimpleRollout,
+) -> dict[tuple[int, str, int], dict[str, Any]]:
+    """Replay only candidate enumeration/application for diagnostic provenance."""
+
+    previous_cache = np.asarray(context.initial_cache, dtype=np.int8).copy()
+    previous_uav = _uav_state_arrays(context, context.initial_uav)
+    replayed: dict[tuple[int, str, int], dict[str, Any]] = {}
+    cache_count = len(context.action_spec.cache_node_ids)
+    for transition in rollout.transitions:
+        origin = int(transition.origin_index)
+        current_cache = previous_cache.copy()
+        current_uav = {
+            uav_id: value.copy() for uav_id, value in previous_uav.items()
+        }
+        cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(
+            transition.action
+        )
+        cache_records = {
+            int(item["head_index"]): item
+            for item in transition.cache_conditional_actions
+        }
+        for head_index, node_id in enumerate(context.action_spec.cache_node_ids):
+            if int(cache_triggers[head_index]) == 0:
+                continue
+            candidates = cache_configuration.enumerate_cache_primitive_actions(
+                current_cache,
+                head_index,
+                context.service_catalog,
+                context.cache_nodes,
+            )
+            expected_count = int(transition.cache_candidate_counts[head_index])
+            if len(candidates) != expected_count:
+                raise AssertionError(
+                    "conditional cache replay candidate count mismatch: "
+                    f"origin={origin}, head={head_index}, replay={len(candidates)}, "
+                    f"rollout={expected_count}"
+                )
+            selected_index = int(transition.cache_selected_indices[head_index])
+            if selected_index < 0 or selected_index >= len(candidates):
+                raise AssertionError("conditional cache replay selected index out of range")
+            selected = candidates[selected_index]
+            applied = cache_configuration.apply_cache_candidate(
+                current_cache,
+                head_index,
+                selected.after_node_cache,
+                context.service_catalog,
+                context.cache_nodes,
+            )
+            recorded = cache_records.get(head_index)
+            if recorded is None:
+                raise AssertionError(
+                    f"missing recorded cache conditional action: origin={origin}, head={head_index}"
+                )
+            if str(recorded["operation_type"]) != str(selected.operation_type):
+                raise AssertionError("conditional cache replay operation mismatch")
+            if bool(recorded["actual_changed"]) != bool(applied["actual_changed"]):
+                raise AssertionError("conditional cache replay actual-change mismatch")
+            replayed[(origin, "cache", head_index)] = {
+                "head_index": head_index,
+                "head_id": str(node_id),
+                "selected_index": selected_index,
+                "candidate_count": len(candidates),
+                "selected_operation_type": str(selected.operation_type),
+                "selected_candidate_before": [
+                    int(value) for value in selected.before_node_cache
+                ],
+                "selected_candidate_after": [
+                    int(value) for value in selected.after_node_cache
+                ],
+                "selected_added_service_ids": [
+                    int(value) for value in selected.added_service_ids
+                ],
+                "selected_removed_service_ids": [
+                    int(value) for value in selected.removed_service_ids
+                ],
+                "selected_actual_changed": bool(applied["actual_changed"]),
+                "apply_actual_changed": bool(applied["actual_changed"]),
+            }
+
+        uav_records = {
+            int(item["head_index"]): item
+            for item in transition.uav_conditional_actions
+        }
+        for uav_index, uav_id in enumerate(context.action_spec.uav_ids):
+            if int(uav_triggers[uav_id]) == 0:
+                continue
+            candidates = uav_configuration.enumerate_uav_primitive_actions(
+                current_uav,
+                previous_uav,
+                uav_id,
+                uav_triggers,
+                context.cfg,
+                context.flight_boundary,
+            )
+            expected_count = int(transition.uav_candidate_counts[uav_index])
+            if len(candidates) != expected_count:
+                raise AssertionError(
+                    "conditional UAV replay candidate count mismatch: "
+                    f"origin={origin}, head={uav_index}, replay={len(candidates)}, "
+                    f"rollout={expected_count}"
+                )
+            selected_index = int(transition.uav_selected_indices[uav_index])
+            if selected_index < 0 or selected_index >= len(candidates):
+                raise AssertionError("conditional UAV replay selected index out of range")
+            selected = candidates[selected_index]
+            applied = uav_configuration.apply_uav_candidate(
+                current_uav,
+                previous_uav,
+                uav_id,
+                selected.after_position,
+                uav_triggers,
+                context.cfg,
+                context.flight_boundary,
+            )
+            recorded = uav_records.get(uav_index)
+            if recorded is None:
+                raise AssertionError(
+                    f"missing recorded UAV conditional action: origin={origin}, head={uav_index}"
+                )
+            if str(recorded["operation_type"]) != str(selected.operation_type):
+                raise AssertionError("conditional UAV replay operation mismatch")
+            if bool(recorded["actual_moved"]) != bool(applied["actual_moved"]):
+                raise AssertionError("conditional UAV replay actual-movement mismatch")
+            replayed[(origin, "uav", uav_index)] = {
+                "head_index": uav_index,
+                "head_id": str(uav_id),
+                "selected_index": selected_index,
+                "candidate_count": len(candidates),
+                "selected_operation_type": str(selected.operation_type),
+                "selected_candidate_before": [
+                    float(value) for value in selected.before_position
+                ],
+                "selected_candidate_after": [
+                    float(value) for value in selected.after_position
+                ],
+                "selected_actual_changed": bool(applied["actual_moved"]),
+                "selected_actual_moved": bool(applied["actual_moved"]),
+                "apply_actual_moved": bool(applied["actual_moved"]),
+            }
+
+        if not np.array_equal(current_cache, transition.next_cache_state):
+            raise AssertionError(
+                f"conditional replay cache state mismatch at origin={origin}"
+            )
+        for uav_id in context.action_spec.uav_ids:
+            if not np.array_equal(
+                current_uav[uav_id],
+                np.asarray(transition.next_uav_positions[uav_id], dtype=np.float64),
+            ):
+                raise AssertionError(
+                    f"conditional replay UAV state mismatch at origin={origin}, id={uav_id}"
+                )
+        previous_cache = np.asarray(transition.next_cache_state, dtype=np.int8).copy()
+        previous_uav = _uav_state_arrays(context, transition.next_uav_positions)
+    return replayed
+
+
+def _conditional_distribution_diagnostic(
+    policy: Any,
+    context: EnvironmentContext,
+    transition: Any,
+    head_type: str,
+    head_index: int,
+    replay_detail: dict[str, Any],
+) -> dict[str, Any]:
+    operation_names = _conditional_operation_names(head_type)
+    if head_type == "cache":
+        candidate_count = int(transition.cache_candidate_counts[head_index])
+        candidate_features = np.asarray(
+            transition.cache_candidate_features[head_index, :candidate_count],
+            dtype=np.float32,
+        )
+        candidate_masks = np.asarray(
+            transition.cache_candidate_masks[head_index, :candidate_count],
+            dtype=bool,
+        )
+        conditional_context = np.asarray(
+            transition.cache_contexts[head_index], dtype=np.float32
+        )
+        feature_dim = int(policy.cache_feature_dim)
+        scorer = policy.cache_candidate_scorer
+        head_id = str(context.action_spec.cache_node_ids[head_index])
+    elif head_type == "uav":
+        candidate_count = int(transition.uav_candidate_counts[head_index])
+        candidate_features = np.asarray(
+            transition.uav_candidate_features[head_index, :candidate_count],
+            dtype=np.float32,
+        )
+        candidate_masks = np.asarray(
+            transition.uav_candidate_masks[head_index, :candidate_count],
+            dtype=bool,
+        )
+        conditional_context = np.asarray(
+            transition.uav_contexts[head_index], dtype=np.float32
+        )
+        feature_dim = int(policy.uav_feature_dim)
+        scorer = policy.uav_candidate_scorer
+        head_id = str(context.action_spec.uav_ids[head_index])
+    else:
+        raise ValueError(f"unknown conditional head type: {head_type}")
+    if candidate_count <= 0:
+        raise AssertionError("triggered conditional head must have candidates")
+    if candidate_features.shape[0] != candidate_count or not bool(
+        np.all(candidate_masks)
+    ):
+        raise AssertionError("conditional candidate masks do not match production candidates")
+    operation_slice = policy._candidate_operation_slice(head_type)
+    with torch.inference_mode():
+        raw_scores, single = policy._candidate_scores(
+            conditional_context,
+            candidate_features,
+            feature_dim,
+            scorer,
+        )
+        if not single or tuple(raw_scores.shape) != (1, candidate_count):
+            raise AssertionError("conditional diagnostic score shape mismatch")
+        balanced_logits = _group_balance_candidate_logits(
+            raw_scores.squeeze(0),
+            candidate_features,
+            candidate_masks,
+            operation_slice,
+        )
+        probabilities = torch.softmax(balanced_logits, dim=-1).detach().cpu().numpy()
+    if not bool(np.all(np.isfinite(probabilities))) or not bool(
+        np.isclose(float(probabilities.sum()), 1.0, rtol=0.0, atol=1.0e-6)
+    ):
+        raise AssertionError("conditional diagnostic probabilities are invalid")
+    start = 0 if operation_slice.start is None else int(operation_slice.start)
+    stop = int(candidate_features.shape[-1]) if operation_slice.stop is None else int(
+        operation_slice.stop
     )
+    operation_values = candidate_features[:, start:stop]
+    if tuple(operation_values.shape) != (candidate_count, len(operation_names)):
+        raise AssertionError("conditional operation feature shape mismatch")
+    if not bool(
+        np.all((operation_values == 0.0) | (operation_values == 1.0))
+    ) or not bool(np.all(operation_values.sum(axis=1) == 1.0)):
+        raise AssertionError("conditional operation features are not one-hot")
+    operation_indices = np.argmax(operation_values, axis=1).astype(np.int64)
+    group_candidate_counts = {
+        operation: int(np.sum(operation_indices == index))
+        for index, operation in enumerate(operation_names)
+    }
+    group_probabilities = {
+        operation: float(probabilities[operation_indices == index].sum())
+        for index, operation in enumerate(operation_names)
+    }
+    candidate_argmax_index = int(np.argmax(probabilities))
+    candidate_argmax_operation = operation_names[int(operation_indices[candidate_argmax_index])]
+    group_map_index = int(
+        np.argmax(np.asarray([group_probabilities[operation] for operation in operation_names]))
+    )
+    group_map_operation = operation_names[group_map_index]
+    group_map_candidates = np.flatnonzero(operation_indices == group_map_index)
+    within_group_index = int(
+        group_map_candidates[int(np.argmax(probabilities[group_map_candidates]))]
+    )
+    selected_index = int(replay_detail["selected_index"])
+    if selected_index != candidate_argmax_index:
+        raise AssertionError(
+            "deterministic conditional selected index is not candidate argmax"
+        )
+    selected_operation_type = str(replay_detail["selected_operation_type"])
+    expected_selected_operation = operation_names[int(operation_indices[selected_index])]
+    if selected_operation_type != expected_selected_operation:
+        raise AssertionError("conditional selected operation does not match features")
+    return {
+        "head_index": int(head_index),
+        "head_id": head_id,
+        "head_type": head_type,
+        "candidate_count": int(candidate_count),
+        "operation_group_candidate_counts": group_candidate_counts,
+        "candidate_probabilities": [float(value) for value in probabilities],
+        "operation_group_probabilities": group_probabilities,
+        "selected_index": selected_index,
+        "selected_operation_type": selected_operation_type,
+        "selected_candidate_probability": float(probabilities[selected_index]),
+        "highest_group_probability_operation": group_map_operation,
+        "group_map_operation": group_map_operation,
+        "within_group_map_candidate_index": within_group_index,
+        "within_group_map_candidate_probability": float(
+            probabilities[within_group_index]
+        ),
+        "candidate_argmax_index": candidate_argmax_index,
+        "candidate_argmax_operation": candidate_argmax_operation,
+        **replay_detail,
+    }
+
+
+def _conditional_policy_diagnostics(
+    policy: Any,
+    context: EnvironmentContext,
+    rollout: SimpleRollout,
+) -> dict[str, Any]:
+    replayed = _replay_selected_conditional_candidates(context, rollout)
+    records: list[dict[str, Any]] = []
+    cache_count = len(context.action_spec.cache_node_ids)
+    uav_count = len(context.action_spec.uav_ids)
+    cache_selected_counts = {
+        operation: 0 for operation in _conditional_operation_names("cache")
+    }
+    uav_selected_counts = {
+        operation: 0 for operation in _conditional_operation_names("uav")
+    }
+    cache_candidate_argmax_noop = 0
+    cache_group_map_noop = 0
+    cache_group_map_differs = 0
+    cache_noop_to_active_group = 0
+    uav_candidate_argmax_stay = 0
+    uav_group_map_stay = 0
+    uav_group_map_differs = 0
+    uav_noop_to_active_group = 0
+    active_cache_noop_count = 0
+    active_uav_noop_count = 0
+    for transition in rollout.transitions:
+        origin = int(transition.origin_index)
+        action = np.asarray(transition.action, dtype=np.int8)
+        for head_index in range(cache_count):
+            if int(action[head_index]) == 0:
+                continue
+            detail = _conditional_distribution_diagnostic(
+                policy,
+                context,
+                transition,
+                "cache",
+                head_index,
+                replayed[(origin, "cache", head_index)],
+            )
+            records.append({"origin": origin, **detail})
+            operation = str(detail["selected_operation_type"])
+            cache_selected_counts[operation] += 1
+            if str(detail["candidate_argmax_operation"]) == "NO_CHANGE":
+                cache_candidate_argmax_noop += 1
+            if str(detail["group_map_operation"]) == "NO_CHANGE":
+                cache_group_map_noop += 1
+            if str(detail["group_map_operation"]) != str(
+                detail["candidate_argmax_operation"]
+            ):
+                cache_group_map_differs += 1
+            if (
+                str(detail["candidate_argmax_operation"]) == "NO_CHANGE"
+                and str(detail["group_map_operation"]) != "NO_CHANGE"
+            ):
+                cache_noop_to_active_group += 1
+            if operation != "NO_CHANGE" and not bool(detail["selected_actual_changed"]):
+                active_cache_noop_count += 1
+        for head_index in range(uav_count):
+            if int(action[cache_count + head_index]) == 0:
+                continue
+            detail = _conditional_distribution_diagnostic(
+                policy,
+                context,
+                transition,
+                "uav",
+                head_index,
+                replayed[(origin, "uav", head_index)],
+            )
+            records.append({"origin": origin, **detail})
+            operation = str(detail["selected_operation_type"])
+            uav_selected_counts[operation] += 1
+            if str(detail["candidate_argmax_operation"]) == "STAY":
+                uav_candidate_argmax_stay += 1
+            if str(detail["group_map_operation"]) == "STAY":
+                uav_group_map_stay += 1
+            if str(detail["group_map_operation"]) != str(
+                detail["candidate_argmax_operation"]
+            ):
+                uav_group_map_differs += 1
+            if (
+                str(detail["candidate_argmax_operation"]) == "STAY"
+                and str(detail["group_map_operation"]) != "STAY"
+            ):
+                uav_noop_to_active_group += 1
+            if operation == "MOVE" and not bool(detail["selected_actual_moved"]):
+                active_uav_noop_count += 1
+
+    def rate(numerator: int, denominator: int) -> float:
+        return 0.0 if denominator == 0 else float(numerator) / float(denominator)
+
+    cache_triggered = int(sum(cache_selected_counts.values()))
+    uav_triggered = int(sum(uav_selected_counts.values()))
+    cache_material_mismatch = (
+        cache_triggered > 0
+        and rate(cache_noop_to_active_group, cache_triggered) >= 0.5
+    )
+    uav_material_mismatch = (
+        uav_triggered > 0
+        and rate(uav_noop_to_active_group, uav_triggered) >= 0.5
+    )
+    group_mismatch = bool(cache_material_mismatch or uav_material_mismatch)
+    total_triggered = cache_triggered + uav_triggered
+    selected_noop = int(cache_selected_counts["NO_CHANGE"] + uav_selected_counts["STAY"])
+    conditional_noop_mode = bool(
+        total_triggered > 0 and rate(selected_noop, total_triggered) >= 0.95
+    )
+    execution_side_noop = bool(active_cache_noop_count + active_uav_noop_count > 0)
+    if execution_side_noop:
+        final_case = "CASE_C2_EXECUTION_NOOP"
+    elif conditional_noop_mode and group_mismatch:
+        final_case = (
+            "CASE_C1_CONDITIONAL_NOOP_MODE + "
+            "CASE_C3_GROUP_BALANCE_DETERMINISTIC_MISMATCH"
+        )
+    elif conditional_noop_mode:
+        final_case = "CASE_C1_CONDITIONAL_NOOP_MODE"
+    elif group_mismatch:
+        final_case = "CASE_C3_GROUP_BALANCE_DETERMINISTIC_MISMATCH"
+    else:
+        final_case = "NO_DOMINANT_DIAGNOSTIC_CASE"
+    return {
+        "triggered_head_records": records,
+        "cache_triggered_head_count": cache_triggered,
+        "cache_selected_no_change_count": int(cache_selected_counts["NO_CHANGE"]),
+        "cache_selected_add_count": int(cache_selected_counts["ADD"]),
+        "cache_selected_delete_count": int(cache_selected_counts["DELETE"]),
+        "cache_selected_swap_count": int(cache_selected_counts["SWAP"]),
+        "cache_selected_no_change_rate": rate(
+            int(cache_selected_counts["NO_CHANGE"]), cache_triggered
+        ),
+        "cache_selected_add_rate": rate(int(cache_selected_counts["ADD"]), cache_triggered),
+        "cache_selected_delete_rate": rate(
+            int(cache_selected_counts["DELETE"]), cache_triggered
+        ),
+        "cache_selected_swap_rate": rate(
+            int(cache_selected_counts["SWAP"]), cache_triggered
+        ),
+        "uav_triggered_head_count": uav_triggered,
+        "uav_selected_stay_count": int(uav_selected_counts["STAY"]),
+        "uav_selected_move_count": int(uav_selected_counts["MOVE"]),
+        "uav_selected_stay_rate": rate(int(uav_selected_counts["STAY"]), uav_triggered),
+        "uav_selected_move_rate": rate(int(uav_selected_counts["MOVE"]), uav_triggered),
+        "cache_candidate_argmax_no_change_rate": rate(
+            cache_candidate_argmax_noop, cache_triggered
+        ),
+        "cache_group_map_no_change_rate": rate(cache_group_map_noop, cache_triggered),
+        "cache_group_map_differs_from_candidate_argmax_rate": rate(
+            cache_group_map_differs, cache_triggered
+        ),
+        "cache_candidate_argmax_noop_to_active_group_rate": rate(
+            cache_noop_to_active_group, cache_triggered
+        ),
+        "uav_candidate_argmax_stay_rate": rate(
+            uav_candidate_argmax_stay, uav_triggered
+        ),
+        "uav_group_map_stay_rate": rate(uav_group_map_stay, uav_triggered),
+        "uav_group_map_differs_from_candidate_argmax_rate": rate(
+            uav_group_map_differs, uav_triggered
+        ),
+        "uav_candidate_argmax_stay_to_active_group_rate": rate(
+            uav_noop_to_active_group, uav_triggered
+        ),
+        "active_cache_operation_selected_but_no_change_count": int(
+            active_cache_noop_count
+        ),
+        "active_uav_operation_selected_but_no_move_count": int(active_uav_noop_count),
+        "execution_side_noop": execution_side_noop,
+        "group_balance_deterministic_decoding_mismatch": group_mismatch,
+        "conditional_noop_mode": conditional_noop_mode,
+        "final_diagnostic_case": final_case,
+    }
+
+
+def _environment_trajectory_equivalent_to_static_zero(
+    rollout: SimpleRollout,
+    static_zero_rollout: SimpleRollout,
+    context: EnvironmentContext,
+) -> bool:
+    if len(rollout.transitions) != len(static_zero_rollout.transitions):
+        return False
+    scalar_fields = (
+        "reward",
+        "actual_task_utility",
+        "cache_cost",
+        "movement_cost",
+    )
+    for first, second in zip(
+        rollout.transitions,
+        static_zero_rollout.transitions,
+        strict=True,
+    ):
+        if int(first.origin_index) != int(second.origin_index) or int(first.slot) != int(
+            second.slot
+        ):
+            return False
+        for field in scalar_fields:
+            if float(getattr(first, field)) != float(getattr(second, field)):
+                return False
+        if int(first.actual_cache_update_count) != int(second.actual_cache_update_count):
+            return False
+        if int(first.actual_uav_movement_count) != int(second.actual_uav_movement_count):
+            return False
+        if not np.array_equal(first.next_cache_state, second.next_cache_state):
+            return False
+        for uav_id in context.action_spec.uav_ids:
+            if not np.array_equal(
+                np.asarray(first.next_uav_positions[uav_id], dtype=np.float64),
+                np.asarray(second.next_uav_positions[uav_id], dtype=np.float64),
+            ):
+                return False
+    return True
 
 
 def _summary(records: list[dict[str, Any]], cache_count: int, uav_count: int) -> dict[str, Any]:
@@ -1201,6 +1706,16 @@ def evaluate_full_episode(
     summary["selected_action_sha256"] = _rollout_action_sha256(rollout)
     summary["policy_action_mode"] = policy_action_mode
     summary["policy_sampling_seed"] = policy_sampling_seed
+    conditional_diagnostics: dict[str, Any] | None = None
+    if diagnostic_accumulator is not None:
+        conditional_diagnostics = _conditional_policy_diagnostics(
+            policy,
+            context,
+            rollout,
+        )
+        for key, value in conditional_diagnostics.items():
+            if key != "triggered_head_records":
+                summary[key] = value
     static_zero_payload: dict[str, Any] | None = None
     static_zero_summary: dict[str, Any] | None = None
     if static_zero_rollout is not None:
@@ -1221,16 +1736,22 @@ def evaluate_full_episode(
             static_zero_summary,
             static_zero_rollout,
         )
-        static_zero_payload["deterministic_p50_equivalent"] = (
-            _deterministic_p50_static_zero_equivalence(
-                records,
-                summary,
-                static_zero_summary,
-            )
+        static_zero_payload[
+            "environment_trajectory_equivalent_to_static_zero"
+        ] = _environment_trajectory_equivalent_to_static_zero(
+            rollout,
+            static_zero_rollout,
+            context,
+        )
+        static_zero_payload["deterministic_p50_equivalent"] = bool(
+            static_zero_payload["environment_trajectory_equivalent_to_static_zero"]
         )
         summary["static_zero_diagnostic"] = static_zero_payload
         summary["deterministic_p50_equivalent_to_static_zero"] = bool(
             static_zero_payload["deterministic_p50_equivalent"]
+        )
+        summary["environment_trajectory_equivalent_to_static_zero"] = bool(
+            static_zero_payload["environment_trajectory_equivalent_to_static_zero"]
         )
     manifest: dict[str, Any] = {
         "experiment_type": "full_episode_evaluation",
@@ -1268,6 +1789,7 @@ def evaluate_full_episode(
         "deterministic": bool(deterministic),
         "selected_action_sha256": _rollout_action_sha256(rollout),
         "policy_diagnostics_recorded": bool(record_policy_diagnostics),
+        "conditional_diagnostics_recorded": bool(conditional_diagnostics is not None),
         "static_zero_diagnostic": bool(static_zero_diagnostic),
         "policy_parameters_updated": bool(policy_parameters_updated),
         "popart_statistics_updated": bool(popart_statistics_updated),
@@ -1280,6 +1802,8 @@ def evaluate_full_episode(
         diagnostics = diagnostic_accumulator.finalize()
         diagnostics["policy_action_mode"] = policy_action_mode
         diagnostics["policy_sampling_seed"] = policy_sampling_seed
+        if conditional_diagnostics is not None:
+            diagnostics["conditional_diagnostics"] = conditional_diagnostics
         _write_json(output_dir / "policy_diagnostics.json", diagnostics)
     if static_zero_payload is not None:
         _write_json(output_dir / "static_zero_summary.json", static_zero_payload)
