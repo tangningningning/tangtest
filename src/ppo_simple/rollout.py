@@ -143,6 +143,7 @@ def collect_rollout(
     terminal_origin_index: int | None = None,
     observation_time_to_go: Callable[[int], float] | None = None,
     deterministic: bool = False,
+    conditional_action_mode: str | None = None,
     policy_diagnostic_callback: Callable[[int, Any], None] | None = None,
     action_transform: Callable[[np.ndarray], Any] | None = None,
 ) -> SimpleRollout:
@@ -296,6 +297,7 @@ def collect_rollout(
                 context,
                 tensor_spec,
                 deterministic=bool(deterministic),
+                conditional_action_mode=conditional_action_mode,
             )
             total_log_prob = primitive.total_log_prob
             cache_contexts = primitive.cache_contexts

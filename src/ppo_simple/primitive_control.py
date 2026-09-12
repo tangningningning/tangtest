@@ -259,8 +259,20 @@ def sample_and_apply_primitive_configuration(
     tensor_spec: PrimitiveTensorSpec,
     *,
     deterministic: bool = False,
+    conditional_action_mode: str | None = None,
 ) -> PrimitiveSelectionResult:
     """Sequentially sample and apply at most one primitive per triggered head."""
+
+    if conditional_action_mode not in (
+        None,
+        "candidate_deterministic",
+        "grouped_deterministic",
+        "stochastic",
+    ):
+        raise ValueError(
+            "conditional_action_mode must be one of: candidate_deterministic, "
+            "grouped_deterministic, stochastic"
+        )
 
     cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     previous_cache = cache.copy()
@@ -336,7 +348,14 @@ def sample_and_apply_primitive_configuration(
         count = len(candidates)
         if count > tensor_spec.cache_max_candidates:
             raise AssertionError("cache candidate count exceeds padded tensor capacity。")
-        if deterministic:
+        if conditional_action_mode == "grouped_deterministic":
+            sampled = policy.sample_cache_candidate_grouped_deterministic(
+                conditional_context,
+                candidate_features,
+            )
+        elif conditional_action_mode == "candidate_deterministic" or (
+            conditional_action_mode is None and deterministic
+        ):
             sampled = policy.sample_cache_candidate(
                 conditional_context,
                 candidate_features,
@@ -403,7 +422,14 @@ def sample_and_apply_primitive_configuration(
         count = len(candidates)
         if count > tensor_spec.uav_max_candidates:
             raise AssertionError("UAV candidate count exceeds padded tensor capacity。")
-        if deterministic:
+        if conditional_action_mode == "grouped_deterministic":
+            sampled = policy.sample_uav_candidate_grouped_deterministic(
+                conditional_context,
+                candidate_features,
+            )
+        elif conditional_action_mode == "candidate_deterministic" or (
+            conditional_action_mode is None and deterministic
+        ):
             sampled = policy.sample_uav_candidate(
                 conditional_context,
                 candidate_features,

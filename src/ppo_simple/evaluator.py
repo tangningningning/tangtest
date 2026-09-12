@@ -71,6 +71,23 @@ FULL_EPISODE_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
 FULL_EPISODE_ORIGIN_START = 0
 FULL_EPISODE_ORIGIN_END = 299
 FULL_EPISODE_SLOT_COUNT = 300
+POLICY_ACTION_MODES = (
+    "candidate_deterministic",
+    "grouped_deterministic",
+    "stochastic",
+)
+
+
+def normalize_policy_action_mode(policy_action_mode: str) -> str:
+    """Normalize the legacy deterministic alias without changing its semantics."""
+
+    mode = str(policy_action_mode)
+    if mode == "deterministic":
+        return "candidate_deterministic"
+    if mode not in POLICY_ACTION_MODES:
+        allowed = ", ".join(("deterministic", *POLICY_ACTION_MODES))
+        raise ValueError(f"policy_action_mode must be one of: {allowed}")
+    return mode
 
 
 def _require_torch() -> None:
@@ -986,6 +1003,7 @@ def _conditional_distribution_diagnostic(
     head_type: str,
     head_index: int,
     replay_detail: dict[str, Any],
+    conditional_action_mode: str,
 ) -> dict[str, Any]:
     operation_names = _conditional_operation_names(head_type)
     if head_type == "cache":
@@ -1080,9 +1098,20 @@ def _conditional_distribution_diagnostic(
         group_map_candidates[int(np.argmax(probabilities[group_map_candidates]))]
     )
     selected_index = int(replay_detail["selected_index"])
-    if selected_index != candidate_argmax_index:
+    if (
+        conditional_action_mode == "candidate_deterministic"
+        and selected_index != candidate_argmax_index
+    ):
         raise AssertionError(
             "deterministic conditional selected index is not candidate argmax"
+        )
+    if (
+        conditional_action_mode == "grouped_deterministic"
+        and selected_index != within_group_index
+    ):
+        raise AssertionError(
+            "grouped deterministic conditional selected index is not group-MAP "
+            "within-group candidate MAP"
         )
     selected_operation_type = str(replay_detail["selected_operation_type"])
     expected_selected_operation = operation_names[int(operation_indices[selected_index])]
@@ -1107,6 +1136,7 @@ def _conditional_distribution_diagnostic(
         ),
         "candidate_argmax_index": candidate_argmax_index,
         "candidate_argmax_operation": candidate_argmax_operation,
+        "conditional_action_mode": conditional_action_mode,
         **replay_detail,
     }
 
@@ -1115,6 +1145,7 @@ def _conditional_policy_diagnostics(
     policy: Any,
     context: EnvironmentContext,
     rollout: SimpleRollout,
+    conditional_action_mode: str,
 ) -> dict[str, Any]:
     replayed = _replay_selected_conditional_candidates(context, rollout)
     records: list[dict[str, Any]] = []
@@ -1149,6 +1180,7 @@ def _conditional_policy_diagnostics(
                 "cache",
                 head_index,
                 replayed[(origin, "cache", head_index)],
+                conditional_action_mode,
             )
             records.append({"origin": origin, **detail})
             operation = str(detail["selected_operation_type"])
@@ -1178,6 +1210,7 @@ def _conditional_policy_diagnostics(
                 "uav",
                 head_index,
                 replayed[(origin, "uav", head_index)],
+                conditional_action_mode,
             )
             records.append({"origin": origin, **detail})
             operation = str(detail["selected_operation_type"])
@@ -1233,6 +1266,7 @@ def _conditional_policy_diagnostics(
         final_case = "NO_DOMINANT_DIAGNOSTIC_CASE"
     return {
         "triggered_head_records": records,
+        "conditional_action_mode": conditional_action_mode,
         "cache_triggered_head_count": cache_triggered,
         "cache_selected_no_change_count": int(cache_selected_counts["NO_CHANGE"]),
         "cache_selected_add_count": int(cache_selected_counts["ADD"]),
@@ -1497,6 +1531,36 @@ def evaluate_heldout(
     return manifest, summary
 
 
+def _conditional_selection_summary(rollout: SimpleRollout) -> dict[str, Any]:
+    """Summarize the primitive choices recorded by the production rollout."""
+
+    cache_operations = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
+    uav_operations = ("STAY", "MOVE")
+    cache_selected = {operation: 0 for operation in cache_operations}
+    uav_selected = {operation: 0 for operation in uav_operations}
+    for transition in rollout.transitions:
+        for action in transition.cache_conditional_actions:
+            operation = str(action["operation_type"])
+            if operation not in cache_selected:
+                raise ValueError(f"unknown cache conditional operation: {operation}")
+            cache_selected[operation] += 1
+        for action in transition.uav_conditional_actions:
+            operation = str(action["operation_type"])
+            if operation not in uav_selected:
+                raise ValueError(f"unknown UAV conditional operation: {operation}")
+            uav_selected[operation] += 1
+    return {
+        "cache_selected_operation_counts": cache_selected,
+        "uav_selected_operation_counts": uav_selected,
+        "cache_selected_no_change_count": int(cache_selected["NO_CHANGE"]),
+        "cache_selected_add_count": int(cache_selected["ADD"]),
+        "cache_selected_delete_count": int(cache_selected["DELETE"]),
+        "cache_selected_swap_count": int(cache_selected["SWAP"]),
+        "uav_selected_stay_count": int(uav_selected["STAY"]),
+        "uav_selected_move_count": int(uav_selected["MOVE"]),
+    }
+
+
 def _full_episode_summary(
     records: list[dict[str, Any]],
     cache_count: int,
@@ -1601,10 +1665,8 @@ def evaluate_full_episode(
     """Evaluate one specified full-episode input realization without training."""
 
     _require_torch()
-    if policy_action_mode not in ("deterministic", "stochastic"):
-        raise ValueError(
-            "policy_action_mode must be 'deterministic' or 'stochastic'"
-        )
+    requested_policy_action_mode = str(policy_action_mode)
+    policy_action_mode = normalize_policy_action_mode(policy_action_mode)
     if policy_sampling_seed is not None:
         policy_sampling_seed = int(policy_sampling_seed)
     project_root = project_config.find_project_root()
@@ -1642,7 +1704,7 @@ def evaluate_full_episode(
         if record_policy_diagnostics
         else None
     )
-    deterministic = policy_action_mode == "deterministic"
+    deterministic = policy_action_mode != "stochastic"
     with torch.inference_mode():
         rollout = collect_rollout(
             policy,
@@ -1652,6 +1714,7 @@ def evaluate_full_episode(
             initial_uav=_copy_uav_positions(context.initial_uav),
             terminal_origin_index=FULL_EPISODE_ORIGIN_END,
             deterministic=deterministic,
+            conditional_action_mode=policy_action_mode,
             policy_diagnostic_callback=(
                 None
                 if diagnostic_accumulator is None
@@ -1673,6 +1736,7 @@ def evaluate_full_episode(
                 initial_uav=_copy_uav_positions(context.initial_uav),
                 terminal_origin_index=FULL_EPISODE_ORIGIN_END,
                 deterministic=True,
+                conditional_action_mode="candidate_deterministic",
                 action_transform=lambda action: np.zeros_like(action),
             )
         if not bool(static_zero_rollout.dones[-1]) or bool(
@@ -1705,13 +1769,17 @@ def evaluate_full_episode(
     )
     summary["selected_action_sha256"] = _rollout_action_sha256(rollout)
     summary["policy_action_mode"] = policy_action_mode
+    summary["policy_action_mode_requested"] = requested_policy_action_mode
     summary["policy_sampling_seed"] = policy_sampling_seed
+    for key, value in _conditional_selection_summary(rollout).items():
+        summary[key] = value
     conditional_diagnostics: dict[str, Any] | None = None
     if diagnostic_accumulator is not None:
         conditional_diagnostics = _conditional_policy_diagnostics(
             policy,
             context,
             rollout,
+            policy_action_mode,
         )
         for key, value in conditional_diagnostics.items():
             if key != "triggered_head_records":
@@ -1785,7 +1853,13 @@ def evaluate_full_episode(
             else str(context.realization.directory)
         ),
         "policy_action_mode": policy_action_mode,
+        "policy_action_mode_requested": requested_policy_action_mode,
         "policy_sampling_seed": policy_sampling_seed,
+        "policy_sampling_seed_derivation": (
+            "caller-supplied deterministic policy_sampling_seed"
+            if policy_sampling_seed is not None
+            else None
+        ),
         "deterministic": bool(deterministic),
         "selected_action_sha256": _rollout_action_sha256(rollout),
         "policy_diagnostics_recorded": bool(record_policy_diagnostics),
@@ -1801,6 +1875,7 @@ def evaluate_full_episode(
     if diagnostic_accumulator is not None:
         diagnostics = diagnostic_accumulator.finalize()
         diagnostics["policy_action_mode"] = policy_action_mode
+        diagnostics["policy_action_mode_requested"] = requested_policy_action_mode
         diagnostics["policy_sampling_seed"] = policy_sampling_seed
         if conditional_diagnostics is not None:
             diagnostics["conditional_diagnostics"] = conditional_diagnostics
@@ -1841,9 +1916,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--policy-action-mode",
-        choices=("deterministic", "stochastic"),
+        choices=("deterministic", *POLICY_ACTION_MODES),
         default="deterministic",
-        help="use policy mode actions or sampled actions for full-episode evaluation",
+        help=(
+            "full-episode action decoder: deterministic is the legacy alias for "
+            "candidate_deterministic"
+        ),
     )
     parser.add_argument(
         "--policy-sampling-seed",

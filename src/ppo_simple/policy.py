@@ -409,6 +409,84 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             logits=distribution_logits,
         )
 
+    def _sample_candidate_grouped_deterministic(
+        self,
+        observation: Any,
+        candidate_features: Any,
+        feature_dim: int,
+        scorer: Any,
+        operation_slice: slice | None,
+    ) -> CandidatePolicySample:
+        """Select a candidate by group-MAP followed by within-group MAP.
+
+        This is an evaluation-only decoder.  It reuses the exact balanced
+        candidate distribution used by the normal conditional head and does
+        not change the existing sampling or PPO evaluation methods.
+        """
+
+        if operation_slice is None:
+            raise ValueError(
+                "grouped deterministic decoding requires operation groups"
+            )
+        scores, single = self._candidate_scores(
+            observation,
+            candidate_features,
+            feature_dim,
+            scorer,
+        )
+        if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
+            raise ValueError("conditional candidate sampling 需要单个 context。")
+        candidate_features_t = torch.as_tensor(
+            candidate_features,
+            dtype=torch.float32,
+            device=scores.device,
+        )
+        distribution_logits = _group_balance_candidate_logits(
+            scores.squeeze(0),
+            candidate_features_t,
+            None,
+            operation_slice,
+        )
+        distribution = torch.distributions.Categorical(logits=distribution_logits)
+        start = 0 if operation_slice.start is None else int(operation_slice.start)
+        stop = (
+            int(candidate_features_t.shape[-1])
+            if operation_slice.stop is None
+            else int(operation_slice.stop)
+        )
+        operation_values = candidate_features_t[:, start:stop]
+        if operation_values.ndim != 2 or int(operation_values.shape[0]) != int(
+            distribution.probs.shape[-1]
+        ):
+            raise ValueError("candidate operation features shape mismatch")
+        operation_indices = torch.argmax(operation_values, dim=-1)
+        group_count = stop - start
+        group_probabilities = torch.stack(
+            [
+                distribution.probs[operation_indices == group_index].sum()
+                for group_index in range(group_count)
+            ]
+        )
+        selected_group = int(torch.argmax(group_probabilities).item())
+        group_candidates = torch.nonzero(
+            operation_indices == selected_group,
+            as_tuple=False,
+        ).reshape(-1)
+        if int(group_candidates.numel()) == 0:
+            raise ValueError("grouped deterministic decoding selected an empty group")
+        selected = int(
+            group_candidates[
+                int(torch.argmax(distribution.probs[group_candidates]).item())
+            ].item()
+        )
+        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=scores.device)
+        return CandidatePolicySample(
+            selected_index=selected,
+            log_prob=distribution.log_prob(selected_tensor),
+            entropy=distribution.entropy(),
+            logits=distribution_logits,
+        )
+
     def sample_cache_candidate(
         self,
         observation: Any,
@@ -436,6 +514,32 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             self.uav_feature_dim,
             self.uav_candidate_scorer,
             deterministic,
+            self._candidate_operation_slice("uav"),
+        )
+
+    def sample_cache_candidate_grouped_deterministic(
+        self,
+        observation: Any,
+        candidate_features: Any,
+    ) -> CandidatePolicySample:
+        return self._sample_candidate_grouped_deterministic(
+            observation,
+            candidate_features,
+            self.cache_feature_dim,
+            self.cache_candidate_scorer,
+            self._candidate_operation_slice("cache"),
+        )
+
+    def sample_uav_candidate_grouped_deterministic(
+        self,
+        observation: Any,
+        candidate_features: Any,
+    ) -> CandidatePolicySample:
+        return self._sample_candidate_grouped_deterministic(
+            observation,
+            candidate_features,
+            self.uav_feature_dim,
+            self.uav_candidate_scorer,
             self._candidate_operation_slice("uav"),
         )
 

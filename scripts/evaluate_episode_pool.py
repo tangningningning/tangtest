@@ -33,6 +33,9 @@ DEVELOPMENT_COUNT = 20
 DEVELOPMENT_EVALUATION_ROLE = "development_checkpoint_selection"
 P50_COMPLETED_EPOCHS = 50
 STUDENT_T_CRITICAL_95_DF19 = 2.093024054408263
+POLICY_SEED_DERIVATION = (
+    "sampling_seed_start + environment_seed * 10 + repeat_index"
+)
 
 
 def _path_is_within(path: Path, parent: Path) -> bool:
@@ -149,9 +152,21 @@ def _metric_record(
     manifest: dict[str, Any],
     summary: dict[str, Any],
     action: str,
+    *,
+    repeat_index: int | None,
+    policy_sampling_seed: int | None,
 ) -> dict[str, Any]:
     return {
         "seed": int(seed),
+        "environment_seed": int(seed),
+        "repeat_index": None if repeat_index is None else int(repeat_index),
+        "policy_sampling_seed": (
+            None if policy_sampling_seed is None else int(policy_sampling_seed)
+        ),
+        "policy_sampling_seed_derivation": (
+            None if policy_sampling_seed is None else POLICY_SEED_DERIVATION
+        ),
+        "policy_action_mode": str(manifest["policy_action_mode"]),
         "episode_return": float(summary["total_return"]),
         "mean_reward": float(summary["mean_slot_reward"]),
         "q_total": float(summary["total_q"]),
@@ -159,6 +174,17 @@ def _metric_record(
         "movement_cost": float(summary["total_movement_cost"]),
         "cache_actual_change_rate": float(summary["cache_change_rate"]),
         "uav_actual_movement_rate": float(summary["uav_movement_rate"]),
+        "cache_trigger_request_rate": float(summary["cache_trigger_request_rate"]),
+        "uav_trigger_request_rate": float(summary["uav_trigger_request_rate"]),
+        "cache_selected_operation_counts": dict(
+            summary.get(
+                "cache_selected_operation_counts",
+                {"NO_CHANGE": 0, "ADD": 0, "DELETE": 0, "SWAP": 0},
+            )
+        ),
+        "uav_selected_operation_counts": dict(
+            summary.get("uav_selected_operation_counts", {"STAY": 0, "MOVE": 0})
+        ),
         "realization_action": action,
         "realization_directory": str(realization_dir),
         "evaluation_directory": str(evaluation_dir),
@@ -184,14 +210,123 @@ def _build_evaluation_summary(
     *,
     config_path: Path,
     checkpoint_path: Path,
+    policy_action_mode: str,
+    sampling_repeats: int,
+    sampling_seed_start: int,
 ) -> dict[str, Any]:
-    if len(records) != DEVELOPMENT_COUNT:
-        raise ValueError(
-            f"development evaluation requires {DEVELOPMENT_COUNT} records, "
-            f"got {len(records)}"
+    if policy_action_mode == "stochastic":
+        if sampling_repeats <= 0:
+            raise ValueError("stochastic sampling_repeats must be positive")
+        expected_rollouts = DEVELOPMENT_COUNT * sampling_repeats
+        if len(records) != expected_rollouts:
+            raise ValueError(
+                f"stochastic development evaluation requires {expected_rollouts} "
+                f"records, got {len(records)}"
+            )
+        by_environment: dict[int, list[dict[str, Any]]] = {}
+        for record in records:
+            seed = int(record["environment_seed"])
+            by_environment.setdefault(seed, []).append(record)
+        expected_seeds = list(
+            range(DEVELOPMENT_SEED_START, DEVELOPMENT_SEED_END + 1)
         )
+        if sorted(by_environment) != expected_seeds:
+            raise ValueError("stochastic aggregation requires all 20 development seeds")
+        environment_records: list[dict[str, Any]] = []
+        within_return_variances: list[float] = []
+        for seed in expected_seeds:
+            environment_rows = sorted(
+                by_environment[seed],
+                key=lambda record: int(record["repeat_index"]),
+            )
+            if [int(row["repeat_index"]) for row in environment_rows] != list(
+                range(sampling_repeats)
+            ):
+                raise ValueError(
+                    f"stochastic repeats for environment {seed} are incomplete"
+                )
+            expected_sampling_seeds = [
+                sampling_seed_start + seed * 10 + repeat_index
+                for repeat_index in range(sampling_repeats)
+            ]
+            actual_sampling_seeds = [
+                int(row["policy_sampling_seed"]) for row in environment_rows
+            ]
+            if actual_sampling_seeds != expected_sampling_seeds:
+                raise ValueError(
+                    f"stochastic sampling seed pairing is invalid for environment {seed}"
+                )
+            within_returns = np.asarray(
+                [row["episode_return"] for row in environment_rows],
+                dtype=np.float64,
+            )
+            within_return_variances.append(
+                float(np.var(within_returns, ddof=1))
+                if sampling_repeats > 1
+                else 0.0
+            )
+            environment_records.append(
+                {
+                    "environment_seed": seed,
+                    "episode_return": float(np.mean(within_returns)),
+                    "q_total": float(
+                        np.mean([row["q_total"] for row in environment_rows])
+                    ),
+                    "cache_cost": float(
+                        np.mean([row["cache_cost"] for row in environment_rows])
+                    ),
+                    "movement_cost": float(
+                        np.mean([row["movement_cost"] for row in environment_rows])
+                    ),
+                    "cache_actual_change_rate": float(
+                        np.mean(
+                            [
+                                row["cache_actual_change_rate"]
+                                for row in environment_rows
+                            ]
+                        )
+                    ),
+                    "uav_actual_movement_rate": float(
+                        np.mean(
+                            [
+                                row["uav_actual_movement_rate"]
+                                for row in environment_rows
+                            ]
+                        )
+                    ),
+                    "cache_trigger_request_rate": float(
+                        np.mean(
+                            [
+                                row["cache_trigger_request_rate"]
+                                for row in environment_rows
+                            ]
+                        )
+                    ),
+                    "uav_trigger_request_rate": float(
+                        np.mean(
+                            [
+                                row["uav_trigger_request_rate"]
+                                for row in environment_rows
+                            ]
+                        )
+                    ),
+                }
+            )
+        within_environment_policy_variance_mean = float(
+            np.mean(within_return_variances)
+        )
+        aggregation_records = environment_records
+    else:
+        if len(records) != DEVELOPMENT_COUNT:
+            raise ValueError(
+                f"development evaluation requires {DEVELOPMENT_COUNT} records, "
+                f"got {len(records)}"
+            )
+        aggregation_records = records
+        within_environment_policy_variance_mean = None
+
     returns = np.asarray(
-        [record["episode_return"] for record in records], dtype=np.float64
+        [record["episode_return"] for record in aggregation_records], dtype=np.float64
     )
     return_std = float(np.std(returns, ddof=1))
     standard_error = return_std / math.sqrt(float(len(returns)))
@@ -201,7 +336,22 @@ def _build_evaluation_summary(
         "development_seed_start": DEVELOPMENT_SEED_START,
         "development_seed_end": DEVELOPMENT_SEED_END,
         "development_count": DEVELOPMENT_COUNT,
-        "count": len(records),
+        "count": len(aggregation_records),
+        "rollout_count": len(records),
+        "environment_count": DEVELOPMENT_COUNT,
+        "policy_action_mode": policy_action_mode,
+        "sampling_repeats": int(sampling_repeats),
+        "sampling_seed_start": (
+            int(sampling_seed_start) if policy_action_mode == "stochastic" else None
+        ),
+        "sampling_seed_derivation": (
+            POLICY_SEED_DERIVATION if policy_action_mode == "stochastic" else None
+        ),
+        "aggregation_level": (
+            "20 environment means after per-environment policy-sample means"
+            if policy_action_mode == "stochastic"
+            else "20 independent environment realizations"
+        ),
         "config_path": str(config_path),
         "config_sha256": evaluator._sha256(config_path),
         "checkpoint_path": str(checkpoint_path),
@@ -223,19 +373,38 @@ def _build_evaluation_summary(
                 "high": float(np.mean(returns) + margin),
             },
         },
-        "q_total": _sample_mean_std([record["q_total"] for record in records]),
+        "q_total": _sample_mean_std(
+            [record["q_total"] for record in aggregation_records]
+        ),
         "cache_cost": _sample_mean_std(
-            [record["cache_cost"] for record in records]
+            [record["cache_cost"] for record in aggregation_records]
         ),
         "movement_cost": _sample_mean_std(
-            [record["movement_cost"] for record in records]
+            [record["movement_cost"] for record in aggregation_records]
         ),
         "cache_actual_change_rate": _sample_mean_std(
-            [record["cache_actual_change_rate"] for record in records]
+            [record["cache_actual_change_rate"] for record in aggregation_records]
         ),
         "uav_actual_movement_rate": _sample_mean_std(
-            [record["uav_actual_movement_rate"] for record in records]
+            [record["uav_actual_movement_rate"] for record in aggregation_records]
         ),
+        "cache_trigger_request_rate": _sample_mean_std(
+            [record["cache_trigger_request_rate"] for record in aggregation_records]
+        ),
+        "uav_trigger_request_rate": _sample_mean_std(
+            [record["uav_trigger_request_rate"] for record in aggregation_records]
+        ),
+        "within_environment_policy_variance_mean": within_environment_policy_variance_mean,
+        "between_environment_return_variance": (
+            float(np.var(returns, ddof=1)) if len(returns) > 1 else 0.0
+        ),
+        "environment_return_means": [
+            {
+                "environment_seed": int(record["environment_seed"]),
+                "mean_return": float(record["episode_return"]),
+            }
+            for record in aggregation_records
+        ],
     }
 
 
@@ -250,11 +419,25 @@ def evaluate_episode_pool(
     device: str = "cpu",
     generate_missing_episodes: bool = False,
     sumo_home: str | None = None,
+    policy_action_mode: str = "deterministic",
+    sampling_repeats: int = 1,
+    sampling_seed_start: int = 500000,
 ) -> dict[str, Any]:
     if start_seed != DEVELOPMENT_SEED_START or count != DEVELOPMENT_COUNT:
         raise ValueError(
             "development evaluation is pinned to seeds 30001..30020 "
             "(start_seed=30001, count=20)"
+        )
+    requested_policy_action_mode = str(policy_action_mode)
+    policy_action_mode = evaluator.normalize_policy_action_mode(policy_action_mode)
+    sampling_repeats = int(sampling_repeats)
+    sampling_seed_start = int(sampling_seed_start)
+    if policy_action_mode == "stochastic":
+        if sampling_repeats <= 0:
+            raise ValueError("stochastic sampling_repeats must be positive")
+    elif sampling_repeats != 1:
+        raise ValueError(
+            "sampling_repeats is only configurable for stochastic evaluation"
         )
     resolved_config = _resolve_path(config_path)
     resolved_checkpoint = _resolve_path(checkpoint_path)
@@ -325,43 +508,82 @@ def evaluate_episode_pool(
                 sumo_home=sumo_home,
                 device=device,
             )
-            evaluation_dir = output_root / f"episode_{seed}"
-            manifest, summary = evaluator.evaluate_full_episode(
-                checkpoint_path=resolved_checkpoint,
-                run_dir=evaluation_dir,
-                config_path=resolved_config,
-                device=device,
-                realization_dir=realization_dir,
+            repeat_indices = (
+                range(sampling_repeats)
+                if policy_action_mode == "stochastic"
+                else (None,)
             )
-            manifest.update(
-                {
-                    "evaluation_role": DEVELOPMENT_EVALUATION_ROLE,
-                    "development_seed_start": DEVELOPMENT_SEED_START,
-                    "development_seed_end": DEVELOPMENT_SEED_END,
-                    "development_count": DEVELOPMENT_COUNT,
-                    "realization_seed": seed,
-                }
-            )
-            evaluator._write_json(
-                evaluation_dir / "full_episode_manifest.json", manifest
-            )
-            record = _metric_record(
-                seed,
-                realization_dir,
-                evaluation_dir,
-                manifest,
-                summary,
-                action,
-            )
-            records.append(record)
-            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
-            stream.write("\n")
+            for repeat_index in repeat_indices:
+                policy_sampling_seed = (
+                    None
+                    if repeat_index is None
+                    else sampling_seed_start + seed * 10 + int(repeat_index)
+                )
+                evaluation_dir = output_root / f"episode_{seed}"
+                if repeat_index is not None:
+                    evaluation_dir = evaluation_dir / f"repeat_{int(repeat_index)}"
+                manifest, summary = evaluator.evaluate_full_episode(
+                    checkpoint_path=resolved_checkpoint,
+                    run_dir=evaluation_dir,
+                    config_path=resolved_config,
+                    device=device,
+                    realization_dir=realization_dir,
+                    policy_action_mode=policy_action_mode,
+                    policy_sampling_seed=policy_sampling_seed,
+                )
+                manifest.update(
+                    {
+                        "evaluation_role": DEVELOPMENT_EVALUATION_ROLE,
+                        "development_seed_start": DEVELOPMENT_SEED_START,
+                        "development_seed_end": DEVELOPMENT_SEED_END,
+                        "development_count": DEVELOPMENT_COUNT,
+                        "realization_seed": seed,
+                        "environment_seed": seed,
+                        "repeat_index": (
+                            None
+                            if repeat_index is None
+                            else int(repeat_index)
+                        ),
+                        "sampling_repeats": int(sampling_repeats),
+                        "sampling_seed_start": (
+                            int(sampling_seed_start)
+                            if policy_action_mode == "stochastic"
+                            else None
+                        ),
+                        "policy_sampling_seed_derivation": (
+                            POLICY_SEED_DERIVATION
+                            if policy_action_mode == "stochastic"
+                            else None
+                        ),
+                        "policy_action_mode_requested": requested_policy_action_mode,
+                    }
+                )
+                evaluator._write_json(
+                    evaluation_dir / "full_episode_manifest.json", manifest
+                )
+                record = _metric_record(
+                    seed,
+                    realization_dir,
+                    evaluation_dir,
+                    manifest,
+                    summary,
+                    action,
+                    repeat_index=repeat_index,
+                    policy_sampling_seed=policy_sampling_seed,
+                )
+                records.append(record)
+                stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+                stream.write("\n")
 
     evaluation_summary = _build_evaluation_summary(
         records,
         config_path=resolved_config,
         checkpoint_path=resolved_checkpoint,
+        policy_action_mode=policy_action_mode,
+        sampling_repeats=sampling_repeats,
+        sampling_seed_start=sampling_seed_start,
     )
+    evaluation_summary["policy_action_mode_requested"] = requested_policy_action_mode
     evaluator._write_json(output_root / "evaluation_summary.json", evaluation_summary)
     return evaluation_summary
 
@@ -385,6 +607,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--sumo-home", default=None)
     parser.add_argument("--generate-missing-episodes", action="store_true")
+    parser.add_argument(
+        "--policy-action-mode",
+        choices=("deterministic", *evaluator.POLICY_ACTION_MODES),
+        default="deterministic",
+        help=(
+            "evaluation decoder; deterministic is the legacy alias for "
+            "candidate_deterministic"
+        ),
+    )
+    parser.add_argument(
+        "--sampling-repeats",
+        type=int,
+        default=1,
+        help="policy samples per environment for stochastic evaluation",
+    )
+    parser.add_argument(
+        "--sampling-seed-start",
+        type=int,
+        default=500000,
+        help=(
+            "base for stochastic seeds: start + environment_seed * 10 + "
+            "repeat_index"
+        ),
+    )
     return parser
 
 
@@ -401,6 +647,9 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             generate_missing_episodes=bool(args.generate_missing_episodes),
             sumo_home=args.sumo_home,
+            policy_action_mode=args.policy_action_mode,
+            sampling_repeats=args.sampling_repeats,
+            sampling_seed_start=args.sampling_seed_start,
         )
         return 0
     except Exception as exc:
