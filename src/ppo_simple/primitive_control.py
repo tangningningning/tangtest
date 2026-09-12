@@ -23,7 +23,11 @@ REPLICA_AWARE_POLICY_SCHEMA = (
     "adaptive_cache_operation_group_replica_aware_v8_popart"
 )
 REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
-    {REPLICA_AWARE_POLICY_SCHEMA, NO_PREDICTION_POLICY_SCHEMA}
+    {
+        REPLICA_AWARE_POLICY_SCHEMA,
+        NO_PREDICTION_POLICY_SCHEMA,
+        "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
+    }
 )
 REPLICA_AWARE_CACHE_FEATURE_NAMES = (
     "removed_replica_before_ratio",
@@ -117,6 +121,40 @@ class CacheOperationPrimitiveSelectionResult:
     cache_old_log_probs: np.ndarray
     cache_conditional_actions: tuple[dict[str, Any], ...]
     cache_candidate_counts: np.ndarray
+
+
+@dataclass(frozen=True)
+class JointCacheUavOperationPrimitiveSelectionResult:
+    """One sequential V9 Cache operation plus explicit UAV operation result."""
+
+    final_cache_state: np.ndarray
+    final_uav_positions: dict[str, tuple[float, float]]
+    derived_action: np.ndarray
+    value: Any
+    total_log_prob: Any
+    total_entropy: Any
+    cache_operation_actions: np.ndarray
+    cache_operation_masks: np.ndarray
+    cache_operation_old_log_probs: np.ndarray
+    cache_operation_entropies: np.ndarray
+    cache_contexts: np.ndarray
+    cache_candidate_features: np.ndarray
+    cache_candidate_masks: np.ndarray
+    cache_selected_indices: np.ndarray
+    cache_old_log_probs: np.ndarray
+    cache_conditional_actions: tuple[dict[str, Any], ...]
+    cache_candidate_counts: np.ndarray
+    uav_operation_actions: np.ndarray
+    uav_operation_masks: np.ndarray
+    uav_operation_old_log_probs: np.ndarray
+    uav_operation_entropies: np.ndarray
+    uav_contexts: np.ndarray
+    uav_candidate_features: np.ndarray
+    uav_candidate_masks: np.ndarray
+    uav_selected_indices: np.ndarray
+    uav_old_log_probs: np.ndarray
+    uav_conditional_actions: tuple[dict[str, Any], ...]
+    uav_candidate_counts: np.ndarray
 
 
 def _intermediate_observation(
@@ -903,4 +941,267 @@ def sample_and_apply_v8_no_prediction_cache_operation_configuration(
         predicted_popularity=zero_predicted_popularity(
             int(context.service_catalog["num_services"])
         ),
+    )
+
+
+def sample_and_apply_v9_joint_cache_uav_operation_configuration(
+    policy: Any,
+    observation: np.ndarray,
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    step: Any,
+    context: Any,
+    tensor_spec: PrimitiveTensorSpec,
+    *,
+    deterministic: bool = False,
+) -> JointCacheUavOperationPrimitiveSelectionResult:
+    """Run V8 Cache decisions followed by sequential STAY/MOVE UAV decisions."""
+
+    operation_order = ("STAY", "MOVE")
+    if tuple(getattr(policy, "uav_operation_order", ())) != operation_order:
+        raise ValueError("V9 UAV operation order must be STAY/MOVE")
+    cache_result = sample_and_apply_v8_cache_operation_configuration(
+        policy,
+        observation,
+        previous_cache_state,
+        previous_uav_positions,
+        step,
+        context,
+        tensor_spec,
+        deterministic=bool(deterministic),
+    )
+    current_uav = {
+        uav_id: np.asarray(previous_uav_positions[uav_id], dtype=np.float64).copy()
+        for uav_id in context.action_spec.uav_ids
+    }
+    previous_uav = {
+        uav_id: np.asarray(previous_uav_positions[uav_id], dtype=np.float64).copy()
+        for uav_id in context.action_spec.uav_ids
+    }
+    uav_operation_actions = np.zeros(tensor_spec.num_uav_heads, dtype=np.int64)
+    uav_operation_masks = np.zeros(
+        (tensor_spec.num_uav_heads, len(operation_order)),
+        dtype=bool,
+    )
+    uav_operation_old_log_probs = np.zeros(
+        tensor_spec.num_uav_heads,
+        dtype=np.float32,
+    )
+    uav_operation_entropies = np.zeros(
+        tensor_spec.num_uav_heads,
+        dtype=np.float32,
+    )
+    uav_contexts = np.zeros(
+        (tensor_spec.num_uav_heads, tensor_spec.observation_dim),
+        dtype=np.float32,
+    )
+    uav_features = np.zeros(
+        (
+            tensor_spec.num_uav_heads,
+            tensor_spec.uav_max_candidates,
+            tensor_spec.uav_feature_dim,
+        ),
+        dtype=np.float32,
+    )
+    uav_masks = np.zeros(
+        (tensor_spec.num_uav_heads, tensor_spec.uav_max_candidates),
+        dtype=bool,
+    )
+    uav_masks[:, 0] = True
+    uav_selected = np.zeros(tensor_spec.num_uav_heads, dtype=np.int64)
+    uav_old_log_probs = np.zeros(tensor_spec.num_uav_heads, dtype=np.float32)
+    uav_counts = np.zeros(tensor_spec.num_uav_heads, dtype=np.int64)
+    uav_actions: list[dict[str, Any]] = []
+    uav_triggers = {
+        uav_id: 0 for uav_id in context.action_spec.uav_ids
+    }
+    total_log_prob = cache_result.total_log_prob
+    total_entropy = cache_result.total_entropy
+
+    for uav_index, uav_id in enumerate(context.action_spec.uav_ids):
+        # The production enumerator requires the current target trigger to be 1.
+        # Prior UAV decisions remain in the trigger map, so later heads see the
+        # updated global positions and the already selected movement state.
+        uav_triggers[uav_id] = 1
+        conditional_context = _intermediate_observation(
+            cache_result.final_cache_state,
+            current_uav,
+            step,
+            context,
+        )
+        candidates = uav_configuration.enumerate_uav_primitive_actions(
+            current_uav,
+            previous_uav,
+            uav_id,
+            uav_triggers,
+            context.cfg,
+            context.flight_boundary,
+        )
+        move_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.operation_type) == "MOVE"
+        ]
+        if len(move_candidates) > tensor_spec.uav_max_candidates:
+            raise AssertionError("V9 UAV candidate count exceeds padded capacity")
+        operation_mask = np.asarray(
+            [True, bool(move_candidates)],
+            dtype=bool,
+        )
+        sampled_operation = policy.sample_uav_operation(
+            conditional_context,
+            uav_index,
+            operation_mask,
+            deterministic=bool(deterministic),
+        )
+        selected_operation_index = int(sampled_operation.selected_index)
+        selected_operation = operation_order[selected_operation_index]
+        uav_operation_actions[uav_index] = selected_operation_index
+        uav_operation_masks[uav_index] = operation_mask
+        uav_operation_old_log_probs[uav_index] = float(
+            sampled_operation.log_prob.detach().cpu()
+        )
+        uav_operation_entropies[uav_index] = float(
+            sampled_operation.entropy.detach().cpu()
+        )
+        uav_contexts[uav_index] = conditional_context
+        total_log_prob = total_log_prob + sampled_operation.log_prob
+        total_entropy = total_entropy + sampled_operation.entropy
+
+        count = len(move_candidates)
+        if count:
+            candidate_features = np.stack(
+                [
+                    _uav_candidate_feature(
+                        candidate,
+                        current_uav,
+                        previous_uav,
+                        uav_triggers,
+                        step.predicted_vehicle_positions,
+                        context,
+                    )
+                    for candidate in move_candidates
+                ]
+            )
+            uav_features[uav_index, :count] = candidate_features
+            uav_masks[uav_index, :count] = True
+        else:
+            candidate_features = np.zeros(
+                (0, tensor_spec.uav_feature_dim),
+                dtype=np.float32,
+            )
+        uav_counts[uav_index] = count
+
+        if selected_operation == "STAY":
+            uav_triggers[uav_id] = 0
+            before = current_uav[uav_id].copy()
+            uav_actions.append(
+                {
+                    "head_type": "uav",
+                    "head_id": str(uav_id),
+                    "head_index": uav_index,
+                    "candidate_count": count,
+                    "selected_index": None,
+                    "operation_type": "STAY",
+                    "before_position": [float(value) for value in before],
+                    "after_position": [float(value) for value in before],
+                    "actual_moved": False,
+                }
+            )
+            continue
+
+        if not move_candidates:
+            raise AssertionError("V9 selected MOVE without a feasible MOVE candidate")
+        if selected_operation != "MOVE":
+            raise AssertionError("V9 UAV operation selected an unsupported operation")
+        sampled_candidate = policy.sample_uav_candidate(
+            conditional_context,
+            candidate_features,
+            deterministic=bool(deterministic),
+        )
+        selected_index = int(sampled_candidate.selected_index)
+        selected = move_candidates[selected_index]
+        if str(selected.operation_type) != "MOVE":
+            raise AssertionError("V9 MOVE candidate sampler returned a non-MOVE action")
+        applied = uav_configuration.apply_uav_candidate(
+            current_uav,
+            previous_uav,
+            uav_id,
+            selected.after_position,
+            uav_triggers,
+            context.cfg,
+            context.flight_boundary,
+        )
+        if str(applied["operation_type"]) != "MOVE" or not bool(
+            applied["actual_moved"]
+        ):
+            raise AssertionError("V9 MOVE operation did not produce actual movement")
+        uav_selected[uav_index] = selected_index
+        uav_old_log_probs[uav_index] = float(
+            sampled_candidate.log_prob.detach().cpu()
+        )
+        total_log_prob = total_log_prob + sampled_candidate.log_prob
+        total_entropy = total_entropy + sampled_candidate.entropy
+        uav_actions.append(
+            {
+                "head_type": "uav",
+                "head_id": str(uav_id),
+                "head_index": uav_index,
+                "candidate_count": count,
+                "selected_index": selected_index,
+                "operation_type": "MOVE",
+                "before_position": [float(value) for value in selected.before_position],
+                "after_position": [float(value) for value in selected.after_position],
+                "actual_moved": True,
+            }
+        )
+
+    uav_configuration.validate_uav_configuration_transition(
+        previous_uav,
+        current_uav,
+        uav_triggers,
+        context.cfg,
+        context.flight_boundary,
+    )
+    derived_action = np.concatenate(
+        [
+            np.asarray(cache_result.derived_action[: tensor_spec.num_cache_heads], dtype=np.int8),
+            np.asarray(
+                [uav_triggers[uav_id] for uav_id in context.action_spec.uav_ids],
+                dtype=np.int8,
+            ),
+        ]
+    ).astype(np.int8)
+    return JointCacheUavOperationPrimitiveSelectionResult(
+        final_cache_state=cache_result.final_cache_state.copy(),
+        final_uav_positions={
+            key: (float(value[0]), float(value[1]))
+            for key, value in current_uav.items()
+        },
+        derived_action=derived_action,
+        value=cache_result.value,
+        total_log_prob=total_log_prob,
+        total_entropy=total_entropy,
+        cache_operation_actions=cache_result.operation_actions,
+        cache_operation_masks=cache_result.operation_masks,
+        cache_operation_old_log_probs=cache_result.operation_old_log_probs,
+        cache_operation_entropies=cache_result.operation_entropies,
+        cache_contexts=cache_result.cache_contexts,
+        cache_candidate_features=cache_result.cache_candidate_features,
+        cache_candidate_masks=cache_result.cache_candidate_masks,
+        cache_selected_indices=cache_result.cache_selected_indices,
+        cache_old_log_probs=cache_result.cache_old_log_probs,
+        cache_conditional_actions=cache_result.cache_conditional_actions,
+        cache_candidate_counts=cache_result.cache_candidate_counts,
+        uav_operation_actions=uav_operation_actions,
+        uav_operation_masks=uav_operation_masks,
+        uav_operation_old_log_probs=uav_operation_old_log_probs,
+        uav_operation_entropies=uav_operation_entropies,
+        uav_contexts=uav_contexts,
+        uav_candidate_features=uav_features,
+        uav_candidate_masks=uav_masks,
+        uav_selected_indices=uav_selected,
+        uav_old_log_probs=uav_old_log_probs,
+        uav_conditional_actions=tuple(uav_actions),
+        uav_candidate_counts=uav_counts,
     )

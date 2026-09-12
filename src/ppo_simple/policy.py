@@ -1198,6 +1198,314 @@ class AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic(
     replica_aware_candidate_features = True
 
 
+class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
+    AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
+):
+    """Joint V9 policy with the frozen V8 Cache branch and explicit UAV ops."""
+
+    architecture_id = "adaptive_joint_cache_replica_aware_uav_operation_v9_popart"
+    architecture_version = 1
+    replica_aware_candidate_features = True
+    uav_operation_order = ("STAY", "MOVE")
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        cache_feature_dim: int,
+        uav_feature_dim: int,
+        num_cache_heads: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(
+            observation_dim,
+            action_dim,
+            cache_feature_dim,
+            uav_feature_dim,
+            num_cache_heads,
+            hidden_sizes,
+        )
+        if int(uav_feature_dim) <= 16:
+            raise ValueError("V9 uav_feature_dim must include at least one UAV head")
+        self.num_uav_heads = int(uav_feature_dim) - 16
+        self.uav_operation_head = nn.Linear(
+            self.hidden_dim,
+            self.num_uav_heads * len(self.uav_operation_order),
+        )
+
+    def actor_parameters(self) -> tuple[Any, ...]:
+        """Return exactly the five modules used by the joint actor."""
+
+        modules = (
+            self.encoder,
+            self.cache_operation_head,
+            self.cache_candidate_scorer,
+            self.uav_operation_head,
+            self.uav_candidate_scorer,
+        )
+        parameters = tuple(
+            parameter
+            for module in modules
+            for parameter in module.parameters()
+        )
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise RuntimeError("V9 actor parameter group contains duplicate parameters.")
+        return parameters
+
+    def _uav_operation_logits(self, observations: Any) -> tuple[Any, bool]:
+        obs, single = self._observations(observations)
+        hidden = self.encoder(obs)
+        logits = self.uav_operation_head(hidden).reshape(
+            int(obs.shape[0]),
+            self.num_uav_heads,
+            len(self.uav_operation_order),
+        )
+        return (logits.squeeze(0) if single else logits), single
+
+    def sample_uav_operation(
+        self,
+        observation: Any,
+        head_index: int,
+        operation_mask: Any,
+        deterministic: bool = False,
+    ) -> OperationPolicySample:
+        """Sample one UAV's explicit STAY/MOVE operation."""
+
+        logits, single = self._uav_operation_logits(observation)
+        if not single or tuple(logits.shape) != (
+            self.num_uav_heads,
+            len(self.uav_operation_order),
+        ):
+            raise ValueError("V9 UAV operation sampling requires one observation")
+        index = int(head_index)
+        if index < 0 or index >= self.num_uav_heads:
+            raise IndexError("V9 UAV operation head index out of range")
+        mask = torch.as_tensor(
+            np.asarray(operation_mask, dtype=bool).reshape(-1),
+            dtype=torch.bool,
+            device=logits.device,
+        )
+        if tuple(mask.shape) != (len(self.uav_operation_order),) or not bool(
+            torch.any(mask).item()
+        ):
+            raise ValueError("V9 UAV operation mask must allow at least one operation")
+        masked_logits = logits[index].masked_fill(~mask, -float("inf"))
+        distribution = torch.distributions.Categorical(logits=masked_logits)
+        selected = (
+            int(torch.argmax(distribution.logits).item())
+            if deterministic
+            else int(distribution.sample().item())
+        )
+        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=logits.device)
+        return OperationPolicySample(
+            selected_index=selected,
+            log_prob=distribution.log_prob(selected_tensor),
+            entropy=distribution.entropy(),
+            logits=masked_logits,
+        )
+
+    def evaluate_joint_cache_uav_operation(
+        self,
+        observations: Any,
+        cache_operation_contexts: Any,
+        cache_operation_masks: Any,
+        cache_operation_actions: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+        cache_candidate_selected_indices: Any,
+        uav_operation_contexts: Any,
+        uav_operation_masks: Any,
+        uav_operation_actions: Any,
+        uav_candidate_features: Any,
+        uav_candidate_masks: Any,
+        uav_candidate_selected_indices: Any,
+    ) -> PolicyEvaluation:
+        """Recompute the full V9 joint log-probability without the old trigger head."""
+
+        cache_evaluation = self.evaluate_cache_operation_primitive(
+            observations,
+            cache_operation_contexts,
+            cache_operation_masks,
+            cache_operation_actions,
+            cache_candidate_features,
+            cache_candidate_masks,
+            cache_candidate_selected_indices,
+        )
+        observations_t, _ = self._observations(observations)
+        operation_contexts_t = torch.as_tensor(
+            uav_operation_contexts,
+            dtype=torch.float32,
+            device=observations_t.device,
+        )
+        operation_masks_t = torch.as_tensor(
+            uav_operation_masks,
+            dtype=torch.bool,
+            device=observations_t.device,
+        )
+        operation_actions_t = torch.as_tensor(
+            uav_operation_actions,
+            dtype=torch.long,
+            device=observations_t.device,
+        )
+        candidate_features_t = torch.as_tensor(
+            uav_candidate_features,
+            dtype=torch.float32,
+            device=observations_t.device,
+        )
+        candidate_masks_t = torch.as_tensor(
+            uav_candidate_masks,
+            dtype=torch.bool,
+            device=observations_t.device,
+        )
+        candidate_selected_t = torch.as_tensor(
+            uav_candidate_selected_indices,
+            dtype=torch.long,
+            device=observations_t.device,
+        )
+        if operation_contexts_t.ndim != 3:
+            raise ValueError("V9 UAV operation_contexts must be [B,U,observation_dim]")
+        batch_size, head_count, observation_dim = [
+            int(value) for value in operation_contexts_t.shape
+        ]
+        if batch_size != int(observations_t.shape[0]):
+            raise ValueError("V9 UAV operation_contexts batch dimension mismatch")
+        if head_count != self.num_uav_heads or observation_dim != self.observation_dim:
+            raise ValueError("V9 UAV operation_contexts shape mismatch")
+        expected_operation_shape = (
+            batch_size,
+            self.num_uav_heads,
+            len(self.uav_operation_order),
+        )
+        if tuple(operation_masks_t.shape) != expected_operation_shape:
+            raise ValueError("V9 UAV operation_masks shape mismatch")
+        if tuple(operation_actions_t.shape) != (batch_size, self.num_uav_heads):
+            raise ValueError("V9 UAV operation_actions shape mismatch")
+        if bool(torch.any(operation_actions_t < 0).item()) or bool(
+            torch.any(operation_actions_t >= len(self.uav_operation_order)).item()
+        ):
+            raise ValueError("V9 UAV operation action index out of range")
+        if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
+            raise ValueError("V9 UAV operation mask cannot block every operation")
+        all_operation_logits, _ = self._uav_operation_logits(
+            operation_contexts_t.reshape(batch_size * head_count, observation_dim)
+        )
+        all_operation_logits = all_operation_logits.reshape(
+            batch_size,
+            head_count,
+            self.num_uav_heads,
+            len(self.uav_operation_order),
+        )
+        head_indices = torch.arange(
+            self.num_uav_heads,
+            dtype=torch.long,
+            device=all_operation_logits.device,
+        )
+        operation_logits = all_operation_logits[:, head_indices, head_indices, :]
+        operation_logits = operation_logits.masked_fill(~operation_masks_t, -float("inf"))
+        operation_distribution = torch.distributions.Categorical(logits=operation_logits)
+        operation_valid = operation_masks_t.gather(
+            -1,
+            operation_actions_t.unsqueeze(-1),
+        ).squeeze(-1)
+        if not bool(torch.all(operation_valid).item()):
+            raise ValueError("V9 UAV operation action is blocked by its operation mask")
+        operation_log_prob = operation_distribution.log_prob(operation_actions_t).sum(dim=-1)
+        operation_entropy = torch.where(
+            operation_masks_t.sum(dim=-1) == 1,
+            torch.zeros_like(operation_distribution.entropy()),
+            operation_distribution.entropy(),
+        ).sum(dim=-1)
+
+        if candidate_features_t.ndim != 4:
+            raise ValueError("V9 UAV candidate_features must be [B,U,C,F]")
+        if tuple(candidate_features_t.shape[:2]) != (
+            batch_size,
+            self.num_uav_heads,
+        ) or int(candidate_features_t.shape[-1]) != self.uav_feature_dim:
+            raise ValueError("V9 UAV candidate_features shape mismatch")
+        candidate_count = int(candidate_features_t.shape[2])
+        if candidate_count <= 0:
+            raise ValueError("V9 UAV candidate tensor must have positive width")
+        expected_candidate_shape = (batch_size, self.num_uav_heads, candidate_count)
+        if tuple(candidate_masks_t.shape) != expected_candidate_shape:
+            raise ValueError("V9 UAV candidate_masks shape mismatch")
+        if tuple(candidate_selected_t.shape) != (batch_size, self.num_uav_heads):
+            raise ValueError("V9 UAV candidate_selected_indices shape mismatch")
+        if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
+            raise ValueError("V9 UAV candidate mask must have a placeholder or candidate")
+        if bool(torch.any(candidate_selected_t < 0).item()) or bool(
+            torch.any(candidate_selected_t >= candidate_count).item()
+        ):
+            raise ValueError("V9 UAV candidate selected index out of range")
+        candidate_valid = candidate_masks_t.gather(
+            -1,
+            candidate_selected_t.unsqueeze(-1),
+        ).squeeze(-1)
+        if not bool(torch.all(candidate_valid).item()):
+            raise ValueError("V9 UAV candidate selected index is masked")
+        candidate_active = operation_actions_t == 1
+        move_feature_slice = slice(1 + self.num_uav_heads, 3 + self.num_uav_heads)
+        selected_operation_features = candidate_features_t[
+            ..., move_feature_slice
+        ].gather(
+            -2,
+            candidate_selected_t.unsqueeze(-1).unsqueeze(-1).expand(
+                -1, -1, 1, 2
+            ),
+        ).squeeze(-2)
+        if bool(
+            torch.any(
+                candidate_active
+                & ~torch.all(
+                    selected_operation_features
+                    == torch.as_tensor(
+                        [0.0, 1.0],
+                        dtype=torch.float32,
+                        device=observations_t.device,
+                    ),
+                    dim=-1,
+                )
+            ).item()
+        ):
+            raise ValueError("V9 MOVE operation requires a MOVE candidate")
+        candidate_contexts = operation_contexts_t.reshape(
+            batch_size * head_count,
+            observation_dim,
+        )
+        flat_features = candidate_features_t.reshape(
+            batch_size * head_count,
+            candidate_count,
+            self.uav_feature_dim,
+        )
+        raw_scores, _ = self._candidate_scores(
+            candidate_contexts,
+            flat_features,
+            self.uav_feature_dim,
+            self.uav_candidate_scorer,
+        )
+        raw_scores = raw_scores.reshape(
+            batch_size,
+            self.num_uav_heads,
+            candidate_count,
+        )
+        candidate_logits = raw_scores.masked_fill(~candidate_masks_t, -float("inf"))
+        candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
+        candidate_log_prob = (
+            candidate_distribution.log_prob(candidate_selected_t)
+            * candidate_active.to(torch.float32)
+        ).sum(dim=-1)
+        candidate_entropy = (
+            candidate_distribution.entropy()
+            * candidate_active.to(torch.float32)
+        ).sum(dim=-1)
+        return PolicyEvaluation(
+            log_prob=cache_evaluation.log_prob + operation_log_prob + candidate_log_prob,
+            entropy=cache_evaluation.entropy + operation_entropy + candidate_entropy,
+            value=cache_evaluation.value,
+            logits=cache_evaluation.logits,
+        )
+
+
 class AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic(
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
 ):

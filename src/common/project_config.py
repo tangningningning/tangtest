@@ -795,10 +795,12 @@ def validate_config(
         "legacy_exact",
         "policy_primitive",
         "policy_primitive_v7_cache_operation",
+        "policy_primitive_v9_joint_cache_uav_operation",
     }:
         raise ValueError(
             "algorithm.ppo.configuration_control_mode 只支持 "
-            "legacy_exact/policy_primitive/policy_primitive_v7_cache_operation。"
+            "legacy_exact/policy_primitive/policy_primitive_v7_cache_operation/"
+            "policy_primitive_v9_joint_cache_uav_operation。"
         )
     policy_schema = str(
         get_config_value(config, "algorithm.ppo.policy_schema", "adaptive_primitive_v1")
@@ -806,6 +808,7 @@ def validate_config(
     if configuration_control_mode in {
         "policy_primitive",
         "policy_primitive_v7_cache_operation",
+        "policy_primitive_v9_joint_cache_uav_operation",
     } and policy_schema not in {
         "adaptive_primitive_v1",
         "adaptive_primitive_v2",
@@ -817,6 +820,7 @@ def validate_config(
         "adaptive_cache_operation_group_v7_popart",
         "adaptive_cache_operation_group_replica_aware_v8_popart",
         "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart",
+        "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -828,7 +832,8 @@ def validate_config(
             "adaptive_primitive_v6_horizon_grouped_separate_critic_popart/"
             "adaptive_cache_operation_group_v7_popart/"
             "adaptive_cache_operation_group_replica_aware_v8_popart/"
-            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart."
+            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart/"
+            "adaptive_joint_cache_replica_aware_uav_operation_v9_popart."
         )
     if (
         configuration_control_mode == "policy_primitive_v7_cache_operation"
@@ -844,6 +849,15 @@ def validate_config(
             "adaptive_cache_operation_group_v7_popart/"
             "adaptive_cache_operation_group_replica_aware_v8_popart/"
             "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart."
+        )
+    if (
+        configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation"
+        and policy_schema
+        != "adaptive_joint_cache_replica_aware_uav_operation_v9_popart"
+    ):
+        raise ValueError(
+            "policy_primitive_v9_joint_cache_uav_operation requires "
+            "adaptive_joint_cache_replica_aware_uav_operation_v9_popart."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:

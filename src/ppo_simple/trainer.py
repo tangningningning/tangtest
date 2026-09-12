@@ -45,6 +45,7 @@ from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
@@ -64,6 +65,7 @@ POPART_CHECKPOINT_VERSION = 6
 V7_CHECKPOINT_VERSION = 7
 V8_CHECKPOINT_VERSION = 8
 V8_NO_PREDICTION_CHECKPOINT_VERSION = 9
+V9_JOINT_CHECKPOINT_VERSION = 10
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
@@ -86,10 +88,15 @@ V8_POLICY_SCHEMAS = frozenset(
     {AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic.architecture_id}
 )
 NO_PREDICTION_POLICY_SCHEMAS = frozenset({NO_PREDICTION_POLICY_SCHEMA})
+JOINT_V9_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic.architecture_id}
+)
 CACHE_OPERATION_POLICY_SCHEMAS = (
     V7_POLICY_SCHEMAS | V8_POLICY_SCHEMAS | NO_PREDICTION_POLICY_SCHEMAS
 )
-POPART_POLICY_SCHEMAS = V6_POLICY_SCHEMAS | CACHE_OPERATION_POLICY_SCHEMAS
+POPART_POLICY_SCHEMAS = (
+    V6_POLICY_SCHEMAS | CACHE_OPERATION_POLICY_SCHEMAS | JOINT_V9_POLICY_SCHEMAS
+)
 SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
 HORIZON_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
 MODERN_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
@@ -990,10 +997,25 @@ class PPOV2Trainer:
         if context.configuration_control_mode in {
             "policy_primitive",
             "policy_primitive_v7_cache_operation",
+            "policy_primitive_v9_joint_cache_uav_operation",
         }:
             primitive_spec = PrimitiveTensorSpec.create(context)
             policy_class: type[AdaptivePrimitiveActorCritic]
-            if context.configuration_control_mode == "policy_primitive_v7_cache_operation":
+            if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
+                if context.policy_schema not in JOINT_V9_POLICY_SCHEMAS:
+                    raise ValueError(
+                        "policy_primitive_v9_joint_cache_uav_operation requires the V9 Joint schema"
+                    )
+                policy_class = AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
+                self.policy = policy_class(
+                    int(context.observation_spec.observation_dim),
+                    int(context.action_spec.action_dim),
+                    primitive_spec.cache_feature_dim,
+                    primitive_spec.uav_feature_dim,
+                    primitive_spec.num_cache_heads,
+                    self.hyperparameters.hidden_sizes,
+                ).to(self.device)
+            elif context.configuration_control_mode == "policy_primitive_v7_cache_operation":
                 if context.policy_schema not in CACHE_OPERATION_POLICY_SCHEMAS:
                     raise ValueError(
                         "policy_primitive_v7_cache_operation requires a supported "
@@ -1113,6 +1135,8 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
+        if self.policy.architecture_id in JOINT_V9_POLICY_SCHEMAS:
+            return V9_JOINT_CHECKPOINT_VERSION
         if self.policy.architecture_id in NO_PREDICTION_POLICY_SCHEMAS:
             return V8_NO_PREDICTION_CHECKPOINT_VERSION
         if self.policy.architecture_id in V8_POLICY_SCHEMAS:
@@ -1270,12 +1294,15 @@ class PPOV2Trainer:
         )
         v7_operation_actions = None
         v7_operation_masks = None
-        if self.context.configuration_control_mode == "policy_primitive_v7_cache_operation":
+        if self.context.configuration_control_mode in {
+            "policy_primitive_v7_cache_operation",
+            "policy_primitive_v9_joint_cache_uav_operation",
+        }:
             if (
                 rollout.v7_cache_operation_actions is None
                 or rollout.v7_cache_operation_masks is None
             ):
-                raise ValueError("V7 rollout is missing cache operation actions/masks")
+                raise ValueError("Cache-operation rollout is missing operation actions/masks")
             v7_operation_actions = torch.as_tensor(
                 rollout.v7_cache_operation_actions,
                 dtype=torch.long,
@@ -1283,6 +1310,21 @@ class PPOV2Trainer:
             )
             v7_operation_masks = torch.as_tensor(
                 rollout.v7_cache_operation_masks,
+                dtype=torch.bool,
+                device=self.device,
+            )
+        uav_operation_actions = None
+        uav_operation_masks = None
+        if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
+            if rollout.uav_operation_actions is None or rollout.uav_operation_masks is None:
+                raise ValueError("V9 rollout is missing UAV operation actions/masks")
+            uav_operation_actions = torch.as_tensor(
+                rollout.uav_operation_actions,
+                dtype=torch.long,
+                device=self.device,
+            )
+            uav_operation_masks = torch.as_tensor(
+                rollout.uav_operation_masks,
                 dtype=torch.bool,
                 device=self.device,
             )
@@ -1358,7 +1400,29 @@ class PPOV2Trainer:
             permutation = torch.randperm(sample_count, device=self.device)
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
-                if self.context.configuration_control_mode == "policy_primitive_v7_cache_operation":
+                if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
+                    if type(self.policy) is not AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic:
+                        raise TypeError("V9 update requires the exact Joint policy")
+                    assert v7_operation_actions is not None
+                    assert v7_operation_masks is not None
+                    assert uav_operation_actions is not None
+                    assert uav_operation_masks is not None
+                    evaluation = self.policy.evaluate_joint_cache_uav_operation(
+                        observations[indices],
+                        cache_contexts[indices],
+                        v7_operation_masks[indices],
+                        v7_operation_actions[indices],
+                        cache_candidate_features[indices],
+                        cache_candidate_masks[indices],
+                        cache_selected_indices[indices],
+                        uav_contexts[indices],
+                        uav_operation_masks[indices],
+                        uav_operation_actions[indices],
+                        uav_candidate_features[indices],
+                        uav_candidate_masks[indices],
+                        uav_selected_indices[indices],
+                    )
+                elif self.context.configuration_control_mode == "policy_primitive_v7_cache_operation":
                     if not isinstance(
                         self.policy,
                         AdaptiveCacheOperationGroupV7PopArtActorCritic,
