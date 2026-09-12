@@ -23,6 +23,8 @@ class PolicySample:
     entropy: Any
     value: Any
     action_mask: np.ndarray
+    action_probabilities: np.ndarray | None = None
+    deterministic_action: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +225,7 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
         observation: Any,
         action_mask: Callable[[int, np.ndarray], Any] | Any = None,
         deterministic: bool = False,
+        record_diagnostics: bool = False,
     ) -> PolicySample:
         logits, value = self.forward(observation)
         if logits.ndim != 1 or tuple(logits.shape) != (self.action_dim,):
@@ -231,6 +234,8 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
         masks: list[np.ndarray] = []
         log_probs: list[Any] = []
         entropies: list[Any] = []
+        action_probabilities: list[float] | None = [] if record_diagnostics else None
+        deterministic_actions: list[int] | None = [] if record_diagnostics else None
         for action_index in range(self.action_dim):
             raw_mask = (
                 np.ones(2, dtype=bool)
@@ -242,13 +247,19 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
                 raise ValueError(f"action_mask[{action_index}] 必须是 [2] 且至少允许一个值。")
             mask_tensor = torch.as_tensor(mask, dtype=torch.bool, device=logits.device).reshape(1, 2)
             distribution = self._masked_distribution(logits[action_index].reshape(1), mask_tensor)
+            deterministic_index = int(torch.argmax(distribution.logits, dim=-1).item())
             value_index = (
-                int(torch.argmax(distribution.logits, dim=-1).item())
+                deterministic_index
                 if deterministic
                 else int(distribution.sample().item())
             )
             actions.append(value_index)
             masks.append(mask.copy())
+            if action_probabilities is not None and deterministic_actions is not None:
+                action_probabilities.append(
+                    float(distribution.probs[0, 1].detach().cpu().item())
+                )
+                deterministic_actions.append(deterministic_index)
             action_tensor = torch.as_tensor([value_index], dtype=torch.long, device=logits.device)
             log_probs.append(distribution.log_prob(action_tensor).squeeze(0))
             entropies.append(distribution.entropy().squeeze(0))
@@ -258,6 +269,16 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
             entropy=torch.stack(entropies).sum(),
             value=value,
             action_mask=np.stack(masks, axis=0),
+            action_probabilities=(
+                None
+                if action_probabilities is None
+                else np.asarray(action_probabilities, dtype=np.float64)
+            ),
+            deterministic_action=(
+                None
+                if deterministic_actions is None
+                else np.asarray(deterministic_actions, dtype=np.int8)
+            ),
         )
 
     def evaluate(

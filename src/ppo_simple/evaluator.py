@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import math
+import random
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -620,6 +621,204 @@ def _rate(numerator: int, denominator: int) -> float:
     return float(numerator) / float(denominator)
 
 
+class _PolicyDiagnosticAccumulator:
+    """Compact trigger-head distribution diagnostics for one full episode."""
+
+    def __init__(self, context: EnvironmentContext) -> None:
+        cache_heads = [
+            (index, f"cache:{node_id}", "cache")
+            for index, node_id in enumerate(context.action_spec.cache_node_ids)
+        ]
+        cache_count = len(cache_heads)
+        uav_heads = [
+            (cache_count + index, f"uav:{uav_id}", "uav")
+            for index, uav_id in enumerate(context.action_spec.uav_ids)
+        ]
+        self.action_dim = int(context.action_spec.action_dim)
+        self.heads: list[dict[str, Any]] = [
+            {
+                "head_index": int(head_index),
+                "head_name": str(head_name),
+                "head_type": str(head_type),
+                "p1": [],
+                "deterministic_ones": 0,
+                "masked_to_zero": 0,
+                "masked_to_one": 0,
+            }
+            for head_index, head_name, head_type in [*cache_heads, *uav_heads]
+        ]
+        if len(self.heads) != self.action_dim:
+            raise ValueError(
+                "policy diagnostic head layout does not match action_spec.action_dim"
+            )
+        self.slot_count = 0
+
+    def observe(self, origin_index: int, sample: Any) -> None:
+        del origin_index
+        probabilities = np.asarray(sample.action_probabilities, dtype=np.float64)
+        deterministic_action = np.asarray(sample.deterministic_action, dtype=np.int8)
+        action_mask = np.asarray(sample.action_mask, dtype=bool)
+        if probabilities.shape != (self.action_dim,):
+            raise ValueError(
+                "policy diagnostic probabilities shape does not match action_spec"
+            )
+        if deterministic_action.shape != (self.action_dim,):
+            raise ValueError(
+                "policy diagnostic deterministic action shape does not match action_spec"
+            )
+        if action_mask.shape != (self.action_dim, 2):
+            raise ValueError("policy diagnostic action mask shape does not match action_spec")
+        if not bool(np.all(np.isfinite(probabilities))) or bool(
+            np.any(probabilities < 0.0) or np.any(probabilities > 1.0)
+        ):
+            raise ValueError("policy diagnostic probabilities must be finite in [0, 1]")
+        if not bool(np.all(np.isin(deterministic_action, [0, 1]))):
+            raise ValueError("policy diagnostic deterministic actions must be binary")
+        for head_index, head in enumerate(self.heads):
+            head["p1"].append(float(probabilities[head_index]))
+            head["deterministic_ones"] += int(deterministic_action[head_index] == 1)
+            head["masked_to_zero"] += int(not bool(action_mask[head_index, 0]))
+            head["masked_to_one"] += int(not bool(action_mask[head_index, 1]))
+        self.slot_count += 1
+
+    @staticmethod
+    def _summary(values: np.ndarray, deterministic_ones: int) -> dict[str, float]:
+        if values.ndim != 1 or values.size == 0:
+            raise ValueError("policy diagnostic summary requires non-empty values")
+        count = int(values.size)
+        return {
+            "mean_p1": float(np.mean(values)),
+            "median_p1": float(np.median(values)),
+            "fraction_p1_gt_0_5": float(np.mean(values > 0.5)),
+            "deterministic_one_rate": float(deterministic_ones) / float(count),
+        }
+
+    def _head_summary(self, head: dict[str, Any]) -> dict[str, Any]:
+        values = np.asarray(head["p1"], dtype=np.float64)
+        if values.size != self.slot_count:
+            raise ValueError("policy diagnostic head slot count mismatch")
+        count = int(values.size)
+        return {
+            "head_index": int(head["head_index"]),
+            "head_name": str(head["head_name"]),
+            "head_type": str(head["head_type"]),
+            "mean_p1": float(np.mean(values)),
+            "median_p1": float(np.median(values)),
+            "min_p1": float(np.min(values)),
+            "max_p1": float(np.max(values)),
+            "fraction_p1_gt_0_5": float(np.mean(values > 0.5)),
+            "fraction_p1_ge_0_5": float(np.mean(values >= 0.5)),
+            "deterministic_one_rate": float(head["deterministic_ones"]) / float(count),
+            "masked_to_zero_rate": float(head["masked_to_zero"]) / float(count),
+            "masked_to_one_rate": float(head["masked_to_one"]) / float(count),
+        }
+
+    def _type_summary(
+        self,
+        head_type: str,
+    ) -> dict[str, Any]:
+        selected = [
+            head
+            for head in self.heads
+            if str(head["head_type"]) == head_type
+        ]
+        values = np.asarray(
+            [value for head in selected for value in head["p1"]],
+            dtype=np.float64,
+        )
+        deterministic_ones = int(
+            sum(int(head["deterministic_ones"]) for head in selected)
+        )
+        summary = self._summary(values, deterministic_ones)
+        summary["head_count"] = len(selected)
+        return summary
+
+    def finalize(self) -> dict[str, Any]:
+        if self.slot_count <= 0:
+            raise ValueError("policy diagnostics did not observe any slots")
+        head_summaries = [self._head_summary(head) for head in self.heads]
+        cache_summary = self._type_summary("cache")
+        uav_summary = self._type_summary("uav")
+        return {
+            "slot_count": int(self.slot_count),
+            "action_dim": int(self.action_dim),
+            "trigger_heads": head_summaries,
+            "cache_trigger_summary": cache_summary,
+            "uav_trigger_summary": uav_summary,
+            "cache_trigger_mean_p1": float(cache_summary["mean_p1"]),
+            "cache_trigger_median_p1": float(cache_summary["median_p1"]),
+            "cache_fraction_p1_gt_0_5": float(cache_summary["fraction_p1_gt_0_5"]),
+            "cache_deterministic_one_rate": float(
+                cache_summary["deterministic_one_rate"]
+            ),
+            "uav_trigger_mean_p1": float(uav_summary["mean_p1"]),
+            "uav_trigger_median_p1": float(uav_summary["median_p1"]),
+            "uav_fraction_p1_gt_0_5": float(uav_summary["fraction_p1_gt_0_5"]),
+            "uav_deterministic_one_rate": float(
+                uav_summary["deterministic_one_rate"]
+            ),
+        }
+
+
+def _seed_policy_sampling(seed: int) -> None:
+    """Seed every RNG used by policy/environment-side evaluation sampling."""
+
+    seed_value = int(seed)
+    if seed_value < 0:
+        raise ValueError("policy_sampling_seed must be non-negative")
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    _require_torch()
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+
+
+def _rollout_action_sha256(rollout: SimpleRollout) -> str:
+    actions = np.ascontiguousarray(np.asarray(rollout.actions, dtype=np.int8))
+    return hashlib.sha256(actions.tobytes(order="C")).hexdigest()
+
+
+def _static_zero_payload(
+    summary: dict[str, Any],
+    rollout: SimpleRollout,
+) -> dict[str, Any]:
+    return {
+        "diagnostic": "static_zero_top_level_triggers",
+        "episode_slots": FULL_EPISODE_SLOT_COUNT,
+        "origin_start": FULL_EPISODE_ORIGIN_START,
+        "origin_end": FULL_EPISODE_ORIGIN_END,
+        "static_zero_return": float(summary["total_return"]),
+        "static_zero_q_total": float(summary["total_q"]),
+        "static_zero_cache_cost": float(summary["total_cache_cost"]),
+        "static_zero_movement_cost": float(summary["total_movement_cost"]),
+        "cache_trigger_request_rate": float(summary["cache_trigger_request_rate"]),
+        "uav_trigger_request_rate": float(summary["uav_trigger_request_rate"]),
+        "cache_actual_change_rate": float(summary["cache_change_rate"]),
+        "uav_actual_movement_rate": float(summary["uav_movement_rate"]),
+        "selected_action_sha256": _rollout_action_sha256(rollout),
+    }
+
+
+def _deterministic_p50_static_zero_equivalence(
+    records: list[dict[str, Any]],
+    summary: dict[str, Any],
+    static_zero_summary: dict[str, Any],
+) -> bool:
+    cache_requests = int(sum(record["cache_trigger_count"] for record in records))
+    uav_requests = int(sum(record["uav_trigger_count"] for record in records))
+    cache_changes = int(sum(record["cache_change_count"] for record in records))
+    uav_movements = int(sum(record["uav_movement_count"] for record in records))
+    return bool(
+        cache_requests == 0
+        and uav_requests == 0
+        and cache_changes == 0
+        and uav_movements == 0
+        and float(summary["total_return"])
+        == float(static_zero_summary["total_return"])
+    )
+
+
 def _summary(records: list[dict[str, Any]], cache_count: int, uav_count: int) -> dict[str, Any]:
     rewards = np.asarray([record["reward"] for record in records], dtype=np.float64)
     q_values = np.asarray([record["q"] for record in records], dtype=np.float64)
@@ -826,6 +1025,9 @@ def _full_episode_summary(
         "cache_trigger_rate": _rate(
             cache_triggers, FULL_EPISODE_SLOT_COUNT * cache_count
         ),
+        "cache_trigger_request_rate": _rate(
+            cache_triggers, FULL_EPISODE_SLOT_COUNT * cache_count
+        ),
         "cache_change_rate": _rate(
             cache_changes, FULL_EPISODE_SLOT_COUNT * cache_count
         ),
@@ -833,6 +1035,9 @@ def _full_episode_summary(
             None if cache_triggers == 0 else _rate(cache_changes, cache_triggers)
         ),
         "uav_trigger_rate": _rate(
+            uav_triggers, FULL_EPISODE_SLOT_COUNT * uav_count
+        ),
+        "uav_trigger_request_rate": _rate(
             uav_triggers, FULL_EPISODE_SLOT_COUNT * uav_count
         ),
         "uav_movement_rate": _rate(
@@ -883,10 +1088,20 @@ def evaluate_full_episode(
     config_path: str | Path = FULL_EPISODE_CONFIG_PATH,
     device: str = "cpu",
     realization_dir: str | Path | None = None,
+    record_policy_diagnostics: bool = False,
+    policy_action_mode: str = "deterministic",
+    policy_sampling_seed: int | None = None,
+    static_zero_diagnostic: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Evaluate one specified full-episode input realization without training."""
 
     _require_torch()
+    if policy_action_mode not in ("deterministic", "stochastic"):
+        raise ValueError(
+            "policy_action_mode must be 'deterministic' or 'stochastic'"
+        )
+    if policy_sampling_seed is not None:
+        policy_sampling_seed = int(policy_sampling_seed)
     project_root = project_config.find_project_root()
     resolved_config = project_config.resolve_path(project_root, config_path)
     resolved_checkpoint = project_config.resolve_path(project_root, checkpoint_path)
@@ -913,8 +1128,16 @@ def evaluate_full_episode(
         expected_completed_epochs=None,
         expected_protocol=FULL_EPISODE_PROTOCOL,
     )
+    if policy_sampling_seed is not None:
+        _seed_policy_sampling(policy_sampling_seed)
     parameter_snapshot = [parameter.detach().clone() for parameter in policy.parameters()]
     popart_snapshot = policy.popart_statistics()
+    diagnostic_accumulator = (
+        _PolicyDiagnosticAccumulator(context)
+        if record_policy_diagnostics
+        else None
+    )
+    deterministic = policy_action_mode == "deterministic"
     with torch.inference_mode():
         rollout = collect_rollout(
             policy,
@@ -923,12 +1146,36 @@ def evaluate_full_episode(
             initial_cache=np.asarray(context.initial_cache, dtype=np.int8).copy(),
             initial_uav=_copy_uav_positions(context.initial_uav),
             terminal_origin_index=FULL_EPISODE_ORIGIN_END,
-            deterministic=True,
+            deterministic=deterministic,
+            policy_diagnostic_callback=(
+                None
+                if diagnostic_accumulator is None
+                else diagnostic_accumulator.observe
+            ),
         )
     if not bool(rollout.dones[-1]) or bool(np.any(rollout.dones[:-1])):
         raise ValueError(
             "full-episode evaluation must terminate only at origin 299"
         )
+    static_zero_rollout: SimpleRollout | None = None
+    if static_zero_diagnostic:
+        with torch.inference_mode():
+            static_zero_rollout = collect_rollout(
+                policy,
+                context,
+                steps,
+                initial_cache=np.asarray(context.initial_cache, dtype=np.int8).copy(),
+                initial_uav=_copy_uav_positions(context.initial_uav),
+                terminal_origin_index=FULL_EPISODE_ORIGIN_END,
+                deterministic=True,
+                action_transform=lambda action: np.zeros_like(action),
+            )
+        if not bool(static_zero_rollout.dones[-1]) or bool(
+            np.any(static_zero_rollout.dones[:-1])
+        ):
+            raise ValueError(
+                "static-zero full-episode diagnostic must terminate only at origin 299"
+            )
     policy_parameters_updated = any(
         not torch.equal(before, after.detach())
         for before, after in zip(parameter_snapshot, policy.parameters(), strict=True)
@@ -951,6 +1198,40 @@ def evaluate_full_episode(
         len(context.action_spec.cache_node_ids),
         len(context.action_spec.uav_ids),
     )
+    summary["selected_action_sha256"] = _rollout_action_sha256(rollout)
+    summary["policy_action_mode"] = policy_action_mode
+    summary["policy_sampling_seed"] = policy_sampling_seed
+    static_zero_payload: dict[str, Any] | None = None
+    static_zero_summary: dict[str, Any] | None = None
+    if static_zero_rollout is not None:
+        static_zero_records = _slot_records_for_range(
+            static_zero_rollout,
+            len(context.action_spec.cache_node_ids),
+            len(context.action_spec.uav_ids),
+            origin_start=FULL_EPISODE_ORIGIN_START,
+            origin_end=FULL_EPISODE_ORIGIN_END,
+            label="static-zero full-episode",
+        )
+        static_zero_summary = _full_episode_summary(
+            static_zero_records,
+            len(context.action_spec.cache_node_ids),
+            len(context.action_spec.uav_ids),
+        )
+        static_zero_payload = _static_zero_payload(
+            static_zero_summary,
+            static_zero_rollout,
+        )
+        static_zero_payload["deterministic_p50_equivalent"] = (
+            _deterministic_p50_static_zero_equivalence(
+                records,
+                summary,
+                static_zero_summary,
+            )
+        )
+        summary["static_zero_diagnostic"] = static_zero_payload
+        summary["deterministic_p50_equivalent_to_static_zero"] = bool(
+            static_zero_payload["deterministic_p50_equivalent"]
+        )
     manifest: dict[str, Any] = {
         "experiment_type": "full_episode_evaluation",
         "data_protocol": FULL_EPISODE_PROTOCOL,
@@ -982,7 +1263,12 @@ def evaluate_full_episode(
             if context.realization is None
             else str(context.realization.directory)
         ),
-        "deterministic": True,
+        "policy_action_mode": policy_action_mode,
+        "policy_sampling_seed": policy_sampling_seed,
+        "deterministic": bool(deterministic),
+        "selected_action_sha256": _rollout_action_sha256(rollout),
+        "policy_diagnostics_recorded": bool(record_policy_diagnostics),
+        "static_zero_diagnostic": bool(static_zero_diagnostic),
         "policy_parameters_updated": bool(policy_parameters_updated),
         "popart_statistics_updated": bool(popart_statistics_updated),
         "optimizer_steps": 0,
@@ -990,6 +1276,13 @@ def evaluate_full_episode(
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "full_episode_manifest.json", manifest)
     _write_json(output_dir / "full_episode_summary.json", summary)
+    if diagnostic_accumulator is not None:
+        diagnostics = diagnostic_accumulator.finalize()
+        diagnostics["policy_action_mode"] = policy_action_mode
+        diagnostics["policy_sampling_seed"] = policy_sampling_seed
+        _write_json(output_dir / "policy_diagnostics.json", diagnostics)
+    if static_zero_payload is not None:
+        _write_json(output_dir / "static_zero_summary.json", static_zero_payload)
     with (output_dir / "full_episode_slot_metrics.jsonl").open(
         "w", encoding="utf-8", newline="\n"
     ) as stream:
@@ -1017,6 +1310,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="full-episode realization directory; omitted uses configured data",
     )
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--record-policy-diagnostics",
+        action="store_true",
+        help="write compact per-trigger-head policy distribution diagnostics",
+    )
+    parser.add_argument(
+        "--policy-action-mode",
+        choices=("deterministic", "stochastic"),
+        default="deterministic",
+        help="use policy mode actions or sampled actions for full-episode evaluation",
+    )
+    parser.add_argument(
+        "--policy-sampling-seed",
+        type=int,
+        default=None,
+        help="seed Python, NumPy, and torch RNGs before policy rollout sampling",
+    )
+    parser.add_argument(
+        "--static-zero-diagnostic",
+        action="store_true",
+        help="also run a same-realization all-zero top-level trigger diagnostic",
+    )
     return parser
 
 
@@ -1029,6 +1344,10 @@ def main(argv: list[str] | None = None) -> int:
             config_path=args.config or FULL_EPISODE_CONFIG_PATH,
             device=args.device,
             realization_dir=args.realization_dir,
+            record_policy_diagnostics=args.record_policy_diagnostics,
+            policy_action_mode=args.policy_action_mode,
+            policy_sampling_seed=args.policy_sampling_seed,
+            static_zero_diagnostic=args.static_zero_diagnostic,
         )
     else:
         evaluate_heldout(

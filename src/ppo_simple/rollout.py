@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 from typing import Any, Callable
 
@@ -143,6 +143,8 @@ def collect_rollout(
     terminal_origin_index: int | None = None,
     observation_time_to_go: Callable[[int], float] | None = None,
     deterministic: bool = False,
+    policy_diagnostic_callback: Callable[[int, Any], None] | None = None,
+    action_transform: Callable[[np.ndarray], Any] | None = None,
 ) -> SimpleRollout:
     """Collect one contiguous request rollout from a supplied environment state.
 
@@ -198,16 +200,47 @@ def collect_rollout(
             context.action_spec,
         )
         selection_started_at = time.perf_counter()
-        if deterministic:
-            sample = policy.sample(
-                observation,
-                action_mask=action_mask_provider,
-                deterministic=True,
-            )
-        else:
-            sample = policy.sample(observation, action_mask=action_mask_provider)
+        sample = policy.sample(
+            observation,
+            action_mask=action_mask_provider,
+            deterministic=bool(deterministic),
+            record_diagnostics=policy_diagnostic_callback is not None,
+        )
         if sample.action.shape != (int(context.action_spec.action_dim),):
             raise AssertionError("PPO v2 action 不符合 action_spec。")
+        if policy_diagnostic_callback is not None:
+            if (
+                sample.action_probabilities is None
+                or sample.deterministic_action is None
+            ):
+                raise RuntimeError(
+                    "policy diagnostics requested but policy sample did not provide "
+                    "trigger distribution details"
+                )
+            policy_diagnostic_callback(int(step.origin_index), sample)
+        if action_transform is not None:
+            transformed_action = np.asarray(
+                action_transform(np.asarray(sample.action, dtype=np.int8).copy()),
+                dtype=np.int8,
+            ).reshape(-1)
+            expected_action_shape = (int(context.action_spec.action_dim),)
+            if transformed_action.shape != expected_action_shape:
+                raise ValueError(
+                    "action_transform returned an action with an invalid shape: "
+                    f"{transformed_action.shape}, expected {expected_action_shape}"
+                )
+            if not bool(np.all(np.isin(transformed_action, [0, 1]))):
+                raise ValueError("action_transform must return a binary request vector")
+            transformed_indices = np.arange(int(context.action_spec.action_dim))
+            if not bool(
+                np.all(
+                    np.asarray(sample.action_mask, dtype=bool)[
+                        transformed_indices, transformed_action
+                    ]
+                )
+            ):
+                raise ValueError("action_transform returned a request blocked by the action mask")
+            sample = replace(sample, action=transformed_action)
         cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(sample.action)
         cache_contexts = np.zeros(
             (tensor_spec.num_cache_heads, tensor_spec.observation_dim), dtype=np.float32
