@@ -14,6 +14,7 @@ from . import interface
 from .interface import _copy_uav_positions
 from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
+    AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptivePrimitiveActorCritic,
     BernoulliActorCritic,
     PolicySample,
@@ -21,6 +22,7 @@ from .policy import (
 from .primitive_control import (
     PrimitiveTensorSpec,
     sample_and_apply_primitive_configuration,
+    sample_and_apply_v8_cache_operation_configuration,
     sample_and_apply_v7_cache_operation_configuration,
 )
 
@@ -221,16 +223,30 @@ def collect_rollout(
                 raise ValueError(
                     "V7 Cache-only rollout does not support binary-trigger diagnostics"
                 )
-            v7_primitive = sample_and_apply_v7_cache_operation_configuration(
-                policy,
-                observation,
-                previous_cache,
-                previous_uav,
-                step,
-                context,
-                tensor_spec,
-                deterministic=bool(deterministic),
-            )
+            if isinstance(
+                policy, AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
+            ):
+                v7_primitive = sample_and_apply_v8_cache_operation_configuration(
+                    policy,
+                    observation,
+                    previous_cache,
+                    previous_uav,
+                    step,
+                    context,
+                    tensor_spec,
+                    deterministic=bool(deterministic),
+                )
+            else:
+                v7_primitive = sample_and_apply_v7_cache_operation_configuration(
+                    policy,
+                    observation,
+                    previous_cache,
+                    previous_uav,
+                    step,
+                    context,
+                    tensor_spec,
+                    deterministic=bool(deterministic),
+                )
             sample = PolicySample(
                 action=np.asarray(v7_primitive.derived_action, dtype=np.int8),
                 log_prob=v7_primitive.total_log_prob,

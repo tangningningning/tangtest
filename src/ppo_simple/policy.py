@@ -1186,3 +1186,13 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
             value=self.critic_value(observations_t),
             logits=operation_logits,
         )
+
+
+class AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic(
+    AdaptiveCacheOperationGroupV7PopArtActorCritic
+):
+    """V7 Cache operation hierarchy with six replica-aware candidate features."""
+
+    architecture_id = "adaptive_cache_operation_group_replica_aware_v8_popart"
+    architecture_version = 1
+    replica_aware_candidate_features = True

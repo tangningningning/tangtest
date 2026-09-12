@@ -13,6 +13,20 @@ from decision import cache_configuration, uav_configuration
 from . import interface
 
 
+REPLICA_AWARE_POLICY_SCHEMA = (
+    "adaptive_cache_operation_group_replica_aware_v8_popart"
+)
+REPLICA_AWARE_CACHE_FEATURE_NAMES = (
+    "removed_replica_before_ratio",
+    "removed_replica_after_ratio",
+    "removed_after_single_replica",
+    "removed_after_zero_replica",
+    "added_replica_before_ratio",
+    "added_replica_after_ratio",
+)
+REPLICA_AWARE_CACHE_FEATURE_DIM = len(REPLICA_AWARE_CACHE_FEATURE_NAMES)
+
+
 @dataclass(frozen=True)
 class PrimitiveTensorSpec:
     num_cache_heads: int
@@ -28,11 +42,19 @@ class PrimitiveTensorSpec:
         service_count = int(context.service_catalog["num_services"])
         uav_count = len(context.action_spec.uav_ids)
         search = uav_configuration.uav_search_config_from_project(context.cfg)
+        replica_aware = (
+            str(getattr(context, "policy_schema", ""))
+            == REPLICA_AWARE_POLICY_SCHEMA
+        )
         return cls(
             num_cache_heads=len(context.action_spec.cache_node_ids),
             num_uav_heads=uav_count,
             observation_dim=int(context.observation_spec.observation_dim),
-            cache_feature_dim=17 + 3 * service_count,
+            cache_feature_dim=(
+                17
+                + 3 * service_count
+                + (REPLICA_AWARE_CACHE_FEATURE_DIM if replica_aware else 0)
+            ),
             uav_feature_dim=16 + uav_count,
             cache_max_candidates=1 + service_count + (service_count * service_count) // 4,
             uav_max_candidates=(
@@ -119,6 +141,8 @@ def _cache_candidate_feature(
     cache_triggers: np.ndarray,
     predicted_popularity: dict[int, float],
     context: Any,
+    *,
+    include_replica_awareness: bool = False,
 ) -> np.ndarray:
     service_count = int(context.service_catalog["num_services"])
     node_count = len(context.cache_nodes["node_ids"])
@@ -159,34 +183,89 @@ def _cache_candidate_feature(
     removed_popularity = float(sum(popularity[index] for index in candidate.removed_service_ids))
     before_used = cache_configuration.node_used_capacity_mb(before.astype(np.int8), sizes)
     after_used = cache_configuration.node_used_capacity_mb(after.astype(np.int8), sizes)
-    values = np.concatenate(
-        [
-            np.asarray(
-                [float(candidate.node_index) / max(node_count - 1, 1)],
-                dtype=np.float64,
-            ),
-            role_feature,
-            operation_feature,
-            before,
-            after,
-            delta,
-            np.asarray(
-                [
-                    before_used / max(capacity, 1.0e-12),
-                    after_used / max(capacity, 1.0e-12),
-                    (capacity - after_used) / max(capacity, 1.0e-12),
-                    added_size / max(capacity, 1.0e-12),
-                    removed_size / max(capacity, 1.0e-12),
-                    added_popularity,
-                    removed_popularity,
-                    math.log1p(max(float(total_cost), 0.0)),
-                    math.log1p(max(float(loading_energy[candidate.node_index]), 0.0)),
-                ],
-                dtype=np.float64,
-            ),
-        ]
+    replica_features = np.zeros(REPLICA_AWARE_CACHE_FEATURE_DIM, dtype=np.float64)
+    if include_replica_awareness:
+        current_cache_array = np.asarray(current_cache, dtype=np.int8)
+        trial_cache_array = np.asarray(trial, dtype=np.int8)
+        if current_cache_array.ndim != 2 or trial_cache_array.shape != current_cache_array.shape:
+            raise AssertionError("replica-aware cache state shape check failed.")
+        if current_cache_array.shape[1] != service_count or not current_cache_array.shape[0]:
+            raise AssertionError("replica-aware cache state dimension check failed.")
+        num_cache_nodes = int(current_cache_array.shape[0])
+
+        removed_service = (
+            None
+            if not candidate.removed_service_ids
+            else int(candidate.removed_service_ids[0])
+        )
+        added_service = (
+            None
+            if not candidate.added_service_ids
+            else int(candidate.added_service_ids[0])
+        )
+
+        def _replica_ratio_pair(service_id: int | None) -> tuple[float, float]:
+            if service_id is None:
+                return 0.0, 0.0
+            if service_id < 0 or service_id >= service_count:
+                raise AssertionError("cache candidate service ID is out of range.")
+            before_count = int(current_cache_array[:, service_id].sum())
+            after_count = int(trial_cache_array[:, service_id].sum())
+            return (
+                before_count / float(num_cache_nodes),
+                after_count / float(num_cache_nodes),
+            )
+
+        removed_before_ratio, removed_after_ratio = _replica_ratio_pair(removed_service)
+        added_before_ratio, added_after_ratio = _replica_ratio_pair(added_service)
+        removed_after_count = (
+            0
+            if removed_service is None
+            else int(trial_cache_array[:, removed_service].sum())
+        )
+        replica_features = np.asarray(
+            [
+                removed_before_ratio,
+                removed_after_ratio,
+                float(removed_after_count == 1) if removed_service is not None else 0.0,
+                float(removed_after_count == 0) if removed_service is not None else 0.0,
+                added_before_ratio,
+                added_after_ratio,
+            ],
+            dtype=np.float64,
+        )
+    feature_parts = [
+        np.asarray(
+            [float(candidate.node_index) / max(node_count - 1, 1)],
+            dtype=np.float64,
+        ),
+        role_feature,
+        operation_feature,
+        before,
+        after,
+        delta,
+        np.asarray(
+            [
+                before_used / max(capacity, 1.0e-12),
+                after_used / max(capacity, 1.0e-12),
+                (capacity - after_used) / max(capacity, 1.0e-12),
+                added_size / max(capacity, 1.0e-12),
+                removed_size / max(capacity, 1.0e-12),
+                added_popularity,
+                removed_popularity,
+                math.log1p(max(float(total_cost), 0.0)),
+                math.log1p(max(float(loading_energy[candidate.node_index]), 0.0)),
+            ],
+            dtype=np.float64,
+        ),
+    ]
+    if include_replica_awareness:
+        feature_parts.append(replica_features)
+    values = np.concatenate(feature_parts)
+    expected_dim = 17 + 3 * service_count + (
+        REPLICA_AWARE_CACHE_FEATURE_DIM if include_replica_awareness else 0
     )
-    if values.shape != (17 + 3 * service_count,) or not np.all(np.isfinite(values)):
+    if values.shape != (expected_dim,) or not np.all(np.isfinite(values)):
         raise AssertionError("cache primitive candidate feature shape/finite check failed。")
     return values.astype(np.float32)
 
@@ -532,6 +611,7 @@ def sample_and_apply_v7_cache_operation_configuration(
     tensor_spec: PrimitiveTensorSpec,
     *,
     deterministic: bool = False,
+    include_replica_awareness: bool = False,
 ) -> CacheOperationPrimitiveSelectionResult:
     """Sequentially sample V7 Cache operations and within-group candidates.
 
@@ -670,6 +750,7 @@ def sample_and_apply_v7_cache_operation_configuration(
                     cache_triggers,
                     step.predicted_service_popularity,
                     context,
+                    include_replica_awareness=include_replica_awareness,
                 )
                 for candidate in group_candidates
             ]
@@ -749,4 +830,30 @@ def sample_and_apply_v7_cache_operation_configuration(
         cache_old_log_probs=cache_old_log_probs,
         cache_conditional_actions=tuple(cache_actions),
         cache_candidate_counts=cache_counts,
+    )
+
+
+def sample_and_apply_v8_cache_operation_configuration(
+    policy: Any,
+    observation: np.ndarray,
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    step: Any,
+    context: Any,
+    tensor_spec: PrimitiveTensorSpec,
+    *,
+    deterministic: bool = False,
+) -> CacheOperationPrimitiveSelectionResult:
+    """Run the unchanged V7 hierarchy with V8 replica-aware candidate features."""
+
+    return sample_and_apply_v7_cache_operation_configuration(
+        policy,
+        observation,
+        previous_cache_state,
+        previous_uav_positions,
+        step,
+        context,
+        tensor_spec,
+        deterministic=bool(deterministic),
+        include_replica_awareness=True,
     )

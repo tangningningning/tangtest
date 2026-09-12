@@ -42,6 +42,7 @@ from .reporting import (
 )
 from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
+    AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
@@ -59,6 +60,7 @@ PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
 POPART_CHECKPOINT_VERSION = 6
 V7_CHECKPOINT_VERSION = 7
+V8_CHECKPOINT_VERSION = 8
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
@@ -77,7 +79,11 @@ V6_POLICY_SCHEMAS = frozenset(
 V7_POLICY_SCHEMAS = frozenset(
     {AdaptiveCacheOperationGroupV7PopArtActorCritic.architecture_id}
 )
-POPART_POLICY_SCHEMAS = V6_POLICY_SCHEMAS | V7_POLICY_SCHEMAS
+V8_POLICY_SCHEMAS = frozenset(
+    {AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic.architecture_id}
+)
+CACHE_OPERATION_POLICY_SCHEMAS = V7_POLICY_SCHEMAS | V8_POLICY_SCHEMAS
+POPART_POLICY_SCHEMAS = V6_POLICY_SCHEMAS | CACHE_OPERATION_POLICY_SCHEMAS
 SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
 HORIZON_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
 MODERN_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
@@ -982,11 +988,18 @@ class PPOV2Trainer:
             primitive_spec = PrimitiveTensorSpec.create(context)
             policy_class: type[AdaptivePrimitiveActorCritic]
             if context.configuration_control_mode == "policy_primitive_v7_cache_operation":
-                if context.policy_schema != AdaptiveCacheOperationGroupV7PopArtActorCritic.architecture_id:
+                if context.policy_schema not in CACHE_OPERATION_POLICY_SCHEMAS:
                     raise ValueError(
-                        "policy_primitive_v7_cache_operation requires the V7 policy schema"
+                        "policy_primitive_v7_cache_operation requires a supported "
+                        "Cache operation policy schema"
                     )
-                self.policy = AdaptiveCacheOperationGroupV7PopArtActorCritic(
+                policy_class = (
+                    AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
+                    if context.policy_schema
+                    == AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic.architecture_id
+                    else AdaptiveCacheOperationGroupV7PopArtActorCritic
+                )
+                self.policy = policy_class(
                     int(context.observation_spec.observation_dim),
                     int(context.action_spec.action_dim),
                     primitive_spec.cache_feature_dim,
@@ -1090,6 +1103,8 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
+        if self.policy.architecture_id in V8_POLICY_SCHEMAS:
+            return V8_CHECKPOINT_VERSION
         if self.policy.architecture_id in V7_POLICY_SCHEMAS:
             return V7_CHECKPOINT_VERSION
         if self.policy.architecture_id in V6_POLICY_SCHEMAS:
