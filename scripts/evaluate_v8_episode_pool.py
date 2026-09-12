@@ -15,6 +15,10 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from ppo_simple.v8_evaluator import evaluate_v8_episode
+from ppo_simple.evaluation_metrics import (
+    episode_metric_statistics,
+    execution_ratio_statistics,
+)
 
 
 def _resolve(project_root: Path, value: str | Path) -> Path:
@@ -64,15 +68,33 @@ def evaluate_pool(
                 if policy_sampling_seed is None
                 else int(policy_sampling_seed) + index
             ),
+            episode_seed=episode_seed,
         )
-        summaries.append({"episode_seed": episode_seed, **summary})
+        if int(summary["episode_seed"]) != episode_seed:
+            raise AssertionError("V8 evaluator returned an unexpected episode_seed")
+        summaries.append(summary)
+    experiment_seeds = {int(summary["experiment_seed"]) for summary in summaries}
+    if len(experiment_seeds) != 1:
+        raise AssertionError("V8 evaluation pool contains inconsistent experiment_seed values")
+    metric_names = (
+        "total_return",
+        "total_q",
+        "total_cache_cost",
+        "cache_change_rate",
+        "mean_task_delay_s",
+        "mean_vehicle_energy_j",
+    )
     output_path.mkdir(parents=True, exist_ok=True)
     aggregate = {
         "experiment_type": "v8_episode_pool_evaluation",
         "episode_pool": str(pool_path),
+        "experiment_seed": next(iter(experiment_seeds)),
+        "episode_count": len(summaries),
         "seed_start": int(seed_start),
         "episodes": int(episodes),
         "policy_action_mode": policy_action_mode,
+        "aggregate_statistics": episode_metric_statistics(summaries, metric_names),
+        "execution_ratio_statistics": execution_ratio_statistics(summaries),
         "summaries": summaries,
     }
     with (output_path / "v8_episode_pool_summary.json").open(

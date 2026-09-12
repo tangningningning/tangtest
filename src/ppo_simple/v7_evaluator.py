@@ -18,6 +18,11 @@ except ModuleNotFoundError:  # pragma: no cover - import-only environments
 from common import project_config
 
 from . import interface
+from .evaluation_metrics import (
+    aggregate_episode_task_metrics,
+    infer_episode_seed,
+    slot_task_metrics_dict,
+)
 from .interface import _copy_uav_positions
 from .policy import AdaptiveCacheOperationGroupV7PopArtActorCritic
 from .rollout import collect_rollout
@@ -107,7 +112,14 @@ def _validate_v7_context(context: Any) -> None:
         raise ValueError("V7 evaluation requires a prediction horizon mask")
 
 
-def _summary(context: Any, rollout: Any, policy_action_mode: str) -> dict[str, Any]:
+def _summary(
+    context: Any,
+    rollout: Any,
+    policy_action_mode: str,
+    *,
+    experiment_seed: int,
+    episode_seed: int,
+) -> dict[str, Any]:
     if rollout.v7_cache_operation_actions is None:
         raise ValueError("V7 rollout is missing operation actions")
     if rollout.v7_cache_operation_masks is None:
@@ -148,7 +160,10 @@ def _summary(context: Any, rollout: Any, policy_action_mode: str) -> dict[str, A
     )
     if actual_uav_movements != 0 or total_movement_cost != 0.0:
         raise AssertionError("V7 Cache-only evaluation moved a UAV")
+    task_metrics = aggregate_episode_task_metrics(rollout.transitions)
     return {
+        "experiment_seed": int(experiment_seed),
+        "episode_seed": int(episode_seed),
         "policy_schema": str(context.policy_schema),
         "policy_action_mode": policy_action_mode,
         "episode_slots": 300,
@@ -164,6 +179,7 @@ def _summary(context: Any, rollout: Any, policy_action_mode: str) -> dict[str, A
         "uav_movement_rate": float(actual_uav_movements)
         / float(300 * uav_count),
         "uav_movement_count": actual_uav_movements,
+        **task_metrics,
         "selected_action_sha256": hashlib.sha256(
             np.ascontiguousarray(rollout.actions, dtype=np.int8).tobytes(order="C")
         ).hexdigest(),
@@ -178,6 +194,7 @@ def evaluate_v7_episode(
     device: str = "cpu",
     policy_action_mode: str = "deterministic",
     policy_sampling_seed: int | None = None,
+    episode_seed: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Evaluate one frozen V7 policy on one complete 0..299 realization."""
 
@@ -195,6 +212,18 @@ def evaluate_v7_episode(
         realization_dir=realization_dir,
     )
     _validate_v7_context(context)
+    resolved_episode_seed = (
+        None if episode_seed is None else int(episode_seed)
+    )
+    if resolved_episode_seed is None:
+        resolved_episode_seed = infer_episode_seed(realization_dir)
+    if resolved_episode_seed is None:
+        raise ValueError(
+            "V7 evaluation requires an explicit episode_seed or episode_<seed> realization"
+        )
+    experiment_seed = int(
+        project_config.get_config_value(context.cfg, "experiment.seed")
+    )
     trainer = PPOV2Trainer(context, device=device)
     config_sha256 = _sha256(resolved_config)
     cursor = trainer.load_checkpoint(resolved_checkpoint, config_sha256)
@@ -223,7 +252,13 @@ def evaluate_v7_episode(
         raise RuntimeError("V7 evaluation modified policy parameters")
     if trainer.policy.popart_statistics() != popart_snapshot:
         raise RuntimeError("V7 evaluation modified PopArt statistics")
-    summary = _summary(context, rollout, mode)
+    summary = _summary(
+        context,
+        rollout,
+        mode,
+        experiment_seed=experiment_seed,
+        episode_seed=resolved_episode_seed,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "experiment_type": "v7_full_episode_evaluation",
@@ -231,6 +266,8 @@ def evaluate_v7_episode(
         "config_sha256": config_sha256,
         "checkpoint_path": str(resolved_checkpoint),
         "checkpoint_completed_epochs": int(cursor.completed_episodes),
+        "experiment_seed": int(experiment_seed),
+        "episode_seed": int(resolved_episode_seed),
         "policy_schema": str(context.policy_schema),
         "configuration_control_mode": str(context.configuration_control_mode),
         "data_protocol": project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
@@ -254,9 +291,12 @@ def evaluate_v7_episode(
             np.asarray(rollout.v7_cache_operation_actions, dtype=np.int64),
             strict=True,
         ):
+            task_metrics = slot_task_metrics_dict(transition)
             stream.write(
                 json.dumps(
                     {
+                        "experiment_seed": int(experiment_seed),
+                        "episode_seed": int(resolved_episode_seed),
                         "origin": int(transition.origin_index),
                         "reward": float(transition.reward),
                         "q": float(transition.actual_task_utility),
@@ -264,6 +304,7 @@ def evaluate_v7_episode(
                         "movement_cost": float(transition.movement_cost),
                         "cache_change_count": int(transition.actual_cache_update_count),
                         "uav_movement_count": int(transition.actual_uav_movement_count),
+                        **task_metrics,
                         "operation_counts": {
                             name: int(np.sum(operation_row == index))
                             for index, name in enumerate(V7_OPERATION_ORDER)

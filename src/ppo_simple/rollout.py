@@ -11,6 +11,7 @@ import numpy as np
 from decision import cache_configuration, slot_environment
 
 from . import interface
+from .evaluation_metrics import task_metrics_from_result
 from .interface import _copy_uav_positions
 from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
@@ -41,6 +42,10 @@ class SimpleTransition:
     actual_task_utility: float
     cache_cost: float
     movement_cost: float
+    task_count: int
+    total_task_delay_s: float
+    total_vehicle_energy_j: float
+    execution_target_counts: dict[str, int]
     actual_cache_update_count: int
     actual_uav_movement_count: int
     cache_contexts: np.ndarray
@@ -466,6 +471,7 @@ def collect_rollout(
             )
         _check_request_contract(previous_cache, previous_uav, result, context.action_spec)
         reward = _check_reward(result)
+        task_metrics = task_metrics_from_result(result, context.cache_nodes)
         done = int(step.origin_index) == terminal_origin_index
         if done and step_index != len(execution_steps) - 1:
             raise ValueError("true episode terminal 必须是 rollout 的最后一步。")
@@ -498,6 +504,10 @@ def collect_rollout(
                 actual_task_utility=float(result.actual_task_utility),
                 cache_cost=float(result.cache_cost),
                 movement_cost=float(result.movement_cost),
+                task_count=int(task_metrics.task_count),
+                total_task_delay_s=float(task_metrics.total_task_delay_s),
+                total_vehicle_energy_j=float(task_metrics.total_vehicle_energy_j),
+                execution_target_counts=dict(task_metrics.execution_target_counts),
                 actual_cache_update_count=actual_cache_update_count,
                 actual_uav_movement_count=actual_uav_movement_count,
                 cache_contexts=cache_contexts.copy(),
