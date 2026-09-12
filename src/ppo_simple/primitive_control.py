@@ -11,10 +11,19 @@ import numpy as np
 from decision import cache_configuration, uav_configuration
 
 from . import interface
+from .no_prediction import (
+    NO_PREDICTION_POLICY_SCHEMA,
+    is_no_prediction_context,
+    mask_no_prediction_observation,
+    zero_predicted_popularity,
+)
 
 
 REPLICA_AWARE_POLICY_SCHEMA = (
     "adaptive_cache_operation_group_replica_aware_v8_popart"
+)
+REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
+    {REPLICA_AWARE_POLICY_SCHEMA, NO_PREDICTION_POLICY_SCHEMA}
 )
 REPLICA_AWARE_CACHE_FEATURE_NAMES = (
     "removed_replica_before_ratio",
@@ -44,7 +53,7 @@ class PrimitiveTensorSpec:
         search = uav_configuration.uav_search_config_from_project(context.cfg)
         replica_aware = (
             str(getattr(context, "policy_schema", ""))
-            == REPLICA_AWARE_POLICY_SCHEMA
+            in REPLICA_AWARE_POLICY_SCHEMAS
         )
         return cls(
             num_cache_heads=len(context.action_spec.cache_node_ids),
@@ -122,7 +131,7 @@ def _intermediate_observation(
         if observation_time_to_go is None
         else float(observation_time_to_go(int(step.origin_index)))
     )
-    return interface.build_step_observation(
+    observation = interface.build_step_observation(
         cache_state,
         uav_positions,
         step,
@@ -132,6 +141,9 @@ def _intermediate_observation(
         context.train_origin_end,
         time_to_go_override=time_to_go_override,
     )
+    if is_no_prediction_context(context):
+        return mask_no_prediction_observation(observation, context.observation_spec)
+    return observation
 
 
 def _cache_candidate_feature(
@@ -612,6 +624,7 @@ def sample_and_apply_v7_cache_operation_configuration(
     *,
     deterministic: bool = False,
     include_replica_awareness: bool = False,
+    predicted_popularity: dict[int, float] | None = None,
 ) -> CacheOperationPrimitiveSelectionResult:
     """Sequentially sample V7 Cache operations and within-group candidates.
 
@@ -663,6 +676,11 @@ def sample_and_apply_v7_cache_operation_configuration(
     cache_actions: list[dict[str, Any]] = []
     total_log_prob: Any | None = None
     total_entropy: Any | None = None
+    candidate_predicted_popularity = (
+        step.predicted_service_popularity
+        if predicted_popularity is None
+        else predicted_popularity
+    )
 
     for node_index, node_id in enumerate(context.action_spec.cache_node_ids):
         conditional_context = _intermediate_observation(
@@ -748,7 +766,7 @@ def sample_and_apply_v7_cache_operation_configuration(
                     cache,
                     previous_cache,
                     cache_triggers,
-                    step.predicted_service_popularity,
+                    candidate_predicted_popularity,
                     context,
                     include_replica_awareness=include_replica_awareness,
                 )
@@ -856,4 +874,33 @@ def sample_and_apply_v8_cache_operation_configuration(
         tensor_spec,
         deterministic=bool(deterministic),
         include_replica_awareness=True,
+    )
+
+
+def sample_and_apply_v8_no_prediction_cache_operation_configuration(
+    policy: Any,
+    observation: np.ndarray,
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    step: Any,
+    context: Any,
+    tensor_spec: PrimitiveTensorSpec,
+    *,
+    deterministic: bool = False,
+) -> CacheOperationPrimitiveSelectionResult:
+    """Run V8's unchanged hierarchy with prediction popularity features zeroed."""
+
+    return sample_and_apply_v7_cache_operation_configuration(
+        policy,
+        observation,
+        previous_cache_state,
+        previous_uav_positions,
+        step,
+        context,
+        tensor_spec,
+        deterministic=bool(deterministic),
+        include_replica_awareness=True,
+        predicted_popularity=zero_predicted_popularity(
+            int(context.service_catalog["num_services"])
+        ),
     )

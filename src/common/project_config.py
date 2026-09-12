@@ -816,6 +816,7 @@ def validate_config(
         "adaptive_primitive_v6_horizon_grouped_separate_critic_popart",
         "adaptive_cache_operation_group_v7_popart",
         "adaptive_cache_operation_group_replica_aware_v8_popart",
+        "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -826,7 +827,8 @@ def validate_config(
             "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization/"
             "adaptive_primitive_v6_horizon_grouped_separate_critic_popart/"
             "adaptive_cache_operation_group_v7_popart/"
-            "adaptive_cache_operation_group_replica_aware_v8_popart."
+            "adaptive_cache_operation_group_replica_aware_v8_popart/"
+            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart."
         )
     if (
         configuration_control_mode == "policy_primitive_v7_cache_operation"
@@ -834,12 +836,14 @@ def validate_config(
         not in {
             "adaptive_cache_operation_group_v7_popart",
             "adaptive_cache_operation_group_replica_aware_v8_popart",
+            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart",
         }
     ):
         raise ValueError(
             "policy_primitive_v7_cache_operation requires "
             "adaptive_cache_operation_group_v7_popart/"
-            "adaptive_cache_operation_group_replica_aware_v8_popart."
+            "adaptive_cache_operation_group_replica_aware_v8_popart/"
+            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:

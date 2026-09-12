@@ -3,6 +3,7 @@
 from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
+    AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
     AdaptivePrimitiveHorizonGroupedV3ActorCritic,
@@ -16,6 +17,7 @@ from .policy import (
 __all__ = [
     "AdaptiveCacheOperationGroupV7PopArtActorCritic",
     "AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic",
+    "AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic",
     "AdaptivePrimitiveActorCritic",
     "AdaptivePrimitiveGroupedV2ActorCritic",
     "AdaptivePrimitiveHorizonGroupedV3ActorCritic",

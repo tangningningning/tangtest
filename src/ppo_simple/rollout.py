@@ -13,9 +13,15 @@ from decision import cache_configuration, slot_environment
 from . import interface
 from .evaluation_metrics import task_metrics_from_result
 from .interface import _copy_uav_positions
+from .no_prediction import (
+    NO_PREDICTION_POLICY_SCHEMA,
+    is_no_prediction_context,
+    mask_no_prediction_observation,
+)
 from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
+    AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
     AdaptivePrimitiveActorCritic,
     BernoulliActorCritic,
     PolicySample,
@@ -24,6 +30,7 @@ from .primitive_control import (
     PrimitiveTensorSpec,
     sample_and_apply_primitive_configuration,
     sample_and_apply_v8_cache_operation_configuration,
+    sample_and_apply_v8_no_prediction_cache_operation_configuration,
     sample_and_apply_v7_cache_operation_configuration,
 )
 
@@ -113,8 +120,9 @@ def _observation(
     train_origin_end: int,
     *,
     time_to_go_override: float | None = None,
+    no_prediction: bool = False,
 ) -> np.ndarray:
-    return interface.build_step_observation(
+    observation = interface.build_step_observation(
         previous_cache,
         previous_uav,
         step,
@@ -124,6 +132,9 @@ def _observation(
         train_origin_end,
         time_to_go_override=time_to_go_override,
     )
+    if no_prediction:
+        return mask_no_prediction_observation(observation, observation_spec)
+    return observation
 
 
 def _check_reward(result: slot_environment.SlotExecutionResult) -> float:
@@ -212,6 +223,7 @@ def collect_rollout(
             context.train_origin_start,
             context.train_origin_end,
             time_to_go_override=time_to_go_override,
+            no_prediction=is_no_prediction_context(context),
         )
         if observation.shape != (int(context.observation_spec.observation_dim),):
             raise AssertionError("PPO v2 observation 不符合 observation_spec。")
@@ -228,7 +240,27 @@ def collect_rollout(
                 raise ValueError(
                     "V7 Cache-only rollout does not support binary-trigger diagnostics"
                 )
-            if isinstance(
+            if context.policy_schema == NO_PREDICTION_POLICY_SCHEMA:
+                if (
+                    type(policy)
+                    is not AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic
+                ):
+                    raise TypeError(
+                        "no-prediction schema requires the exact V8 no-prediction policy"
+                    )
+                v7_primitive = (
+                    sample_and_apply_v8_no_prediction_cache_operation_configuration(
+                        policy,
+                        observation,
+                        previous_cache,
+                        previous_uav,
+                        step,
+                        context,
+                        tensor_spec,
+                        deterministic=bool(deterministic),
+                    )
+                )
+            elif isinstance(
                 policy, AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
             ):
                 v7_primitive = sample_and_apply_v8_cache_operation_configuration(
@@ -583,6 +615,7 @@ def collect_rollout(
             context.train_origin_start,
             context.train_origin_end,
             time_to_go_override=time_to_go_override,
+            no_prediction=is_no_prediction_context(context),
         )
 
     return SimpleRollout(

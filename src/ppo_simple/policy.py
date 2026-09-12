@@ -1196,3 +1196,16 @@ class AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic(
     architecture_id = "adaptive_cache_operation_group_replica_aware_v8_popart"
     architecture_version = 1
     replica_aware_candidate_features = True
+
+
+class AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic(
+    AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
+):
+    """V8 hierarchy with future vehicle/popularity inputs masked at rollout time."""
+
+    architecture_id = (
+        "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart"
+    )
+    architecture_version = 1
+    replica_aware_candidate_features = True
+    no_prediction_ablation = True
