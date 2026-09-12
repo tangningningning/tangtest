@@ -65,6 +65,29 @@ class PrimitiveSelectionResult:
     uav_candidate_counts: np.ndarray
 
 
+@dataclass(frozen=True)
+class CacheOperationPrimitiveSelectionResult:
+    """One sequential V7 Cache operation/candidate decision result."""
+
+    final_cache_state: np.ndarray
+    final_uav_positions: dict[str, tuple[float, float]]
+    derived_action: np.ndarray
+    value: Any
+    total_log_prob: Any
+    total_entropy: Any
+    operation_actions: np.ndarray
+    operation_masks: np.ndarray
+    operation_old_log_probs: np.ndarray
+    operation_entropies: np.ndarray
+    cache_contexts: np.ndarray
+    cache_candidate_features: np.ndarray
+    cache_candidate_masks: np.ndarray
+    cache_selected_indices: np.ndarray
+    cache_old_log_probs: np.ndarray
+    cache_conditional_actions: tuple[dict[str, Any], ...]
+    cache_candidate_counts: np.ndarray
+
+
 def _intermediate_observation(
     cache_state: np.ndarray,
     uav_positions: dict[str, Any],
@@ -496,4 +519,234 @@ def sample_and_apply_primitive_configuration(
         uav_conditional_actions=tuple(uav_actions),
         cache_candidate_counts=cache_counts,
         uav_candidate_counts=uav_counts,
+    )
+
+
+def sample_and_apply_v7_cache_operation_configuration(
+    policy: Any,
+    observation: np.ndarray,
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    step: Any,
+    context: Any,
+    tensor_spec: PrimitiveTensorSpec,
+    *,
+    deterministic: bool = False,
+) -> CacheOperationPrimitiveSelectionResult:
+    """Sequentially sample V7 Cache operations and within-group candidates.
+
+    The operation mask is derived from the production candidate enumeration at
+    the current Cache state.  A NO_CHANGE decision ends that node's decision;
+    it never invokes a second candidate categorical distribution.
+    """
+
+    operation_order = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
+    if tuple(getattr(policy, "operation_order", ())) != operation_order:
+        raise ValueError("V7 policy operation order must be NO_CHANGE/ADD/DELETE/SWAP")
+    cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
+    previous_cache = cache.copy()
+    previous_uav = {
+        uav_id: np.asarray(previous_uav_positions[uav_id], dtype=np.float64).copy()
+        for uav_id in context.action_spec.uav_ids
+    }
+    current_uav = {key: value.copy() for key, value in previous_uav.items()}
+    if tensor_spec.num_cache_heads != len(context.action_spec.cache_node_ids):
+        raise ValueError("V7 tensor spec cache head count does not match action spec")
+
+    operation_actions = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+    operation_masks = np.zeros(
+        (tensor_spec.num_cache_heads, len(operation_order)),
+        dtype=bool,
+    )
+    operation_old_log_probs = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+    operation_entropies = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+    cache_contexts = np.zeros(
+        (tensor_spec.num_cache_heads, tensor_spec.observation_dim), dtype=np.float32
+    )
+    cache_features = np.zeros(
+        (
+            tensor_spec.num_cache_heads,
+            tensor_spec.cache_max_candidates,
+            tensor_spec.cache_feature_dim,
+        ),
+        dtype=np.float32,
+    )
+    cache_masks = np.zeros(
+        (tensor_spec.num_cache_heads, tensor_spec.cache_max_candidates),
+        dtype=bool,
+    )
+    cache_masks[:, 0] = True
+    cache_selected = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+    cache_old_log_probs = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+    cache_counts = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+    cache_triggers = np.zeros(tensor_spec.num_cache_heads, dtype=np.int8)
+    cache_actions: list[dict[str, Any]] = []
+    total_log_prob: Any | None = None
+    total_entropy: Any | None = None
+
+    for node_index, node_id in enumerate(context.action_spec.cache_node_ids):
+        conditional_context = _intermediate_observation(
+            cache,
+            current_uav,
+            step,
+            context,
+        )
+        candidates = cache_configuration.enumerate_cache_primitive_actions(
+            cache,
+            node_index,
+            context.service_catalog,
+            context.cache_nodes,
+        )
+        operation_mask = np.zeros(len(operation_order), dtype=bool)
+        operation_mask[0] = True
+        for candidate in candidates:
+            try:
+                operation_index = operation_order.index(str(candidate.operation_type))
+            except ValueError as exc:
+                raise ValueError(
+                    f"unsupported production cache operation: {candidate.operation_type}"
+                ) from exc
+            operation_mask[operation_index] = True
+        sampled_operation = policy.sample_cache_operation(
+            conditional_context,
+            node_index,
+            operation_mask,
+            deterministic=bool(deterministic),
+        )
+        selected_operation_index = int(sampled_operation.selected_index)
+        selected_operation = operation_order[selected_operation_index]
+        operation_actions[node_index] = selected_operation_index
+        operation_masks[node_index] = operation_mask
+        operation_old_log_probs[node_index] = float(
+            sampled_operation.log_prob.detach().cpu()
+        )
+        operation_entropies[node_index] = float(
+            sampled_operation.entropy.detach().cpu()
+        )
+        cache_contexts[node_index] = conditional_context
+        total_log_prob = (
+            sampled_operation.log_prob
+            if total_log_prob is None
+            else total_log_prob + sampled_operation.log_prob
+        )
+        total_entropy = (
+            sampled_operation.entropy
+            if total_entropy is None
+            else total_entropy + sampled_operation.entropy
+        )
+
+        if selected_operation_index == 0:
+            cache_actions.append(
+                {
+                    "head_type": "cache",
+                    "head_id": str(node_id),
+                    "head_index": node_index,
+                    "candidate_count": 0,
+                    "selected_index": None,
+                    "operation_type": "NO_CHANGE",
+                    "added_service_ids": [],
+                    "removed_service_ids": [],
+                    "actual_changed": False,
+                }
+            )
+            continue
+
+        cache_triggers[node_index] = 1
+        group_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.operation_type) == selected_operation
+        ]
+        if not group_candidates:
+            raise AssertionError(
+                "V7 selected an operation whose production candidate group is empty"
+            )
+        candidate_features = np.stack(
+            [
+                _cache_candidate_feature(
+                    candidate,
+                    cache,
+                    previous_cache,
+                    cache_triggers,
+                    step.predicted_service_popularity,
+                    context,
+                )
+                for candidate in group_candidates
+            ]
+        )
+        count = len(group_candidates)
+        if count > tensor_spec.cache_max_candidates:
+            raise AssertionError("V7 cache candidate count exceeds padded capacity")
+        sampled_candidate = policy.sample_cache_candidate_v7(
+            conditional_context,
+            candidate_features,
+            deterministic=bool(deterministic),
+        )
+        selected_index = int(sampled_candidate.selected_index)
+        selected = group_candidates[selected_index]
+        applied = cache_configuration.apply_cache_candidate(
+            cache,
+            node_index,
+            selected.after_node_cache,
+            context.service_catalog,
+            context.cache_nodes,
+        )
+        cache_features[node_index, :count] = candidate_features
+        cache_masks[node_index, :count] = True
+        cache_selected[node_index] = selected_index
+        cache_old_log_probs[node_index] = float(
+            sampled_candidate.log_prob.detach().cpu()
+        )
+        cache_counts[node_index] = count
+        total_log_prob = total_log_prob + sampled_candidate.log_prob
+        total_entropy = total_entropy + sampled_candidate.entropy
+        cache_actions.append(
+            {
+                "head_type": "cache",
+                "head_id": str(node_id),
+                "head_index": node_index,
+                "candidate_count": count,
+                "selected_index": selected_index,
+                "operation_type": selected.operation_type,
+                "added_service_ids": list(selected.added_service_ids),
+                "removed_service_ids": list(selected.removed_service_ids),
+                "actual_changed": bool(applied["actual_changed"]),
+            }
+        )
+
+    if total_log_prob is None or total_entropy is None:
+        raise RuntimeError("V7 Cache operation selection produced no heads")
+    cache_configuration.validate_cache_shape_and_capacity(
+        cache,
+        context.service_catalog,
+        context.cache_nodes,
+    )
+    derived_action = np.concatenate(
+        [
+            cache_triggers,
+            np.zeros(len(context.action_spec.uav_ids), dtype=np.int8),
+        ]
+    ).astype(np.int8)
+    value = policy.critic_value(observation)
+    return CacheOperationPrimitiveSelectionResult(
+        final_cache_state=cache.copy(),
+        final_uav_positions={
+            key: (float(value[0]), float(value[1]))
+            for key, value in current_uav.items()
+        },
+        derived_action=derived_action,
+        value=value,
+        total_log_prob=total_log_prob,
+        total_entropy=total_entropy,
+        operation_actions=operation_actions,
+        operation_masks=operation_masks,
+        operation_old_log_probs=operation_old_log_probs,
+        operation_entropies=operation_entropies,
+        cache_contexts=cache_contexts,
+        cache_candidate_features=cache_features,
+        cache_candidate_masks=cache_masks,
+        cache_selected_indices=cache_selected,
+        cache_old_log_probs=cache_old_log_probs,
+        cache_conditional_actions=tuple(cache_actions),
+        cache_candidate_counts=cache_counts,
     )

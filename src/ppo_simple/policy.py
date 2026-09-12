@@ -43,6 +43,14 @@ class CandidatePolicySample:
     logits: Any
 
 
+@dataclass(frozen=True)
+class OperationPolicySample:
+    selected_index: int
+    log_prob: Any
+    entropy: Any
+    logits: Any
+
+
 def _require_torch() -> None:
     if torch is None or nn is None:
         raise ImportError("PPO v2 requires PyTorch.")
@@ -841,3 +849,340 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic(
             self.critic_head.bias.mul_(std_old).add_(mean_old - mean_new).div_(std_new)
             self.popart_mean.fill_(mean_new)
             self.popart_std.fill_(std_new)
+
+
+class AdaptiveCacheOperationGroupV7PopArtActorCritic(
+    AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
+):
+    """V7 Cache-only hierarchical policy on top of the frozen V6 backbone.
+
+    The inherited V6 binary trigger head and UAV scorer remain in the module
+    hierarchy for checkpoint compatibility, but V7 training does not use
+    either of them.  Cache operation logits are produced by a new per-node
+    four-way head, while candidate logits are the raw cache scorer scores
+    restricted to the operation selected by that head.
+    """
+
+    architecture_id = "adaptive_cache_operation_group_v7_popart"
+    architecture_version = 1
+    operation_order = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        cache_feature_dim: int,
+        uav_feature_dim: int,
+        num_cache_heads: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(
+            observation_dim,
+            action_dim,
+            cache_feature_dim,
+            uav_feature_dim,
+            hidden_sizes,
+        )
+        if int(num_cache_heads) <= 0:
+            raise ValueError("V7 num_cache_heads must be positive")
+        self.num_cache_heads = int(num_cache_heads)
+        self.cache_operation_head = nn.Linear(
+            self.hidden_dim,
+            self.num_cache_heads * len(self.operation_order),
+        )
+
+    def actor_parameters(self) -> tuple[Any, ...]:
+        """Return only parameters used by the V7 Cache policy."""
+
+        modules = (
+            self.encoder,
+            self.cache_candidate_scorer,
+            self.cache_operation_head,
+        )
+        parameters = tuple(
+            parameter
+            for module in modules
+            for parameter in module.parameters()
+        )
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise RuntimeError("V7 actor parameter group contains duplicate parameters.")
+        return parameters
+
+    def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
+        obs, single = self._observations(observations)
+        hidden = self.encoder(obs)
+        logits = self.cache_operation_head(hidden).reshape(
+            int(obs.shape[0]),
+            self.num_cache_heads,
+            len(self.operation_order),
+        )
+        return (logits.squeeze(0) if single else logits), single
+
+    def sample_cache_operation(
+        self,
+        observation: Any,
+        head_index: int,
+        operation_mask: Any,
+        deterministic: bool = False,
+    ) -> OperationPolicySample:
+        """Sample one node's operation using its dynamic feasibility mask."""
+
+        logits, single = self._operation_logits(observation)
+        if not single or tuple(logits.shape) != (
+            self.num_cache_heads,
+            len(self.operation_order),
+        ):
+            raise ValueError("V7 operation sampling requires one observation")
+        index = int(head_index)
+        if index < 0 or index >= self.num_cache_heads:
+            raise IndexError("V7 cache operation head index out of range")
+        mask = torch.as_tensor(
+            np.asarray(operation_mask, dtype=bool).reshape(-1),
+            dtype=torch.bool,
+            device=logits.device,
+        )
+        if tuple(mask.shape) != (len(self.operation_order),) or not bool(
+            torch.any(mask).item()
+        ):
+            raise ValueError("V7 operation mask must allow at least one operation")
+        masked_logits = logits[index].masked_fill(~mask, -float("inf"))
+        distribution = torch.distributions.Categorical(logits=masked_logits)
+        selected = (
+            int(torch.argmax(distribution.logits).item())
+            if deterministic
+            else int(distribution.sample().item())
+        )
+        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=logits.device)
+        return OperationPolicySample(
+            selected_index=selected,
+            log_prob=distribution.log_prob(selected_tensor),
+            entropy=distribution.entropy(),
+            logits=masked_logits,
+        )
+
+    def sample_cache_candidate_v7(
+        self,
+        observation: Any,
+        candidate_features: Any,
+        candidate_mask: Any | None = None,
+        deterministic: bool = False,
+    ) -> CandidatePolicySample:
+        """Sample only within one operation group using raw scorer scores."""
+
+        scores, single = self._candidate_scores(
+            observation,
+            candidate_features,
+            self.cache_feature_dim,
+            self.cache_candidate_scorer,
+        )
+        if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
+            raise ValueError("V7 candidate sampling requires one context")
+        raw_scores = scores.squeeze(0)
+        if candidate_mask is None:
+            mask = torch.ones_like(raw_scores, dtype=torch.bool)
+        else:
+            mask = torch.as_tensor(
+                np.asarray(candidate_mask, dtype=bool).reshape(-1),
+                dtype=torch.bool,
+                device=raw_scores.device,
+            )
+        if tuple(mask.shape) != tuple(raw_scores.shape) or not bool(
+            torch.any(mask).item()
+        ):
+            raise ValueError("V7 candidate mask must allow at least one candidate")
+        distribution_logits = raw_scores.masked_fill(~mask, -float("inf"))
+        distribution = torch.distributions.Categorical(logits=distribution_logits)
+        selected = (
+            int(torch.argmax(distribution.logits).item())
+            if deterministic
+            else int(distribution.sample().item())
+        )
+        selected_tensor = torch.as_tensor(
+            selected,
+            dtype=torch.long,
+            device=raw_scores.device,
+        )
+        return CandidatePolicySample(
+            selected_index=selected,
+            log_prob=distribution.log_prob(selected_tensor),
+            entropy=distribution.entropy(),
+            logits=distribution_logits,
+        )
+
+    def evaluate_cache_operation_primitive(
+        self,
+        observations: Any,
+        operation_contexts: Any,
+        operation_masks: Any,
+        operation_actions: Any,
+        candidate_features: Any,
+        candidate_masks: Any,
+        candidate_selected_indices: Any,
+    ) -> PolicyEvaluation:
+        """Evaluate the V7 joint operation-plus-candidate distribution."""
+
+        observations_t, _ = self._observations(observations)
+        operation_contexts_t = torch.as_tensor(
+            operation_contexts,
+            dtype=torch.float32,
+            device=observations_t.device,
+        )
+        operation_masks_t = torch.as_tensor(
+            operation_masks,
+            dtype=torch.bool,
+            device=observations_t.device,
+        )
+        operation_actions_t = torch.as_tensor(
+            operation_actions,
+            dtype=torch.long,
+            device=observations_t.device,
+        )
+        candidate_features_t = torch.as_tensor(
+            candidate_features,
+            dtype=torch.float32,
+            device=observations_t.device,
+        )
+        candidate_masks_t = torch.as_tensor(
+            candidate_masks,
+            dtype=torch.bool,
+            device=observations_t.device,
+        )
+        candidate_selected_t = torch.as_tensor(
+            candidate_selected_indices,
+            dtype=torch.long,
+            device=observations_t.device,
+        )
+        if operation_contexts_t.ndim != 3:
+            raise ValueError("V7 operation_contexts must be [B,H,observation_dim]")
+        batch_size, head_count, observation_dim = [
+            int(value) for value in operation_contexts_t.shape
+        ]
+        if batch_size != int(observations_t.shape[0]):
+            raise ValueError("V7 operation_contexts batch dimension mismatch")
+        if head_count != self.num_cache_heads or observation_dim != self.observation_dim:
+            raise ValueError("V7 operation_contexts shape mismatch")
+        expected_operation_shape = (
+            batch_size,
+            self.num_cache_heads,
+            len(self.operation_order),
+        )
+        if tuple(operation_masks_t.shape) != expected_operation_shape:
+            raise ValueError("V7 operation_masks shape mismatch")
+        if tuple(operation_actions_t.shape) != (
+            batch_size,
+            self.num_cache_heads,
+        ):
+            raise ValueError("V7 operation_actions shape mismatch")
+        if bool(torch.any(operation_actions_t < 0).item()) or bool(
+            torch.any(operation_actions_t >= len(self.operation_order)).item()
+        ):
+            raise ValueError("V7 operation action index out of range")
+        if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
+            raise ValueError("V7 operation mask cannot block every operation")
+
+        all_operation_logits, _ = self._operation_logits(
+            operation_contexts_t.reshape(batch_size * head_count, observation_dim)
+        )
+        all_operation_logits = all_operation_logits.reshape(
+            batch_size,
+            head_count,
+            self.num_cache_heads,
+            len(self.operation_order),
+        )
+        head_indices = torch.arange(
+            self.num_cache_heads,
+            dtype=torch.long,
+            device=all_operation_logits.device,
+        )
+        operation_logits = all_operation_logits[:, head_indices, head_indices, :]
+        if tuple(operation_logits.shape) != expected_operation_shape:
+            raise AssertionError("V7 operation head diagonal shape mismatch")
+        operation_logits = operation_logits.masked_fill(
+            ~operation_masks_t,
+            -float("inf"),
+        )
+        operation_distribution = torch.distributions.Categorical(logits=operation_logits)
+        operation_valid = operation_masks_t.gather(
+            -1,
+            operation_actions_t.unsqueeze(-1),
+        ).squeeze(-1)
+        if not bool(torch.all(operation_valid).item()):
+            raise ValueError("V7 operation action is blocked by its operation mask")
+        operation_log_prob = operation_distribution.log_prob(operation_actions_t).sum(dim=-1)
+        operation_entropy = torch.where(
+            operation_masks_t.sum(dim=-1) == 1,
+            torch.zeros_like(operation_distribution.entropy()),
+            operation_distribution.entropy(),
+        ).sum(dim=-1)
+
+        if candidate_features_t.ndim != 4:
+            raise ValueError("V7 candidate_features must be [B,H,C,F]")
+        if tuple(candidate_features_t.shape[:2]) != (
+            batch_size,
+            self.num_cache_heads,
+        ) or int(candidate_features_t.shape[-1]) != self.cache_feature_dim:
+            raise ValueError("V7 candidate_features shape mismatch")
+        candidate_count = int(candidate_features_t.shape[2])
+        if candidate_count <= 0:
+            raise ValueError("V7 candidate tensor must have positive width")
+        expected_candidate_shape = (
+            batch_size,
+            self.num_cache_heads,
+            candidate_count,
+        )
+        if tuple(candidate_masks_t.shape) != expected_candidate_shape:
+            raise ValueError("V7 candidate_masks shape mismatch")
+        if tuple(candidate_selected_t.shape) != (
+            batch_size,
+            self.num_cache_heads,
+        ):
+            raise ValueError("V7 candidate_selected_indices shape mismatch")
+        if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
+            raise ValueError("V7 candidate mask must have a placeholder or active candidate")
+        if bool(torch.any(candidate_selected_t < 0).item()) or bool(
+            torch.any(candidate_selected_t >= candidate_count).item()
+        ):
+            raise ValueError("V7 candidate selected index out of range")
+        candidate_valid = candidate_masks_t.gather(
+            -1,
+            candidate_selected_t.unsqueeze(-1),
+        ).squeeze(-1)
+        if not bool(torch.all(candidate_valid).item()):
+            raise ValueError("V7 candidate selected index is masked")
+        candidate_contexts = operation_contexts_t.reshape(
+            batch_size * head_count,
+            observation_dim,
+        )
+        flat_features = candidate_features_t.reshape(
+            batch_size * head_count,
+            candidate_count,
+            self.cache_feature_dim,
+        )
+        raw_scores, _ = self._candidate_scores(
+            candidate_contexts,
+            flat_features,
+            self.cache_feature_dim,
+            self.cache_candidate_scorer,
+        )
+        raw_scores = raw_scores.reshape(
+            batch_size,
+            self.num_cache_heads,
+            candidate_count,
+        )
+        candidate_logits = raw_scores.masked_fill(~candidate_masks_t, -float("inf"))
+        candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
+        candidate_active = operation_actions_t != 0
+        candidate_log_prob = (
+            candidate_distribution.log_prob(candidate_selected_t)
+            * candidate_active.to(torch.float32)
+        ).sum(dim=-1)
+        candidate_entropy = (
+            candidate_distribution.entropy()
+            * candidate_active.to(torch.float32)
+        ).sum(dim=-1)
+        return PolicyEvaluation(
+            log_prob=operation_log_prob + candidate_log_prob,
+            entropy=operation_entropy + candidate_entropy,
+            value=self.critic_value(observations_t),
+            logits=operation_logits,
+        )

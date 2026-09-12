@@ -1,6 +1,7 @@
 """Minimal dimension-driven PPO for Cache/UAV reconfiguration requests."""
 
 from .policy import (
+    AdaptiveCacheOperationGroupV7PopArtActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
     AdaptivePrimitiveHorizonGroupedV3ActorCritic,
@@ -12,6 +13,7 @@ from .policy import (
 )
 
 __all__ = [
+    "AdaptiveCacheOperationGroupV7PopArtActorCritic",
     "AdaptivePrimitiveActorCritic",
     "AdaptivePrimitiveGroupedV2ActorCritic",
     "AdaptivePrimitiveHorizonGroupedV3ActorCritic",

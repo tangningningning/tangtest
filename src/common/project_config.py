@@ -791,15 +791,22 @@ def validate_config(
             "legacy_exact",
         )
     )
-    if configuration_control_mode not in {"legacy_exact", "policy_primitive"}:
+    if configuration_control_mode not in {
+        "legacy_exact",
+        "policy_primitive",
+        "policy_primitive_v7_cache_operation",
+    }:
         raise ValueError(
             "algorithm.ppo.configuration_control_mode 只支持 "
-            "legacy_exact/policy_primitive。"
+            "legacy_exact/policy_primitive/policy_primitive_v7_cache_operation。"
         )
     policy_schema = str(
         get_config_value(config, "algorithm.ppo.policy_schema", "adaptive_primitive_v1")
     )
-    if configuration_control_mode == "policy_primitive" and policy_schema not in {
+    if configuration_control_mode in {
+        "policy_primitive",
+        "policy_primitive_v7_cache_operation",
+    } and policy_schema not in {
         "adaptive_primitive_v1",
         "adaptive_primitive_v2",
         "adaptive_primitive_v2_grouped",
@@ -807,6 +814,7 @@ def validate_config(
         "adaptive_primitive_v4_horizon_grouped_separate_critic",
         "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization",
         "adaptive_primitive_v6_horizon_grouped_separate_critic_popart",
+        "adaptive_cache_operation_group_v7_popart",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -815,7 +823,16 @@ def validate_config(
             "adaptive_primitive_v3_horizon_grouped/"
             "adaptive_primitive_v4_horizon_grouped_separate_critic/"
             "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization/"
-            "adaptive_primitive_v6_horizon_grouped_separate_critic_popart."
+            "adaptive_primitive_v6_horizon_grouped_separate_critic_popart/"
+            "adaptive_cache_operation_group_v7_popart."
+        )
+    if (
+        configuration_control_mode == "policy_primitive_v7_cache_operation"
+        and policy_schema != "adaptive_cache_operation_group_v7_popart"
+    ):
+        raise ValueError(
+            "policy_primitive_v7_cache_operation requires "
+            "adaptive_cache_operation_group_v7_popart."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:

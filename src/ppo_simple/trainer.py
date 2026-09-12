@@ -41,6 +41,7 @@ from .reporting import (
     write_run_manifest,
 )
 from .policy import (
+    AdaptiveCacheOperationGroupV7PopArtActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
@@ -57,6 +58,7 @@ CHECKPOINT_VERSION = 2
 PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
 POPART_CHECKPOINT_VERSION = 6
+V7_CHECKPOINT_VERSION = 7
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
@@ -72,9 +74,13 @@ DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES = 64
 V6_POLICY_SCHEMAS = frozenset(
     {AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id}
 )
-SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
-HORIZON_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
-MODERN_POLICY_SCHEMAS = V6_POLICY_SCHEMAS
+V7_POLICY_SCHEMAS = frozenset(
+    {AdaptiveCacheOperationGroupV7PopArtActorCritic.architecture_id}
+)
+POPART_POLICY_SCHEMAS = V6_POLICY_SCHEMAS | V7_POLICY_SCHEMAS
+SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
+HORIZON_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
+MODERN_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
 
 REALIZATION_ARTIFACT_FILENAMES = {
     "trajectory": "trajectory.csv",
@@ -969,30 +975,47 @@ class PPOV2Trainer:
         self.context = context
         self.hyperparameters = hyperparameters_from_project(context.cfg)
         self.device = torch.device(device)
-        if context.configuration_control_mode == "policy_primitive":
+        if context.configuration_control_mode in {
+            "policy_primitive",
+            "policy_primitive_v7_cache_operation",
+        }:
             primitive_spec = PrimitiveTensorSpec.create(context)
             policy_class: type[AdaptivePrimitiveActorCritic]
-            if (
-                context.policy_schema
-                == AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id
-            ):
-                policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
-            elif context.policy_schema == AdaptivePrimitiveActorCritic.architecture_id:
-                # system_config.toml intentionally retains the original primitive
-                # schema as a compatibility/default configuration.
-                policy_class = AdaptivePrimitiveActorCritic
+            if context.configuration_control_mode == "policy_primitive_v7_cache_operation":
+                if context.policy_schema != AdaptiveCacheOperationGroupV7PopArtActorCritic.architecture_id:
+                    raise ValueError(
+                        "policy_primitive_v7_cache_operation requires the V7 policy schema"
+                    )
+                self.policy = AdaptiveCacheOperationGroupV7PopArtActorCritic(
+                    int(context.observation_spec.observation_dim),
+                    int(context.action_spec.action_dim),
+                    primitive_spec.cache_feature_dim,
+                    primitive_spec.uav_feature_dim,
+                    primitive_spec.num_cache_heads,
+                    self.hyperparameters.hidden_sizes,
+                ).to(self.device)
             else:
-                raise ValueError(
-                    "unknown policy_primitive policy_schema="
-                    f"{context.policy_schema}"
-                )
-            self.policy = policy_class(
-                int(context.observation_spec.observation_dim),
-                int(context.action_spec.action_dim),
-                primitive_spec.cache_feature_dim,
-                primitive_spec.uav_feature_dim,
-                self.hyperparameters.hidden_sizes,
-            ).to(self.device)
+                if (
+                    context.policy_schema
+                    == AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id
+                ):
+                    policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
+                elif context.policy_schema == AdaptivePrimitiveActorCritic.architecture_id:
+                    # system_config.toml intentionally retains the original primitive
+                    # schema as a compatibility/default configuration.
+                    policy_class = AdaptivePrimitiveActorCritic
+                else:
+                    raise ValueError(
+                        "unknown policy_primitive policy_schema="
+                        f"{context.policy_schema}"
+                    )
+                self.policy = policy_class(
+                    int(context.observation_spec.observation_dim),
+                    int(context.action_spec.action_dim),
+                    primitive_spec.cache_feature_dim,
+                    primitive_spec.uav_feature_dim,
+                    self.hyperparameters.hidden_sizes,
+                ).to(self.device)
         elif context.configuration_control_mode == "legacy_exact":
             self.policy = BernoulliActorCritic(
                 int(context.observation_spec.observation_dim),
@@ -1004,7 +1027,7 @@ class PPOV2Trainer:
                 f"unknown configuration_control_mode={context.configuration_control_mode}"
             )
         if (
-            self.policy.architecture_id in V6_POLICY_SCHEMAS
+            self.policy.architecture_id in POPART_POLICY_SCHEMAS
         ) != (
             self.hyperparameters.critic_value_scale_mode
             == CRITIC_VALUE_SCALE_POPART_NORMALIZED
@@ -1052,7 +1075,7 @@ class PPOV2Trainer:
         return self.policy.architecture_id in SEPARATE_OPTIMIZATION_POLICY_SCHEMAS
 
     def _uses_popart_critic(self) -> bool:
-        return self.policy.architecture_id in V6_POLICY_SCHEMAS
+        return self.policy.architecture_id in POPART_POLICY_SCHEMAS
 
     def _critic_return_scale(self) -> float:
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_NONE:
@@ -1067,6 +1090,8 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
+        if self.policy.architecture_id in V7_POLICY_SCHEMAS:
+            return V7_CHECKPOINT_VERSION
         if self.policy.architecture_id in V6_POLICY_SCHEMAS:
             return POPART_CHECKPOINT_VERSION
         if (
@@ -1216,6 +1241,24 @@ class PPOV2Trainer:
         cache_selected_indices = torch.as_tensor(
             rollout.cache_selected_indices, dtype=torch.long, device=self.device
         )
+        v7_operation_actions = None
+        v7_operation_masks = None
+        if self.context.configuration_control_mode == "policy_primitive_v7_cache_operation":
+            if (
+                rollout.v7_cache_operation_actions is None
+                or rollout.v7_cache_operation_masks is None
+            ):
+                raise ValueError("V7 rollout is missing cache operation actions/masks")
+            v7_operation_actions = torch.as_tensor(
+                rollout.v7_cache_operation_actions,
+                dtype=torch.long,
+                device=self.device,
+            )
+            v7_operation_masks = torch.as_tensor(
+                rollout.v7_cache_operation_masks,
+                dtype=torch.bool,
+                device=self.device,
+            )
         uav_contexts = torch.as_tensor(
             rollout.uav_contexts, dtype=torch.float32, device=self.device
         )
@@ -1288,7 +1331,24 @@ class PPOV2Trainer:
             permutation = torch.randperm(sample_count, device=self.device)
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
-                if self.context.configuration_control_mode == "policy_primitive":
+                if self.context.configuration_control_mode == "policy_primitive_v7_cache_operation":
+                    if not isinstance(
+                        self.policy,
+                        AdaptiveCacheOperationGroupV7PopArtActorCritic,
+                    ):
+                        raise TypeError("V7 update requires the V7 Cache policy")
+                    assert v7_operation_actions is not None
+                    assert v7_operation_masks is not None
+                    evaluation = self.policy.evaluate_cache_operation_primitive(
+                        observations[indices],
+                        cache_contexts[indices],
+                        v7_operation_masks[indices],
+                        v7_operation_actions[indices],
+                        cache_candidate_features[indices],
+                        cache_candidate_masks[indices],
+                        cache_selected_indices[indices],
+                    )
+                elif self.context.configuration_control_mode == "policy_primitive":
                     if not isinstance(self.policy, AdaptivePrimitiveActorCritic):
                         raise TypeError("policy_primitive update requires adaptive policy。")
                     evaluation = self.policy.evaluate_primitive(
