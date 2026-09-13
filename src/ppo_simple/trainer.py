@@ -462,7 +462,7 @@ def _resolve_config_file(project_root: Path, config_path: str | Path) -> Path:
 def _load_single_episode_generator(project_root: Path) -> Any:
     """Load the existing generator only when lazy generation is requested."""
 
-    generator_path = project_root / "scripts" / "generate_episode_realization.py"
+    generator_path = project_root / "scripts" / "generation" / "generate_episode_realization.py"
     if not generator_path.is_file():
         raise FileNotFoundError(
             f"single-episode generator is not available: {generator_path}"

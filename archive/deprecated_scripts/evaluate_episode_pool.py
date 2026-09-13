@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
 SCRIPTS_ROOT = PROJECT_ROOT / "scripts"
 if str(SRC_ROOT) not in sys.path:
@@ -23,8 +23,8 @@ if str(SCRIPTS_ROOT) not in sys.path:
 
 from common import project_config
 from ppo_simple import evaluator
-from generate_episode_pool import _validate_complete_realization
-import generate_episode_realization as realization_generator
+from generation.generate_episode_pool import _validate_complete_realization
+from generation import generate_episode_realization as realization_generator
 
 
 DEVELOPMENT_SEED_START = 30001
