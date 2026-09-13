@@ -44,6 +44,31 @@ launchers.  The canonical implementations live in the category directories.
 The reserved final-test pool has not been executed.  Development results are
 not final-test data.
 
+## Unified experiment registry
+
+The stable paper labels are registered in
+`configs/experiment_registry.toml`:
+
+| Method ID | Definition | Status |
+| --- | --- | --- |
+| `proposed_joint_v9` | prediction + adaptive Cache + adaptive UAV + learned policy | FROZEN |
+| `ablation_cache_only` | prediction + adaptive Cache + fixed UAV + learned policy | NOT YET FORMALLY TRAINED TO 222 |
+| `ablation_joint_no_prediction` | no prediction + adaptive Cache + adaptive UAV + learned policy | NOT YET FORMALLY TRAINED |
+| `baseline_popularity_greedy` | prediction/popularity Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |
+| `baseline_true_static` | fixed Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |
+
+Use the read-only registry entrypoint to validate or inspect definitions:
+
+```text
+python scripts/experiment_registry.py --validate
+python scripts/experiment_registry.py --list
+python scripts/experiment_registry.py --show proposed_joint_v9
+```
+
+The `ablation_joint_no_prediction` row is deliberately not mapped to the
+existing V8 Cache-only no-prediction configuration, because that configuration
+does not have the Joint Cache + UAV definition recorded above.
+
 ## Main commands
 
 Run commands from the repository root.  The package must be installed (or

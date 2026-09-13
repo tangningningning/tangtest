@@ -1,0 +1,138 @@
+# Stable paper-experiment registry.  This file describes scope and entrypoints;
+# it does not change any algorithm or existing TOML configuration.
+
+registry_version = 1
+final_test_executed = false
+
+[protocol.training]
+epochs = 222
+seed_start = 20001
+seed_end = 20222
+learning_method_ids = [
+    "proposed_joint_v9",
+    "ablation_cache_only",
+    "ablation_joint_no_prediction",
+]
+
+[protocol.evaluation]
+development_seed_start = 30001
+development_seed_end = 30020
+final_test_seed_start = 40001
+final_test_seed_end = 40020
+statistical_unit = "environment_realization"
+learned_policy_repeats_per_environment = 5
+nonlearning_baseline_repeats_per_environment = 1
+repeat_aggregation = "within_environment_mean_then_across_environment_statistics"
+
+[protocol.metrics]
+primary = [
+    "total_return",
+    "total_q",
+    "total_cache_cost",
+    "total_movement_cost",
+    "cache_change_rate",
+    "uav_movement_rate",
+    "total_tasks",
+    "mean_task_delay_s",
+    "mean_vehicle_energy_j",
+]
+execution_counts = [
+    "local_count",
+    "sv_count",
+    "rsu_count",
+    "uav_count",
+    "cloud_count",
+]
+execution_ratios = [
+    "local_ratio",
+    "sv_ratio",
+    "rsu_ratio",
+    "uav_ratio",
+    "cloud_ratio",
+]
+
+[methods.proposed_joint_v9]
+category = "proposed"
+status = "FROZEN"
+prediction = true
+adaptive_cache = true
+adaptive_uav = true
+learned_policy = true
+policy_mode = "stochastic"
+stochastic_repeats = 5
+cache_policy = "learned_adaptive"
+uav_policy = "learned_adaptive"
+config = "system_config_ppo_v9_joint_cache_uav.toml"
+checkpoint = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt"
+training_entrypoint = "ppo-train"
+evaluation_entrypoint = "scripts/evaluation/evaluate_v9_joint_episode_pool.py"
+notes = "Formal Joint V9 checkpoint and policy mode are frozen."
+
+[methods.ablation_cache_only]
+category = "ablation"
+status = "NOT_YET_FORMALLY_TRAINED_TO_222"
+prediction = true
+adaptive_cache = true
+adaptive_uav = false
+learned_policy = true
+policy_mode = "stochastic"
+stochastic_repeats = 5
+cache_policy = "learned_adaptive"
+uav_policy = "fixed"
+config = "system_config_ppo_v8_cache_operation_group_replica_aware.toml"
+checkpoint = ""
+training_entrypoint = "ppo-train"
+evaluation_entrypoint = "scripts/evaluation/evaluate_v8_episode_pool.py"
+notes = "V8 Cache-only configuration is available; no formal epoch-222 checkpoint is assigned."
+
+[methods.ablation_joint_no_prediction]
+category = "ablation"
+status = "NOT_YET_FORMALLY_TRAINED"
+implementation_status = "JOINT_NO_PREDICTION_CONFIGURATION_PENDING"
+prediction = false
+adaptive_cache = true
+adaptive_uav = true
+learned_policy = true
+policy_mode = "stochastic"
+stochastic_repeats = 5
+cache_policy = "learned_adaptive"
+uav_policy = "learned_adaptive"
+config = ""
+checkpoint = ""
+training_entrypoint = "ppo-train"
+evaluation_entrypoint = ""
+notes = "Do not alias the existing V8 Cache-only no-prediction configuration to this Joint method."
+
+[methods.baseline_popularity_greedy]
+category = "baseline"
+status = "IMPLEMENTATION_AVAILABLE"
+prediction = true
+adaptive_cache = true
+adaptive_uav = false
+learned_policy = false
+policy_mode = "deterministic"
+stochastic_repeats = 1
+cache_policy = "prediction_popularity_greedy"
+uav_policy = "fixed"
+config = "system_config_ppo_v8_cache_operation_group_replica_aware.toml"
+checkpoint = ""
+training_entrypoint = ""
+evaluation_entrypoint = "scripts/baselines/evaluate_popularity_greedy_episode_pool.py"
+notes = "Non-learning prediction/popularity-based cache baseline with fixed UAV."
+
+[methods.baseline_true_static]
+category = "baseline"
+status = "IMPLEMENTATION_AVAILABLE"
+prediction = false
+adaptive_cache = false
+adaptive_uav = false
+learned_policy = false
+policy_mode = "deterministic"
+stochastic_repeats = 1
+cache_policy = "true_static"
+uav_policy = "fixed"
+config = "system_config_ppo_v8_cache_operation_group_replica_aware.toml"
+checkpoint = ""
+training_entrypoint = ""
+evaluation_entrypoint = "scripts/baselines/evaluate_static_episode_pool.py"
+notes = "Non-learning fixed-cache, fixed-UAV baseline."
