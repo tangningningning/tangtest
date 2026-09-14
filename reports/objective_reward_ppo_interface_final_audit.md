@@ -456,7 +456,7 @@ FormalTrainingProtocol 当前是 single-trace/in-trace deterministic evaluation�
 
 ### P3 — historical documentation hazard
 
-reports/baseline_v2_alignment_repair_validation.md 仍保留 pre-freeze 的 observation=184/queue 描述；reports/ppo_interface_audit.md 等旧文档也可能保留旧阶段说明。它们应继续作为历史记录，不能覆盖当前 source、system_config.toml 和 12.pdf 的冻结口径。
+Pre-freeze 的旧 PPO 文档可能保留 observation、queue 或接口的旧阶段说明；它们不能覆盖当前 source、system_config.toml 和 12.pdf 的冻结口径。
 
 ### Current source verdict
 
@@ -487,4 +487,3 @@ reports/baseline_v2_alignment_repair_validation.md 仍保留 pre-freeze 的 obse
 - src/ppo/ppo_rollout.py:779--839、884--965、965--1408、1964--2050；
 - src/ppo/ppo_update.py:194--236、583--780；
 - src/ppo/ppo_training.py:2966--3145、3190--3215、6704--6810。
-

@@ -18,7 +18,7 @@
 - 时延、计算和能耗纯公式：src/common/system_model.py。
 - 生成增量检查和 metadata：scripts/regenerate_artifacts.py。
 - 正式 artifact：data/generated/service_catalog.json、popularity.csv、popularity_history.csv、tasks.csv、popularity_predictions.csv、prediction_scenarios.npz、generation_metadata.json。
-- 已有报告：task_generation_audit.md、reports/artifact_consistency_report.md、reports/computation_load_analysis.md、reports/cloud_delay_analysis.md、reports/ppo_interface_audit.md。
+- 已有报告：task_generation_audit.md、reports/artifact_consistency_report.md、reports/computation_load_analysis.md、reports/cloud_delay_analysis.md、reports/objective_reward_ppo_interface_final_audit.md。
 
 既有 task_generation_audit.md 已经给出了一部分静态任务生成结论；本报告补充实际 artifact 的固定 seed 统计、运行时消费链、两份 PDF 的逐项公式对照和当前可进入下一模块的判定。
 

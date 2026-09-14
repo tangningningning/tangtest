@@ -19,9 +19,6 @@ scripts/
   generation/   Episode and project-artifact generation
   evaluation/   Frozen learned-policy evaluation
   baselines/    Explicit Static and Prediction-Popularity Greedy evaluation
-  diagnostics/  Posthoc diagnostics and audits
-archive/
-  deprecated_scripts/  Historical command-line implementations kept for reference
 configs/        Configuration index; active TOMLs and the minimal LR sweep set
 reports/        Research reports and experiment records
 runs/           Generated experiment artifacts; formal runs are not reorganized
@@ -126,5 +123,5 @@ five repeats as additional independent environments.
 
 The learned-policy ablations are under `scripts/evaluation/`; the explicit
 Static and Prediction-Popularity Greedy baselines are under
-`scripts/baselines/`.  See `configs/README.md` and
-`archive/README.md` for the configuration and history index.
+`scripts/baselines/`.  See `configs/README.md` and the reports directory for
+the configuration and experiment history index.

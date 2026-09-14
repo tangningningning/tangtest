@@ -20,7 +20,7 @@ Joint_Service_Caching_Communication_and_Computing_Resource_Allocation_in_Collabo
 - src/decision/task_allocation.py 的实际位置、Matching、KKT、边缘/Cloud 执行路径；
 - src/decision/cache_configuration.py 的预测位置、预测任务和 surrogate 复用路径；
 - src/decision/slot_environment.py 的配置阶段到实际调度阶段的位置耦合；
-- 已有 cloud_delay_analysis.md、baseline_v2_rollout_validation.md、computation_load_analysis.md、cache_offloading_coupling_audit.md 和 task_mathematical_model_audit.md；
+- 已有 cloud_delay_analysis.md、computation_load_analysis.md、cache_offloading_coupling_audit.md 和 task_mathematical_model_audit.md；
 - 固定 seed=4401、slot=20、实际 trajectory/tasks artifact 的一条真实任务链路。
 
 总体结论如下：
@@ -424,9 +424,7 @@ T_code = T_pdf_execution + T_queue_wait
 - reports/task_mathematical_model_audit.md：确认 tasks.csv 的 input_size 已是 bit、cpu_cycles 已是 cycle；本报告直接复用该单位合同。
 - reports/computation_load_analysis.md：确认 Cloud 总 CPU 在当前模型中可按同槽任务数共享；本报告进一步验证了 Cloud 通信/计算/能耗的数值链。
 - reports/cloud_delay_analysis.md：确认 psi_c=11 只放大 Cloud 通信时延，不改变 Cloud 计算时延和车辆上传能耗；本报告公式复算通过。
-- reports/baseline_v2_rollout_validation.md：该报告的单 slot 示例是 slot=0、time=100 s；它与本报告使用相同的通信/Cloud/KKT 公式，但任务数量和路径统计不应与本报告的 slot=20 数值直接混同。本报告以 TV 18 进一步做了四条路径的逐项复算。
 - reports/cache_offloading_coupling_audit.md：确认 cache state 先决定 feasible target，再由 Matching/KKT 决定实际路径；本报告选取的 TV 18 任务确实同时具备 SV/RSU/UAV/Cloud 候选，实际最终选择由 delay/energy/resource 共同决定。
-- reports/ppo_interface_audit.md：通信审计不改变 observation/action 结论，也没有读取或修改 PPO 接口。
 
 现有报告之间没有发现通信单位、Cloud psi_c 或 KKT resource sum 的互相矛盾。当前新增的两个模型风险是 UAV 高度字段语义和 Cloud 总资源均分是否属于正式主模型。
 

@@ -310,7 +310,6 @@ UAV backlog 按 `UAV_0`/`UAV_1` 身份保留，而不是按旧水平坐标复制
 
 - `reports/computation_load_analysis.md` 使用过 `20e9 cycle/s` 和同槽按任务数共享的 Cloud 解释；当前为 `5e9 cycle/s` per task 且不做同槽 `N` 均分，因此其中 Cloud 延迟/资源表已过时。
 - `reports/cloud_delay_analysis.md` 中的旧 Cloud 延迟数值也不能与当前 `psi_c=11`、固定每任务资源直接混用。
-- `reports/baseline_v2_rollout_validation.md` 的旧 slot 任务数、Cloud 数量和路径统计是在旧 Cloud 合同下形成，不应与本次 fixed-seed 结果横向比较。
 - `reports/communication_contract_repair_validation.md` 是上一轮合同修复验证，当前只作为已确认前置条件参考；本审计没有回退或重新解释其中的 Cloud/UAV 合同。
 
 ## 7. 问题分级
