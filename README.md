@@ -22,7 +22,7 @@ scripts/
   diagnostics/  Posthoc diagnostics and audits
 archive/
   deprecated_scripts/  Historical command-line implementations kept for reference
-configs/        Configuration index; active TOMLs remain at the repository root
+configs/        Configuration index; active TOMLs and the minimal LR sweep set
 reports/        Research reports and experiment records
 runs/           Generated experiment artifacts; formal runs are not reorganized
 ```
@@ -30,11 +30,15 @@ runs/           Generated experiment artifacts; formal runs are not reorganized
 The files directly under `scripts/` with the old names are compatibility
 launchers.  The canonical implementations live in the category directories.
 
-## Formal Joint V9
+## Formal `proposed_joint`
 
-- Checkpoint: `runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt`
+- `FORMAL_METHOD_ID = proposed_joint`
+- Formal base run: `runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050`
+- Frozen checkpoint: `runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt`
+- The retained 1e-4 base run completed 300 epochs.
 - Config: `system_config_ppo_v9_joint_cache_uav.toml`
 - Policy schema: `adaptive_joint_cache_replica_aware_uav_operation_v9_popart`
+- Configuration control mode: `policy_primitive_v9_joint_cache_uav_operation`
 - Policy mode: `stochastic`
 - Stochastic repeats: `5` per environment, averaged within environment before
   aggregation across environments
@@ -44,6 +48,21 @@ launchers.  The canonical implementations live in the category directories.
 The reserved final-test pool has not been executed.  Development results are
 not final-test data.
 
+Implementation history: the V9 policy schema and control-mode strings are
+retained internally for checkpoint compatibility.  V7/V8/V9 are historical
+implementation labels, not new paper-facing method IDs.
+
+## Learning-rate experiments
+
+| Experiment ID | Actor learning rate | Status | Artifact |
+| --- | ---: | --- | --- |
+| `proposed_joint_lr_1e4` | `1e-4` | COMPLETED, 300 epochs | formal base run above |
+| `proposed_joint_lr_1e3` | `1e-3` | COMPLETED, 240 epochs | `runs/lr_sweep_v9_actor_1e3` |
+| `proposed_joint_lr_5e4` | `5e-4` | PLANNED; no run directory yet | `configs/lr_sweep/v9_actor_lr_5e4.toml` |
+
+The historical LR run/config paths remain unchanged so that manifests and
+provenance continue to resolve.
+
 ## Unified experiment registry
 
 The stable paper labels are registered in
@@ -51,7 +70,7 @@ The stable paper labels are registered in
 
 | Method ID | Definition | Status |
 | --- | --- | --- |
-| `proposed_joint_v9` | prediction + adaptive Cache + adaptive UAV + learned policy | FROZEN |
+| `proposed_joint` | prediction + adaptive Cache + adaptive UAV + learned policy | FROZEN |
 | `ablation_cache_only` | prediction + adaptive Cache + fixed UAV + learned policy | NOT YET FORMALLY TRAINED TO 222 |
 | `ablation_joint_no_prediction` | no prediction + adaptive Cache + adaptive UAV + learned policy | NOT YET FORMALLY TRAINED |
 | `baseline_popularity_greedy` | prediction/popularity Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |
@@ -62,7 +81,7 @@ Use the read-only registry entrypoint to validate or inspect definitions:
 ```text
 python scripts/experiment_registry.py --validate
 python scripts/experiment_registry.py --list
-python scripts/experiment_registry.py --show proposed_joint_v9
+python scripts/experiment_registry.py --show proposed_joint
 ```
 
 The `ablation_joint_no_prediction` row is deliberately not mapped to the

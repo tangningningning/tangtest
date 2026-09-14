@@ -1,5 +1,7 @@
 # Stable paper-experiment registry.  This file describes scope and entrypoints;
-# it does not change any algorithm or existing TOML configuration.
+# it does not change any algorithm or existing TOML configuration.  The
+# paper-facing proposed method ID is `proposed_joint`; internal V9 strings are
+# retained only for checkpoint compatibility and provenance.
 
 registry_version = 1
 final_test_executed = false
@@ -9,7 +11,7 @@ epochs = 222
 seed_start = 20001
 seed_end = 20222
 learning_method_ids = [
-    "proposed_joint_v9",
+    "proposed_joint",
     "ablation_cache_only",
     "ablation_joint_no_prediction",
 ]
@@ -51,7 +53,28 @@ execution_ratios = [
     "cloud_ratio",
 ]
 
-[methods.proposed_joint_v9]
+[learning_rate_experiments.proposed_joint_lr_1e4]
+actor_learning_rate = 1.0e-4
+status = "COMPLETED"
+completed_epochs = 300
+run = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050"
+config = "system_config_ppo_v9_joint_cache_uav.toml"
+
+[learning_rate_experiments.proposed_joint_lr_1e3]
+actor_learning_rate = 1.0e-3
+status = "COMPLETED"
+completed_epochs = 240
+run = "runs/lr_sweep_v9_actor_1e3"
+config = "configs/lr_sweep/v9_actor_lr_1e3.toml"
+
+[learning_rate_experiments.proposed_joint_lr_5e4]
+actor_learning_rate = 5.0e-4
+status = "PLANNED"
+run = ""
+config = "configs/lr_sweep/v9_actor_lr_5e4.toml"
+notes = "Retained for the next comparison; no run directory exists yet."
+
+[methods.proposed_joint]
 category = "proposed"
 status = "FROZEN"
 prediction = true
@@ -66,7 +89,8 @@ config = "system_config_ppo_v9_joint_cache_uav.toml"
 checkpoint = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt"
 training_entrypoint = "ppo-train"
 evaluation_entrypoint = "scripts/evaluation/evaluate_v9_joint_episode_pool.py"
-notes = "Formal Joint V9 checkpoint and policy mode are frozen."
+base_run = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050"
+notes = "Formal proposed_joint checkpoint and policy mode are frozen; the internal V9 schema is retained for checkpoint compatibility."
 
 [methods.ablation_cache_only]
 category = "ablation"

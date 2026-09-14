@@ -21,7 +21,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = PROJECT_ROOT / "configs" / "experiment_registry.toml"
 METHOD_IDS = (
-    "proposed_joint_v9",
+    "proposed_joint",
     "ablation_cache_only",
     "ablation_joint_no_prediction",
     "baseline_popularity_greedy",
@@ -179,7 +179,7 @@ def validate_registry(
         errors,
     )
     expected_flags = {
-        "proposed_joint_v9": (True, True, True, True),
+        "proposed_joint": (True, True, True, True),
         "ablation_cache_only": (True, True, False, True),
         "ablation_joint_no_prediction": (False, True, True, True),
         "baseline_popularity_greedy": (True, True, False, False),
