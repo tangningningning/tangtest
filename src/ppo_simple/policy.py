@@ -1288,6 +1288,8 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
         index = int(head_index)
         if index < 0 or index >= self.num_uav_heads:
             raise IndexError("V9 UAV operation head index out of range")
+        raw_operation_logits = logits[index]
+        raw_operation_probabilities = torch.softmax(raw_operation_logits, dim=-1)
         mask = torch.as_tensor(
             np.asarray(operation_mask, dtype=bool).reshape(-1),
             dtype=torch.bool,
@@ -1310,6 +1312,8 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             log_prob=distribution.log_prob(selected_tensor),
             entropy=distribution.entropy(),
             logits=masked_logits,
+            raw_logits=raw_operation_logits.detach(),
+            probabilities=raw_operation_probabilities.detach(),
         )
 
     def evaluate_joint_cache_uav_operation(
