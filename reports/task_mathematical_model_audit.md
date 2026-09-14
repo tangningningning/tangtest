@@ -10,7 +10,7 @@
 
 本次检查了：
 
-- 统一配置：system_config.toml。
+- 统一配置：configs/system_config.toml。
 - 任务与流行度生成：src/scenario/task_scenario.py。
 - 预测场景生成：src/scenario/scenario_generator.py、src/scenario/popularity_prediction.py。
 - 实际任务读取和 Matching/KKT 输入：src/decision/task_allocation.py。
@@ -18,9 +18,9 @@
 - 时延、计算和能耗纯公式：src/common/system_model.py。
 - 生成增量检查和 metadata：scripts/regenerate_artifacts.py。
 - 正式 artifact：data/generated/service_catalog.json、popularity.csv、popularity_history.csv、tasks.csv、popularity_predictions.csv、prediction_scenarios.npz、generation_metadata.json。
-- 已有报告：task_generation_audit.md、reports/artifact_consistency_report.md、reports/computation_load_analysis.md、reports/cloud_delay_analysis.md、reports/objective_reward_ppo_interface_final_audit.md。
+- 已有报告：reports/artifact_consistency_report.md、reports/objective_reward_ppo_interface_final_audit.md。
 
-既有 task_generation_audit.md 已经给出了一部分静态任务生成结论；本报告补充实际 artifact 的固定 seed 统计、运行时消费链、两份 PDF 的逐项公式对照和当前可进入下一模块的判定。
+此前的任务生成审计结论已并入本报告；本报告补充实际 artifact 的固定 seed 统计、运行时消费链、两份 PDF 的逐项公式对照和当前可进入下一模块的判定。
 
 两份 PDF 均可访问。第一份为 14 页，12.pdf 为 12 页。PDF 公式对照使用了文字提取和代表性页面渲染复核；12.pdf 第 2、3、5、7、8 页是本次任务模型对照的主要页面。
 
@@ -63,7 +63,7 @@
 
 其中每个 t 对全部 TV 各抽一次，不共享一个总任务数约束，也没有按服务类型对到达概率做额外加权。代码证据：
 
-- system_config.toml:84、122-124：TV 数量和 arrival_probability=0.7。
+- configs/system_config.toml:84、122-124：TV 数量和 arrival_probability=0.7。
 - src/scenario/task_scenario.py:803-829：逐 slot 生成 arrival，并对每个 TV 生成一行。
 - src/scenario/task_scenario.py:367-379：master_seed 派生独立 task_arrival、service_request、workload_variation 随机流。
 
@@ -140,18 +140,18 @@
 
 | 数学量/概念 | 配置入口 | 生成器/Artifact | 运行时消费 | 审计结论 |
 |---|---|---|---|---|
-| TV/SV/F、slot 时间 | system_config.toml:76-89、96-104 | generation_metadata.json；vehicle_roles.json | task_scenario、scenario_generator、slot_environment | 25=5 SV+20 TV，300 slot，dt=1 s，一致 |
-| lambda | system_config.toml:122-124 | service_catalog.json generation_config、tasks.csv arrival | task_scenario.generate_tasks；task_allocation.load_actual_tasks | 读取统一配置，正式 p=0.7 |
-| zeta/rank/rho_star | system_config.toml:125-130 | popularity.csv、popularity_history.csv | popularity_prediction 作为监督标签和诊断；任务生成已固化到 tasks.csv | 动态 Zipf，一致 |
-| service catalog | system_config.toml:42-43 | service_catalog.json，F=10，ID=0..9 | cache_configuration.load_service_catalog | 服务大小 MB、D 基准 bit、cycles_per_bit 分别读取 |
-| 真实任务 | system_config.toml:50、task_scenario.py:1147-1216 | tasks.csv，20×300=6000 行 | task_allocation.load_actual_tasks:1740-1756 | 只读取当前 slot 且 arrival=1 的行 |
+| TV/SV/F、slot 时间 | configs/system_config.toml:76-89、96-104 | generation_metadata.json；vehicle_roles.json | task_scenario、scenario_generator、slot_environment | 25=5 SV+20 TV，300 slot，dt=1 s，一致 |
+| lambda | configs/system_config.toml:122-124 | service_catalog.json generation_config、tasks.csv arrival | task_scenario.generate_tasks；task_allocation.load_actual_tasks | 读取统一配置，正式 p=0.7 |
+| zeta/rank/rho_star | configs/system_config.toml:125-130 | popularity.csv、popularity_history.csv | popularity_prediction 作为监督标签和诊断；任务生成已固化到 tasks.csv | 动态 Zipf，一致 |
+| service catalog | configs/system_config.toml:42-43 | service_catalog.json，F=10，ID=0..9 | cache_configuration.load_service_catalog | 服务大小 MB、D 基准 bit、cycles_per_bit 分别读取 |
+| 真实任务 | configs/system_config.toml:50、task_scenario.py:1147-1216 | tasks.csv，20×300=6000 行 | task_allocation.load_actual_tasks:1740-1756 | 只读取当前 slot 且 arrival=1 的行 |
 | 预测 popularity | paths.popularity、paths.popularity_history、paths.popularity_gru | popularity_predictions.csv、prediction_scenarios.npz | popularity_prediction:247-281；scenario_generator:528-555、1060-1091 | 只用 origin 前历史构造 rho_hat |
 | 预测任务 D/L | scenario_generator:593-659 | prediction_scenarios.npz | cache_configuration:468-559、795-818 | 以 rho_hat 抽出的样本驱动预测配置效用 |
 | 实际执行时延 | nodes.* CPU 和 system_model.py | 不另存转换后的单位 | task_allocation:1316-1372、system_model.py:32-178 | D/L 直接进入 bit/cycle 公式，无重复换算 |
 
 ### 4.1 运行时完整数据流
 
-    system_config.toml
+    configs/system_config.toml
         -> task_config_from_project_config()
         -> task_scenario.build_artifacts()
         -> service_catalog.json + popularity*.csv + tasks.csv
@@ -171,7 +171,7 @@
 
 ### 5.1 概率来源与独立性
 
-结论：是 Bernoulli/概率到达；概率来自 system_config.toml 的 task.arrival_probability=0.7。
+结论：是 Bernoulli/概率到达；概率来自 configs/system_config.toml 的 task.arrival_probability=0.7。
 
 代码没有为不同车辆设置不同 lambda，也没有根据 slot、服务类型、位置或历史请求动态改变 lambda。每个 TV-slot 都从 arrival_rng 取得一个随机数并与 0.7 比较。arrival_rng 是独立于服务抽样和负载抽样的 RNG stream；不同车辆和 slot 在实现上是同一伪随机流的连续独立抽样，而不是共享总数的无放回抽样。
 
@@ -268,7 +268,7 @@ popularity_predictions.csv 和 prediction_scenarios.npz 中的 rho_hat 已做交
 
 | 层次 | 字段 | 实际单位 | 证据 |
 |---|---|---|---|
-| TOML 配置 | input_size_min_kb/max_kb | KB，500..5000 | system_config.toml:114-120 |
+| TOML 配置 | input_size_min_kb/max_kb | KB，500..5000 | configs/system_config.toml:114-120 |
 | service_catalog.json | input_size_kb | KB，展示/追溯 | service_catalog.json services |
 | service_catalog.json | mean_input_size | bit | service_catalog.json units；task_scenario.py:467 |
 | tasks.csv | input_size | bit | service_catalog.json units；task_scenario.py:883 |
@@ -441,7 +441,7 @@ system_model.py 使用：
 ### 提示
 
 1. **存在非正式调用路径的静默回退。**
-   scenario_generator.py:558-581 在 project_config=None 且 catalog generation_config 缺字段时，将 arrival_probability 回退到 0.5；task_scenario.TaskConfig 也保留函数级默认值。正式 main() 在 scenario_generator.py:884-992 传入 system_config.toml，因此当前正式 artifact 没有触发该回退；但后续建议缺关键任务参数时 fail-closed，避免 direct API 调用产生另一套模型。
+   scenario_generator.py:558-581 在 project_config=None 且 catalog generation_config 缺字段时，将 arrival_probability 回退到 0.5；task_scenario.TaskConfig 也保留函数级默认值。正式 main() 在 scenario_generator.py:884-992 传入 configs/system_config.toml，因此当前正式 artifact 没有触发该回退；但后续建议缺关键任务参数时 fail-closed，避免 direct API 调用产生另一套模型。
 
 2. **0-based service_id 需要对外文档化。**
    12.pdf 使用 1-based 数学集合，工程使用 0-based 数组索引。当前所有 artifact 和 runtime 已统一，不是问题，但公式转代码或结果表必须注明映射。

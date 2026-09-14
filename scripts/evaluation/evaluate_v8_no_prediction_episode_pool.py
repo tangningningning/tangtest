@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="system_config_ppo_v8_no_prediction_ablation.toml",
+        default="configs/ablations/system_config_ppo_v8_no_prediction_ablation.toml",
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--run-dir", required=True)

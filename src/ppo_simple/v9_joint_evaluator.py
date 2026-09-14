@@ -211,7 +211,7 @@ def _summary(
 def evaluate_v9_joint_episode(
     checkpoint_path: str | Path,
     run_dir: str | Path,
-    config_path: str | Path = "system_config_ppo_v9_joint_cache_uav.toml",
+    config_path: str | Path = "configs/proposed/system_config_ppo_v9_joint_cache_uav.toml",
     realization_dir: str | Path | None = None,
     device: str = "cpu",
     policy_action_mode: str = "deterministic",

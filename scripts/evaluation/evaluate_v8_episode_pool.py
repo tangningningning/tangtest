@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="system_config_ppo_v8_cache_operation_group_replica_aware.toml",
+        default="configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml",
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--run-dir", required=True)

@@ -49,6 +49,10 @@ class OperationPolicySample:
     log_prob: Any
     entropy: Any
     logits: Any
+    # Optional raw (pre-mask) diagnostics. These are derived from the
+    # already-computed operation logits and never sample an additional action.
+    raw_logits: Any | None = None
+    probabilities: Any | None = None
 
 
 def _require_torch() -> None:
@@ -945,7 +949,9 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
             torch.any(mask).item()
         ):
             raise ValueError("V7 operation mask must allow at least one operation")
-        masked_logits = logits[index].masked_fill(~mask, -float("inf"))
+        raw_logits = logits[index]
+        raw_distribution = torch.distributions.Categorical(logits=raw_logits)
+        masked_logits = raw_logits.masked_fill(~mask, -float("inf"))
         distribution = torch.distributions.Categorical(logits=masked_logits)
         selected = (
             int(torch.argmax(distribution.logits).item())
@@ -958,6 +964,8 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
             log_prob=distribution.log_prob(selected_tensor),
             entropy=distribution.entropy(),
             logits=masked_logits,
+            raw_logits=raw_logits,
+            probabilities=raw_distribution.probs,
         )
 
     def sample_cache_candidate_v7(

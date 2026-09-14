@@ -27,7 +27,7 @@ PROBABILITY_SUM_TOLERANCE = 1.0e-6
 CAPACITY_TOLERANCE_MB = 1.0e-9
 VALUE_TOLERANCE = 1.0e-12
 
-DEFAULT_CONFIG = Path("system_config.toml")
+DEFAULT_CONFIG = Path("configs/system_config.toml")
 DEFAULT_SERVICE_CATALOG = Path("data/generated/service_catalog.json")
 DEFAULT_POPULARITY = Path("data/generated/popularity.csv")
 DEFAULT_REPORT = Path("reports/cache_capacity_analysis.md")
@@ -98,7 +98,7 @@ def load_service_sizes(catalog: dict[str, Any]) -> dict[int, float]:
 
 
 def load_cache_profiles(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """从统一 system_config.toml 读取四类节点的缓存容量。"""
+    """从统一 configs/system_config.toml 读取四类节点的缓存容量。"""
 
     nodes = _mapping(config.get("nodes"), "nodes")
     vehicle = _mapping(nodes.get("vehicle"), "nodes.vehicle")
@@ -675,7 +675,7 @@ def render_report(
             "",
             "## 8. 修改边界",
             "",
-            "本次分析只读取 `system_config.toml`、service catalog、popularity 和缓存相关源码；没有修改配置、缓存算法、reward、PPO、task generation 或任何 artifact。",
+            "本次分析只读取 `configs/system_config.toml`、service catalog、popularity 和缓存相关源码；没有修改配置、缓存算法、reward、PPO、task generation 或任何 artifact。",
             "",
         ]
     )

@@ -273,7 +273,7 @@ Direct-CF loss 函数只把已形成的 A_CF/A_gate 作为 advantage，不再重
 
 执行：
 
-    scripts/regenerate_artifacts.py --config system_config.toml --check-only
+    scripts/generation/regenerate_artifacts.py --config configs/system_config.toml --check-only
 
 结果：
 

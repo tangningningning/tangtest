@@ -179,7 +179,7 @@ def _summary(
 
 def evaluate_static_episode(
     run_dir: str | Path,
-    config_path: str | Path = "system_config_ppo_v8_cache_operation_group_replica_aware.toml",
+    config_path: str | Path = "configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml",
     realization_dir: str | Path | None = None,
     episode_seed: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:

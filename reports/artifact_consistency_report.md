@@ -1,6 +1,6 @@
 # Artifact 一致性报告
 
-本报告由 `scripts/regenerate_artifacts.py` 根据 `system_config.toml` 生成。
+本报告由 `scripts/generation/regenerate_artifacts.py` 根据 `configs/system_config.toml` 生成。
 角色重建复用既有 `trajectory.csv`，未启动 SUMO；未运行 PPO 或完整实验。
 
 ## 当前配置摘要
@@ -52,5 +52,5 @@
 - service 参数 -> service_catalog、popularity、tasks、TV 初始缓存、预测场景
 - vehicle 参数/角色集合 -> vehicle_roles、tasks、TV 初始缓存、vehicle_predictions、prediction_scenarios
 - task 参数 -> popularity、tasks、GRU 预测输入和 prediction_scenarios
-- cache 容量比例 -> system_config.toml 中的派生 MB 容量和 TV 初始缓存
+- cache 容量比例 -> configs/system_config.toml 中的派生 MB 容量和 TV 初始缓存
 - RSU/UAV 数量 -> node_positions.json；位置仍由 node_placement.py 道路感知生成

@@ -1183,7 +1183,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SUMO 完整交通生成、TraCI 轨迹采集和固定 TV/SV 角色划分。"
     )
-    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--config", default="configs/system_config.toml")
     parser.add_argument(
         "--episode-seed",
         type=int,

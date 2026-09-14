@@ -1292,7 +1292,7 @@ def validate_uav_optimizer_once(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="给定 UAV trigger，优化 UAV 当前位置配置。")
-    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--config", default="configs/system_config.toml")
     parser.add_argument("--origin-index", type=int, default=0)
     return parser
 

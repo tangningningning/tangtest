@@ -94,7 +94,7 @@ def _validate_no_prediction_context(context: Any) -> None:
 def evaluate_v8_no_prediction_episode(
     checkpoint_path: str | Path,
     run_dir: str | Path,
-    config_path: str | Path = "system_config_ppo_v8_no_prediction_ablation.toml",
+    config_path: str | Path = "configs/ablations/system_config_ppo_v8_no_prediction_ablation.toml",
     realization_dir: str | Path | None = None,
     device: str = "cpu",
     policy_action_mode: str = "deterministic",

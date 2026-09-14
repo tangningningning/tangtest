@@ -1,7 +1,7 @@
 # 正式 baseline 系统规模与参数状态
 
-本报告对应当前 `system_config.toml` 和 `data/generated/` 正式 artifact。
-`system_config.toml` 是唯一正式参数入口。当前正式规模为 5 个 SV、20 个 TV、
+本报告对应当前 `configs/system_config.toml` 和 `data/generated/` 正式 artifact。
+`configs/system_config.toml` 是唯一正式参数入口。当前正式规模为 5 个 SV、20 个 TV、
 2 个 RSU、2 个 UAV、1 个 Cloud 和 10 个 service；artifact 一致性状态见第 5 节。
 
 ## 1. 系统规模

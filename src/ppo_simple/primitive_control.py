@@ -148,6 +148,8 @@ class JointCacheUavOperationPrimitiveSelectionResult:
     uav_operation_masks: np.ndarray
     uav_operation_old_log_probs: np.ndarray
     uav_operation_entropies: np.ndarray
+    uav_operation_probabilities: np.ndarray
+    uav_operation_logit_margins: np.ndarray
     uav_contexts: np.ndarray
     uav_candidate_features: np.ndarray
     uav_candidate_masks: np.ndarray
@@ -991,6 +993,14 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
         tensor_spec.num_uav_heads,
         dtype=np.float32,
     )
+    uav_operation_probabilities = np.zeros(
+        (tensor_spec.num_uav_heads, len(operation_order)),
+        dtype=np.float32,
+    )
+    uav_operation_logit_margins = np.zeros(
+        tensor_spec.num_uav_heads,
+        dtype=np.float32,
+    )
     uav_contexts = np.zeros(
         (tensor_spec.num_uav_heads, tensor_spec.observation_dim),
         dtype=np.float32,
@@ -1063,6 +1073,35 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
         )
         uav_operation_entropies[uav_index] = float(
             sampled_operation.entropy.detach().cpu()
+        )
+        if (
+            sampled_operation.raw_logits is None
+            or sampled_operation.probabilities is None
+        ):
+            raise RuntimeError(
+                "V9 UAV operation sampling did not return raw diagnostics"
+            )
+        raw_logits = np.asarray(
+            sampled_operation.raw_logits.detach().cpu().numpy(),
+            dtype=np.float64,
+        ).reshape(-1)
+        raw_probabilities = np.asarray(
+            sampled_operation.probabilities.detach().cpu().numpy(),
+            dtype=np.float64,
+        ).reshape(-1)
+        if raw_logits.shape != (len(operation_order),):
+            raise AssertionError("V9 UAV raw operation logits shape mismatch")
+        if raw_probabilities.shape != (len(operation_order),):
+            raise AssertionError("V9 UAV raw operation probabilities shape mismatch")
+        if not np.all(np.isfinite(raw_logits)) or not np.all(
+            np.isfinite(raw_probabilities)
+        ):
+            raise FloatingPointError("V9 UAV raw operation diagnostics are non-finite")
+        if not np.isclose(float(raw_probabilities.sum()), 1.0):
+            raise AssertionError("V9 UAV raw operation probabilities must sum to one")
+        uav_operation_probabilities[uav_index] = raw_probabilities.astype(np.float32)
+        uav_operation_logit_margins[uav_index] = float(
+            raw_logits[0] - raw_logits[1]
         )
         uav_contexts[uav_index] = conditional_context
         total_log_prob = total_log_prob + sampled_operation.log_prob
@@ -1197,6 +1236,8 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
         uav_operation_masks=uav_operation_masks,
         uav_operation_old_log_probs=uav_operation_old_log_probs,
         uav_operation_entropies=uav_operation_entropies,
+        uav_operation_probabilities=uav_operation_probabilities,
+        uav_operation_logit_margins=uav_operation_logit_margins,
         uav_contexts=uav_contexts,
         uav_candidate_features=uav_features,
         uav_candidate_masks=uav_masks,

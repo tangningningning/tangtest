@@ -19,7 +19,7 @@ scripts/
   generation/   Episode and project-artifact generation
   evaluation/   Frozen learned-policy evaluation
   baselines/    Explicit Static and Prediction-Popularity Greedy evaluation
-configs/        Configuration index; active TOMLs and the minimal LR sweep set
+configs/        Classified configurations and the minimal LR sweep set
 reports/        Research reports and experiment records
 runs/           Generated experiment artifacts; formal runs are not reorganized
 ```
@@ -33,7 +33,7 @@ launchers.  The canonical implementations live in the category directories.
 - Formal base run: `runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050`
 - Frozen checkpoint: `runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt`
 - The retained 1e-4 base run completed 300 epochs.
-- Config: `system_config_ppo_v9_joint_cache_uav.toml`
+- Config: `configs/proposed/system_config_ppo_v9_joint_cache_uav.toml`
 - Policy schema: `adaptive_joint_cache_replica_aware_uav_operation_v9_popart`
 - Configuration control mode: `policy_primitive_v9_joint_cache_uav_operation`
 - Policy mode: `stochastic`
@@ -54,11 +54,12 @@ implementation labels, not new paper-facing method IDs.
 | Experiment ID | Actor learning rate | Status | Artifact |
 | --- | ---: | --- | --- |
 | `proposed_joint_lr_1e4` | `1e-4` | COMPLETED, 300 epochs | formal base run above |
-| `proposed_joint_lr_1e3` | `1e-3` | COMPLETED, 240 epochs | `runs/lr_sweep_v9_actor_1e3` |
-| `proposed_joint_lr_5e4` | `5e-4` | PLANNED; no run directory yet | `configs/lr_sweep/v9_actor_lr_5e4.toml` |
+| `proposed_joint_lr_1e3` | `1e-3` | COMPLETED, 300 epochs | `runs/lr_sweep_v9_actor_1e3` |
+| `proposed_joint_lr_5e4` | `5e-4` | COMPLETED, 300 epochs | `runs/lr_sweep_proposed_joint_actor_5e4` |
 
-The historical LR run/config paths remain unchanged so that manifests and
-provenance continue to resolve.
+The LR configuration paths and run manifests remain explicit so that
+provenance continues to resolve.  The paper-facing formal method remains
+`proposed_joint`; V9 is only an internal compatibility label.
 
 ## Unified experiment registry
 
@@ -94,14 +95,14 @@ Generate an existing-protocol episode pool:
 
 ```text
 python scripts/generation/generate_episode_pool.py \
-  --config system_config_ppo_v6_full_episode_randomized.toml \
+  --config configs/episode_generation/system_config_ppo_v6_full_episode_randomized.toml \
   --output-dir runs/<episode-pool> --start-seed <seed-start> --count <count>
 ```
 
 Train through the single PPO implementation:
 
 ```text
-ppo-train --config system_config_ppo_v9_joint_cache_uav.toml \
+ppo-train --config configs/proposed/system_config_ppo_v9_joint_cache_uav.toml \
   --epochs <epochs> --run-dir runs/<new-run> \
   --episode-pool runs/<episode-pool> --episode-seed-start <seed-start>
 ```
@@ -110,7 +111,7 @@ Evaluate a frozen Joint V9 policy on an existing pool:
 
 ```text
 python scripts/evaluation/evaluate_v9_joint_episode_pool.py \
-  --config system_config_ppo_v9_joint_cache_uav.toml \
+  --config configs/proposed/system_config_ppo_v9_joint_cache_uav.toml \
   --checkpoint runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt \
   --run-dir runs/<evaluation-run> --episode-pool runs/<episode-pool> \
   --seed-start <seed-start> --episodes <count> \

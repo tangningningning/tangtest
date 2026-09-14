@@ -1191,7 +1191,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="从独立 calibration SUMO 轨迹生成 causal Kalman predictions 和 residual bank。"
     )
-    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--config", default="configs/system_config.toml")
     parser.add_argument(
         "--roles-file",
         default=None,

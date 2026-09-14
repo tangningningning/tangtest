@@ -8,7 +8,7 @@ or evaluator behavior was changed by this audit.
 ## 1. Current baseline
 
 The active V6 configuration is
-`system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_actorlr1e4.toml`.
+`configs/baselines/system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_actorlr1e4.toml`.
 It declares:
 
 | Item | Current value |
@@ -67,7 +67,7 @@ identified separately rather than silently redefining the old checkpoint.
 
 | Location | Finding |
 | --- | --- |
-| `system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_actorlr1e4.toml`, `[algorithm.ppo.data_protocol]` | Encodes train `0..239` and test `240..299`; retain unchanged for the frozen V6 baseline. |
+| `configs/baselines/system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_actorlr1e4.toml`, `[algorithm.ppo.data_protocol]` | Encodes train `0..239` and test `240..299`; retain unchanged for the frozen V6 baseline. |
 | `src/ppo_simple/evaluator.py:40-59, 173-257, 278-356, 433-542` | Pins the old held-out evaluator to `240..299`, `60` slots, and checkpoint `completed_epochs=240`; retain for old V6 reproduction. |
 | `src/ppo_simple/plotting.py:13, 79-85, 171-301` | `SLOTS_PER_EPOCH=240` and the slot-metrics writer/validator assume a complete 240-origin training Epoch. This is an old reporting contract, not a PPO mathematical requirement. |
 | `src/ppo_simple/reporting.py:477-504` | The final summary exposes fixed reward regions `0..59`, `60..119`, `120..179`, and `180..239`; this is tied to the old 240-origin report. |

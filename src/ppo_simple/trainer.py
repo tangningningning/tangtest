@@ -661,6 +661,127 @@ def _critic_episode_metrics(
     return explained_variance, value_std, target_std
 
 
+def _uav_episode_diagnostics(
+    *,
+    available: bool,
+    move_probabilities: list[float],
+    stay_probabilities: list[float],
+    logit_margins: list[float],
+    move_feasible: list[bool],
+    move_selected: list[bool],
+    actual_movement: list[bool],
+    move_advantages: list[float],
+    stay_advantages: list[float],
+) -> dict[str, Any]:
+    """Summarize already-sampled UAV diagnostics without another policy call."""
+
+    empty = {
+        "uav_move_probability_mean": None,
+        "uav_move_probability_median": None,
+        "uav_move_probability_p10": None,
+        "uav_move_probability_p90": None,
+        "uav_move_probability_gt_0_5_rate": None,
+        "uav_stay_probability_mean": None,
+        "uav_head_entropy": None,
+        "uav_binary_entropy_mean": None,
+        "uav_stay_move_logit_margin_mean": None,
+        "uav_stay_move_logit_margin_median": None,
+        "uav_move_feasible_count": None,
+        "uav_move_feasible_rate": None,
+        "uav_move_selected_count": None,
+        "uav_move_selected_rate": None,
+        "uav_move_given_selected": None,
+        "uav_action_advantage_logging_available": False,
+        "mean_advantage_for_uav_move": None,
+        "median_advantage_for_uav_move": None,
+        "mean_advantage_for_uav_stay": None,
+        "median_advantage_for_uav_stay": None,
+    }
+    if not available:
+        return empty
+
+    move = np.asarray(move_probabilities, dtype=np.float64)
+    stay = np.asarray(stay_probabilities, dtype=np.float64)
+    margins = np.asarray(logit_margins, dtype=np.float64)
+    feasible = np.asarray(move_feasible, dtype=bool)
+    selected = np.asarray(move_selected, dtype=bool)
+    actual = np.asarray(actual_movement, dtype=bool)
+    if not (
+        move.ndim
+        == stay.ndim
+        == margins.ndim
+        == feasible.ndim
+        == selected.ndim
+        == actual.ndim
+        == 1
+        and len(move)
+        == len(stay)
+        == len(margins)
+        == len(feasible)
+        == len(selected)
+        == len(actual)
+        > 0
+    ):
+        raise AssertionError("UAV diagnostic arrays must be aligned and non-empty")
+    if not (
+        np.all(np.isfinite(move))
+        and np.all(np.isfinite(stay))
+        and np.all(np.isfinite(margins))
+    ):
+        raise FloatingPointError("UAV diagnostic arrays contain NaN/Inf")
+    if not (
+        np.all((move >= 0.0) & (move <= 1.0))
+        and np.all((stay >= 0.0) & (stay <= 1.0))
+        and np.allclose(move + stay, 1.0, rtol=0.0, atol=1.0e-6)
+    ):
+        raise AssertionError("UAV diagnostic probabilities are invalid")
+
+    def _percentile(values: np.ndarray, percentile: float) -> float:
+        return float(np.percentile(values, percentile))
+
+    def _advantage_summary(values: list[float]) -> tuple[float | None, float | None]:
+        if not values:
+            return None, None
+        values_a = np.asarray(values, dtype=np.float64)
+        if not np.all(np.isfinite(values_a)):
+            raise FloatingPointError("UAV action advantages contain NaN/Inf")
+        return float(np.mean(values_a)), float(np.median(values_a))
+
+    move_advantage_mean, move_advantage_median = _advantage_summary(move_advantages)
+    stay_advantage_mean, stay_advantage_median = _advantage_summary(stay_advantages)
+    probability_entropy = -(
+        np.where(move > 0.0, move * np.log(np.maximum(move, 1.0e-12)), 0.0)
+        + np.where(stay > 0.0, stay * np.log(np.maximum(stay, 1.0e-12)), 0.0)
+    )
+    selected_count = int(np.sum(selected))
+    return {
+        "uav_move_probability_mean": float(np.mean(move)),
+        "uav_move_probability_median": float(np.median(move)),
+        "uav_move_probability_p10": _percentile(move, 10.0),
+        "uav_move_probability_p90": _percentile(move, 90.0),
+        "uav_move_probability_gt_0_5_rate": float(np.mean(move > 0.5)),
+        "uav_stay_probability_mean": float(np.mean(stay)),
+        "uav_head_entropy": float(np.mean(probability_entropy)),
+        "uav_binary_entropy_mean": float(np.mean(probability_entropy)),
+        "uav_stay_move_logit_margin_mean": float(np.mean(margins)),
+        "uav_stay_move_logit_margin_median": float(np.median(margins)),
+        "uav_move_feasible_count": int(np.sum(feasible)),
+        "uav_move_feasible_rate": float(np.mean(feasible)),
+        "uav_move_selected_count": selected_count,
+        "uav_move_selected_rate": float(np.mean(selected)),
+        "uav_move_given_selected": (
+            None
+            if selected_count == 0
+            else float(np.sum(actual & selected)) / float(selected_count)
+        ),
+        "uav_action_advantage_logging_available": True,
+        "mean_advantage_for_uav_move": move_advantage_mean,
+        "median_advantage_for_uav_move": move_advantage_median,
+        "mean_advantage_for_uav_stay": stay_advantage_mean,
+        "median_advantage_for_uav_stay": stay_advantage_median,
+    }
+
+
 def _append_critic_diagnostics(
     path: Path,
     *,
@@ -718,7 +839,7 @@ def _append_critic_diagnostics(
 
 
 def load_environment_context(
-    config_path: str = "system_config.toml",
+    config_path: str = "configs/system_config.toml",
     realization_dir: str | Path | None = None,
 ) -> EnvironmentContext:
     cfg = project_config.load_config(config_path)
@@ -1046,7 +1167,7 @@ class PPOV2Trainer:
                 ):
                     policy_class = AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
                 elif context.policy_schema == AdaptivePrimitiveActorCritic.architecture_id:
-                    # system_config.toml intentionally retains the original primitive
+                    # configs/system_config.toml intentionally retains the original primitive
                     # schema as a compatibility/default configuration.
                     policy_class = AdaptivePrimitiveActorCritic
                 else:
@@ -2345,6 +2466,15 @@ def run_training(
     episode_cache_change_counts: list[int] = []
     episode_uav_trigger_counts: list[int] = []
     episode_uav_movement_counts: list[int] = []
+    episode_uav_move_probabilities: list[float] = []
+    episode_uav_stay_probabilities: list[float] = []
+    episode_uav_logit_margins: list[float] = []
+    episode_uav_move_feasible: list[bool] = []
+    episode_uav_move_selected: list[bool] = []
+    episode_uav_actual_movement: list[bool] = []
+    episode_uav_move_advantages: list[float] = []
+    episode_uav_stay_advantages: list[float] = []
+    episode_uav_diagnostics_available = False
     episode_cache_requests = 0
     episode_actual_cache_updates = 0
     episode_uav_requests = 0
@@ -2426,6 +2556,15 @@ def run_training(
             episode_cache_change_counts = []
             episode_uav_trigger_counts = []
             episode_uav_movement_counts = []
+            episode_uav_move_probabilities = []
+            episode_uav_stay_probabilities = []
+            episode_uav_logit_margins = []
+            episode_uav_move_feasible = []
+            episode_uav_move_selected = []
+            episode_uav_actual_movement = []
+            episode_uav_move_advantages = []
+            episode_uav_stay_advantages = []
+            episode_uav_diagnostics_available = False
             episode_cache_requests = 0
             episode_actual_cache_updates = 0
             episode_uav_requests = 0
@@ -2564,6 +2703,79 @@ def run_training(
         episode_uav_movement_counts.extend(
             int(item.actual_uav_movement_count) for item in rollout.transitions
         )
+        for transition, raw_advantage in zip(
+            rollout.transitions,
+            update.raw_advantages,
+            strict=True,
+        ):
+            if transition.uav_operation_probabilities is None:
+                continue
+            probabilities = np.asarray(
+                transition.uav_operation_probabilities,
+                dtype=np.float64,
+            )
+            margins = np.asarray(
+                transition.uav_operation_logit_margins,
+                dtype=np.float64,
+            )
+            operation_actions = np.asarray(
+                transition.uav_operation_actions,
+                dtype=np.int64,
+            )
+            operation_masks = np.asarray(
+                transition.uav_operation_masks,
+                dtype=bool,
+            )
+            actual_flags = np.asarray(
+                [
+                    bool(action.get("actual_moved", False))
+                    for action in transition.uav_conditional_actions
+                ],
+                dtype=bool,
+            )
+            if (
+                probabilities.ndim != 2
+                or probabilities.shape[1] != 2
+                or margins.ndim != 1
+                or operation_actions.ndim != 1
+                or operation_masks.ndim != 2
+                or operation_masks.shape[1] != 2
+                or actual_flags.ndim != 1
+                or probabilities.shape[0]
+                != margins.shape[0]
+                != operation_actions.shape[0]
+                != operation_masks.shape[0]
+                != actual_flags.shape[0]
+            ):
+                raise AssertionError("UAV diagnostic transition shapes are inconsistent")
+            if not np.all(np.isfinite(probabilities)) or not np.all(
+                np.isfinite(margins)
+            ):
+                raise FloatingPointError(
+                    "UAV diagnostic transition values are non-finite"
+                )
+            episode_uav_diagnostics_available = True
+            move_probabilities = probabilities[:, 1]
+            stay_probabilities = probabilities[:, 0]
+            move_selected = operation_actions == 1
+            move_feasible = operation_masks[:, 1]
+            episode_uav_move_probabilities.extend(move_probabilities.tolist())
+            episode_uav_stay_probabilities.extend(stay_probabilities.tolist())
+            episode_uav_logit_margins.extend(margins.tolist())
+            episode_uav_move_feasible.extend(move_feasible.tolist())
+            episode_uav_move_selected.extend(move_selected.tolist())
+            episode_uav_actual_movement.extend(actual_flags.tolist())
+            raw_advantage_value = float(raw_advantage)
+            if not np.isfinite(raw_advantage_value):
+                raise FloatingPointError("UAV action advantage is non-finite")
+            if np.any(move_selected):
+                episode_uav_move_advantages.extend(
+                    [raw_advantage_value] * int(np.sum(move_selected))
+                )
+            if np.any(~move_selected):
+                episode_uav_stay_advantages.extend(
+                    [raw_advantage_value] * int(np.sum(~move_selected))
+                )
         episode_cache_requests += cache_requests
         episode_actual_cache_updates += actual_cache_updates
         episode_uav_requests += uav_requests
@@ -2783,6 +2995,17 @@ def run_training(
             )
             epoch_entropy = float(np.mean(episode_entropies))
             epoch_approximate_kl = float(np.mean(episode_approximate_kls))
+            uav_diagnostic_metrics = _uav_episode_diagnostics(
+                available=episode_uav_diagnostics_available,
+                move_probabilities=episode_uav_move_probabilities,
+                stay_probabilities=episode_uav_stay_probabilities,
+                logit_margins=episode_uav_logit_margins,
+                move_feasible=episode_uav_move_feasible,
+                move_selected=episode_uav_move_selected,
+                actual_movement=episode_uav_actual_movement,
+                move_advantages=episode_uav_move_advantages,
+                stay_advantages=episode_uav_stay_advantages,
+            )
             if (
                 context.policy_schema in MODERN_POLICY_SCHEMAS
                 and (best_epoch_return is None or epoch_return > best_epoch_return)
@@ -2906,6 +3129,7 @@ def run_training(
                     "wall_clock_runtime_seconds": epoch_runtime_seconds,
                     "rollout_runtime_seconds": rollout_runtime_seconds,
                     "update_runtime_seconds": update_runtime_seconds,
+                    **uav_diagnostic_metrics,
                 },
             )
             append_training_slot_metrics(
@@ -2976,7 +3200,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="PPO v2 Cache/UAV trainer (1 Epoch = one complete train-origin pass)"
     )
-    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--config", default="configs/system_config.toml")
     parser.add_argument(
         "--epochs",
         type=int,

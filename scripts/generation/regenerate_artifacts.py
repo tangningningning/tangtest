@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按 system_config.toml 的依赖关系重生成并校验正式 artifact。
+"""按 configs/system_config.toml 的依赖关系重生成并校验正式 artifact。
 
 脚本只编排已有场景生成器，不实现新的任务、缓存、预测、通信或优化算法。
 车辆角色复用已有 trajectory.csv，不启动 SUMO；预测阶段只调用现有的 GRU
@@ -34,7 +34,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "system_config.toml"
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "system_config.toml"
 DEFAULT_METADATA_PATH = PROJECT_ROOT / "data/generated/generation_metadata.json"
 DEFAULT_REPORT_PATH = PROJECT_ROOT / "reports/artifact_consistency_report.md"
 FLOAT_TOLERANCE = 1.0e-9
@@ -73,7 +73,7 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
     with config_path.open("rb") as stream:
         value = tomllib.load(stream)
     if not isinstance(value, dict):
-        raise ValueError("system_config.toml 根对象必须是 table。")
+        raise ValueError("configs/system_config.toml 根对象必须是 table。")
     return value
 
 
@@ -953,7 +953,7 @@ def write_report(
     lines = [
         "# Artifact 一致性报告",
         "",
-        "本报告由 `scripts/generation/regenerate_artifacts.py` 根据 `system_config.toml` 生成。",
+        "本报告由 `scripts/generation/regenerate_artifacts.py` 根据 `configs/system_config.toml` 生成。",
         "角色重建复用既有 `trajectory.csv`，未启动 SUMO；未运行 PPO 或完整实验。",
         "",
         "## 当前配置摘要",
@@ -987,7 +987,7 @@ def write_report(
     if errors:
         lines.extend(["", "## 错误或未完成项", ""])
         lines.extend(f"- {error}" for error in errors)
-    lines.extend(["", "## 依赖关系", "", "- service 参数 -> service_catalog、popularity、tasks、TV 初始缓存、预测场景", "- vehicle 参数/角色集合 -> vehicle_roles、tasks、TV 初始缓存、vehicle_predictions、prediction_scenarios", "- task 参数 -> popularity、tasks、GRU 预测输入和 prediction_scenarios", "- cache 容量比例 -> system_config.toml 中的派生 MB 容量和 TV 初始缓存", "- RSU/UAV 数量 -> node_positions.json；位置仍由 node_placement.py 道路感知生成", ""])
+    lines.extend(["", "## 依赖关系", "", "- service 参数 -> service_catalog、popularity、tasks、TV 初始缓存、预测场景", "- vehicle 参数/角色集合 -> vehicle_roles、tasks、TV 初始缓存、vehicle_predictions、prediction_scenarios", "- task 参数 -> popularity、tasks、GRU 预测输入和 prediction_scenarios", "- cache 容量比例 -> configs/system_config.toml 中的派生 MB 容量和 TV 初始缓存", "- RSU/UAV 数量 -> node_positions.json；位置仍由 node_placement.py 道路感知生成", ""])
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -1059,7 +1059,7 @@ def build_parser() -> argparse.ArgumentParser:
     """构造统一 artifact 入口参数解析器。"""
 
     parser = argparse.ArgumentParser(
-        description="根据 system_config.toml 增量重生成并校验正式 artifact。"
+        description="根据 configs/system_config.toml 增量重生成并校验正式 artifact。"
     )
     parser.add_argument(
         "--config",

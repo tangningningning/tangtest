@@ -58,21 +58,22 @@ actor_learning_rate = 1.0e-4
 status = "COMPLETED"
 completed_epochs = 300
 run = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050"
-config = "system_config_ppo_v9_joint_cache_uav.toml"
+config = "configs/proposed/system_config_ppo_v9_joint_cache_uav.toml"
 
 [learning_rate_experiments.proposed_joint_lr_1e3]
 actor_learning_rate = 1.0e-3
 status = "COMPLETED"
-completed_epochs = 240
+completed_epochs = 300
 run = "runs/lr_sweep_v9_actor_1e3"
 config = "configs/lr_sweep/v9_actor_lr_1e3.toml"
 
 [learning_rate_experiments.proposed_joint_lr_5e4]
 actor_learning_rate = 5.0e-4
-status = "PLANNED"
-run = ""
+status = "COMPLETED"
+completed_epochs = 300
+run = "runs/lr_sweep_proposed_joint_actor_5e4"
 config = "configs/lr_sweep/v9_actor_lr_5e4.toml"
-notes = "Retained for the next comparison; no run directory exists yet."
+notes = "Completed 300-epoch run; internal V9-compatible schema is retained."
 
 [methods.proposed_joint]
 category = "proposed"
@@ -85,7 +86,7 @@ policy_mode = "stochastic"
 stochastic_repeats = 5
 cache_policy = "learned_adaptive"
 uav_policy = "learned_adaptive"
-config = "system_config_ppo_v9_joint_cache_uav.toml"
+config = "configs/proposed/system_config_ppo_v9_joint_cache_uav.toml"
 checkpoint = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt"
 training_entrypoint = "ppo-train"
 evaluation_entrypoint = "scripts/evaluation/evaluate_v9_joint_episode_pool.py"
@@ -103,7 +104,7 @@ policy_mode = "stochastic"
 stochastic_repeats = 5
 cache_policy = "learned_adaptive"
 uav_policy = "fixed"
-config = "system_config_ppo_v8_cache_operation_group_replica_aware.toml"
+config = "configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml"
 checkpoint = ""
 training_entrypoint = "ppo-train"
 evaluation_entrypoint = "scripts/evaluation/evaluate_v8_episode_pool.py"
@@ -138,7 +139,7 @@ policy_mode = "deterministic"
 stochastic_repeats = 1
 cache_policy = "prediction_popularity_greedy"
 uav_policy = "fixed"
-config = "system_config_ppo_v8_cache_operation_group_replica_aware.toml"
+config = "configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml"
 checkpoint = ""
 training_entrypoint = ""
 evaluation_entrypoint = "scripts/baselines/evaluate_popularity_greedy_episode_pool.py"
@@ -155,7 +156,7 @@ policy_mode = "deterministic"
 stochastic_repeats = 1
 cache_policy = "true_static"
 uav_policy = "fixed"
-config = "system_config_ppo_v8_cache_operation_group_replica_aware.toml"
+config = "configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml"
 checkpoint = ""
 training_entrypoint = ""
 evaluation_entrypoint = "scripts/baselines/evaluate_static_episode_pool.py"

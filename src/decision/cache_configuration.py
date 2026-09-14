@@ -2308,7 +2308,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="给定 cache trigger 和预测场景，优化动态缓存配置。"
     )
-    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--config", default="configs/system_config.toml")
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     parser.add_argument("--prediction-scenarios", default=None)
     parser.add_argument("--service-catalog", default=None)

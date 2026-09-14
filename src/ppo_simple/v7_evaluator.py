@@ -189,7 +189,7 @@ def _summary(
 def evaluate_v7_episode(
     checkpoint_path: str | Path,
     run_dir: str | Path,
-    config_path: str | Path = "system_config_ppo_v7_cache_operation_group.toml",
+    config_path: str | Path = "configs/baselines/system_config_ppo_v7_cache_operation_group.toml",
     realization_dir: str | Path | None = None,
     device: str = "cpu",
     policy_action_mode: str = "deterministic",

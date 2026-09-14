@@ -87,6 +87,8 @@ class SimpleTransition:
     uav_operation_masks: np.ndarray | None = None
     uav_operation_log_probs: np.ndarray | None = None
     uav_operation_entropies: np.ndarray | None = None
+    uav_operation_probabilities: np.ndarray | None = None
+    uav_operation_logit_margins: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -434,6 +436,8 @@ def collect_rollout(
         uav_operation_masks: np.ndarray | None = None
         uav_operation_log_probs: np.ndarray | None = None
         uav_operation_entropies: np.ndarray | None = None
+        uav_operation_probabilities: np.ndarray | None = None
+        uav_operation_logit_margins: np.ndarray | None = None
         total_log_prob = sample.log_prob
         configuration_override = None
         if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
@@ -465,6 +469,8 @@ def collect_rollout(
             uav_operation_masks = v9_primitive.uav_operation_masks
             uav_operation_log_probs = v9_primitive.uav_operation_old_log_probs
             uav_operation_entropies = v9_primitive.uav_operation_entropies
+            uav_operation_probabilities = v9_primitive.uav_operation_probabilities
+            uav_operation_logit_margins = v9_primitive.uav_operation_logit_margins
             configuration_override = slot_environment.build_policy_primitive_configuration(
                 previous_cache,
                 previous_uav,
@@ -699,6 +705,16 @@ def collect_rollout(
                     None
                     if uav_operation_entropies is None
                     else uav_operation_entropies.copy()
+                ),
+                uav_operation_probabilities=(
+                    None
+                    if uav_operation_probabilities is None
+                    else uav_operation_probabilities.copy()
+                ),
+                uav_operation_logit_margins=(
+                    None
+                    if uav_operation_logit_margins is None
+                    else uav_operation_logit_margins.copy()
                 ),
             )
         )

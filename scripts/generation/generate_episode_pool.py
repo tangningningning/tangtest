@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="system_config_ppo_v6_full_episode_randomized.toml",
+        default="configs/episode_generation/system_config_ppo_v6_full_episode_randomized.toml",
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start-seed", type=int, required=True)

@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="system_config_ppo_v9_joint_cache_uav.toml",
+        default="configs/proposed/system_config_ppo_v9_joint_cache_uav.toml",
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--run-dir", required=True)

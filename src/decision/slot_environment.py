@@ -509,7 +509,7 @@ def execute_slot(
     )
 
 
-def run_slot20_validation(config_path: str = "system_config.toml") -> dict[str, SlotExecutionResult]:
+def run_slot20_validation(config_path: str = "configs/system_config.toml") -> dict[str, SlotExecutionResult]:
     cfg = project_config.load_config(config_path)
     project_config.validate_config(cfg)
     project_config.validate_for_formal_experiment(cfg)
@@ -650,7 +650,7 @@ def _summary(result: SlotExecutionResult) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Execute one actual slot from trigger to reward.")
-    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--config", default="configs/system_config.toml")
     return parser
 
 
@@ -1568,7 +1568,7 @@ def _result_summary(result: JointConfigurationResult) -> dict[str, Any]:
 
 def build_configuration_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Cache + UAV trigger-conditioned configuration optimizer.")
-    parser.add_argument("--config", default="system_config.toml")
+    parser.add_argument("--config", default="configs/system_config.toml")
     parser.add_argument("--origin-index", type=int, default=0)
     return parser
 

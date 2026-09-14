@@ -174,7 +174,7 @@ def _summary(
 def evaluate_v8_episode(
     checkpoint_path: str | Path,
     run_dir: str | Path,
-    config_path: str | Path = "system_config_ppo_v8_cache_operation_group_replica_aware.toml",
+    config_path: str | Path = "configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml",
     realization_dir: str | Path | None = None,
     device: str = "cpu",
     policy_action_mode: str = "deterministic",

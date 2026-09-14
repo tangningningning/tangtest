@@ -47,7 +47,7 @@ from .trainer import (
 
 
 FORMAL_CONFIG_PATH = (
-    "system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_"
+    "configs/baselines/system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_"
     "actorlr1e4.toml"
 )
 FORMAL_TRAINING_RUN_DIR = Path("runs/ppo_v6_popart_actor1e4_fresh_20260910")
@@ -66,7 +66,7 @@ TEST_SEGMENTS = (
     (270, 284),
     (285, 299),
 )
-FULL_EPISODE_CONFIG_PATH = "system_config_ppo_v6_full_episode_randomized.toml"
+FULL_EPISODE_CONFIG_PATH = "configs/episode_generation/system_config_ppo_v6_full_episode_randomized.toml"
 FULL_EPISODE_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
 FULL_EPISODE_ORIGIN_START = 0
 FULL_EPISODE_ORIGIN_END = 299

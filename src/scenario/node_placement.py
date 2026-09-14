@@ -32,10 +32,10 @@ def find_project_root() -> Path:
         Path.cwd().resolve(),
     )
     for candidate in candidates:
-        if (candidate / "system_config.toml").is_file() and (candidate / "data").is_dir():
+        if (candidate / "configs" / "system_config.toml").is_file() and (candidate / "data").is_dir():
             return candidate
     raise FileNotFoundError(
-        "无法定位项目根目录：期望找到 system_config.toml 和 data/。"
+        "无法定位项目根目录：期望找到 configs/system_config.toml 和 data/。"
     )
 
 
@@ -77,7 +77,7 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
     with config_path.open("rb") as stream:
         config = tomllib.load(stream)
     if not isinstance(config, dict):
-        raise ValueError("system_config.toml 根对象必须是 table。")
+        raise ValueError("configs/system_config.toml 根对象必须是 table。")
     return config
 
 
@@ -449,8 +449,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="system_config.toml",
-        help="统一 TOML 配置路径，默认使用项目根目录下的 system_config.toml。",
+        default="configs/system_config.toml",
+        help="统一 TOML 配置路径，默认使用项目根目录下的 configs/system_config.toml。",
     )
     parser.add_argument(
         "--output",
