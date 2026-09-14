@@ -248,6 +248,7 @@ def build_run_manifest(
         "gae_lambda": float(hyper.gae_lambda),
         "clip_epsilon": float(hyper.clip_epsilon),
         "update_epochs": int(hyper.update_epochs),
+        "target_kl": hyper.target_kl,
         "num_minibatches": int(hyper.num_minibatches),
         "minibatch_size": int(context.minibatch_size),
         "actor_learning_rate": _optimizer_learning_rate(

@@ -182,6 +182,7 @@ class PPOV2Hyperparameters:
     entropy_coefficient: float
     max_grad_norm: float
     update_epochs: int
+    target_kl: float | None
     num_minibatches: int
     hidden_sizes: tuple[int, ...]
     advantage_normalization_mode: str
@@ -267,6 +268,8 @@ class UpdateResult:
     entropy: float
     approximate_kl: float
     clip_fraction: float
+    kl_early_stop_triggered: bool
+    ppo_update_epochs_executed: int
     total_loss: float
     gradient_finite: bool
     returns_finite: bool
@@ -942,6 +945,7 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
     get = project_config.get_config_value
     hidden_sizes = tuple(int(value) for value in get(cfg, "algorithm.ppo.hidden_sizes"))
     learning_rate = float(get(cfg, "algorithm.ppo.learning_rate"))
+    raw_target_kl = get(cfg, "algorithm.ppo.target_kl")
     values = PPOV2Hyperparameters(
         gamma=float(get(cfg, "algorithm.ppo.gamma")),
         gae_lambda=float(get(cfg, "algorithm.ppo.gae_lambda")),
@@ -957,6 +961,7 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         entropy_coefficient=float(get(cfg, "algorithm.ppo.entropy_coefficient")),
         max_grad_norm=float(get(cfg, "algorithm.ppo.max_grad_norm")),
         update_epochs=int(get(cfg, "algorithm.ppo.update_epochs")),
+        target_kl=(None if raw_target_kl is None else float(raw_target_kl)),
         num_minibatches=int(get(cfg, "algorithm.ppo.num_minibatches")),
         hidden_sizes=hidden_sizes,
         advantage_normalization_mode=str(
@@ -1007,6 +1012,10 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         raise ValueError("PPO v2 entropy/max_grad_norm 非法。")
     if values.update_epochs <= 0 or values.num_minibatches <= 0:
         raise ValueError("PPO v2 update_epochs/num_minibatches 必须为正整数。")
+    if values.target_kl is not None and (
+        not math.isfinite(values.target_kl) or values.target_kl <= 0.0
+    ):
+        raise ValueError("target_kl 必须是正的有限数，或省略以禁用 KL protection。")
     if values.advantage_normalization_mode not in {
         ADVANTAGE_NORMALIZATION_CENTERED_STD,
         ADVANTAGE_NORMALIZATION_STD_ONLY,
@@ -1506,6 +1515,8 @@ class PPOV2Trainer:
         gradient_finite = True
         actor_parameters: list[Any] | None = None
         critic_parameters: list[Any] | None = None
+        kl_early_stop_triggered = False
+        ppo_update_epochs_executed = 0
         if self._uses_separate_optimization():
             if not isinstance(
                 self.policy,
@@ -1517,8 +1528,9 @@ class PPOV2Trainer:
             if self.actor_optimizer is None or self.critic_optimizer is None:
                 raise RuntimeError("V5 actor/critic optimizers are not initialized.")
         minibatch_size = sample_count // hyper.num_minibatches
-        for _ in range(hyper.update_epochs):
+        for update_epoch in range(hyper.update_epochs):
             permutation = torch.randperm(sample_count, device=self.device)
+            update_epoch_approximate_kls: list[float] = []
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
                 if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
@@ -1754,9 +1766,21 @@ class PPOV2Trainer:
                 policy_loss_values.append(policy_loss_value)
                 value_loss_values.append(value_loss_value)
                 approximate_kl_values.append(approximate_kl_value)
+                update_epoch_approximate_kls.append(approximate_kl_value)
                 gradient_norm_values.append(gradient_norm_value)
                 actor_gradient_norm_values.append(actor_gradient_norm_value)
                 critic_gradient_norm_values.append(critic_gradient_norm_value)
+            ppo_update_epochs_executed += 1
+            if (
+                hyper.target_kl is not None
+                and update_epoch + 1 < hyper.update_epochs
+                and float(np.mean(update_epoch_approximate_kls)) > hyper.target_kl
+            ):
+                # Check only after every minibatch in this update epoch has
+                # completed.  The shared V9 loop therefore stops both actor
+                # and critic updates for the remaining update epochs.
+                kl_early_stop_triggered = True
+                break
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
             self.critic_return_statistics.update(returns)
         delta_squared = 0.0
@@ -1770,6 +1794,8 @@ class PPOV2Trainer:
             entropy=entropy_value,
             approximate_kl=approximate_kl_value,
             clip_fraction=clip_fraction_value,
+            kl_early_stop_triggered=kl_early_stop_triggered,
+            ppo_update_epochs_executed=ppo_update_epochs_executed,
             total_loss=total_loss_value,
             gradient_finite=gradient_finite,
             returns_finite=returns_finite,
@@ -2862,6 +2888,8 @@ def run_training(
                 "approximate_kl": float(update.approximate_kl),
                 "approximate_kl_min": float(update.approximate_kl_min),
                 "approximate_kl_max": float(update.approximate_kl_max),
+                "kl_early_stop_triggered": bool(update.kl_early_stop_triggered),
+                "ppo_update_epochs_executed": int(update.ppo_update_epochs_executed),
                 "clip_fraction": float(update.clip_fraction),
                 "gradient_norm": float(update.gradient_norm),
                 "gradient_norm_min": float(update.gradient_norm_min),
@@ -3094,6 +3122,8 @@ def run_training(
                     "best_epoch_return": best_epoch_return,
                     "entropy_mean": epoch_entropy,
                     "approximate_kl_mean": epoch_approximate_kl,
+                    "kl_early_stop_triggered": bool(update.kl_early_stop_triggered),
+                    "ppo_update_epochs_executed": int(update.ppo_update_epochs_executed),
                     "cache_trigger_rate": cache_trigger_rate,
                     "cache_change_given_trigger": cache_change_given_trigger,
                     "uav_trigger_rate": uav_trigger_rate,
