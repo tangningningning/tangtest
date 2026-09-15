@@ -23,6 +23,8 @@ from .policy import (
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
     AdaptivePrimitiveActorCritic,
     BernoulliActorCritic,
     PolicySample,
@@ -120,6 +122,11 @@ class SimpleRollout:
     uav_operation_masks: np.ndarray | None = None
     uav_operation_log_probs: np.ndarray | None = None
     uav_operation_entropies: np.ndarray | None = None
+    # Candidate old log-probabilities are already stored per transition.  The
+    # rollout-level stacks make branch diagnostics indexable without logging
+    # any new arrays or changing the sampled action path.
+    cache_old_log_probs: np.ndarray | None = None
+    uav_old_log_probs: np.ndarray | None = None
 
 
 def _observation(
@@ -243,9 +250,16 @@ def collect_rollout(
         v7_primitive: Any | None = None
         v9_primitive: Any | None = None
         if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
-            if type(policy) is not AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic:
+            if not isinstance(
+                policy,
+                (
+                    AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
+                    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
+                    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
+                ),
+            ):
                 raise TypeError(
-                    "policy_primitive_v9_joint_cache_uav_operation requires the exact V9 policy"
+                    "policy_primitive_v9_joint_cache_uav_operation requires a V9/V10 Joint policy"
                 )
             if action_transform is not None:
                 raise ValueError("V9 Joint rollout does not support action_transform")
@@ -832,6 +846,12 @@ def collect_rollout(
                 [item.uav_operation_entropies for item in transitions]
             ).astype(np.float32)
         ),
+        cache_old_log_probs=np.stack(
+            [item.cache_old_log_probs for item in transitions]
+        ).astype(np.float32),
+        uav_old_log_probs=np.stack(
+            [item.uav_old_log_probs for item in transitions]
+        ).astype(np.float32),
     )
 
 

@@ -33,6 +33,13 @@ class PolicyEvaluation:
     entropy: Any
     value: Any
     logits: Any
+    # Optional branch-level diagnostics.  These are populated only by policy
+    # schemas whose rollout already carries the corresponding primitive
+    # actions and old log-probabilities; they do not affect the PPO objective.
+    cache_log_prob: Any | None = None
+    uav_log_prob: Any | None = None
+    cache_entropy: Any | None = None
+    uav_entropy: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -665,6 +672,10 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             entropy=trigger.entropy + cache_entropy + uav_entropy,
             value=trigger.value,
             logits=trigger.logits,
+            cache_log_prob=cache_log_prob,
+            uav_log_prob=uav_log_prob,
+            cache_entropy=cache_entropy,
+            uav_entropy=uav_entropy,
         )
 
 
@@ -1193,6 +1204,8 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
             entropy=operation_entropy + candidate_entropy,
             value=self.critic_value(observations_t),
             logits=operation_logits,
+            cache_log_prob=operation_log_prob + candidate_log_prob,
+            cache_entropy=operation_entropy + candidate_entropy,
         )
 
 
@@ -1259,6 +1272,45 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
         if len({id(parameter) for parameter in parameters}) != len(parameters):
             raise RuntimeError("V9 actor parameter group contains duplicate parameters.")
         return parameters
+
+    def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
+        """Return disjoint actor groups for post-backward diagnostics only.
+
+        The actor still has one optimizer and one joint PPO loss.  The shared
+        encoder is intentionally kept separate from the branch-only modules so
+        its gradient is not attributed to either branch.
+        """
+
+        groups = {
+            "cache": tuple(
+                parameter
+                for module in (
+                    self.cache_operation_head,
+                    self.cache_candidate_scorer,
+                )
+                for parameter in module.parameters()
+            ),
+            "uav": tuple(
+                parameter
+                for module in (
+                    self.uav_operation_head,
+                    self.uav_candidate_scorer,
+                )
+                for parameter in module.parameters()
+            ),
+            "shared": tuple(self.encoder.parameters()),
+        }
+        group_ids = [
+            id(parameter)
+            for parameters in groups.values()
+            for parameter in parameters
+        ]
+        if len(set(group_ids)) != len(group_ids):
+            raise RuntimeError("V9 actor gradient groups overlap.")
+        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
+        if set(group_ids) != actor_ids:
+            raise RuntimeError("V9 actor gradient groups do not cover the actor.")
+        return groups
 
     def _uav_operation_logits(self, observations: Any) -> tuple[Any, bool]:
         obs, single = self._observations(observations)
@@ -1515,7 +1567,38 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             entropy=cache_evaluation.entropy + operation_entropy + candidate_entropy,
             value=cache_evaluation.value,
             logits=cache_evaluation.logits,
+            cache_log_prob=cache_evaluation.log_prob,
+            uav_log_prob=operation_log_prob + candidate_log_prob,
+            cache_entropy=cache_evaluation.entropy,
+            uav_entropy=operation_entropy + candidate_entropy,
         )
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
+):
+    """Additive V10 schema exposing V9's existing Cache/UAV branch statistics.
+
+    No module is added or renamed.  The state-dict layout, action hierarchy,
+    and optimizer parameter groups remain inherited from V9; the new schema
+    only makes the branch-observability stage explicit for future runs.
+    """
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable"
+    )
+    architecture_version = 1
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic
+):
+    """V10-B schema using branchwise PPO optimization with one actor optimizer."""
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise"
+    )
+    architecture_version = 1
 
 
 class AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic(

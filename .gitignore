@@ -33,6 +33,7 @@ env/
 # Simulation output
 # =========================
 runs/
+dist_server/
 
 
 # =========================

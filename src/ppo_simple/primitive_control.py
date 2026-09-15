@@ -27,6 +27,8 @@ REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
         REPLICA_AWARE_POLICY_SCHEMA,
         NO_PREDICTION_POLICY_SCHEMA,
         "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
+        "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
+        "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
     }
 )
 REPLICA_AWARE_CACHE_FEATURE_NAMES = (

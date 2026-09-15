@@ -46,6 +46,8 @@ from .policy import (
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
@@ -66,6 +68,7 @@ V7_CHECKPOINT_VERSION = 7
 V8_CHECKPOINT_VERSION = 8
 V8_NO_PREDICTION_CHECKPOINT_VERSION = 9
 V9_JOINT_CHECKPOINT_VERSION = 10
+V10_BRANCHWISE_CHECKPOINT_VERSION = 11
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
@@ -91,11 +94,22 @@ NO_PREDICTION_POLICY_SCHEMAS = frozenset({NO_PREDICTION_POLICY_SCHEMA})
 JOINT_V9_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic.architecture_id}
 )
+JOINT_V10_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic.architecture_id}
+)
+JOINT_V10_BRANCHWISE_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id}
+)
+JOINT_CACHE_UAV_POLICY_SCHEMAS = (
+    JOINT_V9_POLICY_SCHEMAS
+    | JOINT_V10_POLICY_SCHEMAS
+    | JOINT_V10_BRANCHWISE_POLICY_SCHEMAS
+)
 CACHE_OPERATION_POLICY_SCHEMAS = (
     V7_POLICY_SCHEMAS | V8_POLICY_SCHEMAS | NO_PREDICTION_POLICY_SCHEMAS
 )
 POPART_POLICY_SCHEMAS = (
-    V6_POLICY_SCHEMAS | CACHE_OPERATION_POLICY_SCHEMAS | JOINT_V9_POLICY_SCHEMAS
+    V6_POLICY_SCHEMAS | CACHE_OPERATION_POLICY_SCHEMAS | JOINT_CACHE_UAV_POLICY_SCHEMAS
 )
 SEPARATE_OPTIMIZATION_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
 HORIZON_POLICY_SCHEMAS = POPART_POLICY_SCHEMAS
@@ -125,6 +139,21 @@ GENERATOR_EXTRA_ARTIFACT_FILENAMES = (
 def _require_torch() -> None:
     if torch is None:
         raise ImportError("PPO v2 training requires PyTorch.")
+
+
+def _gradient_group_norm(parameters: Any) -> float:
+    """Return a pre-clipping L2 norm for one diagnostic parameter group."""
+
+    squared_norm = None
+    for parameter in parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        component = torch.sum(gradient.detach() ** 2)
+        squared_norm = component if squared_norm is None else squared_norm + component
+    if squared_norm is None:
+        return 0.0
+    return float(torch.sqrt(squared_norm).detach().cpu())
 
 
 @dataclass(frozen=True)
@@ -296,6 +325,18 @@ class UpdateResult:
     raw_advantages: np.ndarray
     raw_returns: np.ndarray
     bootstrap_value: float
+    cache_approx_kl: float = math.nan
+    uav_approx_kl: float = math.nan
+    cache_clip_fraction: float = math.nan
+    uav_clip_fraction: float = math.nan
+    cache_entropy: float = math.nan
+    uav_entropy: float = math.nan
+    cache_head_gradient_norm: float = math.nan
+    uav_head_gradient_norm: float = math.nan
+    shared_actor_gradient_norm: float = math.nan
+    cache_policy_loss: float = math.nan
+    uav_policy_loss: float = math.nan
+    actor_policy_loss: float = math.nan
 
 
 @dataclass(frozen=True)
@@ -633,6 +674,31 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         json.dump(record, stream, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         stream.write("\n")
+
+
+def _branch_update_metric_fields(update: UpdateResult) -> dict[str, float]:
+    """Return finite branch diagnostics without changing legacy log schemas."""
+
+    values = {
+        "cache_approx_kl": float(update.cache_approx_kl),
+        "uav_approx_kl": float(update.uav_approx_kl),
+        "cache_clip_fraction": float(update.cache_clip_fraction),
+        "uav_clip_fraction": float(update.uav_clip_fraction),
+        "cache_entropy": float(update.cache_entropy),
+        "uav_entropy": float(update.uav_entropy),
+        "cache_head_gradient_norm": float(update.cache_head_gradient_norm),
+        "uav_head_gradient_norm": float(update.uav_head_gradient_norm),
+        "shared_actor_gradient_norm": float(update.shared_actor_gradient_norm),
+    }
+    fields = values if all(math.isfinite(value) for value in values.values()) else {}
+    policy_losses = {
+        "cache_policy_loss": float(update.cache_policy_loss),
+        "uav_policy_loss": float(update.uav_policy_loss),
+        "actor_policy_loss": float(update.actor_policy_loss),
+    }
+    if all(math.isfinite(value) for value in policy_losses.values()):
+        fields.update(policy_losses)
+    return fields
 
 
 def _critic_episode_metrics(
@@ -1132,11 +1198,21 @@ class PPOV2Trainer:
             primitive_spec = PrimitiveTensorSpec.create(context)
             policy_class: type[AdaptivePrimitiveActorCritic]
             if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
-                if context.policy_schema not in JOINT_V9_POLICY_SCHEMAS:
+                if context.policy_schema not in JOINT_CACHE_UAV_POLICY_SCHEMAS:
                     raise ValueError(
-                        "policy_primitive_v9_joint_cache_uav_operation requires the V9 Joint schema"
+                        "policy_primitive_v9_joint_cache_uav_operation requires a supported Joint Cache/UAV schema"
                     )
-                policy_class = AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
+                policy_class = (
+                    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic
+                    if context.policy_schema
+                    == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id
+                    else (
+                        AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic
+                        if context.policy_schema
+                        == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic.architecture_id
+                        else AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
+                    )
+                )
                 self.policy = policy_class(
                     int(context.observation_spec.observation_dim),
                     int(context.action_spec.action_dim),
@@ -1265,7 +1341,9 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
-        if self.policy.architecture_id in JOINT_V9_POLICY_SCHEMAS:
+        if self.policy.architecture_id in JOINT_V10_BRANCHWISE_POLICY_SCHEMAS:
+            return V10_BRANCHWISE_CHECKPOINT_VERSION
+        if self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS:
             return V9_JOINT_CHECKPOINT_VERSION
         if self.policy.architecture_id in NO_PREDICTION_POLICY_SCHEMAS:
             return V8_NO_PREDICTION_CHECKPOINT_VERSION
@@ -1424,6 +1502,7 @@ class PPOV2Trainer:
         )
         v7_operation_actions = None
         v7_operation_masks = None
+        v7_operation_old_log_probs = None
         if self.context.configuration_control_mode in {
             "policy_primitive_v7_cache_operation",
             "policy_primitive_v9_joint_cache_uav_operation",
@@ -1443,8 +1522,15 @@ class PPOV2Trainer:
                 dtype=torch.bool,
                 device=self.device,
             )
+            if rollout.v7_cache_operation_log_probs is not None:
+                v7_operation_old_log_probs = torch.as_tensor(
+                    rollout.v7_cache_operation_log_probs,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         uav_operation_actions = None
         uav_operation_masks = None
+        uav_operation_old_log_probs = None
         if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
             if rollout.uav_operation_actions is None or rollout.uav_operation_masks is None:
                 raise ValueError("V9 rollout is missing UAV operation actions/masks")
@@ -1458,6 +1544,12 @@ class PPOV2Trainer:
                 dtype=torch.bool,
                 device=self.device,
             )
+            if rollout.uav_operation_log_probs is not None:
+                uav_operation_old_log_probs = torch.as_tensor(
+                    rollout.uav_operation_log_probs,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         uav_contexts = torch.as_tensor(
             rollout.uav_contexts, dtype=torch.float32, device=self.device
         )
@@ -1471,6 +1563,58 @@ class PPOV2Trainer:
             rollout.uav_selected_indices, dtype=torch.long, device=self.device
         )
         old_log_probs = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=self.device)
+        branch_diagnostics_enabled = (
+            self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS
+        )
+        branchwise_policy_enabled = (
+            self.policy.architecture_id in JOINT_V10_BRANCHWISE_POLICY_SCHEMAS
+        )
+        cache_candidate_old_log_probs = None
+        uav_candidate_old_log_probs = None
+        if branch_diagnostics_enabled:
+            if (
+                v7_operation_old_log_probs is None
+                or uav_operation_old_log_probs is None
+                or rollout.cache_old_log_probs is None
+                or rollout.uav_old_log_probs is None
+            ):
+                raise ValueError(
+                    "Joint Cache/UAV rollout is missing branch old log-probabilities"
+                )
+            cache_candidate_old_log_probs = torch.as_tensor(
+                rollout.cache_old_log_probs,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            uav_candidate_old_log_probs = torch.as_tensor(
+                rollout.uav_old_log_probs,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if tuple(v7_operation_old_log_probs.shape) != tuple(
+                v7_operation_actions.shape
+            ):
+                raise ValueError(
+                    "Joint Cache rollout operation old log-probabilities shape mismatch"
+                )
+            if tuple(cache_candidate_old_log_probs.shape) != tuple(
+                cache_selected_indices.shape
+            ):
+                raise ValueError(
+                    "Joint Cache candidate old log-probabilities shape mismatch"
+                )
+            if tuple(uav_operation_old_log_probs.shape) != tuple(
+                uav_operation_actions.shape
+            ):
+                raise ValueError(
+                    "Joint UAV operation old log-probabilities shape mismatch"
+                )
+            if tuple(uav_candidate_old_log_probs.shape) != tuple(
+                uav_selected_indices.shape
+            ):
+                raise ValueError(
+                    "Joint UAV candidate old log-probabilities shape mismatch"
+                )
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
         critic_targets_t = (
@@ -1512,9 +1656,22 @@ class PPOV2Trainer:
         gradient_norm_values: list[float] = []
         actor_gradient_norm_values: list[float] = []
         critic_gradient_norm_values: list[float] = []
+        cache_approx_kl_values: list[float] = []
+        uav_approx_kl_values: list[float] = []
+        cache_clip_fraction_values: list[float] = []
+        uav_clip_fraction_values: list[float] = []
+        cache_entropy_values: list[float] = []
+        uav_entropy_values: list[float] = []
+        cache_head_gradient_norm_values: list[float] = []
+        uav_head_gradient_norm_values: list[float] = []
+        shared_actor_gradient_norm_values: list[float] = []
+        cache_policy_loss_values: list[float] = []
+        uav_policy_loss_values: list[float] = []
+        actor_policy_loss_values: list[float] = []
         gradient_finite = True
         actor_parameters: list[Any] | None = None
         critic_parameters: list[Any] | None = None
+        branch_gradient_parameter_groups: dict[str, tuple[Any, ...]] | None = None
         kl_early_stop_triggered = False
         ppo_update_epochs_executed = 0
         if self._uses_separate_optimization():
@@ -1527,6 +1684,17 @@ class PPOV2Trainer:
             critic_parameters = list(self.policy.critic_parameters())
             if self.actor_optimizer is None or self.critic_optimizer is None:
                 raise RuntimeError("V5 actor/critic optimizers are not initialized.")
+            if branch_diagnostics_enabled:
+                group_builder = getattr(
+                    self.policy,
+                    "actor_gradient_parameter_groups",
+                    None,
+                )
+                if group_builder is None:
+                    raise RuntimeError(
+                        "Joint Cache/UAV policy does not expose branch gradient groups"
+                    )
+                branch_gradient_parameter_groups = group_builder()
         minibatch_size = sample_count // hyper.num_minibatches
         for update_epoch in range(hyper.update_epochs):
             permutation = torch.randperm(sample_count, device=self.device)
@@ -1534,8 +1702,11 @@ class PPOV2Trainer:
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
                 if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
-                    if type(self.policy) is not AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic:
-                        raise TypeError("V9 update requires the exact Joint policy")
+                    if not isinstance(
+                        self.policy,
+                        AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
+                    ):
+                        raise TypeError("V9/V10 update requires a Joint policy")
                     assert v7_operation_actions is not None
                     assert v7_operation_masks is not None
                     assert uav_operation_actions is not None
@@ -1595,6 +1766,132 @@ class PPOV2Trainer:
                         actions[indices],
                         masks[indices],
                     )
+                branch_policy_loss = None
+                cache_branch_policy_loss = None
+                uav_branch_policy_loss = None
+                if branch_diagnostics_enabled:
+                    if (
+                        evaluation.cache_log_prob is None
+                        or evaluation.uav_log_prob is None
+                        or evaluation.cache_entropy is None
+                        or evaluation.uav_entropy is None
+                        or cache_candidate_old_log_probs is None
+                        or uav_candidate_old_log_probs is None
+                        or v7_operation_old_log_probs is None
+                        or uav_operation_old_log_probs is None
+                    ):
+                        raise RuntimeError(
+                            "Joint Cache/UAV evaluation did not expose branch diagnostics"
+                        )
+                    cache_old_log_prob = (
+                        v7_operation_old_log_probs[indices].sum(dim=-1)
+                        + cache_candidate_old_log_probs[indices].sum(dim=-1)
+                    )
+                    uav_old_log_prob = (
+                        uav_operation_old_log_probs[indices].sum(dim=-1)
+                        + uav_candidate_old_log_probs[indices].sum(dim=-1)
+                    )
+                    cache_branch_delta = evaluation.cache_log_prob - cache_old_log_prob
+                    uav_branch_delta = evaluation.uav_log_prob - uav_old_log_prob
+                    cache_branch_ratio = torch.exp(cache_branch_delta)
+                    uav_branch_ratio = torch.exp(uav_branch_delta)
+                    branch_metric_tensors = (
+                        cache_branch_delta.detach(),
+                        uav_branch_delta.detach(),
+                        cache_branch_ratio.detach(),
+                        uav_branch_ratio.detach(),
+                        evaluation.cache_entropy.detach(),
+                        evaluation.uav_entropy.detach(),
+                    )
+                    if branchwise_policy_enabled:
+                        cache_branch_unclipped = (
+                            cache_branch_ratio * advantages_t[indices]
+                        )
+                        cache_branch_clipped = torch.clamp(
+                            cache_branch_ratio,
+                            1.0 - hyper.clip_epsilon,
+                            1.0 + hyper.clip_epsilon,
+                        ) * advantages_t[indices]
+                        uav_branch_unclipped = (
+                            uav_branch_ratio * advantages_t[indices]
+                        )
+                        uav_branch_clipped = torch.clamp(
+                            uav_branch_ratio,
+                            1.0 - hyper.clip_epsilon,
+                            1.0 + hyper.clip_epsilon,
+                        ) * advantages_t[indices]
+                        cache_branch_policy_loss = -torch.minimum(
+                            cache_branch_unclipped,
+                            cache_branch_clipped,
+                        ).mean()
+                        uav_branch_policy_loss = -torch.minimum(
+                            uav_branch_unclipped,
+                            uav_branch_clipped,
+                        ).mean()
+                        branch_policy_loss = 0.5 * (
+                            cache_branch_policy_loss + uav_branch_policy_loss
+                        )
+                        branch_metric_tensors += (
+                            cache_branch_policy_loss,
+                            uav_branch_policy_loss,
+                            branch_policy_loss,
+                        )
+                    if not all(
+                        bool(torch.all(torch.isfinite(value)).item())
+                        for value in branch_metric_tensors
+                    ):
+                        raise FloatingPointError(
+                            "Joint Cache/UAV branch metrics are non-finite"
+                        )
+                    cache_approx_kl_values.append(
+                        float(torch.mean(-cache_branch_delta.detach()).cpu())
+                    )
+                    uav_approx_kl_values.append(
+                        float(torch.mean(-uav_branch_delta.detach()).cpu())
+                    )
+                    cache_clip_fraction_values.append(
+                        float(
+                            torch.mean(
+                                (
+                                    torch.abs(cache_branch_ratio.detach() - 1.0)
+                                    > hyper.clip_epsilon
+                                )
+                                .to(torch.float32)
+                            ).cpu()
+                        )
+                    )
+                    uav_clip_fraction_values.append(
+                        float(
+                            torch.mean(
+                                (
+                                    torch.abs(uav_branch_ratio.detach() - 1.0)
+                                    > hyper.clip_epsilon
+                                )
+                                .to(torch.float32)
+                            ).cpu()
+                        )
+                    )
+                    cache_entropy_values.append(
+                        float(torch.mean(evaluation.cache_entropy.detach()).cpu())
+                    )
+                    uav_entropy_values.append(
+                        float(torch.mean(evaluation.uav_entropy.detach()).cpu())
+                    )
+                    if branchwise_policy_enabled:
+                        assert (
+                            cache_branch_policy_loss is not None
+                            and uav_branch_policy_loss is not None
+                            and branch_policy_loss is not None
+                        )
+                        cache_policy_loss_values.append(
+                            float(cache_branch_policy_loss.detach().cpu())
+                        )
+                        uav_policy_loss_values.append(
+                            float(uav_branch_policy_loss.detach().cpu())
+                        )
+                        actor_policy_loss_values.append(
+                            float(branch_policy_loss.detach().cpu())
+                        )
                 ratio = torch.exp(evaluation.log_prob - old_log_probs[indices])
                 unclipped = ratio * advantages_t[indices]
                 clipped = torch.clamp(
@@ -1607,6 +1904,8 @@ class PPOV2Trainer:
                     (torch.abs(ratio - 1.0) > hyper.clip_epsilon).to(torch.float32)
                 )
                 policy_loss = -torch.minimum(unclipped, clipped).mean()
+                if branch_policy_loss is not None:
+                    policy_loss = branch_policy_loss
                 value_residual = (
                     evaluation.value.detach() - returns_t[indices]
                     if self._uses_separate_optimization()
@@ -1657,6 +1956,40 @@ class PPOV2Trainer:
                             gradient_finite = False
                     if not gradient_finite:
                         raise FloatingPointError("PPO v5 actor gradient 非 finite。")
+                    if branch_diagnostics_enabled:
+                        if branch_gradient_parameter_groups is None:
+                            raise RuntimeError(
+                                "Joint Cache/UAV branch gradient groups are unavailable"
+                            )
+                        cache_head_gradient_norm_value = _gradient_group_norm(
+                            branch_gradient_parameter_groups["cache"]
+                        )
+                        uav_head_gradient_norm_value = _gradient_group_norm(
+                            branch_gradient_parameter_groups["uav"]
+                        )
+                        shared_actor_gradient_norm_value = _gradient_group_norm(
+                            branch_gradient_parameter_groups["shared"]
+                        )
+                        if not all(
+                            np.isfinite(value)
+                            for value in (
+                                cache_head_gradient_norm_value,
+                                uav_head_gradient_norm_value,
+                                shared_actor_gradient_norm_value,
+                            )
+                        ):
+                            raise FloatingPointError(
+                                "Joint Cache/UAV branch gradient norm 非 finite。"
+                            )
+                        cache_head_gradient_norm_values.append(
+                            cache_head_gradient_norm_value
+                        )
+                        uav_head_gradient_norm_values.append(
+                            uav_head_gradient_norm_value
+                        )
+                        shared_actor_gradient_norm_values.append(
+                            shared_actor_gradient_norm_value
+                        )
                     actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
                         actor_parameters, hyper.max_grad_norm
                     )
@@ -1822,6 +2155,66 @@ class PPOV2Trainer:
             raw_advantages=advantages.copy(),
             raw_returns=returns.copy(),
             bootstrap_value=bootstrap_value,
+            cache_approx_kl=(
+                float(np.mean(cache_approx_kl_values))
+                if cache_approx_kl_values
+                else math.nan
+            ),
+            uav_approx_kl=(
+                float(np.mean(uav_approx_kl_values))
+                if uav_approx_kl_values
+                else math.nan
+            ),
+            cache_clip_fraction=(
+                float(np.mean(cache_clip_fraction_values))
+                if cache_clip_fraction_values
+                else math.nan
+            ),
+            uav_clip_fraction=(
+                float(np.mean(uav_clip_fraction_values))
+                if uav_clip_fraction_values
+                else math.nan
+            ),
+            cache_entropy=(
+                float(np.mean(cache_entropy_values))
+                if cache_entropy_values
+                else math.nan
+            ),
+            uav_entropy=(
+                float(np.mean(uav_entropy_values))
+                if uav_entropy_values
+                else math.nan
+            ),
+            cache_head_gradient_norm=(
+                float(np.mean(cache_head_gradient_norm_values))
+                if cache_head_gradient_norm_values
+                else math.nan
+            ),
+            uav_head_gradient_norm=(
+                float(np.mean(uav_head_gradient_norm_values))
+                if uav_head_gradient_norm_values
+                else math.nan
+            ),
+            shared_actor_gradient_norm=(
+                float(np.mean(shared_actor_gradient_norm_values))
+                if shared_actor_gradient_norm_values
+                else math.nan
+            ),
+            cache_policy_loss=(
+                float(np.mean(cache_policy_loss_values))
+                if cache_policy_loss_values
+                else math.nan
+            ),
+            uav_policy_loss=(
+                float(np.mean(uav_policy_loss_values))
+                if uav_policy_loss_values
+                else math.nan
+            ),
+            actor_policy_loss=(
+                float(np.mean(actor_policy_loss_values))
+                if actor_policy_loss_values
+                else math.nan
+            ),
         )
 
     def checkpoint_payload(
@@ -2886,11 +3279,13 @@ def run_training(
                 "value_loss_max": float(update.value_loss_max),
                 "entropy": float(update.entropy),
                 "approximate_kl": float(update.approximate_kl),
+                "joint_approx_kl": float(update.approximate_kl),
                 "approximate_kl_min": float(update.approximate_kl_min),
                 "approximate_kl_max": float(update.approximate_kl_max),
                 "kl_early_stop_triggered": bool(update.kl_early_stop_triggered),
                 "ppo_update_epochs_executed": int(update.ppo_update_epochs_executed),
                 "clip_fraction": float(update.clip_fraction),
+                "joint_clip_fraction": float(update.clip_fraction),
                 "gradient_norm": float(update.gradient_norm),
                 "gradient_norm_min": float(update.gradient_norm_min),
                 "gradient_norm_max": float(update.gradient_norm_max),
@@ -2906,6 +3301,7 @@ def run_training(
                 "total_loss": float(update.total_loss),
                 "total_loss_finite": bool(np.isfinite(update.total_loss)),
                 "checkpoint": str(checkpoint_path),
+                **_branch_update_metric_fields(update),
             },
         )
         if verbose:
