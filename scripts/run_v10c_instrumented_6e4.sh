@@ -8,10 +8,10 @@ export PYTHONPATH="${REPO_ROOT}/src"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CONFIG_PATH="${REPO_ROOT}/configs/lr_sweep/v10_branchwise_actor_lr_6e4_kl.toml"
 EPISODE_POOL="${REPO_ROOT}/runs/ppo_v6_popart_actor1e4_lazy_episode_pool_20260911"
-RUN_DIR="${REPO_ROOT}/runs/ppo_v10c_instrumented_6e4"
+RUN_DIR="${REPO_ROOT}/runs/ppo_v10c_instrumented_6e4_ep240"
 EXPECTED_ACTOR_LR="0.0006"
 EPISODE_SEED_START=20001
-TARGET_EPOCHS=300
+TARGET_EPOCHS=240
 
 fail() {
     echo "[V10-C 6e-4] ERROR: $*" >&2
@@ -117,6 +117,9 @@ if actual_ids != expected_ids:
     raise SystemExit(
         f"episode pool must contain exactly episode_20001..episode_20300; got {actual_ids[:3]}..{actual_ids[-3:]}"
     )
+for endpoint_name in ("episode_20001", "episode_20240"):
+    if not (pool_path / endpoint_name).is_dir():
+        raise SystemExit(f"required used episode is missing: {endpoint_name}")
 required_artifacts = {
     "trajectory.csv",
     "vehicle_roles.json",
