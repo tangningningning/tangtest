@@ -823,6 +823,7 @@ def validate_config(
         "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
         "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
         "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
+        "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -837,7 +838,8 @@ def validate_config(
             "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart/"
             "adaptive_joint_cache_replica_aware_uav_operation_v9_popart/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise."
+            "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise/"
+            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder."
         )
     if (
         configuration_control_mode == "policy_primitive_v7_cache_operation"
@@ -861,13 +863,15 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
+            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
         }
     ):
         raise ValueError(
             "policy_primitive_v9_joint_cache_uav_operation requires "
             "adaptive_joint_cache_replica_aware_uav_operation_v9_popart/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise."
+            "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise/"
+            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:

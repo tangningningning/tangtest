@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import math
 from typing import Any, Callable
@@ -222,9 +223,14 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
             raise ValueError("observations 包含 NaN/Inf。")
         return obs, single
 
+    def _default_actor_encoder(self) -> Any:
+        """Return the representation used by the legacy single-head path."""
+
+        return self.encoder
+
     def forward(self, observations: Any) -> tuple[Any, Any]:
         obs, single = self._observations(observations)
-        hidden = self.encoder(obs)
+        hidden = self._default_actor_encoder()(obs)
         logits = self.actor_head(hidden)
         values = self._critic_values(obs, hidden)
         if single:
@@ -307,7 +313,7 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
         action_masks: Any = None,
     ) -> PolicyEvaluation:
         obs, _ = self._observations(observations)
-        hidden = self.encoder(obs)
+        hidden = self._default_actor_encoder()(obs)
         logits = self.actor_head(hidden)
         values = self._critic_values(obs, hidden)
         action_values = _validate_binary_actions(actions, self.action_dim).to(logits.device)
@@ -359,6 +365,10 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             nn.Linear(candidate_hidden, 1),
         )
 
+    def _candidate_encoder_for_scorer(self, scorer: Any) -> Any:
+        del scorer
+        return self._default_actor_encoder()
+
     def _candidate_scores(
         self,
         observations: Any,
@@ -380,7 +390,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
             )
         if not bool(torch.all(torch.isfinite(features)).item()):
             raise ValueError("candidate_features 包含 NaN/Inf。")
-        hidden = self.encoder(obs)
+        hidden = self._candidate_encoder_for_scorer(scorer)(obs)
         expanded_hidden = hidden.unsqueeze(1).expand(-1, int(features.shape[1]), -1)
         scores = scorer(torch.cat([expanded_hidden, features], dim=-1)).squeeze(-1)
         return scores, single
@@ -1599,6 +1609,128 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic(
         "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise"
     )
     architecture_version = 1
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic
+):
+    """V10-C with independent Cache and UAV actor representations.
+
+    The inherited V10-B constructor creates the original shared encoder and
+    all existing heads in the same initialization order.  Its encoder is then
+    cloned into two independent modules without consuming additional random
+    numbers; the critic and all head/scorer initialization therefore remain
+    identical to V10-B at construction time.
+    """
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder"
+    )
+    architecture_version = 1
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        cache_feature_dim: int,
+        uav_feature_dim: int,
+        num_cache_heads: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(
+            observation_dim,
+            action_dim,
+            cache_feature_dim,
+            uav_feature_dim,
+            num_cache_heads,
+            hidden_sizes,
+        )
+        original_encoder = self.encoder
+        self.cache_encoder = deepcopy(original_encoder)
+        self.uav_encoder = deepcopy(original_encoder)
+        del self.encoder
+
+    def _default_actor_encoder(self) -> Any:
+        return self.cache_encoder
+
+    def _candidate_encoder_for_scorer(self, scorer: Any) -> Any:
+        if scorer is self.cache_candidate_scorer:
+            return self.cache_encoder
+        if scorer is self.uav_candidate_scorer:
+            return self.uav_encoder
+        raise ValueError("V10-C candidate scorer has no registered branch encoder")
+
+    def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
+        obs, single = self._observations(observations)
+        hidden = self.cache_encoder(obs)
+        logits = self.cache_operation_head(hidden).reshape(
+            int(obs.shape[0]),
+            self.num_cache_heads,
+            len(self.operation_order),
+        )
+        return (logits.squeeze(0) if single else logits), single
+
+    def _uav_operation_logits(self, observations: Any) -> tuple[Any, bool]:
+        obs, single = self._observations(observations)
+        hidden = self.uav_encoder(obs)
+        logits = self.uav_operation_head(hidden).reshape(
+            int(obs.shape[0]),
+            self.num_uav_heads,
+            len(self.uav_operation_order),
+        )
+        return (logits.squeeze(0) if single else logits), single
+
+    def actor_parameters(self) -> tuple[Any, ...]:
+        modules = (
+            self.cache_encoder,
+            self.uav_encoder,
+            self.cache_operation_head,
+            self.cache_candidate_scorer,
+            self.uav_operation_head,
+            self.uav_candidate_scorer,
+        )
+        parameters = tuple(
+            parameter
+            for module in modules
+            for parameter in module.parameters()
+        )
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise RuntimeError("V10-C actor parameter group contains duplicates.")
+        return parameters
+
+    def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
+        groups = {
+            "cache": tuple(
+                parameter
+                for module in (
+                    self.cache_operation_head,
+                    self.cache_candidate_scorer,
+                )
+                for parameter in module.parameters()
+            ),
+            "uav": tuple(
+                parameter
+                for module in (
+                    self.uav_operation_head,
+                    self.uav_candidate_scorer,
+                )
+                for parameter in module.parameters()
+            ),
+            "cache_encoder": tuple(self.cache_encoder.parameters()),
+            "uav_encoder": tuple(self.uav_encoder.parameters()),
+            "shared": (),
+        }
+        group_ids = [
+            id(parameter)
+            for parameters in groups.values()
+            for parameter in parameters
+        ]
+        if len(set(group_ids)) != len(group_ids):
+            raise RuntimeError("V10-C actor gradient groups overlap.")
+        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
+        if set(group_ids) != actor_ids:
+            raise RuntimeError("V10-C actor gradient groups do not cover the actor.")
+        return groups
 
 
 class AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic(

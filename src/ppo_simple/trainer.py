@@ -48,6 +48,7 @@ from .policy import (
     AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
@@ -69,6 +70,7 @@ V8_CHECKPOINT_VERSION = 8
 V8_NO_PREDICTION_CHECKPOINT_VERSION = 9
 V9_JOINT_CHECKPOINT_VERSION = 10
 V10_BRANCHWISE_CHECKPOINT_VERSION = 11
+V10C_DECOUPLED_CHECKPOINT_VERSION = 12
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
@@ -97,9 +99,12 @@ JOINT_V9_POLICY_SCHEMAS = frozenset(
 JOINT_V10_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic.architecture_id}
 )
+JOINT_V10C_DECOUPLED_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic.architecture_id}
+)
 JOINT_V10_BRANCHWISE_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id}
-)
+) | JOINT_V10C_DECOUPLED_POLICY_SCHEMAS
 JOINT_CACHE_UAV_POLICY_SCHEMAS = (
     JOINT_V9_POLICY_SCHEMAS
     | JOINT_V10_POLICY_SCHEMAS
@@ -345,6 +350,10 @@ class UpdateResult:
     uav_branch_new_log_probs: np.ndarray | None = None
     uav_branch_ratios: np.ndarray | None = None
     uav_branch_clipped: np.ndarray | None = None
+    cache_encoder_gradient_norm: float = math.nan
+    uav_encoder_gradient_norm: float = math.nan
+    kl_minibatch_diagnostics: tuple[dict[str, Any], ...] = ()
+    kl_epoch_diagnostics: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -719,7 +728,52 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, float]:
     }
     if all(math.isfinite(value) for value in policy_losses.values()):
         fields.update(policy_losses)
+    encoder_gradient_norms = {
+        "cache_encoder_gradient_norm": float(update.cache_encoder_gradient_norm),
+        "uav_encoder_gradient_norm": float(update.uav_encoder_gradient_norm),
+    }
+    if all(math.isfinite(value) for value in encoder_gradient_norms.values()):
+        fields.update(encoder_gradient_norms)
     return fields
+
+
+def _v10c_kl_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
+    """Return V10-C-only minibatch/epoch KL diagnostics for update JSONL."""
+
+    if not update.kl_epoch_diagnostics:
+        return {}
+    epoch_fields = (
+        "cache_only_kl_trigger_count",
+        "uav_only_kl_trigger_count",
+        "both_kl_trigger_count",
+        "neither_kl_trigger_count",
+    )
+    return {
+        "kl_minibatch_diagnostics": [
+            dict(record) for record in update.kl_minibatch_diagnostics
+        ],
+        "kl_epoch_diagnostics": [
+            dict(record) for record in update.kl_epoch_diagnostics
+        ],
+        **{
+            field: int(
+                sum(int(record[field]) for record in update.kl_epoch_diagnostics)
+            )
+            for field in epoch_fields
+        },
+        "cache_trigger_suppressed_uav_update": bool(
+            any(
+                record["cache_trigger_suppressed_uav_update"]
+                for record in update.kl_epoch_diagnostics
+            )
+        ),
+        "uav_trigger_suppressed_cache_update": bool(
+            any(
+                record["uav_trigger_suppressed_cache_update"]
+                for record in update.kl_epoch_diagnostics
+            )
+        ),
+    }
 
 
 def _critic_episode_metrics(
@@ -1526,17 +1580,26 @@ class PPOV2Trainer:
                     raise ValueError(
                         "policy_primitive_v9_joint_cache_uav_operation requires a supported Joint Cache/UAV schema"
                     )
-                policy_class = (
-                    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic
-                    if context.policy_schema
-                    == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id
-                    else (
-                        AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic
-                        if context.policy_schema
-                        == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic.architecture_id
-                        else AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
+                if context.policy_schema in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS:
+                    policy_class = (
+                        AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic
                     )
-                )
+                elif (
+                    context.policy_schema
+                    == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id
+                ):
+                    policy_class = (
+                        AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic
+                    )
+                elif (
+                    context.policy_schema
+                    == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic.architecture_id
+                ):
+                    policy_class = (
+                        AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic
+                    )
+                else:
+                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
                 self.policy = policy_class(
                     int(context.observation_spec.observation_dim),
                     int(context.action_spec.action_dim),
@@ -1665,6 +1728,8 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
+        if self.policy.architecture_id in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS:
+            return V10C_DECOUPLED_CHECKPOINT_VERSION
         if self.policy.architecture_id in JOINT_V10_BRANCHWISE_POLICY_SCHEMAS:
             return V10_BRANCHWISE_CHECKPOINT_VERSION
         if self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS:
@@ -1893,6 +1958,9 @@ class PPOV2Trainer:
         branchwise_policy_enabled = (
             self.policy.architecture_id in JOINT_V10_BRANCHWISE_POLICY_SCHEMAS
         )
+        v10c_kl_instrumentation_enabled = (
+            self.policy.architecture_id in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS
+        )
         cache_candidate_old_log_probs = None
         uav_candidate_old_log_probs = None
         if branch_diagnostics_enabled:
@@ -1994,7 +2062,11 @@ class PPOV2Trainer:
         uav_entropy_values: list[float] = []
         cache_head_gradient_norm_values: list[float] = []
         uav_head_gradient_norm_values: list[float] = []
+        cache_encoder_gradient_norm_values: list[float] = []
+        uav_encoder_gradient_norm_values: list[float] = []
         shared_actor_gradient_norm_values: list[float] = []
+        kl_minibatch_diagnostics: list[dict[str, Any]] = []
+        kl_epoch_diagnostics: list[dict[str, Any]] = []
         cache_policy_loss_values: list[float] = []
         uav_policy_loss_values: list[float] = []
         actor_policy_loss_values: list[float] = []
@@ -2044,6 +2116,9 @@ class PPOV2Trainer:
         for update_epoch in range(hyper.update_epochs):
             permutation = torch.randperm(sample_count, device=self.device)
             update_epoch_approximate_kls: list[float] = []
+            update_epoch_cache_approx_kls: list[float] = []
+            update_epoch_uav_approx_kls: list[float] = []
+            epoch_diagnostic_start = len(kl_minibatch_diagnostics)
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
                 if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
@@ -2211,12 +2286,21 @@ class PPOV2Trainer:
                         raise FloatingPointError(
                             "Joint Cache/UAV branch metrics are non-finite"
                         )
-                    cache_approx_kl_values.append(
-                        float(torch.mean(-cache_branch_delta.detach()).cpu())
+                    cache_minibatch_approx_kl = float(
+                        torch.mean(-cache_branch_delta.detach()).cpu()
                     )
-                    uav_approx_kl_values.append(
-                        float(torch.mean(-uav_branch_delta.detach()).cpu())
+                    uav_minibatch_approx_kl = float(
+                        torch.mean(-uav_branch_delta.detach()).cpu()
                     )
+                    cache_approx_kl_values.append(cache_minibatch_approx_kl)
+                    uav_approx_kl_values.append(uav_minibatch_approx_kl)
+                    if v10c_kl_instrumentation_enabled:
+                        update_epoch_cache_approx_kls.append(
+                            cache_minibatch_approx_kl
+                        )
+                        update_epoch_uav_approx_kls.append(
+                            uav_minibatch_approx_kl
+                        )
                     cache_clip_fraction_values.append(
                         float(
                             torch.mean(
@@ -2338,12 +2422,35 @@ class PPOV2Trainer:
                         shared_actor_gradient_norm_value = _gradient_group_norm(
                             branch_gradient_parameter_groups["shared"]
                         )
+                        cache_encoder_gradient_norm_value = (
+                            _gradient_group_norm(
+                                branch_gradient_parameter_groups["cache_encoder"]
+                            )
+                            if "cache_encoder" in branch_gradient_parameter_groups
+                            else math.nan
+                        )
+                        uav_encoder_gradient_norm_value = (
+                            _gradient_group_norm(
+                                branch_gradient_parameter_groups["uav_encoder"]
+                            )
+                            if "uav_encoder" in branch_gradient_parameter_groups
+                            else math.nan
+                        )
                         if not all(
                             np.isfinite(value)
                             for value in (
                                 cache_head_gradient_norm_value,
                                 uav_head_gradient_norm_value,
                                 shared_actor_gradient_norm_value,
+                            )
+                        ) or (
+                            v10c_kl_instrumentation_enabled
+                            and not all(
+                                np.isfinite(value)
+                                for value in (
+                                    cache_encoder_gradient_norm_value,
+                                    uav_encoder_gradient_norm_value,
+                                )
                             )
                         ):
                             raise FloatingPointError(
@@ -2358,6 +2465,13 @@ class PPOV2Trainer:
                         shared_actor_gradient_norm_values.append(
                             shared_actor_gradient_norm_value
                         )
+                        if v10c_kl_instrumentation_enabled:
+                            cache_encoder_gradient_norm_values.append(
+                                cache_encoder_gradient_norm_value
+                            )
+                            uav_encoder_gradient_norm_values.append(
+                                uav_encoder_gradient_norm_value
+                            )
                     actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
                         actor_parameters, hyper.max_grad_norm
                     )
@@ -2468,10 +2582,65 @@ class PPOV2Trainer:
                 value_loss_values.append(value_loss_value)
                 approximate_kl_values.append(approximate_kl_value)
                 update_epoch_approximate_kls.append(approximate_kl_value)
+                if v10c_kl_instrumentation_enabled:
+                    if not (
+                        update_epoch_cache_approx_kls
+                        and update_epoch_uav_approx_kls
+                    ):
+                        raise RuntimeError(
+                            "V10-C branch KL diagnostics are not aligned with minibatches"
+                        )
+                    target_kl_value = hyper.target_kl
+                    kl_minibatch_diagnostics.append(
+                        {
+                            "update_epoch": int(update_epoch + 1),
+                            "minibatch": int(
+                                len(kl_minibatch_diagnostics)
+                                - epoch_diagnostic_start
+                                + 1
+                            ),
+                            "cache_approx_kl": float(
+                                update_epoch_cache_approx_kls[-1]
+                            ),
+                            "uav_approx_kl": float(
+                                update_epoch_uav_approx_kls[-1]
+                            ),
+                            "joint_approx_kl": float(approximate_kl_value),
+                            "target_kl": (
+                                None
+                                if target_kl_value is None
+                                else float(target_kl_value)
+                            ),
+                            "cache_over_target": (
+                                None
+                                if target_kl_value is None
+                                else bool(
+                                    update_epoch_cache_approx_kls[-1]
+                                    > target_kl_value
+                                )
+                            ),
+                            "uav_over_target": (
+                                None
+                                if target_kl_value is None
+                                else bool(
+                                    update_epoch_uav_approx_kls[-1]
+                                    > target_kl_value
+                                )
+                            ),
+                            "joint_over_target": (
+                                None
+                                if target_kl_value is None
+                                else bool(approximate_kl_value > target_kl_value)
+                            ),
+                            "joint_gate_triggered_after_epoch": False,
+                            "remaining_update_epochs_suppressed": 0,
+                        }
+                    )
                 gradient_norm_values.append(gradient_norm_value)
                 actor_gradient_norm_values.append(actor_gradient_norm_value)
                 critic_gradient_norm_values.append(critic_gradient_norm_value)
             ppo_update_epochs_executed += 1
+            joint_gate_triggered = False
             if (
                 hyper.target_kl is not None
                 and update_epoch + 1 < hyper.update_epochs
@@ -2481,6 +2650,104 @@ class PPOV2Trainer:
                 # completed.  The shared V9 loop therefore stops both actor
                 # and critic updates for the remaining update epochs.
                 kl_early_stop_triggered = True
+                joint_gate_triggered = True
+            if v10c_kl_instrumentation_enabled:
+                if not (
+                    update_epoch_cache_approx_kls
+                    and update_epoch_uav_approx_kls
+                    and len(update_epoch_cache_approx_kls)
+                    == len(update_epoch_uav_approx_kls)
+                    == len(update_epoch_approximate_kls)
+                ):
+                    raise RuntimeError("V10-C epoch KL diagnostics are incomplete")
+                cache_epoch_approx_kl = float(
+                    np.mean(update_epoch_cache_approx_kls)
+                )
+                uav_epoch_approx_kl = float(
+                    np.mean(update_epoch_uav_approx_kls)
+                )
+                joint_epoch_approx_kl = float(
+                    np.mean(update_epoch_approximate_kls)
+                )
+                target_kl_value = hyper.target_kl
+                cache_epoch_over_target = (
+                    None
+                    if target_kl_value is None
+                    else bool(cache_epoch_approx_kl > target_kl_value)
+                )
+                uav_epoch_over_target = (
+                    None
+                    if target_kl_value is None
+                    else bool(uav_epoch_approx_kl > target_kl_value)
+                )
+                cache_only_trigger = (
+                    cache_epoch_over_target is True
+                    and uav_epoch_over_target is False
+                )
+                uav_only_trigger = (
+                    uav_epoch_over_target is True
+                    and cache_epoch_over_target is False
+                )
+                both_trigger = (
+                    cache_epoch_over_target is True
+                    and uav_epoch_over_target is True
+                )
+                neither_trigger = (
+                    cache_epoch_over_target is False
+                    and uav_epoch_over_target is False
+                )
+                remaining_epochs_suppressed = (
+                    int(hyper.update_epochs - update_epoch - 1)
+                    if joint_gate_triggered
+                    else 0
+                )
+                for minibatch_record in kl_minibatch_diagnostics[
+                    epoch_diagnostic_start:
+                ]:
+                    minibatch_record[
+                        "joint_gate_triggered_after_epoch"
+                    ] = bool(joint_gate_triggered)
+                    minibatch_record[
+                        "remaining_update_epochs_suppressed"
+                    ] = remaining_epochs_suppressed
+                kl_epoch_diagnostics.append(
+                    {
+                        "update_epoch": int(update_epoch + 1),
+                        "minibatch_count": int(
+                            len(update_epoch_approximate_kls)
+                        ),
+                        "cache_approx_kl": cache_epoch_approx_kl,
+                        "uav_approx_kl": uav_epoch_approx_kl,
+                        "joint_approx_kl": joint_epoch_approx_kl,
+                        "target_kl": (
+                            None
+                            if target_kl_value is None
+                            else float(target_kl_value)
+                        ),
+                        "cache_over_target": cache_epoch_over_target,
+                        "uav_over_target": uav_epoch_over_target,
+                        "joint_over_target": (
+                            None
+                            if target_kl_value is None
+                            else bool(joint_epoch_approx_kl > target_kl_value)
+                        ),
+                        "joint_gate_triggered": bool(joint_gate_triggered),
+                        "remaining_update_epochs_suppressed": (
+                            remaining_epochs_suppressed
+                        ),
+                        "cache_only_kl_trigger_count": int(cache_only_trigger),
+                        "uav_only_kl_trigger_count": int(uav_only_trigger),
+                        "both_kl_trigger_count": int(both_trigger),
+                        "neither_kl_trigger_count": int(neither_trigger),
+                        "cache_trigger_suppressed_uav_update": bool(
+                            joint_gate_triggered and cache_only_trigger
+                        ),
+                        "uav_trigger_suppressed_cache_update": bool(
+                            joint_gate_triggered and uav_only_trigger
+                        ),
+                    }
+                )
+            if joint_gate_triggered:
                 break
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
             self.critic_return_statistics.update(returns)
@@ -2582,6 +2849,16 @@ class PPOV2Trainer:
                 if shared_actor_gradient_norm_values
                 else math.nan
             ),
+            cache_encoder_gradient_norm=(
+                float(np.mean(cache_encoder_gradient_norm_values))
+                if cache_encoder_gradient_norm_values
+                else math.nan
+            ),
+            uav_encoder_gradient_norm=(
+                float(np.mean(uav_encoder_gradient_norm_values))
+                if uav_encoder_gradient_norm_values
+                else math.nan
+            ),
             cache_policy_loss=(
                 float(np.mean(cache_policy_loss_values))
                 if cache_policy_loss_values
@@ -2601,6 +2878,12 @@ class PPOV2Trainer:
             uav_branch_new_log_probs=uav_branch_new_log_probs_values,
             uav_branch_ratios=uav_branch_ratios_values,
             uav_branch_clipped=uav_branch_clipped_values,
+            kl_minibatch_diagnostics=tuple(
+                dict(record) for record in kl_minibatch_diagnostics
+            ),
+            kl_epoch_diagnostics=tuple(
+                dict(record) for record in kl_epoch_diagnostics
+            ),
         )
 
     def checkpoint_payload(
@@ -3801,6 +4084,7 @@ def run_training(
                 "total_loss_finite": bool(np.isfinite(update.total_loss)),
                 "checkpoint": str(checkpoint_path),
                 **_branch_update_metric_fields(update),
+                **_v10c_kl_update_metric_fields(update),
             },
         )
         if verbose:
