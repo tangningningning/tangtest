@@ -323,6 +323,10 @@ class UpdateResult:
     actor_optimizer_steps: int
     critic_optimizer_steps: int
     raw_advantages: np.ndarray
+    # The exact normalized advantage tensor consumed by the PPO actor loss.
+    # This is exposed for compact action-conditional diagnostics only; it is
+    # not recomputed and does not participate in any additional update.
+    ppo_advantages: np.ndarray
     raw_returns: np.ndarray
     bootstrap_value: float
     cache_approx_kl: float = math.nan
@@ -337,6 +341,10 @@ class UpdateResult:
     cache_policy_loss: float = math.nan
     uav_policy_loss: float = math.nan
     actor_policy_loss: float = math.nan
+    uav_branch_old_log_probs: np.ndarray | None = None
+    uav_branch_new_log_probs: np.ndarray | None = None
+    uav_branch_ratios: np.ndarray | None = None
+    uav_branch_clipped: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -676,6 +684,19 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         stream.write("\n")
 
 
+def _binary_action_bitmask(action: Any) -> int:
+    """Encode a binary action vector as one compact, deterministic integer."""
+
+    values = np.asarray(action, dtype=np.int8).reshape(-1)
+    if not np.all((values == 0) | (values == 1)):
+        raise ValueError("binary action bitmask requires only 0/1 values")
+    bitmask = 0
+    for index, value in enumerate(values.tolist()):
+        if int(value):
+            bitmask |= 1 << int(index)
+    return int(bitmask)
+
+
 def _branch_update_metric_fields(update: UpdateResult) -> dict[str, float]:
     """Return finite branch diagnostics without changing legacy log schemas."""
 
@@ -741,8 +762,27 @@ def _uav_episode_diagnostics(
     actual_movement: list[bool],
     move_advantages: list[float],
     stay_advantages: list[float],
+    global_advantages: list[float],
+    global_return_targets: list[float],
+    rewards: list[float],
+    q_values: list[float],
+    movement_costs: list[float],
+    delays: list[float],
+    energies: list[float],
+    old_log_probs: list[float],
+    new_log_probs: list[float],
+    ratios: list[float],
+    clipped: list[bool],
+    feasible_action_counts: list[int],
+    move_candidate_counts: list[int],
 ) -> dict[str, Any]:
-    """Summarize already-sampled UAV diagnostics without another policy call."""
+    """Summarize sampled UAV diagnostics without another policy call.
+
+    The required MOVE/STAY action-conditional fields are grouped by the
+    verified physical ``actual_movement`` flag.  Selected operation labels are
+    retained separately so a future run can audit action-vs-physical mismatches
+    without silently treating an action index as a movement outcome.
+    """
 
     empty = {
         "uav_move_probability_mean": None,
@@ -765,6 +805,48 @@ def _uav_episode_diagnostics(
         "median_advantage_for_uav_move": None,
         "mean_advantage_for_uav_stay": None,
         "median_advantage_for_uav_stay": None,
+        "uav_action_conditional_logging_available": False,
+        "uav_move_count": None,
+        "uav_stay_count": None,
+        "uav_move_adv_mean": None,
+        "uav_stay_adv_mean": None,
+        "uav_move_adv_median": None,
+        "uav_stay_adv_median": None,
+        "uav_move_adv_positive_fraction": None,
+        "uav_stay_adv_positive_fraction": None,
+        "uav_move_reward_mean": None,
+        "uav_stay_reward_mean": None,
+        "uav_move_q_total_mean": None,
+        "uav_stay_q_total_mean": None,
+        "uav_move_movement_cost_mean": None,
+        "uav_stay_movement_cost_mean": None,
+        "uav_move_delay_mean": None,
+        "uav_stay_delay_mean": None,
+        "uav_move_energy_mean": None,
+        "uav_stay_energy_mean": None,
+        "uav_move_return_target_mean": None,
+        "uav_stay_return_target_mean": None,
+        "uav_move_old_log_prob_mean": None,
+        "uav_stay_old_log_prob_mean": None,
+        "uav_move_new_log_prob_mean": None,
+        "uav_stay_new_log_prob_mean": None,
+        "uav_move_ratio_mean": None,
+        "uav_stay_ratio_mean": None,
+        "uav_move_clip_fraction": None,
+        "uav_stay_clip_fraction": None,
+        "uav_selected_move_count": None,
+        "uav_selected_stay_count": None,
+        "uav_selected_move_actual_move_count": None,
+        "uav_selected_move_actual_stay_count": None,
+        "uav_selected_stay_actual_move_count": None,
+        "uav_selected_stay_actual_stay_count": None,
+        "uav_feasible_action_count_mean": None,
+        "uav_feasible_action_count_min": None,
+        "uav_feasible_action_count_max": None,
+        "uav_move_candidate_count_mean": None,
+        "uav_move_candidate_count_min": None,
+        "uav_move_candidate_count_max": None,
+        "uav_action_mask_summary": None,
     }
     if not available:
         return empty
@@ -775,21 +857,10 @@ def _uav_episode_diagnostics(
     feasible = np.asarray(move_feasible, dtype=bool)
     selected = np.asarray(move_selected, dtype=bool)
     actual = np.asarray(actual_movement, dtype=bool)
-    if not (
-        move.ndim
-        == stay.ndim
-        == margins.ndim
-        == feasible.ndim
-        == selected.ndim
-        == actual.ndim
-        == 1
-        and len(move)
-        == len(stay)
-        == len(margins)
-        == len(feasible)
-        == len(selected)
-        == len(actual)
-        > 0
+    expected_length = len(move)
+    if expected_length <= 0 or not all(
+        array.ndim == 1 and len(array) == expected_length
+        for array in (stay, margins, feasible, selected, actual)
     ):
         raise AssertionError("UAV diagnostic arrays must be aligned and non-empty")
     if not (
@@ -805,6 +876,45 @@ def _uav_episode_diagnostics(
     ):
         raise AssertionError("UAV diagnostic probabilities are invalid")
 
+    def _aligned_float_array(values: list[float], field: str) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim != 1 or len(array) != expected_length:
+            raise AssertionError(f"{field} must align with UAV diagnostic samples")
+        if not np.all(np.isfinite(array)):
+            raise FloatingPointError(f"{field} contains NaN/Inf")
+        return array
+
+    advantages = _aligned_float_array(global_advantages, "global_advantages")
+    return_targets = _aligned_float_array(
+        global_return_targets, "global_return_targets"
+    )
+    rewards_a = _aligned_float_array(rewards, "rewards")
+    q_values_a = _aligned_float_array(q_values, "q_values")
+    movement_costs_a = _aligned_float_array(movement_costs, "movement_costs")
+    delays_a = _aligned_float_array(delays, "delays")
+    energies_a = _aligned_float_array(energies, "energies")
+    old_log_probs_a = _aligned_float_array(old_log_probs, "old_log_probs")
+    new_log_probs_a = _aligned_float_array(new_log_probs, "new_log_probs")
+    ratios_a = _aligned_float_array(ratios, "ratios")
+    if np.any(ratios_a < 0.0):
+        raise AssertionError("UAV branch ratios must be non-negative")
+    clipped_a = np.asarray(clipped, dtype=bool)
+    if clipped_a.ndim != 1 or len(clipped_a) != expected_length:
+        raise AssertionError("clipped must align with UAV diagnostic samples")
+    feasible_counts_a = np.asarray(feasible_action_counts, dtype=np.float64)
+    candidate_counts_a = np.asarray(move_candidate_counts, dtype=np.float64)
+    if not (
+        feasible_counts_a.ndim == candidate_counts_a.ndim == 1
+        and len(feasible_counts_a) == len(candidate_counts_a) == expected_length
+        and np.all(np.isfinite(feasible_counts_a))
+        and np.all(np.isfinite(candidate_counts_a))
+        and np.all(feasible_counts_a >= 0.0)
+        and np.all(candidate_counts_a >= 0.0)
+        and np.all(feasible_counts_a == np.floor(feasible_counts_a))
+        and np.all(candidate_counts_a == np.floor(candidate_counts_a))
+    ):
+        raise AssertionError("UAV action mask counts are invalid")
+
     def _percentile(values: np.ndarray, percentile: float) -> float:
         return float(np.percentile(values, percentile))
 
@@ -816,8 +926,60 @@ def _uav_episode_diagnostics(
             raise FloatingPointError("UAV action advantages contain NaN/Inf")
         return float(np.mean(values_a)), float(np.median(values_a))
 
+    def _group_stats(mask: np.ndarray) -> dict[str, Any]:
+        if mask.ndim != 1 or len(mask) != expected_length:
+            raise AssertionError("UAV action-conditional mask is not aligned")
+        if not bool(np.any(mask)):
+            return {
+                "count": 0,
+                "adv_mean": None,
+                "adv_median": None,
+                "adv_positive_fraction": None,
+                "reward_mean": None,
+                "q_total_mean": None,
+                "movement_cost_mean": None,
+                "delay_mean": None,
+                "energy_mean": None,
+                "return_target_mean": None,
+                "old_log_prob_mean": None,
+                "new_log_prob_mean": None,
+                "ratio_mean": None,
+                "clip_fraction": None,
+            }
+
+        def _mean(values: np.ndarray) -> float:
+            result = float(np.mean(values[mask]))
+            if not np.isfinite(result):
+                raise FloatingPointError("UAV action-conditional mean is non-finite")
+            return result
+
+        def _median(values: np.ndarray) -> float:
+            result = float(np.median(values[mask]))
+            if not np.isfinite(result):
+                raise FloatingPointError("UAV action-conditional median is non-finite")
+            return result
+
+        return {
+            "count": int(np.sum(mask)),
+            "adv_mean": _mean(advantages),
+            "adv_median": _median(advantages),
+            "adv_positive_fraction": float(np.mean(advantages[mask] > 0.0)),
+            "reward_mean": _mean(rewards_a),
+            "q_total_mean": _mean(q_values_a),
+            "movement_cost_mean": _mean(movement_costs_a),
+            "delay_mean": _mean(delays_a),
+            "energy_mean": _mean(energies_a),
+            "return_target_mean": _mean(return_targets),
+            "old_log_prob_mean": _mean(old_log_probs_a),
+            "new_log_prob_mean": _mean(new_log_probs_a),
+            "ratio_mean": _mean(ratios_a),
+            "clip_fraction": float(np.mean(clipped_a[mask])),
+        }
+
     move_advantage_mean, move_advantage_median = _advantage_summary(move_advantages)
     stay_advantage_mean, stay_advantage_median = _advantage_summary(stay_advantages)
+    actual_move_stats = _group_stats(actual)
+    actual_stay_stats = _group_stats(~actual)
     probability_entropy = -(
         np.where(move > 0.0, move * np.log(np.maximum(move, 1.0e-12)), 0.0)
         + np.where(stay > 0.0, stay * np.log(np.maximum(stay, 1.0e-12)), 0.0)
@@ -848,6 +1010,60 @@ def _uav_episode_diagnostics(
         "median_advantage_for_uav_move": move_advantage_median,
         "mean_advantage_for_uav_stay": stay_advantage_mean,
         "median_advantage_for_uav_stay": stay_advantage_median,
+        "uav_action_conditional_logging_available": True,
+        "uav_move_count": actual_move_stats["count"],
+        "uav_stay_count": actual_stay_stats["count"],
+        "uav_move_adv_mean": actual_move_stats["adv_mean"],
+        "uav_stay_adv_mean": actual_stay_stats["adv_mean"],
+        "uav_move_adv_median": actual_move_stats["adv_median"],
+        "uav_stay_adv_median": actual_stay_stats["adv_median"],
+        "uav_move_adv_positive_fraction": actual_move_stats[
+            "adv_positive_fraction"
+        ],
+        "uav_stay_adv_positive_fraction": actual_stay_stats[
+            "adv_positive_fraction"
+        ],
+        "uav_move_reward_mean": actual_move_stats["reward_mean"],
+        "uav_stay_reward_mean": actual_stay_stats["reward_mean"],
+        "uav_move_q_total_mean": actual_move_stats["q_total_mean"],
+        "uav_stay_q_total_mean": actual_stay_stats["q_total_mean"],
+        "uav_move_movement_cost_mean": actual_move_stats["movement_cost_mean"],
+        "uav_stay_movement_cost_mean": actual_stay_stats["movement_cost_mean"],
+        "uav_move_delay_mean": actual_move_stats["delay_mean"],
+        "uav_stay_delay_mean": actual_stay_stats["delay_mean"],
+        "uav_move_energy_mean": actual_move_stats["energy_mean"],
+        "uav_stay_energy_mean": actual_stay_stats["energy_mean"],
+        "uav_move_return_target_mean": actual_move_stats["return_target_mean"],
+        "uav_stay_return_target_mean": actual_stay_stats["return_target_mean"],
+        "uav_move_old_log_prob_mean": actual_move_stats["old_log_prob_mean"],
+        "uav_stay_old_log_prob_mean": actual_stay_stats["old_log_prob_mean"],
+        "uav_move_new_log_prob_mean": actual_move_stats["new_log_prob_mean"],
+        "uav_stay_new_log_prob_mean": actual_stay_stats["new_log_prob_mean"],
+        "uav_move_ratio_mean": actual_move_stats["ratio_mean"],
+        "uav_stay_ratio_mean": actual_stay_stats["ratio_mean"],
+        "uav_move_clip_fraction": actual_move_stats["clip_fraction"],
+        "uav_stay_clip_fraction": actual_stay_stats["clip_fraction"],
+        "uav_selected_move_count": selected_count,
+        "uav_selected_stay_count": int(expected_length - selected_count),
+        "uav_selected_move_actual_move_count": int(np.sum(selected & actual)),
+        "uav_selected_move_actual_stay_count": int(np.sum(selected & ~actual)),
+        "uav_selected_stay_actual_move_count": int(np.sum(~selected & actual)),
+        "uav_selected_stay_actual_stay_count": int(np.sum(~selected & ~actual)),
+        "uav_feasible_action_count_mean": float(np.mean(feasible_counts_a)),
+        "uav_feasible_action_count_min": int(np.min(feasible_counts_a)),
+        "uav_feasible_action_count_max": int(np.max(feasible_counts_a)),
+        "uav_move_candidate_count_mean": float(np.mean(candidate_counts_a)),
+        "uav_move_candidate_count_min": int(np.min(candidate_counts_a)),
+        "uav_move_candidate_count_max": int(np.max(candidate_counts_a)),
+        "uav_action_mask_summary": {
+            "operation_width": 2,
+            "feasible_operation_count_mean": float(np.mean(feasible_counts_a)),
+            "feasible_operation_count_min": int(np.min(feasible_counts_a)),
+            "feasible_operation_count_max": int(np.max(feasible_counts_a)),
+            "move_candidate_count_mean": float(np.mean(candidate_counts_a)),
+            "move_candidate_count_min": int(np.min(candidate_counts_a)),
+            "move_candidate_count_max": int(np.max(candidate_counts_a)),
+        },
     }
 
 
@@ -860,6 +1076,7 @@ def _append_critic_diagnostics(
     optimizer_steps: int,
     rollout: SimpleRollout,
     update: UpdateResult,
+    cache_count: int | None = None,
 ) -> None:
     """Append v2 raw critic targets already computed by the PPO update."""
 
@@ -867,43 +1084,150 @@ def _append_critic_diagnostics(
     if not (
         len(transitions)
         == len(update.raw_advantages)
+        == len(update.ppo_advantages)
         == len(update.raw_returns)
     ):
         raise AssertionError("critic diagnostics length mismatch")
-    for transition, raw_advantage, raw_return in zip(
+    for transition_index, (transition, raw_advantage, raw_return) in enumerate(zip(
         transitions,
         update.raw_advantages,
         update.raw_returns,
         strict=True,
-    ):
+    )):
         old_value = float(transition.old_value)
         target = float(raw_return)
         residual = old_value - target
         normalized_residual = residual / float(update.critic_return_scale)
-        values = (old_value, float(raw_advantage), target, update.bootstrap_value, residual)
+        global_advantage = float(update.ppo_advantages[transition_index])
+        values = (
+            old_value,
+            float(raw_advantage),
+            global_advantage,
+            target,
+            update.bootstrap_value,
+            residual,
+        )
         if not all(np.isfinite(value) for value in values):
             raise FloatingPointError("critic diagnostics contain non-finite values")
+        record: dict[str, Any] = {
+            "record_type": "critic_transition",
+            "seed": int(seed),
+            "episode": int(epoch),
+            "epoch": int(epoch),
+            "chunk_origin_start": int(chunk_origin_start),
+            "optimizer_steps": int(optimizer_steps),
+            "origin": int(transition.origin_index),
+            "slot": int(transition.slot),
+            "done": bool(transition.done),
+            "old_value": old_value,
+            "raw_advantage": float(raw_advantage),
+            "global_advantage": global_advantage,
+            "advantage_source": "actual_PPO_advantage",
+            "raw_return": target,
+            "global_return_target": target,
+            "value_target": target,
+            "bootstrap_value": float(update.bootstrap_value),
+            "value_residual": residual,
+            "abs_value_residual": abs(residual),
+            "critic_return_scale": float(update.critic_return_scale),
+            "normalized_value_residual": normalized_residual,
+        }
+        if transition.uav_operation_actions is not None:
+            if cache_count is None:
+                raise AssertionError(
+                    "cache_count is required for joint UAV action diagnostics"
+                )
+            if (
+                transition.uav_operation_masks is None
+                or transition.uav_candidate_counts is None
+                or update.uav_branch_old_log_probs is None
+                or update.uav_branch_new_log_probs is None
+                or update.uav_branch_ratios is None
+                or update.uav_branch_clipped is None
+            ):
+                raise AssertionError(
+                    "joint UAV action diagnostics are incomplete"
+                )
+            operation_actions = np.asarray(
+                transition.uav_operation_actions, dtype=np.int64
+            ).reshape(-1)
+            operation_masks = np.asarray(
+                transition.uav_operation_masks, dtype=bool
+            )
+            candidate_counts = np.asarray(
+                transition.uav_candidate_counts, dtype=np.int64
+            ).reshape(-1)
+            actual_flags = np.asarray(
+                [
+                    bool(action.get("actual_moved", False))
+                    for action in transition.uav_conditional_actions
+                ],
+                dtype=bool,
+            ).reshape(-1)
+            uav_count = len(operation_actions)
+            if not (
+                operation_masks.shape == (uav_count, 2)
+                and len(candidate_counts) == uav_count
+                and len(actual_flags) == uav_count
+                and np.all(operation_actions >= 0)
+                and np.all(operation_actions < 2)
+                and np.all(candidate_counts >= 0)
+                and np.all(np.isfinite(operation_masks))
+            ):
+                raise AssertionError("joint UAV action diagnostic shapes are invalid")
+            if int(np.sum(actual_flags)) != int(transition.actual_uav_movement_count):
+                raise AssertionError(
+                    "UAV actual movement flags disagree with rollout movement count"
+                )
+            branch_old = float(update.uav_branch_old_log_probs[transition_index])
+            branch_new = float(update.uav_branch_new_log_probs[transition_index])
+            branch_ratio = float(update.uav_branch_ratios[transition_index])
+            branch_clipped = bool(update.uav_branch_clipped[transition_index])
+            branch_values = (branch_old, branch_new, branch_ratio)
+            if not all(np.isfinite(value) for value in branch_values):
+                raise FloatingPointError(
+                    "joint UAV branch action diagnostics are non-finite"
+                )
+            cache_action = np.asarray(
+                transition.action[: int(cache_count)], dtype=np.int8
+            ).reshape(-1)
+            if len(cache_action) != int(cache_count) or not np.all(
+                (cache_action == 0) | (cache_action == 1)
+            ):
+                raise AssertionError("selected Cache action is not binary")
+            record.update(
+                {
+                    "selected_cache_action": [int(value) for value in cache_action],
+                    "selected_uav_action": [
+                        "MOVE" if int(value) == 1 else "STAY"
+                        for value in operation_actions
+                    ],
+                    "actual_uav_move": [int(value) for value in actual_flags],
+                    "old_uav_log_prob": branch_old,
+                    "new_uav_log_prob": branch_new,
+                    "uav_ratio": branch_ratio,
+                    "uav_clipped": branch_clipped,
+                    "uav_log_prob_scope": "joint_uav_branch_per_transition",
+                    "feasible_uav_action_count": [
+                        int(value) for value in operation_masks.sum(axis=1)
+                    ],
+                    "uav_action_mask": [
+                        [int(value) for value in row]
+                        for row in operation_masks
+                    ],
+                    "uav_move_candidate_count": [
+                        int(value) for value in candidate_counts
+                    ],
+                    "reward": float(transition.reward),
+                    "q_total": float(transition.actual_task_utility),
+                    "movement_cost": float(transition.movement_cost),
+                    "delay": float(transition.total_task_delay_s),
+                    "energy": float(transition.total_vehicle_energy_j),
+                }
+            )
         _append_jsonl(
             path,
-            {
-                "record_type": "critic_transition",
-                "seed": int(seed),
-                "episode": int(epoch),
-                "epoch": int(epoch),
-                "chunk_origin_start": int(chunk_origin_start),
-                "optimizer_steps": int(optimizer_steps),
-                "origin": int(transition.origin_index),
-                "done": bool(transition.done),
-                "old_value": old_value,
-                "raw_advantage": float(raw_advantage),
-                "raw_return": target,
-                "value_target": target,
-                "bootstrap_value": float(update.bootstrap_value),
-                "value_residual": residual,
-                "abs_value_residual": abs(residual),
-                "critic_return_scale": float(update.critic_return_scale),
-                "normalized_value_residual": normalized_residual,
-            },
+            record,
         )
 
 
@@ -1641,6 +1965,12 @@ class PPOV2Trainer:
                     "unsupported advantage_normalization_mode: "
                     f"{hyper.advantage_normalization_mode}"
                 )
+        # Keep exactly the tensor used by the actor loss.  The copy is made
+        # after the configured global normalization and is only returned for
+        # diagnostics; no second or heuristic advantage is constructed.
+        ppo_advantages = advantages_t.detach().cpu().numpy().astype(
+            np.float32, copy=True
+        )
 
         before = [parameter.detach().clone() for parameter in self.policy.parameters()]
         policy_loss_value = 0.0
@@ -1674,6 +2004,21 @@ class PPOV2Trainer:
         branch_gradient_parameter_groups: dict[str, tuple[Any, ...]] | None = None
         kl_early_stop_triggered = False
         ppo_update_epochs_executed = 0
+        uav_branch_old_log_probs_values: np.ndarray | None = None
+        uav_branch_new_log_probs_values: np.ndarray | None = None
+        uav_branch_ratios_values: np.ndarray | None = None
+        uav_branch_clipped_values: np.ndarray | None = None
+        if branch_diagnostics_enabled:
+            uav_branch_old_log_probs_values = np.full(
+                sample_count, np.nan, dtype=np.float64
+            )
+            uav_branch_new_log_probs_values = np.full(
+                sample_count, np.nan, dtype=np.float64
+            )
+            uav_branch_ratios_values = np.full(
+                sample_count, np.nan, dtype=np.float64
+            )
+            uav_branch_clipped_values = np.zeros(sample_count, dtype=bool)
         if self._uses_separate_optimization():
             if not isinstance(
                 self.policy,
@@ -1795,6 +2140,29 @@ class PPOV2Trainer:
                     uav_branch_delta = evaluation.uav_log_prob - uav_old_log_prob
                     cache_branch_ratio = torch.exp(cache_branch_delta)
                     uav_branch_ratio = torch.exp(uav_branch_delta)
+                    if (
+                        uav_branch_old_log_probs_values is None
+                        or uav_branch_new_log_probs_values is None
+                        or uav_branch_ratios_values is None
+                        or uav_branch_clipped_values is None
+                    ):
+                        raise RuntimeError(
+                            "Joint UAV branch diagnostic arrays are unavailable"
+                        )
+                    sample_indices = indices.detach().cpu().numpy()
+                    uav_branch_old_log_probs_values[sample_indices] = (
+                        uav_old_log_prob.detach().cpu().numpy()
+                    )
+                    uav_branch_new_log_probs_values[sample_indices] = (
+                        evaluation.uav_log_prob.detach().cpu().numpy()
+                    )
+                    uav_branch_ratios_values[sample_indices] = (
+                        uav_branch_ratio.detach().cpu().numpy()
+                    )
+                    uav_branch_clipped_values[sample_indices] = (
+                        torch.abs(uav_branch_ratio.detach() - 1.0)
+                        > hyper.clip_epsilon
+                    ).cpu().numpy()
                     branch_metric_tensors = (
                         cache_branch_delta.detach(),
                         uav_branch_delta.detach(),
@@ -2116,6 +2484,19 @@ class PPOV2Trainer:
                 break
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
             self.critic_return_statistics.update(returns)
+        if branch_diagnostics_enabled:
+            assert uav_branch_old_log_probs_values is not None
+            assert uav_branch_new_log_probs_values is not None
+            assert uav_branch_ratios_values is not None
+            assert uav_branch_clipped_values is not None
+            if not (
+                np.all(np.isfinite(uav_branch_old_log_probs_values))
+                and np.all(np.isfinite(uav_branch_new_log_probs_values))
+                and np.all(np.isfinite(uav_branch_ratios_values))
+            ):
+                raise FloatingPointError(
+                    "Joint UAV branch action diagnostics contain NaN/Inf"
+                )
         delta_squared = 0.0
         for old_parameter, new_parameter in zip(before, self.policy.parameters()):
             delta_squared += float(torch.sum((new_parameter.detach() - old_parameter) ** 2).cpu())
@@ -2153,6 +2534,7 @@ class PPOV2Trainer:
             actor_optimizer_steps=self.actor_optimizer_steps,
             critic_optimizer_steps=self.critic_optimizer_steps,
             raw_advantages=advantages.copy(),
+            ppo_advantages=ppo_advantages.copy(),
             raw_returns=returns.copy(),
             bootstrap_value=bootstrap_value,
             cache_approx_kl=(
@@ -2215,6 +2597,10 @@ class PPOV2Trainer:
                 if actor_policy_loss_values
                 else math.nan
             ),
+            uav_branch_old_log_probs=uav_branch_old_log_probs_values,
+            uav_branch_new_log_probs=uav_branch_new_log_probs_values,
+            uav_branch_ratios=uav_branch_ratios_values,
+            uav_branch_clipped=uav_branch_clipped_values,
         )
 
     def checkpoint_payload(
@@ -2893,6 +3279,20 @@ def run_training(
     episode_uav_actual_movement: list[bool] = []
     episode_uav_move_advantages: list[float] = []
     episode_uav_stay_advantages: list[float] = []
+    episode_uav_global_advantages: list[float] = []
+    episode_uav_return_targets: list[float] = []
+    episode_uav_rewards: list[float] = []
+    episode_uav_q_values: list[float] = []
+    episode_uav_movement_costs: list[float] = []
+    episode_uav_delays: list[float] = []
+    episode_uav_energies: list[float] = []
+    episode_uav_old_log_probs: list[float] = []
+    episode_uav_new_log_probs: list[float] = []
+    episode_uav_ratios: list[float] = []
+    episode_uav_clipped: list[bool] = []
+    episode_uav_feasible_action_counts: list[int] = []
+    episode_uav_move_candidate_counts: list[int] = []
+    episode_cache_action_bitmasks: list[int] = []
     episode_uav_diagnostics_available = False
     episode_cache_requests = 0
     episode_actual_cache_updates = 0
@@ -2983,6 +3383,20 @@ def run_training(
             episode_uav_actual_movement = []
             episode_uav_move_advantages = []
             episode_uav_stay_advantages = []
+            episode_uav_global_advantages = []
+            episode_uav_return_targets = []
+            episode_uav_rewards = []
+            episode_uav_q_values = []
+            episode_uav_movement_costs = []
+            episode_uav_delays = []
+            episode_uav_energies = []
+            episode_uav_old_log_probs = []
+            episode_uav_new_log_probs = []
+            episode_uav_ratios = []
+            episode_uav_clipped = []
+            episode_uav_feasible_action_counts = []
+            episode_uav_move_candidate_counts = []
+            episode_cache_action_bitmasks = []
             episode_uav_diagnostics_available = False
             episode_cache_requests = 0
             episode_actual_cache_updates = 0
@@ -3119,16 +3533,29 @@ def run_training(
             int(np.asarray(item.action[cache_count:], dtype=np.int64).sum())
             for item in rollout.transitions
         )
+        episode_cache_action_bitmasks.extend(
+            _binary_action_bitmask(item.action[:cache_count])
+            for item in rollout.transitions
+        )
         episode_uav_movement_counts.extend(
             int(item.actual_uav_movement_count) for item in rollout.transitions
         )
-        for transition, raw_advantage in zip(
+        for transition_index, (transition, raw_advantage) in enumerate(zip(
             rollout.transitions,
             update.raw_advantages,
             strict=True,
-        ):
+        )):
             if transition.uav_operation_probabilities is None:
                 continue
+            if (
+                update.uav_branch_old_log_probs is None
+                or update.uav_branch_new_log_probs is None
+                or update.uav_branch_ratios is None
+                or update.uav_branch_clipped is None
+            ):
+                raise AssertionError(
+                    "joint UAV rollout is missing PPO branch log-probability diagnostics"
+                )
             probabilities = np.asarray(
                 transition.uav_operation_probabilities,
                 dtype=np.float64,
@@ -3173,17 +3600,88 @@ def run_training(
                 raise FloatingPointError(
                     "UAV diagnostic transition values are non-finite"
                 )
+            candidate_counts = np.asarray(
+                transition.uav_candidate_counts, dtype=np.int64
+            ).reshape(-1)
+            if len(candidate_counts) != len(actual_flags) or np.any(candidate_counts < 0):
+                raise AssertionError(
+                    "UAV candidate-count diagnostics are inconsistent"
+                )
+            if int(np.sum(actual_flags)) != int(transition.actual_uav_movement_count):
+                raise AssertionError(
+                    "UAV actual movement flags disagree with physical movement count"
+                )
+            global_advantage_value = float(update.ppo_advantages[transition_index])
+            return_target_value = float(update.raw_returns[transition_index])
+            branch_old_value = float(
+                update.uav_branch_old_log_probs[transition_index]
+            )
+            branch_new_value = float(
+                update.uav_branch_new_log_probs[transition_index]
+            )
+            branch_ratio_value = float(update.uav_branch_ratios[transition_index])
+            branch_clipped_value = bool(update.uav_branch_clipped[transition_index])
+            action_condition_values = (
+                global_advantage_value,
+                return_target_value,
+                branch_old_value,
+                branch_new_value,
+                branch_ratio_value,
+                float(transition.reward),
+                float(transition.actual_task_utility),
+                float(transition.movement_cost),
+                float(transition.total_task_delay_s),
+                float(transition.total_vehicle_energy_j),
+            )
+            if not all(np.isfinite(value) for value in action_condition_values):
+                raise FloatingPointError(
+                    "UAV action-conditional logging values are non-finite"
+                )
             episode_uav_diagnostics_available = True
             move_probabilities = probabilities[:, 1]
             stay_probabilities = probabilities[:, 0]
             move_selected = operation_actions == 1
             move_feasible = operation_masks[:, 1]
+            feasible_action_counts = operation_masks.sum(axis=1).astype(np.int64)
             episode_uav_move_probabilities.extend(move_probabilities.tolist())
             episode_uav_stay_probabilities.extend(stay_probabilities.tolist())
             episode_uav_logit_margins.extend(margins.tolist())
             episode_uav_move_feasible.extend(move_feasible.tolist())
             episode_uav_move_selected.extend(move_selected.tolist())
             episode_uav_actual_movement.extend(actual_flags.tolist())
+            episode_uav_global_advantages.extend(
+                [global_advantage_value] * len(actual_flags)
+            )
+            episode_uav_return_targets.extend(
+                [return_target_value] * len(actual_flags)
+            )
+            episode_uav_rewards.extend(
+                [float(transition.reward)] * len(actual_flags)
+            )
+            episode_uav_q_values.extend(
+                [float(transition.actual_task_utility)] * len(actual_flags)
+            )
+            episode_uav_movement_costs.extend(
+                [float(transition.movement_cost)] * len(actual_flags)
+            )
+            episode_uav_delays.extend(
+                [float(transition.total_task_delay_s)] * len(actual_flags)
+            )
+            episode_uav_energies.extend(
+                [float(transition.total_vehicle_energy_j)] * len(actual_flags)
+            )
+            episode_uav_old_log_probs.extend(
+                [branch_old_value] * len(actual_flags)
+            )
+            episode_uav_new_log_probs.extend(
+                [branch_new_value] * len(actual_flags)
+            )
+            episode_uav_ratios.extend([branch_ratio_value] * len(actual_flags))
+            episode_uav_clipped.extend([branch_clipped_value] * len(actual_flags))
+            episode_uav_feasible_action_counts.extend(
+                feasible_action_counts.tolist()
+            )
+            episode_uav_move_candidate_counts.extend(candidate_counts.tolist())
             raw_advantage_value = float(raw_advantage)
             if not np.isfinite(raw_advantage_value):
                 raise FloatingPointError("UAV action advantage is non-finite")
@@ -3231,6 +3729,7 @@ def run_training(
                 optimizer_steps=update.optimizer_steps,
                 rollout=rollout,
                 update=update,
+                cache_count=cache_count,
             )
         _append_jsonl(
             update_metrics_path,
@@ -3429,7 +3928,30 @@ def run_training(
                 actual_movement=episode_uav_actual_movement,
                 move_advantages=episode_uav_move_advantages,
                 stay_advantages=episode_uav_stay_advantages,
+                global_advantages=episode_uav_global_advantages,
+                global_return_targets=episode_uav_return_targets,
+                rewards=episode_uav_rewards,
+                q_values=episode_uav_q_values,
+                movement_costs=episode_uav_movement_costs,
+                delays=episode_uav_delays,
+                energies=episode_uav_energies,
+                old_log_probs=episode_uav_old_log_probs,
+                new_log_probs=episode_uav_new_log_probs,
+                ratios=episode_uav_ratios,
+                clipped=episode_uav_clipped,
+                feasible_action_counts=episode_uav_feasible_action_counts,
+                move_candidate_counts=episode_uav_move_candidate_counts,
             )
+            if len(episode_cache_action_bitmasks) != len(episode_reward_array):
+                raise AssertionError(
+                    "selected Cache action bitmasks are not aligned with episode slots"
+                )
+            cache_action_bitmask_histogram: dict[str, int] = {}
+            for bitmask in episode_cache_action_bitmasks:
+                key = str(int(bitmask))
+                cache_action_bitmask_histogram[key] = (
+                    cache_action_bitmask_histogram.get(key, 0) + 1
+                )
             if (
                 context.policy_schema in MODERN_POLICY_SCHEMAS
                 and (best_epoch_return is None or epoch_return > best_epoch_return)
@@ -3555,6 +4077,27 @@ def run_training(
                     "wall_clock_runtime_seconds": epoch_runtime_seconds,
                     "rollout_runtime_seconds": rollout_runtime_seconds,
                     "update_runtime_seconds": update_runtime_seconds,
+                    "advantage_source": "actual_PPO_advantage",
+                    "selected_cache_action_bitmask_encoding": (
+                        "bit_i=selected cache trigger at cache head i; little-endian"
+                    ),
+                    "selected_cache_action_bitmask_per_slot": [
+                        int(value) for value in episode_cache_action_bitmasks
+                    ],
+                    "selected_cache_action_bitmask_histogram": (
+                        cache_action_bitmask_histogram
+                    ),
+                    "uav_action_conditional_grouping": (
+                        "actual_uav_move" if episode_uav_diagnostics_available else None
+                    ),
+                    "uav_action_log_prob_scope": (
+                        "joint_uav_branch_per_transition"
+                        if episode_uav_diagnostics_available
+                        else None
+                    ),
+                    "uav_action_conditioning_observational": (
+                        True if episode_uav_diagnostics_available else None
+                    ),
                     **uav_diagnostic_metrics,
                 },
             )
