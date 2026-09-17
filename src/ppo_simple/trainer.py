@@ -49,6 +49,7 @@ from .policy import (
     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
@@ -71,6 +72,9 @@ V8_NO_PREDICTION_CHECKPOINT_VERSION = 9
 V9_JOINT_CHECKPOINT_VERSION = 10
 V10_BRANCHWISE_CHECKPOINT_VERSION = 11
 V10C_DECOUPLED_CHECKPOINT_VERSION = 12
+V10D_BRANCH_SPECIFIC_KL_CHECKPOINT_VERSION = 13
+KL_GATE_MODE_JOINT = "joint"
+KL_GATE_MODE_BRANCH_SPECIFIC = "branch_specific"
 DEFAULT_ROLLOUT_STEPS = 16
 PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
@@ -102,9 +106,12 @@ JOINT_V10_POLICY_SCHEMAS = frozenset(
 JOINT_V10C_DECOUPLED_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic.architecture_id}
 )
+JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic.architecture_id}
+)
 JOINT_V10_BRANCHWISE_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id}
-) | JOINT_V10C_DECOUPLED_POLICY_SCHEMAS
+) | JOINT_V10C_DECOUPLED_POLICY_SCHEMAS | JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
 JOINT_CACHE_UAV_POLICY_SCHEMAS = (
     JOINT_V9_POLICY_SCHEMAS
     | JOINT_V10_POLICY_SCHEMAS
@@ -159,6 +166,90 @@ def _gradient_group_norm(parameters: Any) -> float:
     if squared_norm is None:
         return 0.0
     return float(torch.sqrt(squared_norm).detach().cpu())
+
+
+def _branch_specific_kl_gate_transition(
+    *,
+    cache_active: bool,
+    uav_active: bool,
+    cache_epoch_kl: float,
+    uav_epoch_kl: float,
+    target_kl: float | None,
+    update_epoch: int,
+    update_epochs: int,
+) -> dict[str, Any]:
+    """Apply one V10-D branch-KL gate transition after a full PPO epoch.
+
+    The transition is deliberately pure so the four required control-flow
+    cases can be tested without collecting a rollout or changing a policy.
+    A branch can only stop when a subsequent update epoch exists; the final
+    epoch remains a diagnostic-only observation, matching the legacy joint
+    gate boundary.
+    """
+
+    epoch_index = int(update_epoch)
+    total_epochs = int(update_epochs)
+    if epoch_index < 0 or total_epochs <= 0 or epoch_index >= total_epochs:
+        raise ValueError("invalid PPO update epoch for KL gate transition")
+    if not bool(cache_active) and not bool(uav_active):
+        raise ValueError("branch-specific KL gate cannot transition from both inactive")
+    if target_kl is None:
+        cache_over_target = None
+        uav_over_target = None
+    else:
+        target = float(target_kl)
+        if not math.isfinite(target) or target <= 0.0:
+            raise ValueError("target_kl must be positive and finite")
+        cache_over_target = bool(float(cache_epoch_kl) > target)
+        uav_over_target = bool(float(uav_epoch_kl) > target)
+    remaining_epochs = max(total_epochs - epoch_index - 1, 0)
+    can_suppress = remaining_epochs > 0
+    cache_newly_stopped = bool(
+        can_suppress and bool(cache_active) and cache_over_target is True
+    )
+    uav_newly_stopped = bool(
+        can_suppress and bool(uav_active) and uav_over_target is True
+    )
+    next_cache_active = bool(cache_active) and not cache_newly_stopped
+    next_uav_active = bool(uav_active) and not uav_newly_stopped
+    both_inactive_stop = bool(
+        can_suppress and not next_cache_active and not next_uav_active
+    )
+    return {
+        "cache_over_target": cache_over_target,
+        "uav_over_target": uav_over_target,
+        "cache_newly_stopped": cache_newly_stopped,
+        "uav_newly_stopped": uav_newly_stopped,
+        "cache_independent_stop": bool(
+            cache_newly_stopped and not uav_newly_stopped
+        ),
+        "uav_independent_stop": bool(
+            uav_newly_stopped and not cache_newly_stopped
+        ),
+        "both_inactive_stop": both_inactive_stop,
+        "cache_active_next": next_cache_active,
+        "uav_active_next": next_uav_active,
+        "remaining_epochs_suppressed": int(remaining_epochs),
+    }
+
+
+def _branch_actor_policy_loss(
+    cache_branch_policy_loss: Any,
+    uav_branch_policy_loss: Any,
+    *,
+    cache_active: bool,
+    uav_active: bool,
+) -> Any:
+    """Keep the V10-D actor branch scale at 0.5 for every active branch."""
+
+    if not bool(cache_active) and not bool(uav_active):
+        raise ValueError("at least one actor branch must remain active")
+    loss = cache_branch_policy_loss.new_zeros(())
+    if bool(cache_active):
+        loss = loss + 0.5 * cache_branch_policy_loss
+    if bool(uav_active):
+        loss = loss + 0.5 * uav_branch_policy_loss
+    return loss
 
 
 @dataclass(frozen=True)
@@ -354,6 +445,17 @@ class UpdateResult:
     uav_encoder_gradient_norm: float = math.nan
     kl_minibatch_diagnostics: tuple[dict[str, Any], ...] = ()
     kl_epoch_diagnostics: tuple[dict[str, Any], ...] = ()
+    kl_gate_mode: str = KL_GATE_MODE_JOINT
+    cache_active_per_update_epoch: tuple[bool, ...] = ()
+    uav_active_per_update_epoch: tuple[bool, ...] = ()
+    cache_stop_epoch: int | None = None
+    uav_stop_epoch: int | None = None
+    cache_suppressed_update_epochs: int = 0
+    uav_suppressed_update_epochs: int = 0
+    joint_kl_diagnostic: bool = False
+    cache_independent_stop: bool = False
+    uav_independent_stop: bool = False
+    both_inactive_stop: bool = False
 
 
 @dataclass(frozen=True)
@@ -706,6 +808,98 @@ def _binary_action_bitmask(action: Any) -> int:
     return int(bitmask)
 
 
+def _cache_operation_epoch_metrics(
+    transitions: Any,
+    initial_cache: np.ndarray,
+    cache_nodes: dict[str, Any],
+    service_sizes_mb: np.ndarray,
+) -> dict[str, Any]:
+    """Summarize cache primitive behavior without affecting the rollout/update."""
+
+    operation_names = ("KEEP", "ADD", "DELETE", "SWAP")
+    roles = ("SV", "RSU", "UAV")
+    node_roles = [str(value).upper() for value in cache_nodes["node_roles"]]
+    node_count = len(node_roles)
+    capacities = np.asarray(cache_nodes["capacities_mb"], dtype=np.float64).reshape(-1)
+    sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
+    operation_counts = {
+        role: {operation: 0 for operation in operation_names} for role in roles
+    }
+    role_samples = {role: 0 for role in roles}
+    previous_cache = np.asarray(initial_cache, dtype=np.int8).copy()
+    rsu_service_count: list[float] = []
+    rsu_capacity_utilization: list[float] = []
+    rsu_nonempty: list[bool] = []
+    rsu_requested_updates = 0
+    rsu_actual_changes = 0
+    rsu_samples = 0
+
+    for transition in transitions:
+        next_cache = np.asarray(transition.next_cache_state, dtype=np.int8)
+        if next_cache.shape != previous_cache.shape:
+            raise ValueError("cache behavior diagnostics encountered a state shape change")
+        actions = {
+            int(item["head_index"]): item
+            for item in transition.cache_conditional_actions
+            if "head_index" in item
+        }
+        for node_index, role in enumerate(node_roles):
+            role_samples[role] = role_samples.get(role, 0) + 1
+            action = actions.get(node_index)
+            if action is not None and role in operation_counts:
+                raw_operation = str(action.get("operation_type", "")).upper()
+                operation = "KEEP" if raw_operation == "NO_CHANGE" else raw_operation
+                if operation in operation_counts[role]:
+                    operation_counts[role][operation] += 1
+            if role != "RSU":
+                continue
+            row = next_cache[node_index]
+            used_mb = float(np.dot(row.astype(np.float64), sizes))
+            capacity = float(capacities[node_index])
+            if not math.isfinite(used_mb) or not math.isfinite(capacity) or capacity <= 0.0:
+                raise FloatingPointError("RSU cache behavior diagnostic is non-finite")
+            rsu_service_count.append(float(row.sum()))
+            rsu_capacity_utilization.append(used_mb / capacity)
+            rsu_nonempty.append(bool(row.sum() > 0))
+            rsu_requested_updates += int(
+                np.asarray(transition.action, dtype=np.int8)[node_index] == 1
+            )
+            rsu_actual_changes += int(
+                np.any(row != previous_cache[node_index])
+            )
+            rsu_samples += 1
+        previous_cache = next_cache.copy()
+
+    def _rate(count: int, denominator: int) -> float:
+        return 0.0 if denominator <= 0 else float(count) / float(denominator)
+
+    operation_rates = {
+        role: {
+            operation: _rate(count, role_samples[role])
+            for operation, count in counts.items()
+        }
+        for role, counts in operation_counts.items()
+    }
+    return {
+        "cache_operation_counts": operation_counts,
+        "cache_operation_rates": operation_rates,
+        "RSU_mean_cached_service_count": (
+            0.0 if not rsu_service_count else float(np.mean(rsu_service_count))
+        ),
+        "RSU_nonempty_fraction": (
+            0.0 if not rsu_nonempty else float(np.mean(rsu_nonempty))
+        ),
+        "RSU_cache_capacity_utilization": (
+            0.0
+            if not rsu_capacity_utilization
+            else float(np.mean(rsu_capacity_utilization))
+        ),
+        "RSU_requested_update_rate": _rate(rsu_requested_updates, rsu_samples),
+        "RSU_actual_change_rate": _rate(rsu_actual_changes, rsu_samples),
+        "RSU_operation_sample_count": int(rsu_samples),
+    }
+
+
 def _branch_update_metric_fields(update: UpdateResult) -> dict[str, float]:
     """Return finite branch diagnostics without changing legacy log schemas."""
 
@@ -748,7 +942,7 @@ def _v10c_kl_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         "both_kl_trigger_count",
         "neither_kl_trigger_count",
     )
-    return {
+    fields: dict[str, Any] = {
         "kl_minibatch_diagnostics": [
             dict(record) for record in update.kl_minibatch_diagnostics
         ],
@@ -774,6 +968,32 @@ def _v10c_kl_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
             )
         ),
     }
+    if update.cache_active_per_update_epoch or update.uav_active_per_update_epoch:
+        fields.update(
+            {
+                "kl_gate_mode": str(update.kl_gate_mode),
+                "cache_active_per_update_epoch": [
+                    bool(value) for value in update.cache_active_per_update_epoch
+                ],
+                "uav_active_per_update_epoch": [
+                    bool(value) for value in update.uav_active_per_update_epoch
+                ],
+                "cache_stop_epoch": update.cache_stop_epoch,
+                "uav_stop_epoch": update.uav_stop_epoch,
+                "cache_suppressed_update_epochs": int(
+                    update.cache_suppressed_update_epochs
+                ),
+                "uav_suppressed_update_epochs": int(
+                    update.uav_suppressed_update_epochs
+                ),
+                "joint_kl_diagnostic": bool(update.joint_kl_diagnostic),
+                "cache_independent_stop": bool(update.cache_independent_stop),
+                "uav_independent_stop": bool(update.uav_independent_stop),
+                "both_inactive_stop": bool(update.both_inactive_stop),
+                "joint_kl_control_enabled": False,
+            }
+        )
+    return fields
 
 
 def _critic_episode_metrics(
@@ -1567,6 +1787,32 @@ class PPOV2Trainer:
         _require_torch()
         self.context = context
         self.hyperparameters = hyperparameters_from_project(context.cfg)
+        self.kl_gate_mode = str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.kl_gate_mode",
+                KL_GATE_MODE_JOINT,
+            )
+        )
+        if self.kl_gate_mode not in {
+            KL_GATE_MODE_JOINT,
+            KL_GATE_MODE_BRANCH_SPECIFIC,
+        }:
+            raise ValueError(
+                "algorithm.ppo.kl_gate_mode 只支持 joint/branch_specific。"
+            )
+        if (
+            self.kl_gate_mode == KL_GATE_MODE_BRANCH_SPECIFIC
+            and context.policy_schema not in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
+        ):
+            raise ValueError(
+                "branch_specific KL gate requires the V10-D policy schema"
+            )
+        if (
+            context.policy_schema in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
+            and self.kl_gate_mode != KL_GATE_MODE_BRANCH_SPECIFIC
+        ):
+            raise ValueError("V10-D policy schema requires kl_gate_mode=branch_specific")
         self.device = torch.device(device)
         if context.configuration_control_mode in {
             "policy_primitive",
@@ -1580,7 +1826,11 @@ class PPOV2Trainer:
                     raise ValueError(
                         "policy_primitive_v9_joint_cache_uav_operation requires a supported Joint Cache/UAV schema"
                     )
-                if context.policy_schema in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS:
+                if context.policy_schema in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS:
+                    policy_class = (
+                        AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic
+                    )
+                elif context.policy_schema in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS:
                     policy_class = (
                         AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic
                     )
@@ -1728,6 +1978,8 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
+        if self.policy.architecture_id in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS:
+            return V10D_BRANCH_SPECIFIC_KL_CHECKPOINT_VERSION
         if self.policy.architecture_id in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS:
             return V10C_DECOUPLED_CHECKPOINT_VERSION
         if self.policy.architecture_id in JOINT_V10_BRANCHWISE_POLICY_SCHEMAS:
@@ -1960,6 +2212,11 @@ class PPOV2Trainer:
         )
         v10c_kl_instrumentation_enabled = (
             self.policy.architecture_id in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS
+            or self.policy.architecture_id in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
+        )
+        branch_specific_kl_gate_enabled = (
+            self.policy.architecture_id in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
+            and self.kl_gate_mode == KL_GATE_MODE_BRANCH_SPECIFIC
         )
         cache_candidate_old_log_probs = None
         uav_candidate_old_log_probs = None
@@ -2076,6 +2333,17 @@ class PPOV2Trainer:
         branch_gradient_parameter_groups: dict[str, tuple[Any, ...]] | None = None
         kl_early_stop_triggered = False
         ppo_update_epochs_executed = 0
+        cache_active = True
+        uav_active = True
+        cache_active_per_update_epoch: list[bool] = []
+        uav_active_per_update_epoch: list[bool] = []
+        cache_stop_epoch: int | None = None
+        uav_stop_epoch: int | None = None
+        cache_suppressed_update_epochs = 0
+        uav_suppressed_update_epochs = 0
+        cache_independent_stop = False
+        uav_independent_stop = False
+        both_inactive_stop = False
         uav_branch_old_log_probs_values: np.ndarray | None = None
         uav_branch_new_log_probs_values: np.ndarray | None = None
         uav_branch_ratios_values: np.ndarray | None = None
@@ -2114,6 +2382,11 @@ class PPOV2Trainer:
                 branch_gradient_parameter_groups = group_builder()
         minibatch_size = sample_count // hyper.num_minibatches
         for update_epoch in range(hyper.update_epochs):
+            cache_active_this_epoch = bool(cache_active)
+            uav_active_this_epoch = bool(uav_active)
+            if branch_specific_kl_gate_enabled:
+                cache_active_per_update_epoch.append(cache_active_this_epoch)
+                uav_active_per_update_epoch.append(uav_active_this_epoch)
             permutation = torch.randperm(sample_count, device=self.device)
             update_epoch_approximate_kls: list[float] = []
             update_epoch_cache_approx_kls: list[float] = []
@@ -2271,9 +2544,17 @@ class PPOV2Trainer:
                             uav_branch_unclipped,
                             uav_branch_clipped,
                         ).mean()
-                        branch_policy_loss = 0.5 * (
-                            cache_branch_policy_loss + uav_branch_policy_loss
-                        )
+                        if branch_specific_kl_gate_enabled:
+                            branch_policy_loss = _branch_actor_policy_loss(
+                                cache_branch_policy_loss,
+                                uav_branch_policy_loss,
+                                cache_active=cache_active_this_epoch,
+                                uav_active=uav_active_this_epoch,
+                            )
+                        else:
+                            branch_policy_loss = 0.5 * (
+                                cache_branch_policy_loss + uav_branch_policy_loss
+                            )
                         branch_metric_tensors += (
                             cache_branch_policy_loss,
                             uav_branch_policy_loss,
@@ -2632,6 +2913,8 @@ class PPOV2Trainer:
                                 if target_kl_value is None
                                 else bool(approximate_kl_value > target_kl_value)
                             ),
+                            "cache_active": bool(cache_active_this_epoch),
+                            "uav_active": bool(uav_active_this_epoch),
                             "joint_gate_triggered_after_epoch": False,
                             "remaining_update_epochs_suppressed": 0,
                         }
@@ -2642,6 +2925,8 @@ class PPOV2Trainer:
             ppo_update_epochs_executed += 1
             joint_gate_triggered = False
             if (
+                not branch_specific_kl_gate_enabled
+                and
                 hyper.target_kl is not None
                 and update_epoch + 1 < hyper.update_epochs
                 and float(np.mean(update_epoch_approximate_kls)) > hyper.target_kl
@@ -2696,11 +2981,66 @@ class PPOV2Trainer:
                     cache_epoch_over_target is False
                     and uav_epoch_over_target is False
                 )
-                remaining_epochs_suppressed = (
-                    int(hyper.update_epochs - update_epoch - 1)
-                    if joint_gate_triggered
-                    else 0
-                )
+                cache_newly_stopped = False
+                uav_newly_stopped = False
+                cache_independent_stop_event = False
+                uav_independent_stop_event = False
+                both_inactive_stop_event = False
+                if branch_specific_kl_gate_enabled:
+                    transition = _branch_specific_kl_gate_transition(
+                        cache_active=cache_active_this_epoch,
+                        uav_active=uav_active_this_epoch,
+                        cache_epoch_kl=cache_epoch_approx_kl,
+                        uav_epoch_kl=uav_epoch_approx_kl,
+                        target_kl=target_kl_value,
+                        update_epoch=update_epoch,
+                        update_epochs=hyper.update_epochs,
+                    )
+                    cache_newly_stopped = bool(
+                        transition["cache_newly_stopped"]
+                    )
+                    uav_newly_stopped = bool(transition["uav_newly_stopped"])
+                    cache_independent_stop_event = bool(
+                        transition["cache_independent_stop"]
+                    )
+                    uav_independent_stop_event = bool(
+                        transition["uav_independent_stop"]
+                    )
+                    both_inactive_stop_event = bool(
+                        transition["both_inactive_stop"]
+                    )
+                    cache_active = bool(transition["cache_active_next"])
+                    uav_active = bool(transition["uav_active_next"])
+                    if cache_newly_stopped and cache_stop_epoch is None:
+                        cache_stop_epoch = int(update_epoch + 1)
+                        cache_suppressed_update_epochs = int(
+                            transition["remaining_epochs_suppressed"]
+                        )
+                    if uav_newly_stopped and uav_stop_epoch is None:
+                        uav_stop_epoch = int(update_epoch + 1)
+                        uav_suppressed_update_epochs = int(
+                            transition["remaining_epochs_suppressed"]
+                        )
+                    cache_independent_stop = (
+                        cache_independent_stop or cache_independent_stop_event
+                    )
+                    uav_independent_stop = (
+                        uav_independent_stop or uav_independent_stop_event
+                    )
+                    both_inactive_stop = (
+                        both_inactive_stop or both_inactive_stop_event
+                    )
+                    if both_inactive_stop_event:
+                        # The triggering epoch's critic update has already
+                        # completed.  Only later epochs are suppressed.
+                        kl_early_stop_triggered = True
+                    remaining_epochs_suppressed = 0
+                else:
+                    remaining_epochs_suppressed = (
+                        int(hyper.update_epochs - update_epoch - 1)
+                        if joint_gate_triggered
+                        else 0
+                    )
                 for minibatch_record in kl_minibatch_diagnostics[
                     epoch_diagnostic_start:
                 ]:
@@ -2710,8 +3050,23 @@ class PPOV2Trainer:
                     minibatch_record[
                         "remaining_update_epochs_suppressed"
                     ] = remaining_epochs_suppressed
-                kl_epoch_diagnostics.append(
-                    {
+                    if branch_specific_kl_gate_enabled:
+                        minibatch_record["cache_active_next_epoch"] = bool(
+                            cache_active
+                        )
+                        minibatch_record["uav_active_next_epoch"] = bool(
+                            uav_active
+                        )
+                        minibatch_record["cache_independent_stop"] = bool(
+                            cache_independent_stop_event
+                        )
+                        minibatch_record["uav_independent_stop"] = bool(
+                            uav_independent_stop_event
+                        )
+                        minibatch_record["both_inactive_stop"] = bool(
+                            both_inactive_stop_event
+                        )
+                epoch_record = {
                         "update_epoch": int(update_epoch + 1),
                         "minibatch_count": int(
                             len(update_epoch_approximate_kls)
@@ -2746,8 +3101,39 @@ class PPOV2Trainer:
                             joint_gate_triggered and uav_only_trigger
                         ),
                     }
-                )
-            if joint_gate_triggered:
+                if branch_specific_kl_gate_enabled:
+                    epoch_record.update(
+                        {
+                            "kl_gate_mode": KL_GATE_MODE_BRANCH_SPECIFIC,
+                            "cache_active": bool(cache_active_this_epoch),
+                            "uav_active": bool(uav_active_this_epoch),
+                            "cache_active_next_epoch": bool(cache_active),
+                            "uav_active_next_epoch": bool(uav_active),
+                            "cache_stop_epoch": cache_stop_epoch,
+                            "uav_stop_epoch": uav_stop_epoch,
+                            "cache_suppressed_update_epochs": int(
+                                cache_suppressed_update_epochs
+                            ),
+                            "uav_suppressed_update_epochs": int(
+                                uav_suppressed_update_epochs
+                            ),
+                            "joint_kl_diagnostic": True,
+                            "joint_kl_control_enabled": False,
+                            "cache_independent_stop": bool(
+                                cache_independent_stop_event
+                            ),
+                            "uav_independent_stop": bool(
+                                uav_independent_stop_event
+                            ),
+                            "both_inactive_stop": bool(
+                                both_inactive_stop_event
+                            ),
+                        }
+                    )
+                kl_epoch_diagnostics.append(epoch_record)
+            if joint_gate_triggered or (
+                branch_specific_kl_gate_enabled and both_inactive_stop
+            ):
                 break
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
             self.critic_return_statistics.update(returns)
@@ -2884,6 +3270,17 @@ class PPOV2Trainer:
             kl_epoch_diagnostics=tuple(
                 dict(record) for record in kl_epoch_diagnostics
             ),
+            kl_gate_mode=self.kl_gate_mode,
+            cache_active_per_update_epoch=tuple(cache_active_per_update_epoch),
+            uav_active_per_update_epoch=tuple(uav_active_per_update_epoch),
+            cache_stop_epoch=cache_stop_epoch,
+            uav_stop_epoch=uav_stop_epoch,
+            cache_suppressed_update_epochs=int(cache_suppressed_update_epochs),
+            uav_suppressed_update_epochs=int(uav_suppressed_update_epochs),
+            joint_kl_diagnostic=bool(v10c_kl_instrumentation_enabled),
+            cache_independent_stop=bool(cache_independent_stop),
+            uav_independent_stop=bool(uav_independent_stop),
+            both_inactive_stop=bool(both_inactive_stop),
         )
 
     def checkpoint_payload(
@@ -3777,6 +4174,12 @@ def run_training(
         actual_uav_movements = int(
             sum(item.actual_uav_movement_count for item in rollout.transitions)
         )
+        cache_operation_metrics = _cache_operation_epoch_metrics(
+            rollout.transitions,
+            current_cache_state,
+            context.cache_nodes,
+            context.service_catalog["service_sizes_mb"],
+        )
         transition_rewards = np.asarray(
             [item.reward for item in rollout.transitions], dtype=np.float64
         )
@@ -4083,6 +4486,7 @@ def run_training(
                 "total_loss": float(update.total_loss),
                 "total_loss_finite": bool(np.isfinite(update.total_loss)),
                 "checkpoint": str(checkpoint_path),
+                **cache_operation_metrics,
                 **_branch_update_metric_fields(update),
                 **_v10c_kl_update_metric_fields(update),
             },
@@ -4332,6 +4736,7 @@ def run_training(
                     "uav_move_given_trigger": uav_move_given_trigger,
                     "cache_actual_change_rate": cache_change_rate,
                     "uav_actual_movement_rate": uav_move_rate,
+                    **cache_operation_metrics,
                     "policy_loss_range": {
                         "min": float(min(episode_policy_loss_mins)),
                         "max": float(max(episode_policy_loss_maxs)),

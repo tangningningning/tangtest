@@ -824,6 +824,7 @@ def validate_config(
         "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
         "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
         "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
+        "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -839,7 +840,8 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_v9_popart/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder."
+            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder/"
+            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl."
         )
     if (
         configuration_control_mode == "policy_primitive_v7_cache_operation"
@@ -864,6 +866,7 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
             "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
+            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
         }
     ):
         raise ValueError(
@@ -871,7 +874,31 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_v9_popart/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder."
+            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder/"
+            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl."
+        )
+    kl_gate_mode = str(
+        get_config_value(config, "algorithm.ppo.kl_gate_mode", "joint")
+    )
+    if kl_gate_mode not in {"joint", "branch_specific"}:
+        raise ValueError(
+            "algorithm.ppo.kl_gate_mode 只支持 joint/branch_specific。"
+        )
+    if (
+        kl_gate_mode == "branch_specific"
+        and policy_schema
+        != "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl"
+    ):
+        raise ValueError(
+            "algorithm.ppo.kl_gate_mode=branch_specific requires the V10-D policy schema."
+        )
+    if (
+        policy_schema
+        == "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl"
+        and kl_gate_mode != "branch_specific"
+    ):
+        raise ValueError(
+            "the V10-D policy schema requires algorithm.ppo.kl_gate_mode=branch_specific."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:

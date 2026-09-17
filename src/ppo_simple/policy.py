@@ -1733,6 +1733,22 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic(
         return groups
 
 
+class AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic
+):
+    """V10-D schema for branch-specific KL gate experiments.
+
+    The policy graph and parameter ownership are exactly V10-C.  V10-D puts
+    the new behavior in the trainer's KL gate, so this subclass only gives
+    the checkpoint/configuration path an explicit, non-overwriting schema.
+    """
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl"
+    )
+    architecture_version = 1
+
+
 class AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic(
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
 ):
