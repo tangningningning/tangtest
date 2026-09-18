@@ -24,6 +24,7 @@ from .evaluation_metrics import (
 from .interface import _copy_uav_positions
 from .policy import AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
 from .rollout import collect_rollout
+from .state_trace import STATE_TRACE_FILENAME, TRACE_FIELDS, write_state_trace
 from .trainer import PPOV2Trainer, aligned_train_steps, load_environment_context
 from .v7_evaluator import (
     _ensure_fresh_output,
@@ -320,9 +321,20 @@ def evaluate_v9_joint_episode(
         "uav_policy_active": True,
         "uav_fixed": False,
         "uav_operation_order": list(V9_UAV_OPERATION_ORDER),
+        "state_trace_filename": STATE_TRACE_FILENAME,
+        "state_trace_fields": list(TRACE_FIELDS),
     }
     _write_json(output_dir / "v9_joint_episode_manifest.json", manifest)
     _write_json(output_dir / "v9_joint_episode_summary.json", summary)
+    write_state_trace(
+        output_dir / STATE_TRACE_FILENAME,
+        context,
+        rollout.transitions,
+        initial_cache=np.asarray(context.initial_cache, dtype=np.int8).copy(),
+        initial_uav=_copy_uav_positions(context.initial_uav),
+        origin_start=0,
+        global_training_slot_start=0,
+    )
     with (output_dir / "v9_joint_slot_metrics.jsonl").open(
         "w", encoding="utf-8", newline="\n"
     ) as stream:

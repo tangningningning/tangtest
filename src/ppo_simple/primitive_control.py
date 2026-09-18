@@ -31,6 +31,9 @@ REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
         "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
         "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
         "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
+        "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
     }
 )
 REPLICA_AWARE_CACHE_FEATURE_NAMES = (
@@ -125,6 +128,10 @@ class CacheOperationPrimitiveSelectionResult:
     cache_old_log_probs: np.ndarray
     cache_conditional_actions: tuple[dict[str, Any], ...]
     cache_candidate_counts: np.ndarray
+    # Complete legal candidate groups for V11-A.  The existing selected-group
+    # tensors above remain unchanged for the production PPO path.
+    cache_all_candidate_features: np.ndarray | None = None
+    cache_all_candidate_masks: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +168,8 @@ class JointCacheUavOperationPrimitiveSelectionResult:
     uav_old_log_probs: np.ndarray
     uav_conditional_actions: tuple[dict[str, Any], ...]
     uav_candidate_counts: np.ndarray
+    cache_all_candidate_features: np.ndarray | None = None
+    cache_all_candidate_masks: np.ndarray | None = None
 
 
 def _intermediate_observation(
@@ -713,6 +722,31 @@ def sample_and_apply_v7_cache_operation_configuration(
         dtype=bool,
     )
     cache_masks[:, 0] = True
+    v11a_cache_node_cf = (
+        str(getattr(context, "policy_schema", ""))
+        == "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf"
+    )
+    cache_all_features: np.ndarray | None = None
+    cache_all_masks: np.ndarray | None = None
+    if v11a_cache_node_cf:
+        operation_count = len(operation_order)
+        cache_all_features = np.zeros(
+            (
+                tensor_spec.num_cache_heads,
+                operation_count,
+                tensor_spec.cache_max_candidates,
+                tensor_spec.cache_feature_dim,
+            ),
+            dtype=np.float32,
+        )
+        cache_all_masks = np.zeros(
+            (
+                tensor_spec.num_cache_heads,
+                operation_count,
+                tensor_spec.cache_max_candidates,
+            ),
+            dtype=bool,
+        )
     cache_selected = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
     cache_old_log_probs = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
     cache_counts = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
@@ -749,6 +783,51 @@ def sample_and_apply_v7_cache_operation_configuration(
                     f"unsupported production cache operation: {candidate.operation_type}"
                 ) from exc
             operation_mask[operation_index] = True
+        if v11a_cache_node_cf:
+            # Materialize every legal operation's production candidate group
+            # only for the legacy V11-A schema.  V10-D/recovery retain the
+            # original selected-operation feature path below.
+            assert cache_all_features is not None and cache_all_masks is not None
+            grouped_candidates = {
+                operation: [
+                    candidate
+                    for candidate in candidates
+                    if str(candidate.operation_type) == operation
+                ]
+                for operation in operation_order
+            }
+            for operation_index, operation in enumerate(operation_order):
+                operation_candidates = grouped_candidates[operation]
+                if not operation_candidates:
+                    continue
+                feature_triggers = cache_triggers.copy()
+                if operation != "NO_CHANGE":
+                    feature_triggers[node_index] = 1
+                candidate_features = np.stack(
+                    [
+                        _cache_candidate_feature(
+                            candidate,
+                            cache,
+                            previous_cache,
+                            feature_triggers,
+                            candidate_predicted_popularity,
+                            context,
+                            include_replica_awareness=include_replica_awareness,
+                        )
+                        for candidate in operation_candidates
+                    ]
+                )
+                count = len(operation_candidates)
+                if count > tensor_spec.cache_max_candidates:
+                    raise AssertionError(
+                        "V11-A Cache candidate count exceeds padded capacity"
+                    )
+                cache_all_features[
+                    node_index,
+                    operation_index,
+                    :count,
+                ] = candidate_features
+                cache_all_masks[node_index, operation_index, :count] = True
         sampled_operation = policy.sample_cache_operation(
             conditional_context,
             node_index,
@@ -803,20 +882,28 @@ def sample_and_apply_v7_cache_operation_configuration(
             raise AssertionError(
                 "V7 selected an operation whose production candidate group is empty"
             )
-        candidate_features = np.stack(
-            [
-                _cache_candidate_feature(
-                    candidate,
-                    cache,
-                    previous_cache,
-                    cache_triggers,
-                    candidate_predicted_popularity,
-                    context,
-                    include_replica_awareness=include_replica_awareness,
-                )
-                for candidate in group_candidates
+        if v11a_cache_node_cf:
+            assert cache_all_features is not None
+            candidate_features = cache_all_features[
+                node_index,
+                selected_operation_index,
+                : len(group_candidates),
             ]
-        )
+        else:
+            candidate_features = np.stack(
+                [
+                    _cache_candidate_feature(
+                        candidate,
+                        cache,
+                        previous_cache,
+                        cache_triggers,
+                        candidate_predicted_popularity,
+                        context,
+                        include_replica_awareness=include_replica_awareness,
+                    )
+                    for candidate in group_candidates
+                ]
+            )
         count = len(group_candidates)
         if count > tensor_spec.cache_max_candidates:
             raise AssertionError("V7 cache candidate count exceeds padded capacity")
@@ -892,6 +979,10 @@ def sample_and_apply_v7_cache_operation_configuration(
         cache_old_log_probs=cache_old_log_probs,
         cache_conditional_actions=tuple(cache_actions),
         cache_candidate_counts=cache_counts,
+        cache_all_candidate_features=(
+            cache_all_features if v11a_cache_node_cf else None
+        ),
+        cache_all_candidate_masks=(cache_all_masks if v11a_cache_node_cf else None),
     )
 
 
@@ -1236,6 +1327,8 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
         cache_old_log_probs=cache_result.cache_old_log_probs,
         cache_conditional_actions=cache_result.cache_conditional_actions,
         cache_candidate_counts=cache_result.cache_candidate_counts,
+        cache_all_candidate_features=cache_result.cache_all_candidate_features,
+        cache_all_candidate_masks=cache_result.cache_all_candidate_masks,
         uav_operation_actions=uav_operation_actions,
         uav_operation_masks=uav_operation_masks,
         uav_operation_old_log_probs=uav_operation_old_log_probs,

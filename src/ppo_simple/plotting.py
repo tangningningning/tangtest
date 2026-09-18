@@ -487,32 +487,39 @@ def update_training_epoch_return_plot(run_dir: Path) -> Path:
         run_path / EPISODE_METRICS_FILENAME
     )
     ma20 = _full_window_moving_average(returns, 20)
-    ma50 = _full_window_moving_average(returns, 50)
 
     figure, axis = plt.subplots(figsize=(12, 6))
     try:
         axis.plot(
             epochs,
             returns,
-            label="Raw Epoch Return",
-            linewidth=0.9,
-            marker=".",
-            markersize=3.0,
-            alpha=0.7,
+            label="_nolegend_",
+            color="#2563eb",
+            linewidth=0.8,
+            alpha=0.15,
         )
-        for moving, label in ((ma20, "MA20"), (ma50, "MA50")):
-            valid = np.isfinite(moving)
-            if np.any(valid):
-                axis.plot(epochs[valid], moving[valid], label=label, linewidth=1.8)
-        axis.set_xlabel("Epoch")
-        axis.set_ylabel("Return")
-        axis.set_title("PPO Training Return per Epoch")
-        axis.grid(True, alpha=0.3)
-        axis.legend()
+        valid = np.isfinite(ma20)
+        if np.any(valid):
+            axis.plot(
+                epochs[valid],
+                ma20[valid],
+                label="MA20",
+                color="#2563eb",
+                linewidth=2.2,
+                marker="o",
+                markersize=4.5,
+                markevery=10,
+            )
+        axis.set_xlabel("Training Epoch")
+        axis.set_ylabel("Episode Return")
+        axis.set_title("PPO Training Return (MA20)")
+        axis.grid(True, axis="y", alpha=0.25)
+        axis.set_axisbelow(True)
+        axis.legend(frameon=False)
         figure.tight_layout()
         output_path = run_path / "plots" / TRAINING_EPOCH_RETURN_PLOT_FILENAME
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(output_path, dpi=180)
+        figure.savefig(output_path, dpi=320, facecolor="white")
     finally:
         plt.close(figure)
     return output_path

@@ -25,6 +25,10 @@ from .policy import (
     AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic,
     AdaptivePrimitiveActorCritic,
     BernoulliActorCritic,
     PolicySample,
@@ -79,6 +83,10 @@ class SimpleTransition:
     online_k100_configuration_calls: int
     matching_summary: dict[str, Any]
     origin_runtime_seconds: float
+    # State at the beginning of this transition.  R2 uses it to replay exact
+    # operation counterfactuals without reconstructing the rollout prefix.
+    previous_cache_state: np.ndarray
+    previous_uav_positions: dict[str, tuple[float, float]]
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
     v7_cache_operation_actions: np.ndarray | None = None
@@ -91,6 +99,8 @@ class SimpleTransition:
     uav_operation_entropies: np.ndarray | None = None
     uav_operation_probabilities: np.ndarray | None = None
     uav_operation_logit_margins: np.ndarray | None = None
+    cache_all_candidate_features: np.ndarray | None = None
+    cache_all_candidate_masks: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +137,8 @@ class SimpleRollout:
     # any new arrays or changing the sampled action path.
     cache_old_log_probs: np.ndarray | None = None
     uav_old_log_probs: np.ndarray | None = None
+    cache_all_candidate_features: np.ndarray | None = None
+    cache_all_candidate_masks: np.ndarray | None = None
 
 
 def _observation(
@@ -256,6 +268,10 @@ def collect_rollout(
                     AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
                     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
                     AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
+                    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic,
+                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic,
+                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
+                    AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic,
                 ),
             ):
                 raise TypeError(
@@ -452,6 +468,8 @@ def collect_rollout(
         uav_operation_entropies: np.ndarray | None = None
         uav_operation_probabilities: np.ndarray | None = None
         uav_operation_logit_margins: np.ndarray | None = None
+        cache_all_candidate_features: np.ndarray | None = None
+        cache_all_candidate_masks: np.ndarray | None = None
         total_log_prob = sample.log_prob
         configuration_override = None
         if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
@@ -468,6 +486,8 @@ def collect_rollout(
             cache_old_log_probs = v9_primitive.cache_old_log_probs
             cache_conditional_actions = v9_primitive.cache_conditional_actions
             cache_candidate_counts = v9_primitive.cache_candidate_counts
+            cache_all_candidate_features = v9_primitive.cache_all_candidate_features
+            cache_all_candidate_masks = v9_primitive.cache_all_candidate_masks
             uav_contexts = v9_primitive.uav_contexts
             uav_candidate_features = v9_primitive.uav_candidate_features
             uav_candidate_masks = v9_primitive.uav_candidate_masks
@@ -678,6 +698,8 @@ def collect_rollout(
                 origin_runtime_seconds=float(
                     time.perf_counter() - origin_started_at
                 ),
+                previous_cache_state=previous_cache.copy(),
+                previous_uav_positions=dict(previous_uav),
                 next_cache_state=next_cache.copy(),
                 next_uav_positions=dict(next_uav),
                 v7_cache_operation_actions=(
@@ -729,6 +751,16 @@ def collect_rollout(
                     None
                     if uav_operation_logit_margins is None
                     else uav_operation_logit_margins.copy()
+                ),
+                cache_all_candidate_features=(
+                    None
+                    if cache_all_candidate_features is None
+                    else cache_all_candidate_features.copy()
+                ),
+                cache_all_candidate_masks=(
+                    None
+                    if cache_all_candidate_masks is None
+                    else cache_all_candidate_masks.copy()
                 ),
             )
         )
@@ -852,6 +884,20 @@ def collect_rollout(
         uav_old_log_probs=np.stack(
             [item.uav_old_log_probs for item in transitions]
         ).astype(np.float32),
+        cache_all_candidate_features=(
+            None
+            if any(item.cache_all_candidate_features is None for item in transitions)
+            else np.stack(
+                [item.cache_all_candidate_features for item in transitions]
+            ).astype(np.float32)
+        ),
+        cache_all_candidate_masks=(
+            None
+            if any(item.cache_all_candidate_masks is None for item in transitions)
+            else np.stack(
+                [item.cache_all_candidate_masks for item in transitions]
+            ).astype(bool)
+        ),
     )
 
 

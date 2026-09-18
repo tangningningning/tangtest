@@ -39,8 +39,18 @@ class PolicyEvaluation:
     # actions and old log-probabilities; they do not affect the PPO objective.
     cache_log_prob: Any | None = None
     uav_log_prob: Any | None = None
+    # Per-UAV operation/candidate log-probabilities.  The aggregate branch
+    # values above remain the compatibility surface for the existing PPO
+    # schemas; R2 uses these tensors to keep the operation trust region
+    # independent from the candidate trust region.
+    uav_operation_log_probs: Any | None = None
+    uav_candidate_log_probs: Any | None = None
     cache_entropy: Any | None = None
     uav_entropy: Any | None = None
+    # Exact per-Cache-node primitive log-probabilities.  These include the
+    # masked operation categorical and, when the operation is not NO_CHANGE,
+    # the selected candidate categorical.
+    cache_node_log_probs: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -1137,7 +1147,8 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
         ).squeeze(-1)
         if not bool(torch.all(operation_valid).item()):
             raise ValueError("V7 operation action is blocked by its operation mask")
-        operation_log_prob = operation_distribution.log_prob(operation_actions_t).sum(dim=-1)
+        operation_node_log_prob = operation_distribution.log_prob(operation_actions_t)
+        operation_log_prob = operation_node_log_prob.sum(dim=-1)
         operation_entropy = torch.where(
             operation_masks_t.sum(dim=-1) == 1,
             torch.zeros_like(operation_distribution.entropy()),
@@ -1201,10 +1212,11 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
         candidate_logits = raw_scores.masked_fill(~candidate_masks_t, -float("inf"))
         candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
         candidate_active = operation_actions_t != 0
-        candidate_log_prob = (
+        candidate_node_log_prob = (
             candidate_distribution.log_prob(candidate_selected_t)
             * candidate_active.to(torch.float32)
-        ).sum(dim=-1)
+        )
+        candidate_log_prob = candidate_node_log_prob.sum(dim=-1)
         candidate_entropy = (
             candidate_distribution.entropy()
             * candidate_active.to(torch.float32)
@@ -1216,6 +1228,152 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
             logits=operation_logits,
             cache_log_prob=operation_log_prob + candidate_log_prob,
             cache_entropy=operation_entropy + candidate_entropy,
+            cache_node_log_probs=operation_node_log_prob + candidate_node_log_prob,
+        )
+
+    def evaluate_cache_all_action_log_probs(
+        self,
+        operation_contexts: Any,
+        operation_masks: Any,
+        all_candidate_features: Any,
+        all_candidate_masks: Any,
+    ) -> Any:
+        """Return exact log-probabilities for every legal Cache primitive.
+
+        The returned tensor has shape ``[B, H, O, C]``.  ``-inf`` marks
+        padded or illegal primitive actions.  Operation ``NO_CHANGE`` owns a
+        single placeholder candidate at index zero and therefore has no
+        candidate-scoring contribution.  Active operations use the same raw
+        scorer and masking path as ``evaluate_cache_operation_primitive``.
+
+        This method is intentionally separate from the PPO evaluation path so
+        the counterfactual baseline can evaluate all legal alternatives under
+        ``torch.no_grad()`` without inventing probabilities for unobserved
+        candidate groups.
+        """
+
+        device = next(self.parameters()).device
+        contexts_t = torch.as_tensor(
+            operation_contexts, dtype=torch.float32, device=device
+        )
+        operation_masks_t = torch.as_tensor(
+            operation_masks, dtype=torch.bool, device=device
+        )
+        features_t = torch.as_tensor(
+            all_candidate_features, dtype=torch.float32, device=device
+        )
+        candidate_masks_t = torch.as_tensor(
+            all_candidate_masks, dtype=torch.bool, device=device
+        )
+        if contexts_t.ndim != 3:
+            raise ValueError("V11-A Cache operation contexts must be [B,H,observation_dim]")
+        batch_size, head_count, observation_dim = [int(value) for value in contexts_t.shape]
+        operation_count = len(self.operation_order)
+        if head_count != self.num_cache_heads or observation_dim != self.observation_dim:
+            raise ValueError("V11-A Cache operation context shape mismatch")
+        expected_operation_shape = (batch_size, head_count, operation_count)
+        if tuple(operation_masks_t.shape) != expected_operation_shape:
+            raise ValueError("V11-A Cache operation mask shape mismatch")
+        if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
+            raise ValueError("V11-A Cache operation mask cannot block every operation")
+        if features_t.ndim != 5:
+            raise ValueError("V11-A Cache candidate features must be [B,H,O,C,F]")
+        candidate_count = int(features_t.shape[3])
+        if tuple(features_t.shape[:3]) != (batch_size, head_count, operation_count):
+            raise ValueError("V11-A Cache candidate feature prefix shape mismatch")
+        if int(features_t.shape[-1]) != self.cache_feature_dim or candidate_count <= 0:
+            raise ValueError("V11-A Cache candidate feature dimension mismatch")
+        expected_candidate_shape = (batch_size, head_count, operation_count, candidate_count)
+        if tuple(candidate_masks_t.shape) != expected_candidate_shape:
+            raise ValueError("V11-A Cache all-candidate mask shape mismatch")
+        if not bool(torch.all(torch.isfinite(features_t)).item()):
+            raise ValueError("V11-A Cache all-candidate features contain NaN/Inf")
+        if not bool(torch.all(candidate_masks_t[:, :, 0, 0]).item()):
+            raise ValueError("V11-A Cache NO_CHANGE placeholder candidate is missing")
+        if bool(torch.any(candidate_masks_t[:, :, 0, 1:]).item()):
+            raise ValueError("V11-A Cache NO_CHANGE must have exactly one placeholder candidate")
+        operation_has_candidates = torch.any(candidate_masks_t, dim=-1)
+        if not bool(torch.all(operation_has_candidates == operation_masks_t).item()):
+            raise ValueError("V11-A operation masks and legal candidate groups disagree")
+
+        all_operation_logits, _ = self._operation_logits(
+            contexts_t.reshape(batch_size * head_count, observation_dim)
+        )
+        all_operation_logits = all_operation_logits.reshape(
+            batch_size,
+            head_count,
+            self.num_cache_heads,
+            operation_count,
+        )
+        head_indices = torch.arange(
+            self.num_cache_heads,
+            dtype=torch.long,
+            device=all_operation_logits.device,
+        )
+        operation_logits = all_operation_logits[:, head_indices, head_indices, :]
+        operation_logits = operation_logits.masked_fill(~operation_masks_t, -float("inf"))
+        operation_distribution = torch.distributions.Categorical(logits=operation_logits)
+        # Categorical.log_prob accepts one scalar action per distribution;
+        # the full operation support is already represented by its normalized
+        # logits, which are the exact log-probabilities for every operation.
+        operation_log_probs = operation_distribution.logits
+
+        action_log_probs = torch.full(
+            expected_candidate_shape,
+            -float("inf"),
+            dtype=operation_logits.dtype,
+            device=operation_logits.device,
+        )
+        action_log_probs[:, :, 0, 0] = operation_log_probs[:, :, 0]
+        if operation_count > 1:
+            active_features = features_t[:, :, 1:, :, :]
+            active_masks = candidate_masks_t[:, :, 1:, :]
+            safe_masks = active_masks.clone()
+            empty_groups = ~torch.any(safe_masks, dim=-1)
+            safe_masks[:, :, :, 0] |= empty_groups
+            active_operation_count = operation_count - 1
+            active_contexts = contexts_t.unsqueeze(2).expand(
+                -1, -1, active_operation_count, -1
+            )
+            flat_contexts = active_contexts.reshape(
+                batch_size * head_count * active_operation_count,
+                observation_dim,
+            )
+            flat_features = active_features.reshape(
+                batch_size * head_count * active_operation_count,
+                candidate_count,
+                self.cache_feature_dim,
+            )
+            flat_scores, _ = self._candidate_scores(
+                flat_contexts,
+                flat_features,
+                self.cache_feature_dim,
+                self.cache_candidate_scorer,
+            )
+            active_scores = flat_scores.reshape(
+                batch_size,
+                head_count,
+                active_operation_count,
+                candidate_count,
+            )
+            candidate_logits = active_scores.masked_fill(~safe_masks, -float("inf"))
+            candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
+            # As above, the normalized categorical logits expose the complete
+            # candidate support in one tensor; log_prob is scalar-valued per
+            # categorical distribution and cannot evaluate a vector support.
+            active_candidate_log_probs = candidate_distribution.logits
+            active_candidate_log_probs = active_candidate_log_probs.masked_fill(
+                ~active_masks,
+                -float("inf"),
+            )
+            active_action_log_probs = (
+                operation_log_probs[:, :, 1:].unsqueeze(-1)
+                + active_candidate_log_probs
+            )
+            action_log_probs[:, :, 1:, :] = active_action_log_probs
+        return action_log_probs.masked_fill(
+            ~(operation_masks_t.unsqueeze(-1) & candidate_masks_t),
+            -float("inf"),
         )
 
 
@@ -1483,7 +1641,8 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
         ).squeeze(-1)
         if not bool(torch.all(operation_valid).item()):
             raise ValueError("V9 UAV operation action is blocked by its operation mask")
-        operation_log_prob = operation_distribution.log_prob(operation_actions_t).sum(dim=-1)
+        uav_operation_log_probs = operation_distribution.log_prob(operation_actions_t)
+        operation_log_prob = uav_operation_log_probs.sum(dim=-1)
         operation_entropy = torch.where(
             operation_masks_t.sum(dim=-1) == 1,
             torch.zeros_like(operation_distribution.entropy()),
@@ -1564,10 +1723,11 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
         )
         candidate_logits = raw_scores.masked_fill(~candidate_masks_t, -float("inf"))
         candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
-        candidate_log_prob = (
+        uav_candidate_log_probs = (
             candidate_distribution.log_prob(candidate_selected_t)
             * candidate_active.to(torch.float32)
-        ).sum(dim=-1)
+        )
+        candidate_log_prob = uav_candidate_log_probs.sum(dim=-1)
         candidate_entropy = (
             candidate_distribution.entropy()
             * candidate_active.to(torch.float32)
@@ -1579,8 +1739,11 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             logits=cache_evaluation.logits,
             cache_log_prob=cache_evaluation.log_prob,
             uav_log_prob=operation_log_prob + candidate_log_prob,
+            uav_operation_log_probs=uav_operation_log_probs,
+            uav_candidate_log_probs=uav_candidate_log_probs,
             cache_entropy=cache_evaluation.entropy,
             uav_entropy=operation_entropy + candidate_entropy,
+            cache_node_log_probs=cache_evaluation.cache_node_log_probs,
         )
 
 
@@ -1746,6 +1909,53 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic(
     architecture_id = (
         "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl"
     )
+    architecture_version = 1
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic
+):
+    """MAINLINE_RECOVERY_R1 schema on the verified V10-D policy graph.
+
+    Recovery keeps V10-D's decoupled encoders, global GAE/PopArt critic, and
+    branch-specific KL control.  The distinct schema prevents a recovery
+    checkpoint from being mistaken for either the V10-D or V11-A experiment.
+    """
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1"
+    )
+    architecture_version = 1
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic
+):
+    """Recovery R2 with operation-only counterfactual TD credit.
+
+    R2 deliberately reuses the R1/V10-D module graph.  The new operation
+    credit assignment and its loss decomposition live in the trainer, so the
+    checkpoint tensor layout and all observation/action heads remain frozen.
+    """
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2"
+    )
+    architecture_version = 1
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic
+):
+    """V11-A schema with trainer-owned Cache-node counterfactual credit.
+
+    The actor/global-critic graph and the V10-D UAV branch are intentionally
+    unchanged.  The independent action-conditioned Cache critic is owned by
+    the trainer so its parameters cannot enter either the actor or global
+    critic parameter groups.
+    """
+
+    architecture_id = "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf"
     architecture_version = 1
 
 

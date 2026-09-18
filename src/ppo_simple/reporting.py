@@ -214,6 +214,27 @@ def build_run_manifest(
     resolved_config_path = Path(
         context.cfg.get("_meta", {}).get("config_path", config_path)
     ).resolve()
+    q_cache_manifest_fields: dict[str, Any] = {}
+    if getattr(trainer, "q_cache_optimizer", None) is not None:
+        q_cache_manifest_fields = {
+            "cache_credit_granularity": "FULL_NODE_ACTION",
+            "q_cache_learning_rate": _optimizer_learning_rate(
+                trainer.q_cache_optimizer, "q_cache"
+            ),
+            "q_cache_target_source": "current_PopArt_normalized_raw_GAE_return",
+            "q_cache_conditioning": (
+                "full_state_plus_target_cache_node_plus_full_cache_and_uav_action_encoding"
+            ),
+            "q_cache_action_encoding": (
+                "per_node_operation_one_hot_plus_candidate_one_hot_plus_production_primitive_feature"
+            ),
+            "q_cache_optimizer_steps_per_rollout": int(
+                hyper.update_epochs * hyper.num_minibatches
+            ),
+            "cache_counterfactual_advantage_source": (
+                "detached_Q_selected_minus_legal_action_policy_expectation"
+            ),
+        }
     return {
         "experiment_type": "main_training",
         "git_commit_sha": git_sha,
@@ -249,6 +270,9 @@ def build_run_manifest(
         "clip_epsilon": float(hyper.clip_epsilon),
         "update_epochs": int(hyper.update_epochs),
         "target_kl": hyper.target_kl,
+        "cache_kl_control": str(
+            getattr(trainer, "cache_kl_control", "epoch")
+        ),
         "num_minibatches": int(hyper.num_minibatches),
         "minibatch_size": int(context.minibatch_size),
         "actor_learning_rate": _optimizer_learning_rate(
@@ -259,6 +283,7 @@ def build_run_manifest(
         ),
         "max_grad_norm": float(hyper.max_grad_norm),
         "entropy_coefficient": float(hyper.entropy_coefficient),
+        **q_cache_manifest_fields,
     }
 
 

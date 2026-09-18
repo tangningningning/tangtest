@@ -1,0 +1,107 @@
+{
+  "report_id": "MAIN_EXPERIMENT_OUTPUT_INVENTORY",
+  "audit_date": "2026-09-18",
+  "audit_mode": "static_code_and_existing_logs_only",
+  "training_started": false,
+  "rollout_started": false,
+  "evaluation_started": false,
+  "status": "PASS",
+  "protected_paths": [
+    {
+      "path": "runs/ppo_v6_popart_actor1e4_lazy_episode_pool_20260911",
+      "reason": "frozen episode pool",
+      "pre_cleanup_files": 3300,
+      "pre_cleanup_bytes": 8357864584,
+      "action": "KEEP"
+    },
+    {
+      "path": "runs/ppo_v10d_decoupled_encoder_branch_kl_6e4_formal",
+      "reason": "V10-D formal comparison",
+      "pre_cleanup_files": 9,
+      "pre_cleanup_bytes": 141439927,
+      "action": "KEEP"
+    }
+  ],
+  "formal_runs": [
+    {
+      "actor_learning_rate": 0.0005,
+      "run_dir": "runs/ppo_v11a_cache_node_cf_5e4_formal",
+      "action": "KEEP_ALL",
+      "files_after_cleanup": 9,
+      "bytes_after_cleanup": 149920413,
+      "raw_slot_and_critic_diagnostics": "KEEP"
+    },
+    {
+      "actor_learning_rate": 0.0006,
+      "run_dir": "runs/ppo_v11a_cache_node_cf_6e4_formal",
+      "action": "KEEP_ALL",
+      "files_after_cleanup": 9,
+      "bytes_after_cleanup": 150898672,
+      "raw_slot_and_critic_diagnostics": "KEEP"
+    },
+    {
+      "actor_learning_rate": 0.005,
+      "run_dir": "runs/ppo_v11a_cache_node_cf_5e3_formal",
+      "action": "KEEP_CORE_DELETE_REDUNDANT_RAW",
+      "files_after_cleanup": 7,
+      "bytes_after_cleanup": 26042565,
+      "deleted_files": [
+        "critic_diagnostics.jsonl",
+        "slot_metrics.jsonl"
+      ],
+      "raw_diagnostics_replacement": "reports/v11a_failure_and_io_analysis.md/.json"
+    },
+    {
+      "actor_learning_rate": 0.006,
+      "run_dir": "runs/ppo_v11a_cache_node_cf_6e3_formal",
+      "action": "KEEP_CORE_DELETE_REDUNDANT_RAW",
+      "files_after_cleanup": 7,
+      "bytes_after_cleanup": 26177734,
+      "deleted_files": [
+        "critic_diagnostics.jsonl",
+        "slot_metrics.jsonl"
+      ],
+      "raw_diagnostics_replacement": "reports/v11a_failure_and_io_analysis.md/.json"
+    }
+  ],
+  "kept_reports": [
+    "reports/main_experiment_io_contract.md",
+    "reports/main_experiment_io_contract.json",
+    "reports/main_experiment_output_inventory.md",
+    "reports/main_experiment_output_inventory.json",
+    "reports/cleanup_manifest.md",
+    "reports/cleanup_manifest.json",
+    "reports/v11a_failure_and_io_analysis.md",
+    "reports/v11a_failure_and_io_analysis.json",
+    "reports/v11a_cache_node_cf_implementation_gate.md",
+    "reports/v11a_cache_node_cf_implementation_gate.json",
+    "reports/v11a_cache_node_kl_decomposition_gate.md",
+    "reports/v11a_cache_node_kl_decomposition_gate.json",
+    "reports/v11a_minibatch_cache_kl_control_gate.md",
+    "reports/v11a_minibatch_cache_kl_control_gate.json",
+    "reports/v11a_cf_critic_readiness_gate.md",
+    "reports/v11a_cf_critic_readiness_gate.json",
+    "reports/ppo_cross_run_root_cause_analysis.md"
+  ],
+  "kept_configs": [
+    "configs/proposed/system_config_ppo_v11a_cache_node_cf_5e3.toml",
+    "configs/proposed/system_config_ppo_v11a_cache_node_cf_5e4.toml",
+    "configs/proposed/system_config_ppo_v11a_cache_node_cf_6e3.toml",
+    "configs/proposed/system_config_ppo_v11a_cache_node_cf_6e4.toml",
+    "configs/lr_sweep/v9_actor_lr_6e4_kl_protection.toml"
+  ],
+  "deleted_categories": {
+    "server_launch_scripts": 4,
+    "superseded_server_reports": 4,
+    "unreferenced_scratch_configs": 1,
+    "large_raw_jsonl_files": 4
+  },
+  "diagnostic_fields_retained_in_compact_reports": [
+    "episode return and critic EV",
+    "Q-cache EV/loss/gradient/steps",
+    "CF raw/normalized statistics and role split",
+    "Cache/UAV KL and early-stop",
+    "selected operation rates and trigger bitmask histograms",
+    "UAV operation mask summary and MOVE candidate counts"
+  ]
+}

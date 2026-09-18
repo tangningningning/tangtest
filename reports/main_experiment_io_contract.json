@@ -1,0 +1,103 @@
+{
+  "report_id": "MAIN_EXPERIMENT_IO_CONTRACT",
+  "audit_date": "2026-09-18",
+  "audit_mode": "static_code_and_existing_logs_only",
+  "training_started": false,
+  "rollout_started": false,
+  "evaluation_started": false,
+  "new_model_or_lr_change": false,
+  "status": {
+    "main_experiment_io_contract": "PASS_WITH_LIMITATIONS",
+    "observation_dim": "400_CONFIRMED",
+    "action_dim": "11_CONFIRMED",
+    "reward_path": "CONFIRMED",
+    "mask_log_coverage": "PARTIAL"
+  },
+  "frozen_inputs": {
+    "episode_pool": "runs/ppo_v6_popart_actor1e4_lazy_episode_pool_20260911",
+    "origin_count": 300,
+    "origin_range": [0, 299],
+    "vehicle_count": 25,
+    "task_vehicle_count": 20,
+    "service_vehicle_count": 5,
+    "service_count": 10,
+    "prediction_horizon": 5,
+    "prediction_horizons": [0, 1, 2, 3, 4],
+    "prediction_scenarios_shapes": {
+      "rho_hat": [300, 5, 10],
+      "positions_xy": [300, 20, 5, 25, 2]
+    }
+  },
+  "node_order": {
+    "cache_nodes": ["23", "87", "43", "75", "58", "RSU_0", "RSU_1", "UAV_0", "UAV_1"],
+    "cache_roles": ["SV", "SV", "SV", "SV", "SV", "RSU", "RSU", "UAV", "UAV"],
+    "uav_ids": ["UAV_0", "UAV_1"],
+    "service_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  },
+  "observation_slices": [
+    {"name": "previous_cache_state", "slice": "[0:90]", "length": 90, "shape": [9, 10], "semantics": "binary previous cache state in fixed node/service order"},
+    {"name": "previous_uav_positions", "slice": "[90:94]", "length": 4, "shape": [2, 2], "semantics": "normalized x/y for UAV_0,UAV_1"},
+    {"name": "predicted_vehicle_positions", "slice": "[94:344]", "length": 250, "shape": [5, 25, 2], "semantics": "normalized predicted x/y for horizons 0..4"},
+    {"name": "predicted_service_popularity", "slice": "[344:394]", "length": 50, "shape": [5, 10], "semantics": "normalized predicted popularity per horizon"},
+    {"name": "prediction_horizon_valid_mask", "slice": "[394:399]", "length": 5, "shape": [5], "semantics": "validity for future prediction horizons"},
+    {"name": "time_to_go", "slice": "[399:400]", "length": 1, "shape": [1], "semantics": "normalized formal origin time-to-go"}
+  ],
+  "observation_dim_equation": "90 + 4 + 250 + 50 + 5 + 1 = 400",
+  "excluded_from_global_observation": [
+    "actual current tasks and arrivals",
+    "actual current vehicle positions",
+    "task input bits and CPU cycles",
+    "true future labels",
+    "matching and KKT allocations",
+    "actual delay, vehicle energy and task utility",
+    "prediction surrogate objective",
+    "raw node capacity/CPU/bandwidth metadata"
+  ],
+  "action_contract": {
+    "outer_action_dim": 11,
+    "outer_action_order": "Cache node indices 0..8 followed by UAV_0,UAV_1 trigger bits",
+    "cache_operation_order": ["NO_CHANGE", "ADD", "DELETE", "SWAP"],
+    "uav_operation_order": ["STAY", "MOVE"],
+    "cache_heads": 9,
+    "uav_heads": 2,
+    "cache_max_candidates": 36,
+    "uav_max_candidates": 89,
+    "cache_candidate_feature_dim": 53,
+    "uav_candidate_feature_dim": 18,
+    "cache_operation_mask_rule": "NO_CHANGE always legal; ADD/DELETE/SWAP from current binary/capacity neighborhood",
+    "uav_operation_mask_rule": "STAY always legal; MOVE legal when a feasible candidate exists"
+  },
+  "q_cache_contract": {
+    "cache_action_encoding_per_head": 93,
+    "uav_action_encoding_per_head": 109,
+    "joint_action_encoding_dim": 1055,
+    "input_components": ["400-d observation", "9-d target Cache node one-hot", "1055-d complete joint action encoding"],
+    "credit_granularity": "FULL_NODE_ACTION",
+    "counterfactual_rule": "replace only target Cache-node action slice; hold all other Cache/UAV action slices fixed"
+  },
+  "reward_contract": {
+    "path": "policy primitive -> build_policy_primitive_configuration -> execute_slot -> actual Matching/KKT -> Q - cache_cost - movement_cost",
+    "formula": "G(t)=Q(t)-C_ca(t)-C_q(t)",
+    "prediction_surrogate_in_policy_primitive_path": "skipped",
+    "units": {
+      "position_distance": "m",
+      "delay": "s",
+      "energy": "J",
+      "input": "bit",
+      "cpu_load": "cycle",
+      "cache_size": "MB",
+      "task_utility_and_Q": "dimensionless normalized scalar",
+      "training_reward": "dimensionless normalized scalar after cost subtraction"
+    }
+  },
+  "evidence": [
+    "src/ppo_simple/interface.py:101-180,391-480,760-1024",
+    "src/ppo_simple/trainer.py:1815-1857,2278-2333,2381-2563",
+    "src/ppo_simple/primitive_control.py:59-83,667-954,1012-1315",
+    "src/decision/cache_configuration.py:331-375,1395-1475",
+    "src/decision/slot_environment.py:192-575,784-870",
+    "src/decision/task_allocation.py:544-650,1556-1605,1672-1788",
+    "src/common/system_model.py:32-169,224-405",
+    "src/ppo_simple/rollout.py:194-617,892-921"
+  ]
+}
