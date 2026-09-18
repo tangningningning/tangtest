@@ -826,6 +826,7 @@ def validate_config(
         "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
         "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
         "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
     }:
         raise ValueError(
@@ -845,6 +846,7 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl/"
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1/"
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2/"
             "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf."
         )
     if (
@@ -872,6 +874,7 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
             "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
             "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
         }
     ):
@@ -883,6 +886,7 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder/"
             "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl/"
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1/"
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2/"
             "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf."
         )
     kl_gate_mode = str(
@@ -898,6 +902,7 @@ def validate_config(
         not in {
             "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
             "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
         }
     ):
@@ -909,6 +914,7 @@ def validate_config(
         in {
             "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
             "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
         }
         and kl_gate_mode != "branch_specific"

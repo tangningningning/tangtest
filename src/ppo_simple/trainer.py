@@ -2399,6 +2399,9 @@ class PPOV2Trainer:
     def _uses_v11a_cache_node_cf(self) -> bool:
         return self.policy.architecture_id in JOINT_V11A_CACHE_NODE_CF_POLICY_SCHEMAS
 
+    def _uses_r2_operation_credit(self) -> bool:
+        return self.policy.architecture_id in JOINT_RECOVERY_R2_POLICY_SCHEMAS
+
     def _uses_popart_critic(self) -> bool:
         return self.policy.architecture_id in POPART_POLICY_SCHEMAS
 
@@ -3148,6 +3151,372 @@ class PPOV2Trainer:
             raise FloatingPointError("Cache full-rollout KL estimator is non-finite")
         return value
 
+    def _compute_r2_operation_credit(self, rollout: SimpleRollout) -> dict[str, Any]:
+        """Compute detached per-UAV counterfactual one-step TD credit.
+
+        This is intentionally a trainer-side replay of the already collected
+        primitive transition.  Cache actions and every non-target UAV action
+        are copied from production; only the target operation is replaced.
+        Each branch goes through the real ``execute_slot`` path with a direct
+        primitive configuration override, so Matching/KKT and all frozen
+        reward/cost semantics remain authoritative.
+        """
+
+        if not self._uses_r2_operation_credit():
+            return {}
+        transitions = tuple(rollout.transitions)
+        if not transitions:
+            raise ValueError("R2 operation credit requires a non-empty rollout")
+        uav_ids = tuple(str(value) for value in self.context.action_spec.uav_ids)
+        head_count = len(uav_ids)
+        sample_count = len(transitions)
+        for transition in transitions:
+            if (
+                transition.previous_cache_state is None
+                or transition.previous_uav_positions is None
+                or transition.uav_operation_actions is None
+                or transition.uav_operation_masks is None
+                or transition.uav_operation_probabilities is None
+                or transition.uav_contexts is None
+                or transition.uav_candidate_features is None
+            ):
+                raise ValueError("R2 rollout is missing operation counterfactual tensors")
+
+        include_bootstrap_step = not bool(transitions[-1].done)
+        aligned_steps = aligned_train_steps(
+            self.context,
+            origin_start=int(transitions[0].origin_index),
+            max_steps=sample_count + int(include_bootstrap_step),
+            include_bootstrap_step=include_bootstrap_step,
+        )
+        if len(aligned_steps) < sample_count + int(include_bootstrap_step):
+            raise RuntimeError("R2 counterfactual replay is missing aligned next steps")
+        for transition, step in zip(transitions, aligned_steps[:sample_count]):
+            if int(transition.origin_index) != int(step.origin_index):
+                raise RuntimeError("R2 counterfactual replay origin alignment failed")
+
+        q_stay = np.zeros((sample_count, head_count), dtype=np.float64)
+        q_move = np.zeros((sample_count, head_count), dtype=np.float64)
+        baseline = np.zeros((sample_count, head_count), dtype=np.float64)
+        move_candidate_counts = np.zeros((sample_count, head_count), dtype=np.int64)
+        counterfactual_environment_executions = 0
+        started_at = time.perf_counter()
+
+        def _position_dict(source: dict[str, Any]) -> dict[str, np.ndarray]:
+            return {
+                uav_id: np.asarray(source[uav_id], dtype=np.float64).copy()
+                for uav_id in uav_ids
+            }
+
+        def _primitive_action(
+            uav_id: str,
+            head_index: int,
+            candidate_count: int,
+            operation: str,
+            before: np.ndarray,
+            after: np.ndarray,
+            selected_index: int | None,
+        ) -> dict[str, Any]:
+            return {
+                "head_type": "uav",
+                "head_id": uav_id,
+                "head_index": int(head_index),
+                "candidate_count": int(candidate_count),
+                "selected_index": selected_index,
+                "operation_type": operation,
+                "before_position": [float(value) for value in before],
+                "after_position": [float(value) for value in after],
+                "actual_moved": bool(operation == "MOVE"),
+            }
+
+        for transition_index, (transition, step) in enumerate(
+            zip(transitions, aligned_steps[:sample_count])
+        ):
+            previous_cache = np.asarray(
+                transition.previous_cache_state, dtype=np.int8
+            ).copy()
+            previous_uav = _position_dict(transition.previous_uav_positions)
+            production_final_uav = _position_dict(transition.next_uav_positions)
+            production_cache_triggers, production_uav_triggers = (
+                self.context.action_spec.action_vector_to_triggers(transition.action)
+            )
+            production_cache_triggers = np.asarray(
+                production_cache_triggers, dtype=np.int8
+            )
+            production_uav_triggers = {
+                str(key): int(value)
+                for key, value in production_uav_triggers.items()
+            }
+            production_cache_actions = tuple(
+                dict(value) for value in transition.cache_conditional_actions
+            )
+            production_uav_actions = [
+                dict(value) for value in transition.uav_conditional_actions
+            ]
+            if len(production_uav_actions) != head_count:
+                raise RuntimeError("R2 production UAV action count mismatch")
+
+            for head_index, uav_id in enumerate(uav_ids):
+                # Reconstruct exactly the sequential conditional state used
+                # by the production sampler for this head.
+                current_uav = _position_dict(transition.previous_uav_positions)
+                enumeration_triggers = {candidate_id: 0 for candidate_id in uav_ids}
+                for prior_index, prior_id in enumerate(uav_ids[:head_index]):
+                    prior_action = production_uav_actions[prior_index]
+                    if str(prior_action.get("operation_type")) == "MOVE":
+                        current_uav[prior_id] = np.asarray(
+                            prior_action["after_position"], dtype=np.float64
+                        )
+                        enumeration_triggers[prior_id] = 1
+                enumeration_triggers[uav_id] = 1
+                candidates = uav_configuration.enumerate_uav_primitive_actions(
+                    current_uav,
+                    previous_uav,
+                    uav_id,
+                    enumeration_triggers,
+                    self.context.cfg,
+                    self.context.flight_boundary,
+                )
+                move_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if str(candidate.operation_type) == "MOVE"
+                ]
+                move_count = len(move_candidates)
+                move_candidate_counts[transition_index, head_index] = move_count
+                if move_count > int(transition.uav_candidate_features.shape[1]):
+                    raise RuntimeError("R2 legal UAV candidates exceed rollout capacity")
+
+                raw_probabilities = np.asarray(
+                    transition.uav_operation_probabilities[head_index],
+                    dtype=np.float64,
+                ).reshape(-1)
+                operation_mask = np.asarray(
+                    transition.uav_operation_masks[head_index], dtype=bool
+                ).reshape(-1)
+                if raw_probabilities.shape != (2,) or operation_mask.shape != (2,):
+                    raise RuntimeError("R2 UAV operation probability/mask shape mismatch")
+                if move_count > 0 and bool(operation_mask[1]):
+                    probability_sum = float(raw_probabilities.sum())
+                    if (
+                        not np.all(np.isfinite(raw_probabilities))
+                        or probability_sum <= 0.0
+                    ):
+                        raise FloatingPointError(
+                            "R2 UAV operation probabilities are non-finite"
+                        )
+                    p_stay, p_move = (
+                        raw_probabilities / probability_sum
+                    ).tolist()
+                else:
+                    # The masked production operation distribution has only
+                    # STAY when no legal MOVE exists.
+                    p_stay, p_move = 1.0, 0.0
+
+                if move_count:
+                    with torch.no_grad():
+                        candidate_sample = self.policy.sample_uav_candidate(
+                            transition.uav_contexts[head_index],
+                            np.asarray(
+                                transition.uav_candidate_features[
+                                    head_index, :move_count
+                                ],
+                                dtype=np.float32,
+                            ),
+                            deterministic=False,
+                        )
+                        candidate_probabilities = torch.softmax(
+                            candidate_sample.logits, dim=-1
+                        ).detach().cpu().numpy().astype(np.float64)
+                    if (
+                        candidate_probabilities.shape != (move_count,)
+                        or not np.all(np.isfinite(candidate_probabilities))
+                        or not np.isclose(
+                            float(candidate_probabilities.sum()), 1.0, atol=1.0e-5
+                        )
+                    ):
+                        raise FloatingPointError(
+                            "R2 candidate probabilities are non-finite or do not sum to one"
+                        )
+                else:
+                    candidate_probabilities = np.zeros(0, dtype=np.float64)
+
+                next_step = (
+                    None
+                    if bool(transition.done)
+                    else aligned_steps[transition_index + 1]
+                )
+
+                def _evaluate_branch(
+                    operation: str,
+                    selected_index: int | None,
+                    before: np.ndarray,
+                    after: np.ndarray,
+                ) -> float:
+                    nonlocal counterfactual_environment_executions
+                    branch_final_uav = {
+                        key: value.copy() for key, value in production_final_uav.items()
+                    }
+                    branch_final_uav[uav_id] = np.asarray(after, dtype=np.float64).copy()
+                    branch_uav_triggers = dict(production_uav_triggers)
+                    branch_uav_triggers[uav_id] = int(operation == "MOVE")
+                    branch_uav_actions = list(production_uav_actions)
+                    branch_uav_actions[head_index] = _primitive_action(
+                        uav_id,
+                        head_index,
+                        move_count,
+                        operation,
+                        np.asarray(before, dtype=np.float64),
+                        np.asarray(after, dtype=np.float64),
+                        selected_index,
+                    )
+                    configuration_override = (
+                        slot_environment.build_policy_primitive_configuration(
+                            previous_cache,
+                            previous_uav,
+                            transition.next_cache_state,
+                            branch_final_uav,
+                            production_cache_triggers,
+                            branch_uav_triggers,
+                            self.context.service_catalog,
+                            self.context.cfg,
+                            self.context.cache_nodes,
+                            self.context.cache_cfg,
+                            self.context.flight_boundary,
+                            cache_actions=production_cache_actions,
+                            uav_actions=tuple(branch_uav_actions),
+                        )
+                    )
+                    result = slot_environment.execute_slot(
+                        previous_cache,
+                        previous_uav,
+                        production_cache_triggers,
+                        branch_uav_triggers,
+                        step.scenario_slice,
+                        step.actual_tasks,
+                        step.actual_vehicle_positions,
+                        self.context.local_cache,
+                        self.context.service_catalog,
+                        self.context.cfg,
+                        self.context.cache_nodes,
+                        self.context.cache_cfg,
+                        self.context.flight_boundary,
+                        slot_id=step.slot,
+                        time_s=step.time_s,
+                        performance_profile=None,
+                        configuration_profile=cache_configuration.ConfigurationEvaluationProfile(),
+                        configuration_override=configuration_override,
+                    )
+                    counterfactual_environment_executions += 1
+                    if not result.step_feasible:
+                        raise RuntimeError(
+                            "R2 counterfactual transition is infeasible: "
+                            f"origin={step.origin_index}, UAV={uav_id}, operation={operation}"
+                        )
+                    _check_request_contract(
+                        previous_cache,
+                        previous_uav,
+                        result,
+                        self.context.action_spec,
+                    )
+                    reward = _check_reward(result)
+                    if next_step is None:
+                        next_value = 0.0
+                    else:
+                        next_observation = _intermediate_observation(
+                            np.asarray(result.next_cache_state, dtype=np.int8),
+                            result.next_uav_positions,
+                            next_step,
+                            self.context,
+                        )
+                        with torch.no_grad():
+                            _, value_tensor = self.policy(next_observation)
+                        next_value = float(value_tensor.detach().cpu().reshape(-1)[0])
+                    q_value = reward + float(self.hyperparameters.gamma) * next_value
+                    if not math.isfinite(q_value):
+                        raise FloatingPointError("R2 counterfactual Q is non-finite")
+                    return float(q_value)
+
+                target_before = current_uav[uav_id].copy()
+                stay_q = _evaluate_branch(
+                    "STAY",
+                    None,
+                    target_before,
+                    target_before,
+                )
+                q_stay[transition_index, head_index] = stay_q
+                if move_count:
+                    move_values = np.asarray(
+                        [
+                            _evaluate_branch(
+                                "MOVE",
+                                candidate_index,
+                                np.asarray(candidate.before_position, dtype=np.float64),
+                                np.asarray(candidate.after_position, dtype=np.float64),
+                            )
+                            for candidate_index, candidate in enumerate(move_candidates)
+                        ],
+                        dtype=np.float64,
+                    )
+                    q_move[transition_index, head_index] = float(
+                        np.dot(candidate_probabilities, move_values)
+                    )
+                else:
+                    # No MOVE branch exists, so its counterfactual value is
+                    # made equal to STAY and the masked MOVE probability is 0.
+                    q_move[transition_index, head_index] = stay_q
+                baseline[transition_index, head_index] = (
+                    float(p_stay) * q_stay[transition_index, head_index]
+                    + float(p_move) * q_move[transition_index, head_index]
+                )
+
+        sampled_operations = np.asarray(
+            [
+                np.asarray(transition.uav_operation_actions, dtype=np.int64)
+                for transition in transitions
+            ],
+            dtype=np.int64,
+        )
+        raw_advantages = np.where(
+            sampled_operations == 0,
+            q_stay - baseline,
+            q_move - baseline,
+        )
+        if not np.all(np.isfinite(raw_advantages)):
+            raise FloatingPointError("R2 operation advantages are non-finite")
+        population_std = float(np.std(raw_advantages, ddof=0))
+        if not math.isfinite(population_std):
+            raise FloatingPointError("R2 operation advantage std is non-finite")
+        scaled_advantages = raw_advantages / (population_std + 1.0e-8)
+        nonzero = raw_advantages != 0.0
+        sign_flip_count = int(
+            np.count_nonzero(
+                nonzero
+                & (np.signbit(raw_advantages) != np.signbit(scaled_advantages))
+            )
+        )
+        if sign_flip_count != 0:
+            raise FloatingPointError("R2 std-only operation scaling flipped a sign")
+        if not np.all(np.isfinite(scaled_advantages)):
+            raise FloatingPointError("R2 scaled operation advantages are non-finite")
+        return {
+            "raw_advantages": raw_advantages.astype(np.float32),
+            "scaled_advantages": scaled_advantages.astype(np.float32),
+            "q_stay": q_stay.astype(np.float32),
+            "q_move": q_move.astype(np.float32),
+            "baseline": baseline.astype(np.float32),
+            "counterfactual_environment_executions": int(
+                counterfactual_environment_executions
+            ),
+            "mean_move_candidate_count": float(np.mean(move_candidate_counts)),
+            "move_candidate_counts": move_candidate_counts,
+            "credit_runtime_seconds": float(time.perf_counter() - started_at),
+            "advantage_normalization": "STD_ONLY",
+            "advantage_centering": False,
+            "advantage_sign_flip_count": sign_flip_count,
+            "ratio_granularity": "OPERATION_ONLY",
+        }
+
     def update(self, rollout: SimpleRollout) -> UpdateResult:
         hyper = self.hyperparameters
         bootstrap_value = 0.0
@@ -3310,6 +3679,7 @@ class PPOV2Trainer:
             rollout.uav_selected_indices, dtype=torch.long, device=self.device
         )
         old_log_probs = torch.as_tensor(rollout.old_log_probs, dtype=torch.float32, device=self.device)
+        r2_enabled = self._uses_r2_operation_credit()
         branch_diagnostics_enabled = (
             self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS
         )
@@ -3375,6 +3745,11 @@ class PPOV2Trainer:
                 raise ValueError(
                     "Joint UAV candidate old log-probabilities shape mismatch"
                 )
+        r2_operation_credit: dict[str, Any] = {}
+        if r2_enabled:
+            if not branch_diagnostics_enabled:
+                raise RuntimeError("R2 operation credit requires joint branch diagnostics")
+            r2_operation_credit = self._compute_r2_operation_credit(rollout)
         cache_kl_control_previous: float | None = None
         if cache_minibatch_kl_control_enabled:
             if (
@@ -3399,6 +3774,17 @@ class PPOV2Trainer:
             )
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+        r2_operation_advantages_scaled_t = None
+        if r2_enabled:
+            r2_operation_advantages_scaled_t = torch.as_tensor(
+                r2_operation_credit["scaled_advantages"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if tuple(r2_operation_advantages_scaled_t.shape) != tuple(
+                uav_operation_actions.shape
+            ):
+                raise RuntimeError("R2 operation advantage shape mismatch")
         critic_targets_t = (
             (returns_t - critic_target_mean) / critic_return_scale
             if popart_critic
@@ -3658,6 +4044,13 @@ class PPOV2Trainer:
                         or v7_operation_old_log_probs is None
                         or uav_operation_old_log_probs is None
                         or (v11a_enabled and evaluation.cache_node_log_probs is None)
+                        or (
+                            r2_enabled
+                            and (
+                                evaluation.uav_operation_log_probs is None
+                                or evaluation.uav_candidate_log_probs is None
+                            )
+                        )
                     ):
                         raise RuntimeError(
                             "Joint Cache/UAV evaluation did not expose branch diagnostics"
@@ -3691,12 +4084,22 @@ class PPOV2Trainer:
                             raise FloatingPointError(
                                 "V11-A old Cache node log-probabilities are non-finite"
                             )
-                    uav_old_log_prob = (
-                        uav_operation_old_log_probs[indices].sum(dim=-1)
-                        + uav_candidate_old_log_probs[indices].sum(dim=-1)
-                    )
+                    if r2_enabled:
+                        assert evaluation.uav_operation_log_probs is not None
+                        uav_old_log_prob = uav_operation_old_log_probs[indices].sum(
+                            dim=-1
+                        )
+                        uav_new_log_prob = evaluation.uav_operation_log_probs.sum(
+                            dim=-1
+                        )
+                    else:
+                        uav_old_log_prob = (
+                            uav_operation_old_log_probs[indices].sum(dim=-1)
+                            + uav_candidate_old_log_probs[indices].sum(dim=-1)
+                        )
+                        uav_new_log_prob = evaluation.uav_log_prob
                     cache_branch_delta = evaluation.cache_log_prob - cache_old_log_prob
-                    uav_branch_delta = evaluation.uav_log_prob - uav_old_log_prob
+                    uav_branch_delta = uav_new_log_prob - uav_old_log_prob
                     cache_branch_ratio = torch.exp(cache_branch_delta)
                     uav_branch_ratio = torch.exp(uav_branch_delta)
                     if (
@@ -3713,7 +4116,7 @@ class PPOV2Trainer:
                         uav_old_log_prob.detach().cpu().numpy()
                     )
                     uav_branch_new_log_probs_values[sample_indices] = (
-                        evaluation.uav_log_prob.detach().cpu().numpy()
+                        uav_new_log_prob.detach().cpu().numpy()
                     )
                     uav_branch_ratios_values[sample_indices] = (
                         uav_branch_ratio.detach().cpu().numpy()
@@ -3780,29 +4183,110 @@ class PPOV2Trainer:
                                 cache_branch_unclipped,
                                 cache_branch_clipped,
                             ).mean()
-                        uav_branch_unclipped = (
-                            uav_branch_ratio * advantages_t[indices]
-                        )
-                        uav_branch_clipped = torch.clamp(
-                            uav_branch_ratio,
-                            1.0 - hyper.clip_epsilon,
-                            1.0 + hyper.clip_epsilon,
-                        ) * advantages_t[indices]
-                        uav_branch_policy_loss = -torch.minimum(
-                            uav_branch_unclipped,
-                            uav_branch_clipped,
-                        ).mean()
-                        if branch_specific_kl_gate_enabled:
-                            branch_policy_loss = _branch_actor_policy_loss(
-                                cache_branch_policy_loss,
-                                uav_branch_policy_loss,
-                                cache_active=cache_active_this_minibatch,
-                                uav_active=uav_active_this_epoch,
+                        if r2_enabled:
+                            assert (
+                                r2_operation_advantages_scaled_t is not None
+                                and evaluation.uav_operation_log_probs is not None
+                                and evaluation.uav_candidate_log_probs is not None
+                                and uav_operation_actions is not None
+                                and uav_operation_old_log_probs is not None
+                                and uav_candidate_old_log_probs is not None
                             )
+                            operation_ratio = torch.exp(
+                                evaluation.uav_operation_log_probs
+                                - uav_operation_old_log_probs[indices]
+                            )
+                            operation_advantage = (
+                                r2_operation_advantages_scaled_t[indices]
+                            )
+                            operation_unclipped = operation_ratio * operation_advantage
+                            operation_clipped = torch.clamp(
+                                operation_ratio,
+                                1.0 - hyper.clip_epsilon,
+                                1.0 + hyper.clip_epsilon,
+                            ) * operation_advantage
+                            operation_policy_loss = -torch.minimum(
+                                operation_unclipped,
+                                operation_clipped,
+                            ).mean()
+                            candidate_ratio = torch.exp(
+                                evaluation.uav_candidate_log_probs
+                                - uav_candidate_old_log_probs[indices]
+                            )
+                            candidate_advantage = advantages_t[indices].unsqueeze(-1)
+                            candidate_unclipped = candidate_ratio * candidate_advantage
+                            candidate_clipped = torch.clamp(
+                                candidate_ratio,
+                                1.0 - hyper.clip_epsilon,
+                                1.0 + hyper.clip_epsilon,
+                            ) * candidate_advantage
+                            candidate_surrogate = torch.minimum(
+                                candidate_unclipped,
+                                candidate_clipped,
+                            )
+                            candidate_active = (
+                                uav_operation_actions[indices] == 1
+                            )
+                            if bool(torch.any(candidate_active).item()):
+                                candidate_policy_loss = -candidate_surrogate[
+                                    candidate_active
+                                ].mean()
+                            else:
+                                candidate_policy_loss = candidate_ratio.sum() * 0.0
+                            # R2's UAV branch is explicitly the mean of the
+                            # operation and candidate PPO losses.  It is kept
+                            # outside _branch_actor_policy_loss so the latter's
+                            # legacy 0.5 branch weight cannot halve R2 twice.
+                            uav_branch_policy_loss = 0.5 * (
+                                operation_policy_loss + candidate_policy_loss
+                            )
+                            branch_metric_tensors += (
+                                operation_ratio.detach(),
+                                candidate_ratio.detach(),
+                                operation_advantage.detach(),
+                                candidate_policy_loss.detach(),
+                            )
+                            if branch_specific_kl_gate_enabled:
+                                branch_policy_loss = 0.0 * (
+                                    cache_branch_policy_loss + uav_branch_policy_loss
+                                )
+                                if cache_active_this_minibatch:
+                                    branch_policy_loss = (
+                                        branch_policy_loss
+                                        + 0.5 * cache_branch_policy_loss
+                                    )
+                                if uav_active_this_epoch:
+                                    branch_policy_loss = (
+                                        branch_policy_loss + uav_branch_policy_loss
+                                    )
+                            else:
+                                branch_policy_loss = 0.5 * (
+                                    cache_branch_policy_loss + uav_branch_policy_loss
+                                )
                         else:
-                            branch_policy_loss = 0.5 * (
-                                cache_branch_policy_loss + uav_branch_policy_loss
+                            uav_branch_unclipped = (
+                                uav_branch_ratio * advantages_t[indices]
                             )
+                            uav_branch_clipped = torch.clamp(
+                                uav_branch_ratio,
+                                1.0 - hyper.clip_epsilon,
+                                1.0 + hyper.clip_epsilon,
+                            ) * advantages_t[indices]
+                            uav_branch_policy_loss = -torch.minimum(
+                                uav_branch_unclipped,
+                                uav_branch_clipped,
+                            ).mean()
+                            if branch_specific_kl_gate_enabled:
+                                branch_policy_loss = _branch_actor_policy_loss(
+                                    cache_branch_policy_loss,
+                                    uav_branch_policy_loss,
+                                    cache_active=cache_active_this_minibatch,
+                                    uav_active=uav_active_this_epoch,
+                                )
+                            else:
+                                branch_policy_loss = 0.5 * (
+                                    cache_branch_policy_loss + uav_branch_policy_loss
+                                )
                         branch_metric_tensors += (
                             cache_branch_policy_loss,
                             uav_branch_policy_loss,
@@ -4726,6 +5210,58 @@ class PPOV2Trainer:
             ),
             uav_minibatches_executed=int(uav_minibatches_executed),
             global_critic_steps=int(global_critic_steps),
+            uav_operation_advantages_raw=(
+                None
+                if not r2_enabled
+                else np.asarray(
+                    r2_operation_credit["raw_advantages"], dtype=np.float32
+                ).copy()
+            ),
+            uav_operation_advantages_scaled=(
+                None
+                if not r2_enabled
+                else np.asarray(
+                    r2_operation_credit["scaled_advantages"], dtype=np.float32
+                ).copy()
+            ),
+            uav_operation_q_stay=(
+                None
+                if not r2_enabled
+                else np.asarray(r2_operation_credit["q_stay"], dtype=np.float32).copy()
+            ),
+            uav_operation_q_move=(
+                None
+                if not r2_enabled
+                else np.asarray(r2_operation_credit["q_move"], dtype=np.float32).copy()
+            ),
+            uav_operation_baseline=(
+                None
+                if not r2_enabled
+                else np.asarray(r2_operation_credit["baseline"], dtype=np.float32).copy()
+            ),
+            uav_operation_counterfactual_env_executions=int(
+                r2_operation_credit.get("counterfactual_environment_executions", 0)
+            ),
+            uav_operation_mean_move_candidate_count=float(
+                r2_operation_credit.get("mean_move_candidate_count", math.nan)
+            ),
+            uav_operation_credit_runtime_seconds=float(
+                r2_operation_credit.get("credit_runtime_seconds", math.nan)
+            ),
+            uav_operation_advantage_normalization=str(
+                r2_operation_credit.get("advantage_normalization", "")
+            ),
+            uav_operation_advantage_centering=(
+                None
+                if not r2_enabled
+                else bool(r2_operation_credit.get("advantage_centering", False))
+            ),
+            uav_operation_advantage_sign_flip_count=int(
+                r2_operation_credit.get("advantage_sign_flip_count", 0)
+            ),
+            uav_operation_ratio_granularity=str(
+                r2_operation_credit.get("ratio_granularity", "")
+            ),
         )
 
     def checkpoint_payload(
