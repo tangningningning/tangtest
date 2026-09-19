@@ -1769,6 +1769,352 @@ class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic(
     architecture_version = 1
 
 
+class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR5ActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic
+):
+    """Recovery R5 policy with exact node-specific Cache credit.
+
+    R5 keeps the R4 network/checkpoint layout and changes only trainer-side
+    Cache credit: the production four-way per-node operation head is grouped
+    into KEEP (NO_CHANGE) and UPDATE (ADD/DELETE/SWAP), with exact
+    node-conditional candidate expectations.
+    """
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5"
+    )
+    architecture_version = 1
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR5ActorCritic
+):
+    """Recovery R6 policy with a true binary Cache trigger.
+
+    R6 deliberately does not inherit the R5 constructor.  The historical
+    constructor creates a four-way ``NO_CHANGE/ADD/DELETE/SWAP`` head; R6
+    replaces that module with a real two-logit ``KEEP/UPDATE`` head while
+    retaining the same decoupled Cache/UAV encoders, critic, candidate
+    scorer, and UAV operation path.  Operation type remains metadata in the
+    unified UPDATE candidate feature, never a second high-level probability.
+    """
+
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6"
+    )
+    architecture_version = 1
+    trigger_order = ("KEEP", "UPDATE")
+    true_binary_trigger = True
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        cache_feature_dim: int,
+        uav_feature_dim: int,
+        num_cache_heads: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        # Bypass the R5/V7 constructor so the production R6 state_dict has no
+        # four-way Cache operation head at all.  This preserves the R5/R4
+        # physical system and UAV modules while changing only Cache policy
+        # factorization.
+        AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic.__init__(
+            self,
+            observation_dim,
+            action_dim,
+            cache_feature_dim,
+            uav_feature_dim,
+            num_cache_heads,
+            hidden_sizes,
+        )
+        del self.cache_operation_head
+        self.cache_trigger_head = nn.Linear(
+            self.hidden_dim,
+            self.num_cache_heads * len(self.trigger_order),
+        )
+
+    def _trigger_logits(self, observations: Any) -> tuple[Any, bool]:
+        obs, single = self._observations(observations)
+        hidden = self.cache_encoder(obs)
+        logits = self.cache_trigger_head(hidden).reshape(
+            int(obs.shape[0]),
+            self.num_cache_heads,
+            len(self.trigger_order),
+        )
+        return (logits.squeeze(0) if single else logits), single
+
+    def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
+        """Compatibility alias exposing the binary trigger logits only."""
+
+        return self._trigger_logits(observations)
+
+    def actor_parameters(self) -> tuple[Any, ...]:
+        modules = (
+            self.cache_encoder,
+            self.uav_encoder,
+            self.cache_trigger_head,
+            self.cache_candidate_scorer,
+            self.uav_operation_head,
+            self.uav_candidate_scorer,
+        )
+        parameters = tuple(
+            parameter
+            for module in modules
+            for parameter in module.parameters()
+        )
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise RuntimeError("R6 actor parameter group contains duplicates.")
+        return parameters
+
+    def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
+        groups = {
+            "cache": tuple(
+                parameter
+                for module in (
+                    self.cache_trigger_head,
+                    self.cache_candidate_scorer,
+                )
+                for parameter in module.parameters()
+            ),
+            "uav": tuple(
+                parameter
+                for module in (
+                    self.uav_operation_head,
+                    self.uav_candidate_scorer,
+                )
+                for parameter in module.parameters()
+            ),
+            "cache_encoder": tuple(self.cache_encoder.parameters()),
+            "uav_encoder": tuple(self.uav_encoder.parameters()),
+            "shared": (),
+        }
+        group_ids = [
+            id(parameter)
+            for parameters in groups.values()
+            for parameter in parameters
+        ]
+        if len(set(group_ids)) != len(group_ids):
+            raise RuntimeError("R6 actor gradient groups overlap.")
+        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
+        if set(group_ids) != actor_ids:
+            raise RuntimeError("R6 actor gradient groups do not cover the actor.")
+        return groups
+
+    def sample_cache_trigger(
+        self,
+        observation: Any,
+        head_index: int,
+        trigger_mask: Any,
+        deterministic: bool = False,
+    ) -> OperationPolicySample:
+        logits, single = self._trigger_logits(observation)
+        if not single or tuple(logits.shape) != (
+            self.num_cache_heads,
+            len(self.trigger_order),
+        ):
+            raise ValueError("R6 Cache trigger sampling requires one observation")
+        index = int(head_index)
+        if index < 0 or index >= self.num_cache_heads:
+            raise IndexError("R6 Cache trigger head index out of range")
+        raw_logits = logits[index]
+        raw_probabilities = torch.softmax(raw_logits, dim=-1)
+        mask = torch.as_tensor(
+            np.asarray(trigger_mask, dtype=bool).reshape(-1),
+            dtype=torch.bool,
+            device=raw_logits.device,
+        )
+        if tuple(mask.shape) != (len(self.trigger_order),) or not bool(
+            torch.any(mask).item()
+        ):
+            raise ValueError("R6 Cache trigger mask must allow at least one value")
+        distribution = torch.distributions.Categorical(
+            logits=raw_logits.masked_fill(~mask, -float("inf"))
+        )
+        selected = (
+            int(torch.argmax(distribution.logits).item())
+            if deterministic
+            else int(distribution.sample().item())
+        )
+        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=raw_logits.device)
+        return OperationPolicySample(
+            selected_index=selected,
+            log_prob=distribution.log_prob(selected_tensor),
+            entropy=distribution.entropy(),
+            logits=distribution.logits,
+            raw_logits=raw_logits.detach(),
+            probabilities=raw_probabilities.detach(),
+        )
+
+    def sample_cache_update_candidate(
+        self,
+        observation: Any,
+        candidate_features: Any,
+        deterministic: bool = False,
+    ) -> CandidatePolicySample:
+        """Sample from the one unified legal ADD/DELETE/SWAP set."""
+
+        scores, single = self._candidate_scores(
+            observation,
+            candidate_features,
+            self.cache_feature_dim,
+            self.cache_candidate_scorer,
+        )
+        if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
+            raise ValueError("R6 candidate sampling requires one context")
+        distribution = torch.distributions.Categorical(logits=scores.squeeze(0))
+        selected = (
+            int(torch.argmax(distribution.logits).item())
+            if deterministic
+            else int(distribution.sample().item())
+        )
+        selected_tensor = torch.as_tensor(
+            selected,
+            dtype=torch.long,
+            device=scores.device,
+        )
+        return CandidatePolicySample(
+            selected_index=selected,
+            log_prob=distribution.log_prob(selected_tensor),
+            entropy=distribution.entropy(),
+            logits=distribution.logits,
+        )
+
+    def evaluate_cache_operation_primitive(
+        self,
+        observations: Any,
+        operation_contexts: Any,
+        operation_masks: Any,
+        operation_actions: Any,
+        candidate_features: Any,
+        candidate_masks: Any,
+        candidate_selected_indices: Any,
+    ) -> PolicyEvaluation:
+        """Evaluate binary triggers plus unified conditional candidates."""
+
+        observations_t, _ = self._observations(observations)
+        contexts_t = torch.as_tensor(
+            operation_contexts,
+            dtype=torch.float32,
+            device=observations_t.device,
+        )
+        masks_t = torch.as_tensor(
+            operation_masks,
+            dtype=torch.bool,
+            device=observations_t.device,
+        )
+        actions_t = torch.as_tensor(
+            operation_actions,
+            dtype=torch.long,
+            device=observations_t.device,
+        )
+        features_t = torch.as_tensor(
+            candidate_features,
+            dtype=torch.float32,
+            device=observations_t.device,
+        )
+        candidate_masks_t = torch.as_tensor(
+            candidate_masks,
+            dtype=torch.bool,
+            device=observations_t.device,
+        )
+        selected_t = torch.as_tensor(
+            candidate_selected_indices,
+            dtype=torch.long,
+            device=observations_t.device,
+        )
+        if contexts_t.ndim != 3:
+            raise ValueError("R6 operation_contexts must be [B,H,observation_dim]")
+        batch_size, head_count, observation_dim = [int(value) for value in contexts_t.shape]
+        if batch_size != int(observations_t.shape[0]) or head_count != self.num_cache_heads:
+            raise ValueError("R6 operation_contexts shape mismatch")
+        if observation_dim != self.observation_dim:
+            raise ValueError("R6 operation_contexts observation dimension mismatch")
+        expected_operation_shape = (batch_size, head_count, 2)
+        if tuple(masks_t.shape) != expected_operation_shape or tuple(actions_t.shape) != (
+            batch_size,
+            head_count,
+        ):
+            raise ValueError("R6 trigger tensor shape mismatch")
+        if bool(torch.any(actions_t < 0).item()) or bool(torch.any(actions_t >= 2).item()):
+            raise ValueError("R6 trigger action index out of range")
+        if not bool(torch.all(torch.any(masks_t, dim=-1)).item()):
+            raise ValueError("R6 trigger mask cannot block every trigger")
+        flat_contexts = contexts_t.reshape(batch_size * head_count, observation_dim)
+        all_logits, _ = self._trigger_logits(flat_contexts)
+        trigger_logits = all_logits.reshape(
+            batch_size,
+            head_count,
+            self.num_cache_heads,
+            2,
+        )
+        head_indices = torch.arange(head_count, dtype=torch.long, device=all_logits.device)
+        trigger_logits = trigger_logits[:, head_indices, head_indices, :]
+        trigger_logits = trigger_logits.masked_fill(~masks_t, -float("inf"))
+        trigger_distribution = torch.distributions.Categorical(logits=trigger_logits)
+        selected_valid = masks_t.gather(-1, actions_t.unsqueeze(-1)).squeeze(-1)
+        if not bool(torch.all(selected_valid).item()):
+            raise ValueError("R6 trigger action is blocked by its mask")
+        trigger_node_log_probs = trigger_distribution.log_prob(actions_t)
+        trigger_log_prob = trigger_node_log_probs.sum(dim=-1)
+        trigger_entropy = torch.where(
+            masks_t.sum(dim=-1) == 1,
+            torch.zeros_like(trigger_distribution.entropy()),
+            trigger_distribution.entropy(),
+        ).sum(dim=-1)
+
+        if features_t.ndim != 4 or tuple(features_t.shape[:2]) != (batch_size, head_count):
+            raise ValueError("R6 candidate feature shape mismatch")
+        candidate_count = int(features_t.shape[2])
+        if candidate_count <= 0 or int(features_t.shape[3]) != self.cache_feature_dim:
+            raise ValueError("R6 candidate feature width mismatch")
+        expected_candidate_shape = (batch_size, head_count, candidate_count)
+        if tuple(candidate_masks_t.shape) != expected_candidate_shape or tuple(selected_t.shape) != (
+            batch_size,
+            head_count,
+        ):
+            raise ValueError("R6 candidate tensor shape mismatch")
+        if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
+            raise ValueError("R6 candidate mask must allow a padded candidate")
+        if bool(torch.any(selected_t < 0).item()) or bool(torch.any(selected_t >= candidate_count).item()):
+            raise ValueError("R6 candidate selected index out of range")
+        candidate_valid = candidate_masks_t.gather(-1, selected_t.unsqueeze(-1)).squeeze(-1)
+        if not bool(torch.all(candidate_valid).item()):
+            raise ValueError("R6 candidate selected index is masked")
+        flat_features = features_t.reshape(
+            batch_size * head_count,
+            candidate_count,
+            self.cache_feature_dim,
+        )
+        raw_scores, _ = self._candidate_scores(
+            flat_contexts,
+            flat_features,
+            self.cache_feature_dim,
+            self.cache_candidate_scorer,
+        )
+        candidate_logits = raw_scores.reshape(
+            batch_size,
+            head_count,
+            candidate_count,
+        ).masked_fill(~candidate_masks_t, -float("inf"))
+        candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
+        candidate_active = actions_t == 1
+        candidate_node_log_probs = candidate_distribution.log_prob(selected_t) * candidate_active.to(torch.float32)
+        candidate_log_prob = candidate_node_log_probs.sum(dim=-1)
+        candidate_entropy = (
+            candidate_distribution.entropy() * candidate_active.to(torch.float32)
+        ).sum(dim=-1)
+        return PolicyEvaluation(
+            log_prob=trigger_log_prob + candidate_log_prob,
+            entropy=trigger_entropy + candidate_entropy,
+            value=self.critic_value(observations_t),
+            logits=trigger_logits,
+            cache_log_prob=trigger_log_prob + candidate_log_prob,
+            cache_entropy=trigger_entropy + candidate_entropy,
+            cache_node_log_probs=trigger_node_log_probs + candidate_node_log_probs,
+        )
+
+
 class AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic(
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
 ):

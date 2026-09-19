@@ -23,6 +23,7 @@ from .policy import (
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic,
     AdaptivePrimitiveActorCritic,
     BernoulliActorCritic,
     PolicySample,
@@ -274,6 +275,10 @@ def collect_rollout(
                 context,
                 tensor_spec,
                 deterministic=bool(deterministic),
+                binary_cache_trigger=isinstance(
+                    policy,
+                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic,
+                ),
             )
             sample = PolicySample(
                 action=np.asarray(r2_primitive.derived_action, dtype=np.int8),

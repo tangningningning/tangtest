@@ -214,10 +214,19 @@ def build_run_manifest(
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
     }
     is_r4 = policy_schema == (
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4"
     )
+    is_r5 = policy_schema == (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5"
+    )
+    is_r6 = policy_schema == (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6"
+    )
+    is_node_cache_credit = is_r5 or is_r6
     git_sha, git_dirty = _git_identity(Path(context.root))
     resolved_config_path = Path(
         context.cfg.get("_meta", {}).get("config_path", config_path)
@@ -264,9 +273,30 @@ def build_run_manifest(
             "COUNTERFACTUAL_ONE_STEP_TD" if is_recovery else "GLOBAL_GAE"
         ),
         "uav_candidate_advantage_source": (
-            "EXACT_CONDITIONAL_COUNTERFACTUAL_Q" if is_r4 else "GLOBAL_GAE"
+            "EXACT_CONDITIONAL_COUNTERFACTUAL_Q"
+            if (is_r4 or is_r5 or is_r6)
+            else "GLOBAL_GAE"
         ),
-        "candidate_advantage_normalization": "NONE" if is_r4 else "LEGACY_GLOBAL_GAE",
+        "candidate_advantage_normalization": (
+            "NONE" if (is_r4 or is_r5 or is_r6) else "LEGACY_GLOBAL_GAE"
+        ),
+        "cache_trigger_advantage_source": (
+            "EXACT_NODE_COUNTERFACTUAL_Q" if is_node_cache_credit else "GLOBAL_GAE"
+        ),
+        "cache_candidate_advantage_source": (
+            "EXACT_NODE_CONDITIONAL_COUNTERFACTUAL_Q"
+            if is_node_cache_credit
+            else "GLOBAL_GAE"
+        ),
+        "cache_trigger_ratio_granularity": (
+            "NODE_ONLY" if is_node_cache_credit else "WHOLE_CACHE_JOINT"
+        ),
+        "cache_candidate_ratio_granularity": (
+            "NODE_CONDITIONAL" if is_node_cache_credit else "WHOLE_CACHE_JOINT"
+        ),
+        "cache_surrogate_reduction": (
+            "MEAN_OVER_VALID_NODE_TIME" if is_node_cache_credit else "LEGACY_TRANSITION"
+        ),
         "critic_value_scale_mode": str(hyper.critic_value_scale_mode),
         "critic_value_scale_epsilon": float(hyper.critic_value_scale_epsilon),
         "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),

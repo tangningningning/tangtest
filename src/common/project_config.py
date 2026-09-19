@@ -819,7 +819,11 @@ def validate_config(
             "LEGACY_GLOBAL_GAE",
         )
     )
-    if policy_schema == "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4":
+    if policy_schema in {
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
+    }:
         if candidate_advantage_source != "EXACT_CONDITIONAL_COUNTERFACTUAL_Q":
             raise ValueError(
                 "Recovery R4 requires algorithm.ppo.uav_candidate_advantage_source="
@@ -827,8 +831,24 @@ def validate_config(
             )
         if candidate_advantage_normalization != "NONE":
             raise ValueError(
-                "Recovery R4 requires algorithm.ppo.candidate_advantage_normalization=NONE."
+                "Recovery R4/R5 requires algorithm.ppo.candidate_advantage_normalization=NONE."
             )
+    if policy_schema in {
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
+    }:
+        r5_cache_sources = {
+            "cache_trigger_advantage_source": "EXACT_NODE_COUNTERFACTUAL_Q",
+            "cache_candidate_advantage_source": "EXACT_NODE_CONDITIONAL_COUNTERFACTUAL_Q",
+            "cache_trigger_ratio_granularity": "NODE_ONLY",
+            "cache_candidate_ratio_granularity": "NODE_CONDITIONAL",
+        }
+        for field, expected in r5_cache_sources.items():
+            actual = str(get_config_value(config, f"algorithm.ppo.{field}", ""))
+            if actual != expected:
+                raise ValueError(
+                    f"Recovery R5 requires algorithm.ppo.{field}={expected}."
+                )
     if configuration_control_mode in {
         "policy_primitive",
         "policy_primitive_v7_cache_operation",
@@ -847,6 +867,8 @@ def validate_config(
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -862,6 +884,8 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2/"
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3/"
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4/"
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5/"
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6/"
             "."
         )
     if (
@@ -886,13 +910,17 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
         }
     ):
         raise ValueError(
             "policy_primitive_r2_joint_cache_uav_operation requires "
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2."
             " / adaptive_joint_cache_replica_aware_uav_operation_recovery_r3 / "
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4."
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4 / "
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5 / "
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6."
         )
     kl_gate_mode = str(
         get_config_value(config, "algorithm.ppo.kl_gate_mode", "joint")
@@ -908,6 +936,8 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
         }
     ):
         raise ValueError(
@@ -919,6 +949,8 @@ def validate_config(
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
         }
         and kl_gate_mode != "branch_specific"
     ):

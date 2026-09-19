@@ -48,11 +48,14 @@ from .policy import (
     AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR5ActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
     BernoulliActorCritic,
 )
+from .r5_cache_credit import compute_exact_node_specific_cache_credit
 from .primitive_control import PrimitiveTensorSpec, _intermediate_observation
 from .rollout import (
     SimpleRollout,
@@ -117,8 +120,21 @@ R3_POLICY_SCHEMAS = frozenset(
 R4_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic.architecture_id}
 )
-RECOVERY_POLICY_SCHEMAS = R2_POLICY_SCHEMAS | R3_POLICY_SCHEMAS | R4_POLICY_SCHEMAS
-CANDIDATE_CREDIT_POLICY_SCHEMAS = R4_POLICY_SCHEMAS
+R5_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR5ActorCritic.architecture_id}
+)
+R6_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic.architecture_id}
+)
+RECOVERY_POLICY_SCHEMAS = (
+    R2_POLICY_SCHEMAS
+    | R3_POLICY_SCHEMAS
+    | R4_POLICY_SCHEMAS
+    | R5_POLICY_SCHEMAS
+    | R6_POLICY_SCHEMAS
+)
+CANDIDATE_CREDIT_POLICY_SCHEMAS = R4_POLICY_SCHEMAS | R5_POLICY_SCHEMAS | R6_POLICY_SCHEMAS
+R5_CACHE_CREDIT_POLICY_SCHEMAS = R5_POLICY_SCHEMAS | R6_POLICY_SCHEMAS
 JOINT_CACHE_UAV_POLICY_SCHEMAS = RECOVERY_POLICY_SCHEMAS
 BRANCH_SPECIFIC_KL_POLICY_SCHEMAS = RECOVERY_POLICY_SCHEMAS
 CACHE_OPERATION_POLICY_SCHEMAS = (
@@ -501,6 +517,14 @@ class UpdateResult:
     uav_candidate_advantage_weighted_mean_residual: float = math.nan
     uav_candidate_advantage_normalization: str = ""
     uav_candidate_advantage_source: str = ""
+    # Recovery R5 exact node-specific Cache credit diagnostics.
+    cache_trigger_advantage_mean_abs: float = math.nan
+    cache_candidate_advantage_mean_abs: float = math.nan
+    cache_trigger_advantage_weighted_mean_residual: float = math.nan
+    cache_candidate_advantage_weighted_mean_residual: float = math.nan
+    cache_trigger_advantage_mean_abs_by_role: dict[str, float] | None = None
+    cache_credit_counterfactual_env_executions: int = 0
+    cache_credit_runtime_seconds: float = math.nan
     actor_policy_loss: float = math.nan
     uav_branch_old_log_probs: np.ndarray | None = None
     uav_branch_new_log_probs: np.ndarray | None = None
@@ -1028,6 +1052,32 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         fields["candidate_advantage_source"] = str(
             update.uav_candidate_advantage_source
         )
+    cache_credit_metrics = {
+        "cache_trigger_advantage_mean_abs": float(
+            update.cache_trigger_advantage_mean_abs
+        ),
+        "cache_candidate_advantage_mean_abs": float(
+            update.cache_candidate_advantage_mean_abs
+        ),
+        "cache_trigger_advantage_weighted_mean_residual": float(
+            update.cache_trigger_advantage_weighted_mean_residual
+        ),
+        "cache_candidate_advantage_weighted_mean_residual": float(
+            update.cache_candidate_advantage_weighted_mean_residual
+        ),
+        "cache_credit_runtime_seconds": float(update.cache_credit_runtime_seconds),
+    }
+    if all(math.isfinite(value) for value in cache_credit_metrics.values()):
+        fields.update(cache_credit_metrics)
+        fields["cache_credit_counterfactual_env_executions"] = int(
+            update.cache_credit_counterfactual_env_executions
+        )
+        if update.cache_trigger_advantage_mean_abs_by_role is not None:
+            fields["cache_trigger_advantage_mean_abs_by_role"] = {
+                str(role): float(value)
+                for role, value in update.cache_trigger_advantage_mean_abs_by_role.items()
+                if math.isfinite(float(value))
+            }
     encoder_gradient_norms = {
         "cache_encoder_gradient_norm": float(update.cache_encoder_gradient_norm),
         "uav_encoder_gradient_norm": float(update.uav_encoder_gradient_norm),
@@ -1986,17 +2036,28 @@ class PPOV2Trainer:
                     raise ValueError(
                         "policy_primitive_r2_joint_cache_uav_operation requires the Recovery R2 policy schema"
                     )
-                policy_class = (
-                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic
-                    if context.policy_schema
+                if (
+                    context.policy_schema
+                    == AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic.architecture_id
+                ):
+                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic
+                elif (
+                    context.policy_schema
+                    == AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR5ActorCritic.architecture_id
+                ):
+                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR5ActorCritic
+                elif (
+                    context.policy_schema
                     == AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic.architecture_id
-                    else (
-                        AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic
-                        if context.policy_schema
-                        == AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic.architecture_id
-                        else AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic
-                    )
-                )
+                ):
+                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic
+                elif (
+                    context.policy_schema
+                    == AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic.architecture_id
+                ):
+                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic
+                else:
+                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic
                 self.policy = policy_class(
                     int(context.observation_spec.observation_dim),
                     int(context.action_spec.action_dim),
@@ -2114,6 +2175,12 @@ class PPOV2Trainer:
 
     def _uses_r4_candidate_credit(self) -> bool:
         return self.policy.architecture_id in CANDIDATE_CREDIT_POLICY_SCHEMAS
+
+    def _uses_r5_cache_credit(self) -> bool:
+        return self.policy.architecture_id in R5_CACHE_CREDIT_POLICY_SCHEMAS
+
+    def _uses_r6_cache_trigger(self) -> bool:
+        return self.policy.architecture_id in R6_POLICY_SCHEMAS
 
     def _uses_popart_critic(self) -> bool:
         return self.policy.architecture_id in POPART_POLICY_SCHEMAS
@@ -2849,6 +2916,127 @@ class PPOV2Trainer:
             return candidate_log_probs.sum() * 0.0
         return -state_surrogate[active_heads].mean()
 
+    def _r5_cache_policy_terms(
+        self,
+        cache_contexts: Any,
+        operation_masks: Any,
+        operation_actions: Any,
+        candidate_features: Any,
+        candidate_operation_indices: Any,
+        candidate_valid_mask: Any,
+    ) -> tuple[Any, Any]:
+        """Return node-only trigger log-probs and node-conditional candidate probs.
+
+        The returned candidate probabilities are normalized over all legal
+        ``ADD/DELETE/SWAP`` candidates for each node after conditioning on the
+        aggregate UPDATE event.  No whole-Cache joint probability enters this
+        helper.
+        """
+
+        if not self._uses_r5_cache_credit():
+            raise RuntimeError("R5 cache policy terms requested for a non-R5 policy")
+        contexts = torch.as_tensor(
+            cache_contexts, dtype=torch.float32, device=self.device
+        )
+        masks = torch.as_tensor(
+            operation_masks, dtype=torch.bool, device=self.device
+        )
+        actions = torch.as_tensor(
+            operation_actions, dtype=torch.long, device=self.device
+        )
+        features = torch.as_tensor(
+            candidate_features, dtype=torch.float32, device=self.device
+        )
+        operation_indices = torch.as_tensor(
+            candidate_operation_indices, dtype=torch.long, device=self.device
+        )
+        valid = torch.as_tensor(
+            candidate_valid_mask, dtype=torch.bool, device=self.device
+        )
+        if contexts.ndim != 3 or masks.ndim != 3 or actions.ndim != 2:
+            raise ValueError("R5 Cache node policy tensor rank mismatch")
+        batch_size, node_count, observation_dim = [int(value) for value in contexts.shape]
+        trigger_width = (
+            2
+            if self._uses_r6_cache_trigger()
+            else len(AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR5ActorCritic.operation_order)
+        )
+        if tuple(masks.shape) != (batch_size, node_count, trigger_width):
+            raise ValueError("R5 Cache operation mask shape mismatch")
+        if tuple(actions.shape) != (batch_size, node_count):
+            raise ValueError("R5 Cache operation action shape mismatch")
+        if features.ndim != 4 or tuple(features.shape[:2]) != (batch_size, node_count):
+            raise ValueError("R5 Cache candidate feature shape mismatch")
+        if tuple(operation_indices.shape) != tuple(valid.shape) or tuple(valid.shape) != tuple(features.shape[:3]):
+            raise ValueError("R5 Cache candidate tensor shape mismatch")
+        flat_contexts = contexts.reshape(batch_size * node_count, observation_dim)
+        if self._uses_r6_cache_trigger():
+            all_logits, _ = self.policy._trigger_logits(flat_contexts)
+        else:
+            all_logits, _ = self.policy._operation_logits(flat_contexts)
+        all_logits = all_logits.reshape(
+            batch_size,
+            node_count,
+            self.policy.num_cache_heads,
+            trigger_width,
+        )
+        head_indices = torch.arange(node_count, dtype=torch.long, device=self.device)
+        logits = all_logits[:, head_indices, head_indices, :]
+        logits = logits.masked_fill(~masks, -float("inf"))
+        operation_probabilities = torch.softmax(logits, dim=-1)
+        p_update = (
+            operation_probabilities[..., 1]
+            if self._uses_r6_cache_trigger()
+            else operation_probabilities[..., 1:].sum(dim=-1)
+        )
+        selected_update = actions != 0
+        selected_probability = torch.where(
+            selected_update,
+            p_update,
+            operation_probabilities[..., 0],
+        )
+        selected_log_prob = torch.log(selected_probability.clamp_min(1.0e-12))
+
+        candidate_count = int(features.shape[2])
+        flat_features = features.reshape(
+            batch_size * node_count,
+            candidate_count,
+            int(features.shape[3]),
+        )
+        raw_scores, _ = self.policy._candidate_scores(
+            flat_contexts,
+            flat_features,
+            self.policy.cache_feature_dim,
+            self.policy.cache_candidate_scorer,
+        )
+        raw_scores = raw_scores.reshape(batch_size, node_count, candidate_count)
+        if self._uses_r6_cache_trigger():
+            unified_logits = raw_scores.masked_fill(~valid, -float("inf"))
+            unified_probabilities = torch.softmax(unified_logits, dim=-1)
+            candidate_probabilities = torch.where(
+                valid,
+                unified_probabilities,
+                torch.zeros_like(unified_probabilities),
+            )
+        else:
+            candidate_probabilities = torch.zeros_like(raw_scores)
+            for operation_index in range(1, len(self.policy.operation_order)):
+                group_mask = valid & (operation_indices == int(operation_index))
+                group_exists = group_mask.any(dim=-1)
+                safe_group_mask = group_mask | (~group_exists).unsqueeze(-1)
+                group_logits = raw_scores.masked_fill(~safe_group_mask, -float("inf"))
+                group_probabilities = torch.softmax(group_logits, dim=-1)
+                group_probabilities = torch.where(
+                    group_mask,
+                    group_probabilities,
+                    torch.zeros_like(group_probabilities),
+                )
+                candidate_probabilities = candidate_probabilities + (
+                    operation_probabilities[..., operation_index]
+                    / p_update.clamp_min(1.0e-12)
+                ).unsqueeze(-1) * group_probabilities
+        return selected_log_prob, candidate_probabilities
+
     def update(self, rollout: SimpleRollout) -> UpdateResult:
         hyper = self.hyperparameters
         bootstrap_value = 0.0
@@ -3052,6 +3240,14 @@ class PPOV2Trainer:
             if not branch_diagnostics_enabled:
                 raise RuntimeError("R2 operation credit requires joint branch diagnostics")
             r2_operation_credit = self._compute_r2_operation_credit(rollout)
+        r5_cache_credit: dict[str, Any] = {}
+        if self._uses_r5_cache_credit():
+            if not branch_diagnostics_enabled:
+                raise RuntimeError("R5 Cache credit requires joint branch diagnostics")
+            r5_cache_credit = compute_exact_node_specific_cache_credit(
+                self,
+                rollout,
+            )
         cache_kl_control_previous: float | None = None
         if cache_minibatch_kl_control_enabled:
             if (
@@ -3169,6 +3365,101 @@ class PPOV2Trainer:
                 torch.all(torch.isfinite(r4_candidate_advantages_t)).item()
             ):
                 raise FloatingPointError("R4 candidate advantages are non-finite")
+        r5_trigger_advantages_t = None
+        r5_trigger_old_probabilities_t = None
+        r5_candidate_features_t = None
+        r5_candidate_operation_indices_t = None
+        r5_candidate_q_values_t = None
+        r5_candidate_old_probabilities_t = None
+        r5_candidate_valid_mask_t = None
+        r5_candidate_advantages_t = None
+        if self._uses_r5_cache_credit():
+            required_r5_keys = (
+                "trigger_advantages",
+                "trigger_old_probabilities",
+                "candidate_features",
+                "candidate_operation_indices",
+                "candidate_q_values",
+                "candidate_probabilities",
+                "candidate_valid_mask",
+                "candidate_q_update",
+            )
+            for key in required_r5_keys:
+                if key not in r5_cache_credit:
+                    raise RuntimeError(f"R5 Cache credit is missing {key}")
+            r5_trigger_advantages_t = torch.as_tensor(
+                r5_cache_credit["trigger_advantages"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            r5_trigger_old_probabilities_t = torch.as_tensor(
+                r5_cache_credit["trigger_old_probabilities"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            r5_candidate_features_t = torch.as_tensor(
+                r5_cache_credit["candidate_features"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            r5_candidate_operation_indices_t = torch.as_tensor(
+                r5_cache_credit["candidate_operation_indices"],
+                dtype=torch.long,
+                device=self.device,
+            )
+            r5_candidate_q_values_t = torch.as_tensor(
+                r5_cache_credit["candidate_q_values"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            r5_candidate_old_probabilities_t = torch.as_tensor(
+                r5_cache_credit["candidate_probabilities"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            r5_candidate_valid_mask_t = torch.as_tensor(
+                r5_cache_credit["candidate_valid_mask"],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            r5_candidate_advantages_t = torch.where(
+                r5_candidate_valid_mask_t,
+                r5_candidate_q_values_t
+                - torch.as_tensor(
+                    r5_cache_credit["candidate_q_update"],
+                    dtype=torch.float32,
+                    device=self.device,
+                ).unsqueeze(-1),
+                torch.zeros_like(r5_candidate_q_values_t),
+            )
+            expected_r5_trigger_shape = tuple(v7_operation_actions.shape)
+            if tuple(r5_trigger_advantages_t.shape) != expected_r5_trigger_shape:
+                raise RuntimeError("R5 trigger advantage shape mismatch")
+            if tuple(r5_trigger_old_probabilities_t.shape) != (
+                sample_count,
+                int(v7_operation_actions.shape[1]),
+                2,
+            ):
+                raise RuntimeError("R5 trigger probability shape mismatch")
+            expected_r5_candidate_shape = (
+                sample_count,
+                int(v7_operation_actions.shape[1]),
+                int(r5_candidate_features_t.shape[2]),
+            )
+            for name, tensor in (
+                ("candidate features", r5_candidate_features_t),
+                ("candidate operation indices", r5_candidate_operation_indices_t),
+                ("candidate q values", r5_candidate_q_values_t),
+                ("candidate old probabilities", r5_candidate_old_probabilities_t),
+                ("candidate valid mask", r5_candidate_valid_mask_t),
+                ("candidate advantages", r5_candidate_advantages_t),
+            ):
+                if tuple(tensor.shape[:3]) != expected_r5_candidate_shape:
+                    raise RuntimeError(f"R5 {name} shape mismatch")
+            if not bool(torch.all(torch.isfinite(r5_trigger_advantages_t)).item()):
+                raise FloatingPointError("R5 trigger advantages are non-finite")
+            if not bool(torch.all(torch.isfinite(r5_candidate_advantages_t)).item()):
+                raise FloatingPointError("R5 candidate advantages are non-finite")
         critic_targets_t = (
             (returns_t - critic_target_mean) / critic_return_scale
             if popart_critic
@@ -3457,18 +3748,104 @@ class PPOV2Trainer:
                     cache_node_delta = None
                     cache_node_ratio = None
                     if branchwise_policy_enabled:
-                        cache_branch_unclipped = (
-                            cache_branch_ratio * advantages_t[indices]
-                        )
-                        cache_branch_clipped = torch.clamp(
-                            cache_branch_ratio,
-                            1.0 - hyper.clip_epsilon,
-                            1.0 + hyper.clip_epsilon,
-                        ) * advantages_t[indices]
-                        cache_branch_policy_loss = -torch.minimum(
-                            cache_branch_unclipped,
-                            cache_branch_clipped,
-                        ).mean()
+                        if self._uses_r5_cache_credit():
+                            assert (
+                                r5_trigger_advantages_t is not None
+                                and r5_trigger_old_probabilities_t is not None
+                                and r5_candidate_features_t is not None
+                                and r5_candidate_operation_indices_t is not None
+                                and r5_candidate_old_probabilities_t is not None
+                                and r5_candidate_valid_mask_t is not None
+                                and r5_candidate_advantages_t is not None
+                                and v7_operation_actions is not None
+                                and v7_operation_masks is not None
+                            )
+                            r5_trigger_new_log_probs, r5_candidate_new_probabilities = (
+                                self._r5_cache_policy_terms(
+                                    cache_contexts[indices],
+                                    v7_operation_masks[indices],
+                                    v7_operation_actions[indices],
+                                    r5_candidate_features_t[indices],
+                                    r5_candidate_operation_indices_t[indices],
+                                    r5_candidate_valid_mask_t[indices],
+                                )
+                            )
+                            selected_update = v7_operation_actions[indices] != 0
+                            old_selected_probability = torch.where(
+                                selected_update,
+                                r5_trigger_old_probabilities_t[indices, ..., 1],
+                                r5_trigger_old_probabilities_t[indices, ..., 0],
+                            )
+                            trigger_ratio = torch.exp(
+                                r5_trigger_new_log_probs
+                                - torch.log(old_selected_probability.clamp_min(1.0e-12))
+                            )
+                            trigger_advantage = r5_trigger_advantages_t[indices]
+                            trigger_unclipped = trigger_ratio * trigger_advantage
+                            trigger_clipped = torch.clamp(
+                                trigger_ratio,
+                                1.0 - hyper.clip_epsilon,
+                                1.0 + hyper.clip_epsilon,
+                            ) * trigger_advantage
+                            trigger_surrogate = torch.minimum(
+                                trigger_unclipped,
+                                trigger_clipped,
+                            )
+                            trigger_policy_loss = -trigger_surrogate.mean()
+
+                            candidate_valid = r5_candidate_valid_mask_t[indices]
+                            candidate_old_probability = (
+                                r5_candidate_old_probabilities_t[indices]
+                            )
+                            candidate_ratio = torch.where(
+                                candidate_valid,
+                                r5_candidate_new_probabilities
+                                / candidate_old_probability.clamp_min(1.0e-12),
+                                torch.ones_like(r5_candidate_new_probabilities),
+                            )
+                            candidate_advantage = r5_candidate_advantages_t[indices]
+                            candidate_unclipped = candidate_ratio * candidate_advantage
+                            candidate_clipped = torch.clamp(
+                                candidate_ratio,
+                                1.0 - hyper.clip_epsilon,
+                                1.0 + hyper.clip_epsilon,
+                            ) * candidate_advantage
+                            candidate_weighted_surrogate = (
+                                candidate_old_probability
+                                * torch.minimum(
+                                    candidate_unclipped,
+                                    candidate_clipped,
+                                )
+                                * candidate_valid.to(torch.float32)
+                            ).sum(dim=-1)
+                            candidate_active = candidate_valid.any(dim=-1)
+                            candidate_policy_loss = (
+                                -candidate_weighted_surrogate[candidate_active].mean()
+                                if bool(torch.any(candidate_active).item())
+                                else r5_candidate_new_probabilities.sum() * 0.0
+                            )
+                            cache_branch_policy_loss = 0.5 * (
+                                trigger_policy_loss + candidate_policy_loss
+                            )
+                            branch_metric_tensors += (
+                                trigger_ratio.detach(),
+                                candidate_ratio.detach(),
+                                trigger_advantage.detach(),
+                                candidate_policy_loss.detach(),
+                            )
+                        else:
+                            cache_branch_unclipped = (
+                                cache_branch_ratio * advantages_t[indices]
+                            )
+                            cache_branch_clipped = torch.clamp(
+                                cache_branch_ratio,
+                                1.0 - hyper.clip_epsilon,
+                                1.0 + hyper.clip_epsilon,
+                            ) * advantages_t[indices]
+                            cache_branch_policy_loss = -torch.minimum(
+                                cache_branch_unclipped,
+                                cache_branch_clipped,
+                            ).mean()
                         if r2_enabled:
                             assert (
                                 r2_operation_advantages_scaled_t is not None
@@ -4530,6 +4907,59 @@ class PPOV2Trainer:
             ),
             uav_operation_ratio_granularity=str(
                 r2_operation_credit.get("ratio_granularity", "")
+            ),
+            cache_trigger_advantage_mean_abs=(
+                float(r5_cache_credit.get("trigger_advantage_mean_abs", math.nan))
+                if r5_cache_credit
+                else math.nan
+            ),
+            cache_candidate_advantage_mean_abs=(
+                float(r5_cache_credit.get("candidate_advantage_mean_abs", math.nan))
+                if r5_cache_credit
+                else math.nan
+            ),
+            cache_trigger_advantage_weighted_mean_residual=(
+                float(
+                    np.mean(
+                        np.abs(
+                            np.asarray(
+                                r5_cache_credit.get(
+                                    "trigger_weighted_mean_residual", []
+                                ),
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                )
+                if r5_cache_credit
+                else math.nan
+            ),
+            cache_candidate_advantage_weighted_mean_residual=(
+                float(
+                    np.mean(
+                        np.abs(
+                            np.asarray(
+                                r5_cache_credit.get(
+                                    "candidate_weighted_mean_residual", []
+                                ),
+                                dtype=np.float64,
+                            )
+                        )
+                    )
+                )
+                if r5_cache_credit
+                else math.nan
+            ),
+            cache_trigger_advantage_mean_abs_by_role=(
+                dict(r5_cache_credit.get("trigger_advantage_mean_abs_by_role", {}))
+                if r5_cache_credit
+                else None
+            ),
+            cache_credit_counterfactual_env_executions=int(
+                r5_cache_credit.get("counterfactual_environment_executions", 0)
+            ),
+            cache_credit_runtime_seconds=float(
+                r5_cache_credit.get("credit_runtime_seconds", math.nan)
             ),
         )
 
@@ -6005,6 +6435,7 @@ def run_training(
                     "cache_actual_change_rate": cache_change_rate,
                     "uav_actual_movement_rate": uav_move_rate,
                     **cache_operation_metrics,
+                    **_branch_update_metric_fields(update),
                     "policy_loss_range": {
                         "min": float(min(episode_policy_loss_mins)),
                         "max": float(max(episode_policy_loss_maxs)),

@@ -29,6 +29,8 @@ REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
     }
 )
 REPLICA_AWARE_CACHE_FEATURE_NAMES = (
@@ -948,6 +950,227 @@ def sample_and_apply_v8_no_prediction_cache_operation_configuration(
     )
 
 
+def sample_and_apply_r6_binary_cache_operation_configuration(
+    policy: Any,
+    observation: np.ndarray,
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    step: Any,
+    context: Any,
+    tensor_spec: PrimitiveTensorSpec,
+    *,
+    deterministic: bool = False,
+) -> CacheOperationPrimitiveSelectionResult:
+    """Sample R6 binary triggers and one unified UPDATE candidate set.
+
+    The production candidate enumerator is intentionally shared with R5.
+    R6 changes only the factorization: all legal ADD/DELETE/SWAP candidates
+    are passed to one conditional categorical distribution after UPDATE.
+    """
+
+    trigger_order = ("KEEP", "UPDATE")
+    if tuple(getattr(policy, "trigger_order", ())) != trigger_order:
+        raise ValueError("R6 Cache trigger order must be KEEP/UPDATE")
+    cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
+    previous_cache = cache.copy()
+    current_uav = {
+        uav_id: np.asarray(previous_uav_positions[uav_id], dtype=np.float64).copy()
+        for uav_id in context.action_spec.uav_ids
+    }
+    if tensor_spec.num_cache_heads != len(context.action_spec.cache_node_ids):
+        raise ValueError("R6 tensor spec cache head count does not match action spec")
+
+    operation_actions = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+    operation_masks = np.zeros(
+        (tensor_spec.num_cache_heads, len(trigger_order)),
+        dtype=bool,
+    )
+    operation_old_log_probs = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+    operation_entropies = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+    cache_contexts = np.zeros(
+        (tensor_spec.num_cache_heads, tensor_spec.observation_dim), dtype=np.float32
+    )
+    cache_features = np.zeros(
+        (
+            tensor_spec.num_cache_heads,
+            tensor_spec.cache_max_candidates,
+            tensor_spec.cache_feature_dim,
+        ),
+        dtype=np.float32,
+    )
+    cache_masks = np.zeros(
+        (tensor_spec.num_cache_heads, tensor_spec.cache_max_candidates),
+        dtype=bool,
+    )
+    cache_masks[:, 0] = True
+    cache_selected = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+    cache_old_log_probs = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+    cache_counts = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
+    cache_triggers = np.zeros(tensor_spec.num_cache_heads, dtype=np.int8)
+    cache_actions: list[dict[str, Any]] = []
+    total_log_prob: Any | None = None
+    total_entropy: Any | None = None
+
+    for node_index, node_id in enumerate(context.action_spec.cache_node_ids):
+        conditional_context = _intermediate_observation(
+            cache,
+            current_uav,
+            step,
+            context,
+        )
+        candidates = cache_configuration.enumerate_cache_primitive_actions(
+            cache,
+            node_index,
+            context.service_catalog,
+            context.cache_nodes,
+        )
+        update_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.operation_type) != "NO_CHANGE"
+        ]
+        operation_mask = np.asarray(
+            [True, bool(update_candidates)],
+            dtype=bool,
+        )
+        sampled_trigger = policy.sample_cache_trigger(
+            conditional_context,
+            node_index,
+            operation_mask,
+            deterministic=bool(deterministic),
+        )
+        selected_trigger = int(sampled_trigger.selected_index)
+        operation_actions[node_index] = selected_trigger
+        operation_masks[node_index] = operation_mask
+        operation_old_log_probs[node_index] = float(
+            sampled_trigger.log_prob.detach().cpu()
+        )
+        operation_entropies[node_index] = float(
+            sampled_trigger.entropy.detach().cpu()
+        )
+        cache_contexts[node_index] = conditional_context
+        total_log_prob = (
+            sampled_trigger.log_prob
+            if total_log_prob is None
+            else total_log_prob + sampled_trigger.log_prob
+        )
+        total_entropy = (
+            sampled_trigger.entropy
+            if total_entropy is None
+            else total_entropy + sampled_trigger.entropy
+        )
+
+        if selected_trigger == 0:
+            cache_actions.append(
+                {
+                    "head_type": "cache",
+                    "head_id": str(node_id),
+                    "head_index": node_index,
+                    "candidate_count": 0,
+                    "selected_index": None,
+                    "operation_type": "NO_CHANGE",
+                    "added_service_ids": [],
+                    "removed_service_ids": [],
+                    "actual_changed": False,
+                }
+            )
+            continue
+
+        if not update_candidates:
+            raise AssertionError("R6 selected UPDATE without a legal candidate")
+        cache_triggers[node_index] = 1
+        candidate_features = np.stack(
+            [
+                _cache_candidate_feature(
+                    candidate,
+                    cache,
+                    previous_cache,
+                    cache_triggers,
+                    step.predicted_service_popularity,
+                    context,
+                    include_replica_awareness=True,
+                )
+                for candidate in update_candidates
+            ]
+        )
+        count = len(update_candidates)
+        if count > tensor_spec.cache_max_candidates:
+            raise AssertionError("R6 Cache candidate count exceeds padded capacity")
+        sampled_candidate = policy.sample_cache_update_candidate(
+            conditional_context,
+            candidate_features,
+            deterministic=bool(deterministic),
+        )
+        selected_index = int(sampled_candidate.selected_index)
+        selected = update_candidates[selected_index]
+        applied = cache_configuration.apply_cache_candidate(
+            cache,
+            node_index,
+            selected.after_node_cache,
+            context.service_catalog,
+            context.cache_nodes,
+        )
+        cache_features[node_index, :count] = candidate_features
+        cache_masks[node_index, :count] = True
+        cache_selected[node_index] = selected_index
+        cache_old_log_probs[node_index] = float(
+            sampled_candidate.log_prob.detach().cpu()
+        )
+        cache_counts[node_index] = count
+        total_log_prob = total_log_prob + sampled_candidate.log_prob
+        total_entropy = total_entropy + sampled_candidate.entropy
+        cache_actions.append(
+            {
+                "head_type": "cache",
+                "head_id": str(node_id),
+                "head_index": node_index,
+                "candidate_count": count,
+                "selected_index": selected_index,
+                "operation_type": str(selected.operation_type),
+                "added_service_ids": list(selected.added_service_ids),
+                "removed_service_ids": list(selected.removed_service_ids),
+                "actual_changed": bool(applied["actual_changed"]),
+            }
+        )
+
+    if total_log_prob is None or total_entropy is None:
+        raise RuntimeError("R6 Cache trigger selection produced no heads")
+    cache_configuration.validate_cache_shape_and_capacity(
+        cache,
+        context.service_catalog,
+        context.cache_nodes,
+    )
+    derived_action = np.concatenate(
+        [
+            cache_triggers,
+            np.zeros(len(context.action_spec.uav_ids), dtype=np.int8),
+        ]
+    ).astype(np.int8)
+    value = policy.critic_value(observation)
+    return CacheOperationPrimitiveSelectionResult(
+        final_cache_state=cache.copy(),
+        final_uav_positions={
+            key: (float(value[0]), float(value[1]))
+            for key, value in current_uav.items()
+        },
+        derived_action=derived_action,
+        value=value,
+        total_log_prob=total_log_prob,
+        total_entropy=total_entropy,
+        operation_actions=operation_actions,
+        operation_masks=operation_masks,
+        operation_old_log_probs=operation_old_log_probs,
+        operation_entropies=operation_entropies,
+        cache_contexts=cache_contexts,
+        cache_candidate_features=cache_features,
+        cache_candidate_masks=cache_masks,
+        cache_selected_indices=cache_selected,
+        cache_old_log_probs=cache_old_log_probs,
+        cache_conditional_actions=tuple(cache_actions),
+        cache_candidate_counts=cache_counts,
+    )
+
+
 def sample_and_apply_r2_joint_cache_uav_operation_configuration(
     policy: Any,
     observation: np.ndarray,
@@ -958,22 +1181,35 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
     tensor_spec: PrimitiveTensorSpec,
     *,
     deterministic: bool = False,
+    binary_cache_trigger: bool = False,
 ) -> JointCacheUavOperationPrimitiveSelectionResult:
     """Run V8 Cache decisions followed by sequential STAY/MOVE UAV decisions."""
 
     operation_order = ("STAY", "MOVE")
     if tuple(getattr(policy, "uav_operation_order", ())) != operation_order:
         raise ValueError("R2 UAV operation order must be STAY/MOVE")
-    cache_result = sample_and_apply_v8_cache_operation_configuration(
-        policy,
-        observation,
-        previous_cache_state,
-        previous_uav_positions,
-        step,
-        context,
-        tensor_spec,
-        deterministic=bool(deterministic),
-    )
+    if binary_cache_trigger:
+        cache_result = sample_and_apply_r6_binary_cache_operation_configuration(
+            policy,
+            observation,
+            previous_cache_state,
+            previous_uav_positions,
+            step,
+            context,
+            tensor_spec,
+            deterministic=bool(deterministic),
+        )
+    else:
+        cache_result = sample_and_apply_v8_cache_operation_configuration(
+            policy,
+            observation,
+            previous_cache_state,
+            previous_uav_positions,
+            step,
+            context,
+            tensor_spec,
+            deterministic=bool(deterministic),
+        )
     current_uav = {
         uav_id: np.asarray(previous_uav_positions[uav_id], dtype=np.float64).copy()
         for uav_id in context.action_spec.uav_ids
