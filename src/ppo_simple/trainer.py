@@ -45,14 +45,9 @@ from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic,
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic,
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
@@ -78,11 +73,7 @@ POPART_CHECKPOINT_VERSION = 6
 V7_CHECKPOINT_VERSION = 7
 V8_CHECKPOINT_VERSION = 8
 V8_NO_PREDICTION_CHECKPOINT_VERSION = 9
-V9_JOINT_CHECKPOINT_VERSION = 10
-V10_BRANCHWISE_CHECKPOINT_VERSION = 11
-V10C_DECOUPLED_CHECKPOINT_VERSION = 12
-V10D_BRANCH_SPECIFIC_KL_CHECKPOINT_VERSION = 13
-V11A_CACHE_NODE_CF_CHECKPOINT_VERSION = 16
+R2_CHECKPOINT_VERSION = 13
 KL_GATE_MODE_JOINT = "joint"
 KL_GATE_MODE_BRANCH_SPECIFIC = "branch_specific"
 CACHE_KL_CONTROL_EPOCH = "epoch"
@@ -93,13 +84,20 @@ PLOT_UPDATE_INTERVAL_EPOCHS = 10
 ADVANTAGE_NORMALIZATION_CENTERED_STD = "centered_std"
 ADVANTAGE_NORMALIZATION_STD_ONLY = "std_only"
 DEFAULT_ADVANTAGE_NORMALIZATION_MODE = ADVANTAGE_NORMALIZATION_CENTERED_STD
+OPERATION_ADVANTAGE_NORMALIZATION_STD_ONLY = "std_only"
+OPERATION_ADVANTAGE_NORMALIZATION_FIXED_REFERENCE_SCALE = "fixed_reference_scale"
+DEFAULT_OPERATION_ADVANTAGE_NORMALIZATION_MODE = (
+    OPERATION_ADVANTAGE_NORMALIZATION_STD_ONLY
+)
+DEFAULT_OPERATION_ADVANTAGE_REFERENCE_SCALE = 0.02
 CRITIC_VALUE_SCALE_NONE = "none"
 CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
 CRITIC_VALUE_SCALE_POPART_NORMALIZED = "popart_normalized"
 DEFAULT_CRITIC_VALUE_SCALE_EPSILON = 1.0e-8
 DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES = 64
-# V6 is the sole production schema.  Its V3/V4/V5 base classes remain in
-# policy.py because their module layout is part of the formal checkpoint.
+# Primitive V6 and Cache-only V7/V8 schemas remain available to their explicit
+# baseline/ablation evaluators.  Recovery R2 is the only current Joint PPO
+# schema.
 V6_POLICY_SCHEMAS = frozenset(
     {AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic.architecture_id}
 )
@@ -110,41 +108,19 @@ V8_POLICY_SCHEMAS = frozenset(
     {AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic.architecture_id}
 )
 NO_PREDICTION_POLICY_SCHEMAS = frozenset({NO_PREDICTION_POLICY_SCHEMA})
-JOINT_V9_POLICY_SCHEMAS = frozenset(
-    {AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic.architecture_id}
-)
-JOINT_V10_POLICY_SCHEMAS = frozenset(
-    {AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic.architecture_id}
-)
-JOINT_V10C_DECOUPLED_POLICY_SCHEMAS = frozenset(
-    {AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic.architecture_id}
-)
-JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS = frozenset(
-    {AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic.architecture_id}
-)
-JOINT_RECOVERY_R1_POLICY_SCHEMAS = frozenset(
-    {AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic.architecture_id}
-)
-JOINT_RECOVERY_R2_POLICY_SCHEMAS = frozenset(
+R2_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic.architecture_id}
 )
-JOINT_V11A_CACHE_NODE_CF_POLICY_SCHEMAS = frozenset(
-    {AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic.architecture_id}
+R3_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic.architecture_id}
 )
-JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS = (
-    JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
-    | JOINT_RECOVERY_R1_POLICY_SCHEMAS
-    | JOINT_RECOVERY_R2_POLICY_SCHEMAS
-    | JOINT_V11A_CACHE_NODE_CF_POLICY_SCHEMAS
+R4_POLICY_SCHEMAS = frozenset(
+    {AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic.architecture_id}
 )
-JOINT_V10_BRANCHWISE_POLICY_SCHEMAS = frozenset(
-    {AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id}
-) | JOINT_V10C_DECOUPLED_POLICY_SCHEMAS | JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
-JOINT_CACHE_UAV_POLICY_SCHEMAS = (
-    JOINT_V9_POLICY_SCHEMAS
-    | JOINT_V10_POLICY_SCHEMAS
-    | JOINT_V10_BRANCHWISE_POLICY_SCHEMAS
-)
+RECOVERY_POLICY_SCHEMAS = R2_POLICY_SCHEMAS | R3_POLICY_SCHEMAS | R4_POLICY_SCHEMAS
+CANDIDATE_CREDIT_POLICY_SCHEMAS = R4_POLICY_SCHEMAS
+JOINT_CACHE_UAV_POLICY_SCHEMAS = RECOVERY_POLICY_SCHEMAS
+BRANCH_SPECIFIC_KL_POLICY_SCHEMAS = RECOVERY_POLICY_SCHEMAS
 CACHE_OPERATION_POLICY_SCHEMAS = (
     V7_POLICY_SCHEMAS | V8_POLICY_SCHEMAS | NO_PREDICTION_POLICY_SCHEMAS
 )
@@ -181,90 +157,6 @@ def _require_torch() -> None:
         raise ImportError("PPO v2 training requires PyTorch.")
 
 
-class CacheNodeCounterfactualCritic(
-    torch.nn.Module if torch is not None else object  # type: ignore[misc]
-):
-    """Independent centralized action-conditioned critic for one Cache node.
-
-    Q_cache conditions on the raw transition state, a deterministic one-hot
-    target-node identity, and the complete deterministic joint action
-    encoding.  The encoding contains every Cache node's operation/primitive
-    feature and every UAV's operation/primitive feature, so counterfactuals
-    replace only the target node slice while holding all other actions fixed.
-    The network owns no Actor or global-critic parameter tensor.
-    """
-
-    def __init__(
-        self,
-        observation_dim: int,
-        num_cache_nodes: int,
-        joint_action_dim: int,
-        hidden_sizes: tuple[int, ...],
-    ) -> None:
-        if torch is None:  # pragma: no cover - guarded by trainer construction
-            raise ImportError("V11-A Cache critic requires PyTorch.")
-        super().__init__()
-        if int(observation_dim) <= 0 or int(num_cache_nodes) <= 0 or int(joint_action_dim) <= 0:
-            raise ValueError("V11-A Cache critic dimensions must be positive")
-        layers: list[Any] = []
-        last_dim = int(observation_dim) + int(num_cache_nodes) + int(joint_action_dim)
-        for hidden_size in hidden_sizes:
-            width = int(hidden_size)
-            if width <= 0:
-                raise ValueError("V11-A Cache critic hidden sizes must be positive")
-            layers.extend([torch.nn.Linear(last_dim, width), torch.nn.Tanh()])
-            last_dim = width
-        layers.append(torch.nn.Linear(last_dim, 1))
-        self.network = torch.nn.Sequential(*layers)
-        self.observation_dim = int(observation_dim)
-        self.num_cache_nodes = int(num_cache_nodes)
-        self.joint_action_dim = int(joint_action_dim)
-
-    def forward(self, observations: Any, node_indices: Any, joint_action_encoding: Any) -> Any:
-        device = next(self.parameters()).device
-        observations_t = torch.as_tensor(
-            observations, dtype=torch.float32, device=device
-        )
-        node_indices_t = torch.as_tensor(node_indices, dtype=torch.long, device=device)
-        joint_action_encoding_t = torch.as_tensor(
-            joint_action_encoding, dtype=torch.float32, device=device
-        )
-        if observations_t.ndim == 1:
-            observations_t = observations_t.unsqueeze(0)
-        if node_indices_t.ndim == 0:
-            node_indices_t = node_indices_t.reshape(1)
-        else:
-            node_indices_t = node_indices_t.reshape(-1)
-        if joint_action_encoding_t.ndim == 1:
-            joint_action_encoding_t = joint_action_encoding_t.unsqueeze(0)
-        if (
-            observations_t.ndim != 2
-            or int(observations_t.shape[1]) != self.observation_dim
-            or joint_action_encoding_t.ndim != 2
-            or tuple(joint_action_encoding_t.shape[1:]) != (self.joint_action_dim,)
-            or int(observations_t.shape[0]) != int(node_indices_t.shape[0])
-            or int(joint_action_encoding_t.shape[0]) != int(node_indices_t.shape[0])
-        ):
-            raise ValueError("V11-A Cache critic input shape mismatch")
-        if not bool(torch.all(torch.isfinite(observations_t)).item()) or not bool(
-            torch.all(torch.isfinite(joint_action_encoding_t)).item()
-        ):
-            raise ValueError("V11-A Cache critic input contains NaN/Inf")
-        if bool(torch.any(node_indices_t < 0).item()) or bool(
-            torch.any(node_indices_t >= self.num_cache_nodes).item()
-        ):
-            raise ValueError("V11-A Cache critic node index out of range")
-        node_one_hot = torch.nn.functional.one_hot(
-            node_indices_t, num_classes=self.num_cache_nodes
-        ).to(dtype=torch.float32)
-        values = self.network(
-            torch.cat([observations_t, node_one_hot, joint_action_encoding_t], dim=-1)
-        ).squeeze(-1)
-        if not bool(torch.all(torch.isfinite(values)).item()):
-            raise FloatingPointError("V11-A Cache critic output contains NaN/Inf")
-        return values
-
-
 def _gradient_group_norm(parameters: Any) -> float:
     """Return a pre-clipping L2 norm for one diagnostic parameter group."""
 
@@ -292,7 +184,7 @@ def _branch_specific_kl_gate_transition(
     cache_gate_enabled: bool = True,
     uav_gate_enabled: bool = True,
 ) -> dict[str, Any]:
-    """Apply one V10-D branch-KL gate transition after a full PPO epoch.
+    """Apply one branch-specific KL gate transition after a full PPO epoch.
 
     The transition is deliberately pure so the four required control-flow
     cases can be tested without collecting a rollout or changing a policy.
@@ -305,8 +197,9 @@ def _branch_specific_kl_gate_transition(
     total_epochs = int(update_epochs)
     if epoch_index < 0 or total_epochs <= 0 or epoch_index >= total_epochs:
         raise ValueError("invalid PPO update epoch for KL gate transition")
-    if not bool(cache_active) and not bool(uav_active):
-        raise ValueError("branch-specific KL gate cannot transition from both inactive")
+    # Both branches inactive is a legal absorbing state.  The triggering
+    # epoch still runs the critic, and subsequent epochs keep the actor frozen
+    # while the global critic schedule continues normally.
     if target_kl is None:
         cache_over_target = None
         uav_over_target = None
@@ -341,7 +234,10 @@ def _branch_specific_kl_gate_transition(
     next_cache_active = bool(cache_active) and not cache_newly_stopped
     next_uav_active = bool(uav_active) and not uav_newly_stopped
     both_inactive_stop = bool(
-        can_suppress and not next_cache_active and not next_uav_active
+        can_suppress
+        and (cache_newly_stopped or uav_newly_stopped)
+        and not next_cache_active
+        and not next_uav_active
     )
     return {
         "cache_over_target": cache_over_target,
@@ -368,7 +264,7 @@ def _branch_actor_policy_loss(
     cache_active: bool,
     uav_active: bool,
 ) -> Any:
-    """Keep the V10-D actor branch scale at 0.5 for every active branch.
+    """Keep the actor branch scale at 0.5 for every active branch.
 
     When both branches have been stopped by the branch-specific KL gate, the
     actor contribution is a graph-connected zero.  This lets the separate
@@ -470,6 +366,8 @@ class PPOV2Hyperparameters:
     num_minibatches: int
     hidden_sizes: tuple[int, ...]
     advantage_normalization_mode: str
+    operation_advantage_normalization_mode: str
+    operation_advantage_reference_scale: float
     critic_value_scale_mode: str
     critic_value_scale_epsilon: float
     critic_value_scale_warmup_samples: int
@@ -595,6 +493,14 @@ class UpdateResult:
     shared_actor_gradient_norm: float = math.nan
     cache_policy_loss: float = math.nan
     uav_policy_loss: float = math.nan
+    # Recovery R4 exact conditional candidate-credit diagnostics.  These are
+    # intentionally separate from the legacy selected-candidate/global-GAE
+    # fields above.
+    uav_candidate_policy_loss: float = math.nan
+    uav_candidate_advantage_mean_abs: float = math.nan
+    uav_candidate_advantage_weighted_mean_residual: float = math.nan
+    uav_candidate_advantage_normalization: str = ""
+    uav_candidate_advantage_source: str = ""
     actor_policy_loss: float = math.nan
     uav_branch_old_log_probs: np.ndarray | None = None
     uav_branch_new_log_probs: np.ndarray | None = None
@@ -615,34 +521,6 @@ class UpdateResult:
     cache_independent_stop: bool = False
     uav_independent_stop: bool = False
     both_inactive_stop: bool = False
-    q_cache_loss: float = math.nan
-    q_cache_explained_variance: float = math.nan
-    q_cache_grad_norm_raw: float = math.nan
-    q_cache_grad_norm_clipped: float = math.nan
-    q_cache_optimizer_steps: int = 0
-    q_cache_optimizer_steps_per_rollout: int = 0
-    q_cache_loss_before: float = math.nan
-    q_cache_loss_after: float = math.nan
-    q_cache_ev_before: float = math.nan
-    q_cache_ev_after: float = math.nan
-    q_cache_epoch_diagnostics: tuple[dict[str, Any], ...] = ()
-    cf_adv_raw: np.ndarray | None = None
-    cf_adv_normalized: np.ndarray | None = None
-    cf_adv_valid_mask: np.ndarray | None = None
-    q_cache_selected_values: np.ndarray | None = None
-    q_cache_counterfactual_baseline: np.ndarray | None = None
-    cf_adv_raw_mean: float = math.nan
-    cf_adv_raw_std: float = math.nan
-    cf_adv_normalized_mean: float = math.nan
-    cf_adv_normalized_std: float = math.nan
-    cf_adv_min: float = math.nan
-    cf_adv_max: float = math.nan
-    cf_adv_positive_fraction: float = math.nan
-    cf_adv_negative_fraction: float = math.nan
-    cache_node_logprob_sum_max_abs_error: float = math.nan
-    cache_surrogate_reduction: str = ""
-    valid_cache_node_time_count: int = 0
-    cache_loss_scale_relative_to_v10d: float = math.nan
     cache_kl_control: str = DEFAULT_CACHE_KL_CONTROL
     cache_stop_update_epoch: int | None = None
     cache_stop_minibatch: int | None = None
@@ -654,7 +532,7 @@ class UpdateResult:
     global_critic_steps: int = 0
     # Recovery R2 operation-credit diagnostics.  These are populated only for
     # the R2 schema and are deliberately separate from the legacy global-GAE
-    # and joint UAV branch fields above.
+# and joint UAV branch fields above.
     uav_operation_advantages_raw: np.ndarray | None = None
     uav_operation_advantages_scaled: np.ndarray | None = None
     uav_operation_q_stay: np.ndarray | None = None
@@ -1111,7 +989,7 @@ def _cache_operation_epoch_metrics(
     }
 
 
-def _branch_update_metric_fields(update: UpdateResult) -> dict[str, float]:
+def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
     """Return finite branch diagnostics without changing legacy log schemas."""
 
     values = {
@@ -1133,6 +1011,23 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, float]:
     }
     if all(math.isfinite(value) for value in policy_losses.values()):
         fields.update(policy_losses)
+    candidate_metrics = {
+        "candidate_loss": float(update.uav_candidate_policy_loss),
+        "mean_abs_candidate_advantage": float(
+            update.uav_candidate_advantage_mean_abs
+        ),
+        "candidate_adv_weighted_mean_residual": float(
+            update.uav_candidate_advantage_weighted_mean_residual
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_metrics.values()):
+        fields.update(candidate_metrics)
+        fields["candidate_advantage_normalization"] = str(
+            update.uav_candidate_advantage_normalization
+        )
+        fields["candidate_advantage_source"] = str(
+            update.uav_candidate_advantage_source
+        )
     encoder_gradient_norms = {
         "cache_encoder_gradient_norm": float(update.cache_encoder_gradient_norm),
         "uav_encoder_gradient_norm": float(update.uav_encoder_gradient_norm),
@@ -1142,153 +1037,8 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, float]:
     return fields
 
 
-def _v11a_update_metric_fields(
-    update: UpdateResult,
-    rollout: SimpleRollout,
-    cache_nodes: dict[str, Any],
-    *,
-    fixed_transition_seed: int = 4401,
-) -> dict[str, Any]:
-    """Return the bounded V11-A diagnostics persisted for a gate run."""
-
-    if (
-        update.cf_adv_raw is None
-        or update.cf_adv_normalized is None
-        or update.cf_adv_valid_mask is None
-    ):
-        return {}
-    raw = np.asarray(update.cf_adv_raw, dtype=np.float64)
-    normalized = np.asarray(update.cf_adv_normalized, dtype=np.float64)
-    valid = np.asarray(update.cf_adv_valid_mask, dtype=bool)
-    if raw.shape != normalized.shape or raw.shape != valid.shape:
-        raise AssertionError("V11-A diagnostics have inconsistent CF advantage shapes")
-    roles = np.asarray([str(value).upper() for value in cache_nodes["node_roles"]])
-    if raw.ndim != 2 or raw.shape[1] != len(roles):
-        raise AssertionError("V11-A diagnostics do not match Cache node roles")
-    if not np.all(np.isfinite(raw)) or not np.all(np.isfinite(normalized)):
-        raise FloatingPointError("V11-A diagnostics contain non-finite CF advantages")
-    fields: dict[str, Any] = {
-        "q_cache_loss": float(update.q_cache_loss),
-        "q_cache_ev": float(update.q_cache_explained_variance),
-        "q_cache_grad_norm": float(update.q_cache_grad_norm_raw),
-        "q_cache_grad_norm_raw": float(update.q_cache_grad_norm_raw),
-        "q_cache_grad_norm_clipped": float(update.q_cache_grad_norm_clipped),
-        "q_cache_optimizer_steps": int(update.q_cache_optimizer_steps),
-        "q_cache_optimizer_steps_per_rollout": int(
-            update.q_cache_optimizer_steps_per_rollout
-        ),
-        "q_cache_loss_before": float(update.q_cache_loss_before),
-        "q_cache_loss_after": float(update.q_cache_loss_after),
-        "q_cache_ev_before": float(update.q_cache_ev_before),
-        "q_cache_ev_after": float(update.q_cache_ev_after),
-        "q_cache_epoch_diagnostics": [
-            dict(record) for record in update.q_cache_epoch_diagnostics
-        ],
-        "cf_adv_raw_mean": float(update.cf_adv_raw_mean),
-        "cf_adv_raw_std": float(update.cf_adv_raw_std),
-        "cf_adv_normalized_mean": float(update.cf_adv_normalized_mean),
-        "cf_adv_normalized_std": float(update.cf_adv_normalized_std),
-        "cf_adv_min": float(update.cf_adv_min),
-        "cf_adv_max": float(update.cf_adv_max),
-        "cf_adv_positive_rate": float(update.cf_adv_positive_fraction),
-        "cf_adv_negative_rate": float(update.cf_adv_negative_fraction),
-        "cache_node_logprob_sum_max_abs_error": float(
-            update.cache_node_logprob_sum_max_abs_error
-        ),
-        "cache_surrogate_reduction": str(update.cache_surrogate_reduction),
-        "valid_cache_node_time_count": int(update.valid_cache_node_time_count),
-        "cache_loss_scale_relative_to_v10d": float(
-            update.cache_loss_scale_relative_to_v10d
-        ),
-        "cache_kl_control": str(update.cache_kl_control),
-        "cache_stop_update_epoch": update.cache_stop_update_epoch,
-        "cache_stop_minibatch": update.cache_stop_minibatch,
-        "cache_kl_before_stop": update.cache_kl_before_stop,
-        "cache_kl_after_stop": update.cache_kl_after_stop,
-        "cache_minibatches_executed": int(update.cache_minibatches_executed),
-        "cache_minibatches_suppressed": int(update.cache_minibatches_suppressed),
-        "uav_minibatches_executed": int(update.uav_minibatches_executed),
-        "global_critic_steps": int(update.global_critic_steps),
-        "q_cache_steps": int(update.q_cache_optimizer_steps_per_rollout),
-    }
-    node_type_stats: dict[str, Any] = {}
-    for role in ("SV", "RSU", "UAV"):
-        role_values = normalized[:, roles == role]
-        role_valid = valid[:, roles == role]
-        selected = role_values[role_valid]
-        output_role = "UAV-cache" if role == "UAV" else role
-        if selected.size:
-            node_type_stats[output_role] = {
-                "count": int(selected.size),
-                "cf_adv_mean": float(np.mean(selected)),
-                "cf_adv_std": float(np.std(selected)),
-                "positive_rate": float(np.mean(selected > 0.0)),
-                "negative_rate": float(np.mean(selected < 0.0)),
-            }
-        else:
-            node_type_stats[output_role] = {
-                "count": 0,
-                "cf_adv_mean": None,
-                "cf_adv_std": None,
-                "positive_rate": None,
-                "negative_rate": None,
-            }
-    fields["cf_adv_by_cache_node_type"] = node_type_stats
-    if not rollout.transitions:
-        raise AssertionError("V11-A fixed diagnostic transition requires a rollout")
-    q_selected = (
-        None
-        if update.q_cache_selected_values is None
-        else np.asarray(update.q_cache_selected_values, dtype=np.float64)
-    )
-    q_baseline = (
-        None
-        if update.q_cache_counterfactual_baseline is None
-        else np.asarray(update.q_cache_counterfactual_baseline, dtype=np.float64)
-    )
-    if q_selected is None or q_baseline is None:
-        raise AssertionError("V11-A fixed diagnostic transition requires Q values")
-    if q_selected.shape != raw.shape or q_baseline.shape != raw.shape:
-        raise AssertionError("V11-A Q diagnostics do not match Cache node roles")
-    if not np.all(np.isfinite(q_selected)) or not np.all(np.isfinite(q_baseline)):
-        raise FloatingPointError("V11-A fixed Q diagnostics contain NaN/Inf")
-    fixed_index = int(np.random.default_rng(int(fixed_transition_seed)).integers(0, len(rollout.transitions)))
-    transition = rollout.transitions[fixed_index]
-    action_records = []
-    for node_index, action in enumerate(transition.cache_conditional_actions):
-        action_records.append(
-            {
-                "node_index": int(node_index),
-                "node_id": str(action.get("head_id")),
-                "operation": str(action.get("operation_type")),
-                "selected_index": action.get("selected_index"),
-            }
-        )
-    fields["cf_adv_fixed_transition"] = {
-        "transition_index": fixed_index,
-        "origin": int(transition.origin_index),
-        "selected_action": action_records,
-        "A_global": float(update.ppo_advantages[fixed_index]),
-        "A_global_raw": float(update.raw_advantages[fixed_index]),
-        "A_cf_by_cache_node": [
-            float(value) for value in raw[fixed_index].tolist()
-        ],
-        "A_cf_normalized_by_cache_node": [
-            float(value) for value in normalized[fixed_index].tolist()
-        ],
-        "valid_node_time": [bool(value) for value in valid[fixed_index].tolist()],
-        "Q_selected_by_cache_node": [
-            float(value) for value in q_selected[fixed_index].tolist()
-        ],
-        "Q_counterfactual_baseline_by_cache_node": [
-            float(value) for value in q_baseline[fixed_index].tolist()
-        ],
-    }
-    return fields
-
-
-def _v10c_kl_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
-    """Return V10-C-only minibatch/epoch KL diagnostics for update JSONL."""
+def _branch_kl_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
+    """Return branch-specific minibatch/epoch KL diagnostics for update JSONL."""
 
     if not update.kl_epoch_diagnostics:
         return {}
@@ -1862,7 +1612,7 @@ def _append_critic_diagnostics(
 
 
 def load_environment_context(
-    config_path: str = "configs/system_config.toml",
+    config_path: str = "configs/proposed/system_config_ppo_recovery_r2_6e4.toml",
     realization_dir: str | Path | None = None,
 ) -> EnvironmentContext:
     cfg = project_config.load_config(config_path)
@@ -1991,6 +1741,20 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
                 DEFAULT_ADVANTAGE_NORMALIZATION_MODE,
             )
         ),
+        operation_advantage_normalization_mode=str(
+            get(
+                cfg,
+                "algorithm.ppo.operation_advantage_normalization_mode",
+                DEFAULT_OPERATION_ADVANTAGE_NORMALIZATION_MODE,
+            )
+        ),
+        operation_advantage_reference_scale=float(
+            get(
+                cfg,
+                "algorithm.ppo.operation_advantage_reference_scale",
+                DEFAULT_OPERATION_ADVANTAGE_REFERENCE_SCALE,
+            )
+        ),
         critic_value_scale_mode=str(
             get(
                 cfg,
@@ -2042,6 +1806,21 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
     }:
         raise ValueError(
             "advantage_normalization_mode 只支持 centered_std/std_only。"
+        )
+    if values.operation_advantage_normalization_mode not in {
+        OPERATION_ADVANTAGE_NORMALIZATION_STD_ONLY,
+        OPERATION_ADVANTAGE_NORMALIZATION_FIXED_REFERENCE_SCALE,
+    }:
+        raise ValueError(
+            "operation_advantage_normalization_mode 只支持 "
+            "std_only/fixed_reference_scale。"
+        )
+    if (
+        not math.isfinite(values.operation_advantage_reference_scale)
+        or values.operation_advantage_reference_scale <= 0.0
+    ):
+        raise ValueError(
+            "operation_advantage_reference_scale 必须是正的有限数。"
         )
     if values.critic_value_scale_mode not in {
         CRITIC_VALUE_SCALE_NONE,
@@ -2137,7 +1916,7 @@ def aligned_train_steps(
 
 
 class PPOV2Trainer:
-    """PPO core for the formal V6 path and retained base-config compatibility."""
+    """PPO core for the Recovery R2 mainline and explicit baseline paths."""
 
     def __init__(self, context: EnvironmentContext, device: str = "cpu") -> None:
         _require_torch()
@@ -2157,12 +1936,9 @@ class PPOV2Trainer:
             raise ValueError(
                 "algorithm.ppo.cache_kl_control 只支持 epoch/minibatch_early_stop。"
             )
-        if (
-            self.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP
-            and context.policy_schema not in JOINT_V11A_CACHE_NODE_CF_POLICY_SCHEMAS
-        ):
+        if self.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP:
             raise ValueError(
-                "minibatch_early_stop cache KL control requires the V11-A policy schema."
+                "minibatch_early_stop cache KL control is not part of the Recovery R2 mainline."
             )
         if (
             self.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP
@@ -2187,61 +1963,40 @@ class PPOV2Trainer:
             )
         if (
             self.kl_gate_mode == KL_GATE_MODE_BRANCH_SPECIFIC
-            and context.policy_schema not in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
+            and context.policy_schema not in BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
         ):
             raise ValueError(
-                "branch_specific KL gate requires the V10-D policy schema"
+                "branch_specific KL gate requires the Recovery R2 policy schema"
             )
         if (
-            context.policy_schema in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
+            context.policy_schema in BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
             and self.kl_gate_mode != KL_GATE_MODE_BRANCH_SPECIFIC
         ):
-            raise ValueError("V10-D policy schema requires kl_gate_mode=branch_specific")
+            raise ValueError("Recovery R2 policy schema requires kl_gate_mode=branch_specific")
         self.device = torch.device(device)
         if context.configuration_control_mode in {
             "policy_primitive",
             "policy_primitive_v7_cache_operation",
-            "policy_primitive_v9_joint_cache_uav_operation",
+            "policy_primitive_r2_joint_cache_uav_operation",
         }:
             primitive_spec = PrimitiveTensorSpec.create(context)
             policy_class: type[AdaptivePrimitiveActorCritic]
-            if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
-                if context.policy_schema not in JOINT_CACHE_UAV_POLICY_SCHEMAS:
+            if context.configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation":
+                if context.policy_schema not in RECOVERY_POLICY_SCHEMAS:
                     raise ValueError(
-                        "policy_primitive_v9_joint_cache_uav_operation requires a supported Joint Cache/UAV schema"
+                        "policy_primitive_r2_joint_cache_uav_operation requires the Recovery R2 policy schema"
                     )
-                if context.policy_schema in JOINT_V11A_CACHE_NODE_CF_POLICY_SCHEMAS:
-                    policy_class = (
-                        AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic
+                policy_class = (
+                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic
+                    if context.policy_schema
+                    == AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic.architecture_id
+                    else (
+                        AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic
+                        if context.policy_schema
+                        == AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic.architecture_id
+                        else AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic
                     )
-                elif context.policy_schema in JOINT_RECOVERY_R2_POLICY_SCHEMAS:
-                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic
-                elif context.policy_schema in JOINT_RECOVERY_R1_POLICY_SCHEMAS:
-                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic
-                elif context.policy_schema in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS:
-                    policy_class = (
-                        AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic
-                    )
-                elif context.policy_schema in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS:
-                    policy_class = (
-                        AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic
-                    )
-                elif (
-                    context.policy_schema
-                    == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic.architecture_id
-                ):
-                    policy_class = (
-                        AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic
-                    )
-                elif (
-                    context.policy_schema
-                    == AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic.architecture_id
-                ):
-                    policy_class = (
-                        AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic
-                    )
-                else:
-                    policy_class = AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
+                )
                 self.policy = policy_class(
                     int(context.observation_spec.observation_dim),
                     int(context.action_spec.action_dim),
@@ -2350,57 +2105,15 @@ class PPOV2Trainer:
             self.actor_optimizer = None
             self.critic_optimizer = None
         self.critic_return_statistics = RunningReturnStatistics()
-        self.q_cache: CacheNodeCounterfactualCritic | None = None
-        self.q_cache_optimizer: Any | None = None
-        self.q_cache_optimizer_steps = 0
-        if self._uses_v11a_cache_node_cf():
-            primitive_spec = PrimitiveTensorSpec.create(context)
-            cache_operation_count = len(getattr(self.policy, "operation_order", ()))
-            uav_operation_count = len(getattr(self.policy, "uav_operation_order", ()))
-            if cache_operation_count <= 0 or uav_operation_count <= 0:
-                raise ValueError("V11-A action orders must be non-empty")
-            cache_action_encoding_dim = (
-                int(cache_operation_count)
-                + int(primitive_spec.cache_max_candidates)
-                + int(primitive_spec.cache_feature_dim)
-            )
-            uav_action_encoding_dim = (
-                int(uav_operation_count)
-                + int(primitive_spec.uav_max_candidates)
-                + int(primitive_spec.uav_feature_dim)
-            )
-            joint_action_dim = (
-                int(primitive_spec.num_cache_heads) * cache_action_encoding_dim
-                + int(primitive_spec.num_uav_heads) * uav_action_encoding_dim
-            )
-            self.q_cache = CacheNodeCounterfactualCritic(
-                int(context.observation_spec.observation_dim),
-                int(primitive_spec.num_cache_heads),
-                joint_action_dim,
-                self.hyperparameters.hidden_sizes,
-            ).to(self.device)
-            self.v11a_cache_action_encoding_dim = int(cache_action_encoding_dim)
-            self.v11a_uav_action_encoding_dim = int(uav_action_encoding_dim)
-            self.v11a_joint_action_dim = int(joint_action_dim)
-            policy_parameter_ids = {id(parameter) for parameter in self.policy.parameters()}
-            q_parameter_ids = {id(parameter) for parameter in self.q_cache.parameters()}
-            if policy_parameter_ids & q_parameter_ids:
-                raise RuntimeError(
-                    "V11-A Q_cache parameters unexpectedly share tensors with Actor/global critic."
-                )
-            self.q_cache_optimizer = torch.optim.Adam(
-                self.q_cache.parameters(),
-                lr=self.hyperparameters.critic_learning_rate,
-            )
 
     def _uses_separate_optimization(self) -> bool:
         return self.policy.architecture_id in SEPARATE_OPTIMIZATION_POLICY_SCHEMAS
 
-    def _uses_v11a_cache_node_cf(self) -> bool:
-        return self.policy.architecture_id in JOINT_V11A_CACHE_NODE_CF_POLICY_SCHEMAS
-
     def _uses_r2_operation_credit(self) -> bool:
-        return self.policy.architecture_id in JOINT_RECOVERY_R2_POLICY_SCHEMAS
+        return self.policy.architecture_id in RECOVERY_POLICY_SCHEMAS
+
+    def _uses_r4_candidate_credit(self) -> bool:
+        return self.policy.architecture_id in CANDIDATE_CREDIT_POLICY_SCHEMAS
 
     def _uses_popart_critic(self) -> bool:
         return self.policy.architecture_id in POPART_POLICY_SCHEMAS
@@ -2418,16 +2131,8 @@ class PPOV2Trainer:
         )
 
     def _expected_checkpoint_version(self) -> int:
-        if self._uses_v11a_cache_node_cf():
-            return V11A_CACHE_NODE_CF_CHECKPOINT_VERSION
-        if self.policy.architecture_id in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS:
-            return V10D_BRANCH_SPECIFIC_KL_CHECKPOINT_VERSION
-        if self.policy.architecture_id in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS:
-            return V10C_DECOUPLED_CHECKPOINT_VERSION
-        if self.policy.architecture_id in JOINT_V10_BRANCHWISE_POLICY_SCHEMAS:
-            return V10_BRANCHWISE_CHECKPOINT_VERSION
-        if self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS:
-            return V9_JOINT_CHECKPOINT_VERSION
+        if self.policy.architecture_id in RECOVERY_POLICY_SCHEMAS:
+            return R2_CHECKPOINT_VERSION
         if self.policy.architecture_id in NO_PREDICTION_POLICY_SCHEMAS:
             return V8_NO_PREDICTION_CHECKPOINT_VERSION
         if self.policy.architecture_id in V8_POLICY_SCHEMAS:
@@ -2445,604 +2150,6 @@ class PPOV2Trainer:
             PRIMITIVE_CHECKPOINT_VERSION
             if self.context.configuration_control_mode == "policy_primitive"
             else CHECKPOINT_VERSION
-        )
-
-    def _v11a_build_joint_action_encoding(
-        self,
-        *,
-        cache_operation_actions: Any,
-        all_candidate_features: Any,
-        all_candidate_masks: Any,
-        cache_selected_indices: Any,
-        uav_operation_actions: Any,
-        uav_candidate_features: Any,
-        uav_candidate_masks: Any,
-        uav_selected_indices: Any,
-    ) -> Any:
-        """Encode the sampled production action for every Cache node and UAV.
-
-        Each Cache slice is ``[operation one-hot, candidate one-hot,
-        primitive feature]``.  Each UAV slice uses the same representation
-        with the existing ``STAY/MOVE`` operation and candidate tensors.  The
-        result is deterministic for a rollout transition and is the only
-        action input consumed by the centralized Q_cache.
-        """
-
-        if not self._uses_v11a_cache_node_cf():
-            raise RuntimeError("V11-A joint action encoding requested for a non-V11-A policy")
-        if self.q_cache is None:
-            raise RuntimeError("V11-A Cache critic is not initialized")
-        cache_actions_t = torch.as_tensor(
-            cache_operation_actions, dtype=torch.long, device=self.device
-        )
-        all_features_t = torch.as_tensor(
-            all_candidate_features, dtype=torch.float32, device=self.device
-        )
-        all_masks_t = torch.as_tensor(
-            all_candidate_masks, dtype=torch.bool, device=self.device
-        )
-        cache_indices_t = torch.as_tensor(
-            cache_selected_indices, dtype=torch.long, device=self.device
-        )
-        uav_actions_t = torch.as_tensor(
-            uav_operation_actions, dtype=torch.long, device=self.device
-        )
-        uav_features_t = torch.as_tensor(
-            uav_candidate_features, dtype=torch.float32, device=self.device
-        )
-        uav_masks_t = torch.as_tensor(
-            uav_candidate_masks, dtype=torch.bool, device=self.device
-        )
-        uav_indices_t = torch.as_tensor(
-            uav_selected_indices, dtype=torch.long, device=self.device
-        )
-        if cache_actions_t.ndim != 2:
-            raise ValueError("V11-A Cache operation actions must be [T,H]")
-        sample_count, node_count = [int(value) for value in cache_actions_t.shape]
-        if all_features_t.ndim != 5:
-            raise ValueError("V11-A all Cache candidate features must be [T,H,O,C,F]")
-        if tuple(all_features_t.shape[:2]) != (sample_count, node_count):
-            raise ValueError("V11-A Cache action/state sample shape mismatch")
-        operation_count = len(getattr(self.policy, "operation_order", ()))
-        uav_operation_count = len(getattr(self.policy, "uav_operation_order", ()))
-        if operation_count <= 0 or uav_operation_count <= 0:
-            raise ValueError("V11-A operation orders must be non-empty")
-        candidate_count = int(all_features_t.shape[3])
-        cache_feature_dim = int(all_features_t.shape[4])
-        if tuple(all_features_t.shape[2:]) != (
-            operation_count,
-            candidate_count,
-            cache_feature_dim,
-        ):
-            raise ValueError("V11-A Cache feature tensor shape mismatch")
-        if tuple(all_masks_t.shape) != (
-            sample_count,
-            node_count,
-            operation_count,
-            candidate_count,
-        ):
-            raise ValueError("V11-A Cache mask tensor shape mismatch")
-        if tuple(cache_indices_t.shape) != (sample_count, node_count):
-            raise ValueError("V11-A Cache selected-index tensor shape mismatch")
-        if node_count != self.q_cache.num_cache_nodes:
-            raise ValueError("V11-A Cache critic node count mismatch")
-        if int(all_features_t.shape[0]) != sample_count:
-            raise ValueError("V11-A Cache feature sample count mismatch")
-        if uav_actions_t.ndim != 2 or int(uav_actions_t.shape[0]) != sample_count:
-            raise ValueError("V11-A UAV operation actions must be [T,U]")
-        uav_count = int(uav_actions_t.shape[1])
-        if uav_features_t.ndim != 4:
-            raise ValueError("V11-A UAV candidate features must be [T,U,C,F]")
-        uav_candidate_count = int(uav_features_t.shape[2])
-        uav_feature_dim = int(uav_features_t.shape[3])
-        if tuple(uav_masks_t.shape) != (sample_count, uav_count, uav_candidate_count):
-            raise ValueError("V11-A UAV candidate mask tensor shape mismatch")
-        if tuple(uav_indices_t.shape) != (sample_count, uav_count):
-            raise ValueError("V11-A UAV selected-index tensor shape mismatch")
-        if int(uav_features_t.shape[1]) != uav_count:
-            raise ValueError("V11-A UAV feature head count mismatch")
-        if uav_count <= 0:
-            raise ValueError("V11-A rollout must contain at least one UAV action")
-        if not (
-            bool(torch.all(torch.isfinite(all_features_t)).item())
-            and bool(torch.all(torch.isfinite(uav_features_t)).item())
-        ):
-            raise FloatingPointError("V11-A joint action features contain NaN/Inf")
-        if bool(torch.any(cache_actions_t < 0).item()) or bool(
-            torch.any(cache_actions_t >= operation_count).item()
-        ):
-            raise ValueError("V11-A Cache operation action is out of range")
-        if bool(torch.any(cache_indices_t < 0).item()) or bool(
-            torch.any(cache_indices_t >= candidate_count).item()
-        ):
-            raise ValueError("V11-A Cache candidate action is out of range")
-        if bool(torch.any(uav_actions_t < 0).item()) or bool(
-            torch.any(uav_actions_t >= uav_operation_count).item()
-        ):
-            raise ValueError("V11-A UAV operation action is out of range")
-        if bool(torch.any(uav_indices_t < 0).item()) or bool(
-            torch.any(uav_indices_t >= uav_candidate_count).item()
-        ):
-            raise ValueError("V11-A UAV candidate action is out of range")
-        time_grid = torch.arange(sample_count, device=self.device)[:, None]
-        cache_node_grid = torch.arange(node_count, device=self.device)[None, :]
-        selected_cache_valid = all_masks_t[
-            time_grid,
-            cache_node_grid,
-            cache_actions_t,
-            cache_indices_t,
-        ]
-        if not bool(torch.all(selected_cache_valid).item()):
-            raise ValueError("V11-A selected Cache primitive is outside the legal action set")
-        uav_time_grid = torch.arange(sample_count, device=self.device)[:, None]
-        uav_head_grid = torch.arange(uav_count, device=self.device)[None, :]
-        selected_uav_valid = uav_masks_t[
-            uav_time_grid,
-            uav_head_grid,
-            uav_indices_t,
-        ]
-        if not bool(torch.all(selected_uav_valid).item()):
-            raise ValueError("V11-A selected UAV primitive is outside the legal action set")
-        selected_cache_features = all_features_t[
-            time_grid,
-            cache_node_grid,
-            cache_actions_t,
-            cache_indices_t,
-        ]
-        selected_uav_features = uav_features_t[
-            uav_time_grid,
-            uav_head_grid,
-            uav_indices_t,
-        ]
-        cache_encoding = torch.cat(
-            [
-                torch.nn.functional.one_hot(
-                    cache_actions_t, num_classes=operation_count
-                ).to(dtype=torch.float32),
-                torch.nn.functional.one_hot(
-                    cache_indices_t, num_classes=candidate_count
-                ).to(dtype=torch.float32),
-                selected_cache_features,
-            ],
-            dim=-1,
-        )
-        uav_encoding = torch.cat(
-            [
-                torch.nn.functional.one_hot(
-                    uav_actions_t, num_classes=uav_operation_count
-                ).to(dtype=torch.float32),
-                torch.nn.functional.one_hot(
-                    uav_indices_t, num_classes=uav_candidate_count
-                ).to(dtype=torch.float32),
-                selected_uav_features,
-            ],
-            dim=-1,
-        )
-        joint_action_encoding = torch.cat(
-            [cache_encoding.reshape(sample_count, -1), uav_encoding.reshape(sample_count, -1)],
-            dim=-1,
-        )
-        if int(joint_action_encoding.shape[1]) != self.q_cache.joint_action_dim:
-            raise ValueError(
-                "V11-A centralized action encoding dimension mismatch: "
-                f"expected={self.q_cache.joint_action_dim}, "
-                f"got={int(joint_action_encoding.shape[1])}"
-            )
-        return joint_action_encoding
-
-    def _v11a_selected_q_values(
-        self,
-        observations_t: Any,
-        joint_action_encoding_t: Any,
-    ) -> Any:
-        if self.q_cache is None:
-            raise RuntimeError("V11-A Cache critic is not initialized")
-        if observations_t.ndim != 2 or joint_action_encoding_t.ndim != 2:
-            raise ValueError("V11-A selected Q inputs must be [T,D] and [T,J]")
-        sample_count = int(observations_t.shape[0])
-        node_count = int(self.q_cache.num_cache_nodes)
-        if int(joint_action_encoding_t.shape[0]) != sample_count:
-            raise ValueError("V11-A selected Q state/action sample mismatch")
-        node_grid = torch.arange(node_count, dtype=torch.long, device=self.device)[None, :]
-        node_grid = node_grid.expand(sample_count, node_count)
-        return self.q_cache(
-            observations_t[:, None, :].expand(sample_count, node_count, -1).reshape(
-                sample_count * node_count, -1
-            ),
-            node_grid.reshape(-1),
-            joint_action_encoding_t[:, None, :].expand(
-                sample_count, node_count, -1
-            ).reshape(sample_count * node_count, -1),
-        ).reshape(sample_count, node_count)
-
-    def _v11a_q_selected_metrics(
-        self,
-        observations_t: Any,
-        joint_action_encoding_t: Any,
-        targets_t: Any,
-    ) -> tuple[float, float]:
-        with torch.no_grad():
-            predictions = self._v11a_selected_q_values(
-                observations_t, joint_action_encoding_t
-            )
-            target_matrix = targets_t[:, None].expand_as(predictions)
-            residual = predictions - target_matrix
-            loss = 0.5 * torch.mean(residual**2)
-            target_variance = torch.var(target_matrix.reshape(-1), unbiased=False)
-            if float(target_variance.detach().cpu()) <= 1.0e-12:
-                explained_variance = 0.0
-            else:
-                explained_variance = float(
-                    (
-                        1.0
-                        - torch.var(residual.reshape(-1), unbiased=False)
-                        / target_variance
-                    ).detach().cpu()
-                )
-            loss_value = float(loss.detach().cpu())
-        if not math.isfinite(loss_value) or not math.isfinite(explained_variance):
-            raise FloatingPointError("V11-A Q_cache selected metrics are non-finite")
-        return loss_value, explained_variance
-
-    def _train_v11a_cache_node_critic(
-        self,
-        *,
-        observations: Any,
-        cache_contexts: Any,
-        operation_masks: Any,
-        operation_actions: Any,
-        all_candidate_features: Any,
-        all_candidate_masks: Any,
-        selected_indices: Any,
-        uav_operation_actions: Any,
-        uav_candidate_features: Any,
-        uav_candidate_masks: Any,
-        uav_selected_indices: Any,
-        critic_targets: Any,
-    ) -> dict[str, Any]:
-        """Train centralized Q_cache first, then freeze it for CF PPO signals."""
-
-        if not self._uses_v11a_cache_node_cf():
-            raise RuntimeError("V11-A Cache critic requested for a non-V11-A policy")
-        if self.q_cache is None or self.q_cache_optimizer is None:
-            raise RuntimeError("V11-A Cache critic optimizer is not initialized")
-        observations_t = torch.as_tensor(
-            observations, dtype=torch.float32, device=self.device
-        )
-        contexts_t = torch.as_tensor(cache_contexts, dtype=torch.float32, device=self.device)
-        operation_masks_t = torch.as_tensor(
-            operation_masks, dtype=torch.bool, device=self.device
-        )
-        operation_actions_t = torch.as_tensor(
-            operation_actions, dtype=torch.long, device=self.device
-        )
-        all_features_t = torch.as_tensor(
-            all_candidate_features, dtype=torch.float32, device=self.device
-        )
-        all_masks_t = torch.as_tensor(
-            all_candidate_masks, dtype=torch.bool, device=self.device
-        )
-        selected_indices_t = torch.as_tensor(
-            selected_indices, dtype=torch.long, device=self.device
-        )
-        uav_operation_actions_t = torch.as_tensor(
-            uav_operation_actions, dtype=torch.long, device=self.device
-        )
-        uav_candidate_features_t = torch.as_tensor(
-            uav_candidate_features, dtype=torch.float32, device=self.device
-        )
-        uav_candidate_masks_t = torch.as_tensor(
-            uav_candidate_masks, dtype=torch.bool, device=self.device
-        )
-        uav_selected_indices_t = torch.as_tensor(
-            uav_selected_indices, dtype=torch.long, device=self.device
-        )
-        targets_t = torch.as_tensor(
-            critic_targets, dtype=torch.float32, device=self.device
-        )
-        if observations_t.ndim != 2:
-            raise ValueError("V11-A Q_cache observations must be [T,D]")
-        sample_count, observation_dim = [int(value) for value in observations_t.shape]
-        if contexts_t.ndim != 3 or int(contexts_t.shape[0]) != sample_count:
-            raise ValueError("V11-A Cache context tensor shape mismatch")
-        node_count = int(operation_actions_t.shape[1])
-        operation_count = len(getattr(self.policy, "operation_order", ()))
-        if tuple(operation_masks_t.shape) != (sample_count, node_count, operation_count):
-            raise ValueError("V11-A Cache operation mask tensor shape mismatch")
-        if tuple(operation_actions_t.shape) != tuple(selected_indices_t.shape):
-            raise ValueError("V11-A Cache operation/index shape mismatch")
-        if tuple(targets_t.shape) != (sample_count,):
-            raise ValueError("V11-A Cache critic target shape mismatch")
-        if observation_dim != self.q_cache.observation_dim:
-            raise ValueError("V11-A Cache critic observation dimension mismatch")
-        if not (
-            bool(torch.all(torch.isfinite(observations_t)).item())
-            and bool(torch.all(torch.isfinite(contexts_t)).item())
-            and bool(torch.all(torch.isfinite(targets_t)).item())
-        ):
-            raise FloatingPointError("V11-A Q_cache state/target inputs contain NaN/Inf")
-        joint_action_encoding_t = self._v11a_build_joint_action_encoding(
-            cache_operation_actions=operation_actions_t,
-            all_candidate_features=all_features_t,
-            all_candidate_masks=all_masks_t,
-            cache_selected_indices=selected_indices_t,
-            uav_operation_actions=uav_operation_actions_t,
-            uav_candidate_features=uav_candidate_features_t,
-            uav_candidate_masks=uav_candidate_masks_t,
-            uav_selected_indices=uav_selected_indices_t,
-        )
-        hyper = self.hyperparameters
-        if sample_count < hyper.num_minibatches or sample_count % hyper.num_minibatches != 0:
-            raise ValueError("V11-A Q rollout length must be divisible by num_minibatches")
-        minibatch_size = sample_count // hyper.num_minibatches
-        q_steps_before = int(self.q_cache_optimizer_steps)
-        q_loss_before, q_ev_before = self._v11a_q_selected_metrics(
-            observations_t, joint_action_encoding_t, targets_t
-        )
-        q_epoch_diagnostics: list[dict[str, Any]] = []
-        q_raw_gradient_norms: list[float] = []
-        q_clipped_gradient_norms: list[float] = []
-        for q_epoch in range(hyper.update_epochs):
-            permutation = torch.randperm(sample_count, device=self.device)
-            for start in range(0, sample_count, minibatch_size):
-                indices = permutation[start : start + minibatch_size]
-                q_predictions = self._v11a_selected_q_values(
-                    observations_t[indices], joint_action_encoding_t[indices]
-                )
-                q_target_batch = targets_t[indices, None].expand_as(q_predictions)
-                q_loss_tensor = 0.5 * torch.mean((q_predictions - q_target_batch) ** 2)
-                if not bool(torch.isfinite(q_loss_tensor).item()):
-                    raise FloatingPointError("V11-A Q_cache loss is non-finite")
-                self.q_cache_optimizer.zero_grad(set_to_none=True)
-                q_loss_tensor.backward()
-                for parameter in self.q_cache.parameters():
-                    if parameter.grad is not None and not bool(
-                        torch.all(torch.isfinite(parameter.grad)).item()
-                    ):
-                        raise FloatingPointError("V11-A Q_cache gradient is non-finite")
-                q_grad_norm_raw = _gradient_group_norm(self.q_cache.parameters())
-                if not math.isfinite(q_grad_norm_raw):
-                    raise FloatingPointError("V11-A Q_cache raw gradient norm is non-finite")
-                clipped_norm = torch.nn.utils.clip_grad_norm_(
-                    self.q_cache.parameters(), hyper.max_grad_norm
-                )
-                if not bool(torch.isfinite(clipped_norm).item()):
-                    raise FloatingPointError(
-                        "V11-A Q_cache gradient clipping norm is non-finite"
-                    )
-                q_grad_norm_clipped = _gradient_group_norm(self.q_cache.parameters())
-                if not math.isfinite(q_grad_norm_clipped):
-                    raise FloatingPointError(
-                        "V11-A Q_cache clipped gradient norm is non-finite"
-                    )
-                self.q_cache_optimizer.step()
-                self.q_cache_optimizer_steps += 1
-                q_raw_gradient_norms.append(float(q_grad_norm_raw))
-                q_clipped_gradient_norms.append(float(q_grad_norm_clipped))
-            q_loss_epoch, q_ev_epoch = self._v11a_q_selected_metrics(
-                observations_t, joint_action_encoding_t, targets_t
-            )
-            q_epoch_diagnostics.append(
-                {
-                    "q_epoch": int(q_epoch + 1),
-                    "q_loss": float(q_loss_epoch),
-                    "q_ev": float(q_ev_epoch),
-                    "q_grad_norm_raw": float(np.mean(q_raw_gradient_norms[-hyper.num_minibatches:])),
-                    "q_grad_norm_clipped": float(
-                        np.mean(q_clipped_gradient_norms[-hyper.num_minibatches:])
-                    ),
-                    "q_optimizer_steps": int(self.q_cache_optimizer_steps),
-                }
-            )
-        q_steps_per_rollout = int(self.q_cache_optimizer_steps) - q_steps_before
-        expected_q_steps = int(hyper.update_epochs * hyper.num_minibatches)
-        if q_steps_per_rollout != expected_q_steps:
-            raise RuntimeError(
-                "V11-A Q schedule step count mismatch: "
-                f"expected={expected_q_steps}, got={q_steps_per_rollout}"
-            )
-        q_loss_after, q_ev_after = self._v11a_q_selected_metrics(
-            observations_t, joint_action_encoding_t, targets_t
-        )
-        with torch.no_grad():
-            all_action_log_probs = self.policy.evaluate_cache_all_action_log_probs(
-                contexts_t,
-                operation_masks_t,
-                all_features_t,
-                all_masks_t,
-            )
-            if tuple(all_action_log_probs.shape) != tuple(all_masks_t.shape):
-                raise ValueError("V11-A Cache legal action log-probability shape mismatch")
-            legal_log_prob_mask = torch.isfinite(all_action_log_probs) | torch.isneginf(
-                all_action_log_probs
-            )
-            if not bool(torch.all(legal_log_prob_mask).item()):
-                raise FloatingPointError("V11-A Cache legal action log-probabilities contain NaN/Inf")
-            action_probabilities = torch.where(
-                torch.isfinite(all_action_log_probs),
-                torch.exp(all_action_log_probs),
-                torch.zeros_like(all_action_log_probs),
-            )
-            probability_sums = action_probabilities.sum(dim=(2, 3))
-            probability_sum_error = float(
-                torch.max(torch.abs(probability_sums - 1.0)).detach().cpu()
-            )
-            if not math.isfinite(probability_sum_error) or probability_sum_error > 1.0e-5:
-                raise FloatingPointError(
-                    "V11-A legal Cache action probabilities do not sum to one: "
-                    f"max_abs_error={probability_sum_error}"
-                )
-            legal_positions = torch.nonzero(all_masks_t, as_tuple=False)
-            if int(legal_positions.shape[0]) <= 0:
-                raise ValueError("V11-A Cache action support is empty")
-            all_q_values = torch.zeros(
-                all_masks_t.shape, dtype=torch.float32, device=self.device
-            )
-            cache_action_dim = int(self.v11a_cache_action_encoding_dim)
-            q_chunk_size = 4096
-            for start in range(0, int(legal_positions.shape[0]), q_chunk_size):
-                positions = legal_positions[start : start + q_chunk_size]
-                time_indices = positions[:, 0]
-                target_nodes = positions[:, 1]
-                alternative_operations = positions[:, 2]
-                alternative_indices = positions[:, 3]
-                alternative_cache_encoding = torch.cat(
-                    [
-                        torch.nn.functional.one_hot(
-                            alternative_operations,
-                            num_classes=operation_count,
-                        ).to(dtype=torch.float32),
-                        torch.nn.functional.one_hot(
-                            alternative_indices,
-                            num_classes=int(all_features_t.shape[3]),
-                        ).to(dtype=torch.float32),
-                        all_features_t[
-                            time_indices,
-                            target_nodes,
-                            alternative_operations,
-                            alternative_indices,
-                        ],
-                    ],
-                    dim=-1,
-                )
-                alternative_joint_encoding = joint_action_encoding_t[time_indices].clone()
-                offsets = target_nodes * cache_action_dim
-                for local_index in range(int(positions.shape[0])):
-                    offset = int(offsets[local_index].item())
-                    alternative_joint_encoding[
-                        local_index, offset : offset + cache_action_dim
-                    ] = alternative_cache_encoding[local_index]
-                alternative_q_values = self.q_cache(
-                    observations_t[time_indices],
-                    target_nodes,
-                    alternative_joint_encoding,
-                )
-                all_q_values[
-                    time_indices,
-                    target_nodes,
-                    alternative_operations,
-                    alternative_indices,
-                ] = alternative_q_values
-            time_grid = torch.arange(sample_count, device=self.device)[:, None]
-            node_grid = torch.arange(node_count, device=self.device)[None, :]
-            selected_q_values = self._v11a_selected_q_values(
-                observations_t, joint_action_encoding_t
-            )
-            baseline = (action_probabilities * all_q_values).sum(dim=(2, 3))
-            cf_raw = selected_q_values - baseline
-            valid_node_mask = all_masks_t.sum(dim=(2, 3)) > 1
-            valid_values = cf_raw[valid_node_mask]
-            if int(valid_values.numel()) <= 0:
-                raise ValueError("V11-A rollout has no Cache node with policy freedom")
-            cf_raw_mean_tensor = valid_values.mean()
-            cf_raw_std_tensor = valid_values.std(unbiased=False)
-            cf_scale = cf_raw_std_tensor + 1.0e-8
-            cf_normalized = torch.zeros_like(cf_raw)
-            cf_normalized[valid_node_mask] = (
-                valid_values - cf_raw_mean_tensor
-            ) / cf_scale
-        if not bool(torch.all(torch.isfinite(cf_raw)).item()) or not bool(
-            torch.all(torch.isfinite(cf_normalized)).item()
-        ):
-            raise FloatingPointError("V11-A CF advantages contain NaN/Inf")
-        cf_values = valid_values.detach().cpu().numpy().astype(np.float64)
-        cf_normalized_values = cf_normalized[valid_node_mask].detach().cpu().numpy().astype(
-            np.float64
-        )
-        return {
-            "q_cache_loss": float(q_loss_after),
-            "q_cache_explained_variance": float(q_ev_after),
-            "q_cache_grad_norm_raw": float(q_raw_gradient_norms[-1]),
-            "q_cache_grad_norm_clipped": float(q_clipped_gradient_norms[-1]),
-            "q_cache_optimizer_steps": int(self.q_cache_optimizer_steps),
-            "q_cache_optimizer_steps_per_rollout": int(q_steps_per_rollout),
-            "q_cache_loss_before": float(q_loss_before),
-            "q_cache_loss_after": float(q_loss_after),
-            "q_cache_ev_before": float(q_ev_before),
-            "q_cache_ev_after": float(q_ev_after),
-            "q_cache_epoch_diagnostics": tuple(q_epoch_diagnostics),
-            "cf_adv_raw": cf_raw.detach().cpu().numpy().astype(np.float32),
-            "cf_adv_normalized": cf_normalized.detach().cpu().numpy().astype(np.float32),
-            "cf_adv_valid_mask": valid_node_mask.detach().cpu().numpy().astype(bool),
-            "cf_adv_raw_mean": float(cf_values.mean()),
-            "cf_adv_raw_std": float(cf_values.std()),
-            "cf_adv_normalized_mean": float(cf_normalized_values.mean()),
-            "cf_adv_normalized_std": float(cf_normalized_values.std()),
-            "cf_adv_min": float(cf_values.min()),
-            "cf_adv_max": float(cf_values.max()),
-            "cf_adv_positive_fraction": float(np.mean(cf_normalized_values > 0.0)),
-            "cf_adv_negative_fraction": float(np.mean(cf_normalized_values < 0.0)),
-            "cache_action_probability_sum_max_abs_error": probability_sum_error,
-            "q_cache_selected_values": selected_q_values.detach().cpu().numpy().astype(
-                np.float32
-            ),
-            "q_cache_counterfactual_baseline": baseline.detach().cpu().numpy().astype(
-                np.float32
-            ),
-            "cache_node_old_q_values": selected_q_values.detach().cpu().numpy().astype(
-                np.float32
-            ),
-        }
-
-    def run_v11a_q_readiness(self, rollout: SimpleRollout) -> dict[str, Any]:
-        """Run the bounded frozen-policy Q readiness gate on one rollout."""
-
-        if not self._uses_v11a_cache_node_cf():
-            raise RuntimeError("V11-A Q readiness requested for a non-V11-A policy")
-        if any(parameter.requires_grad for parameter in self.policy.parameters()):
-            raise RuntimeError("V11-A Q readiness requires Actor/global critic parameters frozen")
-        bootstrap_value = 0.0
-        if rollout.bootstrap_observation is not None:
-            with torch.no_grad():
-                _, bootstrap_tensor = self.policy(rollout.bootstrap_observation)
-            bootstrap_value = float(bootstrap_tensor.detach().cpu())
-        advantages, returns = compute_gae(
-            rollout.rewards,
-            rollout.old_values,
-            rollout.dones,
-            bootstrap_value,
-            self.hyperparameters.gamma,
-            self.hyperparameters.gae_lambda,
-        )
-        if not np.all(np.isfinite(advantages)) or not np.all(np.isfinite(returns)):
-            raise FloatingPointError("V11-A Q readiness GAE targets contain NaN/Inf")
-        if self._uses_popart_critic():
-            readiness_statistics = RunningReturnStatistics.from_checkpoint(
-                self.critic_return_statistics.count,
-                self.critic_return_statistics.mean,
-                self.critic_return_statistics.m2,
-            )
-            readiness_statistics.update(returns)
-            target_mean, target_scale = readiness_statistics.active_statistics(
-                self.hyperparameters.critic_value_scale_epsilon,
-                self.hyperparameters.critic_value_scale_warmup_samples,
-            )
-            critic_targets = (returns - target_mean) / target_scale
-        else:
-            critic_targets = returns
-        if not np.all(np.isfinite(critic_targets)):
-            raise FloatingPointError("V11-A Q readiness targets contain NaN/Inf")
-        if (
-            rollout.v7_cache_operation_masks is None
-            or rollout.v7_cache_operation_actions is None
-            or rollout.cache_all_candidate_features is None
-            or rollout.cache_all_candidate_masks is None
-            or rollout.uav_operation_actions is None
-        ):
-            raise ValueError("V11-A Q readiness rollout is missing joint action tensors")
-        return self._train_v11a_cache_node_critic(
-            observations=rollout.observations,
-            cache_contexts=rollout.cache_contexts,
-            operation_masks=rollout.v7_cache_operation_masks,
-            operation_actions=rollout.v7_cache_operation_actions,
-            all_candidate_features=rollout.cache_all_candidate_features,
-            all_candidate_masks=rollout.cache_all_candidate_masks,
-            selected_indices=rollout.cache_selected_indices,
-            uav_operation_actions=rollout.uav_operation_actions,
-            uav_candidate_features=rollout.uav_candidate_features,
-            uav_candidate_masks=rollout.uav_candidate_masks,
-            uav_selected_indices=rollout.uav_selected_indices,
-            critic_targets=critic_targets,
         )
 
     def collect_chunk(
@@ -3151,7 +2258,12 @@ class PPOV2Trainer:
             raise FloatingPointError("Cache full-rollout KL estimator is non-finite")
         return value
 
-    def _compute_r2_operation_credit(self, rollout: SimpleRollout) -> dict[str, Any]:
+    def _compute_r2_operation_credit(
+        self,
+        rollout: SimpleRollout,
+        *,
+        target_transition_indices: tuple[int, ...] | None = None,
+    ) -> dict[str, Any]:
         """Compute detached per-UAV counterfactual one-step TD credit.
 
         This is intentionally a trainer-side replay of the already collected
@@ -3164,7 +2276,18 @@ class PPOV2Trainer:
 
         if not self._uses_r2_operation_credit():
             return {}
-        transitions = tuple(rollout.transitions)
+        all_transitions = tuple(rollout.transitions)
+        if target_transition_indices is None:
+            transitions = all_transitions
+        else:
+            selected_indices = tuple(int(index) for index in target_transition_indices)
+            if not selected_indices:
+                raise ValueError("R2 counterfactual target transition selection is empty")
+            if len(set(selected_indices)) != len(selected_indices):
+                raise ValueError("R2 counterfactual target transition selection repeats an index")
+            if any(index < 0 or index >= len(all_transitions) for index in selected_indices):
+                raise IndexError("R2 counterfactual target transition index is out of range")
+            transitions = tuple(all_transitions[index] for index in selected_indices)
         if not transitions:
             raise ValueError("R2 operation credit requires a non-empty rollout")
         uav_ids = tuple(str(value) for value in self.context.action_spec.uav_ids)
@@ -3182,16 +2305,38 @@ class PPOV2Trainer:
             ):
                 raise ValueError("R2 rollout is missing operation counterfactual tensors")
 
-        include_bootstrap_step = not bool(transitions[-1].done)
+        first_origin = int(transitions[0].origin_index)
+        last_origin = max(int(transition.origin_index) for transition in transitions)
+        include_bootstrap_step = not bool(
+            all(
+                bool(transition.done)
+                for transition in transitions
+                if int(transition.origin_index) == last_origin
+            )
+        )
+        aligned_span = last_origin - first_origin + 1 + int(include_bootstrap_step)
         aligned_steps = aligned_train_steps(
             self.context,
-            origin_start=int(transitions[0].origin_index),
-            max_steps=sample_count + int(include_bootstrap_step),
+            origin_start=first_origin,
+            max_steps=aligned_span,
             include_bootstrap_step=include_bootstrap_step,
         )
-        if len(aligned_steps) < sample_count + int(include_bootstrap_step):
+        if len(aligned_steps) < aligned_span:
             raise RuntimeError("R2 counterfactual replay is missing aligned next steps")
-        for transition, step in zip(transitions, aligned_steps[:sample_count]):
+        aligned_steps_by_origin = {
+            int(step.origin_index): step for step in aligned_steps
+        }
+        selected_aligned_steps = []
+        for transition in transitions:
+            try:
+                selected_aligned_steps.append(
+                    aligned_steps_by_origin[int(transition.origin_index)]
+                )
+            except KeyError as exc:
+                raise RuntimeError(
+                    "R2 counterfactual replay is missing a selected aligned step"
+                ) from exc
+        for transition, step in zip(transitions, selected_aligned_steps, strict=True):
             if int(transition.origin_index) != int(step.origin_index):
                 raise RuntimeError("R2 counterfactual replay origin alignment failed")
 
@@ -3199,6 +2344,28 @@ class PPOV2Trainer:
         q_move = np.zeros((sample_count, head_count), dtype=np.float64)
         baseline = np.zeros((sample_count, head_count), dtype=np.float64)
         move_candidate_counts = np.zeros((sample_count, head_count), dtype=np.int64)
+        candidate_capacity = int(transitions[0].uav_candidate_features.shape[1])
+        if candidate_capacity <= 0:
+            raise RuntimeError("R2 rollout candidate capacity must be positive")
+        if any(
+            int(transition.uav_candidate_features.shape[1]) != candidate_capacity
+            for transition in transitions
+        ):
+            raise RuntimeError("R2 rollout candidate capacity is not time-aligned")
+        # The exact branch evaluator below already produces Q_c for every legal
+        # MOVE candidate.  Keep those values and the same frozen-policy
+        # probabilities so Recovery R4 can consume them without another
+        # execute_slot/Matching/KKT enumeration.
+        candidate_q_values = np.zeros(
+            (sample_count, head_count, candidate_capacity), dtype=np.float64
+        )
+        candidate_probabilities_values = np.zeros_like(candidate_q_values)
+        candidate_valid_mask = np.zeros(
+            (sample_count, head_count, candidate_capacity), dtype=bool
+        )
+        candidate_weighted_mean_residual = np.zeros(
+            (sample_count, head_count), dtype=np.float64
+        )
         counterfactual_environment_executions = 0
         started_at = time.perf_counter()
 
@@ -3230,7 +2397,7 @@ class PPOV2Trainer:
             }
 
         for transition_index, (transition, step) in enumerate(
-            zip(transitions, aligned_steps[:sample_count])
+            zip(transitions, selected_aligned_steps, strict=True)
         ):
             previous_cache = np.asarray(
                 transition.previous_cache_state, dtype=np.int8
@@ -3338,21 +2505,30 @@ class PPOV2Trainer:
                         raise FloatingPointError(
                             "R2 candidate probabilities are non-finite or do not sum to one"
                         )
+                    if self._uses_r4_candidate_credit():
+                        candidate_probability_sum = float(candidate_probabilities.sum())
+                        candidate_probabilities = (
+                            candidate_probabilities / candidate_probability_sum
+                        )
                 else:
                     candidate_probabilities = np.zeros(0, dtype=np.float64)
 
                 next_step = (
                     None
                     if bool(transition.done)
-                    else aligned_steps[transition_index + 1]
+                    else aligned_steps_by_origin.get(int(transition.origin_index) + 1)
                 )
+                if not bool(transition.done) and next_step is None:
+                    raise RuntimeError(
+                        "R2 counterfactual replay is missing the next aligned step"
+                    )
 
                 def _evaluate_branch(
                     operation: str,
                     selected_index: int | None,
                     before: np.ndarray,
                     after: np.ndarray,
-                ) -> float:
+                ) -> tuple[float, np.ndarray | None]:
                     nonlocal counterfactual_environment_executions
                     branch_final_uav = {
                         key: value.copy() for key, value in production_final_uav.items()
@@ -3421,7 +2597,7 @@ class PPOV2Trainer:
                     )
                     reward = _check_reward(result)
                     if next_step is None:
-                        next_value = 0.0
+                        next_observation = None
                     else:
                         next_observation = _intermediate_observation(
                             np.asarray(result.next_cache_state, dtype=np.int8),
@@ -3429,37 +2605,100 @@ class PPOV2Trainer:
                             next_step,
                             self.context,
                         )
-                        with torch.no_grad():
-                            _, value_tensor = self.policy(next_observation)
-                        next_value = float(value_tensor.detach().cpu().reshape(-1)[0])
-                    q_value = reward + float(self.hyperparameters.gamma) * next_value
-                    if not math.isfinite(q_value):
-                        raise FloatingPointError("R2 counterfactual Q is non-finite")
-                    return float(q_value)
+                    return float(reward), next_observation
 
                 target_before = current_uav[uav_id].copy()
-                stay_q = _evaluate_branch(
+                branch_rewards: list[float] = []
+                branch_observations: list[np.ndarray | None] = []
+                stay_reward, stay_observation = _evaluate_branch(
                     "STAY",
                     None,
                     target_before,
                     target_before,
                 )
+                branch_rewards.append(stay_reward)
+                branch_observations.append(stay_observation)
+                if move_count:
+                    for candidate_index, candidate in enumerate(move_candidates):
+                        move_reward, move_observation = _evaluate_branch(
+                            "MOVE",
+                            candidate_index,
+                            np.asarray(candidate.before_position, dtype=np.float64),
+                            np.asarray(candidate.after_position, dtype=np.float64),
+                        )
+                        branch_rewards.append(move_reward)
+                        branch_observations.append(move_observation)
+
+                if next_step is None:
+                    next_values = np.zeros(len(branch_rewards), dtype=np.float64)
+                else:
+                    if len(branch_observations) != len(branch_rewards) or any(
+                        observation is None for observation in branch_observations
+                    ):
+                        raise RuntimeError(
+                            "R2 counterfactual branch observation batch is incomplete"
+                        )
+                    # Every branch above has already gone through the exact
+                    # environment/Matching/KKT path.  Only the critic inference
+                    # is batched here; branch order is STAY followed by the
+                    # stable legal MOVE candidate order.
+                    next_observation_batch = np.stack(
+                        [
+                            np.asarray(observation, dtype=np.float32)
+                            for observation in branch_observations
+                        ],
+                        axis=0,
+                    )
+                    with torch.no_grad():
+                        if not hasattr(self.policy, "critic_value"):
+                            raise RuntimeError(
+                                "R2 policy does not expose the exact critic_value path"
+                            )
+                        value_tensor = self.policy.critic_value(next_observation_batch)
+                    next_values = (
+                        value_tensor.detach().cpu().numpy().reshape(-1).astype(np.float64)
+                    )
+                    if next_values.shape != (len(branch_rewards),):
+                        raise RuntimeError(
+                            "R2 counterfactual critic batch shape mismatch"
+                        )
+                    # Preserve the historical scalar STAY critic result exactly.
+                    # The MOVE candidates still use the batched path; this one
+                    # extra scalar call is negligible relative to the exact
+                    # Matching/KKT branches and keeps the operation-side PPO
+                    # loss within its stricter numerical equivalence gate.
+                    with torch.no_grad():
+                        _, stay_value_tensor = self.policy(branch_observations[0])
+                    next_values[0] = float(
+                        stay_value_tensor.detach().cpu().reshape(-1)[0]
+                    )
+                q_values = np.asarray(branch_rewards, dtype=np.float64)
+                q_values += float(self.hyperparameters.gamma) * next_values
+                if not np.all(np.isfinite(q_values)):
+                    raise FloatingPointError("R2 counterfactual Q is non-finite")
+                stay_q = float(q_values[0])
                 q_stay[transition_index, head_index] = stay_q
                 if move_count:
-                    move_values = np.asarray(
-                        [
-                            _evaluate_branch(
-                                "MOVE",
-                                candidate_index,
-                                np.asarray(candidate.before_position, dtype=np.float64),
-                                np.asarray(candidate.after_position, dtype=np.float64),
-                            )
-                            for candidate_index, candidate in enumerate(move_candidates)
-                        ],
-                        dtype=np.float64,
-                    )
+                    move_values = q_values[1:]
+                    candidate_q_values[
+                        transition_index, head_index, :move_count
+                    ] = move_values
+                    candidate_probabilities_values[
+                        transition_index, head_index, :move_count
+                    ] = candidate_probabilities
+                    candidate_valid_mask[
+                        transition_index, head_index, :move_count
+                    ] = True
                     q_move[transition_index, head_index] = float(
                         np.dot(candidate_probabilities, move_values)
+                    )
+                    candidate_weighted_mean_residual[
+                        transition_index, head_index
+                    ] = float(
+                        np.dot(
+                            candidate_probabilities,
+                            move_values - q_move[transition_index, head_index],
+                        )
                     )
                 else:
                     # No MOVE branch exists, so its counterfactual value is
@@ -3484,10 +2723,40 @@ class PPOV2Trainer:
         )
         if not np.all(np.isfinite(raw_advantages)):
             raise FloatingPointError("R2 operation advantages are non-finite")
-        population_std = float(np.std(raw_advantages, ddof=0))
-        if not math.isfinite(population_std):
-            raise FloatingPointError("R2 operation advantage std is non-finite")
-        scaled_advantages = raw_advantages / (population_std + 1.0e-8)
+        operation_normalization_mode = (
+            self.hyperparameters.operation_advantage_normalization_mode
+        )
+        if (
+            operation_normalization_mode
+            == OPERATION_ADVANTAGE_NORMALIZATION_STD_ONLY
+        ):
+            population_std = float(np.std(raw_advantages, ddof=0))
+            if not math.isfinite(population_std):
+                raise FloatingPointError("R2 operation advantage std is non-finite")
+            scaled_advantages = raw_advantages / (population_std + 1.0e-8)
+            advantage_normalization = "STD_ONLY"
+            advantage_reference_scale = float(population_std)
+        elif (
+            operation_normalization_mode
+            == OPERATION_ADVANTAGE_NORMALIZATION_FIXED_REFERENCE_SCALE
+        ):
+            advantage_reference_scale = float(
+                self.hyperparameters.operation_advantage_reference_scale
+            )
+            if (
+                not math.isfinite(advantage_reference_scale)
+                or advantage_reference_scale <= 0.0
+            ):
+                raise FloatingPointError(
+                    "R3 fixed operation advantage reference scale is invalid"
+                )
+            scaled_advantages = raw_advantages / advantage_reference_scale
+            advantage_normalization = "FIXED_REFERENCE_SCALE"
+        else:  # pragma: no cover - validated by hyperparameters_from_project
+            raise ValueError(
+                "unsupported operation advantage normalization mode: "
+                f"{operation_normalization_mode}"
+            )
         nonzero = raw_advantages != 0.0
         sign_flip_count = int(
             np.count_nonzero(
@@ -3510,12 +2779,75 @@ class PPOV2Trainer:
             ),
             "mean_move_candidate_count": float(np.mean(move_candidate_counts)),
             "move_candidate_counts": move_candidate_counts,
+            "candidate_q_values": candidate_q_values,
+            "candidate_probabilities": candidate_probabilities_values,
+            "candidate_valid_mask": candidate_valid_mask,
+            "candidate_q_move": q_move.copy(),
+            "candidate_weighted_mean_residual": candidate_weighted_mean_residual,
             "credit_runtime_seconds": float(time.perf_counter() - started_at),
-            "advantage_normalization": "STD_ONLY",
+            "advantage_normalization": advantage_normalization,
+            "advantage_reference_scale": float(advantage_reference_scale),
             "advantage_centering": False,
             "advantage_sign_flip_count": sign_flip_count,
             "ratio_granularity": "OPERATION_ONLY",
         }
+
+    @staticmethod
+    def _r4_candidate_policy_loss(
+        candidate_log_probs: Any,
+        old_candidate_probabilities: Any,
+        candidate_advantages: Any,
+        candidate_valid_mask: Any,
+        clip_epsilon: float,
+    ) -> Any:
+        """Exact pi_old-weighted PPO expectation over legal MOVE candidates.
+
+        The leading dimensions are ``[batch, UAV head]`` and the final
+        dimension enumerates the padded candidate tensor.  A head with no legal
+        MOVE candidate contributes no conditional candidate loss.  The
+        operation loss remains a separate term in ``update``.
+        """
+
+        valid = torch.as_tensor(
+            candidate_valid_mask,
+            dtype=torch.bool,
+            device=candidate_log_probs.device,
+        )
+        old_probabilities = torch.as_tensor(
+            old_candidate_probabilities, dtype=torch.float32, device=valid.device
+        )
+        advantages = torch.as_tensor(
+            candidate_advantages, dtype=torch.float32, device=valid.device
+        )
+        if tuple(candidate_log_probs.shape) != tuple(valid.shape):
+            raise ValueError("R4 candidate log-probability/mask shape mismatch")
+        if tuple(old_probabilities.shape) != tuple(valid.shape) or tuple(
+            advantages.shape
+        ) != tuple(valid.shape):
+            raise ValueError("R4 candidate loss tensor shape mismatch")
+        safe_new_log_probs = torch.where(
+            valid, candidate_log_probs, torch.zeros_like(candidate_log_probs)
+        )
+        safe_old_log_probs = torch.where(
+            valid,
+            torch.log(old_probabilities.clamp_min(1.0e-12)),
+            torch.zeros_like(old_probabilities),
+        )
+        ratio = torch.exp(safe_new_log_probs - safe_old_log_probs)
+        unclipped = ratio * advantages
+        clipped = torch.clamp(
+            ratio,
+            1.0 - float(clip_epsilon),
+            1.0 + float(clip_epsilon),
+        ) * advantages
+        weighted_surrogate = (
+            old_probabilities * torch.minimum(unclipped, clipped)
+        ) * valid.to(torch.float32)
+        state_surrogate = weighted_surrogate.sum(dim=-1)
+        active_heads = valid.any(dim=-1)
+        if not bool(torch.any(active_heads).item()):
+            return candidate_log_probs.sum() * 0.0
+        return -state_surrogate[active_heads].mean()
 
     def update(self, rollout: SimpleRollout) -> UpdateResult:
         hyper = self.hyperparameters
@@ -3595,33 +2927,12 @@ class PPOV2Trainer:
         cache_selected_indices = torch.as_tensor(
             rollout.cache_selected_indices, dtype=torch.long, device=self.device
         )
-        v11a_enabled = self._uses_v11a_cache_node_cf()
-        cache_all_candidate_features = None
-        cache_all_candidate_masks = None
-        if v11a_enabled:
-            if (
-                rollout.cache_all_candidate_features is None
-                or rollout.cache_all_candidate_masks is None
-            ):
-                raise ValueError(
-                    "V11-A rollout is missing complete legal Cache candidate groups"
-                )
-            cache_all_candidate_features = torch.as_tensor(
-                rollout.cache_all_candidate_features,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            cache_all_candidate_masks = torch.as_tensor(
-                rollout.cache_all_candidate_masks,
-                dtype=torch.bool,
-                device=self.device,
-            )
         v7_operation_actions = None
         v7_operation_masks = None
         v7_operation_old_log_probs = None
         if self.context.configuration_control_mode in {
             "policy_primitive_v7_cache_operation",
-            "policy_primitive_v9_joint_cache_uav_operation",
+            "policy_primitive_r2_joint_cache_uav_operation",
         }:
             if (
                 rollout.v7_cache_operation_actions is None
@@ -3647,9 +2958,9 @@ class PPOV2Trainer:
         uav_operation_actions = None
         uav_operation_masks = None
         uav_operation_old_log_probs = None
-        if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
+        if self.context.configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation":
             if rollout.uav_operation_actions is None or rollout.uav_operation_masks is None:
-                raise ValueError("V9 rollout is missing UAV operation actions/masks")
+                raise ValueError("R2 rollout is missing UAV operation actions/masks")
             uav_operation_actions = torch.as_tensor(
                 rollout.uav_operation_actions,
                 dtype=torch.long,
@@ -3683,22 +2994,13 @@ class PPOV2Trainer:
         branch_diagnostics_enabled = (
             self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS
         )
-        branchwise_policy_enabled = (
-            self.policy.architecture_id in JOINT_V10_BRANCHWISE_POLICY_SCHEMAS
-        )
-        v10c_kl_instrumentation_enabled = (
-            self.policy.architecture_id in JOINT_V10C_DECOUPLED_POLICY_SCHEMAS
-            or self.policy.architecture_id in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
-        )
+        branchwise_policy_enabled = r2_enabled
+        branch_kl_instrumentation_enabled = r2_enabled
         branch_specific_kl_gate_enabled = (
-            self.policy.architecture_id in JOINT_V10D_BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
+            self.policy.architecture_id in BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
             and self.kl_gate_mode == KL_GATE_MODE_BRANCH_SPECIFIC
         )
-        cache_minibatch_kl_control_enabled = (
-            self.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP
-            and v11a_enabled
-            and branch_diagnostics_enabled
-        )
+        cache_minibatch_kl_control_enabled = False
         cache_candidate_old_log_probs = None
         uav_candidate_old_log_probs = None
         if branch_diagnostics_enabled:
@@ -3785,6 +3087,88 @@ class PPOV2Trainer:
                 uav_operation_actions.shape
             ):
                 raise RuntimeError("R2 operation advantage shape mismatch")
+        r4_candidate_q_values_t = None
+        r4_candidate_old_probabilities_t = None
+        r4_candidate_advantages_t = None
+        r4_candidate_valid_mask_t = None
+        r4_candidate_weighted_mean_residual_t = None
+        if self._uses_r4_candidate_credit():
+            for key in (
+                "candidate_q_values",
+                "candidate_probabilities",
+                "candidate_valid_mask",
+                "candidate_q_move",
+            ):
+                if key not in r2_operation_credit:
+                    raise RuntimeError(f"R4 operation credit is missing {key}")
+            r4_candidate_q_values_t = torch.as_tensor(
+                r2_operation_credit["candidate_q_values"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            r4_candidate_old_probabilities_t = torch.as_tensor(
+                r2_operation_credit["candidate_probabilities"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            r4_candidate_valid_mask_t = torch.as_tensor(
+                r2_operation_credit["candidate_valid_mask"],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            r4_candidate_advantages_t = torch.where(
+                r4_candidate_valid_mask_t,
+                r4_candidate_q_values_t
+                - torch.as_tensor(
+                    r2_operation_credit["candidate_q_move"],
+                    dtype=torch.float32,
+                    device=self.device,
+                ).unsqueeze(-1),
+                torch.zeros_like(r4_candidate_q_values_t),
+            )
+            r4_candidate_weighted_mean_residual_t = torch.as_tensor(
+                r2_operation_credit["candidate_weighted_mean_residual"],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            expected_candidate_shape = (
+                sample_count,
+                int(uav_operation_actions.shape[1]),
+                int(uav_candidate_features.shape[2]),
+            )
+            for name, tensor in (
+                ("candidate_q_values", r4_candidate_q_values_t),
+                ("candidate_probabilities", r4_candidate_old_probabilities_t),
+                ("candidate_valid_mask", r4_candidate_valid_mask_t),
+                ("candidate_advantages", r4_candidate_advantages_t),
+            ):
+                if tuple(tensor.shape) != expected_candidate_shape:
+                    raise RuntimeError(
+                        f"R4 {name} shape mismatch: "
+                        f"expected={expected_candidate_shape}, got={tuple(tensor.shape)}"
+                    )
+            if tuple(r4_candidate_weighted_mean_residual_t.shape) != tuple(
+                uav_operation_actions.shape
+            ):
+                raise RuntimeError("R4 candidate residual shape mismatch")
+            if tuple(r2_operation_credit["candidate_q_move"].shape) != tuple(
+                uav_operation_actions.shape
+            ):
+                raise RuntimeError("R4 candidate q_move shape mismatch")
+            if bool(
+                torch.any(
+                    r4_candidate_old_probabilities_t[~r4_candidate_valid_mask_t] != 0.0
+                ).item()
+            ) or bool(
+                torch.any(
+                    r4_candidate_old_probabilities_t[r4_candidate_valid_mask_t] <= 0.0
+                ).item()
+            ):
+                raise FloatingPointError("R4 candidate probabilities are invalid")
+            if not bool(
+                torch.all(torch.isfinite(r4_candidate_advantages_t)).item()
+            ):
+                raise FloatingPointError("R4 candidate advantages are non-finite")
         critic_targets_t = (
             (returns_t - critic_target_mean) / critic_return_scale
             if popart_critic
@@ -3816,49 +3200,6 @@ class PPOV2Trainer:
             np.float32, copy=True
         )
 
-        v11a_credit: dict[str, Any] = {}
-        if v11a_enabled:
-            if (
-                v7_operation_masks is None
-                or v7_operation_actions is None
-                or cache_all_candidate_features is None
-                or cache_all_candidate_masks is None
-                or uav_operation_actions is None
-            ):
-                raise RuntimeError("V11-A Cache operation tensors are incomplete")
-            v11a_credit = self._train_v11a_cache_node_critic(
-                observations=observations,
-                cache_contexts=cache_contexts,
-                operation_masks=v7_operation_masks,
-                operation_actions=v7_operation_actions,
-                all_candidate_features=cache_all_candidate_features,
-                all_candidate_masks=cache_all_candidate_masks,
-                selected_indices=cache_selected_indices,
-                uav_operation_actions=uav_operation_actions,
-                uav_candidate_features=uav_candidate_features,
-                uav_candidate_masks=uav_candidate_masks,
-                uav_selected_indices=uav_selected_indices,
-                critic_targets=critic_targets_t,
-            )
-        cf_adv_normalized_t = None
-        cf_adv_valid_mask_t = None
-        cache_node_logprob_sum_max_abs_error = math.nan
-        if v11a_enabled:
-            cf_adv_normalized_t = torch.as_tensor(
-                v11a_credit["cf_adv_normalized"],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            cf_adv_valid_mask_t = torch.as_tensor(
-                v11a_credit["cf_adv_valid_mask"],
-                dtype=torch.bool,
-                device=self.device,
-            )
-            if tuple(cf_adv_normalized_t.shape) != tuple(cache_selected_indices.shape):
-                raise ValueError("V11-A CF advantage shape mismatch")
-            if tuple(cf_adv_valid_mask_t.shape) != tuple(cache_selected_indices.shape):
-                raise ValueError("V11-A CF valid-mask shape mismatch")
-
         before = [parameter.detach().clone() for parameter in self.policy.parameters()]
         policy_loss_value = 0.0
         value_loss_value = 0.0
@@ -3889,7 +3230,9 @@ class PPOV2Trainer:
         cache_policy_loss_values: list[float] = []
         uav_policy_loss_values: list[float] = []
         actor_policy_loss_values: list[float] = []
-        cache_node_logprob_sum_errors: list[float] = []
+        candidate_policy_loss_values: list[float] = []
+        candidate_advantage_mean_abs_values: list[float] = []
+        candidate_advantage_weighted_mean_residual_values: list[float] = []
         gradient_finite = True
         actor_parameters: list[Any] | None = None
         critic_parameters: list[Any] | None = None
@@ -3965,12 +3308,12 @@ class PPOV2Trainer:
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
                 cache_active_this_minibatch = bool(cache_active)
-                if self.context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
+                if self.context.configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation":
                     if not isinstance(
                         self.policy,
-                        AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
+                        AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
                     ):
-                        raise TypeError("V9/V10 update requires a Joint policy")
+                        raise TypeError("R2 update requires the Recovery R2 policy")
                     assert v7_operation_actions is not None
                     assert v7_operation_masks is not None
                     assert uav_operation_actions is not None
@@ -4043,12 +3386,15 @@ class PPOV2Trainer:
                         or uav_candidate_old_log_probs is None
                         or v7_operation_old_log_probs is None
                         or uav_operation_old_log_probs is None
-                        or (v11a_enabled and evaluation.cache_node_log_probs is None)
                         or (
                             r2_enabled
                             and (
                                 evaluation.uav_operation_log_probs is None
                                 or evaluation.uav_candidate_log_probs is None
+                                or (
+                                    self._uses_r4_candidate_credit()
+                                    and evaluation.uav_candidate_log_probs_all is None
+                                )
                             )
                         )
                     ):
@@ -4059,31 +3405,6 @@ class PPOV2Trainer:
                         v7_operation_old_log_probs[indices].sum(dim=-1)
                         + cache_candidate_old_log_probs[indices].sum(dim=-1)
                     )
-                    cache_node_old_log_prob = (
-                        v7_operation_old_log_probs[indices]
-                        + cache_candidate_old_log_probs[indices]
-                    )
-                    if v11a_enabled:
-                        assert evaluation.cache_node_log_probs is not None
-                        cache_node_sum_error = float(
-                            torch.max(
-                                torch.abs(
-                                    evaluation.cache_node_log_probs.sum(dim=-1)
-                                    - evaluation.cache_log_prob
-                                )
-                            ).detach().cpu()
-                        )
-                        if not math.isfinite(cache_node_sum_error):
-                            raise FloatingPointError(
-                                "V11-A Cache node log-probability sum is non-finite"
-                            )
-                        cache_node_logprob_sum_errors.append(cache_node_sum_error)
-                        if not bool(
-                            torch.all(torch.isfinite(cache_node_old_log_prob)).item()
-                        ):
-                            raise FloatingPointError(
-                                "V11-A old Cache node log-probabilities are non-finite"
-                            )
                     if r2_enabled:
                         assert evaluation.uav_operation_log_probs is not None
                         uav_old_log_prob = uav_operation_old_log_probs[indices].sum(
@@ -4136,53 +3457,18 @@ class PPOV2Trainer:
                     cache_node_delta = None
                     cache_node_ratio = None
                     if branchwise_policy_enabled:
-                        if v11a_enabled:
-                            assert evaluation.cache_node_log_probs is not None
-                            assert cf_adv_normalized_t is not None
-                            assert cf_adv_valid_mask_t is not None
-                            cache_node_delta = (
-                                evaluation.cache_node_log_probs
-                                - cache_node_old_log_prob
-                            )
-                            cache_node_ratio = torch.exp(cache_node_delta)
-                            cache_cf_advantage = cf_adv_normalized_t[indices]
-                            cache_valid = cf_adv_valid_mask_t[indices]
-                            cache_node_unclipped = (
-                                cache_node_ratio * cache_cf_advantage
-                            )
-                            cache_node_clipped = torch.clamp(
-                                cache_node_ratio,
-                                1.0 - hyper.clip_epsilon,
-                                1.0 + hyper.clip_epsilon,
-                            ) * cache_cf_advantage
-                            cache_node_surrogate = torch.minimum(
-                                cache_node_unclipped,
-                                cache_node_clipped,
-                            )
-                            if bool(torch.any(cache_valid).item()):
-                                cache_branch_policy_loss = -cache_node_surrogate[cache_valid].mean()
-                            else:
-                                # Keep a graph-connected zero so an empty
-                                # minibatch contributes no Cache actor update.
-                                cache_branch_policy_loss = cache_node_ratio.sum() * 0.0
-                            branch_metric_tensors += (
-                                cache_node_delta.detach(),
-                                cache_node_ratio.detach(),
-                                cache_cf_advantage.detach(),
-                            )
-                        else:
-                            cache_branch_unclipped = (
-                                cache_branch_ratio * advantages_t[indices]
-                            )
-                            cache_branch_clipped = torch.clamp(
-                                cache_branch_ratio,
-                                1.0 - hyper.clip_epsilon,
-                                1.0 + hyper.clip_epsilon,
-                            ) * advantages_t[indices]
-                            cache_branch_policy_loss = -torch.minimum(
-                                cache_branch_unclipped,
-                                cache_branch_clipped,
-                            ).mean()
+                        cache_branch_unclipped = (
+                            cache_branch_ratio * advantages_t[indices]
+                        )
+                        cache_branch_clipped = torch.clamp(
+                            cache_branch_ratio,
+                            1.0 - hyper.clip_epsilon,
+                            1.0 + hyper.clip_epsilon,
+                        ) * advantages_t[indices]
+                        cache_branch_policy_loss = -torch.minimum(
+                            cache_branch_unclipped,
+                            cache_branch_clipped,
+                        ).mean()
                         if r2_enabled:
                             assert (
                                 r2_operation_advantages_scaled_t is not None
@@ -4213,26 +3499,70 @@ class PPOV2Trainer:
                                 evaluation.uav_candidate_log_probs
                                 - uav_candidate_old_log_probs[indices]
                             )
-                            candidate_advantage = advantages_t[indices].unsqueeze(-1)
-                            candidate_unclipped = candidate_ratio * candidate_advantage
-                            candidate_clipped = torch.clamp(
-                                candidate_ratio,
-                                1.0 - hyper.clip_epsilon,
-                                1.0 + hyper.clip_epsilon,
-                            ) * candidate_advantage
-                            candidate_surrogate = torch.minimum(
-                                candidate_unclipped,
-                                candidate_clipped,
-                            )
-                            candidate_active = (
-                                uav_operation_actions[indices] == 1
-                            )
-                            if bool(torch.any(candidate_active).item()):
-                                candidate_policy_loss = -candidate_surrogate[
-                                    candidate_active
-                                ].mean()
+                            if self._uses_r4_candidate_credit():
+                                assert (
+                                    evaluation.uav_candidate_log_probs_all is not None
+                                    and r4_candidate_old_probabilities_t is not None
+                                    and r4_candidate_advantages_t is not None
+                                    and r4_candidate_valid_mask_t is not None
+                                )
+                                candidate_advantage = r4_candidate_advantages_t[indices]
+                                candidate_valid = r4_candidate_valid_mask_t[indices]
+                                candidate_policy_loss = self._r4_candidate_policy_loss(
+                                    evaluation.uav_candidate_log_probs_all,
+                                    r4_candidate_old_probabilities_t[indices],
+                                    candidate_advantage,
+                                    candidate_valid,
+                                    hyper.clip_epsilon,
+                                )
+                                candidate_active = candidate_valid
+                                candidate_residual = (
+                                    r4_candidate_old_probabilities_t[indices]
+                                    * candidate_advantage
+                                ).sum(dim=-1)
+                                active_heads = candidate_valid.any(dim=-1)
+                                if bool(torch.any(active_heads).item()):
+                                    candidate_policy_loss_values.append(
+                                        float(candidate_policy_loss.detach().cpu())
+                                    )
+                                    candidate_advantage_mean_abs_values.append(
+                                        float(
+                                            torch.abs(candidate_advantage[active_heads])
+                                            .masked_select(candidate_valid[active_heads])
+                                            .mean()
+                                            .detach()
+                                            .cpu()
+                                        )
+                                    )
+                                    candidate_advantage_weighted_mean_residual_values.append(
+                                        float(
+                                            torch.abs(candidate_residual[active_heads])
+                                            .mean()
+                                            .detach()
+                                            .cpu()
+                                        )
+                                    )
                             else:
-                                candidate_policy_loss = candidate_ratio.sum() * 0.0
+                                candidate_advantage = advantages_t[indices].unsqueeze(-1)
+                                candidate_unclipped = candidate_ratio * candidate_advantage
+                                candidate_clipped = torch.clamp(
+                                    candidate_ratio,
+                                    1.0 - hyper.clip_epsilon,
+                                    1.0 + hyper.clip_epsilon,
+                                ) * candidate_advantage
+                                candidate_surrogate = torch.minimum(
+                                    candidate_unclipped,
+                                    candidate_clipped,
+                                )
+                                candidate_active = (
+                                    uav_operation_actions[indices] == 1
+                                )
+                                if bool(torch.any(candidate_active).item()):
+                                    candidate_policy_loss = -candidate_surrogate[
+                                        candidate_active
+                                    ].mean()
+                                else:
+                                    candidate_policy_loss = candidate_ratio.sum() * 0.0
                             # R2's UAV branch is explicitly the mean of the
                             # operation and candidate PPO losses.  It is kept
                             # outside _branch_actor_policy_loss so the latter's
@@ -4307,39 +3637,19 @@ class PPOV2Trainer:
                     )
                     cache_approx_kl_values.append(cache_minibatch_approx_kl)
                     uav_approx_kl_values.append(uav_minibatch_approx_kl)
-                    if v10c_kl_instrumentation_enabled:
+                    if branch_kl_instrumentation_enabled:
                         update_epoch_cache_approx_kls.append(
                             cache_minibatch_approx_kl
                         )
                         update_epoch_uav_approx_kls.append(
                             uav_minibatch_approx_kl
                         )
-                    if (
-                        v11a_enabled
-                        and cache_node_ratio is not None
-                        and cache_valid is not None
-                        and bool(torch.any(cache_valid).item())
-                    ):
-                        cache_clip_metric = torch.mean(
-                            (
-                                torch.abs(cache_node_ratio.detach() - 1.0)
-                                > hyper.clip_epsilon
-                            )[cache_valid].to(torch.float32)
-                        )
-                    else:
-                        cache_clip_metric = torch.mean(
-                            (
-                                torch.abs(
-                                    (
-                                        cache_node_ratio
-                                        if cache_node_ratio is not None
-                                        else cache_branch_ratio
-                                    ).detach()
-                                    - 1.0
-                                )
-                                > hyper.clip_epsilon
-                            ).to(torch.float32)
-                        )
+                    cache_clip_metric = torch.mean(
+                        (
+                            torch.abs(cache_branch_ratio.detach() - 1.0)
+                            > hyper.clip_epsilon
+                        ).to(torch.float32)
+                    )
                     cache_clip_fraction_values.append(
                         float(cache_clip_metric.detach().cpu())
                     )
@@ -4492,7 +3802,7 @@ class PPOV2Trainer:
                                 shared_actor_gradient_norm_value,
                             )
                         ) or (
-                            v10c_kl_instrumentation_enabled
+                            branch_kl_instrumentation_enabled
                             and not all(
                                 np.isfinite(value)
                                 for value in (
@@ -4513,22 +3823,36 @@ class PPOV2Trainer:
                         shared_actor_gradient_norm_values.append(
                             shared_actor_gradient_norm_value
                         )
-                        if v10c_kl_instrumentation_enabled:
+                        if branch_kl_instrumentation_enabled:
                             cache_encoder_gradient_norm_values.append(
                                 cache_encoder_gradient_norm_value
                             )
                             uav_encoder_gradient_norm_values.append(
                                 uav_encoder_gradient_norm_value
                             )
-                    actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                        actor_parameters, hyper.max_grad_norm
+                    actor_update_active = bool(
+                        cache_active_this_minibatch or uav_active_this_epoch
                     )
-                    actor_gradient_norm_value = float(actor_gradient_norm.detach().cpu())
-                    if not np.isfinite(actor_gradient_norm_value):
-                        raise FloatingPointError("PPO v5 actor gradient norm 非 finite。")
-                    self.actor_optimizer.step()
-                    self.actor_optimizer_steps += 1
-                    self.optimizer_steps = self.actor_optimizer_steps
+                    if not actor_update_active:
+                        if any(parameter.grad is not None for parameter in actor_parameters):
+                            raise RuntimeError(
+                                "PPO v5 both-inactive actor backward left gradients."
+                            )
+                        actor_gradient_norm_value = 0.0
+                    else:
+                        actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                            actor_parameters, hyper.max_grad_norm
+                        )
+                        actor_gradient_norm_value = float(
+                            actor_gradient_norm.detach().cpu()
+                        )
+                        if not np.isfinite(actor_gradient_norm_value):
+                            raise FloatingPointError(
+                                "PPO v5 actor gradient norm 非 finite。"
+                            )
+                        self.actor_optimizer.step()
+                        self.actor_optimizer_steps += 1
+                        self.optimizer_steps = self.actor_optimizer_steps
 
                     # Rebuild the critic graph after the actor step.  No graph
                     # is retained and the actor group is cleared before critic
@@ -4683,13 +4007,13 @@ class PPOV2Trainer:
                 value_loss_values.append(value_loss_value)
                 approximate_kl_values.append(approximate_kl_value)
                 update_epoch_approximate_kls.append(approximate_kl_value)
-                if v10c_kl_instrumentation_enabled:
+                if branch_kl_instrumentation_enabled:
                     if not (
                         update_epoch_cache_approx_kls
                         and update_epoch_uav_approx_kls
                     ):
                         raise RuntimeError(
-                            "V10-C branch KL diagnostics are not aligned with minibatches"
+                            "branch KL diagnostics are not aligned with minibatches"
                         )
                     target_kl_value = hyper.target_kl
                     kl_minibatch_diagnostics.append(
@@ -4765,11 +4089,11 @@ class PPOV2Trainer:
                 and float(np.mean(update_epoch_approximate_kls)) > hyper.target_kl
             ):
                 # Check only after every minibatch in this update epoch has
-                # completed.  The shared V9 loop therefore stops both actor
+                # completed.  The shared R2 loop therefore stops both actor
                 # and critic updates for the remaining update epochs.
                 kl_early_stop_triggered = True
                 joint_gate_triggered = True
-            if v10c_kl_instrumentation_enabled:
+            if branch_kl_instrumentation_enabled:
                 if not (
                     update_epoch_cache_approx_kls
                     and update_epoch_uav_approx_kls
@@ -4777,7 +4101,7 @@ class PPOV2Trainer:
                     == len(update_epoch_uav_approx_kls)
                     == len(update_epoch_approximate_kls)
                 ):
-                    raise RuntimeError("V10-C epoch KL diagnostics are incomplete")
+                    raise RuntimeError("branch epoch KL diagnostics are incomplete")
                 cache_epoch_approx_kl = float(
                     np.mean(update_epoch_cache_approx_kls)
                 )
@@ -5100,6 +4424,29 @@ class PPOV2Trainer:
                 if actor_policy_loss_values
                 else math.nan
             ),
+            uav_candidate_policy_loss=(
+                float(np.mean(candidate_policy_loss_values))
+                if candidate_policy_loss_values
+                else math.nan
+            ),
+            uav_candidate_advantage_mean_abs=(
+                float(np.mean(candidate_advantage_mean_abs_values))
+                if candidate_advantage_mean_abs_values
+                else math.nan
+            ),
+            uav_candidate_advantage_weighted_mean_residual=(
+                float(np.mean(candidate_advantage_weighted_mean_residual_values))
+                if candidate_advantage_weighted_mean_residual_values
+                else math.nan
+            ),
+            uav_candidate_advantage_normalization=(
+                "NONE" if self._uses_r4_candidate_credit() else ""
+            ),
+            uav_candidate_advantage_source=(
+                "EXACT_CONDITIONAL_COUNTERFACTUAL_Q"
+                if self._uses_r4_candidate_credit()
+                else ""
+            ),
             uav_branch_old_log_probs=uav_branch_old_log_probs_values,
             uav_branch_new_log_probs=uav_branch_new_log_probs_values,
             uav_branch_ratios=uav_branch_ratios_values,
@@ -5117,88 +4464,10 @@ class PPOV2Trainer:
             uav_stop_epoch=uav_stop_epoch,
             cache_suppressed_update_epochs=int(cache_suppressed_update_epochs),
             uav_suppressed_update_epochs=int(uav_suppressed_update_epochs),
-            joint_kl_diagnostic=bool(v10c_kl_instrumentation_enabled),
+            joint_kl_diagnostic=bool(branch_kl_instrumentation_enabled),
             cache_independent_stop=bool(cache_independent_stop),
             uav_independent_stop=bool(uav_independent_stop),
             both_inactive_stop=bool(both_inactive_stop),
-            q_cache_loss=float(v11a_credit.get("q_cache_loss", math.nan)),
-            q_cache_explained_variance=float(
-                v11a_credit.get("q_cache_explained_variance", math.nan)
-            ),
-            q_cache_grad_norm_raw=float(
-                v11a_credit.get("q_cache_grad_norm_raw", math.nan)
-            ),
-            q_cache_grad_norm_clipped=float(
-                v11a_credit.get("q_cache_grad_norm_clipped", math.nan)
-            ),
-            q_cache_optimizer_steps=int(
-                v11a_credit.get("q_cache_optimizer_steps", 0)
-            ),
-            q_cache_optimizer_steps_per_rollout=int(
-                v11a_credit.get("q_cache_optimizer_steps_per_rollout", 0)
-            ),
-            q_cache_loss_before=float(
-                v11a_credit.get("q_cache_loss_before", math.nan)
-            ),
-            q_cache_loss_after=float(
-                v11a_credit.get("q_cache_loss_after", math.nan)
-            ),
-            q_cache_ev_before=float(
-                v11a_credit.get("q_cache_ev_before", math.nan)
-            ),
-            q_cache_ev_after=float(
-                v11a_credit.get("q_cache_ev_after", math.nan)
-            ),
-            q_cache_epoch_diagnostics=tuple(
-                dict(record)
-                for record in v11a_credit.get("q_cache_epoch_diagnostics", ())
-            ),
-            cf_adv_raw=v11a_credit.get("cf_adv_raw"),
-            cf_adv_normalized=v11a_credit.get("cf_adv_normalized"),
-            cf_adv_valid_mask=v11a_credit.get("cf_adv_valid_mask"),
-            q_cache_selected_values=v11a_credit.get("q_cache_selected_values"),
-            q_cache_counterfactual_baseline=v11a_credit.get(
-                "q_cache_counterfactual_baseline"
-            ),
-            cf_adv_raw_mean=float(v11a_credit.get("cf_adv_raw_mean", math.nan)),
-            cf_adv_raw_std=float(v11a_credit.get("cf_adv_raw_std", math.nan)),
-            cf_adv_normalized_mean=float(
-                v11a_credit.get("cf_adv_normalized_mean", math.nan)
-            ),
-            cf_adv_normalized_std=float(
-                v11a_credit.get("cf_adv_normalized_std", math.nan)
-            ),
-            cf_adv_min=float(v11a_credit.get("cf_adv_min", math.nan)),
-            cf_adv_max=float(v11a_credit.get("cf_adv_max", math.nan)),
-            cf_adv_positive_fraction=float(
-                v11a_credit.get("cf_adv_positive_fraction", math.nan)
-            ),
-            cf_adv_negative_fraction=float(
-                v11a_credit.get("cf_adv_negative_fraction", math.nan)
-            ),
-            cache_node_logprob_sum_max_abs_error=(
-                float(max(cache_node_logprob_sum_errors))
-                if cache_node_logprob_sum_errors
-                else math.nan
-            ),
-            cache_surrogate_reduction=(
-                "mean_over_valid_cache_node_time"
-                if v11a_enabled
-                else "transition_mean"
-            ),
-            valid_cache_node_time_count=(
-                int(torch.sum(cf_adv_valid_mask_t).detach().cpu())
-                if v11a_enabled and cf_adv_valid_mask_t is not None
-                else 0
-            ),
-            cache_loss_scale_relative_to_v10d=(
-                float(sample_count)
-                / float(torch.sum(cf_adv_valid_mask_t).detach().cpu())
-                if v11a_enabled
-                and cf_adv_valid_mask_t is not None
-                and int(torch.sum(cf_adv_valid_mask_t).detach().cpu()) > 0
-                else math.nan
-            ),
             cache_kl_control=self.cache_kl_control,
             cache_stop_update_epoch=cache_stop_epoch,
             cache_stop_minibatch=cache_stop_minibatch,
@@ -5291,15 +4560,17 @@ class PPOV2Trainer:
             "checkpoint_version": self._expected_checkpoint_version(),
             "method": PPO_V2_METHOD,
             "policy_schema": self.policy.architecture_id,
-            "cache_credit_granularity": (
-                "FULL_NODE_ACTION"
-                if self._uses_v11a_cache_node_cf()
-                else None
-            ),
+            "cache_credit_granularity": None,
             "cache_kl_control": str(self.cache_kl_control),
             "configuration_control_mode": self.context.configuration_control_mode,
             "advantage_normalization_mode": (
                 self.hyperparameters.advantage_normalization_mode
+            ),
+            "operation_advantage_normalization_mode": (
+                self.hyperparameters.operation_advantage_normalization_mode
+            ),
+            "operation_advantage_reference_scale": (
+                self.hyperparameters.operation_advantage_reference_scale
             ),
             "critic_value_scale_mode": self.hyperparameters.critic_value_scale_mode,
             "critic_value_scale_epsilon": self.hyperparameters.critic_value_scale_epsilon,
@@ -5355,17 +4626,6 @@ class PPOV2Trainer:
                 {
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "optimizer_steps": int(self.optimizer_steps),
-                }
-            )
-        if self._uses_v11a_cache_node_cf():
-            if self.q_cache is None or self.q_cache_optimizer is None:
-                raise RuntimeError("V11-A Q_cache optimizer is not initialized.")
-            payload.update(
-                {
-                    "q_cache_state_dict": self.q_cache.state_dict(),
-                    "q_cache_optimizer_state_dict": self.q_cache_optimizer.state_dict(),
-                    "q_cache_optimizer_steps": int(self.q_cache_optimizer_steps),
-                    "q_cache_learning_rate": float(self.hyperparameters.critic_learning_rate),
                 }
             )
         if self.policy.architecture_id in MODERN_POLICY_SCHEMAS:
@@ -5514,10 +4774,6 @@ class PPOV2Trainer:
                 "PPO checkpoint policy schema incompatible: "
                 f"checkpoint={checkpoint_schema}, expected={expected_schema}."
             )
-        if self._uses_v11a_cache_node_cf() and payload.get(
-            "cache_credit_granularity"
-        ) != "FULL_NODE_ACTION":
-            raise ValueError("V11-A checkpoint cache credit granularity mismatch.")
         if payload.get("configuration_control_mode", "legacy_exact") != (
             self.context.configuration_control_mode
         ):
@@ -5551,21 +4807,6 @@ class PPOV2Trainer:
             self.optimizer_steps = int(payload.get("optimizer_steps", 0))
             self.actor_optimizer_steps = self.optimizer_steps
             self.critic_optimizer_steps = self.optimizer_steps
-        if self._uses_v11a_cache_node_cf():
-            if self.q_cache is None or self.q_cache_optimizer is None:
-                raise RuntimeError("V11-A Q_cache optimizer is not initialized.")
-            if (
-                "q_cache_state_dict" not in payload
-                or "q_cache_optimizer_state_dict" not in payload
-            ):
-                raise ValueError(
-                    "V11-A checkpoint must contain Q_cache and optimizer state."
-                )
-            self.q_cache.load_state_dict(payload["q_cache_state_dict"], strict=True)
-            self.q_cache_optimizer.load_state_dict(payload["q_cache_optimizer_state_dict"])
-            self.q_cache_optimizer_steps = int(payload.get("q_cache_optimizer_steps", 0))
-            if self.q_cache_optimizer_steps < 0:
-                raise ValueError("V11-A Q_cache optimizer steps must be non-negative.")
         self.critic_return_statistics = restored_statistics
         if self._uses_popart_critic():
             if not isinstance(
@@ -6206,11 +5447,6 @@ def run_training(
             context.cache_nodes,
             context.service_catalog["service_sizes_mb"],
         )
-        v11a_update_metrics = _v11a_update_metric_fields(
-            update,
-            rollout,
-            context.cache_nodes,
-        )
         transition_rewards = np.asarray(
             [item.reward for item in rollout.transitions], dtype=np.float64
         )
@@ -6520,8 +5756,7 @@ def run_training(
                 "checkpoint": str(checkpoint_path),
                 **cache_operation_metrics,
                 **_branch_update_metric_fields(update),
-                **_v10c_kl_update_metric_fields(update),
-                **v11a_update_metrics,
+                **_branch_kl_update_metric_fields(update),
             },
         )
         if verbose:
@@ -6770,7 +6005,6 @@ def run_training(
                     "cache_actual_change_rate": cache_change_rate,
                     "uav_actual_movement_rate": uav_move_rate,
                     **cache_operation_metrics,
-                    **v11a_update_metrics,
                     "policy_loss_range": {
                         "min": float(min(episode_policy_loss_mins)),
                         "max": float(max(episode_policy_loss_maxs)),
@@ -6892,7 +6126,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="PPO v2 Cache/UAV trainer (1 Epoch = one complete train-origin pass)"
     )
-    parser.add_argument("--config", default="configs/system_config.toml")
+    parser.add_argument(
+        "--config",
+        default="configs/proposed/system_config_ppo_recovery_r2_6e4.toml",
+    )
     parser.add_argument(
         "--epochs",
         type=int,

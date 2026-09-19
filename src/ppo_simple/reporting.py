@@ -210,6 +210,14 @@ def build_run_manifest(
     test_origin_start = protocol["test_origin_start"]
     test_origin_end = protocol["test_origin_end"]
     policy_schema = str(getattr(trainer.policy, "architecture_id", context.policy_schema))
+    is_recovery = policy_schema in {
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
+    }
+    is_r4 = policy_schema == (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4"
+    )
     git_sha, git_dirty = _git_identity(Path(context.root))
     resolved_config_path = Path(
         context.cfg.get("_meta", {}).get("config_path", config_path)
@@ -246,6 +254,19 @@ def build_run_manifest(
         "policy_schema": policy_schema,
         "configuration_control_mode": str(context.configuration_control_mode),
         "advantage_normalization_mode": str(hyper.advantage_normalization_mode),
+        "operation_advantage_normalization_mode": str(
+            hyper.operation_advantage_normalization_mode
+        ),
+        "operation_advantage_reference_scale": float(
+            hyper.operation_advantage_reference_scale
+        ),
+        "uav_operation_advantage_source": (
+            "COUNTERFACTUAL_ONE_STEP_TD" if is_recovery else "GLOBAL_GAE"
+        ),
+        "uav_candidate_advantage_source": (
+            "EXACT_CONDITIONAL_COUNTERFACTUAL_Q" if is_r4 else "GLOBAL_GAE"
+        ),
+        "candidate_advantage_normalization": "NONE" if is_r4 else "LEGACY_GLOBAL_GAE",
         "critic_value_scale_mode": str(hyper.critic_value_scale_mode),
         "critic_value_scale_epsilon": float(hyper.critic_value_scale_epsilon),
         "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),

@@ -1,7 +1,8 @@
-# Stable paper-experiment registry.  This file describes scope and entrypoints;
-# it does not change any algorithm or existing TOML configuration.  The
-# paper-facing proposed method ID is `proposed_joint`; internal V9 strings are
-# retained only for checkpoint compatibility and provenance.
+# Stable experiment registry.  This file describes scope and entrypoints; it
+# does not change any algorithm or existing TOML configuration.  The stable
+# proposed-method ID remains `proposed_joint`, whose current implementation is
+# Recovery R2.  Earlier development versions are retained only in Git history
+# and reports.
 
 registry_version = 1
 final_test_executed = false
@@ -53,31 +54,9 @@ execution_ratios = [
     "cloud_ratio",
 ]
 
-[learning_rate_experiments.proposed_joint_lr_1e4]
-actor_learning_rate = 1.0e-4
-status = "COMPLETED"
-completed_epochs = 300
-run = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050"
-config = "configs/proposed/system_config_ppo_v9_joint_cache_uav.toml"
-
-[learning_rate_experiments.proposed_joint_lr_1e3]
-actor_learning_rate = 1.0e-3
-status = "COMPLETED"
-completed_epochs = 300
-run = "runs/lr_sweep_v9_actor_1e3"
-config = "configs/lr_sweep/v9_actor_lr_1e3.toml"
-
-[learning_rate_experiments.proposed_joint_lr_5e4]
-actor_learning_rate = 5.0e-4
-status = "COMPLETED"
-completed_epochs = 300
-run = "runs/lr_sweep_proposed_joint_actor_5e4"
-config = "configs/lr_sweep/v9_actor_lr_5e4.toml"
-notes = "Completed 300-epoch run; internal V9-compatible schema is retained."
-
 [methods.proposed_joint]
 category = "proposed"
-status = "FROZEN"
+status = "BOUNDED_GATE_PASSED_FORMAL_TRAINING_PENDING"
 prediction = true
 adaptive_cache = true
 adaptive_uav = true
@@ -86,12 +65,11 @@ policy_mode = "stochastic"
 stochastic_repeats = 5
 cache_policy = "learned_adaptive"
 uav_policy = "learned_adaptive"
-config = "configs/proposed/system_config_ppo_v9_joint_cache_uav.toml"
-checkpoint = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt"
+config = "configs/proposed/system_config_ppo_recovery_r2_6e4.toml"
+checkpoint = ""
 training_entrypoint = "ppo-train"
-evaluation_entrypoint = "scripts/evaluation/evaluate_v9_joint_episode_pool.py"
-base_run = "runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050"
-notes = "Formal proposed_joint checkpoint and policy mode are frozen; the internal V9 schema is retained for checkpoint compatibility."
+evaluation_entrypoint = "src/ppo_simple/evaluator.py"
+notes = "Recovery R2 bounded gate passed; formal training and final-test seed execution are pending. Generation, training, and frozen-checkpoint evaluation use the same R2 configuration. The R2 evaluator averages stochastic repeats within each environment, then reports statistics across environment means. The R2 policy is a standalone current policy schema with the verified V7/V8-compatible backbone."
 
 [methods.ablation_cache_only]
 category = "ablation"

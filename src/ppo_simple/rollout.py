@@ -22,13 +22,7 @@ from .policy import (
     AdaptiveCacheOperationGroupV7PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
     AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic,
     AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic,
     AdaptivePrimitiveActorCritic,
     BernoulliActorCritic,
     PolicySample,
@@ -39,7 +33,7 @@ from .primitive_control import (
     sample_and_apply_v8_cache_operation_configuration,
     sample_and_apply_v8_no_prediction_cache_operation_configuration,
     sample_and_apply_v7_cache_operation_configuration,
-    sample_and_apply_v9_joint_cache_uav_operation_configuration,
+    sample_and_apply_r2_joint_cache_uav_operation_configuration,
 )
 
 
@@ -99,8 +93,6 @@ class SimpleTransition:
     uav_operation_entropies: np.ndarray | None = None
     uav_operation_probabilities: np.ndarray | None = None
     uav_operation_logit_margins: np.ndarray | None = None
-    cache_all_candidate_features: np.ndarray | None = None
-    cache_all_candidate_masks: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -137,8 +129,6 @@ class SimpleRollout:
     # any new arrays or changing the sampled action path.
     cache_old_log_probs: np.ndarray | None = None
     uav_old_log_probs: np.ndarray | None = None
-    cache_all_candidate_features: np.ndarray | None = None
-    cache_all_candidate_masks: np.ndarray | None = None
 
 
 def _observation(
@@ -260,30 +250,22 @@ def collect_rollout(
             raise AssertionError("PPO v2 observation 不符合 observation_spec。")
         selection_started_at = time.perf_counter()
         v7_primitive: Any | None = None
-        v9_primitive: Any | None = None
-        if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
+        r2_primitive: Any | None = None
+        if context.configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation":
             if not isinstance(
                 policy,
-                (
-                    AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic,
-                    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic,
-                    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic,
-                    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic,
-                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic,
-                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
-                    AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic,
-                ),
+                AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
             ):
                 raise TypeError(
-                    "policy_primitive_v9_joint_cache_uav_operation requires a V9/V10 Joint policy"
+                    "policy_primitive_r2_joint_cache_uav_operation requires the Recovery R2 policy"
                 )
             if action_transform is not None:
-                raise ValueError("V9 Joint rollout does not support action_transform")
+                raise ValueError("Recovery R2 rollout does not support action_transform")
             if policy_diagnostic_callback is not None:
                 raise ValueError(
-                    "V9 Joint rollout does not support binary-trigger diagnostics"
+                    "Recovery R2 rollout does not support binary-trigger diagnostics"
                 )
-            v9_primitive = sample_and_apply_v9_joint_cache_uav_operation_configuration(
+            r2_primitive = sample_and_apply_r2_joint_cache_uav_operation_configuration(
                 policy,
                 observation,
                 previous_cache,
@@ -294,10 +276,10 @@ def collect_rollout(
                 deterministic=bool(deterministic),
             )
             sample = PolicySample(
-                action=np.asarray(v9_primitive.derived_action, dtype=np.int8),
-                log_prob=v9_primitive.total_log_prob,
-                entropy=v9_primitive.total_entropy,
-                value=v9_primitive.value,
+                action=np.asarray(r2_primitive.derived_action, dtype=np.int8),
+                log_prob=r2_primitive.total_log_prob,
+                entropy=r2_primitive.total_entropy,
+                value=r2_primitive.value,
                 action_mask=np.ones(
                     (int(context.action_spec.action_dim), 2),
                     dtype=bool,
@@ -468,48 +450,44 @@ def collect_rollout(
         uav_operation_entropies: np.ndarray | None = None
         uav_operation_probabilities: np.ndarray | None = None
         uav_operation_logit_margins: np.ndarray | None = None
-        cache_all_candidate_features: np.ndarray | None = None
-        cache_all_candidate_masks: np.ndarray | None = None
         total_log_prob = sample.log_prob
         configuration_override = None
-        if context.configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation":
-            if v9_primitive is None:
-                raise RuntimeError("V9 Joint primitive selection was not produced")
+        if context.configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation":
+            if r2_primitive is None:
+                raise RuntimeError("R2 joint primitive selection was not produced")
             cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(
                 sample.action
             )
-            total_log_prob = v9_primitive.total_log_prob
-            cache_contexts = v9_primitive.cache_contexts
-            cache_candidate_features = v9_primitive.cache_candidate_features
-            cache_candidate_masks = v9_primitive.cache_candidate_masks
-            cache_selected_indices = v9_primitive.cache_selected_indices
-            cache_old_log_probs = v9_primitive.cache_old_log_probs
-            cache_conditional_actions = v9_primitive.cache_conditional_actions
-            cache_candidate_counts = v9_primitive.cache_candidate_counts
-            cache_all_candidate_features = v9_primitive.cache_all_candidate_features
-            cache_all_candidate_masks = v9_primitive.cache_all_candidate_masks
-            uav_contexts = v9_primitive.uav_contexts
-            uav_candidate_features = v9_primitive.uav_candidate_features
-            uav_candidate_masks = v9_primitive.uav_candidate_masks
-            uav_selected_indices = v9_primitive.uav_selected_indices
-            uav_old_log_probs = v9_primitive.uav_old_log_probs
-            uav_conditional_actions = v9_primitive.uav_conditional_actions
-            uav_candidate_counts = v9_primitive.uav_candidate_counts
-            v7_operation_actions = v9_primitive.cache_operation_actions
-            v7_operation_masks = v9_primitive.cache_operation_masks
-            v7_operation_log_probs = v9_primitive.cache_operation_old_log_probs
-            v7_operation_entropies = v9_primitive.cache_operation_entropies
-            uav_operation_actions = v9_primitive.uav_operation_actions
-            uav_operation_masks = v9_primitive.uav_operation_masks
-            uav_operation_log_probs = v9_primitive.uav_operation_old_log_probs
-            uav_operation_entropies = v9_primitive.uav_operation_entropies
-            uav_operation_probabilities = v9_primitive.uav_operation_probabilities
-            uav_operation_logit_margins = v9_primitive.uav_operation_logit_margins
+            total_log_prob = r2_primitive.total_log_prob
+            cache_contexts = r2_primitive.cache_contexts
+            cache_candidate_features = r2_primitive.cache_candidate_features
+            cache_candidate_masks = r2_primitive.cache_candidate_masks
+            cache_selected_indices = r2_primitive.cache_selected_indices
+            cache_old_log_probs = r2_primitive.cache_old_log_probs
+            cache_conditional_actions = r2_primitive.cache_conditional_actions
+            cache_candidate_counts = r2_primitive.cache_candidate_counts
+            uav_contexts = r2_primitive.uav_contexts
+            uav_candidate_features = r2_primitive.uav_candidate_features
+            uav_candidate_masks = r2_primitive.uav_candidate_masks
+            uav_selected_indices = r2_primitive.uav_selected_indices
+            uav_old_log_probs = r2_primitive.uav_old_log_probs
+            uav_conditional_actions = r2_primitive.uav_conditional_actions
+            uav_candidate_counts = r2_primitive.uav_candidate_counts
+            v7_operation_actions = r2_primitive.cache_operation_actions
+            v7_operation_masks = r2_primitive.cache_operation_masks
+            v7_operation_log_probs = r2_primitive.cache_operation_old_log_probs
+            v7_operation_entropies = r2_primitive.cache_operation_entropies
+            uav_operation_actions = r2_primitive.uav_operation_actions
+            uav_operation_masks = r2_primitive.uav_operation_masks
+            uav_operation_log_probs = r2_primitive.uav_operation_old_log_probs
+            uav_operation_entropies = r2_primitive.uav_operation_entropies
+            uav_operation_probabilities = r2_primitive.uav_operation_probabilities
+            uav_operation_logit_margins = r2_primitive.uav_operation_logit_margins
             configuration_override = slot_environment.build_policy_primitive_configuration(
                 previous_cache,
                 previous_uav,
-                v9_primitive.final_cache_state,
-                v9_primitive.final_uav_positions,
+                r2_primitive.final_cache_state,
+                r2_primitive.final_uav_positions,
                 cache_triggers,
                 uav_triggers,
                 context.service_catalog,
@@ -752,16 +730,6 @@ def collect_rollout(
                     if uav_operation_logit_margins is None
                     else uav_operation_logit_margins.copy()
                 ),
-                cache_all_candidate_features=(
-                    None
-                    if cache_all_candidate_features is None
-                    else cache_all_candidate_features.copy()
-                ),
-                cache_all_candidate_masks=(
-                    None
-                    if cache_all_candidate_masks is None
-                    else cache_all_candidate_masks.copy()
-                ),
             )
         )
         previous_cache = next_cache
@@ -884,20 +852,6 @@ def collect_rollout(
         uav_old_log_probs=np.stack(
             [item.uav_old_log_probs for item in transitions]
         ).astype(np.float32),
-        cache_all_candidate_features=(
-            None
-            if any(item.cache_all_candidate_features is None for item in transitions)
-            else np.stack(
-                [item.cache_all_candidate_features for item in transitions]
-            ).astype(np.float32)
-        ),
-        cache_all_candidate_masks=(
-            None
-            if any(item.cache_all_candidate_masks is None for item in transitions)
-            else np.stack(
-                [item.cache_all_candidate_masks for item in transitions]
-            ).astype(bool)
-        ),
     )
 
 

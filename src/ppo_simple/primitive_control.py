@@ -26,14 +26,9 @@ REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
     {
         REPLICA_AWARE_POLICY_SCHEMA,
         NO_PREDICTION_POLICY_SCHEMA,
-        "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-        "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
     }
 )
 REPLICA_AWARE_CACHE_FEATURE_NAMES = (
@@ -128,15 +123,11 @@ class CacheOperationPrimitiveSelectionResult:
     cache_old_log_probs: np.ndarray
     cache_conditional_actions: tuple[dict[str, Any], ...]
     cache_candidate_counts: np.ndarray
-    # Complete legal candidate groups for V11-A.  The existing selected-group
-    # tensors above remain unchanged for the production PPO path.
-    cache_all_candidate_features: np.ndarray | None = None
-    cache_all_candidate_masks: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
 class JointCacheUavOperationPrimitiveSelectionResult:
-    """One sequential V9 Cache operation plus explicit UAV operation result."""
+    """One sequential Cache operation plus explicit UAV operation result."""
 
     final_cache_state: np.ndarray
     final_uav_positions: dict[str, tuple[float, float]]
@@ -168,8 +159,6 @@ class JointCacheUavOperationPrimitiveSelectionResult:
     uav_old_log_probs: np.ndarray
     uav_conditional_actions: tuple[dict[str, Any], ...]
     uav_candidate_counts: np.ndarray
-    cache_all_candidate_features: np.ndarray | None = None
-    cache_all_candidate_masks: np.ndarray | None = None
 
 
 def _intermediate_observation(
@@ -722,31 +711,6 @@ def sample_and_apply_v7_cache_operation_configuration(
         dtype=bool,
     )
     cache_masks[:, 0] = True
-    v11a_cache_node_cf = (
-        str(getattr(context, "policy_schema", ""))
-        == "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf"
-    )
-    cache_all_features: np.ndarray | None = None
-    cache_all_masks: np.ndarray | None = None
-    if v11a_cache_node_cf:
-        operation_count = len(operation_order)
-        cache_all_features = np.zeros(
-            (
-                tensor_spec.num_cache_heads,
-                operation_count,
-                tensor_spec.cache_max_candidates,
-                tensor_spec.cache_feature_dim,
-            ),
-            dtype=np.float32,
-        )
-        cache_all_masks = np.zeros(
-            (
-                tensor_spec.num_cache_heads,
-                operation_count,
-                tensor_spec.cache_max_candidates,
-            ),
-            dtype=bool,
-        )
     cache_selected = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
     cache_old_log_probs = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
     cache_counts = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
@@ -783,51 +747,6 @@ def sample_and_apply_v7_cache_operation_configuration(
                     f"unsupported production cache operation: {candidate.operation_type}"
                 ) from exc
             operation_mask[operation_index] = True
-        if v11a_cache_node_cf:
-            # Materialize every legal operation's production candidate group
-            # only for the legacy V11-A schema.  V10-D/recovery retain the
-            # original selected-operation feature path below.
-            assert cache_all_features is not None and cache_all_masks is not None
-            grouped_candidates = {
-                operation: [
-                    candidate
-                    for candidate in candidates
-                    if str(candidate.operation_type) == operation
-                ]
-                for operation in operation_order
-            }
-            for operation_index, operation in enumerate(operation_order):
-                operation_candidates = grouped_candidates[operation]
-                if not operation_candidates:
-                    continue
-                feature_triggers = cache_triggers.copy()
-                if operation != "NO_CHANGE":
-                    feature_triggers[node_index] = 1
-                candidate_features = np.stack(
-                    [
-                        _cache_candidate_feature(
-                            candidate,
-                            cache,
-                            previous_cache,
-                            feature_triggers,
-                            candidate_predicted_popularity,
-                            context,
-                            include_replica_awareness=include_replica_awareness,
-                        )
-                        for candidate in operation_candidates
-                    ]
-                )
-                count = len(operation_candidates)
-                if count > tensor_spec.cache_max_candidates:
-                    raise AssertionError(
-                        "V11-A Cache candidate count exceeds padded capacity"
-                    )
-                cache_all_features[
-                    node_index,
-                    operation_index,
-                    :count,
-                ] = candidate_features
-                cache_all_masks[node_index, operation_index, :count] = True
         sampled_operation = policy.sample_cache_operation(
             conditional_context,
             node_index,
@@ -882,28 +801,20 @@ def sample_and_apply_v7_cache_operation_configuration(
             raise AssertionError(
                 "V7 selected an operation whose production candidate group is empty"
             )
-        if v11a_cache_node_cf:
-            assert cache_all_features is not None
-            candidate_features = cache_all_features[
-                node_index,
-                selected_operation_index,
-                : len(group_candidates),
+        candidate_features = np.stack(
+            [
+                _cache_candidate_feature(
+                    candidate,
+                    cache,
+                    previous_cache,
+                    cache_triggers,
+                    candidate_predicted_popularity,
+                    context,
+                    include_replica_awareness=include_replica_awareness,
+                )
+                for candidate in group_candidates
             ]
-        else:
-            candidate_features = np.stack(
-                [
-                    _cache_candidate_feature(
-                        candidate,
-                        cache,
-                        previous_cache,
-                        cache_triggers,
-                        candidate_predicted_popularity,
-                        context,
-                        include_replica_awareness=include_replica_awareness,
-                    )
-                    for candidate in group_candidates
-                ]
-            )
+        )
         count = len(group_candidates)
         if count > tensor_spec.cache_max_candidates:
             raise AssertionError("V7 cache candidate count exceeds padded capacity")
@@ -979,10 +890,6 @@ def sample_and_apply_v7_cache_operation_configuration(
         cache_old_log_probs=cache_old_log_probs,
         cache_conditional_actions=tuple(cache_actions),
         cache_candidate_counts=cache_counts,
-        cache_all_candidate_features=(
-            cache_all_features if v11a_cache_node_cf else None
-        ),
-        cache_all_candidate_masks=(cache_all_masks if v11a_cache_node_cf else None),
     )
 
 
@@ -1041,7 +948,7 @@ def sample_and_apply_v8_no_prediction_cache_operation_configuration(
     )
 
 
-def sample_and_apply_v9_joint_cache_uav_operation_configuration(
+def sample_and_apply_r2_joint_cache_uav_operation_configuration(
     policy: Any,
     observation: np.ndarray,
     previous_cache_state: np.ndarray,
@@ -1056,7 +963,7 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
 
     operation_order = ("STAY", "MOVE")
     if tuple(getattr(policy, "uav_operation_order", ())) != operation_order:
-        raise ValueError("V9 UAV operation order must be STAY/MOVE")
+        raise ValueError("R2 UAV operation order must be STAY/MOVE")
     cache_result = sample_and_apply_v8_cache_operation_configuration(
         policy,
         observation,
@@ -1148,7 +1055,7 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
             if str(candidate.operation_type) == "MOVE"
         ]
         if len(move_candidates) > tensor_spec.uav_max_candidates:
-            raise AssertionError("V9 UAV candidate count exceeds padded capacity")
+            raise AssertionError("R2 UAV candidate count exceeds padded capacity")
         operation_mask = np.asarray(
             [True, bool(move_candidates)],
             dtype=bool,
@@ -1174,7 +1081,7 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
             or sampled_operation.probabilities is None
         ):
             raise RuntimeError(
-                "V9 UAV operation sampling did not return raw diagnostics"
+                "R2 UAV operation sampling did not return raw diagnostics"
             )
         raw_logits = np.asarray(
             sampled_operation.raw_logits.detach().cpu().numpy(),
@@ -1185,15 +1092,15 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
             dtype=np.float64,
         ).reshape(-1)
         if raw_logits.shape != (len(operation_order),):
-            raise AssertionError("V9 UAV raw operation logits shape mismatch")
+            raise AssertionError("R2 UAV raw operation logits shape mismatch")
         if raw_probabilities.shape != (len(operation_order),):
-            raise AssertionError("V9 UAV raw operation probabilities shape mismatch")
+            raise AssertionError("R2 UAV raw operation probabilities shape mismatch")
         if not np.all(np.isfinite(raw_logits)) or not np.all(
             np.isfinite(raw_probabilities)
         ):
-            raise FloatingPointError("V9 UAV raw operation diagnostics are non-finite")
+            raise FloatingPointError("R2 UAV raw operation diagnostics are non-finite")
         if not np.isclose(float(raw_probabilities.sum()), 1.0):
-            raise AssertionError("V9 UAV raw operation probabilities must sum to one")
+            raise AssertionError("R2 UAV raw operation probabilities must sum to one")
         uav_operation_probabilities[uav_index] = raw_probabilities.astype(np.float32)
         uav_operation_logit_margins[uav_index] = float(
             raw_logits[0] - raw_logits[1]
@@ -1245,9 +1152,9 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
             continue
 
         if not move_candidates:
-            raise AssertionError("V9 selected MOVE without a feasible MOVE candidate")
+            raise AssertionError("R2 selected MOVE without a feasible MOVE candidate")
         if selected_operation != "MOVE":
-            raise AssertionError("V9 UAV operation selected an unsupported operation")
+            raise AssertionError("R2 UAV operation selected an unsupported operation")
         sampled_candidate = policy.sample_uav_candidate(
             conditional_context,
             candidate_features,
@@ -1256,7 +1163,7 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
         selected_index = int(sampled_candidate.selected_index)
         selected = move_candidates[selected_index]
         if str(selected.operation_type) != "MOVE":
-            raise AssertionError("V9 MOVE candidate sampler returned a non-MOVE action")
+            raise AssertionError("R2 MOVE candidate sampler returned a non-MOVE action")
         applied = uav_configuration.apply_uav_candidate(
             current_uav,
             previous_uav,
@@ -1269,7 +1176,7 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
         if str(applied["operation_type"]) != "MOVE" or not bool(
             applied["actual_moved"]
         ):
-            raise AssertionError("V9 MOVE operation did not produce actual movement")
+            raise AssertionError("R2 MOVE operation did not produce actual movement")
         uav_selected[uav_index] = selected_index
         uav_old_log_probs[uav_index] = float(
             sampled_candidate.log_prob.detach().cpu()
@@ -1327,8 +1234,6 @@ def sample_and_apply_v9_joint_cache_uav_operation_configuration(
         cache_old_log_probs=cache_result.cache_old_log_probs,
         cache_conditional_actions=cache_result.cache_conditional_actions,
         cache_candidate_counts=cache_result.cache_candidate_counts,
-        cache_all_candidate_features=cache_result.cache_all_candidate_features,
-        cache_all_candidate_masks=cache_result.cache_all_candidate_masks,
         uav_operation_actions=uav_operation_actions,
         uav_operation_masks=uav_operation_masks,
         uav_operation_old_log_probs=uav_operation_old_log_probs,

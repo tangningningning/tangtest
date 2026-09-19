@@ -516,9 +516,9 @@ method = "ppo_simple_v2"
 # legacy_exact keeps the K=100 iterative reference path. policy_primitive uses
 # one primitive per trigger. v2 appends one normalized finite-horizon time-to-go
 # state feature; v1 remains available only for its preserved baseline checkpoint.
-configuration_control_mode = "policy_primitive_v9_joint_cache_uav_operation"
-# RECOVERY_R2_OPERATION_CREDIT_FIX: R1/V10-D graph with per-UAV
-# counterfactual one-step TD credit for the UAV operation head only; Cache,
+configuration_control_mode = "policy_primitive_r2_joint_cache_uav_operation"
+# RECOVERY_R2_OPERATION_CREDIT_FIX: per-UAV counterfactual one-step TD credit
+# for the UAV operation head only; Cache,
 # candidate, global critic, PopArt, GAE, reward, and movement semantics stay frozen.
 policy_schema = "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2"
 kl_gate_mode = "branch_specific"
@@ -649,5 +649,3 @@ terminal_origin = 299
 "objective.lambda_movement" = "EXPERIMENT_DESIGN"
 "objective.T_ref" = "TRAIN_ONLY_CALIBRATION"
 "objective.E_ref" = "TRAIN_ONLY_CALIBRATION"
-
-

@@ -795,20 +795,44 @@ def validate_config(
         "legacy_exact",
         "policy_primitive",
         "policy_primitive_v7_cache_operation",
-        "policy_primitive_v9_joint_cache_uav_operation",
+        "policy_primitive_r2_joint_cache_uav_operation",
     }:
         raise ValueError(
             "algorithm.ppo.configuration_control_mode 只支持 "
             "legacy_exact/policy_primitive/policy_primitive_v7_cache_operation/"
-            "policy_primitive_v9_joint_cache_uav_operation。"
+            "policy_primitive_r2_joint_cache_uav_operation。"
         )
     policy_schema = str(
         get_config_value(config, "algorithm.ppo.policy_schema", "adaptive_primitive_v1")
     )
+    candidate_advantage_source = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.uav_candidate_advantage_source",
+            "GLOBAL_GAE",
+        )
+    )
+    candidate_advantage_normalization = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.candidate_advantage_normalization",
+            "LEGACY_GLOBAL_GAE",
+        )
+    )
+    if policy_schema == "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4":
+        if candidate_advantage_source != "EXACT_CONDITIONAL_COUNTERFACTUAL_Q":
+            raise ValueError(
+                "Recovery R4 requires algorithm.ppo.uav_candidate_advantage_source="
+                "EXACT_CONDITIONAL_COUNTERFACTUAL_Q."
+            )
+        if candidate_advantage_normalization != "NONE":
+            raise ValueError(
+                "Recovery R4 requires algorithm.ppo.candidate_advantage_normalization=NONE."
+            )
     if configuration_control_mode in {
         "policy_primitive",
         "policy_primitive_v7_cache_operation",
-        "policy_primitive_v9_joint_cache_uav_operation",
+        "policy_primitive_r2_joint_cache_uav_operation",
     } and policy_schema not in {
         "adaptive_primitive_v1",
         "adaptive_primitive_v2",
@@ -820,14 +844,9 @@ def validate_config(
         "adaptive_cache_operation_group_v7_popart",
         "adaptive_cache_operation_group_replica_aware_v8_popart",
         "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart",
-        "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
-        "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
         "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-        "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
     }:
         raise ValueError(
             "algorithm.ppo.policy_schema for policy_primitive must be "
@@ -840,14 +859,10 @@ def validate_config(
             "adaptive_cache_operation_group_v7_popart/"
             "adaptive_cache_operation_group_replica_aware_v8_popart/"
             "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v9_popart/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1/"
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf."
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3/"
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4/"
+            "."
         )
     if (
         configuration_control_mode == "policy_primitive_v7_cache_operation"
@@ -865,29 +880,19 @@ def validate_config(
             "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart."
         )
     if (
-        configuration_control_mode == "policy_primitive_v9_joint_cache_uav_operation"
+        configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation"
         and policy_schema
         not in {
-            "adaptive_joint_cache_replica_aware_uav_operation_v9_popart",
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable",
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise",
-            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder",
-            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-            "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
         }
     ):
         raise ValueError(
-            "policy_primitive_v9_joint_cache_uav_operation requires "
-            "adaptive_joint_cache_replica_aware_uav_operation_v9_popart/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2/"
-            "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf."
+            "policy_primitive_r2_joint_cache_uav_operation requires "
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2."
+            " / adaptive_joint_cache_replica_aware_uav_operation_recovery_r3 / "
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4."
         )
     kl_gate_mode = str(
         get_config_value(config, "algorithm.ppo.kl_gate_mode", "joint")
@@ -900,27 +905,25 @@ def validate_config(
         kl_gate_mode == "branch_specific"
         and policy_schema
         not in {
-            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-            "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
         }
     ):
         raise ValueError(
-            "algorithm.ppo.kl_gate_mode=branch_specific requires the V10-D/V11-A policy schema."
+            "algorithm.ppo.kl_gate_mode=branch_specific requires the Recovery R2 policy schema."
         )
     if (
         policy_schema
         in {
-            "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1",
             "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-            "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
+            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
         }
         and kl_gate_mode != "branch_specific"
     ):
         raise ValueError(
-            "the V10-D/V11-A policy schema requires algorithm.ppo.kl_gate_mode=branch_specific."
+            "the Recovery R2 policy schema requires algorithm.ppo.kl_gate_mode=branch_specific."
         )
     cache_kl_control = str(
         get_config_value(config, "algorithm.ppo.cache_kl_control", "epoch")
@@ -929,12 +932,9 @@ def validate_config(
         raise ValueError(
             "algorithm.ppo.cache_kl_control 只支持 epoch/minibatch_early_stop。"
         )
-    if (
-        cache_kl_control == "minibatch_early_stop"
-        and policy_schema != "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf"
-    ):
+    if cache_kl_control == "minibatch_early_stop":
         raise ValueError(
-            "algorithm.ppo.cache_kl_control=minibatch_early_stop requires the V11-A policy schema."
+            "algorithm.ppo.cache_kl_control=minibatch_early_stop is not supported by the current mainline."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
@@ -978,6 +978,35 @@ def validate_config(
     if advantage_normalization_mode not in {"centered_std", "std_only"}:
         raise ValueError(
             "algorithm.ppo.advantage_normalization_mode 只支持 centered_std/std_only。"
+        )
+    operation_advantage_normalization_mode = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.operation_advantage_normalization_mode",
+            "std_only",
+        )
+    )
+    if operation_advantage_normalization_mode not in {
+        "std_only",
+        "fixed_reference_scale",
+    }:
+        raise ValueError(
+            "algorithm.ppo.operation_advantage_normalization_mode 只支持 "
+            "std_only/fixed_reference_scale。"
+        )
+    operation_advantage_reference_scale = float(
+        get_config_value(
+            config,
+            "algorithm.ppo.operation_advantage_reference_scale",
+            0.02,
+        )
+    )
+    if (
+        not math.isfinite(operation_advantage_reference_scale)
+        or operation_advantage_reference_scale <= 0.0
+    ):
+        raise ValueError(
+            "algorithm.ppo.operation_advantage_reference_scale 必须是正的有限数。"
         )
     critic_value_scale_mode = str(
         get_config_value(config, "algorithm.ppo.critic_value_scale_mode", "none")

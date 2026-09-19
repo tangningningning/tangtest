@@ -1,9 +1,9 @@
 # adaptive_cache_mec
 
-This repository contains the adaptive cache and MEC simulation, PPO policies,
-frozen evaluators, baselines, and reproducible episode-generation utilities.
-The directory layout separates command-line orchestration from the reusable
-implementation in `src/`.
+This repository contains the adaptive cache and MEC simulation, the Recovery R2
+PPO policy, frozen evaluation utilities, baselines, and reproducible
+episode-generation utilities.  The directory layout separates command-line
+orchestration from the reusable implementation in `src/`.
 
 ## Project structure
 
@@ -17,58 +17,65 @@ src/
 scripts/
   training/     Training-entrypoint notes; implementation is src/ppo_simple/trainer.py
   generation/   Episode and project-artifact generation
-  evaluation/   Frozen learned-policy evaluation
+  evaluation/   Retained learned-policy comparison evaluation
   baselines/    Explicit Static and Prediction-Popularity Greedy evaluation
-configs/        Classified configurations and the minimal LR sweep set
+configs/        Recovery R2 plus baseline and artifact-support configs
 reports/        Research reports and experiment records
 runs/           Generated experiment artifacts; formal runs are not reorganized
 ```
 
-The files directly under `scripts/` with the old names are compatibility
-launchers.  The canonical implementations live in the category directories.
+The canonical generation entrypoints live under `scripts/generation/`.
+Comparison evaluators remain under `scripts/evaluation/` and
+`scripts/baselines/`; they are non-mainline compatibility/comparison tools.
 
-## Formal `proposed_joint`
+## Current mainline: Recovery R2
 
-- `FORMAL_METHOD_ID = proposed_joint`
-- Formal base run: `runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050`
-- Frozen checkpoint: `runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt`
-- The retained 1e-4 base run completed 300 epochs.
-- Config: `configs/proposed/system_config_ppo_v9_joint_cache_uav.toml`
-- Policy schema: `adaptive_joint_cache_replica_aware_uav_operation_v9_popart`
-- Configuration control mode: `policy_primitive_v9_joint_cache_uav_operation`
-- Policy mode: `stochastic`
-- Stochastic repeats: `5` per environment, averaged within environment before
-  aggregation across environments
-- Development seeds: `30001..30020`
-- Reserved final-test seeds: `40001..40020`
+```text
+CURRENT_POLICY_SCHEMA =
+adaptive_joint_cache_replica_aware_uav_operation_recovery_r2
 
-The reserved final-test pool has not been executed.  Development results are
-not final-test data.
+CURRENT_CONFIG =
+configs/proposed/system_config_ppo_recovery_r2_6e4.toml
+```
 
-Implementation history: the V9 policy schema and control-mode strings are
-retained internally for checkpoint compatibility.  V7/V8/V9 are historical
-implementation labels, not new paper-facing method IDs.
+The current operating chain is:
 
-## Learning-rate experiments
+```text
+Fixed SUMO network
+  -> episode realization / episode pool
+  -> Recovery R2 PPO training
+  -> checkpoint
+  -> evaluation
+```
 
-| Experiment ID | Actor learning rate | Status | Artifact |
-| --- | ---: | --- | --- |
-| `proposed_joint_lr_1e4` | `1e-4` | COMPLETED, 300 epochs | formal base run above |
-| `proposed_joint_lr_1e3` | `1e-3` | COMPLETED, 300 epochs | `runs/lr_sweep_v9_actor_1e3` |
-| `proposed_joint_lr_5e4` | `5e-4` | COMPLETED, 300 epochs | `runs/lr_sweep_proposed_joint_actor_5e4` |
+Recovery R2 is the current algorithm mainline.  Its bounded gate passed
+(witness alignment 4/4, autograd direction 4/4, and no NaN/Inf); formal
+training has not yet been completed.
 
-The LR configuration paths and run manifests remain explicit so that
-provenance continues to resolve.  The paper-facing formal method remains
-`proposed_joint`; V9 is only an internal compatibility label.
+The R2 credit contract is:
+
+- Cache advantage = `GLOBAL_GAE`
+- UAV operation advantage = `COUNTERFACTUAL_ONE_STEP_TD`
+- UAV operation PPO ratio = `OPERATION_ONLY`
+- Candidate credit = the original Recovery R1 path
+- Operation advantage normalization = `STD_ONLY`
+- No centered mean subtraction
+
+The R2 policy is the standalone current learned policy schema.  It preserves
+the verified parameter/module layout and checkpoint key set while using a
+neutral shared base; V7/V8 and primitive baseline paths remain available as
+separate baselines.
 
 ## Unified experiment registry
 
-The stable paper labels are registered in
-`configs/experiment_registry.toml`:
+The stable comparison labels are registered in
+`configs/experiment_registry.toml`.  The R2 mainline is recorded there under
+the stable `proposed_joint` identifier; baseline and ablation entries remain
+non-mainline comparison definitions:
 
 | Method ID | Definition | Status |
 | --- | --- | --- |
-| `proposed_joint` | prediction + adaptive Cache + adaptive UAV + learned policy | FROZEN |
+| `proposed_joint` | Recovery R2 prediction + adaptive Cache + adaptive UAV + learned policy | BOUNDED GATE PASSED; FORMAL TRAINING PENDING |
 | `ablation_cache_only` | prediction + adaptive Cache + fixed UAV + learned policy | NOT YET FORMALLY TRAINED TO 222 |
 | `ablation_joint_no_prediction` | no prediction + adaptive Cache + adaptive UAV + learned policy | NOT YET FORMALLY TRAINED |
 | `baseline_popularity_greedy` | prediction/popularity Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |
@@ -91,38 +98,43 @@ does not have the Joint Cache + UAV definition recorded above.
 Run commands from the repository root.  The package must be installed (or
 `src` must be on `PYTHONPATH`).
 
-Generate an existing-protocol episode pool:
+Generate an existing-protocol episode pool with the same Recovery R2
+configuration used by training and evaluation:
 
 ```text
 python scripts/generation/generate_episode_pool.py \
-  --config configs/episode_generation/system_config_ppo_v6_full_episode_randomized.toml \
+  --config configs/proposed/system_config_ppo_recovery_r2_6e4.toml \
   --output-dir runs/<episode-pool> --start-seed <seed-start> --count <count>
 ```
 
-Train through the single PPO implementation:
+Train the current Recovery R2 mainline through the single PPO implementation:
 
 ```text
-ppo-train --config configs/proposed/system_config_ppo_v9_joint_cache_uav.toml \
+ppo-train --config configs/proposed/system_config_ppo_recovery_r2_6e4.toml \
   --epochs <epochs> --run-dir runs/<new-run> \
   --episode-pool runs/<episode-pool> --episode-seed-start <seed-start>
 ```
 
-Evaluate a frozen Joint V9 policy on an existing pool:
+Evaluate a frozen Recovery R2 checkpoint on 20 episode realizations with 5
+stochastic repeats per realization:
 
 ```text
-python scripts/evaluation/evaluate_v9_joint_episode_pool.py \
-  --config configs/proposed/system_config_ppo_v9_joint_cache_uav.toml \
-  --checkpoint runs/ppo_v9_joint_cache_uav_stage1_ep50_20001_20050/checkpoint_ep222_frozen.pt \
-  --run-dir runs/<evaluation-run> --episode-pool runs/<episode-pool> \
-  --seed-start <seed-start> --episodes <count> \
+ppo-eval \
+  --config configs/proposed/system_config_ppo_recovery_r2_6e4.toml \
+  --checkpoint runs/<training-run>/<checkpoint>.pt \
+  --run-dir runs/<evaluation-run> \
+  --episode-pool runs/<episode-pool> \
+  --seed-start <seed-start> --episodes 20 --repeats 5 \
   --policy-action-mode stochastic --policy-sampling-seed <fixed-seed>
 ```
 
-For the formal stochastic protocol, use five fixed sampling passes and first
-average their metrics within each environment realization.  Do not treat the
-five repeats as additional independent environments.
+The evaluator loads the checkpoint through the same `PPOV2Trainer` policy
+factory and checkpoint validation path as training.  Repeats are averaged
+within each environment realization, then statistics are computed across the
+20 environment means.  Formal training and final-test seed execution are
+intentionally not claimed or performed in this cleanup pass.
 
-The learned-policy ablations are under `scripts/evaluation/`; the explicit
-Static and Prediction-Popularity Greedy baselines are under
-`scripts/baselines/`.  See `configs/README.md` and the reports directory for
-the configuration and experiment history index.
+The learned-policy comparison/ablation evaluators are under
+`scripts/evaluation/`; the explicit Static and Prediction-Popularity Greedy
+baselines are under `scripts/baselines/`.  See `configs/README.md` and the
+reports directory for the retained configuration and experiment history.

@@ -45,6 +45,11 @@ class PolicyEvaluation:
     # independent from the candidate trust region.
     uav_operation_log_probs: Any | None = None
     uav_candidate_log_probs: Any | None = None
+    # Full conditional UAV candidate log-probabilities.  This is populated by
+    # the Recovery R4 evaluator so the exact conditional PPO expectation can
+    # enumerate every legal MOVE candidate, including states whose sampled
+    # operation was STAY.
+    uav_candidate_log_probs_all: Any | None = None
     cache_entropy: Any | None = None
     uav_entropy: Any | None = None
     # Exact per-Cache-node primitive log-probabilities.  These include the
@@ -1231,152 +1236,6 @@ class AdaptiveCacheOperationGroupV7PopArtActorCritic(
             cache_node_log_probs=operation_node_log_prob + candidate_node_log_prob,
         )
 
-    def evaluate_cache_all_action_log_probs(
-        self,
-        operation_contexts: Any,
-        operation_masks: Any,
-        all_candidate_features: Any,
-        all_candidate_masks: Any,
-    ) -> Any:
-        """Return exact log-probabilities for every legal Cache primitive.
-
-        The returned tensor has shape ``[B, H, O, C]``.  ``-inf`` marks
-        padded or illegal primitive actions.  Operation ``NO_CHANGE`` owns a
-        single placeholder candidate at index zero and therefore has no
-        candidate-scoring contribution.  Active operations use the same raw
-        scorer and masking path as ``evaluate_cache_operation_primitive``.
-
-        This method is intentionally separate from the PPO evaluation path so
-        the counterfactual baseline can evaluate all legal alternatives under
-        ``torch.no_grad()`` without inventing probabilities for unobserved
-        candidate groups.
-        """
-
-        device = next(self.parameters()).device
-        contexts_t = torch.as_tensor(
-            operation_contexts, dtype=torch.float32, device=device
-        )
-        operation_masks_t = torch.as_tensor(
-            operation_masks, dtype=torch.bool, device=device
-        )
-        features_t = torch.as_tensor(
-            all_candidate_features, dtype=torch.float32, device=device
-        )
-        candidate_masks_t = torch.as_tensor(
-            all_candidate_masks, dtype=torch.bool, device=device
-        )
-        if contexts_t.ndim != 3:
-            raise ValueError("V11-A Cache operation contexts must be [B,H,observation_dim]")
-        batch_size, head_count, observation_dim = [int(value) for value in contexts_t.shape]
-        operation_count = len(self.operation_order)
-        if head_count != self.num_cache_heads or observation_dim != self.observation_dim:
-            raise ValueError("V11-A Cache operation context shape mismatch")
-        expected_operation_shape = (batch_size, head_count, operation_count)
-        if tuple(operation_masks_t.shape) != expected_operation_shape:
-            raise ValueError("V11-A Cache operation mask shape mismatch")
-        if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
-            raise ValueError("V11-A Cache operation mask cannot block every operation")
-        if features_t.ndim != 5:
-            raise ValueError("V11-A Cache candidate features must be [B,H,O,C,F]")
-        candidate_count = int(features_t.shape[3])
-        if tuple(features_t.shape[:3]) != (batch_size, head_count, operation_count):
-            raise ValueError("V11-A Cache candidate feature prefix shape mismatch")
-        if int(features_t.shape[-1]) != self.cache_feature_dim or candidate_count <= 0:
-            raise ValueError("V11-A Cache candidate feature dimension mismatch")
-        expected_candidate_shape = (batch_size, head_count, operation_count, candidate_count)
-        if tuple(candidate_masks_t.shape) != expected_candidate_shape:
-            raise ValueError("V11-A Cache all-candidate mask shape mismatch")
-        if not bool(torch.all(torch.isfinite(features_t)).item()):
-            raise ValueError("V11-A Cache all-candidate features contain NaN/Inf")
-        if not bool(torch.all(candidate_masks_t[:, :, 0, 0]).item()):
-            raise ValueError("V11-A Cache NO_CHANGE placeholder candidate is missing")
-        if bool(torch.any(candidate_masks_t[:, :, 0, 1:]).item()):
-            raise ValueError("V11-A Cache NO_CHANGE must have exactly one placeholder candidate")
-        operation_has_candidates = torch.any(candidate_masks_t, dim=-1)
-        if not bool(torch.all(operation_has_candidates == operation_masks_t).item()):
-            raise ValueError("V11-A operation masks and legal candidate groups disagree")
-
-        all_operation_logits, _ = self._operation_logits(
-            contexts_t.reshape(batch_size * head_count, observation_dim)
-        )
-        all_operation_logits = all_operation_logits.reshape(
-            batch_size,
-            head_count,
-            self.num_cache_heads,
-            operation_count,
-        )
-        head_indices = torch.arange(
-            self.num_cache_heads,
-            dtype=torch.long,
-            device=all_operation_logits.device,
-        )
-        operation_logits = all_operation_logits[:, head_indices, head_indices, :]
-        operation_logits = operation_logits.masked_fill(~operation_masks_t, -float("inf"))
-        operation_distribution = torch.distributions.Categorical(logits=operation_logits)
-        # Categorical.log_prob accepts one scalar action per distribution;
-        # the full operation support is already represented by its normalized
-        # logits, which are the exact log-probabilities for every operation.
-        operation_log_probs = operation_distribution.logits
-
-        action_log_probs = torch.full(
-            expected_candidate_shape,
-            -float("inf"),
-            dtype=operation_logits.dtype,
-            device=operation_logits.device,
-        )
-        action_log_probs[:, :, 0, 0] = operation_log_probs[:, :, 0]
-        if operation_count > 1:
-            active_features = features_t[:, :, 1:, :, :]
-            active_masks = candidate_masks_t[:, :, 1:, :]
-            safe_masks = active_masks.clone()
-            empty_groups = ~torch.any(safe_masks, dim=-1)
-            safe_masks[:, :, :, 0] |= empty_groups
-            active_operation_count = operation_count - 1
-            active_contexts = contexts_t.unsqueeze(2).expand(
-                -1, -1, active_operation_count, -1
-            )
-            flat_contexts = active_contexts.reshape(
-                batch_size * head_count * active_operation_count,
-                observation_dim,
-            )
-            flat_features = active_features.reshape(
-                batch_size * head_count * active_operation_count,
-                candidate_count,
-                self.cache_feature_dim,
-            )
-            flat_scores, _ = self._candidate_scores(
-                flat_contexts,
-                flat_features,
-                self.cache_feature_dim,
-                self.cache_candidate_scorer,
-            )
-            active_scores = flat_scores.reshape(
-                batch_size,
-                head_count,
-                active_operation_count,
-                candidate_count,
-            )
-            candidate_logits = active_scores.masked_fill(~safe_masks, -float("inf"))
-            candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
-            # As above, the normalized categorical logits expose the complete
-            # candidate support in one tensor; log_prob is scalar-valued per
-            # categorical distribution and cannot evaluate a vector support.
-            active_candidate_log_probs = candidate_distribution.logits
-            active_candidate_log_probs = active_candidate_log_probs.masked_fill(
-                ~active_masks,
-                -float("inf"),
-            )
-            active_action_log_probs = (
-                operation_log_probs[:, :, 1:].unsqueeze(-1)
-                + active_candidate_log_probs
-            )
-            action_log_probs[:, :, 1:, :] = active_action_log_probs
-        return action_log_probs.masked_fill(
-            ~(operation_masks_t.unsqueeze(-1) & candidate_masks_t),
-            -float("inf"),
-        )
-
-
 class AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic(
     AdaptiveCacheOperationGroupV7PopArtActorCritic
 ):
@@ -1387,12 +1246,12 @@ class AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic(
     replica_aware_candidate_features = True
 
 
-class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
+class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
     AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
 ):
-    """Joint V9 policy with the frozen V8 Cache branch and explicit UAV ops."""
+    """Neutral joint Cache/UAV policy base with explicit UAV operations."""
 
-    architecture_id = "adaptive_joint_cache_replica_aware_uav_operation_v9_popart"
+    architecture_id = "adaptive_joint_cache_replica_aware_uav_operation_joint_base"
     architecture_version = 1
     replica_aware_candidate_features = True
     uav_operation_order = ("STAY", "MOVE")
@@ -1415,7 +1274,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             hidden_sizes,
         )
         if int(uav_feature_dim) <= 16:
-            raise ValueError("V9 uav_feature_dim must include at least one UAV head")
+            raise ValueError("uav_feature_dim must include at least one UAV head")
         self.num_uav_heads = int(uav_feature_dim) - 16
         self.uav_operation_head = nn.Linear(
             self.hidden_dim,
@@ -1438,7 +1297,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             for parameter in module.parameters()
         )
         if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("V9 actor parameter group contains duplicate parameters.")
+            raise RuntimeError("actor parameter group contains duplicate parameters.")
         return parameters
 
     def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
@@ -1474,10 +1333,10 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             for parameter in parameters
         ]
         if len(set(group_ids)) != len(group_ids):
-            raise RuntimeError("V9 actor gradient groups overlap.")
+            raise RuntimeError("actor gradient groups overlap.")
         actor_ids = {id(parameter) for parameter in self.actor_parameters()}
         if set(group_ids) != actor_ids:
-            raise RuntimeError("V9 actor gradient groups do not cover the actor.")
+            raise RuntimeError("actor gradient groups do not cover the actor.")
         return groups
 
     def _uav_operation_logits(self, observations: Any) -> tuple[Any, bool]:
@@ -1504,10 +1363,10 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             self.num_uav_heads,
             len(self.uav_operation_order),
         ):
-            raise ValueError("V9 UAV operation sampling requires one observation")
+            raise ValueError("UAV operation sampling requires one observation")
         index = int(head_index)
         if index < 0 or index >= self.num_uav_heads:
-            raise IndexError("V9 UAV operation head index out of range")
+            raise IndexError("UAV operation head index out of range")
         raw_operation_logits = logits[index]
         raw_operation_probabilities = torch.softmax(raw_operation_logits, dim=-1)
         mask = torch.as_tensor(
@@ -1518,7 +1377,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
         if tuple(mask.shape) != (len(self.uav_operation_order),) or not bool(
             torch.any(mask).item()
         ):
-            raise ValueError("V9 UAV operation mask must allow at least one operation")
+            raise ValueError("UAV operation mask must allow at least one operation")
         masked_logits = logits[index].masked_fill(~mask, -float("inf"))
         distribution = torch.distributions.Categorical(logits=masked_logits)
         selected = (
@@ -1552,7 +1411,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
         uav_candidate_masks: Any,
         uav_candidate_selected_indices: Any,
     ) -> PolicyEvaluation:
-        """Recompute the full V9 joint log-probability without the old trigger head."""
+        """Recompute the full joint log-probability without the old trigger head."""
 
         cache_evaluation = self.evaluate_cache_operation_primitive(
             observations,
@@ -1595,29 +1454,29 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             device=observations_t.device,
         )
         if operation_contexts_t.ndim != 3:
-            raise ValueError("V9 UAV operation_contexts must be [B,U,observation_dim]")
+            raise ValueError("UAV operation_contexts must be [B,U,observation_dim]")
         batch_size, head_count, observation_dim = [
             int(value) for value in operation_contexts_t.shape
         ]
         if batch_size != int(observations_t.shape[0]):
-            raise ValueError("V9 UAV operation_contexts batch dimension mismatch")
+            raise ValueError("UAV operation_contexts batch dimension mismatch")
         if head_count != self.num_uav_heads or observation_dim != self.observation_dim:
-            raise ValueError("V9 UAV operation_contexts shape mismatch")
+            raise ValueError("UAV operation_contexts shape mismatch")
         expected_operation_shape = (
             batch_size,
             self.num_uav_heads,
             len(self.uav_operation_order),
         )
         if tuple(operation_masks_t.shape) != expected_operation_shape:
-            raise ValueError("V9 UAV operation_masks shape mismatch")
+            raise ValueError("UAV operation_masks shape mismatch")
         if tuple(operation_actions_t.shape) != (batch_size, self.num_uav_heads):
-            raise ValueError("V9 UAV operation_actions shape mismatch")
+            raise ValueError("UAV operation_actions shape mismatch")
         if bool(torch.any(operation_actions_t < 0).item()) or bool(
             torch.any(operation_actions_t >= len(self.uav_operation_order)).item()
         ):
-            raise ValueError("V9 UAV operation action index out of range")
+            raise ValueError("UAV operation action index out of range")
         if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
-            raise ValueError("V9 UAV operation mask cannot block every operation")
+            raise ValueError("UAV operation mask cannot block every operation")
         all_operation_logits, _ = self._uav_operation_logits(
             operation_contexts_t.reshape(batch_size * head_count, observation_dim)
         )
@@ -1640,7 +1499,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             operation_actions_t.unsqueeze(-1),
         ).squeeze(-1)
         if not bool(torch.all(operation_valid).item()):
-            raise ValueError("V9 UAV operation action is blocked by its operation mask")
+            raise ValueError("UAV operation action is blocked by its operation mask")
         uav_operation_log_probs = operation_distribution.log_prob(operation_actions_t)
         operation_log_prob = uav_operation_log_probs.sum(dim=-1)
         operation_entropy = torch.where(
@@ -1650,32 +1509,32 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
         ).sum(dim=-1)
 
         if candidate_features_t.ndim != 4:
-            raise ValueError("V9 UAV candidate_features must be [B,U,C,F]")
+            raise ValueError("UAV candidate_features must be [B,U,C,F]")
         if tuple(candidate_features_t.shape[:2]) != (
             batch_size,
             self.num_uav_heads,
         ) or int(candidate_features_t.shape[-1]) != self.uav_feature_dim:
-            raise ValueError("V9 UAV candidate_features shape mismatch")
+            raise ValueError("UAV candidate_features shape mismatch")
         candidate_count = int(candidate_features_t.shape[2])
         if candidate_count <= 0:
-            raise ValueError("V9 UAV candidate tensor must have positive width")
+            raise ValueError("UAV candidate tensor must have positive width")
         expected_candidate_shape = (batch_size, self.num_uav_heads, candidate_count)
         if tuple(candidate_masks_t.shape) != expected_candidate_shape:
-            raise ValueError("V9 UAV candidate_masks shape mismatch")
+            raise ValueError("UAV candidate_masks shape mismatch")
         if tuple(candidate_selected_t.shape) != (batch_size, self.num_uav_heads):
-            raise ValueError("V9 UAV candidate_selected_indices shape mismatch")
+            raise ValueError("UAV candidate_selected_indices shape mismatch")
         if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
-            raise ValueError("V9 UAV candidate mask must have a placeholder or candidate")
+            raise ValueError("UAV candidate mask must have a placeholder or candidate")
         if bool(torch.any(candidate_selected_t < 0).item()) or bool(
             torch.any(candidate_selected_t >= candidate_count).item()
         ):
-            raise ValueError("V9 UAV candidate selected index out of range")
+            raise ValueError("UAV candidate selected index out of range")
         candidate_valid = candidate_masks_t.gather(
             -1,
             candidate_selected_t.unsqueeze(-1),
         ).squeeze(-1)
         if not bool(torch.all(candidate_valid).item()):
-            raise ValueError("V9 UAV candidate selected index is masked")
+            raise ValueError("UAV candidate selected index is masked")
         candidate_active = operation_actions_t == 1
         move_feature_slice = slice(1 + self.num_uav_heads, 3 + self.num_uav_heads)
         selected_operation_features = candidate_features_t[
@@ -1700,7 +1559,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
                 )
             ).item()
         ):
-            raise ValueError("V9 MOVE operation requires a MOVE candidate")
+            raise ValueError("MOVE operation requires a MOVE candidate")
         candidate_contexts = operation_contexts_t.reshape(
             batch_size * head_count,
             observation_dim,
@@ -1741,53 +1600,26 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic(
             uav_log_prob=operation_log_prob + candidate_log_prob,
             uav_operation_log_probs=uav_operation_log_probs,
             uav_candidate_log_probs=uav_candidate_log_probs,
+            uav_candidate_log_probs_all=candidate_distribution.logits,
             cache_entropy=cache_evaluation.entropy,
             uav_entropy=operation_entropy + candidate_entropy,
             cache_node_log_probs=cache_evaluation.cache_node_log_probs,
         )
 
 
-class AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationV9PopArtActorCritic
+class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic
 ):
-    """Additive V10 schema exposing V9's existing Cache/UAV branch statistics.
+    """Neutral decoupled-encoder joint Cache/UAV policy base.
 
-    No module is added or renamed.  The state-dict layout, action hierarchy,
-    and optimizer parameter groups remain inherited from V9; the new schema
-    only makes the branch-observability stage explicit for future runs.
+    The joint base constructor creates the shared encoder and all existing
+    heads in the historical initialization order.  The encoder is then cloned
+    into two independent modules without consuming additional random numbers;
+    the critic and all head/scorer initialization therefore remain unchanged.
     """
 
     architecture_id = (
-        "adaptive_joint_cache_replica_aware_uav_operation_v10_branch_observable"
-    )
-    architecture_version = 1
-
-
-class AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchObservableActorCritic
-):
-    """V10-B schema using branchwise PPO optimization with one actor optimizer."""
-
-    architecture_id = (
-        "adaptive_joint_cache_replica_aware_uav_operation_v10_branchwise"
-    )
-    architecture_version = 1
-
-
-class AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationV10BranchwiseActorCritic
-):
-    """V10-C with independent Cache and UAV actor representations.
-
-    The inherited V10-B constructor creates the original shared encoder and
-    all existing heads in the same initialization order.  Its encoder is then
-    cloned into two independent modules without consuming additional random
-    numbers; the critic and all head/scorer initialization therefore remain
-    identical to V10-B at construction time.
-    """
-
-    architecture_id = (
-        "adaptive_joint_cache_replica_aware_uav_operation_v10c_decoupled_encoder"
+        "adaptive_joint_cache_replica_aware_uav_operation_decoupled_encoder"
     )
     architecture_version = 1
 
@@ -1821,7 +1653,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic(
             return self.cache_encoder
         if scorer is self.uav_candidate_scorer:
             return self.uav_encoder
-        raise ValueError("V10-C candidate scorer has no registered branch encoder")
+        raise ValueError("candidate scorer has no registered branch encoder")
 
     def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
         obs, single = self._observations(observations)
@@ -1858,7 +1690,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic(
             for parameter in module.parameters()
         )
         if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("V10-C actor parameter group contains duplicates.")
+            raise RuntimeError("actor parameter group contains duplicates.")
         return parameters
 
     def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
@@ -1889,53 +1721,20 @@ class AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic(
             for parameter in parameters
         ]
         if len(set(group_ids)) != len(group_ids):
-            raise RuntimeError("V10-C actor gradient groups overlap.")
+            raise RuntimeError("actor gradient groups overlap.")
         actor_ids = {id(parameter) for parameter in self.actor_parameters()}
         if set(group_ids) != actor_ids:
-            raise RuntimeError("V10-C actor gradient groups do not cover the actor.")
+            raise RuntimeError("actor gradient groups do not cover the actor.")
         return groups
 
 
-class AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationV10CDecoupledEncoderActorCritic
-):
-    """V10-D schema for branch-specific KL gate experiments.
-
-    The policy graph and parameter ownership are exactly V10-C.  V10-D puts
-    the new behavior in the trainer's KL gate, so this subclass only gives
-    the checkpoint/configuration path an explicit, non-overwriting schema.
-    """
-
-    architecture_id = (
-        "adaptive_joint_cache_replica_aware_uav_operation_v10d_decoupled_encoder_branch_kl"
-    )
-    architecture_version = 1
-
-
-class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic
-):
-    """MAINLINE_RECOVERY_R1 schema on the verified V10-D policy graph.
-
-    Recovery keeps V10-D's decoupled encoders, global GAE/PopArt critic, and
-    branch-specific KL control.  The distinct schema prevents a recovery
-    checkpoint from being mistaken for either the V10-D or V11-A experiment.
-    """
-
-    architecture_id = (
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r1"
-    )
-    architecture_version = 1
-
-
 class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR1ActorCritic
+    AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic
 ):
-    """Recovery R2 with operation-only counterfactual TD credit.
+    """Current Recovery R2 Cache/UAV actor-critic policy.
 
-    R2 deliberately reuses the R1/V10-D module graph.  The new operation
-    credit assignment and its loss decomposition live in the trainer, so the
-    checkpoint tensor layout and all observation/action heads remain frozen.
+    Operation-credit assignment and its loss decomposition live in the trainer;
+    this policy owns the frozen observation/action graph and checkpoint layout.
     """
 
     architecture_id = (
@@ -1944,18 +1743,29 @@ class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic(
     architecture_version = 1
 
 
-class AdaptiveJointCacheReplicaAwareUAVOperationV11ACacheNodeCFActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationV10DBranchSpecificKLActorCritic
+class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic
 ):
-    """V11-A schema with trainer-owned Cache-node counterfactual credit.
+    """Recovery R3 policy with the R2 architecture and fixed op-scale credit."""
 
-    The actor/global-critic graph and the V10-D UAV branch are intentionally
-    unchanged.  The independent action-conditioned Cache critic is owned by
-    the trainer so its parameters cannot enter either the actor or global
-    critic parameter groups.
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3"
+    )
+    architecture_version = 1
+
+
+class AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR4ActorCritic(
+    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR3ActorCritic
+):
+    """Recovery R4 policy with exact conditional candidate credit.
+
+    The network and checkpoint layout remain identical to R3.  R4 changes only
+    the trainer-side candidate credit and full conditional PPO expectation.
     """
 
-    architecture_id = "adaptive_joint_cache_replica_aware_uav_operation_v11a_cache_node_cf"
+    architecture_id = (
+        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4"
+    )
     architecture_version = 1
 
 

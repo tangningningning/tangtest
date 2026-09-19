@@ -661,35 +661,6 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 # ---- Joint cache/UAV configuration orchestration ----
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Trigger-conditioned Cache + UAV configuration optimizer.
-
-本模块只实现冻结框架中的 Trigger-conditioned Configuration Optimization：
-
-给定外部 cache trigger ``Z_ca(t)``、UAV trigger ``Z_q(t)``、上一时隙真实
-reference state ``C_prev, Q_prev`` 和同一个 prediction scenario slice，求当前
-时隙 configuration ``C(t), Q^U(t)``。
-
-它不决定 trigger，不做 Matching/KKT/PPO，不重新实现 cache/UAV/channel/rate
-公式；只用 block-coordinate 方式交替调用已有 Cache solver 和 UAV solver。
-
-关键约束：reference state 永远是 ``C_prev, Q_prev``，外层搜索中产生的
-``C_current, Q_current`` 只是 candidate state。所有 cache loading cost、
-UAV movement cost、UAV 物理约束和最大位移约束都必须相对 reference state，
-而不是相对上一轮 candidate。
-"""
-
-import argparse
-import json
-import math
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
-import numpy as np
-
-
 
 @dataclass(frozen=True)
 class JointConfigurationResult:

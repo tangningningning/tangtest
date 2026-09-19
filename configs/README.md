@@ -1,30 +1,36 @@
 # Configuration index
 
 TOML files are classified under `configs/` so current commands have stable,
-purpose-specific paths.  Historical manifests retain their original recorded
-paths and hashes; no duplicate full TOML copies are maintained.
-The stable paper-method registry is `configs/experiment_registry.toml` and its
-read-only display/validation entrypoint is `scripts/experiment_registry.py`.
+purpose-specific paths.  Recovery R2 is the only current proposed-method
+configuration.  The stable comparison registry is
+`configs/experiment_registry.toml` and its read-only display/validation
+entrypoint is `scripts/experiment_registry.py`.
 
 The registry is the source of stable method IDs, status, component flags,
 training/evaluation protocol, and canonical command paths.  It does not execute
 experiments.
 
-## ACTIVE / FORMAL
+## CURRENT MAINLINE
 
-- `proposed/system_config_ppo_v9_joint_cache_uav.toml` — formal `proposed_joint`
-  configuration.  Its internal policy schema remains
-  `adaptive_joint_cache_replica_aware_uav_operation_v9_popart` for checkpoint
-  compatibility.
+- `proposed/system_config_ppo_recovery_r2_6e4.toml` — Recovery R2 bounded-gate
+  configuration with policy schema
+  `adaptive_joint_cache_replica_aware_uav_operation_recovery_r2`.
+- `system_config.toml` — shared artifact-generation/system configuration,
+  retained for existing artifact workflows.
 
-## LEARNING-RATE SWEEP
+## UNIFIED GENERATION / TRAINING / EVALUATION
 
-- `lr_sweep/v9_actor_lr_1e3.toml` — retained; `proposed_joint_lr_1e3` completed
-  300 epochs in `runs/lr_sweep_v9_actor_1e3`.
-- `lr_sweep/v9_actor_lr_5e4.toml` — retained; `proposed_joint_lr_5e4` completed
-  300 epochs in `runs/lr_sweep_proposed_joint_actor_5e4`.
+The canonical generation entrypoints, `ppo-train`, and `ppo-eval` all use
+`proposed/system_config_ppo_recovery_r2_6e4.toml`.  The effective data protocol
+is the full 300-slot randomized episode protocol: origins 0 through 299,
+terminal origin 299, and no held-out test-origin range.  A field-by-field
+comparison against the former V6 episode-generation configuration found no
+physical or episode-generation differences (`PENDING_CONFIG_MERGE = NO`).
 
-## ABLATIONS / COMPARISONS
+`system_config.toml` remains separately available for existing artifact
+workflows; it is not the PPO mainline configuration.
+
+## BASELINES / ABLATIONS (NON-MAINLINE)
 
 - `ablations/system_config_ppo_v8_no_prediction_ablation.toml` — V8 no-prediction
   ablation.
@@ -33,19 +39,13 @@ experiments.
 - `baselines/system_config_ppo_v7_cache_operation_group.toml` — V7 Cache-only policy
   comparison.
 
-## HISTORICAL / SUPPORTING
-
-- `episode_generation/system_config_ppo_v6_full_episode_randomized.toml` — full randomized
-  episode-pool protocol used by the existing training pool.
 - `baselines/system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_actorlr1e4.toml`
-  — earlier V6 grouped primitive policy.
-- `system_config.toml` — shared artifact-generation/system configuration
-  retained for recorded artifact workflows.
+  — retained earlier grouped primitive policy configuration for comparison.
 
 ## Stable method IDs
 
-- `proposed_joint` — FROZEN; the formal checkpoint remains assigned at epoch
-  222, while the retained 1e-4 base run completed 300 epochs.
+- `proposed_joint` — Recovery R2 bounded gate passed; formal training is not
+  yet completed.
 - `ablation_cache_only` — NOT YET FORMALLY TRAINED TO 222; V8 Cache-only
   configuration and evaluator are available.
 - `ablation_joint_no_prediction` — NOT YET FORMALLY TRAINED; a Joint
@@ -54,12 +54,10 @@ experiments.
 - `baseline_popularity_greedy` — implementation available.
 - `baseline_true_static` — implementation available.
 
-Final test seeds `40001..40020` remain reserved and have not been executed.
-
-The current learning-rate records are `proposed_joint_lr_1e4` (completed,
-300 epochs), `proposed_joint_lr_1e3` (completed, 300 epochs), and
-`proposed_joint_lr_5e4` (completed, 300 epochs).  V7/V8/V9 in historical filenames and
-internal compatibility strings are not new paper-facing method names.
+Final test seeds and historical LR sweep files are outside the Recovery R2
+mainline and are not executed by this cleanup pass.  Earlier development
+versions are retained only in Git history and reports; V7/V8 baseline support
+remains explicit.
 
 Changing a configuration's role here does not change its contents or the
 provenance of any existing run.
