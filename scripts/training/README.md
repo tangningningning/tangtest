@@ -7,8 +7,8 @@ orchestration wrappers; no second training implementation is maintained here.
 The current mainline entry is:
 
 ```text
-ppo-train --config configs/proposed/system_config_ppo_recovery_r2_6e4.toml
+ppo-train --config configs/proposed/system_config.toml
 ```
 
-Recovery R2 has passed its bounded implementation gate; formal training is
-not yet completed.
+The proposed joint exact-Q listwise candidate implementation gate has passed;
+formal training is not run by the mainline consolidation task.

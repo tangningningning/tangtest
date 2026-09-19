@@ -1,4 +1,4 @@
-"""Recovery R2 frozen-policy evaluator.
+"""Proposed joint frozen-policy evaluator.
 
 The evaluator uses the same PPOV2Trainer policy factory and checkpoint
 loader as training.  It only samples actions and executes the real rollout
@@ -40,9 +40,9 @@ from .trainer import (
 )
 
 
-R2_POLICY_SCHEMA = "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2"
-R2_CONTROL_MODE = "policy_primitive_r2_joint_cache_uav_operation"
-R2_CONFIG_PATH = "configs/proposed/system_config_ppo_recovery_r2_6e4.toml"
+PROPOSED_POLICY_SCHEMA = "adaptive_joint_cache_uav_ppo"
+PROPOSED_CONTROL_MODE = "policy_primitive_joint_cache_uav_operation"
+PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 FULL_EPISODE_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
 FULL_EPISODE_SLOTS = 300
 FULL_EPISODE_ORIGIN_START = 0
@@ -69,7 +69,7 @@ EPISODE_METRIC_NAMES = (
 
 def _require_torch() -> None:
     if torch is None:
-        raise ImportError("Recovery R2 evaluation requires PyTorch.")
+        raise ImportError("proposed joint evaluation requires PyTorch.")
 
 
 def _resolve_path(project_root: Path, value: str | Path) -> Path:
@@ -98,16 +98,16 @@ def _ensure_fresh_output(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _validate_r2_context(context: Any) -> dict[str, Any]:
-    if str(context.policy_schema) != R2_POLICY_SCHEMA:
+def _validate_proposed_context(context: Any) -> dict[str, Any]:
+    if str(context.policy_schema) != PROPOSED_POLICY_SCHEMA:
         raise ValueError(
-            "Recovery R2 evaluator requires policy_schema="
-            f"{R2_POLICY_SCHEMA}, got {context.policy_schema}"
+            "proposed joint evaluator requires policy_schema="
+            f"{PROPOSED_POLICY_SCHEMA}, got {context.policy_schema}"
         )
-    if str(context.configuration_control_mode) != R2_CONTROL_MODE:
+    if str(context.configuration_control_mode) != PROPOSED_CONTROL_MODE:
         raise ValueError(
-            "Recovery R2 evaluator requires configuration_control_mode="
-            f"{R2_CONTROL_MODE}, got {context.configuration_control_mode}"
+            "proposed joint evaluator requires configuration_control_mode="
+            f"{PROPOSED_CONTROL_MODE}, got {context.configuration_control_mode}"
         )
     protocol = project_config.get_ppo_data_protocol(context.cfg)
     expected = {
@@ -125,7 +125,7 @@ def _validate_r2_context(context: Any) -> dict[str, Any]:
         actual = protocol.get(key)
         if actual != expected_value:
             raise ValueError(
-                "Recovery R2 evaluator protocol mismatch for "
+                "proposed joint evaluator protocol mismatch for "
                 f"{key}: {actual!r} != {expected_value!r}"
             )
     return protocol
@@ -134,14 +134,14 @@ def _validate_r2_context(context: Any) -> dict[str, Any]:
 def _load_checkpoint_metadata(checkpoint: Path) -> dict[str, Any]:
     _require_torch()
     if not checkpoint.is_file():
-        raise FileNotFoundError(f"R2 checkpoint does not exist: {checkpoint}")
+        raise FileNotFoundError(f"proposed checkpoint does not exist: {checkpoint}")
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
-        raise ValueError("R2 checkpoint payload must be a mapping")
-    if payload.get("policy_schema") != R2_POLICY_SCHEMA:
+        raise ValueError("proposed checkpoint payload must be a mapping")
+    if payload.get("policy_schema") != PROPOSED_POLICY_SCHEMA:
         raise ValueError(
-            "R2 checkpoint policy_schema mismatch: "
-            f"{payload.get('policy_schema')!r} != {R2_POLICY_SCHEMA!r}"
+            "proposed checkpoint policy_schema mismatch: "
+            f"{payload.get('policy_schema')!r} != {PROPOSED_POLICY_SCHEMA!r}"
         )
     return payload
 
@@ -156,7 +156,7 @@ def _seed_policy_sampling(seed: int) -> None:
         torch.cuda.manual_seed_all(value)
 
 
-def _load_r2_trainer(
+def _load_proposed_trainer(
     context: Any,
     checkpoint: Path,
     config_hash: str,
@@ -166,20 +166,20 @@ def _load_r2_trainer(
     trainer = PPOV2Trainer(context, device=device)
     if trainer.policy.architecture_id != context.policy_schema:
         raise TypeError(
-            "Trainer policy factory did not construct the configured R2 schema: "
+            "Trainer policy factory did not construct the configured proposed schema: "
             f"{trainer.policy.architecture_id!r} != {context.policy_schema!r}"
         )
     if checkpoint_metadata.get("configuration_control_mode") != (
         context.configuration_control_mode
     ):
         raise ValueError(
-            "R2 checkpoint configuration_control_mode mismatch: "
+            "proposed checkpoint configuration_control_mode mismatch: "
             f"{checkpoint_metadata.get('configuration_control_mode')!r} != "
             f"{context.configuration_control_mode!r}"
         )
     trainer.load_checkpoint(checkpoint, config_hash)
-    if trainer.policy.architecture_id != R2_POLICY_SCHEMA:
-        raise TypeError("R2 checkpoint restored an unexpected policy schema")
+    if trainer.policy.architecture_id != PROPOSED_POLICY_SCHEMA:
+        raise TypeError("proposed checkpoint restored an unexpected policy schema")
     trainer.policy.eval()
     return trainer
 
@@ -197,11 +197,11 @@ def _rollout_summary(
 ) -> dict[str, Any]:
     if len(rollout.transitions) != FULL_EPISODE_SLOTS:
         raise ValueError(
-            "R2 evaluation rollout must contain exactly "
+            "proposed evaluation rollout must contain exactly "
             f"{FULL_EPISODE_SLOTS} transitions"
         )
     if not bool(rollout.dones[-1]) or bool(np.any(rollout.dones[:-1])):
-        raise ValueError("R2 evaluation must terminate only at origin 299")
+        raise ValueError("proposed evaluation must terminate only at origin 299")
 
     task_metrics = aggregate_episode_task_metrics(rollout.transitions)
     cache_head_count = len(context.action_spec.cache_node_ids)
@@ -209,19 +209,19 @@ def _rollout_summary(
     total_cache_heads = FULL_EPISODE_SLOTS * cache_head_count
     total_uav_heads = FULL_EPISODE_SLOTS * uav_head_count
     if total_cache_heads <= 0 or total_uav_heads <= 0:
-        raise ValueError("R2 evaluation requires Cache and UAV action heads")
+        raise ValueError("proposed evaluation requires Cache and UAV action heads")
 
     uav_operation_actions = rollout.uav_operation_actions
     if uav_operation_actions is None:
-        raise ValueError("R2 evaluation rollout is missing UAV operation actions")
+        raise ValueError("proposed evaluation rollout is missing UAV operation actions")
     operation_order = tuple(getattr(trainer.policy, "uav_operation_order", ()))
     if "STAY" not in operation_order or "MOVE" not in operation_order:
-        raise ValueError("R2 policy does not expose the STAY/MOVE operation order")
+        raise ValueError("proposed policy does not expose the STAY/MOVE operation order")
     uav_operation_array = np.asarray(uav_operation_actions, dtype=np.int64)
     expected_shape = (FULL_EPISODE_SLOTS, uav_head_count)
     if uav_operation_array.shape != expected_shape:
         raise ValueError(
-            "R2 UAV operation action shape mismatch: "
+            "proposed UAV operation action shape mismatch: "
             f"{uav_operation_array.shape} != {expected_shape}"
         )
     move_index = operation_order.index("MOVE")
@@ -280,7 +280,7 @@ def _rollout_summary(
         "uav_move_rate",
     )
     if not all(math.isfinite(float(summary[name])) for name in finite_values):
-        raise FloatingPointError("R2 evaluation produced a non-finite metric")
+        raise FloatingPointError("proposed evaluation produced a non-finite metric")
     return summary
 
 
@@ -360,7 +360,7 @@ def evaluate_pool(
     pool_path = _resolve_path(project_root, episode_pool)
     output_path = _resolve_path(project_root, run_dir)
     if not config_file.is_file():
-        raise FileNotFoundError(f"R2 config is not readable: {config_file}")
+        raise FileNotFoundError(f"proposed config is not readable: {config_file}")
     if not pool_path.is_dir():
         raise FileNotFoundError(f"episode pool does not exist: {pool_path}")
     _ensure_fresh_output(output_path)
@@ -368,7 +368,7 @@ def evaluate_pool(
     checkpoint_metadata = _load_checkpoint_metadata(checkpoint)
     config_hash = _sha256(config_file)
     reference_context = load_environment_context(str(config_file))
-    protocol = _validate_r2_context(reference_context)
+    protocol = _validate_proposed_context(reference_context)
     environment_means: list[dict[str, Any]] = []
     repeat_summaries: list[dict[str, Any]] = []
 
@@ -383,13 +383,13 @@ def evaluate_pool(
             str(config_file),
             realization_dir=realization_dir,
         )
-        _validate_r2_context(context)
+        _validate_proposed_context(context)
         _assert_realization_context_compatible(reference_context, context)
         steps = aligned_train_steps(context)
         if len(steps) != FULL_EPISODE_SLOTS:
-            raise ValueError("R2 evaluation aligned steps are not a full 300-slot episode")
+            raise ValueError("proposed evaluation aligned steps are not a full 300-slot episode")
 
-        trainer = _load_r2_trainer(
+        trainer = _load_proposed_trainer(
             context,
             checkpoint,
             config_hash,
@@ -447,15 +447,15 @@ def evaluate_pool(
                 strict=True,
             )
         ):
-            raise RuntimeError("R2 evaluation modified policy parameters")
+            raise RuntimeError("proposed evaluation modified policy parameters")
         if trainer.policy.popart_statistics() != popart_snapshot:
-            raise RuntimeError("R2 evaluation modified PopArt statistics")
+            raise RuntimeError("proposed evaluation modified PopArt statistics")
         if (
             int(trainer.optimizer_steps),
             int(trainer.actor_optimizer_steps),
             int(trainer.critic_optimizer_steps),
         ) != optimizer_steps_snapshot:
-            raise RuntimeError("R2 evaluation performed an optimizer step")
+            raise RuntimeError("proposed evaluation performed an optimizer step")
 
         environment_mean = _mean_environment_summary(
             episode_seed,
@@ -464,7 +464,7 @@ def evaluate_pool(
         environment_means.append(environment_mean)
         environment_output = output_path / f"episode_{episode_seed}"
         environment_output.mkdir(parents=True, exist_ok=False)
-        with (environment_output / "r2_repeat_summaries.json").open(
+        with (environment_output / "proposed_repeat_summaries.json").open(
             "w", encoding="utf-8", newline="\n"
         ) as stream:
             json.dump(
@@ -482,13 +482,13 @@ def evaluate_pool(
         if all(summary.get(name) is not None for summary in environment_means)
     )
     aggregate = {
-        "experiment_type": "recovery_r2_episode_pool_evaluation",
+        "experiment_type": "proposed_joint_episode_pool_evaluation",
         "config_path": str(config_file),
         "config_sha256": config_hash,
         "checkpoint_path": str(checkpoint),
         "checkpoint_policy_schema": checkpoint_metadata.get("policy_schema"),
-        "policy_schema": R2_POLICY_SCHEMA,
-        "configuration_control_mode": R2_CONTROL_MODE,
+        "policy_schema": PROPOSED_POLICY_SCHEMA,
+        "configuration_control_mode": PROPOSED_CONTROL_MODE,
         "data_protocol": str(protocol["protocol"]),
         "episode_pool": str(pool_path),
         "episode_count": len(environment_means),
@@ -509,7 +509,7 @@ def evaluate_pool(
         "environment_means": environment_means,
         "repeat_summaries": repeat_summaries,
     }
-    with (output_path / "r2_episode_pool_summary.json").open(
+    with (output_path / "proposed_episode_pool_summary.json").open(
         "w", encoding="utf-8", newline="\n"
     ) as stream:
         json.dump(aggregate, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -519,9 +519,9 @@ def evaluate_pool(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate a frozen Recovery R2 PPO policy on an episode pool"
+        description="Evaluate a frozen proposed joint PPO policy on an episode pool"
     )
-    parser.add_argument("--config", default=R2_CONFIG_PATH)
+    parser.add_argument("--config", default=PROPOSED_CONFIG_PATH)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--episode-pool", required=True)

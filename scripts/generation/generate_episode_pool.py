@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="configs/proposed/system_config_ppo_recovery_r2_6e4.toml",
+        default="configs/proposed/system_config.toml",
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start-seed", type=int, required=True)

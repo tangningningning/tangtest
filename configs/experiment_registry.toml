@@ -1,8 +1,7 @@
 # Stable experiment registry.  This file describes scope and entrypoints; it
 # does not change any algorithm or existing TOML configuration.  The stable
-# proposed-method ID remains `proposed_joint`, whose current implementation is
-# Recovery R2.  Earlier development versions are retained only in Git history
-# and reports.
+# proposed-method ID is `proposed_joint`, the sole current production mainline.
+# Earlier development versions are retained only in Git history and reports.
 
 registry_version = 1
 final_test_executed = false
@@ -56,7 +55,7 @@ execution_ratios = [
 
 [methods.proposed_joint]
 category = "proposed"
-status = "BOUNDED_GATE_PASSED_FORMAL_TRAINING_PENDING"
+status = "EXACT_Q_LISTWISE_GATE_PASSED_FORMAL_TRAINING_PENDING"
 prediction = true
 adaptive_cache = true
 adaptive_uav = true
@@ -65,11 +64,11 @@ policy_mode = "stochastic"
 stochastic_repeats = 5
 cache_policy = "learned_adaptive"
 uav_policy = "learned_adaptive"
-config = "configs/proposed/system_config_ppo_recovery_r2_6e4.toml"
+config = "configs/proposed/system_config.toml"
 checkpoint = ""
 training_entrypoint = "ppo-train"
 evaluation_entrypoint = "src/ppo_simple/evaluator.py"
-notes = "Recovery R2 bounded gate passed; formal training and final-test seed execution are pending. Generation, training, and frozen-checkpoint evaluation use the same R2 configuration. The R2 evaluator averages stochastic repeats within each environment, then reports statistics across environment means. The R2 policy is a standalone current policy schema with the verified V7/V8-compatible backbone."
+notes = "The exact-Q listwise candidate implementation gate passed. Cache KEEP/UPDATE and UAV STAY/MOVE operation heads remain unchanged; only candidate policy optimization uses the detached state-wise standardized exact-Q teacher. Formal training and final-test seed execution remain pending. Generation, training, and frozen-checkpoint evaluation use configs/proposed/system_config.toml."
 
 [methods.ablation_cache_only]
 category = "ablation"

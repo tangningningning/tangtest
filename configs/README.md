@@ -1,7 +1,7 @@
 # Configuration index
 
 TOML files are classified under `configs/` so current commands have stable,
-purpose-specific paths.  Recovery R2 is the only current proposed-method
+purpose-specific paths.  `proposed_joint` is the only current proposed-method
 configuration.  The stable comparison registry is
 `configs/experiment_registry.toml` and its read-only display/validation
 entrypoint is `scripts/experiment_registry.py`.
@@ -12,16 +12,16 @@ experiments.
 
 ## CURRENT MAINLINE
 
-- `proposed/system_config_ppo_recovery_r2_6e4.toml` — Recovery R2 bounded-gate
-  configuration with policy schema
-  `adaptive_joint_cache_replica_aware_uav_operation_recovery_r2`.
+- `proposed/system_config.toml` — the single proposed mainline configuration
+  with policy schema `adaptive_joint_cache_uav_ppo` and exact-Q listwise
+  candidate improvement.
 - `system_config.toml` — shared artifact-generation/system configuration,
   retained for existing artifact workflows.
 
 ## UNIFIED GENERATION / TRAINING / EVALUATION
 
 The canonical generation entrypoints, `ppo-train`, and `ppo-eval` all use
-`proposed/system_config_ppo_recovery_r2_6e4.toml`.  The effective data protocol
+`proposed/system_config.toml`.  The effective data protocol
 is the full 300-slot randomized episode protocol: origins 0 through 299,
 terminal origin 299, and no held-out test-origin range.  A field-by-field
 comparison against the former V6 episode-generation configuration found no
@@ -44,8 +44,8 @@ workflows; it is not the PPO mainline configuration.
 
 ## Stable method IDs
 
-- `proposed_joint` — Recovery R2 bounded gate passed; formal training is not
-  yet completed.
+- `proposed_joint` — exact-Q listwise implementation gate passed; formal
+  training is not yet completed.
 - `ablation_cache_only` — NOT YET FORMALLY TRAINED TO 222; V8 Cache-only
   configuration and evaluator are available.
 - `ablation_joint_no_prediction` — NOT YET FORMALLY TRAINED; a Joint
@@ -54,7 +54,7 @@ workflows; it is not the PPO mainline configuration.
 - `baseline_popularity_greedy` — implementation available.
 - `baseline_true_static` — implementation available.
 
-Final test seeds and historical LR sweep files are outside the Recovery R2
+Final test seeds and historical LR sweep files are outside the proposed
 mainline and are not executed by this cleanup pass.  Earlier development
 versions are retained only in Git history and reports; V7/V8 baseline support
 remains explicit.

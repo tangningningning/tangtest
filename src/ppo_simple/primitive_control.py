@@ -26,11 +26,7 @@ REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
     {
         REPLICA_AWARE_POLICY_SCHEMA,
         NO_PREDICTION_POLICY_SCHEMA,
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
+        "adaptive_joint_cache_uav_ppo",
     }
 )
 REPLICA_AWARE_CACHE_FEATURE_NAMES = (
@@ -950,7 +946,7 @@ def sample_and_apply_v8_no_prediction_cache_operation_configuration(
     )
 
 
-def sample_and_apply_r6_binary_cache_operation_configuration(
+def sample_and_apply_binary_cache_operation_configuration(
     policy: Any,
     observation: np.ndarray,
     previous_cache_state: np.ndarray,
@@ -961,16 +957,16 @@ def sample_and_apply_r6_binary_cache_operation_configuration(
     *,
     deterministic: bool = False,
 ) -> CacheOperationPrimitiveSelectionResult:
-    """Sample R6 binary triggers and one unified UPDATE candidate set.
+    """Sample binary Cache triggers and one unified UPDATE candidate set.
 
-    The production candidate enumerator is intentionally shared with R5.
-    R6 changes only the factorization: all legal ADD/DELETE/SWAP candidates
+    The production candidate enumerator is shared with the exact Cache credit path.
+    The proposed joint policy changes only the factorization: all legal ADD/DELETE/SWAP candidates
     are passed to one conditional categorical distribution after UPDATE.
     """
 
     trigger_order = ("KEEP", "UPDATE")
     if tuple(getattr(policy, "trigger_order", ())) != trigger_order:
-        raise ValueError("R6 Cache trigger order must be KEEP/UPDATE")
+        raise ValueError("Cache trigger order must be KEEP/UPDATE")
     cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     previous_cache = cache.copy()
     current_uav = {
@@ -978,7 +974,7 @@ def sample_and_apply_r6_binary_cache_operation_configuration(
         for uav_id in context.action_spec.uav_ids
     }
     if tensor_spec.num_cache_heads != len(context.action_spec.cache_node_ids):
-        raise ValueError("R6 tensor spec cache head count does not match action spec")
+        raise ValueError("Cache tensor spec head count does not match action spec")
 
     operation_actions = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
     operation_masks = np.zeros(
@@ -1077,7 +1073,7 @@ def sample_and_apply_r6_binary_cache_operation_configuration(
             continue
 
         if not update_candidates:
-            raise AssertionError("R6 selected UPDATE without a legal candidate")
+            raise AssertionError("selected UPDATE without a legal candidate")
         cache_triggers[node_index] = 1
         candidate_features = np.stack(
             [
@@ -1095,7 +1091,7 @@ def sample_and_apply_r6_binary_cache_operation_configuration(
         )
         count = len(update_candidates)
         if count > tensor_spec.cache_max_candidates:
-            raise AssertionError("R6 Cache candidate count exceeds padded capacity")
+            raise AssertionError("Cache candidate count exceeds padded capacity")
         sampled_candidate = policy.sample_cache_update_candidate(
             conditional_context,
             candidate_features,
@@ -1134,7 +1130,7 @@ def sample_and_apply_r6_binary_cache_operation_configuration(
         )
 
     if total_log_prob is None or total_entropy is None:
-        raise RuntimeError("R6 Cache trigger selection produced no heads")
+        raise RuntimeError("Cache trigger selection produced no heads")
     cache_configuration.validate_cache_shape_and_capacity(
         cache,
         context.service_catalog,
@@ -1171,7 +1167,7 @@ def sample_and_apply_r6_binary_cache_operation_configuration(
     )
 
 
-def sample_and_apply_r2_joint_cache_uav_operation_configuration(
+def sample_and_apply_joint_cache_uav_operation_configuration(
     policy: Any,
     observation: np.ndarray,
     previous_cache_state: np.ndarray,
@@ -1187,9 +1183,9 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
 
     operation_order = ("STAY", "MOVE")
     if tuple(getattr(policy, "uav_operation_order", ())) != operation_order:
-        raise ValueError("R2 UAV operation order must be STAY/MOVE")
+        raise ValueError("UAV operation order must be STAY/MOVE")
     if binary_cache_trigger:
-        cache_result = sample_and_apply_r6_binary_cache_operation_configuration(
+        cache_result = sample_and_apply_binary_cache_operation_configuration(
             policy,
             observation,
             previous_cache_state,
@@ -1291,7 +1287,7 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
             if str(candidate.operation_type) == "MOVE"
         ]
         if len(move_candidates) > tensor_spec.uav_max_candidates:
-            raise AssertionError("R2 UAV candidate count exceeds padded capacity")
+            raise AssertionError("UAV candidate count exceeds padded capacity")
         operation_mask = np.asarray(
             [True, bool(move_candidates)],
             dtype=bool,
@@ -1317,7 +1313,7 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
             or sampled_operation.probabilities is None
         ):
             raise RuntimeError(
-                "R2 UAV operation sampling did not return raw diagnostics"
+                "UAV operation sampling did not return raw diagnostics"
             )
         raw_logits = np.asarray(
             sampled_operation.raw_logits.detach().cpu().numpy(),
@@ -1328,15 +1324,15 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
             dtype=np.float64,
         ).reshape(-1)
         if raw_logits.shape != (len(operation_order),):
-            raise AssertionError("R2 UAV raw operation logits shape mismatch")
+            raise AssertionError("UAV raw operation logits shape mismatch")
         if raw_probabilities.shape != (len(operation_order),):
-            raise AssertionError("R2 UAV raw operation probabilities shape mismatch")
+            raise AssertionError("UAV raw operation probabilities shape mismatch")
         if not np.all(np.isfinite(raw_logits)) or not np.all(
             np.isfinite(raw_probabilities)
         ):
-            raise FloatingPointError("R2 UAV raw operation diagnostics are non-finite")
+            raise FloatingPointError("UAV raw operation diagnostics are non-finite")
         if not np.isclose(float(raw_probabilities.sum()), 1.0):
-            raise AssertionError("R2 UAV raw operation probabilities must sum to one")
+            raise AssertionError("UAV raw operation probabilities must sum to one")
         uav_operation_probabilities[uav_index] = raw_probabilities.astype(np.float32)
         uav_operation_logit_margins[uav_index] = float(
             raw_logits[0] - raw_logits[1]
@@ -1388,9 +1384,9 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
             continue
 
         if not move_candidates:
-            raise AssertionError("R2 selected MOVE without a feasible MOVE candidate")
+            raise AssertionError("selected MOVE without a feasible MOVE candidate")
         if selected_operation != "MOVE":
-            raise AssertionError("R2 UAV operation selected an unsupported operation")
+            raise AssertionError("UAV operation selected an unsupported operation")
         sampled_candidate = policy.sample_uav_candidate(
             conditional_context,
             candidate_features,
@@ -1399,7 +1395,7 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
         selected_index = int(sampled_candidate.selected_index)
         selected = move_candidates[selected_index]
         if str(selected.operation_type) != "MOVE":
-            raise AssertionError("R2 MOVE candidate sampler returned a non-MOVE action")
+            raise AssertionError("MOVE candidate sampler returned a non-MOVE action")
         applied = uav_configuration.apply_uav_candidate(
             current_uav,
             previous_uav,
@@ -1412,7 +1408,7 @@ def sample_and_apply_r2_joint_cache_uav_operation_configuration(
         if str(applied["operation_type"]) != "MOVE" or not bool(
             applied["actual_moved"]
         ):
-            raise AssertionError("R2 MOVE operation did not produce actual movement")
+            raise AssertionError("MOVE operation did not produce actual movement")
         uav_selected[uav_index] = selected_index
         uav_old_log_probs[uav_index] = float(
             sampled_candidate.log_prob.detach().cpu()

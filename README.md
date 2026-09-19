@@ -1,7 +1,7 @@
 # adaptive_cache_mec
 
-This repository contains the adaptive cache and MEC simulation, the Recovery R2
-PPO policy, frozen evaluation utilities, baselines, and reproducible
+This repository contains the adaptive cache and MEC simulation, the proposed
+joint PPO policy, frozen evaluation utilities, baselines, and reproducible
 episode-generation utilities.  The directory layout separates command-line
 orchestration from the reusable implementation in `src/`.
 
@@ -19,7 +19,7 @@ scripts/
   generation/   Episode and project-artifact generation
   evaluation/   Retained learned-policy comparison evaluation
   baselines/    Explicit Static and Prediction-Popularity Greedy evaluation
-configs/        Recovery R2 plus baseline and artifact-support configs
+configs/        The proposed mainline plus baseline and artifact-support configs
 reports/        Research reports and experiment records
 runs/           Generated experiment artifacts; formal runs are not reorganized
 ```
@@ -28,14 +28,14 @@ The canonical generation entrypoints live under `scripts/generation/`.
 Comparison evaluators remain under `scripts/evaluation/` and
 `scripts/baselines/`; they are non-mainline compatibility/comparison tools.
 
-## Current mainline: Recovery R2
+## Current mainline: proposed_joint
 
 ```text
 CURRENT_POLICY_SCHEMA =
-adaptive_joint_cache_replica_aware_uav_operation_recovery_r2
+adaptive_joint_cache_uav_ppo
 
 CURRENT_CONFIG =
-configs/proposed/system_config_ppo_recovery_r2_6e4.toml
+configs/proposed/system_config.toml
 ```
 
 The current operating chain is:
@@ -43,25 +43,24 @@ The current operating chain is:
 ```text
 Fixed SUMO network
   -> episode realization / episode pool
-  -> Recovery R2 PPO training
+  -> proposed_joint PPO training
   -> checkpoint
   -> evaluation
 ```
 
-Recovery R2 is the current algorithm mainline.  Its bounded gate passed
-(witness alignment 4/4, autograd direction 4/4, and no NaN/Inf); formal
-training has not yet been completed.
+`proposed_joint` is the only production proposed schema.  The exact-Q
+listwise candidate correctness gate passed; formal training has not been run
+by this consolidation task.
 
-The R2 credit contract is:
+The proposed-joint credit contract is:
 
-- Cache advantage = `GLOBAL_GAE`
+- Cache trigger credit = exact node counterfactual Q
 - UAV operation advantage = `COUNTERFACTUAL_ONE_STEP_TD`
 - UAV operation PPO ratio = `OPERATION_ONLY`
-- Candidate credit = the original Recovery R1 path
-- Operation advantage normalization = `STD_ONLY`
-- No centered mean subtraction
+- Cache and UAV candidate objective = `EXACT_Q_LISTWISE`
+- Candidate teacher = state-wise standardized exact Q softmax over all legal candidates
 
-The R2 policy is the standalone current learned policy schema.  It preserves
+The proposed policy is the standalone current learned policy schema.  It preserves
 the verified parameter/module layout and checkpoint key set while using a
 neutral shared base; V7/V8 and primitive baseline paths remain available as
 separate baselines.
@@ -69,13 +68,13 @@ separate baselines.
 ## Unified experiment registry
 
 The stable comparison labels are registered in
-`configs/experiment_registry.toml`.  The R2 mainline is recorded there under
+`configs/experiment_registry.toml`.  The proposed mainline is recorded there under
 the stable `proposed_joint` identifier; baseline and ablation entries remain
 non-mainline comparison definitions:
 
 | Method ID | Definition | Status |
 | --- | --- | --- |
-| `proposed_joint` | Recovery R2 prediction + adaptive Cache + adaptive UAV + learned policy | BOUNDED GATE PASSED; FORMAL TRAINING PENDING |
+| `proposed_joint` | exact-Q listwise candidate prediction + adaptive Cache + adaptive UAV + learned policy | IMPLEMENTATION GATE PASSED; FORMAL TRAINING PENDING |
 | `ablation_cache_only` | prediction + adaptive Cache + fixed UAV + learned policy | NOT YET FORMALLY TRAINED TO 222 |
 | `ablation_joint_no_prediction` | no prediction + adaptive Cache + adaptive UAV + learned policy | NOT YET FORMALLY TRAINED |
 | `baseline_popularity_greedy` | prediction/popularity Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |
@@ -98,29 +97,29 @@ does not have the Joint Cache + UAV definition recorded above.
 Run commands from the repository root.  The package must be installed (or
 `src` must be on `PYTHONPATH`).
 
-Generate an existing-protocol episode pool with the same Recovery R2
+Generate an existing-protocol episode pool with the same proposed-joint
 configuration used by training and evaluation:
 
 ```text
 python scripts/generation/generate_episode_pool.py \
-  --config configs/proposed/system_config_ppo_recovery_r2_6e4.toml \
+  --config configs/proposed/system_config.toml \
   --output-dir runs/<episode-pool> --start-seed <seed-start> --count <count>
 ```
 
-Train the current Recovery R2 mainline through the single PPO implementation:
+Train the current proposed mainline through the single PPO implementation:
 
 ```text
-ppo-train --config configs/proposed/system_config_ppo_recovery_r2_6e4.toml \
+ppo-train --config configs/proposed/system_config.toml \
   --epochs <epochs> --run-dir runs/<new-run> \
   --episode-pool runs/<episode-pool> --episode-seed-start <seed-start>
 ```
 
-Evaluate a frozen Recovery R2 checkpoint on 20 episode realizations with 5
+Evaluate a frozen proposed-joint checkpoint on 20 episode realizations with 5
 stochastic repeats per realization:
 
 ```text
 ppo-eval \
-  --config configs/proposed/system_config_ppo_recovery_r2_6e4.toml \
+  --config configs/proposed/system_config.toml \
   --checkpoint runs/<training-run>/<checkpoint>.pt \
   --run-dir runs/<evaluation-run> \
   --episode-pool runs/<episode-pool> \
