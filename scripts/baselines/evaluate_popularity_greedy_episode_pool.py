@@ -18,7 +18,7 @@ from ppo_simple.evaluation_metrics import (
     episode_metric_statistics,
     execution_ratio_statistics,
 )
-from ppo_simple.popularity_greedy_evaluator import evaluate_popularity_greedy_episode
+from baselines.popularity_greedy_evaluator import evaluate_popularity_greedy_episode
 
 
 def _resolve(project_root: Path, value: str | Path) -> Path:
@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml",
+        default="configs/baselines/replica_aware_cache_only.toml",
     )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--episode-pool", required=True)

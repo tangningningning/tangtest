@@ -639,7 +639,7 @@ def compute_exact_node_specific_cache_credit(
                 state["p_keep"] * (keep_q - state_baseline)
                 + state["p_update"] * (update_q - state_baseline)
             )
-            selected_update = int(transition.v7_cache_operation_actions[node_index]) != 0
+            selected_update = int(transition.cache_operation_actions[node_index]) != 0
             trigger_advantages[sample_index, node_index] = (
                 update_q - state_baseline if selected_update else keep_q - state_baseline
             )

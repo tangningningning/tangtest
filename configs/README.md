@@ -24,7 +24,7 @@ The canonical generation entrypoints, `ppo-train`, and `ppo-eval` all use
 `proposed/system_config.toml`.  The effective data protocol
 is the full 300-slot randomized episode protocol: origins 0 through 299,
 terminal origin 299, and no held-out test-origin range.  A field-by-field
-comparison against the former V6 episode-generation configuration found no
+comparison against the retained primitive episode-generation configuration found no
 physical or episode-generation differences (`PENDING_CONFIG_MERGE = NO`).
 
 `system_config.toml` remains separately available for existing artifact
@@ -32,12 +32,10 @@ workflows; it is not the PPO mainline configuration.
 
 ## BASELINES / ABLATIONS (NON-MAINLINE)
 
-- `ablations/system_config_ppo_v8_no_prediction_ablation.toml` — V8 no-prediction
-  ablation.
-- `baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml` — V8
-  replica-aware Cache-only policy and explicit-cache baselines.
-- `baselines/system_config_ppo_v7_cache_operation_group.toml` — V7 Cache-only policy
-  comparison.
+- `ablations/no_prediction.toml` — no-prediction cache-only ablation.
+- `baselines/replica_aware_cache_only.toml` — replica-aware cache-only policy
+  and explicit-cache baselines.
+- `baselines/cache_only.toml` — cache-only policy comparison.
 
 - `baselines/system_config_ppo_primitive_v6_horizon_grouped_separate_optimization_popart_actorlr1e4.toml`
   — retained earlier grouped primitive policy configuration for comparison.
@@ -46,18 +44,18 @@ workflows; it is not the PPO mainline configuration.
 
 - `proposed_joint` — exact-Q listwise implementation gate passed; formal
   training is not yet completed.
-- `ablation_cache_only` — NOT YET FORMALLY TRAINED TO 222; V8 Cache-only
+- `ablation_cache_only` — NOT YET FORMALLY TRAINED TO 222; cache-only
   configuration and evaluator are available.
 - `ablation_joint_no_prediction` — NOT YET FORMALLY TRAINED; a Joint
-  no-prediction configuration is intentionally not aliased to the existing V8
-  Cache-only no-prediction ablation.
+  no-prediction configuration is intentionally not aliased to the existing
+  cache-only no-prediction ablation.
 - `baseline_popularity_greedy` — implementation available.
 - `baseline_true_static` — implementation available.
 
 Final test seeds and historical LR sweep files are outside the proposed
 mainline and are not executed by this cleanup pass.  Earlier development
-versions are retained only in Git history and reports; V7/V8 baseline support
-remains explicit.
+versions are retained only in Git history and reports; comparison support
+remains explicit under semantic baseline and ablation paths.
 
 Changing a configuration's role here does not change its contents or the
 provenance of any existing run.

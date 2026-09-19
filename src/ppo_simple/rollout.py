@@ -13,17 +13,16 @@ from decision import cache_configuration, slot_environment
 from . import interface
 from .evaluation_metrics import task_metrics_from_result
 from .interface import _copy_uav_positions
-from .no_prediction import (
+from ablations.no_prediction import (
     NO_PREDICTION_POLICY_SCHEMA,
     is_no_prediction_context,
     mask_no_prediction_observation,
 )
 from .policy import (
-    AdaptiveCacheOperationGroupV7PopArtActorCritic,
-    AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
-    AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
-    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic,
+    AdaptiveCacheOnlyActorCritic,
+    AdaptiveReplicaAwareCacheOnlyActorCritic,
+    AdaptiveNoPredictionCacheOnlyActorCritic,
+    AdaptiveJointCacheUAVPPOActorCritic,
     AdaptivePrimitiveActorCritic,
     BernoulliActorCritic,
     PolicySample,
@@ -31,10 +30,10 @@ from .policy import (
 from .primitive_control import (
     PrimitiveTensorSpec,
     sample_and_apply_primitive_configuration,
-    sample_and_apply_v8_cache_operation_configuration,
-    sample_and_apply_v8_no_prediction_cache_operation_configuration,
-    sample_and_apply_v7_cache_operation_configuration,
-    sample_and_apply_r2_joint_cache_uav_operation_configuration,
+    sample_and_apply_replica_aware_cache_operation_configuration,
+    sample_and_apply_no_prediction_cache_operation_configuration,
+    sample_and_apply_cache_operation_configuration,
+    sample_and_apply_joint_cache_uav_operation_configuration,
 )
 
 
@@ -78,16 +77,16 @@ class SimpleTransition:
     online_k100_configuration_calls: int
     matching_summary: dict[str, Any]
     origin_runtime_seconds: float
-    # State at the beginning of this transition.  R2 uses it to replay exact
+    # State at the beginning of this transition.  proposed uses it to replay exact
     # operation counterfactuals without reconstructing the rollout prefix.
     previous_cache_state: np.ndarray
     previous_uav_positions: dict[str, tuple[float, float]]
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
-    v7_cache_operation_actions: np.ndarray | None = None
-    v7_cache_operation_masks: np.ndarray | None = None
-    v7_cache_operation_log_probs: np.ndarray | None = None
-    v7_cache_operation_entropies: np.ndarray | None = None
+    cache_operation_actions: np.ndarray | None = None
+    cache_operation_masks: np.ndarray | None = None
+    cache_operation_log_probs: np.ndarray | None = None
+    cache_operation_entropies: np.ndarray | None = None
     uav_operation_actions: np.ndarray | None = None
     uav_operation_masks: np.ndarray | None = None
     uav_operation_log_probs: np.ndarray | None = None
@@ -117,10 +116,10 @@ class SimpleRollout:
     next_cache_state: np.ndarray
     next_uav_positions: dict[str, tuple[float, float]]
     bootstrap_observation: np.ndarray | None
-    v7_cache_operation_actions: np.ndarray | None = None
-    v7_cache_operation_masks: np.ndarray | None = None
-    v7_cache_operation_log_probs: np.ndarray | None = None
-    v7_cache_operation_entropies: np.ndarray | None = None
+    cache_operation_actions: np.ndarray | None = None
+    cache_operation_masks: np.ndarray | None = None
+    cache_operation_log_probs: np.ndarray | None = None
+    cache_operation_entropies: np.ndarray | None = None
     uav_operation_actions: np.ndarray | None = None
     uav_operation_masks: np.ndarray | None = None
     uav_operation_log_probs: np.ndarray | None = None
@@ -250,23 +249,20 @@ def collect_rollout(
         if observation.shape != (int(context.observation_spec.observation_dim),):
             raise AssertionError("PPO v2 observation 不符合 observation_spec。")
         selection_started_at = time.perf_counter()
-        v7_primitive: Any | None = None
-        r2_primitive: Any | None = None
-        if context.configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation":
-            if not isinstance(
-                policy,
-                AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR2ActorCritic,
-            ):
+        cache_primitive: Any | None = None
+        joint_primitive: Any | None = None
+        if context.configuration_control_mode == "policy_primitive_joint_cache_uav_operation":
+            if not isinstance(policy, AdaptiveJointCacheUAVPPOActorCritic):
                 raise TypeError(
-                    "policy_primitive_r2_joint_cache_uav_operation requires the Recovery R2 policy"
+                    "policy_primitive_joint_cache_uav_operation requires the proposed joint policy"
                 )
             if action_transform is not None:
-                raise ValueError("Recovery R2 rollout does not support action_transform")
+                raise ValueError("proposed joint rollout does not support action_transform")
             if policy_diagnostic_callback is not None:
                 raise ValueError(
-                    "Recovery R2 rollout does not support binary-trigger diagnostics"
+                    "proposed joint rollout does not support binary-trigger diagnostics"
                 )
-            r2_primitive = sample_and_apply_r2_joint_cache_uav_operation_configuration(
+            joint_primitive = sample_and_apply_joint_cache_uav_operation_configuration(
                 policy,
                 observation,
                 previous_cache,
@@ -275,42 +271,39 @@ def collect_rollout(
                 context,
                 tensor_spec,
                 deterministic=bool(deterministic),
-                binary_cache_trigger=isinstance(
-                    policy,
-                    AdaptiveJointCacheReplicaAwareUAVOperationRecoveryR6ActorCritic,
-                ),
+                binary_cache_trigger=True,
             )
             sample = PolicySample(
-                action=np.asarray(r2_primitive.derived_action, dtype=np.int8),
-                log_prob=r2_primitive.total_log_prob,
-                entropy=r2_primitive.total_entropy,
-                value=r2_primitive.value,
+                action=np.asarray(joint_primitive.derived_action, dtype=np.int8),
+                log_prob=joint_primitive.total_log_prob,
+                entropy=joint_primitive.total_entropy,
+                value=joint_primitive.value,
                 action_mask=np.ones(
                     (int(context.action_spec.action_dim), 2),
                     dtype=bool,
                 ),
             )
-        elif context.configuration_control_mode == "policy_primitive_v7_cache_operation":
-            if not isinstance(policy, AdaptiveCacheOperationGroupV7PopArtActorCritic):
+        elif context.configuration_control_mode == "policy_primitive_cache_operation":
+            if not isinstance(policy, AdaptiveCacheOnlyActorCritic):
                 raise TypeError(
-                    "policy_primitive_v7_cache_operation requires the V7 policy"
+                    "policy_primitive_cache_operation requires a Cache-only policy"
                 )
             if action_transform is not None:
-                raise ValueError("V7 Cache-only rollout does not support action_transform")
+                raise ValueError("Cache-only rollout does not support action_transform")
             if policy_diagnostic_callback is not None:
                 raise ValueError(
-                    "V7 Cache-only rollout does not support binary-trigger diagnostics"
+                    "Cache-only rollout does not support binary-trigger diagnostics"
                 )
             if context.policy_schema == NO_PREDICTION_POLICY_SCHEMA:
                 if (
                     type(policy)
-                    is not AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic
+                    is not AdaptiveNoPredictionCacheOnlyActorCritic
                 ):
                     raise TypeError(
-                        "no-prediction schema requires the exact V8 no-prediction policy"
+                        "no-prediction schema requires the exact no-prediction Cache-only policy"
                     )
-                v7_primitive = (
-                    sample_and_apply_v8_no_prediction_cache_operation_configuration(
+                cache_primitive = (
+                    sample_and_apply_no_prediction_cache_operation_configuration(
                         policy,
                         observation,
                         previous_cache,
@@ -322,9 +315,9 @@ def collect_rollout(
                     )
                 )
             elif isinstance(
-                policy, AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic
+                policy, AdaptiveReplicaAwareCacheOnlyActorCritic
             ):
-                v7_primitive = sample_and_apply_v8_cache_operation_configuration(
+                cache_primitive = sample_and_apply_replica_aware_cache_operation_configuration(
                     policy,
                     observation,
                     previous_cache,
@@ -335,7 +328,7 @@ def collect_rollout(
                     deterministic=bool(deterministic),
                 )
             else:
-                v7_primitive = sample_and_apply_v7_cache_operation_configuration(
+                cache_primitive = sample_and_apply_cache_operation_configuration(
                     policy,
                     observation,
                     previous_cache,
@@ -346,10 +339,10 @@ def collect_rollout(
                     deterministic=bool(deterministic),
                 )
             sample = PolicySample(
-                action=np.asarray(v7_primitive.derived_action, dtype=np.int8),
-                log_prob=v7_primitive.total_log_prob,
-                entropy=v7_primitive.total_entropy,
-                value=v7_primitive.value,
+                action=np.asarray(cache_primitive.derived_action, dtype=np.int8),
+                log_prob=cache_primitive.total_log_prob,
+                entropy=cache_primitive.total_entropy,
+                value=cache_primitive.value,
                 action_mask=np.ones(
                     (int(context.action_spec.action_dim), 2),
                     dtype=bool,
@@ -445,10 +438,10 @@ def collect_rollout(
         uav_conditional_actions: tuple[dict[str, Any], ...] = ()
         cache_candidate_counts = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
         uav_candidate_counts = np.zeros(tensor_spec.num_uav_heads, dtype=np.int64)
-        v7_operation_actions: np.ndarray | None = None
-        v7_operation_masks: np.ndarray | None = None
-        v7_operation_log_probs: np.ndarray | None = None
-        v7_operation_entropies: np.ndarray | None = None
+        cache_operation_actions: np.ndarray | None = None
+        cache_operation_masks: np.ndarray | None = None
+        cache_operation_log_probs: np.ndarray | None = None
+        cache_operation_entropies: np.ndarray | None = None
         uav_operation_actions: np.ndarray | None = None
         uav_operation_masks: np.ndarray | None = None
         uav_operation_log_probs: np.ndarray | None = None
@@ -457,42 +450,42 @@ def collect_rollout(
         uav_operation_logit_margins: np.ndarray | None = None
         total_log_prob = sample.log_prob
         configuration_override = None
-        if context.configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation":
-            if r2_primitive is None:
-                raise RuntimeError("R2 joint primitive selection was not produced")
+        if context.configuration_control_mode == "policy_primitive_joint_cache_uav_operation":
+            if joint_primitive is None:
+                raise RuntimeError("proposed joint primitive selection was not produced")
             cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(
                 sample.action
             )
-            total_log_prob = r2_primitive.total_log_prob
-            cache_contexts = r2_primitive.cache_contexts
-            cache_candidate_features = r2_primitive.cache_candidate_features
-            cache_candidate_masks = r2_primitive.cache_candidate_masks
-            cache_selected_indices = r2_primitive.cache_selected_indices
-            cache_old_log_probs = r2_primitive.cache_old_log_probs
-            cache_conditional_actions = r2_primitive.cache_conditional_actions
-            cache_candidate_counts = r2_primitive.cache_candidate_counts
-            uav_contexts = r2_primitive.uav_contexts
-            uav_candidate_features = r2_primitive.uav_candidate_features
-            uav_candidate_masks = r2_primitive.uav_candidate_masks
-            uav_selected_indices = r2_primitive.uav_selected_indices
-            uav_old_log_probs = r2_primitive.uav_old_log_probs
-            uav_conditional_actions = r2_primitive.uav_conditional_actions
-            uav_candidate_counts = r2_primitive.uav_candidate_counts
-            v7_operation_actions = r2_primitive.cache_operation_actions
-            v7_operation_masks = r2_primitive.cache_operation_masks
-            v7_operation_log_probs = r2_primitive.cache_operation_old_log_probs
-            v7_operation_entropies = r2_primitive.cache_operation_entropies
-            uav_operation_actions = r2_primitive.uav_operation_actions
-            uav_operation_masks = r2_primitive.uav_operation_masks
-            uav_operation_log_probs = r2_primitive.uav_operation_old_log_probs
-            uav_operation_entropies = r2_primitive.uav_operation_entropies
-            uav_operation_probabilities = r2_primitive.uav_operation_probabilities
-            uav_operation_logit_margins = r2_primitive.uav_operation_logit_margins
+            total_log_prob = joint_primitive.total_log_prob
+            cache_contexts = joint_primitive.cache_contexts
+            cache_candidate_features = joint_primitive.cache_candidate_features
+            cache_candidate_masks = joint_primitive.cache_candidate_masks
+            cache_selected_indices = joint_primitive.cache_selected_indices
+            cache_old_log_probs = joint_primitive.cache_old_log_probs
+            cache_conditional_actions = joint_primitive.cache_conditional_actions
+            cache_candidate_counts = joint_primitive.cache_candidate_counts
+            uav_contexts = joint_primitive.uav_contexts
+            uav_candidate_features = joint_primitive.uav_candidate_features
+            uav_candidate_masks = joint_primitive.uav_candidate_masks
+            uav_selected_indices = joint_primitive.uav_selected_indices
+            uav_old_log_probs = joint_primitive.uav_old_log_probs
+            uav_conditional_actions = joint_primitive.uav_conditional_actions
+            uav_candidate_counts = joint_primitive.uav_candidate_counts
+            cache_operation_actions = joint_primitive.cache_operation_actions
+            cache_operation_masks = joint_primitive.cache_operation_masks
+            cache_operation_log_probs = joint_primitive.cache_operation_old_log_probs
+            cache_operation_entropies = joint_primitive.cache_operation_entropies
+            uav_operation_actions = joint_primitive.uav_operation_actions
+            uav_operation_masks = joint_primitive.uav_operation_masks
+            uav_operation_log_probs = joint_primitive.uav_operation_old_log_probs
+            uav_operation_entropies = joint_primitive.uav_operation_entropies
+            uav_operation_probabilities = joint_primitive.uav_operation_probabilities
+            uav_operation_logit_margins = joint_primitive.uav_operation_logit_margins
             configuration_override = slot_environment.build_policy_primitive_configuration(
                 previous_cache,
                 previous_uav,
-                r2_primitive.final_cache_state,
-                r2_primitive.final_uav_positions,
+                joint_primitive.final_cache_state,
+                joint_primitive.final_uav_positions,
                 cache_triggers,
                 uav_triggers,
                 context.service_catalog,
@@ -503,29 +496,29 @@ def collect_rollout(
                 cache_actions=cache_conditional_actions,
                 uav_actions=uav_conditional_actions,
             )
-        elif context.configuration_control_mode == "policy_primitive_v7_cache_operation":
-            if v7_primitive is None:
-                raise RuntimeError("V7 primitive selection was not produced")
+        elif context.configuration_control_mode == "policy_primitive_cache_operation":
+            if cache_primitive is None:
+                raise RuntimeError("Cache-only primitive selection was not produced")
             cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(
                 sample.action
             )
-            total_log_prob = v7_primitive.total_log_prob
-            cache_contexts = v7_primitive.cache_contexts
-            cache_candidate_features = v7_primitive.cache_candidate_features
-            cache_candidate_masks = v7_primitive.cache_candidate_masks
-            cache_selected_indices = v7_primitive.cache_selected_indices
-            cache_old_log_probs = v7_primitive.cache_old_log_probs
-            cache_conditional_actions = v7_primitive.cache_conditional_actions
-            cache_candidate_counts = v7_primitive.cache_candidate_counts
-            v7_operation_actions = v7_primitive.operation_actions
-            v7_operation_masks = v7_primitive.operation_masks
-            v7_operation_log_probs = v7_primitive.operation_old_log_probs
-            v7_operation_entropies = v7_primitive.operation_entropies
+            total_log_prob = cache_primitive.total_log_prob
+            cache_contexts = cache_primitive.cache_contexts
+            cache_candidate_features = cache_primitive.cache_candidate_features
+            cache_candidate_masks = cache_primitive.cache_candidate_masks
+            cache_selected_indices = cache_primitive.cache_selected_indices
+            cache_old_log_probs = cache_primitive.cache_old_log_probs
+            cache_conditional_actions = cache_primitive.cache_conditional_actions
+            cache_candidate_counts = cache_primitive.cache_candidate_counts
+            cache_operation_actions = cache_primitive.operation_actions
+            cache_operation_masks = cache_primitive.operation_masks
+            cache_operation_log_probs = cache_primitive.operation_old_log_probs
+            cache_operation_entropies = cache_primitive.operation_entropies
             configuration_override = slot_environment.build_policy_primitive_configuration(
                 previous_cache,
                 previous_uav,
-                v7_primitive.final_cache_state,
-                v7_primitive.final_uav_positions,
+                cache_primitive.final_cache_state,
+                cache_primitive.final_uav_positions,
                 cache_triggers,
                 uav_triggers,
                 context.service_catalog,
@@ -685,25 +678,25 @@ def collect_rollout(
                 previous_uav_positions=dict(previous_uav),
                 next_cache_state=next_cache.copy(),
                 next_uav_positions=dict(next_uav),
-                v7_cache_operation_actions=(
+                cache_operation_actions=(
                     None
-                    if v7_operation_actions is None
-                    else v7_operation_actions.copy()
+                    if cache_operation_actions is None
+                    else cache_operation_actions.copy()
                 ),
-                v7_cache_operation_masks=(
+                cache_operation_masks=(
                     None
-                    if v7_operation_masks is None
-                    else v7_operation_masks.copy()
+                    if cache_operation_masks is None
+                    else cache_operation_masks.copy()
                 ),
-                v7_cache_operation_log_probs=(
+                cache_operation_log_probs=(
                     None
-                    if v7_operation_log_probs is None
-                    else v7_operation_log_probs.copy()
+                    if cache_operation_log_probs is None
+                    else cache_operation_log_probs.copy()
                 ),
-                v7_cache_operation_entropies=(
+                cache_operation_entropies=(
                     None
-                    if v7_operation_entropies is None
-                    else v7_operation_entropies.copy()
+                    if cache_operation_entropies is None
+                    else cache_operation_entropies.copy()
                 ),
                 uav_operation_actions=(
                     None
@@ -795,32 +788,32 @@ def collect_rollout(
         next_cache_state=previous_cache.copy(),
         next_uav_positions=dict(previous_uav),
         bootstrap_observation=bootstrap_observation,
-        v7_cache_operation_actions=(
+        cache_operation_actions=(
             None
-            if any(item.v7_cache_operation_actions is None for item in transitions)
+            if any(item.cache_operation_actions is None for item in transitions)
             else np.stack(
-                [item.v7_cache_operation_actions for item in transitions]
+                [item.cache_operation_actions for item in transitions]
             ).astype(np.int64)
         ),
-        v7_cache_operation_masks=(
+        cache_operation_masks=(
             None
-            if any(item.v7_cache_operation_masks is None for item in transitions)
+            if any(item.cache_operation_masks is None for item in transitions)
             else np.stack(
-                [item.v7_cache_operation_masks for item in transitions]
+                [item.cache_operation_masks for item in transitions]
             ).astype(bool)
         ),
-        v7_cache_operation_log_probs=(
+        cache_operation_log_probs=(
             None
-            if any(item.v7_cache_operation_log_probs is None for item in transitions)
+            if any(item.cache_operation_log_probs is None for item in transitions)
             else np.stack(
-                [item.v7_cache_operation_log_probs for item in transitions]
+                [item.cache_operation_log_probs for item in transitions]
             ).astype(np.float32)
         ),
-        v7_cache_operation_entropies=(
+        cache_operation_entropies=(
             None
-            if any(item.v7_cache_operation_entropies is None for item in transitions)
+            if any(item.cache_operation_entropies is None for item in transitions)
             else np.stack(
-                [item.v7_cache_operation_entropies for item in transitions]
+                [item.cache_operation_entropies for item in transitions]
             ).astype(np.float32)
         ),
         uav_operation_actions=(

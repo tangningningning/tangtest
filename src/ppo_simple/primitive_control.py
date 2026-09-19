@@ -11,7 +11,7 @@ import numpy as np
 from decision import cache_configuration, uav_configuration
 
 from . import interface
-from .no_prediction import (
+from ablations.no_prediction import (
     NO_PREDICTION_POLICY_SCHEMA,
     is_no_prediction_context,
     mask_no_prediction_observation,
@@ -20,7 +20,7 @@ from .no_prediction import (
 
 
 REPLICA_AWARE_POLICY_SCHEMA = (
-    "adaptive_cache_operation_group_replica_aware_v8_popart"
+    "adaptive_replica_aware_cache_only_popart"
 )
 REPLICA_AWARE_POLICY_SCHEMAS = frozenset(
     {
@@ -102,7 +102,7 @@ class PrimitiveSelectionResult:
 
 @dataclass(frozen=True)
 class CacheOperationPrimitiveSelectionResult:
-    """One sequential V7 Cache operation/candidate decision result."""
+    """One sequential Cache-only Cache operation/candidate decision result."""
 
     final_cache_state: np.ndarray
     final_uav_positions: dict[str, tuple[float, float]]
@@ -653,7 +653,7 @@ def sample_and_apply_primitive_configuration(
     )
 
 
-def sample_and_apply_v7_cache_operation_configuration(
+def sample_and_apply_cache_operation_configuration(
     policy: Any,
     observation: np.ndarray,
     previous_cache_state: np.ndarray,
@@ -666,7 +666,7 @@ def sample_and_apply_v7_cache_operation_configuration(
     include_replica_awareness: bool = False,
     predicted_popularity: dict[int, float] | None = None,
 ) -> CacheOperationPrimitiveSelectionResult:
-    """Sequentially sample V7 Cache operations and within-group candidates.
+    """Sequentially sample Cache-only Cache operations and within-group candidates.
 
     The operation mask is derived from the production candidate enumeration at
     the current Cache state.  A NO_CHANGE decision ends that node's decision;
@@ -675,7 +675,7 @@ def sample_and_apply_v7_cache_operation_configuration(
 
     operation_order = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
     if tuple(getattr(policy, "operation_order", ())) != operation_order:
-        raise ValueError("V7 policy operation order must be NO_CHANGE/ADD/DELETE/SWAP")
+        raise ValueError("Cache-only policy operation order must be NO_CHANGE/ADD/DELETE/SWAP")
     cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     previous_cache = cache.copy()
     previous_uav = {
@@ -684,7 +684,7 @@ def sample_and_apply_v7_cache_operation_configuration(
     }
     current_uav = {key: value.copy() for key, value in previous_uav.items()}
     if tensor_spec.num_cache_heads != len(context.action_spec.cache_node_ids):
-        raise ValueError("V7 tensor spec cache head count does not match action spec")
+        raise ValueError("Cache-only tensor spec cache head count does not match action spec")
 
     operation_actions = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
     operation_masks = np.zeros(
@@ -797,7 +797,7 @@ def sample_and_apply_v7_cache_operation_configuration(
         ]
         if not group_candidates:
             raise AssertionError(
-                "V7 selected an operation whose production candidate group is empty"
+                "Cache-only selected an operation whose production candidate group is empty"
             )
         candidate_features = np.stack(
             [
@@ -815,8 +815,8 @@ def sample_and_apply_v7_cache_operation_configuration(
         )
         count = len(group_candidates)
         if count > tensor_spec.cache_max_candidates:
-            raise AssertionError("V7 cache candidate count exceeds padded capacity")
-        sampled_candidate = policy.sample_cache_candidate_v7(
+            raise AssertionError("Cache-only cache candidate count exceeds padded capacity")
+        sampled_candidate = policy.sample_cache_candidate(
             conditional_context,
             candidate_features,
             deterministic=bool(deterministic),
@@ -854,7 +854,7 @@ def sample_and_apply_v7_cache_operation_configuration(
         )
 
     if total_log_prob is None or total_entropy is None:
-        raise RuntimeError("V7 Cache operation selection produced no heads")
+        raise RuntimeError("Cache-only Cache operation selection produced no heads")
     cache_configuration.validate_cache_shape_and_capacity(
         cache,
         context.service_catalog,
@@ -891,7 +891,7 @@ def sample_and_apply_v7_cache_operation_configuration(
     )
 
 
-def sample_and_apply_v8_cache_operation_configuration(
+def sample_and_apply_replica_aware_cache_operation_configuration(
     policy: Any,
     observation: np.ndarray,
     previous_cache_state: np.ndarray,
@@ -902,9 +902,9 @@ def sample_and_apply_v8_cache_operation_configuration(
     *,
     deterministic: bool = False,
 ) -> CacheOperationPrimitiveSelectionResult:
-    """Run the unchanged V7 hierarchy with V8 replica-aware candidate features."""
+    """Run the unchanged cache-only hierarchy with replica-aware candidate features."""
 
-    return sample_and_apply_v7_cache_operation_configuration(
+    return sample_and_apply_cache_operation_configuration(
         policy,
         observation,
         previous_cache_state,
@@ -917,7 +917,7 @@ def sample_and_apply_v8_cache_operation_configuration(
     )
 
 
-def sample_and_apply_v8_no_prediction_cache_operation_configuration(
+def sample_and_apply_no_prediction_cache_operation_configuration(
     policy: Any,
     observation: np.ndarray,
     previous_cache_state: np.ndarray,
@@ -928,9 +928,9 @@ def sample_and_apply_v8_no_prediction_cache_operation_configuration(
     *,
     deterministic: bool = False,
 ) -> CacheOperationPrimitiveSelectionResult:
-    """Run V8's unchanged hierarchy with prediction popularity features zeroed."""
+    """Run the replica-aware cache-only hierarchy with prediction popularity features zeroed."""
 
-    return sample_and_apply_v7_cache_operation_configuration(
+    return sample_and_apply_cache_operation_configuration(
         policy,
         observation,
         previous_cache_state,
@@ -1179,7 +1179,7 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
     deterministic: bool = False,
     binary_cache_trigger: bool = False,
 ) -> JointCacheUavOperationPrimitiveSelectionResult:
-    """Run V8 Cache decisions followed by sequential STAY/MOVE UAV decisions."""
+    """Run Replica-aware Cache-only Cache decisions followed by sequential STAY/MOVE UAV decisions."""
 
     operation_order = ("STAY", "MOVE")
     if tuple(getattr(policy, "uav_operation_order", ())) != operation_order:
@@ -1196,7 +1196,7 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
             deterministic=bool(deterministic),
         )
     else:
-        cache_result = sample_and_apply_v8_cache_operation_configuration(
+        cache_result = sample_and_apply_replica_aware_cache_operation_configuration(
             policy,
             observation,
             previous_cache_state,

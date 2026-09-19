@@ -1,4 +1,4 @@
-"""Frozen evaluator for the V8 no-prediction PPO ablation."""
+"""Frozen evaluator for the no-prediction cache-only PPO ablation."""
 
 from __future__ import annotations
 
@@ -15,30 +15,33 @@ except ModuleNotFoundError:  # pragma: no cover - import-only environments
 
 from common import project_config
 
-from .evaluation_metrics import infer_episode_seed, slot_task_metrics_dict
-from .interface import _copy_uav_positions
+from ppo_simple.evaluation_metrics import infer_episode_seed, slot_task_metrics_dict
+from ppo_simple.interface import _copy_uav_positions
 from .no_prediction import NO_PREDICTION_POLICY_SCHEMA
-from .policy import (
-    AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
+from ppo_simple.policy import (
+    AdaptiveNoPredictionCacheOnlyActorCritic,
 )
-from .rollout import collect_rollout
-from .trainer import PPOV2Trainer, aligned_train_steps, load_environment_context
-from .v7_evaluator import (
+from ppo_simple.rollout import collect_rollout
+from ppo_simple.trainer import PPOV2Trainer, aligned_train_steps, load_environment_context
+from baselines.cache_only_evaluator import (
     _ensure_fresh_output,
     _resolve_path,
     _seed_sampling,
     _sha256,
     _write_json,
 )
-from .v8_evaluator import V8_OPERATION_ORDER, _summary as _v8_summary
+from baselines.replica_aware_cache_only_evaluator import (
+    REPLICA_AWARE_CACHE_OPERATION_ORDER,
+    _summary as _replica_aware_summary,
+)
 
 
-V8_NO_PREDICTION_POLICY_ACTION_MODES = ("deterministic", "stochastic")
+NO_PREDICTION_CACHE_POLICY_ACTION_MODES = ("deterministic", "stochastic")
 
 
 def _require_torch() -> None:
     if torch is None:
-        raise ImportError("V8 no-prediction evaluation requires PyTorch")
+        raise ImportError("Replica-aware Cache-only no-prediction evaluation requires PyTorch")
 
 
 def _validate_no_prediction_context(context: Any) -> None:
@@ -50,27 +53,27 @@ def _validate_no_prediction_context(context: Any) -> None:
     )
     if context.configuration_control_mode != configured_control_mode:
         raise ValueError(
-            "V8 no-prediction context configuration_control_mode disagrees with config"
+            "Replica-aware Cache-only no-prediction context configuration_control_mode disagrees with config"
         )
-    if configured_control_mode != "policy_primitive_v7_cache_operation":
+    if configured_control_mode != "policy_primitive_cache_operation":
         raise ValueError(
-            "V8 no-prediction evaluation requires configuration_control_mode="
-            "policy_primitive_v7_cache_operation"
+            "Replica-aware Cache-only no-prediction evaluation requires configuration_control_mode="
+            "policy_primitive_cache_operation"
         )
     configured_schema = str(
         project_config.get_config_value(context.cfg, "algorithm.ppo.policy_schema")
     )
     if str(context.policy_schema) != configured_schema:
-        raise ValueError("V8 no-prediction context policy_schema disagrees with config")
+        raise ValueError("Replica-aware Cache-only no-prediction context policy_schema disagrees with config")
     if str(context.policy_schema) != NO_PREDICTION_POLICY_SCHEMA:
         raise ValueError(
-            "V8 no-prediction evaluation requires policy_schema="
+            "Replica-aware Cache-only no-prediction evaluation requires policy_schema="
             f"{NO_PREDICTION_POLICY_SCHEMA}"
         )
     protocol = project_config.get_ppo_data_protocol(context.cfg)
     if protocol["protocol"] != project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
         raise ValueError(
-            "V8 no-prediction evaluation requires full_episode_randomized protocol"
+            "Replica-aware Cache-only no-prediction evaluation requires full_episode_randomized protocol"
         )
     if (
         context.train_origin_start,
@@ -79,22 +82,22 @@ def _validate_no_prediction_context(context: Any) -> None:
         context.terminal_origin,
     ) != (0, 299, 300, 299):
         raise ValueError(
-            "V8 no-prediction evaluation requires the 0..299 episode protocol"
+            "Replica-aware Cache-only no-prediction evaluation requires the 0..299 episode protocol"
         )
     if int(context.observation_spec.prediction_horizon) != 5:
-        raise ValueError("V8 no-prediction evaluation requires prediction horizon H=5")
+        raise ValueError("Replica-aware Cache-only no-prediction evaluation requires prediction horizon H=5")
     if context.observation_spec.horizon_mask_slice is None:
-        raise ValueError("V8 no-prediction evaluation requires a prediction horizon mask")
+        raise ValueError("Replica-aware Cache-only no-prediction evaluation requires a prediction horizon mask")
     if context.observation_spec.time_to_go_slice is None:
-        raise ValueError("V8 no-prediction evaluation requires time-to-go")
+        raise ValueError("Replica-aware Cache-only no-prediction evaluation requires time-to-go")
     if int(context.observation_spec.observation_dim) != 400:
-        raise ValueError("V8 no-prediction evaluation requires observation_dim=400")
+        raise ValueError("Replica-aware Cache-only no-prediction evaluation requires observation_dim=400")
 
 
-def evaluate_v8_no_prediction_episode(
+def evaluate_no_prediction_episode(
     checkpoint_path: str | Path,
     run_dir: str | Path,
-    config_path: str | Path = "configs/ablations/system_config_ppo_v8_no_prediction_ablation.toml",
+    config_path: str | Path = "configs/ablations/no_prediction.toml",
     realization_dir: str | Path | None = None,
     device: str = "cpu",
     policy_action_mode: str = "deterministic",
@@ -105,9 +108,9 @@ def evaluate_v8_no_prediction_episode(
 
     _require_torch()
     mode = str(policy_action_mode)
-    if mode not in V8_NO_PREDICTION_POLICY_ACTION_MODES:
+    if mode not in NO_PREDICTION_CACHE_POLICY_ACTION_MODES:
         raise ValueError(
-            "V8 no-prediction policy_action_mode must be deterministic or stochastic"
+            "Replica-aware Cache-only no-prediction policy_action_mode must be deterministic or stochastic"
         )
     project_root = project_config.find_project_root()
     resolved_config = _resolve_path(project_root, config_path)
@@ -124,7 +127,7 @@ def evaluate_v8_no_prediction_episode(
         resolved_episode_seed = infer_episode_seed(realization_dir)
     if resolved_episode_seed is None:
         raise ValueError(
-            "V8 no-prediction evaluation requires episode_seed or episode_<seed> realization"
+            "Replica-aware Cache-only no-prediction evaluation requires episode_seed or episode_<seed> realization"
         )
     experiment_seed = int(
         project_config.get_config_value(context.cfg, "experiment.seed")
@@ -134,10 +137,10 @@ def evaluate_v8_no_prediction_episode(
     cursor = trainer.load_checkpoint(resolved_checkpoint, config_sha256)
     if (
         type(trainer.policy)
-        is not AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic
+        is not AdaptiveNoPredictionCacheOnlyActorCritic
     ):
         raise TypeError(
-            "checkpoint did not restore the exact V8 no-prediction policy type"
+            "checkpoint did not restore the exact Replica-aware Cache-only no-prediction policy type"
         )
     if trainer.policy.architecture_id != NO_PREDICTION_POLICY_SCHEMA:
         raise TypeError("checkpoint restored an unexpected no-prediction policy schema")
@@ -170,17 +173,17 @@ def evaluate_v8_no_prediction_episode(
             parameter_snapshot, trainer.policy.parameters(), strict=True
         )
     ):
-        raise RuntimeError("V8 no-prediction evaluation modified policy parameters")
+        raise RuntimeError("Replica-aware Cache-only no-prediction evaluation modified policy parameters")
     if trainer.policy.popart_statistics() != popart_snapshot:
-        raise RuntimeError("V8 no-prediction evaluation modified PopArt statistics")
+        raise RuntimeError("Replica-aware Cache-only no-prediction evaluation modified PopArt statistics")
     if (
         int(trainer.optimizer_steps),
         int(trainer.actor_optimizer_steps),
         int(trainer.critic_optimizer_steps),
     ) != optimizer_steps_before_eval:
-        raise RuntimeError("V8 no-prediction evaluation performed an optimizer step")
+        raise RuntimeError("Replica-aware Cache-only no-prediction evaluation performed an optimizer step")
 
-    summary = _v8_summary(
+    summary = _replica_aware_summary(
         context,
         rollout,
         mode,
@@ -189,7 +192,7 @@ def evaluate_v8_no_prediction_episode(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
-        "experiment_type": "v8_no_prediction_full_episode_evaluation",
+        "experiment_type": "no_prediction_full_episode_evaluation",
         "config_path": str(resolved_config),
         "config_sha256": config_sha256,
         "checkpoint_path": str(resolved_checkpoint),
@@ -213,14 +216,14 @@ def evaluate_v8_no_prediction_episode(
             "popularity_slice",
         ],
     }
-    _write_json(output_dir / "v8_no_prediction_episode_manifest.json", manifest)
-    _write_json(output_dir / "v8_no_prediction_episode_summary.json", summary)
-    with (output_dir / "v8_no_prediction_slot_metrics.jsonl").open(
+    _write_json(output_dir / "no_prediction_episode_manifest.json", manifest)
+    _write_json(output_dir / "no_prediction_episode_summary.json", summary)
+    with (output_dir / "no_prediction_slot_metrics.jsonl").open(
         "w", encoding="utf-8", newline="\n"
     ) as stream:
         for transition, operation_row in zip(
             rollout.transitions,
-            np.asarray(rollout.v7_cache_operation_actions, dtype=np.int64),
+            np.asarray(rollout.cache_operation_actions, dtype=np.int64),
             strict=True,
         ):
             task_metrics = slot_task_metrics_dict(transition)
@@ -239,7 +242,7 @@ def evaluate_v8_no_prediction_episode(
                         **task_metrics,
                         "operation_counts": {
                             name: int(np.sum(operation_row == index))
-                            for index, name in enumerate(V8_OPERATION_ORDER)
+                            for index, name in enumerate(REPLICA_AWARE_CACHE_OPERATION_ORDER)
                         },
                     },
                     ensure_ascii=False,

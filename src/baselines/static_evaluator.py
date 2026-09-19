@@ -17,14 +17,14 @@ import numpy as np
 from common import project_config
 from decision import slot_environment
 
-from .evaluation_metrics import (
+from ppo_simple.evaluation_metrics import (
     aggregate_episode_task_metrics,
     infer_episode_seed,
     slot_task_metrics_dict,
     task_metrics_from_result,
 )
-from .interface import _copy_uav_positions
-from .trainer import aligned_train_steps, load_environment_context
+from ppo_simple.interface import _copy_uav_positions
+from ppo_simple.trainer import aligned_train_steps, load_environment_context
 
 
 STATIC_DATA_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
@@ -179,7 +179,7 @@ def _summary(
 
 def evaluate_static_episode(
     run_dir: str | Path,
-    config_path: str | Path = "configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml",
+    config_path: str | Path = "configs/baselines/replica_aware_cache_only.toml",
     realization_dir: str | Path | None = None,
     episode_seed: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:

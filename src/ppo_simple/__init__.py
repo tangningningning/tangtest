@@ -1,9 +1,9 @@
 """Minimal dimension-driven PPO for Cache/UAV reconfiguration requests."""
 
 from .policy import (
-    AdaptiveCacheOperationGroupV7PopArtActorCritic,
-    AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic,
-    AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic,
+    AdaptiveCacheOnlyActorCritic,
+    AdaptiveReplicaAwareCacheOnlyActorCritic,
+    AdaptiveNoPredictionCacheOnlyActorCritic,
     AdaptiveJointCacheUAVPPOActorCritic,
     AdaptivePrimitiveActorCritic,
     AdaptivePrimitiveGroupedV2ActorCritic,
@@ -16,9 +16,9 @@ from .policy import (
 )
 
 __all__ = [
-    "AdaptiveCacheOperationGroupV7PopArtActorCritic",
-    "AdaptiveCacheOperationGroupReplicaAwareV8PopArtActorCritic",
-    "AdaptiveCacheOperationGroupReplicaAwareV8NoPredictionPopArtActorCritic",
+    "AdaptiveCacheOnlyActorCritic",
+    "AdaptiveReplicaAwareCacheOnlyActorCritic",
+    "AdaptiveNoPredictionCacheOnlyActorCritic",
     "AdaptiveJointCacheUAVPPOActorCritic",
     "AdaptivePrimitiveActorCritic",
     "AdaptivePrimitiveGroupedV2ActorCritic",

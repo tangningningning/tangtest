@@ -1,4 +1,4 @@
-"""Evaluate the frozen V8 no-prediction policy on an existing episode pool."""
+"""Evaluate the frozen Replica-aware Cache-only no-prediction policy on an existing episode pool."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from ppo_simple.evaluation_metrics import (
     episode_metric_statistics,
     execution_ratio_statistics,
 )
-from ppo_simple.v8_no_prediction_evaluator import evaluate_v8_no_prediction_episode
+from ablations.no_prediction_evaluator import evaluate_no_prediction_episode
 
 
 def _resolve(project_root: Path, value: str | Path) -> Path:
@@ -45,7 +45,7 @@ def evaluate_pool(
     output_path = _resolve(PROJECT_ROOT, run_dir)
     if output_path.exists() and any(output_path.iterdir()):
         raise FileExistsError(
-            "fresh V8 no-prediction pool output already contains artifacts; "
+            "fresh Replica-aware Cache-only no-prediction pool output already contains artifacts; "
             "use a new --run-dir"
         )
     summaries: list[dict[str, Any]] = []
@@ -54,9 +54,9 @@ def evaluate_pool(
         realization = pool_path / f"episode_{episode_seed}"
         if not realization.is_dir():
             raise FileNotFoundError(
-                f"V8 no-prediction evaluation pool realization is missing: {realization}"
+                f"Replica-aware Cache-only no-prediction evaluation pool realization is missing: {realization}"
             )
-        _, summary = evaluate_v8_no_prediction_episode(
+        _, summary = evaluate_no_prediction_episode(
             checkpoint_path=checkpoint_path,
             run_dir=output_path / f"episode_{episode_seed}",
             config_path=config_path,
@@ -72,13 +72,13 @@ def evaluate_pool(
         )
         if int(summary["episode_seed"]) != episode_seed:
             raise AssertionError(
-                "V8 no-prediction evaluator returned an unexpected episode_seed"
+                "Replica-aware Cache-only no-prediction evaluator returned an unexpected episode_seed"
             )
         summaries.append(summary)
     experiment_seeds = {int(summary["experiment_seed"]) for summary in summaries}
     if len(experiment_seeds) != 1:
         raise AssertionError(
-            "V8 no-prediction evaluation pool has inconsistent experiment_seed values"
+            "Replica-aware Cache-only no-prediction evaluation pool has inconsistent experiment_seed values"
         )
     metric_names = (
         "total_return",
@@ -90,7 +90,7 @@ def evaluate_pool(
     )
     output_path.mkdir(parents=True, exist_ok=True)
     aggregate = {
-        "experiment_type": "v8_no_prediction_episode_pool_evaluation",
+        "experiment_type": "no_prediction_episode_pool_evaluation",
         "episode_pool": str(pool_path),
         "experiment_seed": next(iter(experiment_seeds)),
         "episode_count": len(summaries),
@@ -101,7 +101,7 @@ def evaluate_pool(
         "execution_ratio_statistics": execution_ratio_statistics(summaries),
         "summaries": summaries,
     }
-    with (output_path / "v8_no_prediction_episode_pool_summary.json").open(
+    with (output_path / "no_prediction_episode_pool_summary.json").open(
         "w", encoding="utf-8", newline="\n"
     ) as stream:
         json.dump(aggregate, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -111,11 +111,11 @@ def evaluate_pool(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate frozen V8 no-prediction PPO on an existing episode pool"
+        description="Evaluate frozen Replica-aware Cache-only no-prediction PPO on an existing episode pool"
     )
     parser.add_argument(
         "--config",
-        default="configs/ablations/system_config_ppo_v8_no_prediction_ablation.toml",
+        default="configs/ablations/no_prediction.toml",
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--run-dir", required=True)

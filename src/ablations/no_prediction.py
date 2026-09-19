@@ -1,4 +1,4 @@
-"""Shared contracts for the V8 no-prediction PPO ablation."""
+"""Shared contracts for the no-prediction cache-only PPO ablation."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import numpy as np
 
 
 NO_PREDICTION_POLICY_SCHEMA = (
-    "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart"
+    "adaptive_replica_aware_cache_only_no_prediction_popart"
 )
 ZEROED_OBSERVATION_SLICES = (
     "predicted_vehicle_slice",

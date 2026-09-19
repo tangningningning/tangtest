@@ -12,7 +12,9 @@ src/
   common/       Shared configuration and system-model helpers
   scenario/     Scenario, trajectory, task, and prediction generation
   decision/     Cache, UAV, matching, KKT, and slot execution logic
-  ppo_simple/   PPO policies, rollout, training, metrics, and evaluators
+  ppo_simple/   Proposed PPO policy, rollout, training, metrics, and core evaluator
+  baselines/    Semantic cache-only and non-learning baseline evaluators
+  ablations/    Semantic ablation contracts and evaluators
   analysis/     Read-only analysis utilities
 scripts/
   training/     Training-entrypoint notes; implementation is src/ppo_simple/trainer.py
@@ -62,8 +64,8 @@ The proposed-joint credit contract is:
 
 The proposed policy is the standalone current learned policy schema.  It preserves
 the verified parameter/module layout and checkpoint key set while using a
-neutral shared base; V7/V8 and primitive baseline paths remain available as
-separate baselines.
+neutral shared base.  Comparison implementations live under semantic
+`src/baselines/` and `src/ablations/` namespaces.
 
 ## Unified experiment registry
 
@@ -89,8 +91,8 @@ python scripts/experiment_registry.py --show proposed_joint
 ```
 
 The `ablation_joint_no_prediction` row is deliberately not mapped to the
-existing V8 Cache-only no-prediction configuration, because that configuration
-does not have the Joint Cache + UAV definition recorded above.
+cache-only no-prediction configuration, because that configuration does not
+have the Joint Cache + UAV definition recorded above.
 
 ## Main commands
 

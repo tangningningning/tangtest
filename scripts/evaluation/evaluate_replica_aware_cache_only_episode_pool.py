@@ -1,4 +1,4 @@
-"""Evaluate a frozen V8 policy on an existing randomized episode pool."""
+"""Evaluate a frozen Replica-aware Cache-only policy on an existing randomized episode pool."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from ppo_simple.v8_evaluator import evaluate_v8_episode
+from baselines.replica_aware_cache_only_evaluator import evaluate_replica_aware_cache_only_episode
 from ppo_simple.evaluation_metrics import (
     episode_metric_statistics,
     execution_ratio_statistics,
@@ -46,7 +46,7 @@ def evaluate_pool(
     output_path = _resolve(project_root, run_dir)
     if output_path.exists() and any(output_path.iterdir()):
         raise FileExistsError(
-            "fresh V8 evaluation pool output already contains artifacts; use a new --run-dir"
+            "fresh Replica-aware Cache-only evaluation pool output already contains artifacts; use a new --run-dir"
         )
     summaries: list[dict[str, Any]] = []
     for index in range(int(episodes)):
@@ -54,9 +54,9 @@ def evaluate_pool(
         realization = pool_path / f"episode_{episode_seed}"
         if not realization.is_dir():
             raise FileNotFoundError(
-                f"V8 evaluation pool realization is missing: {realization}"
+                f"Replica-aware Cache-only evaluation pool realization is missing: {realization}"
             )
-        _, summary = evaluate_v8_episode(
+        _, summary = evaluate_replica_aware_cache_only_episode(
             checkpoint_path=checkpoint_path,
             run_dir=output_path / f"episode_{episode_seed}",
             config_path=config_path,
@@ -71,11 +71,11 @@ def evaluate_pool(
             episode_seed=episode_seed,
         )
         if int(summary["episode_seed"]) != episode_seed:
-            raise AssertionError("V8 evaluator returned an unexpected episode_seed")
+            raise AssertionError("Replica-aware Cache-only evaluator returned an unexpected episode_seed")
         summaries.append(summary)
     experiment_seeds = {int(summary["experiment_seed"]) for summary in summaries}
     if len(experiment_seeds) != 1:
-        raise AssertionError("V8 evaluation pool contains inconsistent experiment_seed values")
+        raise AssertionError("Replica-aware Cache-only evaluation pool contains inconsistent experiment_seed values")
     metric_names = (
         "total_return",
         "total_q",
@@ -86,7 +86,7 @@ def evaluate_pool(
     )
     output_path.mkdir(parents=True, exist_ok=True)
     aggregate = {
-        "experiment_type": "v8_episode_pool_evaluation",
+        "experiment_type": "replica_aware_cache_only_episode_pool_evaluation",
         "episode_pool": str(pool_path),
         "experiment_seed": next(iter(experiment_seeds)),
         "episode_count": len(summaries),
@@ -97,7 +97,7 @@ def evaluate_pool(
         "execution_ratio_statistics": execution_ratio_statistics(summaries),
         "summaries": summaries,
     }
-    with (output_path / "v8_episode_pool_summary.json").open(
+    with (output_path / "replica_aware_cache_only_episode_pool_summary.json").open(
         "w", encoding="utf-8", newline="\n"
     ) as stream:
         json.dump(aggregate, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -107,11 +107,11 @@ def evaluate_pool(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate frozen PPO V8 replica-aware Cache policy on an episode pool"
+        description="Evaluate a frozen replica-aware cache-only policy on an episode pool"
     )
     parser.add_argument(
         "--config",
-        default="configs/baselines/system_config_ppo_v8_cache_operation_group_replica_aware.toml",
+        default="configs/baselines/replica_aware_cache_only.toml",
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--run-dir", required=True)

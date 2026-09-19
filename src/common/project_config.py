@@ -794,17 +794,35 @@ def validate_config(
     if configuration_control_mode not in {
         "legacy_exact",
         "policy_primitive",
-        "policy_primitive_v7_cache_operation",
-        "policy_primitive_r2_joint_cache_uav_operation",
+        "policy_primitive_cache_operation",
+        "policy_primitive_joint_cache_uav_operation",
     }:
         raise ValueError(
             "algorithm.ppo.configuration_control_mode 只支持 "
-            "legacy_exact/policy_primitive/policy_primitive_v7_cache_operation/"
-            "policy_primitive_r2_joint_cache_uav_operation。"
+            "legacy_exact/policy_primitive/policy_primitive_cache_operation/"
+            "policy_primitive_joint_cache_uav_operation。"
         )
     policy_schema = str(
         get_config_value(config, "algorithm.ppo.policy_schema", "adaptive_primitive_v1")
     )
+    proposed_schema = "adaptive_joint_cache_uav_ppo"
+    supported_policy_schemas = {
+        "adaptive_primitive_v1",
+        "adaptive_primitive_v2",
+        "adaptive_primitive_v2_grouped",
+        "adaptive_primitive_v3_horizon_grouped",
+        "adaptive_primitive_v4_horizon_grouped_separate_critic",
+        "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization",
+        "adaptive_primitive_v6_horizon_grouped_separate_critic_popart",
+        "adaptive_cache_only_popart",
+        "adaptive_replica_aware_cache_only_popart",
+        "adaptive_replica_aware_cache_only_no_prediction_popart",
+        proposed_schema,
+    }
+    if policy_schema not in supported_policy_schemas:
+        raise ValueError(
+            "algorithm.ppo.policy_schema is not a supported semantic policy schema."
+        )
     candidate_advantage_source = str(
         get_config_value(
             config,
@@ -819,108 +837,77 @@ def validate_config(
             "LEGACY_GLOBAL_GAE",
         )
     )
-    if policy_schema in {
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
-    }:
+    candidate_policy_improvement = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.candidate_policy_improvement",
+            "LEGACY_PPO",
+        )
+    )
+    if candidate_policy_improvement not in {"LEGACY_PPO", "EXACT_Q_LISTWISE"}:
+        raise ValueError(
+            "algorithm.ppo.candidate_policy_improvement 只支持 LEGACY_PPO/EXACT_Q_LISTWISE。"
+        )
+    exact_q_temperature = float(
+        get_config_value(config, "algorithm.ppo.exact_q_listwise_temperature", 1.0)
+    )
+    if not math.isfinite(exact_q_temperature) or exact_q_temperature <= 0.0:
+        raise ValueError(
+            "algorithm.ppo.exact_q_listwise_temperature 必须是正的有限数。"
+        )
+    if policy_schema == proposed_schema:
         if candidate_advantage_source != "EXACT_CONDITIONAL_COUNTERFACTUAL_Q":
             raise ValueError(
-                "Recovery R4 requires algorithm.ppo.uav_candidate_advantage_source="
+                "proposed_joint requires algorithm.ppo.uav_candidate_advantage_source="
                 "EXACT_CONDITIONAL_COUNTERFACTUAL_Q."
             )
         if candidate_advantage_normalization != "NONE":
             raise ValueError(
-                "Recovery R4/R5 requires algorithm.ppo.candidate_advantage_normalization=NONE."
+                "proposed_joint requires algorithm.ppo.candidate_advantage_normalization=NONE."
             )
-    if policy_schema in {
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
-    }:
-        r5_cache_sources = {
+        if candidate_policy_improvement != "EXACT_Q_LISTWISE":
+            raise ValueError(
+                "proposed_joint requires algorithm.ppo.candidate_policy_improvement=EXACT_Q_LISTWISE."
+            )
+        proposed_cache_sources = {
             "cache_trigger_advantage_source": "EXACT_NODE_COUNTERFACTUAL_Q",
             "cache_candidate_advantage_source": "EXACT_NODE_CONDITIONAL_COUNTERFACTUAL_Q",
             "cache_trigger_ratio_granularity": "NODE_ONLY",
             "cache_candidate_ratio_granularity": "NODE_CONDITIONAL",
         }
-        for field, expected in r5_cache_sources.items():
+        for field, expected in proposed_cache_sources.items():
             actual = str(get_config_value(config, f"algorithm.ppo.{field}", ""))
             if actual != expected:
                 raise ValueError(
-                    f"Recovery R5 requires algorithm.ppo.{field}={expected}."
+                    f"proposed_joint requires algorithm.ppo.{field}={expected}."
                 )
     if configuration_control_mode in {
         "policy_primitive",
-        "policy_primitive_v7_cache_operation",
-        "policy_primitive_r2_joint_cache_uav_operation",
-    } and policy_schema not in {
-        "adaptive_primitive_v1",
-        "adaptive_primitive_v2",
-        "adaptive_primitive_v2_grouped",
-        "adaptive_primitive_v3_horizon_grouped",
-        "adaptive_primitive_v4_horizon_grouped_separate_critic",
-        "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization",
-        "adaptive_primitive_v6_horizon_grouped_separate_critic_popart",
-        "adaptive_cache_operation_group_v7_popart",
-        "adaptive_cache_operation_group_replica_aware_v8_popart",
-        "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
-    }:
-        raise ValueError(
-            "algorithm.ppo.policy_schema for policy_primitive must be "
-            "adaptive_primitive_v1/adaptive_primitive_v2/"
-            "adaptive_primitive_v2_grouped/"
-            "adaptive_primitive_v3_horizon_grouped/"
-            "adaptive_primitive_v4_horizon_grouped_separate_critic/"
-            "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization/"
-            "adaptive_primitive_v6_horizon_grouped_separate_critic_popart/"
-            "adaptive_cache_operation_group_v7_popart/"
-            "adaptive_cache_operation_group_replica_aware_v8_popart/"
-            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5/"
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6/"
-            "."
-        )
+        "policy_primitive_cache_operation",
+        "policy_primitive_joint_cache_uav_operation",
+    } and policy_schema not in supported_policy_schemas:
+        raise ValueError("policy_primitive requires a supported policy schema")
     if (
-        configuration_control_mode == "policy_primitive_v7_cache_operation"
+        configuration_control_mode == "policy_primitive_cache_operation"
         and policy_schema
         not in {
-            "adaptive_cache_operation_group_v7_popart",
-            "adaptive_cache_operation_group_replica_aware_v8_popart",
-            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart",
+            "adaptive_cache_only_popart",
+            "adaptive_replica_aware_cache_only_popart",
+            "adaptive_replica_aware_cache_only_no_prediction_popart",
         }
     ):
         raise ValueError(
-            "policy_primitive_v7_cache_operation requires "
-            "adaptive_cache_operation_group_v7_popart/"
-            "adaptive_cache_operation_group_replica_aware_v8_popart/"
-            "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart."
+            "policy_primitive_cache_operation requires "
+            "adaptive_cache_only_popart/"
+            "adaptive_replica_aware_cache_only_popart/"
+            "adaptive_replica_aware_cache_only_no_prediction_popart."
         )
     if (
-        configuration_control_mode == "policy_primitive_r2_joint_cache_uav_operation"
-        and policy_schema
-        not in {
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
-        }
+        configuration_control_mode == "policy_primitive_joint_cache_uav_operation"
+        and policy_schema != proposed_schema
     ):
         raise ValueError(
-            "policy_primitive_r2_joint_cache_uav_operation requires "
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2."
-            " / adaptive_joint_cache_replica_aware_uav_operation_recovery_r3 / "
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4 / "
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5 / "
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6."
+            "policy_primitive_joint_cache_uav_operation requires adaptive_joint_cache_uav_ppo."
         )
     kl_gate_mode = str(
         get_config_value(config, "algorithm.ppo.kl_gate_mode", "joint")
@@ -931,31 +918,17 @@ def validate_config(
         )
     if (
         kl_gate_mode == "branch_specific"
-        and policy_schema
-        not in {
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
-        }
+        and policy_schema != proposed_schema
     ):
         raise ValueError(
-            "algorithm.ppo.kl_gate_mode=branch_specific requires the Recovery R2 policy schema."
+            "algorithm.ppo.kl_gate_mode=branch_specific requires the proposed joint policy schema."
         )
     if (
-        policy_schema
-        in {
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-            "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
-        }
+        policy_schema == proposed_schema
         and kl_gate_mode != "branch_specific"
     ):
         raise ValueError(
-            "the Recovery R2 policy schema requires algorithm.ppo.kl_gate_mode=branch_specific."
+            "the proposed joint policy schema requires algorithm.ppo.kl_gate_mode=branch_specific."
         )
     cache_kl_control = str(
         get_config_value(config, "algorithm.ppo.cache_kl_control", "epoch")

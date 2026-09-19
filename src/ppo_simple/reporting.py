@@ -210,23 +210,8 @@ def build_run_manifest(
     test_origin_start = protocol["test_origin_start"]
     test_origin_end = protocol["test_origin_end"]
     policy_schema = str(getattr(trainer.policy, "architecture_id", context.policy_schema))
-    is_recovery = policy_schema in {
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r3",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5",
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6",
-    }
-    is_r4 = policy_schema == (
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r4"
-    )
-    is_r5 = policy_schema == (
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r5"
-    )
-    is_r6 = policy_schema == (
-        "adaptive_joint_cache_replica_aware_uav_operation_recovery_r6"
-    )
-    is_node_cache_credit = is_r5 or is_r6
+    is_proposed_joint = policy_schema == "adaptive_joint_cache_uav_ppo"
+    is_node_cache_credit = is_proposed_joint
     git_sha, git_dirty = _git_identity(Path(context.root))
     resolved_config_path = Path(
         context.cfg.get("_meta", {}).get("config_path", config_path)
@@ -270,15 +255,17 @@ def build_run_manifest(
             hyper.operation_advantage_reference_scale
         ),
         "uav_operation_advantage_source": (
-            "COUNTERFACTUAL_ONE_STEP_TD" if is_recovery else "GLOBAL_GAE"
+            "COUNTERFACTUAL_ONE_STEP_TD" if is_proposed_joint else "GLOBAL_GAE"
         ),
         "uav_candidate_advantage_source": (
             "EXACT_CONDITIONAL_COUNTERFACTUAL_Q"
-            if (is_r4 or is_r5 or is_r6)
+            if is_proposed_joint
             else "GLOBAL_GAE"
         ),
         "candidate_advantage_normalization": (
-            "NONE" if (is_r4 or is_r5 or is_r6) else "LEGACY_GLOBAL_GAE"
+            "EXACT_Q_LISTWISE"
+            if is_proposed_joint
+            else "LEGACY_GLOBAL_GAE"
         ),
         "cache_trigger_advantage_source": (
             "EXACT_NODE_COUNTERFACTUAL_Q" if is_node_cache_credit else "GLOBAL_GAE"
@@ -334,6 +321,12 @@ def build_run_manifest(
         ),
         "max_grad_norm": float(hyper.max_grad_norm),
         "entropy_coefficient": float(hyper.entropy_coefficient),
+        "candidate_policy_improvement": str(
+            getattr(trainer, "candidate_policy_improvement", "LEGACY_PPO")
+        ),
+        "exact_q_listwise_temperature": float(
+            getattr(trainer, "exact_q_listwise_temperature", 1.0)
+        ),
         **q_cache_manifest_fields,
     }
 

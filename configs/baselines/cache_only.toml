@@ -30,13 +30,13 @@
 
 [experiment]
 # 实验名称。用于后续结果 metadata 和配置快照引用；修改它不需要重新生成数据。
-name = "recovery_r2_wmove_0p50_dev3"
+name = "cache_only"
 # 主实验随机种子。当前沿用已有正式数据中的主 seed；修改后若用于生成任务/预测场景，需要重跑对应上游模块。
 seed = 4401
 # 重复实验编号。只用于后续批量实验标识，不改变系统物理模型。
 repeat_index = 0
 # 输出标签。用于后续 result 文件命名；修改它不需要重新生成上游数据。
-output_tag = "recovery_r2_wmove_0p50_dev3_20260919"
+output_tag = "cache_only"
 
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
@@ -403,7 +403,7 @@ lambda_cache = 0.1
 # 不使用 accepted movement 或 optimizer 最终位置反向选择它；后续正式实验只做
 # one-factor-at-a-time 的 0.5x/1x/2x sensitivity，本轮不运行。
 lambda_movement = 1.76e-5
-uav_movement_cost_weight = 0.50
+uav_movement_cost_weight = 10.0
 cache_cost_weight = 0.1
 # T_ref/E_ref 采用正式 train origins（slot 0..239）中 arrival=1 任务在 TV local CPU
 # 上的 P95 尺度；test origins（slot 240..299）不参与参考值拟合。
@@ -516,19 +516,15 @@ method = "ppo_simple_v2"
 # legacy_exact keeps the K=100 iterative reference path. policy_primitive uses
 # one primitive per trigger. v2 appends one normalized finite-horizon time-to-go
 # state feature; v1 remains available only for its preserved baseline checkpoint.
-configuration_control_mode = "policy_primitive_r2_joint_cache_uav_operation"
-# RECOVERY_R2_OPERATION_CREDIT_FIX: per-UAV counterfactual one-step TD credit
-# for the UAV operation head only; Cache,
-# candidate, global critic, PopArt, GAE, reward, and movement semantics stay frozen.
-policy_schema = "adaptive_joint_cache_replica_aware_uav_operation_recovery_r2"
-kl_gate_mode = "branch_specific"
+configuration_control_mode = "policy_primitive_cache_operation"
+policy_schema = "adaptive_cache_only_popart"
 hidden_sizes = [128, 128]
 # PPO algorithm parameters; these do not belong to the physical system model.
 gamma = 1.0
 gae_lambda = 0.95
 clip_epsilon = 0.2
 learning_rate = 3.0e-4
-actor_learning_rate = 6.0e-4
+actor_learning_rate = 1.0e-4
 critic_learning_rate = 3.0e-4
 value_loss_coefficient = 0.01
 entropy_coefficient = 0.0
@@ -538,7 +534,6 @@ max_grad_norm = 0.5
 # 不是系统物理参数，也不声称为当前任务最优值。
 # 后续实验如需要再进行有限敏感性分析。
 update_epochs = 4
-target_kl = 0.10
 num_minibatches = 10
 # 300 transitions / 10 minibatches = 30 samples per minibatch.
 minibatch_size = 30
@@ -649,5 +644,3 @@ terminal_origin = 299
 "objective.lambda_movement" = "EXPERIMENT_DESIGN"
 "objective.T_ref" = "TRAIN_ONLY_CALIBRATION"
 "objective.E_ref" = "TRAIN_ONLY_CALIBRATION"
-
-

@@ -30,13 +30,13 @@
 
 [experiment]
 # 实验名称。用于后续结果 metadata 和配置快照引用；修改它不需要重新生成数据。
-name = "v8_no_prediction_ablation"
+name = "no_prediction"
 # 主实验随机种子。当前沿用已有正式数据中的主 seed；修改后若用于生成任务/预测场景，需要重跑对应上游模块。
 seed = 4401
 # 重复实验编号。只用于后续批量实验标识，不改变系统物理模型。
 repeat_index = 0
 # 输出标签。用于后续 result 文件命名；修改它不需要重新生成上游数据。
-output_tag = "v8_no_prediction_ablation"
+output_tag = "no_prediction"
 
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
@@ -516,8 +516,8 @@ method = "ppo_simple_v2"
 # legacy_exact keeps the K=100 iterative reference path. policy_primitive uses
 # one primitive per trigger. v2 appends one normalized finite-horizon time-to-go
 # state feature; v1 remains available only for its preserved baseline checkpoint.
-configuration_control_mode = "policy_primitive_v7_cache_operation"
-policy_schema = "adaptive_cache_operation_group_replica_aware_v8_no_prediction_popart"
+configuration_control_mode = "policy_primitive_cache_operation"
+policy_schema = "adaptive_replica_aware_cache_only_no_prediction_popart"
 hidden_sizes = [128, 128]
 # PPO algorithm parameters; these do not belong to the physical system model.
 gamma = 1.0
