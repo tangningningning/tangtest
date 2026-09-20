@@ -51,7 +51,12 @@ from .policy import (
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
     BernoulliActorCritic,
 )
-from .cache_credit import compute_exact_node_specific_cache_credit
+from .cache_credit import (
+    compute_cache_action_q_credit,
+    compute_exact_node_specific_cache_credit,
+)
+from .cache_action_q import CacheActionQCritic
+from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
 from .primitive_control import PrimitiveTensorSpec, _intermediate_observation
 from .rollout import (
     SimpleRollout,
@@ -79,7 +84,27 @@ NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
 # The full-information UAV operation teacher and post-operation-stop
 # candidate-only routing are not resume-compatible with the prior proposed
 # objective.  A fresh initialization is therefore required for this version.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 14
+# The sparse Action-Q Cache teacher is not resume-compatible with either the
+# prior full-Exact objective or the intermediate hybrid-surrogate objective.
+# Keep the version bump explicit so old proposed checkpoints cannot silently
+# change supervision.
+JOINT_PROPOSED_CHECKPOINT_VERSION = 16
+CACHE_COUNTERFACTUAL_MODE = "SPARSE_FULL_EXACT_AUDIT"
+CACHE_VALUE_MODEL = "ACTION_CONDITIONED_Q_CRITIC"
+CACHE_NORMAL_COUNTERFACTUAL_MODE = "NONE"
+CACHE_AUDIT_MODE = "SPARSE_FULL_EXACT"
+CACHE_ACTUAL_ACTION_Q_SOURCE = "PRODUCTION_REAL_TD_Q"
+CACHE_UNEXECUTED_ACTION_Q_SOURCE = "LEARNED_ACTION_Q"
+CACHE_ACTION_Q_HIDDEN_DIM = 64
+CACHE_ACTION_Q_LEARNING_RATE = 1.0e-3
+CACHE_ACTION_Q_AUDIT_INTERVAL = 20
+CACHE_SURROGATE_TYPE = "DELTA_Q_ENSEMBLE"
+CACHE_SURROGATE_ENSEMBLE_SIZE = 3
+CACHE_SURROGATE_HIDDEN_DIM = 64
+CACHE_SURROGATE_LEARNING_RATE = 1.0e-3
+CACHE_SURROGATE_AUDIT_INTERVAL = 20
+CACHE_SURROGATE_AUDIT_WINDOW = 3
+CACHE_SURROGATE_MAX_K = 12
 KL_GATE_MODE_JOINT = "joint"
 KL_GATE_MODE_BRANCH_SPECIFIC = "branch_specific"
 CACHE_KL_CONTROL_EPOCH = "epoch"
@@ -515,6 +540,45 @@ class UpdateResult:
     cache_trigger_advantage_mean_abs_by_role: dict[str, float] | None = None
     cache_credit_counterfactual_env_executions: int = 0
     cache_credit_runtime_seconds: float = math.nan
+    cache_candidate_q_source: str = ""
+    cache_logical_candidate_count: int = 0
+    cache_exact_candidate_count: int = 0
+    cache_surrogate_candidate_count: int = 0
+    cache_keep_exact_count: int = 0
+    cache_full_exact_audit_count: int = 0
+    cache_counterfactual_executions_saved: int = 0
+    cache_counterfactual_execution_reduction_fraction: float = math.nan
+    cache_surrogate_inference_runtime_seconds: float = math.nan
+    cache_surrogate_train_runtime_seconds: float = math.nan
+    cache_surrogate_delta_q_mae: float = math.nan
+    cache_surrogate_delta_q_rmse: float = math.nan
+    cache_surrogate_rank_correlation: float = math.nan
+    cache_surrogate_uncertainty_mean: float = math.nan
+    cache_surrogate_uncertainty_p90: float = math.nan
+    cache_surrogate_screening_active: bool = False
+    cache_surrogate_screening_ready: bool = False
+    cache_surrogate_selected_k: int | None = None
+    cache_surrogate_audit_statistics: dict[str, Any] | None = None
+    cache_total_logical_branches: int = 0
+    cache_full_exact_audit_branches: int = 0
+    cache_normal_slot_counterfactual_branches: int = 0
+    cache_counterfactual_executions_avoided: int = 0
+    cache_candidate_value_source: str = ""
+    cache_q_critic_mae: float = math.nan
+    cache_q_critic_rmse: float = math.nan
+    cache_q_critic_rank_correlation: float = math.nan
+    cache_q_critic_argmax_accuracy: float = math.nan
+    cache_q_critic_recall_at_3: float = math.nan
+    cache_q_critic_recall_at_5: float = math.nan
+    cache_q_critic_selected_exact_regret: dict[str, Any] | None = None
+    cache_q_critic_normalized_regret_p95: float = math.nan
+    cache_q_critic_usable_for_policy_credit: str = "INCONCLUSIVE"
+    cache_q_critic_train_seconds: float = math.nan
+    cache_q_critic_inference_seconds: float = math.nan
+    cache_audit_exact_seconds: float = math.nan
+    cache_heldout_audit_before_training: bool = False
+    cache_actual_action_q_anchor: str = "NO"
+    cache_q_critic_audit_metrics: dict[str, Any] | None = None
     cache_target_scorer_parameter_delta_norm: float = math.nan
     uav_target_scorer_parameter_delta_norm: float = math.nan
     cache_top1_exact_q_accuracy_before: float = math.nan
@@ -1326,6 +1390,103 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
                 for role, value in update.cache_trigger_advantage_mean_abs_by_role.items()
                 if math.isfinite(float(value))
             }
+    hybrid_cache_metrics = {
+        "CACHE_LOGICAL_CANDIDATE_COUNT": int(update.cache_logical_candidate_count),
+        "CACHE_EXACT_CANDIDATE_COUNT": int(update.cache_exact_candidate_count),
+        "CACHE_SURROGATE_CANDIDATE_COUNT": int(
+            update.cache_surrogate_candidate_count
+        ),
+        "CACHE_KEEP_EXACT_COUNT": int(update.cache_keep_exact_count),
+        "CACHE_FULL_EXACT_AUDIT_COUNT": int(update.cache_full_exact_audit_count),
+        "CACHE_COUNTERFACTUAL_ENV_EXECUTIONS": int(
+            update.cache_credit_counterfactual_env_executions
+        ),
+        "CACHE_COUNTERFACTUAL_EXECUTIONS_SAVED": int(
+            update.cache_counterfactual_executions_saved
+        ),
+        "CACHE_COUNTERFACTUAL_EXECUTIONS_AVOIDED": int(
+            update.cache_counterfactual_executions_avoided
+        ),
+        "CACHE_SURROGATE_SCREENING_ACTIVE": bool(
+            update.cache_surrogate_screening_active
+        ),
+        "CACHE_SURROGATE_SCREENING_READY": bool(
+            update.cache_surrogate_screening_ready
+        ),
+        "CACHE_SURROGATE_SELECTED_K": update.cache_surrogate_selected_k,
+        "CACHE_TRIGGER_Q_SOURCE": str(update.cache_candidate_q_source),
+        "CACHE_TOTAL_LOGICAL_BRANCHES": int(update.cache_total_logical_branches),
+        "CACHE_FULL_EXACT_AUDIT_BRANCHES": int(update.cache_full_exact_audit_branches),
+        "CACHE_NORMAL_SLOT_COUNTERFACTUAL_BRANCHES": int(
+            update.cache_normal_slot_counterfactual_branches
+        ),
+        "CACHE_CANDIDATE_VALUE_SOURCE": str(update.cache_candidate_value_source),
+        "CACHE_ACTUAL_ACTION_Q_ANCHOR": str(update.cache_actual_action_q_anchor),
+        "CACHE_HELDOUT_AUDIT_BEFORE_TRAINING": bool(
+            update.cache_heldout_audit_before_training
+        ),
+        "CACHE_Q_CRITIC_USABLE_FOR_POLICY_CREDIT": str(
+            update.cache_q_critic_usable_for_policy_credit
+        ),
+    }
+    fields.update(hybrid_cache_metrics)
+    runtime_metrics = {
+        "CACHE_COUNTERFACTUAL_EXECUTION_REDUCTION_FRACTION": float(
+            update.cache_counterfactual_execution_reduction_fraction
+        ),
+        "SURROGATE_INFERENCE_RUNTIME_SECONDS": float(
+            update.cache_surrogate_inference_runtime_seconds
+        ),
+        "SURROGATE_TRAIN_RUNTIME_SECONDS": float(
+            update.cache_surrogate_train_runtime_seconds
+        ),
+        "CACHE_SURROGATE_DELTA_Q_MAE": float(update.cache_surrogate_delta_q_mae),
+        "CACHE_SURROGATE_DELTA_Q_RMSE": float(update.cache_surrogate_delta_q_rmse),
+        "CACHE_SURROGATE_RANK_CORRELATION": float(
+            update.cache_surrogate_rank_correlation
+        ),
+        "CACHE_SURROGATE_UNCERTAINTY_MEAN": float(
+            update.cache_surrogate_uncertainty_mean
+        ),
+        "CACHE_SURROGATE_UNCERTAINTY_P90": float(
+            update.cache_surrogate_uncertainty_p90
+        ),
+        "CACHE_Q_CRITIC_MAE": float(update.cache_q_critic_mae),
+        "CACHE_Q_CRITIC_RMSE": float(update.cache_q_critic_rmse),
+        "CACHE_Q_CRITIC_RANK_CORRELATION": float(
+            update.cache_q_critic_rank_correlation
+        ),
+        "CACHE_Q_CRITIC_ARGMAX_ACCURACY": float(
+            update.cache_q_critic_argmax_accuracy
+        ),
+        "CACHE_Q_CRITIC_RECALL_AT_3": float(update.cache_q_critic_recall_at_3),
+        "CACHE_Q_CRITIC_RECALL_AT_5": float(update.cache_q_critic_recall_at_5),
+        "CACHE_Q_CRITIC_NORMALIZED_REGRET_P95": float(
+            update.cache_q_critic_normalized_regret_p95
+        ),
+        "CACHE_Q_CRITIC_TRAIN_SECONDS": float(update.cache_q_critic_train_seconds),
+        "CACHE_Q_INFERENCE_SECONDS": float(update.cache_q_critic_inference_seconds),
+        "CACHE_AUDIT_EXACT_SECONDS": float(update.cache_audit_exact_seconds),
+    }
+    fields.update(
+        {
+            key: value
+            for key, value in runtime_metrics.items()
+            if math.isfinite(float(value))
+        }
+    )
+    if update.cache_surrogate_audit_statistics is not None:
+        fields["CACHE_SURROGATE_AUDIT_STATISTICS"] = dict(
+            update.cache_surrogate_audit_statistics
+        )
+    if update.cache_q_critic_selected_exact_regret is not None:
+        fields["CACHE_Q_CRITIC_SELECTED_EXACT_REGRET"] = dict(
+            update.cache_q_critic_selected_exact_regret
+        )
+    if update.cache_q_critic_audit_metrics is not None:
+        fields["CACHE_Q_CRITIC_AUDIT_METRICS"] = dict(
+            update.cache_q_critic_audit_metrics
+        )
     if math.isfinite(float(update.uav_operation_credit_runtime_seconds)):
         fields["uav_operation_credit_runtime_seconds"] = float(
             update.uav_operation_credit_runtime_seconds
@@ -2583,6 +2744,79 @@ class PPOV2Trainer:
             raise ValueError(
                 "actor/critic learning-rate overrides require separate actor/critic optimization"
             )
+
+        # Cache counterfactual screening is deliberately a separate learning
+        # system.  The ensemble is not attached to ``self.policy`` and its
+        # optimizer is never used by PPO, so surrogate regression cannot send
+        # gradients into the Cache encoder/scorer or the actor/critic.
+        self.cache_surrogate_ensemble: Any | None = None
+        self.cache_surrogate_optimizer: Any | None = None
+        self.cache_surrogate_context_dim: int | None = None
+        self.cache_surrogate_feature_dim: int | None = None
+        self.cache_surrogate_training_count = 0
+        self.cache_surrogate_shadow_complete = False
+        self.cache_surrogate_screening_ready = False
+        self.cache_surrogate_screening_active = False
+        self.cache_surrogate_selected_k: int | None = None
+        self.cache_surrogate_audit_history: list[dict[str, Any]] = []
+        self.cache_surrogate_audit_statistics: dict[str, Any] | None = None
+        self.cache_surrogate_audit_interval = CACHE_SURROGATE_AUDIT_INTERVAL
+        self.cache_surrogate_rng = np.random.default_rng(0xCACE5AFE)
+        if self._uses_exact_cache_credit():
+            primitive_spec = PrimitiveTensorSpec.create(context)
+            self.cache_surrogate_context_dim = int(
+                context.observation_spec.observation_dim
+            )
+            self.cache_surrogate_feature_dim = int(primitive_spec.cache_feature_dim)
+            self.cache_surrogate_ensemble = torch.nn.ModuleList(
+                [
+                    CacheCounterfactualDeltaQSurrogate(
+                        self.cache_surrogate_context_dim,
+                        self.cache_surrogate_feature_dim,
+                        CACHE_SURROGATE_HIDDEN_DIM,
+                    )
+                    for _ in range(CACHE_SURROGATE_ENSEMBLE_SIZE)
+                ]
+            ).to(self.device)
+            self.cache_surrogate_optimizer = torch.optim.Adam(
+                self.cache_surrogate_ensemble.parameters(),
+                lr=CACHE_SURROGATE_LEARNING_RATE,
+            )
+        # The proposed Cache mainline uses one fresh, policy-independent
+        # action-conditioned residual Q critic.  It is intentionally separate
+        # from the PPO global critic: the latter supplies detached V(s), while
+        # this module learns only A_phi(s, a).
+        self.cache_action_q_context_dim: int | None = None
+        self.cache_action_q_node_count: int | None = None
+        self.cache_action_q_feature_dim: int | None = None
+        self.cache_action_q_critic: Any | None = None
+        self.cache_action_q_optimizer: Any | None = None
+        self.cache_action_q_training_count = 0
+        self.cache_action_q_optimizer_steps = 0
+        self.cache_action_q_audit_interval = CACHE_ACTION_Q_AUDIT_INTERVAL
+        self.cache_action_q_audit_statistics: dict[str, Any] | None = None
+        self.cache_action_q_sparse_mode = False
+        if self._uses_exact_cache_credit():
+            primitive_spec = PrimitiveTensorSpec.create(context)
+            self.cache_action_q_context_dim = int(context.observation_spec.observation_dim)
+            self.cache_action_q_node_count = int(primitive_spec.num_cache_heads)
+            self.cache_action_q_feature_dim = int(primitive_spec.cache_feature_dim)
+            self.cache_action_q_critic = CacheActionQCritic(
+                self.cache_action_q_context_dim,
+                self.cache_action_q_node_count,
+                self.cache_action_q_feature_dim,
+                CACHE_ACTION_Q_HIDDEN_DIM,
+            ).to(self.device)
+            policy_parameter_ids = {id(parameter) for parameter in self.policy.parameters()}
+            action_q_parameter_ids = {
+                id(parameter) for parameter in self.cache_action_q_critic.parameters()
+            }
+            if policy_parameter_ids & action_q_parameter_ids:
+                raise RuntimeError("Cache Action-Q critic shares parameters with PPO policy")
+            self.cache_action_q_optimizer = torch.optim.Adam(
+                self.cache_action_q_critic.parameters(),
+                lr=CACHE_ACTION_Q_LEARNING_RATE,
+            )
         self.optimizer_steps = 0
         self.actor_optimizer_steps = 0
         self.critic_optimizer_steps = 0
@@ -2674,6 +2908,273 @@ class PPOV2Trainer:
 
     def _uses_exact_cache_credit(self) -> bool:
         return self.policy.architecture_id in EXACT_CACHE_CREDIT_POLICY_SCHEMAS
+
+    def cache_action_q_metadata(self) -> dict[str, Any]:
+        """Return the immutable sparse Cache Action-Q objective identity."""
+
+        return {
+            "CACHE_VALUE_MODEL": CACHE_VALUE_MODEL,
+            "CACHE_NORMAL_COUNTERFACTUAL_MODE": CACHE_NORMAL_COUNTERFACTUAL_MODE,
+            "CACHE_AUDIT_MODE": CACHE_AUDIT_MODE,
+            "CACHE_ACTUAL_ACTION_Q_SOURCE": CACHE_ACTUAL_ACTION_Q_SOURCE,
+            "CACHE_UNEXECUTED_ACTION_Q_SOURCE": CACHE_UNEXECUTED_ACTION_Q_SOURCE,
+            "cache_value_model": CACHE_VALUE_MODEL,
+            "cache_normal_counterfactual_mode": CACHE_NORMAL_COUNTERFACTUAL_MODE,
+            "cache_audit_mode": CACHE_AUDIT_MODE,
+            "cache_actual_action_q_source": CACHE_ACTUAL_ACTION_Q_SOURCE,
+            "cache_unexecuted_action_q_source": CACHE_UNEXECUTED_ACTION_Q_SOURCE,
+            "cache_counterfactual_mode": CACHE_COUNTERFACTUAL_MODE,
+            "cache_action_q_architecture": CacheActionQCritic.architecture_id,
+            "cache_action_q_architecture_version": CacheActionQCritic.architecture_version,
+            "cache_action_q_context_dim": self.cache_action_q_context_dim,
+            "cache_action_q_node_count": self.cache_action_q_node_count,
+            "cache_action_q_feature_dim": self.cache_action_q_feature_dim,
+            "cache_action_q_hidden_dim": CACHE_ACTION_Q_HIDDEN_DIM,
+            "cache_action_q_learning_rate": CACHE_ACTION_Q_LEARNING_RATE,
+            "cache_action_q_audit_interval": self.cache_action_q_audit_interval,
+        }
+
+    def cache_surrogate_metadata(self) -> dict[str, Any]:
+        """Compatibility alias for old manifest callers."""
+
+        return self.cache_action_q_metadata()
+
+    def _predict_cache_action_q(
+        self,
+        conditional_contexts: np.ndarray,
+        node_identities: np.ndarray,
+        is_update: np.ndarray,
+        candidate_features: np.ndarray,
+    ) -> np.ndarray:
+        """Return detached residual Action-Q predictions."""
+
+        if self.cache_action_q_critic is None:
+            raise RuntimeError("Cache Action-Q critic is not initialized")
+        with torch.no_grad():
+            residual = self.cache_action_q_critic(
+                conditional_contexts,
+                node_identities,
+                is_update,
+                candidate_features,
+            ).detach().cpu().numpy().reshape(-1)
+        if not np.all(np.isfinite(residual)):
+            raise FloatingPointError("Cache Action-Q residual prediction is non-finite")
+        return residual.astype(np.float64)
+
+    def _train_cache_action_q(
+        self,
+        conditional_contexts: np.ndarray,
+        node_identities: np.ndarray,
+        is_update: np.ndarray,
+        candidate_features: np.ndarray,
+        target_residual: np.ndarray,
+    ) -> dict[str, float | int]:
+        """Fit only the independent Action-Q residual critic."""
+
+        if self.cache_action_q_critic is None or self.cache_action_q_optimizer is None:
+            raise RuntimeError("Cache Action-Q optimizer is not initialized")
+        contexts = np.asarray(conditional_contexts, dtype=np.float32)
+        nodes = np.asarray(node_identities, dtype=np.float32)
+        updates = np.asarray(is_update, dtype=np.float32)
+        features = np.asarray(candidate_features, dtype=np.float32)
+        targets = np.asarray(target_residual, dtype=np.float32).reshape(-1)
+        count = len(targets)
+        if contexts.shape != (count, int(self.cache_action_q_context_dim)):
+            raise ValueError("Cache Action-Q context label shape mismatch")
+        if nodes.shape != (count, int(self.cache_action_q_node_count)):
+            raise ValueError("Cache Action-Q node label shape mismatch")
+        if updates.shape != (count, 1):
+            raise ValueError("Cache Action-Q is_update label shape mismatch")
+        if features.shape != (count, int(self.cache_action_q_feature_dim)):
+            raise ValueError("Cache Action-Q feature label shape mismatch")
+        if not all(
+            np.all(np.isfinite(value))
+            for value in (contexts, nodes, updates, features, targets)
+        ):
+            raise FloatingPointError("Cache Action-Q labels contain NaN/Inf")
+        if count == 0:
+            return {"count": 0, "loss": math.nan, "mae": math.nan, "rmse": math.nan}
+        context_tensor = torch.as_tensor(contexts, dtype=torch.float32, device=self.device)
+        node_tensor = torch.as_tensor(nodes, dtype=torch.float32, device=self.device)
+        update_tensor = torch.as_tensor(updates, dtype=torch.float32, device=self.device)
+        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device)
+        target_tensor = torch.as_tensor(targets, dtype=torch.float32, device=self.device)
+        self.cache_action_q_optimizer.zero_grad(set_to_none=True)
+        prediction = self.cache_action_q_critic(
+            context_tensor,
+            node_tensor,
+            update_tensor,
+            feature_tensor,
+        )
+        loss = torch.mean((prediction - target_tensor) ** 2)
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError("Cache Action-Q regression loss is non-finite")
+        loss.backward()
+        if any(parameter.grad is not None for parameter in self.policy.parameters()):
+            raise RuntimeError("Cache Action-Q loss produced a PPO policy gradient")
+        torch.nn.utils.clip_grad_norm_(
+            self.cache_action_q_critic.parameters(), max_norm=10.0
+        )
+        self.cache_action_q_optimizer.step()
+        self.cache_action_q_training_count += count
+        self.cache_action_q_optimizer_steps += 1
+        with torch.no_grad():
+            residual = prediction - target_tensor
+            mae = float(torch.mean(torch.abs(residual)).detach().cpu())
+            rmse = float(torch.sqrt(torch.mean(residual**2)).detach().cpu())
+        return {
+            "count": int(count),
+            "loss": float(loss.detach().cpu()),
+            "mae": mae,
+            "rmse": rmse,
+        }
+
+    def _predict_cache_surrogate(
+        self,
+        conditional_context: np.ndarray,
+        candidate_features: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ensemble mean/std for one Cache conditional state."""
+
+        if self.cache_surrogate_ensemble is None:
+            raise RuntimeError("Cache surrogate ensemble is not initialized")
+        context_tensor = torch.as_tensor(
+            np.asarray(conditional_context, dtype=np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        feature_tensor = torch.as_tensor(
+            np.asarray(candidate_features, dtype=np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.no_grad():
+            predictions = torch.stack(
+                [member(context_tensor, feature_tensor) for member in self.cache_surrogate_ensemble],
+                dim=0,
+            )
+        prediction_array = predictions.detach().cpu().numpy().reshape(
+            CACHE_SURROGATE_ENSEMBLE_SIZE, -1
+        )
+        mu = np.mean(prediction_array, axis=0, dtype=np.float64)
+        sigma = np.std(prediction_array, axis=0, dtype=np.float64)
+        if not np.all(np.isfinite(mu)) or not np.all(np.isfinite(sigma)):
+            raise FloatingPointError("Cache surrogate prediction contains NaN/Inf")
+        return mu, sigma
+
+    def _train_cache_surrogate(
+        self,
+        conditional_contexts: np.ndarray,
+        candidate_features: np.ndarray,
+        target_delta_q: np.ndarray,
+    ) -> dict[str, float | int]:
+        """Fit only the independent ensemble on labels from exact branches."""
+
+        if self.cache_surrogate_ensemble is None or self.cache_surrogate_optimizer is None:
+            raise RuntimeError("Cache surrogate optimizer is not initialized")
+        contexts = np.asarray(conditional_contexts, dtype=np.float32)
+        features = np.asarray(candidate_features, dtype=np.float32)
+        targets = np.asarray(target_delta_q, dtype=np.float32).reshape(-1)
+        if not len(targets):
+            return {"count": 0, "loss": math.nan, "mae": math.nan, "rmse": math.nan}
+        if contexts.shape != (
+            len(targets),
+            int(self.cache_surrogate_context_dim),
+        ):
+            raise ValueError("Cache surrogate context label shape mismatch")
+        if features.shape != (
+            len(targets),
+            int(self.cache_surrogate_feature_dim),
+        ):
+            raise ValueError("Cache surrogate feature label shape mismatch")
+        if not (
+            np.all(np.isfinite(contexts))
+            and np.all(np.isfinite(features))
+            and np.all(np.isfinite(targets))
+        ):
+            raise FloatingPointError("Cache surrogate labels contain NaN/Inf")
+        context_tensor = torch.as_tensor(contexts, dtype=torch.float32, device=self.device)
+        feature_tensor = torch.as_tensor(
+            features[:, None, :], dtype=torch.float32, device=self.device
+        )
+        target_tensor = torch.as_tensor(
+            targets, dtype=torch.float32, device=self.device
+        )
+        self.cache_surrogate_optimizer.zero_grad(set_to_none=True)
+        predictions = torch.stack(
+            [member(context_tensor, feature_tensor).squeeze(-1) for member in self.cache_surrogate_ensemble],
+            dim=0,
+        )
+        loss = torch.mean((predictions - target_tensor.unsqueeze(0)) ** 2)
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError("Cache surrogate regression loss is non-finite")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.cache_surrogate_ensemble.parameters(),
+            max_norm=10.0,
+        )
+        self.cache_surrogate_optimizer.step()
+        with torch.no_grad():
+            mean_prediction = predictions.mean(dim=0)
+            residual = mean_prediction - target_tensor
+            mae = float(torch.mean(torch.abs(residual)).detach().cpu())
+            rmse = float(torch.sqrt(torch.mean(residual**2)).detach().cpu())
+        self.cache_surrogate_training_count += int(len(targets))
+        return {
+            "count": int(len(targets)),
+            "loss": float(loss.detach().cpu()),
+            "mae": mae,
+            "rmse": rmse,
+        }
+
+    def _update_cache_surrogate_gate(self, cache_credit: dict[str, Any]) -> None:
+        """Update readiness from shadow/audit evidence and enforce fallback."""
+
+        if not cache_credit:
+            return
+        gate_metrics = cache_credit.get("gate_metrics")
+        if not bool(cache_credit.get("full_exact_evaluation", False)) or not gate_metrics:
+            return
+        if int(gate_metrics.get("row_count", 0)) <= 0:
+            return
+        self.cache_surrogate_audit_history.append(dict(gate_metrics))
+        self.cache_surrogate_audit_history = self.cache_surrogate_audit_history[
+            -CACHE_SURROGATE_AUDIT_WINDOW:
+        ]
+        self.cache_surrogate_audit_statistics = dict(gate_metrics)
+        self.cache_surrogate_audit_statistics["window_size"] = int(
+            len(self.cache_surrogate_audit_history)
+        )
+        recalls: dict[int, list[float]] = {}
+        p95_values: dict[int, list[float]] = {}
+        for record in self.cache_surrogate_audit_history:
+            for key, value in record.get("recall_at_k", {}).items():
+                recalls.setdefault(int(key), []).append(float(value))
+            for key, value in record.get("normalized_regret_p95_at_k", {}).items():
+                p95_values.setdefault(int(key), []).append(float(value))
+        eligible: list[int] = []
+        window_recall: dict[str, float] = {}
+        window_p95: dict[str, float] = {}
+        for k in range(1, CACHE_SURROGATE_MAX_K + 1):
+            if k not in recalls or k not in p95_values:
+                continue
+            recall = float(np.mean(recalls[k]))
+            p95 = float(np.max(p95_values[k]))
+            window_recall[str(k)] = recall
+            window_p95[str(k)] = p95
+            if recall >= 0.99 and p95 <= 0.01:
+                eligible.append(k)
+        self.cache_surrogate_audit_statistics.update(
+            {
+                "window_recall_at_k": window_recall,
+                "window_normalized_regret_p95_at_k": window_p95,
+            }
+        )
+        selected_k = min(eligible) if eligible else None
+        self.cache_surrogate_shadow_complete = True
+        self.cache_surrogate_selected_k = selected_k
+        self.cache_surrogate_screening_ready = selected_k is not None
+        self.cache_surrogate_screening_active = selected_k is not None
 
     def _uses_binary_cache_trigger(self) -> bool:
         return self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS
@@ -4076,9 +4577,14 @@ class PPOV2Trainer:
         if self._uses_exact_cache_credit():
             if not branch_diagnostics_enabled:
                 raise RuntimeError("Exact Cache credit requires joint branch diagnostics")
-            cache_credit = compute_exact_node_specific_cache_credit(
+            cache_credit = compute_cache_action_q_credit(
                 self,
                 rollout,
+            )
+            self.cache_action_q_audit_statistics = (
+                None
+                if cache_credit.get("audit_metrics") is None
+                else dict(cache_credit["audit_metrics"])
             )
         cache_proposal_diagnostics: dict[str, Any] | None = None
         if cache_credit:
@@ -4087,6 +4593,19 @@ class PPOV2Trainer:
                 cache_credit["candidate_valid_mask"],
                 cache_credit["candidate_proposal_sources"],
                 cache_credit["candidate_hamming_distances"],
+            )
+            cache_proposal_diagnostics.update(
+                {
+                    "cache_candidate_q_source": str(
+                        cache_credit.get("candidate_value_source", "")
+                    ),
+                    "cache_exact_candidate_count": int(
+                        cache_credit.get("exact_candidate_count", 0)
+                    ),
+                    "cache_surrogate_candidate_count": int(
+                        cache_credit.get("action_q_candidate_count", 0)
+                    ),
+                }
             )
         uav_proposal_diagnostics: dict[str, Any] | None = None
         if uav_operation_credit:
@@ -6054,12 +6573,16 @@ class PPOV2Trainer:
                         self.policy.cache_candidate_scorer,
                     )
                 )
-                cache_exact_q_quality = _exact_q_policy_quality_metrics(
-                    cache_target_policy_probabilities_before.detach().cpu().numpy(),
-                    cache_target_policy_probabilities_after.detach().cpu().numpy(),
-                    cache_candidate_q_values_t.detach().cpu().numpy(),
-                    cache_candidate_valid_mask_t.detach().cpu().numpy(),
-                )
+                if str(cache_credit.get("candidate_value_source", "")) in {
+                    "FULL_EXACT_Q",
+                    "FULL_EXACT_AUDIT",
+                }:
+                    cache_exact_q_quality = _exact_q_policy_quality_metrics(
+                        cache_target_policy_probabilities_before.detach().cpu().numpy(),
+                        cache_target_policy_probabilities_after.detach().cpu().numpy(),
+                        cache_candidate_q_values_t.detach().cpu().numpy(),
+                        cache_candidate_valid_mask_t.detach().cpu().numpy(),
+                    )
             if self._uses_exact_uav_candidate_credit():
                 assert uav_target_policy_probabilities_before is not None
                 assert conditional_candidate_valid_mask_t is not None
@@ -6379,6 +6902,137 @@ class PPOV2Trainer:
             cache_credit_runtime_seconds=float(
                 cache_credit.get("credit_runtime_seconds", math.nan)
             ),
+            cache_candidate_q_source=str(
+                cache_credit.get("candidate_value_source", "")
+            ),
+            cache_candidate_value_source=str(
+                cache_credit.get("candidate_value_source", "")
+            ),
+            cache_logical_candidate_count=int(
+                cache_credit.get("logical_candidate_count", 0)
+            ),
+            cache_exact_candidate_count=int(
+                cache_credit.get("exact_candidate_count", 0)
+            ),
+            cache_surrogate_candidate_count=int(
+                cache_credit.get("surrogate_candidate_count", 0)
+            ),
+            cache_keep_exact_count=int(cache_credit.get("keep_exact_count", 0)),
+            cache_full_exact_audit_count=int(
+                cache_credit.get("full_exact_audit_count", 0)
+            ),
+            cache_counterfactual_executions_saved=int(
+                cache_credit.get("counterfactual_executions_saved", 0)
+            ),
+            cache_counterfactual_execution_reduction_fraction=float(
+                cache_credit.get(
+                    "counterfactual_execution_reduction_fraction", math.nan
+                )
+            ),
+            cache_surrogate_inference_runtime_seconds=float(
+                cache_credit.get("surrogate_inference_runtime_seconds", math.nan)
+            ),
+            cache_surrogate_train_runtime_seconds=float(
+                cache_credit.get("surrogate_train_runtime_seconds", math.nan)
+            ),
+            cache_surrogate_delta_q_mae=float(
+                cache_credit.get("surrogate_delta_q_mae", math.nan)
+            ),
+            cache_surrogate_delta_q_rmse=float(
+                cache_credit.get("surrogate_delta_q_rmse", math.nan)
+            ),
+            cache_surrogate_rank_correlation=float(
+                cache_credit.get("surrogate_rank_correlation", math.nan)
+            ),
+            cache_surrogate_uncertainty_mean=float(
+                cache_credit.get("surrogate_uncertainty_mean", math.nan)
+            ),
+            cache_surrogate_uncertainty_p90=float(
+                cache_credit.get("surrogate_uncertainty_p90", math.nan)
+            ),
+            cache_surrogate_screening_active=bool(
+                self.cache_surrogate_screening_active
+            ),
+            cache_surrogate_screening_ready=bool(
+                self.cache_surrogate_screening_ready
+            ),
+            cache_surrogate_selected_k=(
+                None
+                if self.cache_surrogate_selected_k is None
+                else int(self.cache_surrogate_selected_k)
+            ),
+            cache_surrogate_audit_statistics=(
+                None
+                if self.cache_surrogate_audit_statistics is None
+                else dict(self.cache_surrogate_audit_statistics)
+            ),
+            cache_total_logical_branches=int(
+                cache_credit.get("total_logical_branch_count", 0)
+            ),
+            cache_full_exact_audit_branches=int(
+                cache_credit.get("full_exact_audit_branch_count", 0)
+            ),
+            cache_normal_slot_counterfactual_branches=int(
+                cache_credit.get("normal_slot_counterfactual_branch_count", 0)
+            ),
+            cache_counterfactual_executions_avoided=int(
+                cache_credit.get("counterfactual_executions_avoided", 0)
+            ),
+            cache_q_critic_mae=float(
+                (cache_credit.get("heldout_audit_metrics") or {}).get("q_mae_stats", {}).get("mean", math.nan)
+            ),
+            cache_q_critic_rmse=float(
+                (cache_credit.get("heldout_audit_metrics") or {}).get("q_rmse_stats", {}).get("mean", math.nan)
+            ),
+            cache_q_critic_rank_correlation=float(
+                (cache_credit.get("heldout_audit_metrics") or {}).get("rank_correlation", math.nan)
+            ),
+            cache_q_critic_argmax_accuracy=float(
+                (cache_credit.get("heldout_audit_metrics") or {}).get("argmax_accuracy", math.nan)
+            ),
+            cache_q_critic_recall_at_3=float(
+                (cache_credit.get("heldout_audit_metrics") or {}).get("recall_at_3", math.nan)
+            ),
+            cache_q_critic_recall_at_5=float(
+                (cache_credit.get("heldout_audit_metrics") or {}).get("recall_at_5", math.nan)
+            ),
+            cache_q_critic_selected_exact_regret=(
+                None
+                if cache_credit.get("heldout_audit_metrics") is None
+                else dict(
+                    cache_credit["heldout_audit_metrics"].get(
+                        "selected_exact_regret_stats", {}
+                    )
+                )
+            ),
+            cache_q_critic_normalized_regret_p95=float(
+                (cache_credit.get("heldout_audit_metrics") or {}).get(
+                    "normalized_regret_p95", math.nan
+                )
+            ),
+            cache_q_critic_usable_for_policy_credit=str(
+                cache_credit.get("cache_q_critic_usable_for_policy_credit", "INCONCLUSIVE")
+            ),
+            cache_q_critic_train_seconds=float(
+                cache_credit.get("cache_q_critic_train_seconds", math.nan)
+            ),
+            cache_q_critic_inference_seconds=float(
+                cache_credit.get("cache_q_critic_inference_seconds", math.nan)
+            ),
+            cache_audit_exact_seconds=float(
+                cache_credit.get("cache_audit_exact_seconds", math.nan)
+            ),
+            cache_heldout_audit_before_training=bool(
+                cache_credit.get("heldout_audit_before_training", False)
+            ),
+            cache_actual_action_q_anchor=str(
+                cache_credit.get("actual_action_q_anchor", "NO")
+            ),
+            cache_q_critic_audit_metrics=(
+                None
+                if cache_credit.get("heldout_audit_metrics") is None
+                else dict(cache_credit["heldout_audit_metrics"])
+            ),
             cache_target_scorer_parameter_delta_norm=float(
                 cache_target_scorer_parameter_delta_norm
             ),
@@ -6503,6 +7157,39 @@ class PPOV2Trainer:
             **learning_rate_metadata,
             "cache_credit_granularity": None,
             "cache_kl_control": str(self.cache_kl_control),
+            **self.cache_surrogate_metadata(),
+            "cache_surrogate_training_count": int(
+                self.cache_surrogate_training_count
+            ),
+            "cache_surrogate_screening_ready": bool(
+                self.cache_surrogate_screening_ready
+            ),
+            "cache_surrogate_screening_active": bool(
+                self.cache_surrogate_screening_active
+            ),
+            "cache_surrogate_selected_k": (
+                None
+                if self.cache_surrogate_selected_k is None
+                else int(self.cache_surrogate_selected_k)
+            ),
+            "cache_surrogate_shadow_complete": bool(
+                self.cache_surrogate_shadow_complete
+            ),
+            "cache_surrogate_audit_statistics": (
+                None
+                if self.cache_surrogate_audit_statistics is None
+                else dict(self.cache_surrogate_audit_statistics)
+            ),
+            "cache_surrogate_audit_history": [
+                dict(item) for item in self.cache_surrogate_audit_history
+            ],
+            "cache_action_q_training_count": int(self.cache_action_q_training_count),
+            "cache_action_q_optimizer_steps": int(self.cache_action_q_optimizer_steps),
+            "cache_action_q_audit_statistics": (
+                None
+                if self.cache_action_q_audit_statistics is None
+                else dict(self.cache_action_q_audit_statistics)
+            ),
             "configuration_control_mode": self.context.configuration_control_mode,
             "advantage_normalization_mode": (
                 self.hyperparameters.advantage_normalization_mode
@@ -6545,8 +7232,27 @@ class PPOV2Trainer:
                 "python": random.getstate(),
                 "numpy": np.random.get_state(),
                 "torch": torch.get_rng_state(),
+                "cache_surrogate": self.cache_surrogate_rng.bit_generator.state,
             },
         }
+        if self.cache_surrogate_ensemble is not None:
+            if self.cache_surrogate_optimizer is None:
+                raise RuntimeError("Cache surrogate optimizer is not initialized.")
+            payload.update(
+                {
+                    "cache_surrogate_state_dict": self.cache_surrogate_ensemble.state_dict(),
+                    "cache_surrogate_optimizer_state_dict": self.cache_surrogate_optimizer.state_dict(),
+                }
+            )
+        if self.cache_action_q_critic is not None:
+            if self.cache_action_q_optimizer is None:
+                raise RuntimeError("Cache Action-Q optimizer is not initialized.")
+            payload.update(
+                {
+                    "cache_action_q_state_dict": self.cache_action_q_critic.state_dict(),
+                    "cache_action_q_optimizer_state_dict": self.cache_action_q_optimizer.state_dict(),
+                }
+            )
         if episode_seed_start is not None:
             payload["episode_seed_start"] = int(episode_seed_start)
         if self._uses_separate_optimization():
@@ -6680,6 +7386,42 @@ class PPOV2Trainer:
                 f"cross-mode resume: checkpoint={checkpoint_cache_kl_control}, "
                 f"expected={self.cache_kl_control}."
             )
+        if self._uses_exact_cache_credit():
+            expected_action_q_metadata = self.cache_action_q_metadata()
+            for field, expected in expected_action_q_metadata.items():
+                if payload.get(field) != expected:
+                    raise ValueError(
+                        "PPO Cache Action-Q checkpoint metadata mismatch: "
+                        f"field={field}, checkpoint={payload.get(field)!r}, "
+                        f"expected={expected!r}."
+                    )
+            if self.cache_action_q_critic is None or self.cache_action_q_optimizer is None:
+                raise RuntimeError("Cache Action-Q critic is not initialized for resume")
+            if (
+                "cache_action_q_state_dict" not in payload
+                or "cache_action_q_optimizer_state_dict" not in payload
+            ):
+                raise ValueError(
+                    "Cache Action-Q checkpoint must contain critic and optimizer state."
+                )
+            self.cache_action_q_critic.load_state_dict(
+                payload["cache_action_q_state_dict"], strict=True
+            )
+            self.cache_action_q_optimizer.load_state_dict(
+                payload["cache_action_q_optimizer_state_dict"]
+            )
+            self.cache_action_q_training_count = int(
+                payload.get("cache_action_q_training_count", -1)
+            )
+            self.cache_action_q_optimizer_steps = int(
+                payload.get("cache_action_q_optimizer_steps", -1)
+            )
+            if self.cache_action_q_training_count < 0 or self.cache_action_q_optimizer_steps < 0:
+                raise ValueError("Cache Action-Q training counters must be non-negative")
+            raw_action_q_statistics = payload.get("cache_action_q_audit_statistics")
+            self.cache_action_q_audit_statistics = (
+                None if raw_action_q_statistics is None else dict(raw_action_q_statistics)
+            )
         restored_statistics = RunningReturnStatistics()
         if expected_scale_mode in {
             CRITIC_VALUE_SCALE_RUNNING_RETURN_STD,
@@ -6777,6 +7519,10 @@ class PPOV2Trainer:
             np.random.set_state(rng_state["numpy"])
         if "torch" in rng_state:
             torch.set_rng_state(rng_state["torch"])
+        if "cache_surrogate" in rng_state:
+            self.cache_surrogate_rng.bit_generator.state = rng_state[
+                "cache_surrogate"
+            ]
         completed_episodes = int(payload.get("completed_episodes", -1))
         completed_training_episodes = int(
             payload.get("completed_training_episodes", completed_episodes)

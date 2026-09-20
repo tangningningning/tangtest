@@ -238,6 +238,9 @@ def build_run_manifest(
                 "detached_Q_selected_minus_legal_action_policy_expectation"
             ),
         }
+    cache_surrogate_manifest_fields: dict[str, Any] = {}
+    if hasattr(trainer, "cache_surrogate_metadata"):
+        cache_surrogate_manifest_fields = dict(trainer.cache_surrogate_metadata())
     return {
         "experiment_type": "main_training",
         "git_commit_sha": git_sha,
@@ -269,10 +272,12 @@ def build_run_manifest(
             else "LEGACY_GLOBAL_GAE"
         ),
         "cache_trigger_advantage_source": (
-            "EXACT_NODE_COUNTERFACTUAL_Q" if is_node_cache_credit else "GLOBAL_GAE"
+            "ACTION_CONDITIONED_Q_CRITIC_WITH_ACTUAL_ACTION_ANCHOR_AND_SPARSE_FULL_EXACT_AUDIT"
+            if is_node_cache_credit
+            else "GLOBAL_GAE"
         ),
         "cache_candidate_advantage_source": (
-            "EXACT_NODE_CONDITIONAL_COUNTERFACTUAL_Q"
+            "ACTION_CONDITIONED_Q_CRITIC_WITH_ACTUAL_ACTION_ANCHOR_AND_SPARSE_FULL_EXACT_AUDIT"
             if is_node_cache_credit
             else "GLOBAL_GAE"
         ),
@@ -330,6 +335,7 @@ def build_run_manifest(
         ),
         **learning_rate_metadata,
         **q_cache_manifest_fields,
+        **cache_surrogate_manifest_fields,
     }
 
 
