@@ -216,6 +216,7 @@ def build_run_manifest(
     resolved_config_path = Path(
         context.cfg.get("_meta", {}).get("config_path", config_path)
     ).resolve()
+    learning_rate_metadata = trainer.learning_rate_metadata()
     q_cache_manifest_fields: dict[str, Any] = {}
     if getattr(trainer, "q_cache_optimizer", None) is not None:
         q_cache_manifest_fields = {
@@ -327,6 +328,7 @@ def build_run_manifest(
         "exact_q_listwise_temperature": float(
             getattr(trainer, "exact_q_listwise_temperature", 1.0)
         ),
+        **learning_rate_metadata,
         **q_cache_manifest_fields,
     }
 
@@ -411,6 +413,16 @@ def validate_run_manifest_for_resume(
         "critic_value_scale_mode",
         "observation_dim",
         "rollout_steps",
+        "experiment_id",
+        "control_mode",
+        "configured_actor_learning_rate",
+        "configured_critic_learning_rate",
+        "effective_actor_learning_rate",
+        "effective_critic_learning_rate",
+        "actor_learning_rate_overridden",
+        "critic_learning_rate_overridden",
+        "lr_experiment_axis",
+        "lr_experiment_value",
     )
     mismatches = {
         field: (existing.get(field), current.get(field))

@@ -41,7 +41,7 @@ from .trainer import (
 
 
 PROPOSED_POLICY_SCHEMA = "adaptive_joint_cache_uav_ppo"
-PROPOSED_CONTROL_MODE = "policy_primitive_joint_cache_uav_operation"
+PROPOSED_CONTROL_MODE = "adaptive_joint_cache_uav_reconfiguration"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 FULL_EPISODE_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
 FULL_EPISODE_SLOTS = 300

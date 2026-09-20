@@ -38,6 +38,18 @@ REPLICA_AWARE_CACHE_FEATURE_NAMES = (
     "added_replica_after_ratio",
 )
 REPLICA_AWARE_CACHE_FEATURE_DIM = len(REPLICA_AWARE_CACHE_FEATURE_NAMES)
+TARGET_RECONFIGURATION_CONTROL_MODE = "adaptive_joint_cache_uav_reconfiguration"
+TARGET_CACHE_PROPOSAL_SOURCES = (
+    "low_reconfiguration",
+    "prediction",
+    "replica_aware",
+    "intermediate",
+)
+TARGET_UAV_PROPOSAL_SOURCES = (
+    "demand_centroid",
+    "projected_demand",
+    "geometry_exploration",
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +67,10 @@ class PrimitiveTensorSpec:
         service_count = int(context.service_catalog["num_services"])
         uav_count = len(context.action_spec.uav_ids)
         search = uav_configuration.uav_search_config_from_project(context.cfg)
+        target_reconfiguration = (
+            str(getattr(context, "configuration_control_mode", ""))
+            == TARGET_RECONFIGURATION_CONTROL_MODE
+        )
         replica_aware = (
             str(getattr(context, "policy_schema", ""))
             in REPLICA_AWARE_POLICY_SCHEMAS
@@ -64,16 +80,32 @@ class PrimitiveTensorSpec:
             num_uav_heads=uav_count,
             observation_dim=int(context.observation_spec.observation_dim),
             cache_feature_dim=(
-                17
-                + 3 * service_count
-                + (REPLICA_AWARE_CACHE_FEATURE_DIM if replica_aware else 0)
+                25 + 6 * service_count
+                if target_reconfiguration
+                else (
+                    17
+                    + 3 * service_count
+                    + (REPLICA_AWARE_CACHE_FEATURE_DIM if replica_aware else 0)
+                )
             ),
-            uav_feature_dim=16 + uav_count,
-            cache_max_candidates=1 + service_count + (service_count * service_count) // 4,
+            uav_feature_dim=(
+                17 + uav_count + 2 * service_count
+                if target_reconfiguration
+                else 16 + uav_count
+            ),
+            cache_max_candidates=(
+                int(context.cache_cfg.target_candidate_capacity)
+                if target_reconfiguration
+                else 1 + service_count + (service_count * service_count) // 4
+            ),
             uav_max_candidates=(
-                1
-                + len(search.coarse_radius_fractions) * search.coarse_num_angles
-                + search.refine_rounds * search.refine_num_angles
+                int(search.target_candidate_capacity)
+                if target_reconfiguration
+                else (
+                    1
+                    + len(search.coarse_radius_fractions) * search.coarse_num_angles
+                    + search.refine_rounds * search.refine_num_angles
+                )
             ),
         )
 
@@ -322,6 +354,114 @@ def _cache_candidate_feature(
     return values.astype(np.float32)
 
 
+def _cache_target_configuration_feature(
+    candidate: cache_configuration.CacheTargetCandidate,
+    current_cache: np.ndarray,
+    previous_cache: np.ndarray,
+    cache_triggers: np.ndarray,
+    node_specific_demand: np.ndarray,
+    observed_service_usage: np.ndarray,
+    context: Any,
+) -> np.ndarray:
+    """Encode a complete target cache configuration, not a primitive edit."""
+
+    service_count = int(context.service_catalog["num_services"])
+    node_count = len(context.cache_nodes["node_ids"])
+    before = np.asarray(candidate.before_node_cache, dtype=np.float64).reshape(-1)
+    target = np.asarray(candidate.target_node_cache, dtype=np.float64).reshape(-1)
+    demand = np.asarray(node_specific_demand, dtype=np.float64).reshape(-1)
+    observed = np.asarray(observed_service_usage, dtype=np.float64).reshape(-1)
+    if before.shape != (service_count,) or target.shape != before.shape:
+        raise ValueError("target cache feature state shape mismatch")
+    if demand.shape != before.shape or observed.shape != before.shape:
+        raise ValueError("target cache feature demand shape mismatch")
+    if not np.all(np.isin(before, [0.0, 1.0])) or not np.all(
+        np.isin(target, [0.0, 1.0])
+    ):
+        raise ValueError("target cache feature states must be binary")
+    delta = target - before
+    sizes = np.asarray(context.service_catalog["service_sizes_mb"], dtype=np.float64)
+    capacity = float(context.cache_nodes["capacities_mb"][candidate.node_index])
+    trial = np.asarray(current_cache, dtype=np.int8).copy()
+    trial[candidate.node_index] = target.astype(np.int8)
+    total_cost, loading_energy = cache_configuration.cache_update_cost(
+        previous_cache,
+        trial,
+        cache_triggers,
+        sizes,
+        context.cache_nodes,
+        context.cache_cfg,
+    )
+    before_used = cache_configuration.node_used_capacity_mb(before.astype(np.int8), sizes)
+    target_used = cache_configuration.node_used_capacity_mb(target.astype(np.int8), sizes)
+    loaded_mb = float(np.dot(np.maximum(delta, 0.0), sizes))
+    released_mb = float(np.dot(np.maximum(-delta, 0.0), sizes))
+    demand_before = demand * before
+    demand_after = demand * target
+    demand_gain = demand_after - demand_before
+    observed_before = observed * before
+    observed_after = observed * target
+    observed_gain = observed_after - observed_before
+    current_replica_counts = np.sum(np.asarray(current_cache, dtype=np.float64), axis=0)
+    target_replica_counts = np.sum(np.asarray(trial, dtype=np.float64), axis=0)
+    current_diversity = float(np.count_nonzero(current_replica_counts > 0.0))
+    target_diversity = float(np.count_nonzero(target_replica_counts > 0.0))
+    zero_after = float(np.count_nonzero(target_replica_counts == 0.0))
+    single_after = float(np.count_nonzero(target_replica_counts == 1.0))
+    role = str(context.cache_nodes["node_roles"][candidate.node_index]).upper()
+    role_feature = np.asarray(
+        [float(role == "SV"), float(role == "RSU"), float(role == "UAV")],
+        dtype=np.float64,
+    )
+    source_feature = np.asarray(
+        [float(candidate.proposal_source == value) for value in TARGET_CACHE_PROPOSAL_SOURCES],
+        dtype=np.float64,
+    )
+    scalar_features = np.asarray(
+        [
+            before_used / max(capacity, 1.0e-12),
+            target_used / max(capacity, 1.0e-12),
+            (capacity - target_used) / max(capacity, 1.0e-12),
+            loaded_mb / max(capacity, 1.0e-12),
+            released_mb / max(capacity, 1.0e-12),
+            float(np.sum(demand_before)),
+            float(np.sum(demand_after)),
+            float(np.sum(demand_gain)),
+            float(np.sum(observed_before)),
+            float(np.sum(observed_after)),
+            float(np.sum(observed_gain)),
+            math.log1p(max(float(total_cost), 0.0)),
+            math.log1p(max(float(loading_energy[candidate.node_index]), 0.0)),
+            float(np.mean(np.abs(delta))),
+            (target_diversity - current_diversity) / max(float(service_count), 1.0),
+            zero_after / max(float(service_count), 1.0),
+            single_after / max(float(service_count), 1.0),
+        ],
+        dtype=np.float64,
+    )
+    values = np.concatenate(
+        [
+            np.asarray(
+                [float(candidate.node_index) / max(node_count - 1, 1)],
+                dtype=np.float64,
+            ),
+            role_feature,
+            before,
+            target,
+            delta,
+            demand_before,
+            demand_after,
+            demand_gain,
+            scalar_features,
+            source_feature,
+        ]
+    )
+    expected_dim = 25 + 6 * service_count
+    if values.shape != (expected_dim,) or not np.all(np.isfinite(values)):
+        raise AssertionError("target cache configuration feature shape/finite check failed")
+    return values.astype(np.float32)
+
+
 def _normalized_xy(
     xy: Any,
     boundary: tuple[float, float, float, float],
@@ -398,6 +538,119 @@ def _uav_candidate_feature(
     )
     if values.shape != (16 + len(uav_ids),) or not np.all(np.isfinite(values)):
         raise AssertionError("UAV primitive candidate feature shape/finite check failed。")
+    return values.astype(np.float32)
+
+
+def _uav_target_position_feature(
+    candidate: uav_configuration.UavTargetCandidate,
+    current_uav: dict[str, np.ndarray],
+    previous_uav: dict[str, np.ndarray],
+    uav_triggers: dict[str, int],
+    predicted_vehicle_positions: dict[str, Any],
+    predicted_vehicle_service_demand: np.ndarray,
+    cache_state: np.ndarray,
+    context: Any,
+) -> np.ndarray:
+    """Encode service-aware UAV target position plus physical movement cost."""
+
+    uav_ids = tuple(context.action_spec.uav_ids)
+    uav_index = uav_ids.index(candidate.uav_id)
+    service_count = int(context.service_catalog["num_services"])
+    search = uav_configuration.uav_search_config_from_project(context.cfg)
+    trial = {
+        key: np.asarray(value, dtype=np.float64).copy()
+        for key, value in current_uav.items()
+    }
+    trial[candidate.uav_id] = np.asarray(candidate.target_position, dtype=np.float64).copy()
+    movement_energy, movement_cost, _, _, _ = uav_configuration.movement_summary(
+        previous_uav,
+        trial,
+        uav_triggers,
+        search,
+    )
+    before_normalized = _normalized_xy(candidate.before_position, context.flight_boundary)
+    target_normalized = _normalized_xy(candidate.target_position, context.flight_boundary)
+    x_min, y_min, x_max, y_max = [float(value) for value in context.flight_boundary]
+    scale = np.asarray([x_max - x_min, y_max - y_min], dtype=np.float64)
+    delta = (np.asarray(candidate.target_position) - np.asarray(candidate.before_position)) / scale
+    distance = float(
+        np.linalg.norm(
+            np.asarray(candidate.target_position) - np.asarray(candidate.before_position)
+        )
+    )
+    vehicle_ids = tuple(context.observation_spec.vehicle_ids)
+    vehicle_xy = np.asarray(
+        [
+            _normalized_xy(predicted_vehicle_positions[vehicle_id], context.flight_boundary)
+            for vehicle_id in vehicle_ids
+        ],
+        dtype=np.float64,
+    )
+    demand = np.asarray(predicted_vehicle_service_demand, dtype=np.float64)
+    if demand.shape != (len(vehicle_ids), service_count) or not np.all(np.isfinite(demand)):
+        raise ValueError("UAV target feature demand shape/finite check failed")
+    node_ids = [str(value) for value in context.cache_nodes["node_ids"]]
+    node_index = node_ids.index(str(candidate.uav_id))
+    cache_vector = np.asarray(cache_state[node_index], dtype=np.float64).reshape(-1)
+    if cache_vector.shape != (service_count,):
+        raise ValueError("UAV target feature cache vector shape mismatch")
+    service_weights = np.maximum(demand @ cache_vector, 0.0)
+    if float(np.sum(service_weights)) > 1.0e-12:
+        demand_centroid = np.sum(
+            vehicle_xy * service_weights[:, None],
+            axis=0,
+        ) / float(np.sum(service_weights))
+    else:
+        demand_centroid = _normalized_xy(candidate.before_position, context.flight_boundary)
+    range_m = max(float(context.cache_cfg.uav_range_m), 1.0e-12)
+    target_xy = np.asarray(candidate.target_position, dtype=np.float64)
+    target_distance = np.linalg.norm(
+        np.asarray([target_xy[0], target_xy[1]], dtype=np.float64)[None, :]
+        - np.asarray(
+            [predicted_vehicle_positions[vehicle_id] for vehicle_id in vehicle_ids],
+            dtype=np.float64,
+        ),
+        axis=1,
+    )
+    serviceability = np.maximum(0.0, 1.0 - target_distance / range_m)
+    target_service_demand = np.sum(demand * serviceability[:, None], axis=0)
+    uav_one_hot = np.zeros(len(uav_ids), dtype=np.float64)
+    uav_one_hot[uav_index] = 1.0
+    source_feature = np.asarray(
+        [float(candidate.proposal_source == value) for value in TARGET_UAV_PROPOSAL_SOURCES],
+        dtype=np.float64,
+    )
+    values = np.concatenate(
+        [
+            np.asarray([float(uav_index) / max(len(uav_ids) - 1, 1)], dtype=np.float64),
+            uav_one_hot,
+            source_feature,
+            before_normalized,
+            target_normalized,
+            delta,
+            np.asarray(
+                [
+                    distance / max(search.max_move_distance_m, 1.0e-12),
+                    math.log1p(max(float(movement_energy), 0.0)),
+                    math.log1p(max(float(movement_cost), 0.0)),
+                ],
+                dtype=np.float64,
+            ),
+            demand_centroid,
+            np.asarray(
+                [
+                    float(np.linalg.norm(target_normalized - demand_centroid)),
+                    float(np.sum(target_service_demand)),
+                ],
+                dtype=np.float64,
+            ),
+            cache_vector,
+            target_service_demand,
+        ]
+    )
+    expected_dim = 17 + len(uav_ids) + 2 * service_count
+    if values.shape != (expected_dim,) or not np.all(np.isfinite(values)):
+        raise AssertionError("UAV target position feature shape/finite check failed")
     return values.astype(np.float32)
 
 
@@ -946,7 +1199,7 @@ def sample_and_apply_no_prediction_cache_operation_configuration(
     )
 
 
-def sample_and_apply_binary_cache_operation_configuration(
+def sample_and_apply_cache_reconfiguration_configuration(
     policy: Any,
     observation: np.ndarray,
     previous_cache_state: np.ndarray,
@@ -957,12 +1210,7 @@ def sample_and_apply_binary_cache_operation_configuration(
     *,
     deterministic: bool = False,
 ) -> CacheOperationPrimitiveSelectionResult:
-    """Sample binary Cache triggers and one unified UPDATE candidate set.
-
-    The production candidate enumerator is shared with the exact Cache credit path.
-    The proposed joint policy changes only the factorization: all legal ADD/DELETE/SWAP candidates
-    are passed to one conditional categorical distribution after UPDATE.
-    """
+    """Sample KEEP/UPDATE and one target-configuration conditional head."""
 
     trigger_order = ("KEEP", "UPDATE")
     if tuple(getattr(policy, "trigger_order", ())) != trigger_order:
@@ -975,6 +1223,10 @@ def sample_and_apply_binary_cache_operation_configuration(
     }
     if tensor_spec.num_cache_heads != len(context.action_spec.cache_node_ids):
         raise ValueError("Cache tensor spec head count does not match action spec")
+    proposal_cache_nodes = uav_configuration.cache_nodes_with_uav_positions(
+        context.cache_nodes,
+        current_uav,
+    )
 
     operation_actions = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
     operation_masks = np.zeros(
@@ -1014,17 +1266,16 @@ def sample_and_apply_binary_cache_operation_configuration(
             step,
             context,
         )
-        candidates = cache_configuration.enumerate_cache_primitive_actions(
+        candidates = cache_configuration.enumerate_cache_target_configurations(
             cache,
             node_index,
             context.service_catalog,
-            context.cache_nodes,
+            proposal_cache_nodes,
+            step.scenario_slice,
+            context.local_cache,
+            context.cache_cfg,
         )
-        update_candidates = [
-            candidate
-            for candidate in candidates
-            if str(candidate.operation_type) != "NO_CHANGE"
-        ]
+        update_candidates = candidates
         operation_mask = np.asarray(
             [True, bool(update_candidates)],
             dtype=bool,
@@ -1064,9 +1315,7 @@ def sample_and_apply_binary_cache_operation_configuration(
                     "head_index": node_index,
                     "candidate_count": 0,
                     "selected_index": None,
-                    "operation_type": "NO_CHANGE",
-                    "added_service_ids": [],
-                    "removed_service_ids": [],
+                    "conditional_action": "KEEP",
                     "actual_changed": False,
                 }
             )
@@ -1075,16 +1324,26 @@ def sample_and_apply_binary_cache_operation_configuration(
         if not update_candidates:
             raise AssertionError("selected UPDATE without a legal candidate")
         cache_triggers[node_index] = 1
+        node_demand = cache_configuration.node_specific_predicted_demand(
+            step.scenario_slice,
+            node_index,
+            proposal_cache_nodes,
+            context.cache_cfg,
+        )
+        observed_usage = cache_configuration.observed_local_service_usage(
+            context.local_cache,
+            int(context.service_catalog["num_services"]),
+        )
         candidate_features = np.stack(
             [
-                _cache_candidate_feature(
+                _cache_target_configuration_feature(
                     candidate,
                     cache,
                     previous_cache,
                     cache_triggers,
-                    step.predicted_service_popularity,
+                    node_demand,
+                    observed_usage,
                     context,
-                    include_replica_awareness=True,
                 )
                 for candidate in update_candidates
             ]
@@ -1099,10 +1358,10 @@ def sample_and_apply_binary_cache_operation_configuration(
         )
         selected_index = int(sampled_candidate.selected_index)
         selected = update_candidates[selected_index]
-        applied = cache_configuration.apply_cache_candidate(
+        applied = cache_configuration.apply_cache_target_configuration(
             cache,
             node_index,
-            selected.after_node_cache,
+            selected.target_node_cache,
             context.service_catalog,
             context.cache_nodes,
         )
@@ -1122,9 +1381,9 @@ def sample_and_apply_binary_cache_operation_configuration(
                 "head_index": node_index,
                 "candidate_count": count,
                 "selected_index": selected_index,
-                "operation_type": str(selected.operation_type),
-                "added_service_ids": list(selected.added_service_ids),
-                "removed_service_ids": list(selected.removed_service_ids),
+                "conditional_action": "TARGET_CONFIGURATION",
+                "target_cache": selected.target_node_cache.astype(int).tolist(),
+                "proposal_source": selected.proposal_source,
                 "actual_changed": bool(applied["actual_changed"]),
             }
         )
@@ -1177,35 +1436,22 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
     tensor_spec: PrimitiveTensorSpec,
     *,
     deterministic: bool = False,
-    binary_cache_trigger: bool = False,
 ) -> JointCacheUavOperationPrimitiveSelectionResult:
-    """Run Replica-aware Cache-only Cache decisions followed by sequential STAY/MOVE UAV decisions."""
+    """Run target-cache reconfiguration followed by sequential STAY/MOVE decisions."""
 
     operation_order = ("STAY", "MOVE")
     if tuple(getattr(policy, "uav_operation_order", ())) != operation_order:
         raise ValueError("UAV operation order must be STAY/MOVE")
-    if binary_cache_trigger:
-        cache_result = sample_and_apply_binary_cache_operation_configuration(
-            policy,
-            observation,
-            previous_cache_state,
-            previous_uav_positions,
-            step,
-            context,
-            tensor_spec,
-            deterministic=bool(deterministic),
-        )
-    else:
-        cache_result = sample_and_apply_replica_aware_cache_operation_configuration(
-            policy,
-            observation,
-            previous_cache_state,
-            previous_uav_positions,
-            step,
-            context,
-            tensor_spec,
-            deterministic=bool(deterministic),
-        )
+    cache_result = sample_and_apply_cache_reconfiguration_configuration(
+        policy,
+        observation,
+        previous_cache_state,
+        previous_uav_positions,
+        step,
+        context,
+        tensor_spec,
+        deterministic=bool(deterministic),
+    )
     current_uav = {
         uav_id: np.asarray(previous_uav_positions[uav_id], dtype=np.float64).copy()
         for uav_id in context.action_spec.uav_ids
@@ -1273,19 +1519,19 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
             step,
             context,
         )
-        candidates = uav_configuration.enumerate_uav_primitive_actions(
+        candidates = uav_configuration.enumerate_uav_target_candidates(
             current_uav,
             previous_uav,
             uav_id,
             uav_triggers,
             context.cfg,
             context.flight_boundary,
+            scenario_slice=step.scenario_slice,
+            cache_state=cache_result.final_cache_state,
+            cache_nodes=context.cache_nodes,
+            predicted_vehicle_positions=step.predicted_vehicle_positions,
         )
-        move_candidates = [
-            candidate
-            for candidate in candidates
-            if str(candidate.operation_type) == "MOVE"
-        ]
+        move_candidates = candidates
         if len(move_candidates) > tensor_spec.uav_max_candidates:
             raise AssertionError("UAV candidate count exceeds padded capacity")
         operation_mask = np.asarray(
@@ -1345,12 +1591,18 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
         if count:
             candidate_features = np.stack(
                 [
-                    _uav_candidate_feature(
+                    _uav_target_position_feature(
                         candidate,
                         current_uav,
                         previous_uav,
                         uav_triggers,
                         step.predicted_vehicle_positions,
+                        cache_configuration.predicted_vehicle_service_demand(
+                            step.scenario_slice,
+                            int(context.service_catalog["num_services"]),
+                            beta_discount=context.cache_cfg.beta_discount,
+                        ),
+                        cache_result.final_cache_state,
                         context,
                     )
                     for candidate in move_candidates
@@ -1375,7 +1627,7 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
                     "head_index": uav_index,
                     "candidate_count": count,
                     "selected_index": None,
-                    "operation_type": "STAY",
+                    "conditional_action": "STAY",
                     "before_position": [float(value) for value in before],
                     "after_position": [float(value) for value in before],
                     "actual_moved": False,
@@ -1394,20 +1646,16 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
         )
         selected_index = int(sampled_candidate.selected_index)
         selected = move_candidates[selected_index]
-        if str(selected.operation_type) != "MOVE":
-            raise AssertionError("MOVE candidate sampler returned a non-MOVE action")
-        applied = uav_configuration.apply_uav_candidate(
+        applied = uav_configuration.apply_uav_target_position(
             current_uav,
             previous_uav,
             uav_id,
-            selected.after_position,
+            selected.target_position,
             uav_triggers,
             context.cfg,
             context.flight_boundary,
         )
-        if str(applied["operation_type"]) != "MOVE" or not bool(
-            applied["actual_moved"]
-        ):
+        if not bool(applied["actual_moved"]):
             raise AssertionError("MOVE operation did not produce actual movement")
         uav_selected[uav_index] = selected_index
         uav_old_log_probs[uav_index] = float(
@@ -1422,9 +1670,11 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
                 "head_index": uav_index,
                 "candidate_count": count,
                 "selected_index": selected_index,
-                "operation_type": "MOVE",
+                "conditional_action": "TARGET_POSITION",
+                "proposal_source": selected.proposal_source,
                 "before_position": [float(value) for value in selected.before_position],
-                "after_position": [float(value) for value in selected.after_position],
+                "target_position": [float(value) for value in selected.target_position],
+                "after_position": [float(value) for value in selected.target_position],
                 "actual_moved": True,
             }
         )

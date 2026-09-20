@@ -114,7 +114,7 @@ def _configuration_summary(
     }
     prediction_skipped = result.stop_reason in {
         "no_trigger_prediction_skipped",
-        "policy_primitive_prediction_skipped",
+        "policy_target_prediction_skipped",
     }
     return {
         "trigger_feasible": result.trigger_feasible,
@@ -752,7 +752,7 @@ def _movement_cost(
     )
 
 
-def build_policy_primitive_configuration(
+def build_policy_target_configuration(
     previous_cache_state: np.ndarray,
     previous_uav_positions: dict[str, Any],
     final_cache_state: np.ndarray,
@@ -767,7 +767,7 @@ def build_policy_primitive_configuration(
     cache_actions: tuple[dict[str, Any], ...] = (),
     uav_actions: tuple[dict[str, Any], ...] = (),
 ) -> JointConfigurationResult:
-    """Build the direct-policy configuration result without a prediction solve."""
+    """Build a direct-policy target configuration without a prediction solve."""
 
     previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     final_cache = np.asarray(final_cache_state, dtype=np.int8).copy()
@@ -783,10 +783,10 @@ def build_policy_primitive_configuration(
     if cache_trigger.shape != (previous_cache.shape[0],) or not np.all(
         np.isin(cache_trigger, [0, 1])
     ):
-        raise ValueError("policy primitive cache triggers 非法。")
+        raise ValueError("policy target cache triggers 非法。")
     actual_cache = np.any(final_cache != previous_cache, axis=1).astype(np.int8)
     if np.any(actual_cache > cache_trigger):
-        raise ValueError("policy primitive cache state 违反 trigger=0 保持不变语义。")
+        raise ValueError("policy target cache state 违反 trigger=0 保持不变语义。")
     uav_configuration.validate_uav_configuration_transition(
         previous_uav,
         final_uav,
@@ -835,9 +835,9 @@ def build_policy_primitive_configuration(
         outer_rounds=0,
         accepted_cache_updates=int(actual_cache.sum()),
         accepted_uav_updates=int(actual_uav),
-        stop_reason="policy_primitive_prediction_skipped",
-        cache_result_summary={"primitive_actions": [dict(value) for value in cache_actions]},
-        uav_result_summary={"primitive_actions": [dict(value) for value in uav_actions]},
+        stop_reason="policy_target_prediction_skipped",
+        cache_result_summary={"target_actions": [dict(value) for value in cache_actions]},
+        uav_result_summary={"target_actions": [dict(value) for value in uav_actions]},
     )
 
 
@@ -857,8 +857,8 @@ def _validated_configuration_override(
 
     if not isinstance(configuration, JointConfigurationResult):
         raise TypeError("configuration_override 必须是 JointConfigurationResult。")
-    if configuration.stop_reason != "policy_primitive_prediction_skipped":
-        raise ValueError("configuration_override 仅接受 policy_primitive result。")
+    if configuration.stop_reason != "policy_target_prediction_skipped":
+        raise ValueError("configuration_override 仅接受 policy target result。")
     if not np.array_equal(configuration.previous_cache_state, previous_cache):
         raise ValueError("configuration_override previous cache 不匹配。")
     if configuration.cache_triggers != cache_trigger.astype(int).tolist():
@@ -871,7 +871,7 @@ def _validated_configuration_override(
             np.asarray(xy, dtype=np.float64),
         ):
             raise ValueError("configuration_override previous UAV state 不匹配。")
-    rebuilt = build_policy_primitive_configuration(
+    rebuilt = build_policy_target_configuration(
         previous_cache,
         previous_uav,
         configuration.final_cache_state,
@@ -883,8 +883,8 @@ def _validated_configuration_override(
         cache_nodes,
         cache_config,
         flight_boundary,
-        cache_actions=tuple(configuration.cache_result_summary.get("primitive_actions", [])),
-        uav_actions=tuple(configuration.uav_result_summary.get("primitive_actions", [])),
+        cache_actions=tuple(configuration.cache_result_summary.get("target_actions", [])),
+        uav_actions=tuple(configuration.uav_result_summary.get("target_actions", [])),
     )
     if not math.isclose(rebuilt.cache_cost, configuration.cache_cost, rel_tol=0.0, abs_tol=0.0):
         raise ValueError("configuration_override cache cost 不匹配。")

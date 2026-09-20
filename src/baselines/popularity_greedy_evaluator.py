@@ -292,7 +292,7 @@ def evaluate_popularity_greedy_episode(
         )
         cache_triggers = np.any(target_cache != previous_cache, axis=1).astype(np.int8)
         uav_triggers = {uav_id: 0 for uav_id in context.action_spec.uav_ids}
-        configuration_override = slot_environment.build_policy_primitive_configuration(
+        configuration_override = slot_environment.build_policy_target_configuration(
             previous_cache,
             previous_uav,
             target_cache,

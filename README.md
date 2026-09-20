@@ -77,7 +77,7 @@ non-mainline comparison definitions:
 | Method ID | Definition | Status |
 | --- | --- | --- |
 | `proposed_joint` | exact-Q listwise candidate prediction + adaptive Cache + adaptive UAV + learned policy | IMPLEMENTATION GATE PASSED; FORMAL TRAINING PENDING |
-| `ablation_cache_only` | prediction + adaptive Cache + fixed UAV + learned policy | NOT YET FORMALLY TRAINED TO 222 |
+| `ablation_cache_only` | prediction + adaptive Cache + fixed UAV + learned policy | NOT YET FORMALLY TRAINED TO 300 |
 | `ablation_joint_no_prediction` | no prediction + adaptive Cache + adaptive UAV + learned policy | NOT YET FORMALLY TRAINED |
 | `baseline_popularity_greedy` | prediction/popularity Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |
 | `baseline_true_static` | fixed Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |

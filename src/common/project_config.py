@@ -730,14 +730,23 @@ def validate_config(
         raise ValueError("prediction.vehicle.horizon 必须 >= 1。")
     if int(get_config_value(config, "scenario.num_scenarios")) < 1:
         raise ValueError("scenario.num_scenarios 必须 >= 1。")
-    if get_config_value(config, "algorithm.uav.method", "coarse_to_fine_coordinate") != (
-        "coarse_to_fine_coordinate"
-    ):
-        raise ValueError("algorithm.uav.method 当前只支持 coarse_to_fine_coordinate。")
+    uav_method = str(
+        get_config_value(config, "algorithm.uav.method", "coarse_to_fine_coordinate")
+    )
+    if uav_method not in {
+        "coarse_to_fine_coordinate",
+        "demand_aware_target_position",
+    }:
+        raise ValueError(
+            "algorithm.uav.method 当前只支持 coarse_to_fine_coordinate/"
+            "demand_aware_target_position。"
+        )
     if int(get_config_value(config, "algorithm.uav.coarse_num_angles")) < 4:
         raise ValueError("algorithm.uav.coarse_num_angles 必须 >= 4。")
     if int(get_config_value(config, "algorithm.uav.refine_num_angles")) < 4:
         raise ValueError("algorithm.uav.refine_num_angles 必须 >= 4。")
+    if int(get_config_value(config, "algorithm.uav.exploration_num_angles", 8)) < 4:
+        raise ValueError("algorithm.uav.exploration_num_angles 必须 >= 4。")
     if int(get_config_value(config, "algorithm.uav.refine_rounds")) < 0:
         raise ValueError("algorithm.uav.refine_rounds 不能为负。")
     if int(get_config_value(config, "algorithm.uav.max_coordinate_rounds")) < 1:
@@ -755,6 +764,26 @@ def validate_config(
         number = float(value)
         if number <= 0.0 or number > 1.0:
             raise ValueError("algorithm.uav.coarse_radius_fractions 必须位于 (0,1]。")
+    exploration_fractions = get_config_value(
+        config, "algorithm.uav.exploration_radius_fractions", [0.5, 1.0]
+    )
+    if not isinstance(exploration_fractions, list) or not exploration_fractions:
+        raise ValueError(
+            "algorithm.uav.exploration_radius_fractions 必须是非空列表。"
+        )
+    if any(float(value) <= 0.0 or float(value) > 1.0 for value in exploration_fractions):
+        raise ValueError(
+            "algorithm.uav.exploration_radius_fractions 必须位于 (0,1]。"
+        )
+    demand_anchor_scales = get_config_value(
+        config, "algorithm.uav.demand_anchor_scales", [0.5, 1.0]
+    )
+    if not isinstance(demand_anchor_scales, list) or not demand_anchor_scales:
+        raise ValueError("algorithm.uav.demand_anchor_scales 必须是非空列表。")
+    if any(float(value) <= 0.0 or float(value) > 1.0 for value in demand_anchor_scales):
+        raise ValueError("algorithm.uav.demand_anchor_scales 必须位于 (0,1]。")
+    if int(get_config_value(config, "algorithm.uav.target_candidate_capacity", 24)) < 1:
+        raise ValueError("algorithm.uav.target_candidate_capacity 必须 >= 1。")
     if get_config_value(config, "algorithm.configuration.method", "cache_uav_coordinate") != (
         "cache_uav_coordinate"
     ):
@@ -796,11 +825,13 @@ def validate_config(
         "policy_primitive",
         "policy_primitive_cache_operation",
         "policy_primitive_joint_cache_uav_operation",
+        "adaptive_joint_cache_uav_reconfiguration",
     }:
         raise ValueError(
             "algorithm.ppo.configuration_control_mode 只支持 "
             "legacy_exact/policy_primitive/policy_primitive_cache_operation/"
-            "policy_primitive_joint_cache_uav_operation。"
+            "policy_primitive_joint_cache_uav_operation/"
+            "adaptive_joint_cache_uav_reconfiguration。"
         )
     policy_schema = str(
         get_config_value(config, "algorithm.ppo.policy_schema", "adaptive_primitive_v1")
@@ -903,11 +934,16 @@ def validate_config(
             "adaptive_replica_aware_cache_only_no_prediction_popart."
         )
     if (
-        configuration_control_mode == "policy_primitive_joint_cache_uav_operation"
+        configuration_control_mode
+        in {
+            "policy_primitive_joint_cache_uav_operation",
+            "adaptive_joint_cache_uav_reconfiguration",
+        }
         and policy_schema != proposed_schema
     ):
         raise ValueError(
-            "policy_primitive_joint_cache_uav_operation requires adaptive_joint_cache_uav_ppo."
+            "the proposed joint reconfiguration control mode requires "
+            "adaptive_joint_cache_uav_ppo."
         )
     kl_gate_mode = str(
         get_config_value(config, "algorithm.ppo.kl_gate_mode", "joint")

@@ -94,6 +94,11 @@ class CacheOptimizationConfig:
     kkt_bisection_tolerance: float
     kkt_max_bisection_iterations: int
     cache_cost_weight: float = 1.0
+    # Proposed-policy target configuration proposal controls.  These are
+    # engineering bounds/coverage knobs, not physical system parameters.
+    target_candidate_capacity: int = 64
+    target_intermediate_fractions: tuple[float, ...] = (0.25, 0.5, 0.75)
+
     def validate(self) -> None:
         values = [
             self.num_rsu,
@@ -127,6 +132,15 @@ class CacheOptimizationConfig:
             raise ValueError("tolerance 不能为负数。")
         if not math.isfinite(self.cache_cost_weight) or self.cache_cost_weight < 0.0:
             raise ValueError("cache_cost_weight 必须是非负有限数。")
+        if int(self.target_candidate_capacity) < 1:
+            raise ValueError("target_candidate_capacity 必须 >= 1。")
+        if not self.target_intermediate_fractions or any(
+            not math.isfinite(float(value)) or not 0.0 < float(value) < 1.0
+            for value in self.target_intermediate_fractions
+        ):
+            raise ValueError(
+                "target_intermediate_fractions 必须是 (0,1) 内的有限非空序列。"
+            )
         if self.num_rsu != len(self.rsu_instances):
             raise ValueError("RSU instance 数量必须等于 num_rsu。")
         if self.num_uav != len(self.uav_instances):
@@ -234,6 +248,17 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
             get(config, "algorithm.kkt.max_bisection_iterations")
         ),
         cache_cost_weight=float(get(config, "objective.cache_cost_weight", 1.0)),
+        target_candidate_capacity=int(
+            get(config, "algorithm.cache.target_candidate_capacity", 64)
+        ),
+        target_intermediate_fractions=tuple(
+            float(value)
+            for value in get(
+                config,
+                "algorithm.cache.target_intermediate_fractions",
+                [0.25, 0.5, 0.75],
+            )
+        ),
     )
 
 
@@ -1377,6 +1402,331 @@ def is_node_feasible(
     capacity_mb: float,
 ) -> bool:
     return node_used_capacity_mb(node_cache, service_sizes_mb) <= capacity_mb + 1e-9
+
+
+def _serviceability_weight(
+    distance_m: float,
+    role: str,
+    config: CacheOptimizationConfig,
+) -> float:
+    """Return a bounded geometric serviceability weight for proposal features.
+
+    This is deliberately only a proposal signal.  The actual communication,
+    Matching, KKT, and reward paths remain in their existing modules.
+    """
+
+    ranges = {
+        "SV": float(config.sv_range_m),
+        "RSU": float(config.rsu_range_m),
+        "UAV": float(config.uav_range_m),
+    }
+    radius = ranges[str(role).upper()]
+    if distance_m >= radius:
+        return 0.0
+    return float(max(0.0, 1.0 - distance_m / max(radius, 1.0e-12)))
+
+
+def predicted_vehicle_service_demand_by_horizon(
+    origin_scenario: dict[str, Any],
+    num_services: int,
+    beta_discount: float = 1.0,
+) -> np.ndarray:
+    """Build a vehicle-specific demand tensor from prediction scenarios only.
+
+    ``arrival``/``service_id`` are sampled prediction scenarios, not the
+    realized future task stream.  If a scenario artifact does not contain
+    usable per-vehicle events, the available predicted popularity is distributed
+    uniformly over vehicles as a finite fallback.
+    """
+
+    arrival = np.asarray(origin_scenario.get("arrival"), dtype=np.float64)
+    service_id = np.asarray(origin_scenario.get("service_id"), dtype=np.int64)
+    positions = np.asarray(origin_scenario.get("positions_xy"), dtype=np.float64)
+    if arrival.ndim != 3 or service_id.shape != arrival.shape:
+        raise ValueError("prediction scenario arrival/service_id must be [S,H,V]")
+    scenarios, horizons, task_vehicle_count = [int(value) for value in arrival.shape]
+    if positions.ndim != 4 or positions.shape[:2] != (scenarios, horizons):
+        raise ValueError("prediction scenario positions_xy must align with [S,H,V,2]")
+    vehicles = int(positions.shape[2])
+    if positions.shape[3] != 2:
+        raise ValueError("prediction scenario positions_xy must end in coordinate dimension 2")
+    vehicle_ids = [str(value) for value in origin_scenario["vehicle_ids"].tolist()]
+    raw_task_vehicle_ids = origin_scenario.get("task_vehicle_ids")
+    task_vehicle_ids = (
+        [str(value) for value in raw_task_vehicle_ids.tolist()]
+        if raw_task_vehicle_ids is not None
+        else []
+    )
+    if len(vehicle_ids) != vehicles or len(task_vehicle_ids) != task_vehicle_count:
+        raise ValueError("prediction vehicle ID arrays do not align with scenario tensors")
+    vehicle_index = {vehicle_id: index for index, vehicle_id in enumerate(vehicle_ids)}
+    task_to_vehicle = [vehicle_index[vehicle_id] for vehicle_id in task_vehicle_ids]
+    demand = np.zeros((scenarios, horizons, vehicles, int(num_services)), dtype=np.float64)
+    for scenario_index in range(scenarios):
+        for horizon in range(horizons):
+            discount = float(beta_discount) ** int(horizon)
+            for task_index, full_vehicle_index in enumerate(task_to_vehicle):
+                if arrival[scenario_index, horizon, task_index] <= 0.0:
+                    continue
+                service = int(service_id[scenario_index, horizon, task_index])
+                if 0 <= service < int(num_services):
+                    demand[scenario_index, horizon, full_vehicle_index, service] += (
+                        discount * arrival[scenario_index, horizon, task_index]
+                    )
+    if not float(np.sum(demand)) > 1.0e-12:
+        rho_hat = np.asarray(origin_scenario.get("rho_hat"), dtype=np.float64)
+        if rho_hat.ndim == 2 and rho_hat.shape[-1] == int(num_services):
+            popularity = np.mean(rho_hat, axis=0)
+        elif rho_hat.ndim == 3 and rho_hat.shape[-1] == int(num_services):
+            popularity = np.mean(rho_hat, axis=tuple(range(rho_hat.ndim - 1)))
+        else:
+            popularity = np.full(int(num_services), 1.0 / max(int(num_services), 1))
+        demand[:] = 0.0
+        fallback_indices = task_to_vehicle or list(range(vehicles))
+        demand[:, :, fallback_indices, :] = popularity.reshape(1, 1, 1, -1) / max(
+            len(fallback_indices), 1
+        )
+    return np.mean(demand, axis=0)
+
+
+def predicted_vehicle_service_demand(
+    origin_scenario: dict[str, Any],
+    num_services: int,
+    beta_discount: float = 1.0,
+) -> np.ndarray:
+    """Return discounted predicted demand per vehicle/service, averaged over S."""
+
+    by_horizon = predicted_vehicle_service_demand_by_horizon(
+        origin_scenario,
+        num_services,
+        beta_discount=beta_discount,
+    )
+    return np.sum(by_horizon, axis=0)
+
+
+def node_specific_predicted_demand(
+    origin_scenario: dict[str, Any],
+    node_index: int,
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+) -> np.ndarray:
+    """Estimate ``D_pred[m,f]`` using predicted vehicles serviceable by node m."""
+
+    num_services = int(origin_scenario["rho_hat"].shape[-1])
+    arrival = np.asarray(origin_scenario["arrival"], dtype=np.float64)
+    positions = np.asarray(origin_scenario["positions_xy"], dtype=np.float64)
+    scenarios, horizons, _ = [int(value) for value in arrival.shape]
+    vehicles = int(positions.shape[2])
+    demand = predicted_vehicle_service_demand_by_horizon(
+        origin_scenario,
+        num_services,
+        beta_discount=config.beta_discount,
+    )
+    # The helper above averages over scenarios.  Align the node geometry with
+    # that same scenario-averaged vehicle/horizon tensor.
+    vehicle_ids = [str(value) for value in origin_scenario["vehicle_ids"].tolist()]
+    role = str(cache_nodes["node_roles"][int(node_index)]).upper()
+    node_id = str(cache_nodes["node_ids"][int(node_index)])
+    node_vehicle_index = vehicle_ids.index(node_id) if role == "SV" else None
+    result = np.zeros(num_services, dtype=np.float64)
+    # ``demand`` is averaged over S already; use the mean predicted position at
+    # each horizon to avoid any realization leakage and keep proposal order
+    # independent of scenario iteration details.
+    mean_positions = np.mean(positions, axis=0)
+    for horizon in range(horizons):
+        if role == "SV":
+            node_xy = mean_positions[horizon, int(node_vehicle_index)]
+        else:
+            node_xy = np.asarray(
+                cache_nodes["fixed_positions"][node_id], dtype=np.float64
+            )
+        for vehicle_index in range(vehicles):
+            distance = float(
+                np.linalg.norm(mean_positions[horizon, vehicle_index] - node_xy)
+            )
+            weight = _serviceability_weight(distance, role, config)
+            if weight > 0.0:
+                result += weight * demand[horizon, vehicle_index]
+    if not np.all(np.isfinite(result)) or np.any(result < -1.0e-12):
+        raise FloatingPointError("node-specific predicted demand is invalid")
+    return np.maximum(result, 0.0).astype(np.float64)
+
+
+def observed_local_service_usage(
+    local_cache_state: dict[str, set[int]],
+    num_services: int,
+) -> np.ndarray:
+    """Return a transparent observed local-replica usage proxy.
+
+    The current environment does not expose a historical edge-node utility
+    decomposition before proposal time.  This statistic therefore uses only
+    observed vehicle-local replicas; it is a usage/availability proxy, not an
+    exact counterfactual gain and is never used in the reward or Exact-Q.
+    """
+
+    vehicle_count = max(len(local_cache_state), 1)
+    values = np.zeros(int(num_services), dtype=np.float64)
+    for services in local_cache_state.values():
+        for service in services:
+            service_index = int(service)
+            if 0 <= service_index < int(num_services):
+                values[service_index] += 1.0
+    return values / float(vehicle_count)
+
+
+@dataclass(frozen=True)
+class CacheTargetCandidate:
+    """One deterministic, feasible target cache configuration for one node."""
+
+    node_index: int
+    node_id: str
+    before_node_cache: np.ndarray
+    target_node_cache: np.ndarray
+    proposal_source: str
+
+
+def _greedy_target_configuration(
+    scores: np.ndarray,
+    service_sizes_mb: np.ndarray,
+    capacity_mb: float,
+) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
+    if scores.shape != sizes.shape or not np.all(np.isfinite(scores)):
+        raise ValueError("target proposal scores/service sizes are not aligned")
+    density = scores / np.maximum(sizes, 1.0e-12)
+    order = sorted(
+        range(len(scores)),
+        key=lambda index: (-float(density[index]), -float(scores[index]), int(index)),
+    )
+    target = np.zeros(len(scores), dtype=np.int8)
+    used = 0.0
+    for service in order:
+        size = float(sizes[service])
+        if size >= 0.0 and used + size <= float(capacity_mb) + 1.0e-9:
+            target[service] = 1
+            used += size
+    return target
+
+
+def enumerate_cache_target_configurations(
+    current_cache_state: np.ndarray,
+    node_index: int,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    origin_scenario: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
+    config: CacheOptimizationConfig,
+) -> list[CacheTargetCandidate]:
+    """Propose a bounded deterministic set of target cache configurations.
+
+    The proposal intentionally covers low-reconfiguration neighbors, a
+    node-specific demand target, a replica-aware alternative, and deterministic
+    intermediate targets.  Candidate labels describe proposal provenance only;
+    the policy action is always the target binary configuration itself.
+    """
+
+    current_cache = np.asarray(current_cache_state, dtype=np.int8)
+    validate_cache_shape_and_capacity(current_cache, service_catalog, cache_nodes)
+    index = int(node_index)
+    if index < 0 or index >= current_cache.shape[0]:
+        raise IndexError("cache target node_index 越界")
+    sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
+    before = current_cache[index].copy()
+    capacity = float(cache_nodes["capacities_mb"][index])
+    demand = node_specific_predicted_demand(origin_scenario, index, cache_nodes, config)
+    observed_usage = observed_local_service_usage(
+        local_cache_state,
+        int(service_catalog["num_services"]),
+    )
+    replica_counts = np.sum(current_cache, axis=0).astype(np.float64)
+    mean_demand = float(np.mean(demand)) if len(demand) else 0.0
+    prediction_target = _greedy_target_configuration(demand, sizes, capacity)
+    replica_scores = demand + (mean_demand + 1.0e-12) / (1.0 + replica_counts)
+    replica_target = _greedy_target_configuration(replica_scores, sizes, capacity)
+    source_targets: list[tuple[str, np.ndarray]] = []
+
+    # This generator is reused only as a target-neighborhood constructor.  The
+    # returned labels are intentionally discarded; no primitive type reaches
+    # the proposed policy or its feature tensor.
+    for _, target in generate_node_neighbors(before, sizes, capacity):
+        source_targets.append(("low_reconfiguration", np.asarray(target, dtype=np.int8)))
+    source_targets.append(("prediction", prediction_target))
+    source_targets.append(("replica_aware", replica_target))
+    for fraction in config.target_intermediate_fractions:
+        blended_scores = (
+            float(fraction) * demand
+            + (1.0 - float(fraction)) * (before.astype(np.float64) * (mean_demand + 1.0e-12))
+        )
+        source_targets.append(
+            (
+                "intermediate",
+                _greedy_target_configuration(blended_scores, sizes, capacity),
+            )
+        )
+
+    candidates: list[CacheTargetCandidate] = []
+    seen: set[bytes] = set()
+    for source, raw_target in source_targets:
+        target = np.asarray(raw_target, dtype=np.int8).reshape(-1)
+        if target.shape != before.shape or not np.all(np.isin(target, [0, 1])):
+            raise ValueError("target cache proposal must be binary and shape-aligned")
+        if np.array_equal(target, before) or not is_node_feasible(target, sizes, capacity):
+            continue
+        key = np.ascontiguousarray(target, dtype=np.int8).tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(
+            CacheTargetCandidate(
+                node_index=index,
+                node_id=str(cache_nodes["node_ids"][index]),
+                before_node_cache=before.copy(),
+                target_node_cache=target.copy(),
+                proposal_source=str(source),
+            )
+        )
+    if len(candidates) > int(config.target_candidate_capacity):
+        raise RuntimeError(
+            "target cache proposal exceeded configured engineering capacity: "
+            f"count={len(candidates)}, capacity={config.target_candidate_capacity}"
+        )
+    return candidates
+
+
+def apply_cache_target_configuration(
+    current_cache_state: np.ndarray,
+    node_index: int,
+    target_node_cache: np.ndarray,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate/apply a target cache configuration selected after UPDATE."""
+
+    current_cache = np.asarray(current_cache_state, dtype=np.int8)
+    validate_cache_shape_and_capacity(current_cache, service_catalog, cache_nodes)
+    index = int(node_index)
+    before = current_cache[index].copy()
+    target = np.asarray(target_node_cache, dtype=np.int8).reshape(-1)
+    if target.shape != before.shape or not np.all(np.isin(target, [0, 1])):
+        raise ValueError("target cache configuration must be binary and shape-aligned")
+    if np.array_equal(target, before):
+        raise ValueError("UPDATE target configuration must differ from KEEP state")
+    if not is_node_feasible(
+        target,
+        np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64),
+        float(cache_nodes["capacities_mb"][index]),
+    ):
+        raise ValueError("target cache configuration violates node capacity")
+    current_cache[index] = target
+    return {
+        "node_index": index,
+        "node_id": str(cache_nodes["node_ids"][index]),
+        "before_node_cache": before,
+        "target_node_cache": current_cache[index].copy(),
+        "actual_changed": True,
+        "conditional_action": "TARGET_CONFIGURATION",
+    }
 
 
 @dataclass(frozen=True)

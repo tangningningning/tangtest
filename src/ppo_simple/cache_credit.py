@@ -1,11 +1,11 @@
 """Exact node-specific Cache counterfactual credit for the proposed mainline.
 
 The helper deliberately owns no optimizer, reward, Matching, KKT, or system
-model logic.  It replays the production primitive transition with one Cache
-node replaced and uses the existing global critic only for the next-state
-bootstrap.  The operation head remains the production four-way
-``NO_CHANGE/ADD/DELETE/SWAP`` head; the proposed binary trigger view is the exact
-aggregation ``KEEP=NO_CHANGE`` and ``UPDATE={ADD,DELETE,SWAP}``.
+model logic.  It replays the production target-configuration transition with
+one Cache node replaced and uses the existing global critic only for the
+next-state bootstrap.  The proposed binary trigger view is KEEP versus UPDATE;
+UPDATE branches replace the node with one complete, feasible target cache
+configuration rather than an ADD/DELETE/SWAP primitive.
 """
 
 from __future__ import annotations
@@ -16,10 +16,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from decision import cache_configuration, slot_environment
+from decision import cache_configuration, slot_environment, uav_configuration
 
 from .primitive_control import (
     _cache_candidate_feature,
+    _cache_target_configuration_feature,
     _intermediate_observation,
 )
 from .rollout import _check_request_contract, _check_reward
@@ -54,10 +55,13 @@ def _replay_cache_prefix(transition: Any, target_index: int) -> tuple[np.ndarray
     action_map = _production_action_map(transition)
     for index in range(int(target_index)):
         working[index] = production_final[index]
-        if str(action_map[index].get("operation_type")) == "NO_CHANGE" and not np.array_equal(
+        is_keep = str(action_map[index].get("conditional_action", "")).upper() == "KEEP" or (
+            str(action_map[index].get("operation_type", "")).upper() == "NO_CHANGE"
+        )
+        if is_keep and not np.array_equal(
             working[index], previous_cache[index]
         ):
-            raise RuntimeError("production NO_CHANGE changed a Cache row")
+            raise RuntimeError("production KEEP changed a Cache row")
     return working, previous_cache
 
 
@@ -110,46 +114,58 @@ def _node_policy_state(
     context = trainer.context
     working_cache, previous_cache = _replay_cache_prefix(transition, node_index)
     current_uav = _position_dict(transition.previous_uav_positions)
+    proposal_cache_nodes = uav_configuration.cache_nodes_with_uav_positions(
+        context.cache_nodes,
+        current_uav,
+    )
     conditional_context = _intermediate_observation(
         working_cache,
         current_uav,
         step,
         context,
     )
-    all_candidates = cache_configuration.enumerate_cache_primitive_actions(
-        working_cache,
-        node_index,
-        context.service_catalog,
-        context.cache_nodes,
-    )
     if bool(getattr(trainer.policy, "true_binary_trigger", False)):
-        # The proposed mainline keeps the exact production enumerator but removes operation-type
-        # multiplicity from the high-level trigger.  ADD/DELETE/SWAP remain
-        # separate candidate metadata/features in one UPDATE conditional set.
-        update_candidates = [
-            candidate
-            for candidate in all_candidates
-            if str(candidate.operation_type) != "NO_CHANGE"
-        ]
+        # The proposed mainline enumerates complete target configurations.  No
+        # primitive operation label reaches the policy, replay, or candidate
+        # tensor; proposal_source is diagnostics-only provenance.
+        update_candidates = cache_configuration.enumerate_cache_target_configurations(
+            working_cache,
+            node_index,
+            context.service_catalog,
+            proposal_cache_nodes,
+            step.scenario_slice,
+            context.local_cache,
+            context.cache_cfg,
+        )
         action_map = _production_action_map(transition)
         sequential_triggers = np.zeros(
             len(context.action_spec.cache_node_ids), dtype=np.int8
         )
         for index in range(node_index):
-            if str(action_map[index].get("operation_type")) != "NO_CHANGE":
+            if str(action_map[index].get("conditional_action", "")).upper() != "KEEP":
                 sequential_triggers[index] = 1
         sequential_triggers[node_index] = 1
         if update_candidates:
+            node_demand = cache_configuration.node_specific_predicted_demand(
+                step.scenario_slice,
+                node_index,
+                proposal_cache_nodes,
+                context.cache_cfg,
+            )
+            observed_usage = cache_configuration.observed_local_service_usage(
+                context.local_cache,
+                int(context.service_catalog["num_services"]),
+            )
             unified_features = np.stack(
                 [
-                    _cache_candidate_feature(
+                    _cache_target_configuration_feature(
                         candidate,
                         working_cache,
                         previous_cache,
                         sequential_triggers,
-                        step.predicted_service_popularity,
+                        node_demand,
+                        observed_usage,
                         context,
-                        include_replica_awareness=True,
                     )
                     for candidate in update_candidates
                 ]
@@ -164,10 +180,7 @@ def _node_policy_state(
                 for feature in unified_features
             ]
             candidate_operations = np.asarray(
-                [
-                    OPERATION_ORDER.index(str(candidate.operation_type))
-                    for candidate in update_candidates
-                ],
+                np.zeros(len(update_candidates), dtype=np.int64),
                 dtype=np.int64,
             )
         else:
@@ -207,6 +220,12 @@ def _node_policy_state(
                 for name in OPERATION_ORDER[1:]
             },
         }
+    all_candidates = cache_configuration.enumerate_cache_primitive_actions(
+        working_cache,
+        node_index,
+        context.service_catalog,
+        context.cache_nodes,
+    )
     operation_mask = np.zeros(len(OPERATION_ORDER), dtype=bool)
     operation_mask[0] = True
     grouped_candidates: dict[str, list[Any]] = {
@@ -340,15 +359,13 @@ def _execute_cache_branch(
                     "head_index": int(index),
                     "candidate_count": 0,
                     "selected_index": None,
-                    "operation_type": "NO_CHANGE",
-                    "added_service_ids": [],
-                    "removed_service_ids": [],
+                    "conditional_action": "KEEP",
                     "actual_changed": False,
                 }
             else:
                 branch_triggers[index] = 1
                 final_cache[index] = np.asarray(
-                    candidate.after_node_cache, dtype=np.int8
+                    candidate.target_node_cache, dtype=np.int8
                 ).copy()
                 action = {
                     "head_type": "cache",
@@ -356,13 +373,15 @@ def _execute_cache_branch(
                     "head_index": int(index),
                     "candidate_count": -1,
                     "selected_index": None,
-                    "operation_type": str(candidate.operation_type),
-                    "added_service_ids": list(candidate.added_service_ids),
-                    "removed_service_ids": list(candidate.removed_service_ids),
+                    "conditional_action": "TARGET_CONFIGURATION",
+                    "target_cache": np.asarray(
+                        candidate.target_node_cache, dtype=np.int8
+                    ).astype(int).tolist(),
+                    "proposal_source": str(candidate.proposal_source),
                     "actual_changed": bool(
                         not np.array_equal(
                             candidate.before_node_cache,
-                            candidate.after_node_cache,
+                            candidate.target_node_cache,
                         )
                     ),
                 }
@@ -371,7 +390,7 @@ def _execute_cache_branch(
     production_uav_triggers = {
         str(key): int(value) for key, value in production_uav_triggers.items()
     }
-    configuration_override = slot_environment.build_policy_primitive_configuration(
+    configuration_override = slot_environment.build_policy_target_configuration(
         previous_cache,
         previous_uav,
         final_cache,
@@ -450,7 +469,7 @@ def _cache_branch_identity(
         )
     else:
         final_cache[int(node_index)] = np.asarray(
-            candidate.after_node_cache, dtype=np.int8
+            candidate.target_node_cache, dtype=np.int8
         )
     final_uav = tuple(
         sorted(
@@ -559,6 +578,12 @@ def compute_exact_node_specific_cache_credit(
     candidate_operation_indices = np.zeros(
         (sample_count, node_count, candidate_capacity), dtype=np.int64
     )
+    candidate_proposal_sources = np.full(
+        (sample_count, node_count, candidate_capacity), "", dtype=object
+    )
+    candidate_hamming_distances = np.full(
+        (sample_count, node_count, candidate_capacity), np.nan, dtype=np.float64
+    )
     candidate_features = np.zeros(
         (sample_count, node_count, candidate_capacity, feature_dim), dtype=np.float32
     )
@@ -663,6 +688,20 @@ def compute_exact_node_specific_cache_credit(
                 candidate_operation_indices[
                     sample_index, node_index, :candidate_count
                 ] = state["candidate_operations"]
+                candidate_proposal_sources[
+                    sample_index, node_index, :candidate_count
+                ] = [str(candidate.proposal_source) for candidate in candidates]
+                candidate_hamming_distances[
+                    sample_index, node_index, :candidate_count
+                ] = [
+                    float(
+                        np.count_nonzero(
+                            np.asarray(candidate.target_node_cache, dtype=np.int8)
+                            != np.asarray(candidate.before_node_cache, dtype=np.int8)
+                        )
+                    )
+                    for candidate in candidates
+                ]
                 candidate_features[
                     sample_index, node_index, :candidate_count
                 ] = np.stack(state["candidate_features"])
@@ -723,6 +762,8 @@ def compute_exact_node_specific_cache_credit(
         "candidate_probabilities": candidate_probabilities.astype(np.float32),
         "candidate_valid_mask": candidate_valid_mask,
         "candidate_operation_indices": candidate_operation_indices,
+        "candidate_proposal_sources": candidate_proposal_sources,
+        "candidate_hamming_distances": candidate_hamming_distances,
         "candidate_features": candidate_features,
         "candidate_q_update": candidate_q_update.astype(np.float32),
         "candidate_weighted_mean_residual": candidate_weighted_mean_residual.astype(

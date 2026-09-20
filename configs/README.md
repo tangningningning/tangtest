@@ -44,7 +44,7 @@ workflows; it is not the PPO mainline configuration.
 
 - `proposed_joint` — exact-Q listwise implementation gate passed; formal
   training is not yet completed.
-- `ablation_cache_only` — NOT YET FORMALLY TRAINED TO 222; cache-only
+- `ablation_cache_only` — NOT YET FORMALLY TRAINED TO 300; cache-only
   configuration and evaluator are available.
 - `ablation_joint_no_prediction` — NOT YET FORMALLY TRAINED; a Joint
   no-prediction configuration is intentionally not aliased to the existing

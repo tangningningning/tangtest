@@ -50,6 +50,10 @@ class PolicyEvaluation:
     # enumerate every legal MOVE candidate, including states whose sampled
     # operation was STAY.
     uav_candidate_log_probs_all: Any | None = None
+    # Full masked STAY/MOVE log-probabilities for every UAV head.  The
+    # proposed operation KL gate compares this categorical distribution on the
+    # complete rollout; it must not depend on the sampled operation only.
+    uav_operation_log_probs_all: Any | None = None
     cache_entropy: Any | None = None
     uav_entropy: Any | None = None
     # Exact per-Cache-node primitive log-probabilities.  These include the
@@ -1264,6 +1268,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         uav_feature_dim: int,
         num_cache_heads: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
+        num_uav_heads: int | None = None,
     ) -> None:
         super().__init__(
             observation_dim,
@@ -1272,10 +1277,19 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
             uav_feature_dim,
             num_cache_heads,
             hidden_sizes,
+            # The Cache-only parent does not consume this joint-head count.
         )
-        if int(uav_feature_dim) <= 16:
-            raise ValueError("uav_feature_dim must include at least one UAV head")
-        self.num_uav_heads = int(uav_feature_dim) - 16
+        if num_uav_heads is None:
+            if int(uav_feature_dim) <= 16:
+                raise ValueError("uav_feature_dim must include at least one UAV head")
+            # Historical primitive tensors encoded the UAV-head count as the
+            # residual width.  New target-position features also carry service
+            # vectors, so the explicit count is required for the proposed path.
+            self.num_uav_heads = int(uav_feature_dim) - 16
+        else:
+            self.num_uav_heads = int(num_uav_heads)
+            if self.num_uav_heads <= 0:
+                raise ValueError("num_uav_heads must be positive")
         self.uav_operation_head = nn.Linear(
             self.hidden_dim,
             self.num_uav_heads * len(self.uav_operation_order),
@@ -1536,30 +1550,8 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         if not bool(torch.all(candidate_valid).item()):
             raise ValueError("UAV candidate selected index is masked")
         candidate_active = operation_actions_t == 1
-        move_feature_slice = slice(1 + self.num_uav_heads, 3 + self.num_uav_heads)
-        selected_operation_features = candidate_features_t[
-            ..., move_feature_slice
-        ].gather(
-            -2,
-            candidate_selected_t.unsqueeze(-1).unsqueeze(-1).expand(
-                -1, -1, 1, 2
-            ),
-        ).squeeze(-2)
-        if bool(
-            torch.any(
-                candidate_active
-                & ~torch.all(
-                    selected_operation_features
-                    == torch.as_tensor(
-                        [0.0, 1.0],
-                        dtype=torch.float32,
-                        device=observations_t.device,
-                    ),
-                    dim=-1,
-                )
-            ).item()
-        ):
-            raise ValueError("MOVE operation requires a MOVE candidate")
+        # The proposed MOVE tensor contains only legal target positions; STAY
+        # is represented exclusively by the high-level operation head.
         candidate_contexts = operation_contexts_t.reshape(
             batch_size * head_count,
             observation_dim,
@@ -1599,6 +1591,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
             cache_log_prob=cache_evaluation.log_prob,
             uav_log_prob=operation_log_prob + candidate_log_prob,
             uav_operation_log_probs=uav_operation_log_probs,
+            uav_operation_log_probs_all=operation_distribution.logits,
             uav_candidate_log_probs=uav_candidate_log_probs,
             uav_candidate_log_probs_all=candidate_distribution.logits,
             cache_entropy=cache_evaluation.entropy,
@@ -1631,6 +1624,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
         uav_feature_dim: int,
         num_cache_heads: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
+        num_uav_heads: int | None = None,
     ) -> None:
         super().__init__(
             observation_dim,
@@ -1639,6 +1633,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
             uav_feature_dim,
             num_cache_heads,
             hidden_sizes,
+            num_uav_heads=num_uav_heads,
         )
         original_encoder = self.encoder
         self.cache_encoder = deepcopy(original_encoder)
@@ -1735,14 +1730,21 @@ class AdaptiveJointCacheUAVPPOActorCritic(
 
     The production mainline uses a real two-logit ``KEEP/UPDATE`` head while
     retaining the existing decoupled Cache/UAV encoders, critic, candidate
-    scorers, and UAV operation path.  Operation type remains metadata in the
-    unified UPDATE candidate feature, never a second high-level probability.
+    scorers, and STAY/MOVE trigger path.  UPDATE/MOVE candidates are complete
+    target configurations/positions; proposal provenance is metadata only and
+    never a second high-level operation probability.
     """
 
     architecture_id = "adaptive_joint_cache_uav_ppo"
     architecture_version = 1
     trigger_order = ("KEEP", "UPDATE")
     true_binary_trigger = True
+
+    def _candidate_operation_slice(self, candidate_kind: str) -> slice | None:
+        # Proposed candidates are complete target configurations/positions;
+        # there is no ADD/DELETE/SWAP or polar-operation group to rebalance.
+        del candidate_kind
+        return None
 
     def __init__(
         self,
@@ -1752,6 +1754,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         uav_feature_dim: int,
         num_cache_heads: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
+        num_uav_heads: int | None = None,
     ) -> None:
         # Bypass the four-way historical operation head so the proposed
         # state_dict contains only the binary Cache trigger.
@@ -1763,6 +1766,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             uav_feature_dim,
             num_cache_heads,
             hidden_sizes,
+            num_uav_heads=num_uav_heads,
         )
         del self.cache_operation_head
         self.cache_trigger_head = nn.Linear(
@@ -1888,7 +1892,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         candidate_features: Any,
         deterministic: bool = False,
     ) -> CandidatePolicySample:
-        """Sample from the one unified legal ADD/DELETE/SWAP set."""
+        """Sample from the one unified legal target-configuration set."""
 
         scores, single = self._candidate_scores(
             observation,

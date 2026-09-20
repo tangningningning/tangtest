@@ -44,6 +44,10 @@ class UavSearchConfig:
     refine_rounds: int
     refine_num_angles: int
     refine_radius_shrink: float
+    exploration_num_angles: int
+    exploration_radius_fractions: tuple[float, ...]
+    demand_anchor_scales: tuple[float, ...]
+    target_candidate_capacity: int
     max_coordinate_rounds: int
     position_tolerance_m: float
     objective_tolerance: float
@@ -95,6 +99,28 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         refine_rounds=int(get(config, "algorithm.uav.refine_rounds")),
         refine_num_angles=int(get(config, "algorithm.uav.refine_num_angles")),
         refine_radius_shrink=float(get(config, "algorithm.uav.refine_radius_shrink")),
+        exploration_num_angles=int(
+            get(config, "algorithm.uav.exploration_num_angles", 8)
+        ),
+        exploration_radius_fractions=tuple(
+            float(value)
+            for value in get(
+                config,
+                "algorithm.uav.exploration_radius_fractions",
+                [0.5, 1.0],
+            )
+        ),
+        demand_anchor_scales=tuple(
+            float(value)
+            for value in get(
+                config,
+                "algorithm.uav.demand_anchor_scales",
+                [0.5, 1.0],
+            )
+        ),
+        target_candidate_capacity=int(
+            get(config, "algorithm.uav.target_candidate_capacity", 24)
+        ),
         max_coordinate_rounds=int(get(config, "algorithm.uav.max_coordinate_rounds")),
         position_tolerance_m=float(get(config, "algorithm.uav.position_tolerance_m")),
         objective_tolerance=float(get(config, "algorithm.uav.objective_tolerance")),
@@ -359,6 +385,212 @@ def coordinate_candidates(
         radius *= search_config.refine_radius_shrink
         candidates.extend(_polar_candidates(current_xy, [radius], search_config.refine_num_angles))
     return candidates
+
+
+@dataclass(frozen=True)
+class UavTargetCandidate:
+    """One deterministic feasible MOVE target supplied to the policy."""
+
+    uav_id: str
+    before_position: np.ndarray
+    target_position: np.ndarray
+    proposal_source: str
+
+
+def _project_target_to_move_ball(
+    old_xy: np.ndarray,
+    target_xy: np.ndarray,
+    max_move_distance_m: float,
+) -> np.ndarray:
+    old = np.asarray(old_xy, dtype=np.float64).reshape(2)
+    target = np.asarray(target_xy, dtype=np.float64).reshape(2)
+    delta = target - old
+    distance = float(np.linalg.norm(delta))
+    if distance <= float(max_move_distance_m):
+        return target.copy()
+    if distance <= 1.0e-12:
+        return old.copy()
+    return old + delta * (float(max_move_distance_m) / distance)
+
+
+def _service_aware_uav_demand_weights(
+    scenario_slice: dict[str, Any],
+    cache_state: np.ndarray,
+    cache_nodes: dict[str, Any],
+    uav_id: str,
+    beta_discount: float = 1.0,
+) -> tuple[tuple[str, ...], np.ndarray]:
+    service_count = int(np.asarray(cache_state).shape[1])
+    vehicle_ids = tuple(str(value) for value in scenario_slice["vehicle_ids"].tolist())
+    demand = cache_configuration.predicted_vehicle_service_demand(
+        scenario_slice,
+        service_count,
+        beta_discount=float(beta_discount),
+    )
+    node_ids = [str(value) for value in cache_nodes["node_ids"]]
+    if str(uav_id) not in node_ids:
+        raise KeyError(f"UAV cache node not found for demand-aware proposal: {uav_id}")
+    node_index = node_ids.index(str(uav_id))
+    cache_vector = np.asarray(cache_state[node_index], dtype=np.float64)
+    weights = np.asarray(demand @ cache_vector, dtype=np.float64)
+    if weights.shape != (len(vehicle_ids),) or not np.all(np.isfinite(weights)):
+        raise FloatingPointError("service-aware UAV vehicle weights are invalid")
+    return vehicle_ids, np.maximum(weights, 0.0)
+
+
+def enumerate_uav_target_candidates(
+    current_uav_positions: dict[str, Any],
+    previous_uav_positions: dict[str, Any],
+    uav_id: str,
+    uav_triggers: dict[str, int],
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+    *,
+    scenario_slice: dict[str, Any],
+    cache_state: np.ndarray,
+    cache_nodes: dict[str, Any],
+    predicted_vehicle_positions: dict[str, Any],
+) -> list[UavTargetCandidate]:
+    """Return demand-aware MOVE targets plus a small deterministic geometry set.
+
+    The candidate set excludes STAY; STAY remains exclusively the high-level
+    operation head.  Every returned point is checked against the existing
+    boundary, one-slot displacement, and sequential multi-UAV safety rules.
+    """
+
+    uav_ids = uav_ids_from_project(project_cfg)
+    current = _as_position_dict(current_uav_positions, uav_ids)
+    previous = _as_position_dict(previous_uav_positions, uav_ids)
+    triggers = _trigger_dict(uav_triggers, uav_ids)
+    target_id = str(uav_id)
+    if target_id not in current:
+        raise KeyError(f"未知 UAV ID：{target_id}")
+    if triggers[target_id] != 1:
+        raise ValueError("只有 MOVE trigger=1 的 UAV 才枚举 target positions")
+    search_config = uav_search_config_from_project(project_cfg)
+    before = current[target_id].copy()
+    vehicle_ids, vehicle_weights = _service_aware_uav_demand_weights(
+        scenario_slice,
+        cache_state,
+        cache_nodes,
+        target_id,
+        beta_discount=float(
+            project_config.get_config_value(project_cfg, "cache.discount_beta", 1.0)
+        ),
+    )
+    ordered_positions = np.asarray(
+        [predicted_vehicle_positions[vehicle_id] for vehicle_id in vehicle_ids],
+        dtype=np.float64,
+    )
+    if ordered_positions.shape != (len(vehicle_ids), 2) or not np.all(
+        np.isfinite(ordered_positions)
+    ):
+        raise ValueError("predicted_vehicle_positions must be finite and aligned")
+    total_weight = float(np.sum(vehicle_weights))
+    anchors: list[tuple[str, np.ndarray]] = []
+    if total_weight > 1.0e-12:
+        centroid = np.sum(
+            ordered_positions * vehicle_weights[:, None],
+            axis=0,
+        ) / total_weight
+        centroid = _project_target_to_move_ball(
+            before,
+            centroid,
+            search_config.max_move_distance_m,
+        )
+        anchors.append(("demand_centroid", centroid))
+        for scale in search_config.demand_anchor_scales:
+            if not math.isfinite(float(scale)) or float(scale) <= 0.0:
+                continue
+            projected = before + float(scale) * (centroid - before)
+            anchors.append(("projected_demand", projected))
+
+    exploration_radii = [
+        float(fraction) * search_config.max_move_distance_m
+        for fraction in search_config.exploration_radius_fractions
+        if math.isfinite(float(fraction)) and float(fraction) > 0.0
+    ]
+    raw_candidates: list[tuple[str, np.ndarray]] = anchors
+    raw_candidates.extend(
+        (
+            "geometry_exploration",
+            candidate,
+        )
+        for candidate in _polar_candidates(
+            before,
+            exploration_radii,
+            search_config.exploration_num_angles,
+        )
+    )
+    candidates: list[UavTargetCandidate] = []
+    seen: set[bytes] = set()
+    for source, raw_candidate in raw_candidates:
+        candidate = np.asarray(raw_candidate, dtype=np.float64).reshape(-1)
+        if candidate.shape != (2,) or not np.all(np.isfinite(candidate)):
+            continue
+        if _same_position(candidate, before, search_config.position_tolerance_m):
+            continue
+        trial = {key: xy.copy() for key, xy in current.items()}
+        trial[target_id] = candidate.copy()
+        if not _candidate_is_feasible(
+            target_id,
+            candidate,
+            previous,
+            trial,
+            triggers,
+            flight_boundary,
+            search_config,
+        ):
+            continue
+        key = np.ascontiguousarray(candidate, dtype=np.float64).tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(
+            UavTargetCandidate(
+                uav_id=target_id,
+                before_position=before.copy(),
+                target_position=candidate.copy(),
+                proposal_source=str(source),
+            )
+        )
+    if len(candidates) > int(search_config.target_candidate_capacity):
+        raise RuntimeError(
+            "UAV target proposal exceeded configured engineering capacity: "
+            f"count={len(candidates)}, capacity={search_config.target_candidate_capacity}"
+        )
+    return candidates
+
+
+def apply_uav_target_position(
+    current_uav_positions: dict[str, np.ndarray],
+    previous_uav_positions: dict[str, Any],
+    uav_id: str,
+    target_position: np.ndarray,
+    uav_triggers: dict[str, int],
+    project_cfg: dict[str, Any],
+    flight_boundary: tuple[float, float, float, float],
+) -> dict[str, Any]:
+    """Validate/apply a policy-selected MOVE target position."""
+
+    target = np.asarray(target_position, dtype=np.float64).reshape(-1)
+    current = _as_position_dict(current_uav_positions, uav_ids_from_project(project_cfg))
+    before = current[str(uav_id)].copy()
+    search_config = uav_search_config_from_project(project_cfg)
+    if _same_position(target, before, search_config.position_tolerance_m):
+        raise ValueError("MOVE target position must differ from current position")
+    applied = apply_uav_candidate(
+        current_uav_positions,
+        previous_uav_positions,
+        uav_id,
+        target,
+        uav_triggers,
+        project_cfg,
+        flight_boundary,
+    )
+    applied["conditional_action"] = "TARGET_POSITION"
+    applied["target_position"] = np.asarray(applied["after_position"], dtype=np.float64).copy()
+    return applied
 
 
 @dataclass(frozen=True)

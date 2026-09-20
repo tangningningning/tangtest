@@ -1,14 +1,27 @@
-# Training entrypoint
+# Training entrypoints
 
-The PPO implementation remains in `src/ppo_simple/trainer.py` and is exposed
-as `ppo-train` by `pyproject.toml`.  This directory is reserved for training
-orchestration wrappers; no second training implementation is maintained here.
+The PPO implementation remains in `src/ppo_simple/trainer.py`; these files are
+only thin orchestration wrappers. They read the formal 300-realization protocol
+from `configs/experiment_registry.toml`, use the same
+`configs/proposed/system_config.toml`, and call the same `ppo_simple.trainer`.
 
-The current mainline entry is:
+The two entries are actor-learning-rate sensitivity runs of the same
+`proposed_joint` experiment, not new algorithms, versions, or configurations:
 
 ```text
-ppo-train --config configs/proposed/system_config.toml
+python scripts/training/run_proposed_actor_lr_3e_minus_3.py
+python scripts/training/run_proposed_actor_lr_3e_minus_4.py
 ```
 
-The proposed joint exact-Q listwise candidate implementation gate has passed;
-formal training is not run by the mainline consolidation task.
+They use independent run directories:
+
+```text
+runs/proposed_joint_actor_lr_3e_minus_3
+runs/proposed_joint_actor_lr_3e_minus_4
+```
+
+Only the actor learning rate differs. Both retain the configured critic
+learning rate, the formal realization sequence `20001..20300`, the existing
+Cache/UAV action schema, Exact-Q listwise candidate objective, and UAV KL
+protection. Use `--resume` only with the matching run directory; checkpoint
+metadata rejects cross-LR resume.

@@ -101,9 +101,9 @@ def validate_registry(
         "protocol.metrics",
         errors,
     )
-    _check_exact(training.get("epochs"), 222, "protocol.training.epochs", errors)
+    _check_exact(training.get("epochs"), 300, "protocol.training.epochs", errors)
     _check_exact(training.get("seed_start"), 20001, "protocol.training.seed_start", errors)
-    _check_exact(training.get("seed_end"), 20222, "protocol.training.seed_end", errors)
+    _check_exact(training.get("seed_end"), 20300, "protocol.training.seed_end", errors)
     _check_exact(
         tuple(training.get("learning_method_ids", ())),
         LEARNING_METHOD_IDS,

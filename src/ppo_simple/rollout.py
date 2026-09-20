@@ -251,10 +251,10 @@ def collect_rollout(
         selection_started_at = time.perf_counter()
         cache_primitive: Any | None = None
         joint_primitive: Any | None = None
-        if context.configuration_control_mode == "policy_primitive_joint_cache_uav_operation":
+        if context.configuration_control_mode == "adaptive_joint_cache_uav_reconfiguration":
             if not isinstance(policy, AdaptiveJointCacheUAVPPOActorCritic):
                 raise TypeError(
-                    "policy_primitive_joint_cache_uav_operation requires the proposed joint policy"
+                    "adaptive_joint_cache_uav_reconfiguration requires the proposed joint policy"
                 )
             if action_transform is not None:
                 raise ValueError("proposed joint rollout does not support action_transform")
@@ -271,7 +271,6 @@ def collect_rollout(
                 context,
                 tensor_spec,
                 deterministic=bool(deterministic),
-                binary_cache_trigger=True,
             )
             sample = PolicySample(
                 action=np.asarray(joint_primitive.derived_action, dtype=np.int8),
@@ -450,7 +449,7 @@ def collect_rollout(
         uav_operation_logit_margins: np.ndarray | None = None
         total_log_prob = sample.log_prob
         configuration_override = None
-        if context.configuration_control_mode == "policy_primitive_joint_cache_uav_operation":
+        if context.configuration_control_mode == "adaptive_joint_cache_uav_reconfiguration":
             if joint_primitive is None:
                 raise RuntimeError("proposed joint primitive selection was not produced")
             cache_triggers, uav_triggers = context.action_spec.action_vector_to_triggers(
@@ -481,7 +480,7 @@ def collect_rollout(
             uav_operation_entropies = joint_primitive.uav_operation_entropies
             uav_operation_probabilities = joint_primitive.uav_operation_probabilities
             uav_operation_logit_margins = joint_primitive.uav_operation_logit_margins
-            configuration_override = slot_environment.build_policy_primitive_configuration(
+            configuration_override = slot_environment.build_policy_target_configuration(
                 previous_cache,
                 previous_uav,
                 joint_primitive.final_cache_state,
@@ -514,7 +513,7 @@ def collect_rollout(
             cache_operation_masks = cache_primitive.operation_masks
             cache_operation_log_probs = cache_primitive.operation_old_log_probs
             cache_operation_entropies = cache_primitive.operation_entropies
-            configuration_override = slot_environment.build_policy_primitive_configuration(
+            configuration_override = slot_environment.build_policy_target_configuration(
                 previous_cache,
                 previous_uav,
                 cache_primitive.final_cache_state,
@@ -560,7 +559,7 @@ def collect_rollout(
             uav_conditional_actions = primitive.uav_conditional_actions
             cache_candidate_counts = primitive.cache_candidate_counts
             uav_candidate_counts = primitive.uav_candidate_counts
-            configuration_override = slot_environment.build_policy_primitive_configuration(
+            configuration_override = slot_environment.build_policy_target_configuration(
                 previous_cache,
                 previous_uav,
                 primitive.final_cache_state,

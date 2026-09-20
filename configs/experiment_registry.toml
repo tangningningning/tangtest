@@ -7,9 +7,9 @@ registry_version = 1
 final_test_executed = false
 
 [protocol.training]
-epochs = 222
+epochs = 300
 seed_start = 20001
-seed_end = 20222
+seed_end = 20300
 learning_method_ids = [
     "proposed_joint",
     "ablation_cache_only",
@@ -72,7 +72,7 @@ notes = "The exact-Q listwise candidate implementation gate passed. Cache KEEP/U
 
 [methods.ablation_cache_only]
 category = "ablation"
-status = "NOT_YET_FORMALLY_TRAINED_TO_222"
+status = "NOT_YET_FORMALLY_TRAINED_TO_300"
 prediction = true
 adaptive_cache = true
 adaptive_uav = false
@@ -85,7 +85,7 @@ config = "configs/baselines/replica_aware_cache_only.toml"
 checkpoint = ""
 training_entrypoint = "ppo-train"
 evaluation_entrypoint = "scripts/evaluation/evaluate_replica_aware_cache_only_episode_pool.py"
-notes = "Replica-aware cache-only configuration is available; no formal epoch-222 checkpoint is assigned."
+notes = "Replica-aware cache-only configuration is available; no formal epoch-300 checkpoint is assigned."
 
 [methods.ablation_joint_no_prediction]
 category = "ablation"

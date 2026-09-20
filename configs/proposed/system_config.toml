@@ -459,23 +459,39 @@ residual_bank_path = "data/calibration/residual_blocks.npz"
 gru_checkpoint_path = "data/generated/popularity_gru.pt"
 
 [algorithm.cache]
-# 当前 cache 模块启用，并使用 knapsack initialization + Add/Delete/Swap local search。
+# Cache reconfiguration proposal for the proposed joint policy.  The policy
+# sees bounded, deterministic target cache configurations; ADD/DELETE/SWAP are
+# only possible physical differences between two binary configurations, never
+# candidate action types.
 enabled = true
 method = "knapsack_local_search"
 max_coordinate_rounds = 20
 tolerance = 1.0e-9
+# Engineering tensor-width cap for target proposals.  It is configurable and
+# intentionally not claimed optimal; train/dev candidate recall should be used
+# to calibrate it before any long training.
+target_candidate_capacity = 64
+# Fractions used to create deterministic current-to-demand intermediate targets.
+target_intermediate_fractions = [0.25, 0.5, 0.75]
 
 [algorithm.uav]
-# Trigger-conditioned UAV 位置配置优化。本模块只解决 WHERE，不决定 WHEN。
+# Trigger-conditioned UAV target-position proposal/optimization.  This module
+# only supplies WHERE; STAY/MOVE remains the learned WHEN decision.
 # Trigger z_u^q(t) 由未来 PPO 外部给定；这里不实现 trigger policy。
 enabled = true
-method = "coarse_to_fine_coordinate"
+method = "demand_aware_target_position"
 # 以下均为算法超参数，不是物理系统参数，不加入 FORMAL_SYSTEM_PARAMETER_KEYS。
 coarse_num_angles = 16
 coarse_radius_fractions = [0.25, 0.5, 0.75, 1.0]
 refine_rounds = 2
 refine_num_angles = 12
 refine_radius_shrink = 0.5
+# Small geometry fallback used beside demand-aware anchors.  These values are
+# proposal controls, not physical movement limits.
+exploration_num_angles = 8
+exploration_radius_fractions = [0.5, 1.0]
+demand_anchor_scales = [0.5, 1.0]
+target_candidate_capacity = 24
 max_coordinate_rounds = 10
 position_tolerance_m = 1.0e-6
 objective_tolerance = 1.0e-9
@@ -513,13 +529,13 @@ objective_tolerance = 1.0e-9
 # Standard PPO v2 training path for binary Cache/UAV requests.
 enabled = true
 method = "ppo_simple_v2"
-# legacy_exact keeps the K=100 iterative reference path. policy_primitive uses
-# one primitive per trigger. v2 appends one normalized finite-horizon time-to-go
+# legacy_exact keeps the K=100 iterative reference path. Legacy policy_primitive
+# modes remain only for preserved baselines. v2 appends one normalized finite-horizon time-to-go
 # state feature; v1 remains available only for its preserved baseline checkpoint.
-configuration_control_mode = "policy_primitive_joint_cache_uav_operation"
+configuration_control_mode = "adaptive_joint_cache_uav_reconfiguration"
 # Proposed joint mainline: exact per-UAV counterfactual operation credit and
 # exact node-specific Cache credit are consumed by the production PPO trainer.
-# Cache trigger/operation, critic, GAE, reward, and movement semantics stay frozen.
+# Cache trigger/target selection, critic, GAE, reward, and movement semantics stay frozen.
 policy_schema = "adaptive_joint_cache_uav_ppo"
 kl_gate_mode = "branch_specific"
 hidden_sizes = [128, 128]
@@ -528,7 +544,7 @@ gamma = 1.0
 gae_lambda = 0.95
 clip_epsilon = 0.2
 learning_rate = 3.0e-4
-actor_learning_rate = 6.0e-4
+actor_learning_rate = 3.0e-4
 critic_learning_rate = 3.0e-4
 value_loss_coefficient = 0.01
 entropy_coefficient = 0.0
@@ -545,8 +561,9 @@ minibatch_size = 30
 advantage_normalization_mode = "centered_std"
 operation_advantage_normalization_mode = "fixed_reference_scale"
 operation_advantage_reference_scale = 0.02
-# Exact conditional candidate Q is consumed by the listwise candidate teacher;
-# trigger and operation heads retain their existing PPO objectives.
+# Exact conditional candidate Q is consumed by the unchanged listwise
+# candidate teacher; the proposed operation head instead consumes the full
+# STAY/MOVE Exact-Q teacher KL and remains independently KL-gated.
 uav_candidate_advantage_source = "EXACT_CONDITIONAL_COUNTERFACTUAL_Q"
 candidate_advantage_normalization = "NONE"
 cache_trigger_advantage_source = "EXACT_NODE_COUNTERFACTUAL_Q"
