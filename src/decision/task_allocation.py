@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -60,12 +61,17 @@ class TransferExchangeMatchingResult:
     kkt_cache_requests: int
     kkt_cache_hits: int
     kkt_cache_misses: int
+    kkt_solver_calls: int
     stop_reason: str
     transfer_exchange_stable: bool
     stable_check_passed: bool
     max_remaining_delta: float
     history: list[dict[str, Any]]
     feasible_targets: dict[str, list[str]]
+    node_eval_cache_requests: int = 0
+    node_eval_cache_hits: int = 0
+    node_eval_cache_misses: int = 0
+    node_eval_full_executions: int = 0
 
 
 def local_target(task_id: str) -> str:
@@ -171,6 +177,7 @@ def evaluate_matching_candidate(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     kkt_cache: KKTResourceAllocationCache | None = None,
+    node_evaluation_cache: NodeEvaluationCache | None = None,
 ) -> KKTMatchingEvaluation:
     """薄 adapter：Matching层 LOCAL:v -> KKT层 LOCAL。"""
 
@@ -183,6 +190,7 @@ def evaluate_matching_candidate(
         cache_nodes,
         cache_config,
         kkt_cache=kkt_cache,
+        node_evaluation_cache=node_evaluation_cache,
     )
 
 
@@ -271,6 +279,7 @@ def enumerate_best_operation(
     evaluate_only: bool = False,
     evaluation_mode: str = "incremental",
     kkt_cache: KKTResourceAllocationCache | None = None,
+    node_evaluation_cache: NodeEvaluationCache | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
     """枚举全部合法 transfer/exchange，返回本轮最大增益候选。
 
@@ -412,6 +421,7 @@ def enumerate_best_operation(
                 cache_nodes,
                 cache_config,
                 kkt_cache=kkt_cache,
+                node_evaluation_cache=node_evaluation_cache,
             )
         else:
             evaluation = evaluate_matching_candidate_incremental(
@@ -426,6 +436,7 @@ def enumerate_best_operation(
                 cache_nodes,
                 cache_config,
                 kkt_cache=kkt_cache,
+                node_evaluation_cache=node_evaluation_cache,
             )
         exact_records[int(metadata["original_index"])] = evaluation
         stats["candidate_evaluations_total"] += 1
@@ -551,11 +562,33 @@ def optimize_task_matching(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     evaluation_mode: str = "incremental",
+    kkt_cache: KKTResourceAllocationCache | None = None,
+    node_evaluation_cache: NodeEvaluationCache | None = None,
 ) -> TransferExchangeMatchingResult:
     """在当前 slot 的缓存和无线状态下执行稳定匹配。"""
 
     if evaluation_mode not in {"full", "incremental"}:
         raise ValueError(f"未知 Matching candidate evaluation mode：{evaluation_mode}")
+    requests_before = 0 if kkt_cache is None else int(kkt_cache.requests)
+    hits_before = 0 if kkt_cache is None else int(kkt_cache.hits)
+    misses_before = 0 if kkt_cache is None else int(kkt_cache.misses)
+    solver_calls_before = 0 if kkt_cache is None else int(kkt_cache.solver_calls)
+    node_requests_before = (
+        0 if node_evaluation_cache is None else int(node_evaluation_cache.requests)
+    )
+    node_hits_before = (
+        0 if node_evaluation_cache is None else int(node_evaluation_cache.hits)
+    )
+    node_misses_before = (
+        0 if node_evaluation_cache is None else int(node_evaluation_cache.misses)
+    )
+    node_full_executions_before = (
+        0
+        if node_evaluation_cache is None
+        else int(node_evaluation_cache.full_executions)
+    )
+    if kkt_cache is None:
+        kkt_cache = KKTResourceAllocationCache()
     max_updates, tolerance = _matching_config(project_cfg)
     tasks = sorted(tasks, key=lambda task: _stable_id_key(task.task_id))
     if not tasks:
@@ -583,9 +616,10 @@ def optimize_task_matching(
             transfer_upper_bound_pruned=0,
             exchange_upper_bound_pruned=0,
             full_evaluator_calls=0,
-            kkt_cache_requests=0,
-            kkt_cache_hits=0,
-            kkt_cache_misses=0,
+            kkt_cache_requests=int(kkt_cache.requests) - requests_before,
+            kkt_cache_hits=int(kkt_cache.hits) - hits_before,
+            kkt_cache_misses=int(kkt_cache.misses) - misses_before,
+            kkt_solver_calls=int(kkt_cache.solver_calls) - solver_calls_before,
             stop_reason="no_tasks",
             transfer_exchange_stable=True,
             stable_check_passed=True,
@@ -607,7 +641,6 @@ def optimize_task_matching(
         task.task_id: feasible_targets[task.task_id][0]
         for task in tasks
     }
-    kkt_cache = KKTResourceAllocationCache()
     current_eval = evaluate_matching_candidate(
         tasks,
         current_matching,
@@ -617,6 +650,7 @@ def optimize_task_matching(
         cache_nodes,
         cache_config,
         kkt_cache=kkt_cache,
+        node_evaluation_cache=node_evaluation_cache,
     )
     if not current_eval.resource_feasible:
         raise AssertionError("Cloud门控后的初始matching应资源可行。")
@@ -654,6 +688,7 @@ def optimize_task_matching(
             tolerance,
             evaluation_mode=evaluation_mode,
             kkt_cache=kkt_cache,
+            node_evaluation_cache=node_evaluation_cache,
         )
         for key, value in stats.items():
             counters[key] += value
@@ -697,6 +732,7 @@ def optimize_task_matching(
             evaluate_only=True,
             evaluation_mode=evaluation_mode,
             kkt_cache=kkt_cache,
+            node_evaluation_cache=node_evaluation_cache,
         )
         # 复检也是候选评价的一部分，便于复杂度记录。
         for key, value in check_stats.items():
@@ -735,9 +771,31 @@ def optimize_task_matching(
         transfer_upper_bound_pruned=counters["transfer_upper_bound_pruned"],
         exchange_upper_bound_pruned=counters["exchange_upper_bound_pruned"],
         full_evaluator_calls=counters["full_evaluator_calls"],
-        kkt_cache_requests=int(kkt_cache.requests),
-        kkt_cache_hits=int(kkt_cache.hits),
-        kkt_cache_misses=int(kkt_cache.misses),
+        kkt_cache_requests=int(kkt_cache.requests) - requests_before,
+        kkt_cache_hits=int(kkt_cache.hits) - hits_before,
+        kkt_cache_misses=int(kkt_cache.misses) - misses_before,
+        kkt_solver_calls=int(kkt_cache.solver_calls) - solver_calls_before,
+        node_eval_cache_requests=(
+            int(node_evaluation_cache.requests) - node_requests_before
+            if node_evaluation_cache is not None
+            else 0
+        ),
+        node_eval_cache_hits=(
+            int(node_evaluation_cache.hits) - node_hits_before
+            if node_evaluation_cache is not None
+            else 0
+        ),
+        node_eval_cache_misses=(
+            int(node_evaluation_cache.misses) - node_misses_before
+            if node_evaluation_cache is not None
+            else 0
+        ),
+        node_eval_full_executions=(
+            int(node_evaluation_cache.full_executions)
+            - node_full_executions_before
+            if node_evaluation_cache is not None
+            else 0
+        ),
         stop_reason=stop_reason,
         transfer_exchange_stable=transfer_exchange_stable,
         stable_check_passed=stable_check_passed,
@@ -1081,6 +1139,10 @@ def _summary(result: TransferExchangeMatchingResult) -> dict[str, Any]:
         "kkt_cache_requests": result.kkt_cache_requests,
         "kkt_cache_hits": result.kkt_cache_hits,
         "kkt_cache_misses": result.kkt_cache_misses,
+        "KKT_CACHE_REQUEST_COUNT": result.kkt_cache_requests,
+        "KKT_CACHE_HIT_COUNT": result.kkt_cache_hits,
+        "KKT_CACHE_MISS_COUNT": result.kkt_cache_misses,
+        "KKT_SOLVER_CALL_COUNT": result.kkt_solver_calls,
         "stop_reason": result.stop_reason,
         "stable": result.transfer_exchange_stable,
         "stable_check_passed": result.stable_check_passed,
@@ -1174,13 +1236,22 @@ class KKTResourceAllocationResult:
     bandwidth_multipliers: dict[str, float]
 
 
+def _exact_position_key(node_position: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(node_position, dtype=np.float64).reshape(-1)
+    if values.shape != (2,):
+        raise ValueError("KKT cache node position must contain exactly two values")
+    return float(values[0]), float(values[1])
+
+
 def _kkt_node_cache_key(
     node_id: str,
     node_tasks: list[Task],
-) -> tuple[str, tuple[str, ...]]:
+    node_position: np.ndarray,
+) -> tuple[str, tuple[str, ...], tuple[float, float]]:
     return (
         str(node_id),
         tuple(sorted((str(task.task_id) for task in node_tasks), key=_stable_id_key)),
+        _exact_position_key(node_position),
     )
 
 
@@ -1188,20 +1259,24 @@ def _kkt_node_cache_key(
 class KKTResourceAllocationCache:
     """Exact node-level KKT cache scoped to one Matching optimization."""
 
-    entries: dict[tuple[str, tuple[str, ...]], KKTResourceAllocationResult] = field(
+    entries: dict[
+        tuple[str, tuple[str, ...], tuple[float, float]], KKTResourceAllocationResult
+    ] = field(
         default_factory=dict
     )
     requests: int = 0
     hits: int = 0
     misses: int = 0
+    solver_calls: int = 0
 
     def get_or_compute(
         self,
         node_id: str,
         node_tasks: list[Task],
+        node_position: np.ndarray,
         compute: Any,
     ) -> KKTResourceAllocationResult:
-        key = _kkt_node_cache_key(node_id, node_tasks)
+        key = _kkt_node_cache_key(node_id, node_tasks, node_position)
         self.requests += 1
         if key in self.entries:
             self.hits += 1
@@ -1226,6 +1301,59 @@ class KKTMatchingEvaluation:
     per_node_task_counts: dict[str, int]
     cpu_resource_sums: dict[str, float]
     bandwidth_resource_sums: dict[str, float]
+
+
+@dataclass
+class NodeEvaluationCache:
+    """Exact edge-node evaluation cache scoped to one transition."""
+
+    entries: dict[
+        tuple[str, tuple[str, ...], tuple[float, float]], KKTMatchingEvaluation
+    ] = field(default_factory=dict)
+    requests: int = 0
+    hits: int = 0
+    misses: int = 0
+    full_executions: int = 0
+    timing_profile: dict[str, float] | None = None
+
+    def get_or_compute(
+        self,
+        node_id: str,
+        node_tasks: list[Task],
+        node_position: np.ndarray,
+        compute: Any,
+    ) -> KKTMatchingEvaluation:
+        lookup_started_at = time.perf_counter() if self.timing_profile is not None else 0.0
+        key = _kkt_node_cache_key(node_id, node_tasks, node_position)
+        self.requests += 1
+        cached = self.entries.get(key)
+        if self.timing_profile is not None:
+            self.timing_profile["node_cache_lookup_runtime"] += (
+                time.perf_counter() - lookup_started_at
+            )
+        if cached is not None:
+            self.hits += 1
+            return cached
+        self.misses += 1
+        self.full_executions += 1
+        compute_started_at = (
+            time.perf_counter() if self.timing_profile is not None else 0.0
+        )
+        kkt_before = (
+            0.0
+            if self.timing_profile is None
+            else self.timing_profile["kkt_runtime"]
+        )
+        result = compute()
+        if self.timing_profile is not None:
+            compute_runtime = time.perf_counter() - compute_started_at
+            kkt_runtime = self.timing_profile["kkt_runtime"] - kkt_before
+            self.timing_profile["node_eval_miss_runtime"] += max(
+                compute_runtime - kkt_runtime,
+                0.0,
+            )
+        self.entries[key] = result
+        return result
 
 
 def kkt_config_from_project(config: dict[str, Any]) -> KKTConfig:
@@ -1562,6 +1690,7 @@ def allocate_resources_kkt(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     kkt_cache: KKTResourceAllocationCache | None = None,
+    timing_profile: dict[str, float] | None = None,
 ) -> KKTResourceAllocationResult:
     """给定 matching 后，只为 edge 节点分配 KKT 的 w/b。"""
 
@@ -1584,25 +1713,48 @@ def allocate_resources_kkt(
             if kkt_cfg.min_bandwidth_fraction * n > 1.0:
                 return KKTResourceAllocationResult(False, f"{node_id} bandwidth epsilon infeasible", {}, {}, {}, {}, {}, {})
             node_cpu = _node_cpu(role, cache_config)
+            coefficient_started_at = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
             cpu_coeff = [
                 cache_config.omega_t * task.cpu_cycles / (cache_config.time_ref_s * node_cpu)
                 for task in node_tasks
             ]
+            if timing_profile is not None:
+                timing_profile["kkt_coefficient_build_runtime"] += (
+                    time.perf_counter() - coefficient_started_at
+                )
+            if kkt_cache is not None:
+                kkt_cache.solver_calls += 1
+            solver_started_at = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
             cpu_values, mu, ok, reason = solve_kkt_fraction_allocation(
                 cpu_coeff,
                 kkt_cfg.min_cpu_fraction,
                 kkt_cfg.bisection_tolerance,
                 kkt_cfg.max_bisection_iterations,
             )
+            if timing_profile is not None:
+                timing_profile["kkt_solver_core_runtime"] += (
+                    time.perf_counter() - solver_started_at
+                )
             if not ok:
                 return KKTResourceAllocationResult(False, f"{node_id} CPU infeasible: {reason}", {}, {}, {}, {}, {}, {})
 
+            coefficient_started_at = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
             bw_coeff = []
             for task in node_tasks:
                 tv_xy = vehicle_positions[task.vehicle_id]
                 node_xy = service_node_positions[node_id]
                 base_rate = _base_rate(role, tv_xy, node_xy, cache_config)
                 if base_rate <= 0.0:
+                    if timing_profile is not None:
+                        timing_profile["kkt_coefficient_build_runtime"] += (
+                            time.perf_counter() - coefficient_started_at
+                        )
                     return KKTResourceAllocationResult(False, f"{node_id} base rate <= 0", {}, {}, {}, {}, {}, {})
                 # bandwidth_loss_coefficient = D/Rbar * (omega_T/T_ref + omega_E*p/E_ref)
                 bw_coeff.append(
@@ -1613,16 +1765,32 @@ def allocate_resources_kkt(
                         + cache_config.omega_e * cache_config.tx_power_w / cache_config.energy_ref_j
                     )
                 )
+            if timing_profile is not None:
+                timing_profile["kkt_coefficient_build_runtime"] += (
+                    time.perf_counter() - coefficient_started_at
+                )
+            if kkt_cache is not None:
+                kkt_cache.solver_calls += 1
+            solver_started_at = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
             bw_values, nu, ok, reason = solve_kkt_fraction_allocation(
                 bw_coeff,
                 kkt_cfg.min_bandwidth_fraction,
                 kkt_cfg.bisection_tolerance,
                 kkt_cfg.max_bisection_iterations,
             )
+            if timing_profile is not None:
+                timing_profile["kkt_solver_core_runtime"] += (
+                    time.perf_counter() - solver_started_at
+                )
             if not ok:
                 return KKTResourceAllocationResult(False, f"{node_id} bandwidth infeasible: {reason}", {}, {}, {}, {}, {}, {})
 
-            return KKTResourceAllocationResult(
+            result_assembly_started_at = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
+            result = KKTResourceAllocationResult(
                 True,
                 "",
                 {
@@ -1640,11 +1808,21 @@ def allocate_resources_kkt(
                 {node_id: float(mu)},
                 {node_id: float(nu)},
             )
+            if timing_profile is not None:
+                timing_profile["kkt_result_assembly_runtime"] += (
+                    time.perf_counter() - result_assembly_started_at
+                )
+            return result
 
         if kkt_cache is None:
             node_result = compute_node_result()
         else:
-            node_result = kkt_cache.get_or_compute(node_id, node_tasks, compute_node_result)
+            node_result = kkt_cache.get_or_compute(
+                node_id,
+                node_tasks,
+                service_node_positions[node_id],
+                compute_node_result,
+            )
         if not node_result.feasible:
             return node_result
         cpu_alloc.update(node_result.cpu_allocations)
@@ -1669,30 +1847,34 @@ def allocate_resources_kkt(
     )
 
 
-def evaluate_matching_with_kkt(
-    tasks: list[Task],
-    matching: dict[str, str],
+def _evaluate_edge_node(
+    node_id: str,
+    node_tasks: list[Task],
     vehicle_positions: dict[str, np.ndarray],
     service_node_positions: dict[str, np.ndarray],
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
-    kkt_cache: KKTResourceAllocationCache | None = None,
+    kkt_cache: KKTResourceAllocationCache | None,
+    timing_profile: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
-    """评价当前 slot 的 matching、KKT 资源、完成时延和车辆能耗。"""
+    """Evaluate one edge node after Matching fixes its complete task set."""
 
-    if not tasks:
-        return KKTMatchingEvaluation(True, "", 0.0, {}, {}, {}, {}, {}, {}, {}, {}, {})
+    node_matching = {task.task_id: node_id for task in node_tasks}
+    kkt_started_at = time.perf_counter() if timing_profile is not None else 0.0
     allocation = allocate_resources_kkt(
-        tasks,
-        matching,
+        node_tasks,
+        node_matching,
         vehicle_positions,
         service_node_positions,
         project_cfg,
         cache_nodes,
         cache_config,
         kkt_cache=kkt_cache,
+        timing_profile=timing_profile,
     )
+    if timing_profile is not None:
+        timing_profile["kkt_runtime"] += time.perf_counter() - kkt_started_at
     if not allocation.feasible:
         return KKTMatchingEvaluation(
             False,
@@ -1709,54 +1891,31 @@ def evaluate_matching_with_kkt(
             allocation.per_node_bandwidth_sum,
         )
 
+    role = _edge_node_role(node_id, cache_nodes)
+    assert role is not None
     per_delay: dict[str, float] = {}
     per_energy: dict[str, float] = {}
     per_utility: dict[str, float] = {}
     per_target: dict[str, str] = {}
-    counts: dict[str, int] = {}
     total_utility = 0.0
-    for task in tasks:
-        target = matching[task.task_id]
-        per_target[task.task_id] = target
-        counts[target] = counts.get(target, 0) + 1
-        if target == LOCAL:
-            result = system_model.local_execution(
-                task.cpu_cycles,
-                cache_config.local_cpu_cycles_per_s,
-                cache_config.local_energy_per_cycle_j,
-            )
-            delay = float(result["delay_s"])
-            energy = float(result["vehicle_energy_j"])
-        elif target == CLOUD:
-            result = system_model.cloud_execution(
-                task.input_bits,
-                task.cpu_cycles,
-                cache_config.cloud_total_bandwidth_bps,
-                cache_config.cloud_total_cpu_cycles_per_s,
-                cache_config.cloud_delay_factor,
-                cache_config.tx_power_w,
-            )
-            delay = float(result["total_delay_s"])
-            energy = float(result["vehicle_energy_j"])
-        else:
-            role = _edge_node_role(target, cache_nodes)
-            assert role is not None
-            tv_xy = vehicle_positions[task.vehicle_id]
-            node_xy = service_node_positions[target]
-            gain = _channel_gain(role, tv_xy, node_xy, cache_config)
-            edge = system_model.edge_execution(
-                task.input_bits,
-                task.cpu_cycles,
-                _node_bandwidth(role, cache_config),
-                allocation.bandwidth_allocations[target][task.task_id],
-                cache_config.tx_power_w,
-                gain,
-                cache_config.noise_power_w,
-                _node_cpu(role, cache_config),
-                allocation.cpu_allocations[target][task.task_id],
-            )
-            delay = float(edge["total_delay_s"])
-            energy = float(edge["vehicle_energy_j"])
+    for task in node_tasks:
+        per_target[task.task_id] = node_id
+        tv_xy = vehicle_positions[task.vehicle_id]
+        node_xy = service_node_positions[node_id]
+        gain = _channel_gain(role, tv_xy, node_xy, cache_config)
+        edge = system_model.edge_execution(
+            task.input_bits,
+            task.cpu_cycles,
+            _node_bandwidth(role, cache_config),
+            allocation.bandwidth_allocations[node_id][task.task_id],
+            cache_config.tx_power_w,
+            gain,
+            cache_config.noise_power_w,
+            _node_cpu(role, cache_config),
+            allocation.cpu_allocations[node_id][task.task_id],
+        )
+        delay = float(edge["total_delay_s"])
+        energy = float(edge["vehicle_energy_j"])
         utility = float(
             system_model.task_utility(
                 delay,
@@ -1782,9 +1941,166 @@ def evaluate_matching_with_kkt(
         per_energy,
         per_utility,
         per_target,
-        counts,
+        {node_id: len(node_tasks)},
         allocation.per_node_cpu_sum,
         allocation.per_node_bandwidth_sum,
+    )
+
+
+def evaluate_matching_with_kkt(
+    tasks: list[Task],
+    matching: dict[str, str],
+    vehicle_positions: dict[str, np.ndarray],
+    service_node_positions: dict[str, np.ndarray],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    kkt_cache: KKTResourceAllocationCache | None = None,
+    node_evaluation_cache: NodeEvaluationCache | None = None,
+) -> KKTMatchingEvaluation:
+    """评价当前 slot 的 matching、KKT 资源、完成时延和车辆能耗。"""
+
+    if not tasks:
+        return KKTMatchingEvaluation(True, "", 0.0, {}, {}, {}, {}, {}, {}, {}, {}, {})
+
+    timing_profile = (
+        node_evaluation_cache.timing_profile
+        if node_evaluation_cache is not None
+        else None
+    )
+    grouped_edge_tasks = _group_edge_tasks(tasks, matching, cache_nodes)
+    edge_evaluations: dict[str, KKTMatchingEvaluation] = {}
+    for node_id, node_tasks in grouped_edge_tasks.items():
+        if node_evaluation_cache is None:
+            node_evaluation = _evaluate_edge_node(
+                node_id,
+                node_tasks,
+                vehicle_positions,
+                service_node_positions,
+                project_cfg,
+                cache_nodes,
+                cache_config,
+                kkt_cache,
+                timing_profile,
+            )
+        else:
+            node_evaluation = node_evaluation_cache.get_or_compute(
+                node_id,
+                node_tasks,
+                service_node_positions[node_id],
+                lambda: _evaluate_edge_node(
+                    node_id,
+                    node_tasks,
+                    vehicle_positions,
+                    service_node_positions,
+                    project_cfg,
+                    cache_nodes,
+                    cache_config,
+                    kkt_cache,
+                    timing_profile,
+                ),
+            )
+        if not node_evaluation.resource_feasible:
+            return KKTMatchingEvaluation(
+                False,
+                node_evaluation.infeasible_reason,
+                node_evaluation.cpu_allocations,
+                node_evaluation.bandwidth_allocations,
+                float("-inf"),
+                {},
+                {},
+                {},
+                {},
+                {},
+                node_evaluation.cpu_resource_sums,
+                node_evaluation.bandwidth_resource_sums,
+            )
+        edge_evaluations[node_id] = node_evaluation
+
+    cpu_allocations: dict[str, dict[str, float]] = {}
+    bandwidth_allocations: dict[str, dict[str, float]] = {}
+    cpu_resource_sums: dict[str, float] = {}
+    bandwidth_resource_sums: dict[str, float] = {}
+    for node_evaluation in edge_evaluations.values():
+        cpu_allocations.update(node_evaluation.cpu_allocations)
+        bandwidth_allocations.update(node_evaluation.bandwidth_allocations)
+        cpu_resource_sums.update(node_evaluation.cpu_resource_sums)
+        bandwidth_resource_sums.update(node_evaluation.bandwidth_resource_sums)
+
+    per_delay: dict[str, float] = {}
+    per_energy: dict[str, float] = {}
+    per_utility: dict[str, float] = {}
+    per_target: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    total_utility = 0.0
+    for task in tasks:
+        target = matching[task.task_id]
+        per_target[task.task_id] = target
+        counts[target] = counts.get(target, 0) + 1
+        cached_node_evaluation = edge_evaluations.get(target)
+        if cached_node_evaluation is not None:
+            delay = cached_node_evaluation.per_task_delay_s[task.task_id]
+            energy = cached_node_evaluation.per_task_vehicle_energy_j[task.task_id]
+            utility = cached_node_evaluation.per_task_utility[task.task_id]
+        elif target == LOCAL:
+            result = system_model.local_execution(
+                task.cpu_cycles,
+                cache_config.local_cpu_cycles_per_s,
+                cache_config.local_energy_per_cycle_j,
+            )
+            delay = float(result["delay_s"])
+            energy = float(result["vehicle_energy_j"])
+            utility = float(
+                system_model.task_utility(
+                    delay,
+                    energy,
+                    cache_config.time_ref_s,
+                    cache_config.energy_ref_j,
+                    cache_config.omega_t,
+                    cache_config.omega_e,
+                )
+            )
+        elif target == CLOUD:
+            result = system_model.cloud_execution(
+                task.input_bits,
+                task.cpu_cycles,
+                cache_config.cloud_total_bandwidth_bps,
+                cache_config.cloud_total_cpu_cycles_per_s,
+                cache_config.cloud_delay_factor,
+                cache_config.tx_power_w,
+            )
+            delay = float(result["total_delay_s"])
+            energy = float(result["vehicle_energy_j"])
+            utility = float(
+                system_model.task_utility(
+                    delay,
+                    energy,
+                    cache_config.time_ref_s,
+                    cache_config.energy_ref_j,
+                    cache_config.omega_t,
+                    cache_config.omega_e,
+                )
+            )
+        else:  # pragma: no cover - edge targets are covered by grouped evaluation
+            raise AssertionError(f"missing edge node evaluation for target {target}")
+        per_delay[task.task_id] = delay
+        per_energy[task.task_id] = energy
+        per_utility[task.task_id] = utility
+        total_utility += utility
+
+    return KKTMatchingEvaluation(
+        True,
+        "",
+        float(total_utility),
+        cpu_allocations,
+        bandwidth_allocations,
+        per_delay,
+        per_energy,
+        per_utility,
+        per_target,
+        counts,
+        cpu_resource_sums,
+        bandwidth_resource_sums,
     )
 
 
@@ -1800,6 +2116,7 @@ def evaluate_matching_candidate_incremental(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     kkt_cache: KKTResourceAllocationCache | None = None,
+    node_evaluation_cache: NodeEvaluationCache | None = None,
 ) -> KKTMatchingEvaluation:
     """只重算 candidate 受影响 edge nodes，返回完整 KKT matching evaluation。"""
 
@@ -1872,6 +2189,7 @@ def evaluate_matching_candidate_incremental(
             cache_nodes,
             cache_config,
             kkt_cache=kkt_cache,
+            node_evaluation_cache=node_evaluation_cache,
         )
         if not node_evaluation.resource_feasible:
             return infeasible(
@@ -1905,6 +2223,7 @@ def evaluate_matching_candidate_incremental(
             cache_nodes,
             cache_config,
             kkt_cache=kkt_cache,
+            node_evaluation_cache=node_evaluation_cache,
         )
         if not non_edge_evaluation.resource_feasible:
             return infeasible(

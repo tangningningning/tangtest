@@ -84,6 +84,14 @@ def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) ->
         "kkt_cache_requests": result.kkt_cache_requests,
         "kkt_cache_hits": result.kkt_cache_hits,
         "kkt_cache_misses": result.kkt_cache_misses,
+        "KKT_CACHE_REQUEST_COUNT": result.kkt_cache_requests,
+        "KKT_CACHE_HIT_COUNT": result.kkt_cache_hits,
+        "KKT_CACHE_MISS_COUNT": result.kkt_cache_misses,
+        "KKT_SOLVER_CALL_COUNT": result.kkt_solver_calls,
+        "NODE_EVAL_CACHE_REQUEST_COUNT": result.node_eval_cache_requests,
+        "NODE_EVAL_CACHE_HIT_COUNT": result.node_eval_cache_hits,
+        "NODE_EVAL_CACHE_MISS_COUNT": result.node_eval_cache_misses,
+        "NODE_EVAL_FULL_EXECUTION_COUNT": result.node_eval_full_executions,
         "stop_reason": result.stop_reason,
         "transfer_exchange_stable": result.transfer_exchange_stable,
         "stable_check_passed": result.stable_check_passed,
@@ -208,6 +216,9 @@ def execute_slot(
     performance_profile: dict[str, Any] | None = None,
     configuration_profile: cache_configuration.ConfigurationEvaluationProfile | None = None,
     configuration_override: JointConfigurationResult | None = None,
+    matching_kkt_cache: task_allocation.KKTResourceAllocationCache | None = None,
+    node_evaluation_cache: task_allocation.NodeEvaluationCache | None = None,
+    exact_q_timing_profile: dict[str, float] | None = None,
 ) -> SlotExecutionResult:
     """Execute one slot from external trigger to actual system utility.
 
@@ -388,6 +399,21 @@ def execute_slot(
         actual_vehicle_positions,
         {uav_id: np.asarray(xy, dtype=np.float64) for uav_id, xy in final_uav.items()},
     )
+    exact_q_matching_started_at = (
+        time.perf_counter() if exact_q_timing_profile is not None else 0.0
+    )
+    exact_q_node_runtime_before = (
+        0.0
+        if exact_q_timing_profile is None
+        else sum(
+            float(exact_q_timing_profile.get(key, 0.0))
+            for key in (
+                "node_cache_lookup_runtime",
+                "node_eval_miss_runtime",
+                "kkt_runtime",
+            )
+        )
+    )
     matching = task_allocation.optimize_task_matching(
         actual_tasks,
         actual_vehicle_positions,
@@ -397,7 +423,23 @@ def execute_slot(
         project_cfg,
         cache_nodes,
         cache_config,
+        kkt_cache=matching_kkt_cache,
+        node_evaluation_cache=node_evaluation_cache,
     )
+    if exact_q_timing_profile is not None:
+        exact_q_matching_elapsed = time.perf_counter() - exact_q_matching_started_at
+        exact_q_node_elapsed = sum(
+            float(exact_q_timing_profile.get(key, 0.0))
+            for key in (
+                "node_cache_lookup_runtime",
+                "node_eval_miss_runtime",
+                "kkt_runtime",
+            )
+        ) - exact_q_node_runtime_before
+        exact_q_timing_profile["matching_runtime"] += max(
+            exact_q_matching_elapsed - exact_q_node_elapsed,
+            0.0,
+        )
     matching_kkt_seconds = (
         time.perf_counter() - matching_started_at
         if performance_profile is not None
@@ -447,9 +489,23 @@ def execute_slot(
         )
 
     actual_q = float(matching.task_utility_sum)
+    reward_cost_started_at = (
+        time.perf_counter() if exact_q_timing_profile is not None else 0.0
+    )
     cache_cost = float(configuration.cache_cost)
     movement_cost = float(configuration.movement_cost)
+    if exact_q_timing_profile is not None:
+        exact_q_timing_profile["reward_cost_aggregation_runtime"] += (
+            time.perf_counter() - reward_cost_started_at
+        )
+    reward_final_started_at = (
+        time.perf_counter() if exact_q_timing_profile is not None else 0.0
+    )
     system_utility = actual_q - cache_cost - movement_cost
+    if exact_q_timing_profile is not None:
+        exact_q_timing_profile["reward_final_combination_runtime"] += (
+            time.perf_counter() - reward_final_started_at
+        )
     if not math.isclose(
         system_utility,
         actual_q - cache_cost - movement_cost,

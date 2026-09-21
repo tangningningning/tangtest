@@ -879,13 +879,30 @@ def validate_config(
         raise ValueError(
             "algorithm.ppo.candidate_policy_improvement 只支持 LEGACY_PPO/EXACT_Q_LISTWISE。"
         )
-    exact_q_temperature = float(
+    legacy_exact_q_temperature = float(
         get_config_value(config, "algorithm.ppo.exact_q_listwise_temperature", 1.0)
     )
-    if not math.isfinite(exact_q_temperature) or exact_q_temperature <= 0.0:
-        raise ValueError(
-            "algorithm.ppo.exact_q_listwise_temperature 必须是正的有限数。"
+    cache_exact_q_temperature = float(
+        get_config_value(
+            config,
+            "algorithm.ppo.cache_exact_q_listwise_temperature",
+            legacy_exact_q_temperature,
         )
+    )
+    uav_exact_q_temperature = float(
+        get_config_value(
+            config,
+            "algorithm.ppo.uav_exact_q_listwise_temperature",
+            legacy_exact_q_temperature,
+        )
+    )
+    for field, value in {
+        "exact_q_listwise_temperature": legacy_exact_q_temperature,
+        "cache_exact_q_listwise_temperature": cache_exact_q_temperature,
+        "uav_exact_q_listwise_temperature": uav_exact_q_temperature,
+    }.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"algorithm.ppo.{field} 必须是正的有限数。")
     if policy_schema == proposed_schema:
         if candidate_advantage_source != "EXACT_Q_LISTWISE":
             raise ValueError(

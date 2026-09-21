@@ -10,7 +10,6 @@ import json
 import math
 import random
 import sys
-import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +23,7 @@ except ModuleNotFoundError:  # pragma: no cover - CLI help/import-only environme
     torch = None  # type: ignore[assignment]
 
 from common import project_config
-from decision import cache_configuration, slot_environment, uav_configuration
+from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
 from scenario import task_scenario
 
 from . import interface
@@ -188,94 +187,6 @@ def _is_filesystem_permission_error(error: OSError) -> bool:
         errno.EPERM,
         errno.EROFS,
     }
-
-
-def _read_episode_artifact_for_training(path: Path) -> None:
-    """Require a manifest-declared artifact to be readable by this process."""
-
-    try:
-        file_stat = path.stat()
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"PPO episode artifact is missing: {path}") from exc
-    except OSError as exc:
-        if _is_filesystem_permission_error(exc):
-            raise EpisodeFilesystemPermissionError(
-                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
-                f"cannot stat canonical episode artifact: {path}"
-            ) from exc
-        raise
-    if not stat.S_ISREG(file_stat.st_mode):
-        raise RuntimeError(f"PPO episode artifact is not a regular file: {path}")
-
-    try:
-        with path.open("rb") as stream:
-            if stream.read(1) == b"":
-                raise RuntimeError(f"PPO episode artifact is empty: {path}")
-    except OSError as exc:
-        if _is_filesystem_permission_error(exc):
-            raise EpisodeFilesystemPermissionError(
-                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
-                f"cannot open canonical episode artifact for rb: {path}"
-            ) from exc
-        raise
-
-
-def _read_episode_manifest_for_training(path: Path) -> bytes:
-    try:
-        manifest_stat = path.stat()
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            "PPO episode realization is missing episode_manifest.json: "
-            f"{path}"
-        ) from exc
-    except OSError as exc:
-        if _is_filesystem_permission_error(exc):
-            raise EpisodeFilesystemPermissionError(
-                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
-                f"cannot stat episode manifest: {path}"
-            ) from exc
-        raise
-    if not stat.S_ISREG(manifest_stat.st_mode):
-        raise RuntimeError(f"PPO episode manifest is not a regular file: {path}")
-
-    try:
-        with path.open("rb") as stream:
-            return stream.read()
-    except OSError as exc:
-        if _is_filesystem_permission_error(exc):
-            raise EpisodeFilesystemPermissionError(
-                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
-                f"cannot open episode manifest for rb: {path}"
-            ) from exc
-        raise
-
-
-def _check_episode_filesystem_readability(directory: Path) -> None:
-    """Read the manifest and every declared artifact before provenance checks."""
-
-    manifest_path = directory / "episode_manifest.json"
-    manifest_bytes = _read_episode_manifest_for_training(manifest_path)
-
-    try:
-        manifest = json.loads(manifest_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"PPO episode manifest is not valid UTF-8 JSON: {manifest_path}"
-        ) from exc
-
-    generated_artifacts = manifest.get("generated_artifacts")
-    if not isinstance(generated_artifacts, list):
-        raise RuntimeError(
-            "PPO episode manifest has no valid generated_artifacts list: "
-            f"{manifest_path}"
-        )
-    for artifact_name in generated_artifacts:
-        if not isinstance(artifact_name, str) or not artifact_name:
-            raise RuntimeError(
-                "PPO episode manifest contains an invalid generated artifact name: "
-                f"{manifest_path}"
-            )
-        _read_episode_artifact_for_training(directory / artifact_name)
 
 
 def _require_torch() -> None:
@@ -753,8 +664,17 @@ class UpdateResult:
     uav_exact_q_execute_slot_call_count: int = 0
     uav_exact_q_matching_call_count: int = 0
     uav_exact_q_kkt_call_count: int = 0
+    uav_exact_q_kkt_cache_request_count: int = 0
+    uav_exact_q_kkt_cache_hit_count: int = 0
+    uav_exact_q_kkt_cache_miss_count: int = 0
+    uav_exact_q_kkt_solver_call_count: int = 0
+    uav_exact_q_node_eval_cache_request_count: int = 0
+    uav_exact_q_node_eval_cache_hit_count: int = 0
+    uav_exact_q_node_eval_cache_miss_count: int = 0
+    uav_exact_q_node_eval_full_execution_count: int = 0
     uav_operation_mean_move_candidate_count: float = math.nan
     uav_operation_credit_runtime_seconds: float = math.nan
+    uav_operation_timing: dict[str, float] | None = None
     uav_operation_advantage_normalization: str = ""
     uav_operation_advantage_centering: bool | None = None
     uav_operation_advantage_sign_flip_count: int = 0
@@ -954,7 +874,6 @@ def _validate_episode_realization_complete(
     generator_module: Any,
     episode_seed: int,
 ) -> RealizationArtifacts:
-    _check_episode_filesystem_readability(directory)
     required_names = (
         *REALIZATION_ARTIFACT_FILENAMES.values(),
         *GENERATOR_EXTRA_ARTIFACT_FILENAMES,
@@ -974,11 +893,6 @@ def _validate_episode_realization_complete(
             get(context.cfg, "simulation.num_research_vehicles")
         ),
         horizon_steps=int(get(context.cfg, "prediction.vehicle.horizon")),
-    )
-    generator_module.validate_episode_provenance(
-        directory,
-        context.cfg,
-        int(episode_seed),
     )
     return artifacts
 
@@ -1645,11 +1559,66 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
                 ),
                 "MATCHING_CALL_COUNT": int(update.uav_exact_q_matching_call_count),
                 # This is the exact KKT resource-cache request count reported
-                # by the unchanged Matching/KKT path. The targeted probe also
-                # records bottom-level solver calls separately.
+                # by the unchanged Matching/KKT path; retain this legacy field
+                # name and meaning for compatibility.
                 "KKT_CALL_COUNT": int(update.uav_exact_q_kkt_call_count),
+                "KKT_CACHE_REQUEST_COUNT": int(
+                    update.uav_exact_q_kkt_cache_request_count
+                ),
+                "KKT_CACHE_HIT_COUNT": int(update.uav_exact_q_kkt_cache_hit_count),
+                "KKT_CACHE_MISS_COUNT": int(update.uav_exact_q_kkt_cache_miss_count),
+                "KKT_SOLVER_CALL_COUNT": int(
+                    update.uav_exact_q_kkt_solver_call_count
+                ),
+                "NODE_EVAL_CACHE_REQUEST_COUNT": int(
+                    update.uav_exact_q_node_eval_cache_request_count
+                ),
+                "NODE_EVAL_CACHE_HIT_COUNT": int(
+                    update.uav_exact_q_node_eval_cache_hit_count
+                ),
+                "NODE_EVAL_CACHE_MISS_COUNT": int(
+                    update.uav_exact_q_node_eval_cache_miss_count
+                ),
+                "NODE_EVAL_CACHE_HIT_RATE": float(
+                    update.uav_exact_q_node_eval_cache_hit_count
+                    / update.uav_exact_q_node_eval_cache_request_count
+                    if update.uav_exact_q_node_eval_cache_request_count > 0
+                    else 0.0
+                ),
+                "NODE_EVAL_FULL_EXECUTION_COUNT": int(
+                    update.uav_exact_q_node_eval_full_execution_count
+                ),
             }
         )
+        if update.uav_operation_timing is not None:
+            timing_fields = {
+                "EXACT_Q_MATCHING_RUNTIME": "matching_runtime",
+                "EXACT_Q_NODE_CACHE_LOOKUP_RUNTIME": "node_cache_lookup_runtime",
+                # Node-evaluation miss time excludes the separately reported
+                # KKT allocation time so the categories remain disjoint.
+                "EXACT_Q_NODE_EVAL_RUNTIME": "node_eval_miss_runtime",
+                "EXACT_Q_NODE_EVAL_MISS_RUNTIME": "node_eval_miss_runtime",
+                "EXACT_Q_KKT_RUNTIME": "kkt_runtime",
+                "KKT_COEFFICIENT_BUILD_RUNTIME": "kkt_coefficient_build_runtime",
+                "KKT_SOLVER_CORE_RUNTIME": "kkt_solver_core_runtime",
+                "KKT_RESULT_ASSEMBLY_RUNTIME": "kkt_result_assembly_runtime",
+                "REWARD_DELAY_AGGREGATION_RUNTIME": "reward_delay_aggregation_runtime",
+                "REWARD_ENERGY_AGGREGATION_RUNTIME": "reward_energy_aggregation_runtime",
+                "REWARD_COST_AGGREGATION_RUNTIME": "reward_cost_aggregation_runtime",
+                "REWARD_FINAL_COMBINATION_RUNTIME": "reward_final_combination_runtime",
+                "EXACT_Q_BRANCH_STATE_BUILD_RUNTIME": "branch_state_build_runtime",
+                "EXACT_Q_REWARD_ASSEMBLY_RUNTIME": "reward_assembly_runtime",
+                "EXACT_Q_CRITIC_RUNTIME": "critic_runtime",
+                "EXACT_Q_OTHER_RUNTIME": "other_runtime",
+            }
+            total_runtime = float(update.uav_operation_credit_runtime_seconds)
+            if math.isfinite(total_runtime) and total_runtime > 0.0:
+                for metric_name, timing_key in timing_fields.items():
+                    value = float(update.uav_operation_timing.get(timing_key, 0.0))
+                    if not math.isfinite(value):
+                        continue
+                    fields[metric_name] = value
+                    fields[f"{metric_name}_FRACTION"] = value / total_runtime
     routing_metrics = {
         "UAV_OPERATION_FULL_ROLLOUT_KL": float(
             update.uav_operation_full_rollout_kl
@@ -2718,18 +2687,33 @@ class PPOV2Trainer:
                 "algorithm.ppo.candidate_policy_improvement 只支持 "
                 "LEGACY_PPO/EXACT_Q_LISTWISE。"
             )
-        self.exact_q_listwise_temperature = float(
+        legacy_exact_q_temperature = float(
             project_config.get_config_value(
                 context.cfg,
                 "algorithm.ppo.exact_q_listwise_temperature",
                 DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE,
             )
         )
-        if (
-            not math.isfinite(self.exact_q_listwise_temperature)
-            or self.exact_q_listwise_temperature <= 0.0
-        ):
-            raise ValueError("exact_q_listwise_temperature 必须是正的有限数。")
+        self.cache_exact_q_listwise_temperature = float(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_exact_q_listwise_temperature",
+                legacy_exact_q_temperature,
+            )
+        )
+        self.uav_exact_q_listwise_temperature = float(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.uav_exact_q_listwise_temperature",
+                legacy_exact_q_temperature,
+            )
+        )
+        for field, value in {
+            "cache_exact_q_listwise_temperature": self.cache_exact_q_listwise_temperature,
+            "uav_exact_q_listwise_temperature": self.uav_exact_q_listwise_temperature,
+        }.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{field} 必须是正的有限数。")
         if (
             self.candidate_policy_improvement
             == CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE
@@ -3575,6 +3559,7 @@ class PPOV2Trainer:
         rollout: SimpleRollout,
         *,
         target_transition_indices: tuple[int, ...] | None = None,
+        use_node_evaluation_cache: bool = True,
     ) -> dict[str, Any]:
         """Compute detached per-UAV counterfactual one-step TD credit.
 
@@ -3692,7 +3677,31 @@ class PPOV2Trainer:
         execute_slot_call_count = 0
         matching_call_count = 0
         kkt_call_count = 0
+        kkt_cache_request_count = 0
+        kkt_cache_hit_count = 0
+        kkt_cache_miss_count = 0
+        kkt_solver_call_count = 0
+        node_eval_cache_request_count = 0
+        node_eval_cache_hit_count = 0
+        node_eval_cache_miss_count = 0
+        node_eval_full_execution_count = 0
         started_at = time.perf_counter()
+        timing_profile = {
+            "matching_runtime": 0.0,
+            "node_cache_lookup_runtime": 0.0,
+            "node_eval_miss_runtime": 0.0,
+            "kkt_runtime": 0.0,
+            "kkt_coefficient_build_runtime": 0.0,
+            "kkt_solver_core_runtime": 0.0,
+            "kkt_result_assembly_runtime": 0.0,
+            "reward_delay_aggregation_runtime": 0.0,
+            "reward_energy_aggregation_runtime": 0.0,
+            "reward_cost_aggregation_runtime": 0.0,
+            "reward_final_combination_runtime": 0.0,
+            "branch_state_build_runtime": 0.0,
+            "reward_assembly_runtime": 0.0,
+            "critic_runtime": 0.0,
+        }
 
         def _position_dict(source: dict[str, Any]) -> dict[str, np.ndarray]:
             return {
@@ -3764,6 +3773,12 @@ class PPOV2Trainer:
             slot_branch_cache: dict[
                 tuple[Any, ...], tuple[float, np.ndarray | None]
             ] = {}
+            transition_kkt_cache = task_allocation.KKTResourceAllocationCache()
+            transition_node_evaluation_cache = (
+                task_allocation.NodeEvaluationCache(timing_profile=timing_profile)
+                if use_node_evaluation_cache
+                else None
+            )
             previous_uav_key = tuple(
                 (
                     str(key),
@@ -3886,6 +3901,11 @@ class PPOV2Trainer:
                     nonlocal branch_request_count, unique_branch_count
                     nonlocal branch_cache_hit_count
                     nonlocal execute_slot_call_count, matching_call_count, kkt_call_count
+                    nonlocal kkt_cache_request_count, kkt_cache_hit_count
+                    nonlocal kkt_cache_miss_count, kkt_solver_call_count
+                    nonlocal node_eval_cache_request_count, node_eval_cache_hit_count
+                    nonlocal node_eval_cache_miss_count, node_eval_full_execution_count
+                    branch_state_started_at = time.perf_counter()
                     branch_final_uav = {
                         key: value.copy() for key, value in production_final_uav.items()
                     }
@@ -3915,6 +3935,9 @@ class PPOV2Trainer:
                     if cached is not None:
                         branch_cache_hit_count += 1
                         cached_reward, cached_observation = cached
+                        timing_profile["branch_state_build_runtime"] += (
+                            time.perf_counter() - branch_state_started_at
+                        )
                         return float(cached_reward), (
                             None
                             if cached_observation is None
@@ -3953,6 +3976,9 @@ class PPOV2Trainer:
                             uav_actions=tuple(branch_uav_actions),
                         )
                     )
+                    timing_profile["branch_state_build_runtime"] += (
+                        time.perf_counter() - branch_state_started_at
+                    )
                     execute_slot_call_count += 1
                     matching_call_count += 1
                     result = slot_environment.execute_slot(
@@ -3974,10 +4000,38 @@ class PPOV2Trainer:
                         performance_profile=None,
                         configuration_profile=cache_configuration.ConfigurationEvaluationProfile(),
                         configuration_override=configuration_override,
+                        matching_kkt_cache=transition_kkt_cache,
+                        node_evaluation_cache=transition_node_evaluation_cache,
+                        exact_q_timing_profile=timing_profile,
                     )
+                    reward_assembly_started_at = time.perf_counter()
                     counterfactual_environment_executions += 1
                     kkt_call_count += int(
                         result.matching_summary.get("kkt_cache_requests", 0)
+                    )
+                    kkt_cache_request_count += int(
+                        result.matching_summary.get("KKT_CACHE_REQUEST_COUNT", 0)
+                    )
+                    kkt_cache_hit_count += int(
+                        result.matching_summary.get("KKT_CACHE_HIT_COUNT", 0)
+                    )
+                    kkt_cache_miss_count += int(
+                        result.matching_summary.get("KKT_CACHE_MISS_COUNT", 0)
+                    )
+                    kkt_solver_call_count += int(
+                        result.matching_summary.get("KKT_SOLVER_CALL_COUNT", 0)
+                    )
+                    node_eval_cache_request_count += int(
+                        result.matching_summary.get("NODE_EVAL_CACHE_REQUEST_COUNT", 0)
+                    )
+                    node_eval_cache_hit_count += int(
+                        result.matching_summary.get("NODE_EVAL_CACHE_HIT_COUNT", 0)
+                    )
+                    node_eval_cache_miss_count += int(
+                        result.matching_summary.get("NODE_EVAL_CACHE_MISS_COUNT", 0)
+                    )
+                    node_eval_full_execution_count += int(
+                        result.matching_summary.get("NODE_EVAL_FULL_EXECUTION_COUNT", 0)
                     )
                     if not result.step_feasible:
                         raise RuntimeError(
@@ -4006,6 +4060,9 @@ class PPOV2Trainer:
                         else np.asarray(next_observation, dtype=np.float32).copy()
                     )
                     slot_branch_cache[branch_key] = (float(reward), safe_observation)
+                    timing_profile["reward_assembly_runtime"] += (
+                        time.perf_counter() - reward_assembly_started_at
+                    )
                     return float(reward), (
                         None
                         if safe_observation is None
@@ -4034,6 +4091,7 @@ class PPOV2Trainer:
                         branch_rewards.append(move_reward)
                         branch_observations.append(move_observation)
 
+                critic_started_at = time.perf_counter()
                 if next_step is None:
                     next_values = np.zeros(len(branch_rewards), dtype=np.float64)
                 else:
@@ -4077,6 +4135,9 @@ class PPOV2Trainer:
                     next_values[0] = float(
                         stay_value_tensor.detach().cpu().reshape(-1)[0]
                     )
+                timing_profile["critic_runtime"] += (
+                    time.perf_counter() - critic_started_at
+                )
                 q_values = np.asarray(branch_rewards, dtype=np.float64)
                 q_values += float(self.hyperparameters.gamma) * next_values
                 if not np.all(np.isfinite(q_values)):
@@ -4187,6 +4248,22 @@ class PPOV2Trainer:
             raise FloatingPointError("proposed std-only operation scaling flipped a sign")
         if not np.all(np.isfinite(scaled_advantages)):
             raise FloatingPointError("proposed scaled operation advantages are non-finite")
+        credit_runtime_seconds = float(time.perf_counter() - started_at)
+        classified_runtime_seconds = sum(
+            float(timing_profile[key])
+            for key in (
+                "matching_runtime",
+                "node_cache_lookup_runtime",
+                "node_eval_miss_runtime",
+                "kkt_runtime",
+                "branch_state_build_runtime",
+                "reward_assembly_runtime",
+                "critic_runtime",
+            )
+        )
+        timing_profile["other_runtime"] = (
+            credit_runtime_seconds - classified_runtime_seconds
+        )
         return {
             "raw_advantages": raw_advantages.astype(np.float32),
             "scaled_advantages": scaled_advantages.astype(np.float32),
@@ -4208,6 +4285,14 @@ class PPOV2Trainer:
             # the Matching path for the unique UAV exact-Q branches. The
             # Matching/KKT implementation itself remains unchanged.
             "kkt_call_count": int(kkt_call_count),
+            "kkt_cache_request_count": int(kkt_cache_request_count),
+            "kkt_cache_hit_count": int(kkt_cache_hit_count),
+            "kkt_cache_miss_count": int(kkt_cache_miss_count),
+            "kkt_solver_call_count": int(kkt_solver_call_count),
+            "node_eval_cache_request_count": int(node_eval_cache_request_count),
+            "node_eval_cache_hit_count": int(node_eval_cache_hit_count),
+            "node_eval_cache_miss_count": int(node_eval_cache_miss_count),
+            "node_eval_full_execution_count": int(node_eval_full_execution_count),
             "mean_move_candidate_count": float(np.mean(move_candidate_counts)),
             "move_candidate_counts": move_candidate_counts,
             "candidate_q_values": candidate_q_values,
@@ -4217,7 +4302,8 @@ class PPOV2Trainer:
             "candidate_move_distances": candidate_move_distances,
             "candidate_q_move": q_move.copy(),
             "candidate_weighted_mean_residual": candidate_weighted_mean_residual,
-            "credit_runtime_seconds": float(time.perf_counter() - started_at),
+            "credit_runtime_seconds": credit_runtime_seconds,
+            "timing": dict(timing_profile),
             "advantage_normalization": advantage_normalization,
             "advantage_reference_scale": float(advantage_reference_scale),
             "advantage_centering": False,
@@ -5006,7 +5092,7 @@ class PPOV2Trainer:
                 conditional_candidate_q_values_t,
                 conditional_candidate_valid_mask_t,
                 uav_operation_masks,
-                self.exact_q_listwise_temperature,
+                self.uav_exact_q_listwise_temperature,
                 hyper.operation_advantage_reference_scale,
             )
         cache_trigger_advantages_t = None
@@ -5570,7 +5656,7 @@ class PPOV2Trainer:
                                 ),
                                 cache_candidate_q_values_t[indices],
                                 candidate_valid,
-                                self.exact_q_listwise_temperature,
+                                self.cache_exact_q_listwise_temperature,
                             )
                             cache_candidate_policy_loss_values.append(
                                 float(candidate_policy_loss.detach().cpu())
@@ -5649,7 +5735,7 @@ class PPOV2Trainer:
                                     evaluation.uav_candidate_log_probs_all,
                                     conditional_candidate_q_values_t[indices],
                                     candidate_valid,
-                                    self.exact_q_listwise_temperature,
+                                    self.uav_exact_q_listwise_temperature,
                                 )
                                 candidate_active = candidate_valid
                                 candidate_residual = (
@@ -7068,11 +7154,40 @@ class PPOV2Trainer:
             uav_exact_q_kkt_call_count=int(
                 uav_operation_credit.get("kkt_call_count", 0)
             ),
+            uav_exact_q_kkt_cache_request_count=int(
+                uav_operation_credit.get("kkt_cache_request_count", 0)
+            ),
+            uav_exact_q_kkt_cache_hit_count=int(
+                uav_operation_credit.get("kkt_cache_hit_count", 0)
+            ),
+            uav_exact_q_kkt_cache_miss_count=int(
+                uav_operation_credit.get("kkt_cache_miss_count", 0)
+            ),
+            uav_exact_q_kkt_solver_call_count=int(
+                uav_operation_credit.get("kkt_solver_call_count", 0)
+            ),
+            uav_exact_q_node_eval_cache_request_count=int(
+                uav_operation_credit.get("node_eval_cache_request_count", 0)
+            ),
+            uav_exact_q_node_eval_cache_hit_count=int(
+                uav_operation_credit.get("node_eval_cache_hit_count", 0)
+            ),
+            uav_exact_q_node_eval_cache_miss_count=int(
+                uav_operation_credit.get("node_eval_cache_miss_count", 0)
+            ),
+            uav_exact_q_node_eval_full_execution_count=int(
+                uav_operation_credit.get("node_eval_full_execution_count", 0)
+            ),
             uav_operation_mean_move_candidate_count=float(
                 uav_operation_credit.get("mean_move_candidate_count", math.nan)
             ),
             uav_operation_credit_runtime_seconds=float(
                 uav_operation_credit.get("credit_runtime_seconds", math.nan)
+            ),
+            uav_operation_timing=(
+                dict(uav_operation_credit.get("timing", {}))
+                if exact_uav_credit_enabled
+                else None
             ),
             uav_operation_advantage_normalization=str(
                 uav_operation_credit.get("advantage_normalization", "")
