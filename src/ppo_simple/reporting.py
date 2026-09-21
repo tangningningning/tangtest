@@ -211,7 +211,6 @@ def build_run_manifest(
     test_origin_end = protocol["test_origin_end"]
     policy_schema = str(getattr(trainer.policy, "architecture_id", context.policy_schema))
     is_proposed_joint = policy_schema == "adaptive_joint_cache_uav_ppo"
-    is_node_cache_credit = is_proposed_joint
     git_sha, git_dirty = _git_identity(Path(context.root))
     resolved_config_path = Path(
         context.cfg.get("_meta", {}).get("config_path", config_path)
@@ -259,37 +258,37 @@ def build_run_manifest(
             hyper.operation_advantage_reference_scale
         ),
         "uav_operation_advantage_source": (
-            "COUNTERFACTUAL_ONE_STEP_TD" if is_proposed_joint else "GLOBAL_GAE"
+            "FULL_INFORMATION_EXACT_Q_TEACHER" if is_proposed_joint else "GLOBAL_GAE"
+        ),
+        "UAV_OPERATION_TEACHER": (
+            "FULL_INFORMATION_EXACT_Q_TEACHER" if is_proposed_joint else "GLOBAL_GAE"
         ),
         "uav_candidate_advantage_source": (
-            "EXACT_CONDITIONAL_COUNTERFACTUAL_Q"
+            "EXACT_Q_LISTWISE"
             if is_proposed_joint
             else "GLOBAL_GAE"
         ),
+        "UAV_CANDIDATE_TEACHER": (
+            "EXACT_Q_LISTWISE" if is_proposed_joint else "GLOBAL_GAE"
+        ),
+        "UAV_TEACHER_UNCHANGED": "YES" if is_proposed_joint else "N/A",
         "candidate_advantage_normalization": (
             "EXACT_Q_LISTWISE"
             if is_proposed_joint
             else "LEGACY_GLOBAL_GAE"
         ),
-        "cache_trigger_advantage_source": (
-            "ACTION_CONDITIONED_Q_CRITIC_WITH_ACTUAL_ACTION_ANCHOR_AND_SPARSE_FULL_EXACT_AUDIT"
-            if is_node_cache_credit
-            else "GLOBAL_GAE"
+        "cache_trigger_advantage_source": "GLOBAL_GAE",
+        "cache_candidate_advantage_source": "GLOBAL_GAE",
+        "cache_trigger_ratio_granularity": "WHOLE_CACHE_JOINT",
+        "cache_candidate_ratio_granularity": "WHOLE_CACHE_JOINT",
+        "cache_surrogate_reduction": "NOT_USED_FOR_PRODUCTION_CREDIT",
+        "CACHE_POLICY_CREDIT_SOURCE": "ACTUAL_ROLLOUT_GAE",
+        "CACHE_ACTION_Q_CRITIC_INITIALIZED": bool(
+            getattr(trainer, "cache_action_q_critic", None) is not None
         ),
-        "cache_candidate_advantage_source": (
-            "ACTION_CONDITIONED_Q_CRITIC_WITH_ACTUAL_ACTION_ANCHOR_AND_SPARSE_FULL_EXACT_AUDIT"
-            if is_node_cache_credit
-            else "GLOBAL_GAE"
-        ),
-        "cache_trigger_ratio_granularity": (
-            "NODE_ONLY" if is_node_cache_credit else "WHOLE_CACHE_JOINT"
-        ),
-        "cache_candidate_ratio_granularity": (
-            "NODE_CONDITIONAL" if is_node_cache_credit else "WHOLE_CACHE_JOINT"
-        ),
-        "cache_surrogate_reduction": (
-            "MEAN_OVER_VALID_NODE_TIME" if is_node_cache_credit else "LEGACY_TRANSITION"
-        ),
+        "CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT": "NO",
+        "CACHE_COUNTERFACTUAL_MODE": "NONE_FOR_PRODUCTION",
+        "CACHE_COUNTERFACTUAL_ENV_EXECUTIONS": 0,
         "critic_value_scale_mode": str(hyper.critic_value_scale_mode),
         "critic_value_scale_epsilon": float(hyper.critic_value_scale_epsilon),
         "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),

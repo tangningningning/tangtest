@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
 import math
 import random
 import sys
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,10 +53,6 @@ from .policy import (
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
     BernoulliActorCritic,
 )
-from .cache_credit import (
-    compute_cache_action_q_credit,
-    compute_exact_node_specific_cache_credit,
-)
 from .cache_action_q import CacheActionQCritic
 from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
 from .primitive_control import PrimitiveTensorSpec, _intermediate_observation
@@ -81,20 +79,18 @@ POPART_CHECKPOINT_VERSION = 6
 CACHE_ONLY_CHECKPOINT_VERSION = 7
 REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
-# The full-information UAV operation teacher and post-operation-stop
-# candidate-only routing are not resume-compatible with the prior proposed
-# objective.  A fresh initialization is therefore required for this version.
-# The sparse Action-Q Cache teacher is not resume-compatible with either the
-# prior full-Exact objective or the intermediate hybrid-surrogate objective.
-# Keep the version bump explicit so old proposed checkpoints cannot silently
-# change supervision.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 16
-CACHE_COUNTERFACTUAL_MODE = "SPARSE_FULL_EXACT_AUDIT"
-CACHE_VALUE_MODEL = "ACTION_CONDITIONED_Q_CRITIC"
-CACHE_NORMAL_COUNTERFACTUAL_MODE = "NONE"
-CACHE_AUDIT_MODE = "SPARSE_FULL_EXACT"
-CACHE_ACTUAL_ACTION_Q_SOURCE = "PRODUCTION_REAL_TD_Q"
-CACHE_UNEXECUTED_ACTION_Q_SOURCE = "LEARNED_ACTION_Q"
+# The proposed Cache objective is now actual-rollout PPO with global GAE.  It
+# is not resume-compatible with the earlier Exact-Q/Action-Q proposed
+# checkpoints, so the version bump is deliberately explicit.
+JOINT_PROPOSED_CHECKPOINT_VERSION = 17
+CACHE_POLICY_CREDIT_SOURCE = "ACTUAL_ROLLOUT_GAE"
+CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT = "NO"
+CACHE_COUNTERFACTUAL_MODE = "NONE_FOR_PRODUCTION"
+CACHE_VALUE_MODEL = "NONE"
+CACHE_NORMAL_COUNTERFACTUAL_MODE = "NONE_FOR_PRODUCTION"
+CACHE_AUDIT_MODE = "DIAGNOSTIC_ONLY"
+CACHE_ACTUAL_ACTION_Q_SOURCE = "NONE"
+CACHE_UNEXECUTED_ACTION_Q_SOURCE = "NONE"
 CACHE_ACTION_Q_HIDDEN_DIM = 64
 CACHE_ACTION_Q_LEARNING_RATE = 1.0e-3
 CACHE_ACTION_Q_AUDIT_INTERVAL = 20
@@ -146,7 +142,9 @@ PROPOSED_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheUAVPPOActorCritic.architecture_id}
 )
 CANDIDATE_CREDIT_POLICY_SCHEMAS = PROPOSED_POLICY_SCHEMAS
-EXACT_CACHE_CREDIT_POLICY_SCHEMAS = PROPOSED_POLICY_SCHEMAS
+# Exact Cache-Q/Action-Q remains available only to explicit diagnostic
+# runners; no production policy schema may enter that path.
+EXACT_CACHE_CREDIT_POLICY_SCHEMAS = frozenset()
 JOINT_CACHE_UAV_POLICY_SCHEMAS = PROPOSED_POLICY_SCHEMAS
 BRANCH_SPECIFIC_KL_POLICY_SCHEMAS = PROPOSED_POLICY_SCHEMAS
 CACHE_OPERATION_POLICY_SCHEMAS = (
@@ -178,6 +176,106 @@ GENERATOR_EXTRA_ARTIFACT_FILENAMES = (
     "sumo_demand.rou.xml",
     "sumo_demand.meta.json",
 )
+
+
+class EpisodeFilesystemPermissionError(RuntimeError):
+    """The current training process cannot read a canonical episode artifact."""
+
+
+def _is_filesystem_permission_error(error: OSError) -> bool:
+    return isinstance(error, PermissionError) or getattr(error, "errno", None) in {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+    }
+
+
+def _read_episode_artifact_for_training(path: Path) -> None:
+    """Require a manifest-declared artifact to be readable by this process."""
+
+    try:
+        file_stat = path.stat()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"PPO episode artifact is missing: {path}") from exc
+    except OSError as exc:
+        if _is_filesystem_permission_error(exc):
+            raise EpisodeFilesystemPermissionError(
+                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
+                f"cannot stat canonical episode artifact: {path}"
+            ) from exc
+        raise
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise RuntimeError(f"PPO episode artifact is not a regular file: {path}")
+
+    try:
+        with path.open("rb") as stream:
+            if stream.read(1) == b"":
+                raise RuntimeError(f"PPO episode artifact is empty: {path}")
+    except OSError as exc:
+        if _is_filesystem_permission_error(exc):
+            raise EpisodeFilesystemPermissionError(
+                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
+                f"cannot open canonical episode artifact for rb: {path}"
+            ) from exc
+        raise
+
+
+def _read_episode_manifest_for_training(path: Path) -> bytes:
+    try:
+        manifest_stat = path.stat()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "PPO episode realization is missing episode_manifest.json: "
+            f"{path}"
+        ) from exc
+    except OSError as exc:
+        if _is_filesystem_permission_error(exc):
+            raise EpisodeFilesystemPermissionError(
+                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
+                f"cannot stat episode manifest: {path}"
+            ) from exc
+        raise
+    if not stat.S_ISREG(manifest_stat.st_mode):
+        raise RuntimeError(f"PPO episode manifest is not a regular file: {path}")
+
+    try:
+        with path.open("rb") as stream:
+            return stream.read()
+    except OSError as exc:
+        if _is_filesystem_permission_error(exc):
+            raise EpisodeFilesystemPermissionError(
+                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
+                f"cannot open episode manifest for rb: {path}"
+            ) from exc
+        raise
+
+
+def _check_episode_filesystem_readability(directory: Path) -> None:
+    """Read the manifest and every declared artifact before provenance checks."""
+
+    manifest_path = directory / "episode_manifest.json"
+    manifest_bytes = _read_episode_manifest_for_training(manifest_path)
+
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"PPO episode manifest is not valid UTF-8 JSON: {manifest_path}"
+        ) from exc
+
+    generated_artifacts = manifest.get("generated_artifacts")
+    if not isinstance(generated_artifacts, list):
+        raise RuntimeError(
+            "PPO episode manifest has no valid generated_artifacts list: "
+            f"{manifest_path}"
+        )
+    for artifact_name in generated_artifacts:
+        if not isinstance(artifact_name, str) or not artifact_name:
+            raise RuntimeError(
+                "PPO episode manifest contains an invalid generated artifact name: "
+                f"{manifest_path}"
+            )
+        _read_episode_artifact_for_training(directory / artifact_name)
 
 
 def _require_torch() -> None:
@@ -648,6 +746,13 @@ class UpdateResult:
     uav_operation_q_move: np.ndarray | None = None
     uav_operation_baseline: np.ndarray | None = None
     uav_operation_counterfactual_env_executions: int = 0
+    uav_exact_q_branch_request_count: int = 0
+    uav_exact_q_unique_branch_count: int = 0
+    uav_exact_q_duplicate_branch_count: int = 0
+    uav_exact_q_cache_hit_count: int = 0
+    uav_exact_q_execute_slot_call_count: int = 0
+    uav_exact_q_matching_call_count: int = 0
+    uav_exact_q_kkt_call_count: int = 0
     uav_operation_mean_move_candidate_count: float = math.nan
     uav_operation_credit_runtime_seconds: float = math.nan
     uav_operation_advantage_normalization: str = ""
@@ -847,7 +952,9 @@ def _validate_episode_realization_complete(
     directory: Path,
     context: EnvironmentContext,
     generator_module: Any,
+    episode_seed: int,
 ) -> RealizationArtifacts:
+    _check_episode_filesystem_readability(directory)
     required_names = (
         *REALIZATION_ARTIFACT_FILENAMES.values(),
         *GENERATOR_EXTRA_ARTIFACT_FILENAMES,
@@ -867,6 +974,11 @@ def _validate_episode_realization_complete(
             get(context.cfg, "simulation.num_research_vehicles")
         ),
         horizon_steps=int(get(context.cfg, "prediction.vehicle.horizon")),
+    )
+    generator_module.validate_episode_provenance(
+        directory,
+        context.cfg,
+        int(episode_seed),
     )
     return artifacts
 
@@ -892,8 +1004,18 @@ def _ensure_episode_realization(
             )
         try:
             artifacts = _validate_episode_realization_complete(
-                realization_dir, context, generator_module
+                realization_dir,
+                context,
+                generator_module,
+                int(episode_seed),
             )
+        except EpisodeFilesystemPermissionError:
+            raise
+        except PermissionError as exc:
+            raise EpisodeFilesystemPermissionError(
+                "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
+                f"existing canonical episode is not readable: {realization_dir}"
+            ) from exc
         except Exception as exc:
             raise RuntimeError(
                 "PPO episode realization exists but is incomplete or invalid; "
@@ -918,8 +1040,18 @@ def _ensure_episode_realization(
             generation_device,
         )
         artifacts = _validate_episode_realization_complete(
-            realization_dir, context, generator_module
+            realization_dir,
+            context,
+            generator_module,
+            int(episode_seed),
         )
+    except EpisodeFilesystemPermissionError:
+        raise
+    except PermissionError as exc:
+        raise EpisodeFilesystemPermissionError(
+            "EPISODE_FILESYSTEM_PERMISSION_FAILURE: "
+            f"generated canonical episode is not readable: {realization_dir}"
+        ) from exc
     except Exception as exc:
         raise RuntimeError(
             "lazy PPO episode realization generation failed; the partial "
@@ -1493,6 +1625,30 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         )
         fields["uav_operation_counterfactual_env_executions"] = int(
             update.uav_operation_counterfactual_env_executions
+        )
+        fields.update(
+            {
+                "UAV_EXACT_Q_BRANCH_REQUEST_COUNT": int(
+                    update.uav_exact_q_branch_request_count
+                ),
+                "UAV_EXACT_Q_UNIQUE_BRANCH_COUNT": int(
+                    update.uav_exact_q_unique_branch_count
+                ),
+                "UAV_EXACT_Q_DUPLICATE_BRANCH_COUNT": int(
+                    update.uav_exact_q_duplicate_branch_count
+                ),
+                "UAV_EXACT_Q_CACHE_HIT_COUNT": int(
+                    update.uav_exact_q_cache_hit_count
+                ),
+                "EXECUTE_SLOT_CALL_COUNT": int(
+                    update.uav_exact_q_execute_slot_call_count
+                ),
+                "MATCHING_CALL_COUNT": int(update.uav_exact_q_matching_call_count),
+                # This is the exact KKT resource-cache request count reported
+                # by the unchanged Matching/KKT path. The targeted probe also
+                # records bottom-level solver calls separately.
+                "KKT_CALL_COUNT": int(update.uav_exact_q_kkt_call_count),
+            }
         )
     routing_metrics = {
         "UAV_OPERATION_FULL_ROLLOUT_KL": float(
@@ -2910,28 +3066,22 @@ class PPOV2Trainer:
         return self.policy.architecture_id in EXACT_CACHE_CREDIT_POLICY_SCHEMAS
 
     def cache_action_q_metadata(self) -> dict[str, Any]:
-        """Return the immutable sparse Cache Action-Q objective identity."""
+        """Return formal Cache-credit metadata without advertising Action-Q."""
 
         return {
+            "CACHE_POLICY_CREDIT_SOURCE": CACHE_POLICY_CREDIT_SOURCE,
+            "CACHE_ACTION_Q_CRITIC_INITIALIZED": bool(
+                self.cache_action_q_critic is not None
+            ),
+            "CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT": CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT,
+            "CACHE_COUNTERFACTUAL_MODE": CACHE_COUNTERFACTUAL_MODE,
             "CACHE_VALUE_MODEL": CACHE_VALUE_MODEL,
-            "CACHE_NORMAL_COUNTERFACTUAL_MODE": CACHE_NORMAL_COUNTERFACTUAL_MODE,
-            "CACHE_AUDIT_MODE": CACHE_AUDIT_MODE,
-            "CACHE_ACTUAL_ACTION_Q_SOURCE": CACHE_ACTUAL_ACTION_Q_SOURCE,
-            "CACHE_UNEXECUTED_ACTION_Q_SOURCE": CACHE_UNEXECUTED_ACTION_Q_SOURCE,
-            "cache_value_model": CACHE_VALUE_MODEL,
-            "cache_normal_counterfactual_mode": CACHE_NORMAL_COUNTERFACTUAL_MODE,
-            "cache_audit_mode": CACHE_AUDIT_MODE,
-            "cache_actual_action_q_source": CACHE_ACTUAL_ACTION_Q_SOURCE,
-            "cache_unexecuted_action_q_source": CACHE_UNEXECUTED_ACTION_Q_SOURCE,
+            "cache_policy_credit_source": CACHE_POLICY_CREDIT_SOURCE,
+            "cache_action_q_critic_initialized": bool(
+                self.cache_action_q_critic is not None
+            ),
+            "cache_action_q_used_for_policy_credit": CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT,
             "cache_counterfactual_mode": CACHE_COUNTERFACTUAL_MODE,
-            "cache_action_q_architecture": CacheActionQCritic.architecture_id,
-            "cache_action_q_architecture_version": CacheActionQCritic.architecture_version,
-            "cache_action_q_context_dim": self.cache_action_q_context_dim,
-            "cache_action_q_node_count": self.cache_action_q_node_count,
-            "cache_action_q_feature_dim": self.cache_action_q_feature_dim,
-            "cache_action_q_hidden_dim": CACHE_ACTION_Q_HIDDEN_DIM,
-            "cache_action_q_learning_rate": CACHE_ACTION_Q_LEARNING_RATE,
-            "cache_action_q_audit_interval": self.cache_action_q_audit_interval,
         }
 
     def cache_surrogate_metadata(self) -> dict[str, Any]:
@@ -3536,6 +3686,12 @@ class PPOV2Trainer:
             (sample_count, head_count), dtype=np.float64
         )
         counterfactual_environment_executions = 0
+        branch_request_count = 0
+        unique_branch_count = 0
+        branch_cache_hit_count = 0
+        execute_slot_call_count = 0
+        matching_call_count = 0
+        kkt_call_count = 0
         started_at = time.perf_counter()
 
         def _position_dict(source: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -3599,6 +3755,23 @@ class PPOV2Trainer:
             ]
             if len(production_uav_actions) != head_count:
                 raise RuntimeError("proposed production UAV action count mismatch")
+
+            # This memo is deliberately created inside one transition.  The
+            # actual tasks, vehicle positions, scenario slice, previous
+            # UAV positions, and next exogenous state are therefore fixed by
+            # construction; the key still includes every mutable
+            # configuration input and never uses candidate index as identity.
+            slot_branch_cache: dict[
+                tuple[Any, ...], tuple[float, np.ndarray | None]
+            ] = {}
+            previous_uav_key = tuple(
+                (
+                    str(key),
+                    float(np.asarray(previous_uav[key], dtype=np.float64)[0]),
+                    float(np.asarray(previous_uav[key], dtype=np.float64)[1]),
+                )
+                for key in uav_ids
+            )
 
             for head_index, uav_id in enumerate(uav_ids):
                 # Reconstruct exactly the sequential conditional state used
@@ -3710,12 +3883,44 @@ class PPOV2Trainer:
                     after: np.ndarray,
                 ) -> tuple[float, np.ndarray | None]:
                     nonlocal counterfactual_environment_executions
+                    nonlocal branch_request_count, unique_branch_count
+                    nonlocal branch_cache_hit_count
+                    nonlocal execute_slot_call_count, matching_call_count, kkt_call_count
                     branch_final_uav = {
                         key: value.copy() for key, value in production_final_uav.items()
                     }
                     branch_final_uav[uav_id] = np.asarray(after, dtype=np.float64).copy()
                     branch_uav_triggers = dict(production_uav_triggers)
                     branch_uav_triggers[uav_id] = int(operation == "MOVE")
+                    branch_key = (
+                        int(transition.origin_index),
+                        np.asarray(previous_cache, dtype=np.int8).tobytes(),
+                        np.asarray(transition.next_cache_state, dtype=np.int8).tobytes(),
+                        previous_uav_key,
+                        tuple(
+                            (
+                                str(key),
+                                float(np.asarray(branch_final_uav[key], dtype=np.float64)[0]),
+                                float(np.asarray(branch_final_uav[key], dtype=np.float64)[1]),
+                            )
+                            for key in uav_ids
+                        ),
+                        tuple(
+                            (str(key), int(branch_uav_triggers[key]))
+                            for key in uav_ids
+                        ),
+                    )
+                    branch_request_count += 1
+                    cached = slot_branch_cache.get(branch_key)
+                    if cached is not None:
+                        branch_cache_hit_count += 1
+                        cached_reward, cached_observation = cached
+                        return float(cached_reward), (
+                            None
+                            if cached_observation is None
+                            else np.asarray(cached_observation, dtype=np.float32).copy()
+                        )
+                    unique_branch_count += 1
                     branch_uav_actions = list(production_uav_actions)
                     branch_uav_actions[head_index] = _target_action(
                         uav_id,
@@ -3748,6 +3953,8 @@ class PPOV2Trainer:
                             uav_actions=tuple(branch_uav_actions),
                         )
                     )
+                    execute_slot_call_count += 1
+                    matching_call_count += 1
                     result = slot_environment.execute_slot(
                         previous_cache,
                         previous_uav,
@@ -3769,6 +3976,9 @@ class PPOV2Trainer:
                         configuration_override=configuration_override,
                     )
                     counterfactual_environment_executions += 1
+                    kkt_call_count += int(
+                        result.matching_summary.get("kkt_cache_requests", 0)
+                    )
                     if not result.step_feasible:
                         raise RuntimeError(
                             "proposed counterfactual transition is infeasible: "
@@ -3790,7 +4000,17 @@ class PPOV2Trainer:
                             next_step,
                             self.context,
                         )
-                    return float(reward), next_observation
+                    safe_observation = (
+                        None
+                        if next_observation is None
+                        else np.asarray(next_observation, dtype=np.float32).copy()
+                    )
+                    slot_branch_cache[branch_key] = (float(reward), safe_observation)
+                    return float(reward), (
+                        None
+                        if safe_observation is None
+                        else safe_observation.copy()
+                    )
 
                 target_before = current_uav[uav_id].copy()
                 branch_rewards: list[float] = []
@@ -3976,6 +4196,18 @@ class PPOV2Trainer:
             "counterfactual_environment_executions": int(
                 counterfactual_environment_executions
             ),
+            "uav_exact_q_branch_request_count": int(branch_request_count),
+            "uav_exact_q_unique_branch_count": int(unique_branch_count),
+            "uav_exact_q_duplicate_branch_count": int(
+                branch_request_count - unique_branch_count
+            ),
+            "uav_exact_q_cache_hit_count": int(branch_cache_hit_count),
+            "execute_slot_call_count": int(execute_slot_call_count),
+            "matching_call_count": int(matching_call_count),
+            # This is the exact number of KKT resource-cache requests made by
+            # the Matching path for the unique UAV exact-Q branches. The
+            # Matching/KKT implementation itself remains unchanged.
+            "kkt_call_count": int(kkt_call_count),
             "mean_move_candidate_count": float(np.mean(move_candidate_counts)),
             "move_candidate_counts": move_candidate_counts,
             "candidate_q_values": candidate_q_values,
@@ -4574,18 +4806,6 @@ class PPOV2Trainer:
                 uav_operation_credit,
             )
         cache_credit: dict[str, Any] = {}
-        if self._uses_exact_cache_credit():
-            if not branch_diagnostics_enabled:
-                raise RuntimeError("Exact Cache credit requires joint branch diagnostics")
-            cache_credit = compute_cache_action_q_credit(
-                self,
-                rollout,
-            )
-            self.cache_action_q_audit_statistics = (
-                None
-                if cache_credit.get("audit_metrics") is None
-                else dict(cache_credit["audit_metrics"])
-            )
         cache_proposal_diagnostics: dict[str, Any] | None = None
         if cache_credit:
             cache_proposal_diagnostics = _proposal_source_diagnostics(
@@ -6740,10 +6960,10 @@ class PPOV2Trainer:
                 else math.nan
             ),
             uav_candidate_advantage_normalization=(
-                "NONE" if self._uses_exact_uav_candidate_credit() else ""
+                "EXACT_Q_LISTWISE" if self._uses_exact_uav_candidate_credit() else ""
             ),
             uav_candidate_advantage_source=(
-                "EXACT_CONDITIONAL_COUNTERFACTUAL_Q"
+                "EXACT_Q_LISTWISE"
                 if self._uses_exact_uav_candidate_credit()
                 else ""
             ),
@@ -6826,6 +7046,27 @@ class PPOV2Trainer:
             ),
             uav_operation_counterfactual_env_executions=int(
                 uav_operation_credit.get("counterfactual_environment_executions", 0)
+            ),
+            uav_exact_q_branch_request_count=int(
+                uav_operation_credit.get("uav_exact_q_branch_request_count", 0)
+            ),
+            uav_exact_q_unique_branch_count=int(
+                uav_operation_credit.get("uav_exact_q_unique_branch_count", 0)
+            ),
+            uav_exact_q_duplicate_branch_count=int(
+                uav_operation_credit.get("uav_exact_q_duplicate_branch_count", 0)
+            ),
+            uav_exact_q_cache_hit_count=int(
+                uav_operation_credit.get("uav_exact_q_cache_hit_count", 0)
+            ),
+            uav_exact_q_execute_slot_call_count=int(
+                uav_operation_credit.get("execute_slot_call_count", 0)
+            ),
+            uav_exact_q_matching_call_count=int(
+                uav_operation_credit.get("matching_call_count", 0)
+            ),
+            uav_exact_q_kkt_call_count=int(
+                uav_operation_credit.get("kkt_call_count", 0)
             ),
             uav_operation_mean_move_candidate_count=float(
                 uav_operation_credit.get("mean_move_candidate_count", math.nan)
@@ -7158,38 +7399,6 @@ class PPOV2Trainer:
             "cache_credit_granularity": None,
             "cache_kl_control": str(self.cache_kl_control),
             **self.cache_surrogate_metadata(),
-            "cache_surrogate_training_count": int(
-                self.cache_surrogate_training_count
-            ),
-            "cache_surrogate_screening_ready": bool(
-                self.cache_surrogate_screening_ready
-            ),
-            "cache_surrogate_screening_active": bool(
-                self.cache_surrogate_screening_active
-            ),
-            "cache_surrogate_selected_k": (
-                None
-                if self.cache_surrogate_selected_k is None
-                else int(self.cache_surrogate_selected_k)
-            ),
-            "cache_surrogate_shadow_complete": bool(
-                self.cache_surrogate_shadow_complete
-            ),
-            "cache_surrogate_audit_statistics": (
-                None
-                if self.cache_surrogate_audit_statistics is None
-                else dict(self.cache_surrogate_audit_statistics)
-            ),
-            "cache_surrogate_audit_history": [
-                dict(item) for item in self.cache_surrogate_audit_history
-            ],
-            "cache_action_q_training_count": int(self.cache_action_q_training_count),
-            "cache_action_q_optimizer_steps": int(self.cache_action_q_optimizer_steps),
-            "cache_action_q_audit_statistics": (
-                None
-                if self.cache_action_q_audit_statistics is None
-                else dict(self.cache_action_q_audit_statistics)
-            ),
             "configuration_control_mode": self.context.configuration_control_mode,
             "advantage_normalization_mode": (
                 self.hyperparameters.advantage_normalization_mode
@@ -7232,9 +7441,58 @@ class PPOV2Trainer:
                 "python": random.getstate(),
                 "numpy": np.random.get_state(),
                 "torch": torch.get_rng_state(),
-                "cache_surrogate": self.cache_surrogate_rng.bit_generator.state,
             },
         }
+        if self.cache_surrogate_ensemble is not None:
+            payload.update(
+                {
+                    "cache_surrogate_training_count": int(
+                        self.cache_surrogate_training_count
+                    ),
+                    "cache_surrogate_screening_ready": bool(
+                        self.cache_surrogate_screening_ready
+                    ),
+                    "cache_surrogate_screening_active": bool(
+                        self.cache_surrogate_screening_active
+                    ),
+                    "cache_surrogate_selected_k": (
+                        None
+                        if self.cache_surrogate_selected_k is None
+                        else int(self.cache_surrogate_selected_k)
+                    ),
+                    "cache_surrogate_shadow_complete": bool(
+                        self.cache_surrogate_shadow_complete
+                    ),
+                    "cache_surrogate_audit_statistics": (
+                        None
+                        if self.cache_surrogate_audit_statistics is None
+                        else dict(self.cache_surrogate_audit_statistics)
+                    ),
+                    "cache_surrogate_audit_history": [
+                        dict(item) for item in self.cache_surrogate_audit_history
+                    ],
+                    "rng_state": {
+                        **payload["rng_state"],
+                        "cache_surrogate": self.cache_surrogate_rng.bit_generator.state,
+                    },
+                }
+            )
+        if self.cache_action_q_critic is not None:
+            payload.update(
+                {
+                    "cache_action_q_training_count": int(
+                        self.cache_action_q_training_count
+                    ),
+                    "cache_action_q_optimizer_steps": int(
+                        self.cache_action_q_optimizer_steps
+                    ),
+                    "cache_action_q_audit_statistics": (
+                        None
+                        if self.cache_action_q_audit_statistics is None
+                        else dict(self.cache_action_q_audit_statistics)
+                    ),
+                }
+            )
         if self.cache_surrogate_ensemble is not None:
             if self.cache_surrogate_optimizer is None:
                 raise RuntimeError("Cache surrogate optimizer is not initialized.")

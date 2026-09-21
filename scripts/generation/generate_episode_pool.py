@@ -65,6 +65,7 @@ def _validate_complete_realization(
     directory: Path,
     *,
     config: dict[str, Any],
+    episode_seed: int,
 ) -> None:
     missing = _missing_artifacts(directory)
     if missing:
@@ -81,6 +82,11 @@ def _validate_complete_realization(
         task_vehicle_count=int(get(config, "simulation.num_task_vehicles")),
         research_vehicle_count=int(get(config, "simulation.num_research_vehicles")),
         horizon_steps=int(get(config, "prediction.vehicle.horizon")),
+    )
+    realization_generator.validate_episode_provenance(
+        directory,
+        config,
+        int(episode_seed),
     )
 
 
@@ -146,7 +152,11 @@ def generate_pool(
                     f"{destination}"
                 )
             validation_started_at = time.perf_counter()
-            _validate_complete_realization(destination, config=config)
+            _validate_complete_realization(
+                destination,
+                config=config,
+                episode_seed=seed,
+            )
             validation_runtime = time.perf_counter() - validation_started_at
             print(
                 _progress_line(
@@ -171,7 +181,11 @@ def generate_pool(
                 sumo_home,
                 device,
             )
-            _validate_complete_realization(destination, config=config)
+            _validate_complete_realization(
+                destination,
+                config=config,
+                episode_seed=seed,
+            )
         except Exception as exc:
             raise RuntimeError(
                 "episode realization generation failed; remove the partial "

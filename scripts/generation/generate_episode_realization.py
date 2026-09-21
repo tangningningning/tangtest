@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -38,6 +40,8 @@ from scenario.realization import EPISODE_SEED_STREAMS, derive_episode_seeds
 
 FORMAL_RUN = PROJECT_ROOT / "runs" / "ppo_v6_popart_actor1e4_fresh_20260910"
 EXPECTED_SLOTS = 300
+EPISODE_MANIFEST_FILENAME = "episode_manifest.json"
+EPISODE_MANIFEST_SCHEMA_VERSION = "episode_manifest_v1"
 
 
 def resolve_project_path(value: str | Path) -> Path:
@@ -90,6 +94,288 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_identity() -> tuple[str, bool]:
+    sha_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    dirty_result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if sha_result.returncode != 0 or dirty_result.returncode != 0:
+        raise RuntimeError(
+            "unable to capture source git identity: "
+            f"sha={sha_result.returncode}, dirty={dirty_result.returncode}"
+        )
+    sha = sha_result.stdout.strip()
+    if not sha:
+        raise RuntimeError("source git SHA is empty")
+    return sha, bool(dirty_result.stdout.strip())
+
+
+def _generation_config_payload(config: dict[str, Any]) -> dict[str, Any]:
+    """Return only fields that can change generated episode artifacts."""
+
+    get = project_config_module.get_config_value
+    return {
+        "schema": EPISODE_MANIFEST_SCHEMA_VERSION,
+        "episode_seed_protocol": "adaptive_cache_mec_episode_seed_v1",
+        "simulation": {
+            key: get(config, f"simulation.{key}")
+            for key in (
+                "dt_s",
+                "warmup_time_s",
+                "episode_time_s",
+                "num_research_vehicles",
+                "num_service_vehicles",
+                "num_task_vehicles",
+                "random_trips_departure_begin_s",
+                "random_trips_departure_end_s",
+                "random_trips_period_s",
+                "random_trips_min_distance_m",
+                "random_trips_intermediate",
+                "random_trips_maxtries",
+            )
+        },
+        "service": {
+            "count": get(config, "service.count"),
+            "generation": {
+                key: get(config, f"service.generation.{key}")
+                for key in (
+                    "service_size_min_gb",
+                    "service_size_max_gb",
+                    "input_size_min_kb",
+                    "input_size_max_kb",
+                    "cycles_per_bit_min",
+                    "cycles_per_bit_max",
+                )
+            },
+        },
+        "task": {
+            key: get(config, f"task.{key}")
+            for key in (
+                "arrival_probability",
+                "popularity_zeta",
+                "popularity_epoch_length",
+                "popularity_changes_per_epoch",
+                "input_relative_jitter",
+                "load_relative_jitter",
+                "master_seed",
+            )
+        },
+        "prediction": {
+            "vehicle": {
+                key: get(config, f"prediction.vehicle.{key}")
+                for key in (
+                    "horizon",
+                    "sigma_position_m",
+                    "sigma_speed_mps",
+                    "observation_noise_seed",
+                )
+            },
+            "popularity": {
+                key: get(config, f"prediction.popularity.{key}")
+                for key in (
+                    "history_length",
+                    "hidden_size",
+                    "training_seed",
+                    "sequence_seed_base",
+                    "num_train_sequences",
+                    "num_val_sequences",
+                    "num_test_sequences",
+                )
+            },
+        },
+        "scenario": {
+            key: get(config, f"scenario.{key}")
+            for key in (
+                "num_scenarios",
+                "master_seed",
+                "max_resample_attempts",
+                "cross_vehicle_residual_sampling",
+            )
+        },
+    }
+
+
+def generation_config_fingerprint(config: dict[str, Any]) -> str:
+    payload = _generation_config_payload(config)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_artifact_hashes(config: dict[str, Any]) -> dict[str, str]:
+    paths = {
+        "service_catalog_sha256": config_path(config, "paths.service_catalog"),
+        "popularity_gru_sha256": config_path(config, "paths.popularity_gru"),
+        "vehicle_residual_bank_sha256": config_path(
+            config, "paths.vehicle_residual_bank"
+        ),
+        "sumo_network_sha256": config_path(config, "paths.sumo_net"),
+    }
+    return {key: sha256_file(path) for key, path in paths.items()}
+
+
+def build_episode_manifest(
+    config: dict[str, Any], episode_seed: int, output_dir: Path
+) -> dict[str, Any]:
+    source_git_sha, source_git_dirty = _git_identity()
+    get = project_config_module.get_config_value
+    seeds = derive_episode_seeds(int(episode_seed))
+    artifact_paths = sorted(
+        path
+        for path in output_dir.iterdir()
+        if path.is_file() and path.name != EPISODE_MANIFEST_FILENAME
+    )
+    artifact_hashes = {
+        path.name: sha256_file(path) for path in artifact_paths
+    }
+    source_hashes = _source_artifact_hashes(config)
+    manifest = {
+        "schema_version": EPISODE_MANIFEST_SCHEMA_VERSION,
+        "episode_seed": int(episode_seed),
+        "derived_episode_seed_streams": seeds,
+        "generation_config_fingerprint": generation_config_fingerprint(config),
+        "generation_config_fields": _generation_config_payload(config),
+        "source_git_sha": source_git_sha,
+        "source_git_dirty": bool(source_git_dirty),
+        **source_hashes,
+        "simulation": {
+            "dt": float(get(config, "simulation.dt_s")),
+            "warmup": float(get(config, "simulation.warmup_time_s")),
+            "episode_slots": EXPECTED_SLOTS,
+        },
+        "vehicle_counts": {
+            "research": int(get(config, "simulation.num_research_vehicles")),
+            "TV": int(get(config, "simulation.num_task_vehicles")),
+            "SV": int(get(config, "simulation.num_service_vehicles")),
+        },
+        "task_generation_identity": {
+            "arrival_probability": get(config, "task.arrival_probability"),
+            "zipf_parameter": get(config, "task.popularity_zeta"),
+            "workload_jitter": {
+                "input_relative_jitter": get(config, "task.input_relative_jitter"),
+                "load_relative_jitter": get(config, "task.load_relative_jitter"),
+            },
+        },
+        "prediction_identity": {
+            "vehicle_horizon": get(config, "prediction.vehicle.horizon"),
+            "vehicle_noise_contract": {
+                "sigma_position_m": get(config, "prediction.vehicle.sigma_position_m"),
+                "sigma_speed_mps": get(config, "prediction.vehicle.sigma_speed_mps"),
+                "observation_noise_seed": get(
+                    config, "prediction.vehicle.observation_noise_seed"
+                ),
+            },
+            "popularity_model_identity": {
+                "checkpoint_sha256": source_hashes["popularity_gru_sha256"],
+                "history_length": get(config, "prediction.popularity.history_length"),
+                "hidden_size": get(config, "prediction.popularity.hidden_size"),
+            },
+            "scenario_count": get(config, "scenario.num_scenarios"),
+        },
+        "generated_artifacts": sorted(artifact_hashes),
+        "generated_artifact_sha256": artifact_hashes,
+    }
+    return manifest
+
+
+def write_episode_manifest(
+    config: dict[str, Any], episode_seed: int, output_dir: Path
+) -> Path:
+    manifest = build_episode_manifest(config, episode_seed, output_dir)
+    path = output_dir / EPISODE_MANIFEST_FILENAME
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    return path
+
+
+def validate_episode_provenance(
+    directory: Path,
+    config: dict[str, Any],
+    episode_seed: int,
+    *,
+    check_source_identity: bool = True,
+) -> dict[str, Any]:
+    """Fail closed when an existing realization is not provenance verified."""
+
+    manifest_path = Path(directory) / EPISODE_MANIFEST_FILENAME
+    prefix = "REALIZATION_PROVENANCE_MISMATCH"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"{prefix}: missing {manifest_path.name}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"{prefix}: invalid JSON in {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"{prefix}: manifest root must be an object")
+    if int(manifest.get("episode_seed", -1)) != int(episode_seed):
+        raise RuntimeError(
+            f"{prefix}: episode_seed={manifest.get('episode_seed')!r} "
+            f"expected={int(episode_seed)}"
+        )
+    expected_fingerprint = generation_config_fingerprint(config)
+    if manifest.get("generation_config_fingerprint") != expected_fingerprint:
+        raise RuntimeError(
+            f"{prefix}: generation_config_fingerprint mismatch; "
+            f"stored={manifest.get('generation_config_fingerprint')!r} "
+            f"expected={expected_fingerprint!r}"
+        )
+    expected_hashes = _source_artifact_hashes(config)
+    for field, expected_hash in expected_hashes.items():
+        if manifest.get(field) != expected_hash:
+            raise RuntimeError(
+                f"{prefix}: {field} mismatch; stored={manifest.get(field)!r} "
+                f"expected={expected_hash!r}"
+            )
+    if check_source_identity:
+        source_sha, source_dirty = _git_identity()
+        if manifest.get("source_git_sha") != source_sha or bool(
+            manifest.get("source_git_dirty")
+        ) != bool(source_dirty):
+            raise RuntimeError(
+                f"{prefix}: source git identity mismatch; "
+                f"stored=({manifest.get('source_git_sha')!r}, "
+                f"{manifest.get('source_git_dirty')!r}) "
+                f"expected=({source_sha!r}, {source_dirty!r})"
+            )
+    actual_paths = sorted(
+        path
+        for path in Path(directory).iterdir()
+        if path.is_file() and path.name != EPISODE_MANIFEST_FILENAME
+    )
+    actual_names = sorted(path.name for path in actual_paths)
+    if manifest.get("generated_artifacts") != actual_names:
+        raise RuntimeError(
+            f"{prefix}: generated artifact filename set mismatch"
+        )
+    stored_artifact_hashes = manifest.get("generated_artifact_sha256")
+    if not isinstance(stored_artifact_hashes, dict):
+        raise RuntimeError(f"{prefix}: generated artifact hashes are missing")
+    for path in actual_paths:
+        actual_hash = sha256_file(path)
+        if stored_artifact_hashes.get(path.name) != actual_hash:
+            raise RuntimeError(
+                f"{prefix}: generated artifact hash mismatch for {path.name}"
+            )
+    return manifest
 
 
 def snapshot_tree(path: Path) -> dict[str, str] | None:
@@ -463,6 +749,7 @@ def run_episode(
         research_vehicle_count=len(roles["research_vehicles"]),
         horizon_steps=horizon_steps,
     )
+    manifest_path = write_episode_manifest(config, int(episode_seed), output_dir)
     assert_snapshot_unchanged("data/generated", protected_data, protected_before["data/generated"])
     assert_snapshot_unchanged("formal V6 run", FORMAL_RUN, protected_before["formal V6 run"])
     total_runtime = time.perf_counter() - total_start
@@ -480,6 +767,7 @@ def run_episode(
     print(f"  prediction_runtime_seconds={prediction_runtime:.6f}")
     print(f"  scenario_runtime_seconds={scenario_runtime:.6f}")
     print(f"  single_episode_runtime_seconds={total_runtime:.6f}")
+    print(f"  episode_manifest={manifest_path}")
     return {
         "episode_seed": episode_seed,
         "derived_stream_count": len(EPISODE_SEED_STREAMS),
@@ -489,6 +777,7 @@ def run_episode(
         "prediction_runtime_seconds": prediction_runtime,
         "scenario_runtime_seconds": scenario_runtime,
         "single_episode_runtime_seconds": total_runtime,
+        "episode_manifest": str(manifest_path),
         "output_dir": str(output_dir),
     }
 

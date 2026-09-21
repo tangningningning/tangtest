@@ -55,7 +55,7 @@ execution_ratios = [
 
 [methods.proposed_joint]
 category = "proposed"
-status = "EXACT_Q_LISTWISE_GATE_PASSED_FORMAL_TRAINING_PENDING"
+status = "CACHE_GAE_UAV_EXACT_TEACHER_DATAFLOW_CORRECTION_PENDING_ONE_EPOCH_GATE"
 prediction = true
 adaptive_cache = true
 adaptive_uav = true
@@ -68,7 +68,7 @@ config = "configs/proposed/system_config.toml"
 checkpoint = ""
 training_entrypoint = "ppo-train"
 evaluation_entrypoint = "src/ppo_simple/evaluator.py"
-notes = "The exact-Q listwise candidate implementation gate passed. Cache KEEP/UPDATE and UAV STAY/MOVE operation heads remain unchanged; only candidate policy optimization uses the detached state-wise standardized exact-Q teacher. Formal training and final-test seed execution remain pending. Generation, training, and frozen-checkpoint evaluation use configs/proposed/system_config.toml."
+notes = "Formal Cache policy credit is sampled PPO from actual rollout rewards and global normalized GAE; no Cache Action-Q, surrogate, or Cache counterfactual executes in production. The unchanged UAV operation teacher is FULL_INFORMATION_EXACT_Q_TEACHER and its candidate teacher is EXACT_Q_LISTWISE. The fresh provenance-verified seed=20001 realization and one-epoch gate are the next structural checks; no final-test seed is implied. Generation, training, and frozen-checkpoint evaluation use configs/proposed/system_config.toml."
 
 [methods.ablation_cache_only]
 category = "ablation"

@@ -533,9 +533,9 @@ method = "ppo_simple_v2"
 # modes remain only for preserved baselines. v2 appends one normalized finite-horizon time-to-go
 # state feature; v1 remains available only for its preserved baseline checkpoint.
 configuration_control_mode = "adaptive_joint_cache_uav_reconfiguration"
-# Proposed joint mainline: exact per-UAV counterfactual operation credit and
-# exact node-specific Cache credit are consumed by the production PPO trainer.
-# Cache trigger/target selection, critic, GAE, reward, and movement semantics stay frozen.
+# Proposed joint mainline: Cache uses the actual-rollout global GAE PPO credit;
+# the UAV operation and candidate teachers remain the existing Exact-Q teachers.
+# Cache counterfactual/Action-Q modules are diagnostic history only.
 policy_schema = "adaptive_joint_cache_uav_ppo"
 kl_gate_mode = "branch_specific"
 hidden_sizes = [128, 128]
@@ -561,15 +561,16 @@ minibatch_size = 30
 advantage_normalization_mode = "centered_std"
 operation_advantage_normalization_mode = "fixed_reference_scale"
 operation_advantage_reference_scale = 0.02
-# Exact conditional candidate Q is consumed by the unchanged listwise
-# candidate teacher; the proposed operation head instead consumes the full
-# STAY/MOVE Exact-Q teacher KL and remains independently KL-gated.
-uav_candidate_advantage_source = "EXACT_CONDITIONAL_COUNTERFACTUAL_Q"
-candidate_advantage_normalization = "NONE"
-cache_trigger_advantage_source = "EXACT_NODE_COUNTERFACTUAL_Q"
-cache_candidate_advantage_source = "EXACT_NODE_CONDITIONAL_COUNTERFACTUAL_Q"
-cache_trigger_ratio_granularity = "NODE_ONLY"
-cache_candidate_ratio_granularity = "NODE_CONDITIONAL"
+# The UAV operation head consumes the full-information Exact-Q teacher KL;
+# its conditional candidate head remains the Exact-Q listwise teacher.
+uav_operation_advantage_source = "FULL_INFORMATION_EXACT_Q_TEACHER"
+uav_candidate_advantage_source = "EXACT_Q_LISTWISE"
+candidate_advantage_normalization = "EXACT_Q_LISTWISE"
+# Formal Cache actor credit is the selected joint branch's actual rollout GAE.
+cache_trigger_advantage_source = "GLOBAL_GAE"
+cache_candidate_advantage_source = "GLOBAL_GAE"
+cache_trigger_ratio_granularity = "WHOLE_CACHE_JOINT"
+cache_candidate_ratio_granularity = "WHOLE_CACHE_JOINT"
 cache_trigger_policy = "TRUE_BINARY_KEEP_UPDATE"
 cache_update_candidate_policy = "UNIFIED_CONDITIONAL_UPDATE_CANDIDATES"
 candidate_policy_improvement = "EXACT_Q_LISTWISE"

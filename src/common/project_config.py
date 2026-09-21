@@ -887,24 +887,24 @@ def validate_config(
             "algorithm.ppo.exact_q_listwise_temperature 必须是正的有限数。"
         )
     if policy_schema == proposed_schema:
-        if candidate_advantage_source != "EXACT_CONDITIONAL_COUNTERFACTUAL_Q":
+        if candidate_advantage_source != "EXACT_Q_LISTWISE":
             raise ValueError(
                 "proposed_joint requires algorithm.ppo.uav_candidate_advantage_source="
-                "EXACT_CONDITIONAL_COUNTERFACTUAL_Q."
+                "EXACT_Q_LISTWISE."
             )
-        if candidate_advantage_normalization != "NONE":
+        if candidate_advantage_normalization != "EXACT_Q_LISTWISE":
             raise ValueError(
-                "proposed_joint requires algorithm.ppo.candidate_advantage_normalization=NONE."
+                "proposed_joint requires algorithm.ppo.candidate_advantage_normalization=EXACT_Q_LISTWISE."
             )
         if candidate_policy_improvement != "EXACT_Q_LISTWISE":
             raise ValueError(
                 "proposed_joint requires algorithm.ppo.candidate_policy_improvement=EXACT_Q_LISTWISE."
             )
         proposed_cache_sources = {
-            "cache_trigger_advantage_source": "EXACT_NODE_COUNTERFACTUAL_Q",
-            "cache_candidate_advantage_source": "EXACT_NODE_CONDITIONAL_COUNTERFACTUAL_Q",
-            "cache_trigger_ratio_granularity": "NODE_ONLY",
-            "cache_candidate_ratio_granularity": "NODE_CONDITIONAL",
+            "cache_trigger_advantage_source": "GLOBAL_GAE",
+            "cache_candidate_advantage_source": "GLOBAL_GAE",
+            "cache_trigger_ratio_granularity": "WHOLE_CACHE_JOINT",
+            "cache_candidate_ratio_granularity": "WHOLE_CACHE_JOINT",
         }
         for field, expected in proposed_cache_sources.items():
             actual = str(get_config_value(config, f"algorithm.ppo.{field}", ""))
