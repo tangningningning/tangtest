@@ -5576,23 +5576,31 @@ class PPOV2Trainer:
         cls,
         q_stay: Any,
         candidate_q_values: Any,
+        rollout_candidate_probabilities: Any,
         candidate_valid_mask: Any,
         operation_valid_mask: Any,
         rollout_operation_masks: Any,
         temperature: float,
         reference_scale: float,
-    ) -> tuple[Any, Any, Any, Any]:
-        """Construct the binary operation teacher from the unchanged Q teacher.
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """Construct the binary operation teacher from frozen rollout values.
 
-        The MOVE value is the legal-candidate Exact-Q teacher expectation.  An
-        inactive candidate set has no MOVE value and is represented only by a
-        masked STAY teacher; it is never assigned a hard-max or fabricated
-        operation target.
+        The candidate head continues to use the unchanged legal-candidate
+        Exact-Q listwise teacher.  The operation head instead uses the
+        rollout-time candidate-policy expectation over the same full-branch
+        feasible candidate set.  An inactive candidate set has no MOVE value
+        and is represented only by a masked STAY teacher; it is never assigned
+        a hard-max or fabricated operation target.
         """
 
         q_values = torch.as_tensor(candidate_q_values, dtype=torch.float32)
         valid = torch.as_tensor(
             candidate_valid_mask, dtype=torch.bool, device=q_values.device
+        )
+        rollout_probabilities = torch.as_tensor(
+            rollout_candidate_probabilities,
+            dtype=torch.float32,
+            device=q_values.device,
         )
         stay_q = torch.as_tensor(q_stay, dtype=torch.float32, device=q_values.device)
         teacher_masks = torch.as_tensor(
@@ -5605,7 +5613,11 @@ class PPOV2Trainer:
             dtype=torch.bool,
             device=q_values.device,
         )
-        if q_values.shape != valid.shape or q_values.ndim < 1:
+        if (
+            q_values.shape != valid.shape
+            or rollout_probabilities.shape != q_values.shape
+            or q_values.ndim < 1
+        ):
             raise ValueError("operation teacher candidate Q shape mismatch")
         if stay_q.shape != q_values.shape[:-1]:
             raise ValueError("operation teacher STAY Q shape mismatch")
@@ -5618,12 +5630,51 @@ class PPOV2Trainer:
             raise ValueError("operation teacher reference scale must be positive and finite")
         if not bool(torch.all(torch.isfinite(stay_q)).item()):
             raise FloatingPointError("operation teacher STAY Q is non-finite")
+        if not bool(torch.all(torch.isfinite(rollout_probabilities)).item()):
+            raise FloatingPointError(
+                "operation teacher rollout candidate probabilities are non-finite"
+            )
+        if bool(torch.any(rollout_probabilities < 0.0).item()):
+            raise ValueError(
+                "operation teacher rollout candidate probabilities are negative"
+            )
         candidate_teacher = cls._exact_q_listwise_teacher(
             q_values,
             valid,
             temperature,
         ).to(q_values.device)
-        q_move_teacher = torch.sum(candidate_teacher * q_values, dim=-1)
+        q_move_listwise_teacher = torch.sum(candidate_teacher * q_values, dim=-1)
+        rollout_probabilities = torch.where(
+            valid,
+            rollout_probabilities,
+            torch.zeros_like(rollout_probabilities),
+        )
+        rollout_probability_mass = rollout_probabilities.sum(dim=-1, keepdim=True)
+        active_candidates = valid.any(dim=-1, keepdim=True)
+        if bool(
+            torch.any(
+                active_candidates
+                & ~torch.isclose(
+                    rollout_probability_mass,
+                    torch.ones_like(rollout_probability_mass),
+                    rtol=0.0,
+                    atol=1.0e-5,
+                )
+            ).item()
+        ):
+            raise ValueError(
+                "operation teacher rollout candidate probabilities are not normalized"
+            )
+        if bool(
+            torch.any(
+                (~active_candidates)
+                & (rollout_probability_mass != 0.0)
+            ).item()
+        ):
+            raise ValueError(
+                "inactive operation teacher candidate heads have non-zero probability mass"
+            )
+        q_move_operation = torch.sum(rollout_probabilities * q_values, dim=-1)
         move_legal = teacher_masks[..., 1]
         if bool(torch.any(teacher_masks & ~rollout_masks).item()):
             raise ValueError(
@@ -5633,7 +5684,7 @@ class PPOV2Trainer:
             raise ValueError("Exact-Q operation teacher has no valid operation")
         stay_legal = teacher_masks[..., 0]
         both_legal = stay_legal & move_legal
-        delta = q_move_teacher - stay_q
+        delta = q_move_operation - stay_q
         move_probability = torch.where(
             both_legal,
             torch.sigmoid(delta / scale),
@@ -5646,7 +5697,13 @@ class PPOV2Trainer:
         teacher = cls._masked_operation_probabilities(raw_teacher, teacher_masks)
         if not bool(torch.all(torch.isfinite(teacher)).item()):
             raise FloatingPointError("operation teacher is non-finite")
-        return teacher.detach(), q_move_teacher.detach(), move_probability.detach(), move_legal
+        return (
+            teacher.detach(),
+            q_move_operation.detach(),
+            q_move_listwise_teacher.detach(),
+            move_probability.detach(),
+            move_legal,
+        )
 
     @staticmethod
     def _operation_teacher_kl(
@@ -6213,7 +6270,8 @@ class PPOV2Trainer:
         uav_operation_old_probabilities_t = None
         uav_operation_teacher_probabilities_t = None
         uav_operation_teacher_move_probabilities_t = None
-        uav_operation_q_move_teacher_t = None
+        uav_operation_q_move_operation_t = None
+        uav_operation_q_move_listwise_teacher_t = None
         uav_operation_move_legal_t = None
         uav_operation_teacher_valid_mask_t = None
         if self._uses_exact_uav_candidate_credit():
@@ -6343,14 +6401,17 @@ class PPOV2Trainer:
                 raise RuntimeError(
                     "Exact-Q counterfactual operation validity mask shape mismatch"
                 )
+            assert conditional_candidate_old_probabilities_t is not None
             (
                 uav_operation_teacher_probabilities_t,
-                uav_operation_q_move_teacher_t,
+                uav_operation_q_move_operation_t,
+                uav_operation_q_move_listwise_teacher_t,
                 uav_operation_teacher_move_probabilities_t,
                 uav_operation_move_legal_t,
             ) = self._exact_q_operation_teacher(
                 q_stay_t,
                 conditional_candidate_q_values_t,
+                conditional_candidate_old_probabilities_t,
                 conditional_candidate_valid_mask_t,
                 uav_operation_teacher_valid_mask_t,
                 uav_operation_masks,
@@ -6954,7 +7015,7 @@ class PPOV2Trainer:
                                 and uav_operation_old_log_probs is not None
                                 and uav_candidate_old_log_probs is not None
                                 and uav_operation_teacher_probabilities_t is not None
-                                and uav_operation_q_move_teacher_t is not None
+                                and uav_operation_q_move_operation_t is not None
                                 and uav_operation_teacher_valid_mask_t is not None
                                 and conditional_candidate_q_values_t is not None
                                 and conditional_candidate_valid_mask_t is not None
@@ -6970,10 +7031,10 @@ class PPOV2Trainer:
                             )
                             operation_advantage = torch.where(
                                 uav_operation_teacher_valid_mask_t[indices].all(dim=-1),
-                                uav_operation_q_move_teacher_t[indices]
+                                uav_operation_q_move_operation_t[indices]
                                 - operation_q_stay[indices],
                                 torch.zeros_like(
-                                    uav_operation_q_move_teacher_t[indices]
+                                    uav_operation_q_move_operation_t[indices]
                                 ),
                             )
                             operation_teacher_policy_loss = self._operation_teacher_kl(
@@ -7992,7 +8053,8 @@ class PPOV2Trainer:
             assert uav_operation_masks is not None
             assert uav_operation_old_probabilities_t is not None
             assert uav_operation_teacher_probabilities_t is not None
-            assert uav_operation_q_move_teacher_t is not None
+            assert uav_operation_q_move_operation_t is not None
+            assert uav_operation_q_move_listwise_teacher_t is not None
             assert conditional_candidate_q_values_t is not None
             assert conditional_candidate_valid_mask_t is not None
             assert uav_operation_teacher_valid_mask_t is not None
@@ -8032,7 +8094,8 @@ class PPOV2Trainer:
                 dtype=torch.float32,
                 device=self.device,
             )
-            q_move_teacher_tensor = uav_operation_q_move_teacher_t
+            q_move_operation_tensor = uav_operation_q_move_operation_t
+            q_move_listwise_teacher_tensor = uav_operation_q_move_listwise_teacher_t
             candidate_valid = conditional_candidate_valid_mask_t
             operation_valid = uav_operation_teacher_valid_mask_t
             stay_legal = operation_valid[..., 0]
@@ -8048,10 +8111,15 @@ class PPOV2Trainer:
                 q_move_tensor,
                 torch.zeros_like(q_move_tensor),
             )
-            safe_q_move_teacher_tensor = torch.where(
+            safe_q_move_operation_tensor = torch.where(
                 move_legal,
-                q_move_teacher_tensor,
-                torch.zeros_like(q_move_teacher_tensor),
+                q_move_operation_tensor,
+                torch.zeros_like(q_move_operation_tensor),
+            )
+            safe_q_move_listwise_teacher_tensor = torch.where(
+                move_legal,
+                q_move_listwise_teacher_tensor,
+                torch.zeros_like(q_move_listwise_teacher_tensor),
             )
             candidate_q_masked = torch.where(
                 candidate_valid,
@@ -8073,7 +8141,7 @@ class PPOV2Trainer:
             )
             teacher_expected_q = (
                 teacher_probabilities[..., 0] * safe_q_stay_tensor
-                + teacher_probabilities[..., 1] * safe_q_move_teacher_tensor
+                + teacher_probabilities[..., 1] * safe_q_move_operation_tensor
             )
             operation_exact_q_regret = torch.clamp(
                 teacher_expected_q - policy_expected_q,
@@ -8102,22 +8170,78 @@ class PPOV2Trainer:
                 uav_selected_indices=uav_selected_indices,
                 old_uav_operation_probabilities=uav_operation_old_probabilities_t,
             )
-            q_move_teacher_better = move_legal & (
-                both_legal & (q_move_teacher_tensor > safe_q_stay_tensor)
+            q_move_listwise_teacher_better = both_legal & (
+                safe_q_move_listwise_teacher_tensor > safe_q_stay_tensor
+            )
+            q_move_operation_better = both_legal & (
+                safe_q_move_operation_tensor > safe_q_stay_tensor
             )
             q_move_best_better = both_legal & (
                 q_move_best_tensor > safe_q_stay_tensor
             )
             q_comparison_mask = both_legal
+            old_operation_move_probability = torch.where(
+                both_legal,
+                torch.sigmoid(
+                    (
+                        safe_q_move_listwise_teacher_tensor
+                        - safe_q_stay_tensor
+                    )
+                    / self.hyperparameters.operation_advantage_reference_scale
+                ),
+                torch.where(
+                    move_legal,
+                    torch.ones_like(safe_q_stay_tensor),
+                    torch.zeros_like(safe_q_stay_tensor),
+                ),
+            )
+            old_operation_teacher_probabilities = self._masked_operation_probabilities(
+                torch.stack(
+                    (
+                        1.0 - old_operation_move_probability,
+                        old_operation_move_probability,
+                    ),
+                    dim=-1,
+                ),
+                operation_valid,
+            )
             uav_operation_teacher_diagnostics = {
+                "OPERATION_MOVE_VALUE_SOURCE": (
+                    "ROLLOUT_POLICY_CANDIDATE_EXPECTATION"
+                ),
+                "OLD_OPERATION_MOVE_VALUE_SOURCE": (
+                    "LISTWISE_TEACHER_EXPECTATION"
+                ),
                 "Q_MOVE_POLICY_MEAN": _active_mean(
                     safe_q_move_tensor, move_legal
                 ),
+                "Q_MOVE_LISTWISE_TEACHER_MEAN": _active_mean(
+                    safe_q_move_listwise_teacher_tensor, move_legal
+                ),
                 "Q_MOVE_TEACHER_MEAN": _active_mean(
-                    safe_q_move_teacher_tensor, move_legal
+                    safe_q_move_listwise_teacher_tensor, move_legal
+                ),
+                "Q_MOVE_OPERATION_MEAN": _active_mean(
+                    safe_q_move_operation_tensor, move_legal
                 ),
                 "Q_MOVE_BEST_MEAN": _active_mean(q_move_best_tensor, move_legal),
                 "Q_STAY_MEAN": _active_mean(safe_q_stay_tensor, stay_legal),
+                "POLICY_MOVE_MINUS_STAY_MEAN": _active_mean(
+                    safe_q_move_tensor - safe_q_stay_tensor,
+                    q_comparison_mask,
+                ),
+                "LISTWISE_TEACHER_MOVE_MINUS_STAY_MEAN": _active_mean(
+                    safe_q_move_listwise_teacher_tensor - safe_q_stay_tensor,
+                    q_comparison_mask,
+                ),
+                "Q_MOVE_OPERATION_MINUS_STAY_MEAN": _active_mean(
+                    safe_q_move_operation_tensor - safe_q_stay_tensor,
+                    q_comparison_mask,
+                ),
+                "BEST_MOVE_MINUS_STAY_MEAN": _active_mean(
+                    q_move_best_tensor - safe_q_stay_tensor,
+                    q_comparison_mask,
+                ),
                 "MOVE_POLICY_BETTER_THAN_STAY_FRACTION": (
                     None
                     if not bool(torch.any(q_comparison_mask).item())
@@ -8132,11 +8256,33 @@ class PPOV2Trainer:
                         .cpu()
                     )
                 ),
+                "LISTWISE_TEACHER_MOVE_BETTER_THAN_STAY_FRACTION": (
+                    None
+                    if not bool(torch.any(q_comparison_mask).item())
+                    else float(
+                        q_move_listwise_teacher_better[q_comparison_mask]
+                        .to(torch.float32)
+                        .mean()
+                        .detach()
+                        .cpu()
+                    )
+                ),
                 "MOVE_TEACHER_BETTER_THAN_STAY_FRACTION": (
                     None
                     if legal_count == 0
-                    else float(q_move_teacher_better.sum().detach().cpu())
+                    else float(q_move_listwise_teacher_better.sum().detach().cpu())
                     / float(legal_count)
+                ),
+                "MOVE_OPERATION_BETTER_THAN_STAY_FRACTION": (
+                    None
+                    if not bool(torch.any(q_comparison_mask).item())
+                    else float(
+                        q_move_operation_better[q_comparison_mask]
+                        .to(torch.float32)
+                        .mean()
+                        .detach()
+                        .cpu()
+                    )
                 ),
                 "MOVE_BEST_BETTER_THAN_STAY_FRACTION": (
                     None
@@ -8146,6 +8292,9 @@ class PPOV2Trainer:
                 ),
                 "OPERATION_TEACHER_MOVE_PROB_MEAN": float(
                     teacher_probabilities[..., 1].mean().detach().cpu()
+                ),
+                "OLD_OPERATION_TEACHER_MOVE_PROB_MEAN": float(
+                    old_operation_teacher_probabilities[..., 1].mean().detach().cpu()
                 ),
                 "OPERATION_POLICY_MOVE_PROB_MEAN": float(
                     valid_final_operation_probabilities[..., 1].mean().detach().cpu()
@@ -8205,6 +8354,31 @@ class PPOV2Trainer:
                 ),
                 "UAV_OPERATION_FULL_ROLLOUT_KL": float(operation_full_rollout_kl),
             }
+            for head_index in range(int(q_move_tensor.shape[1])):
+                head_mask = q_comparison_mask[:, head_index]
+                uav_operation_teacher_diagnostics.update(
+                    {
+                        f"UAV_{head_index}_POLICY_Q_GAP_MEAN": _active_mean(
+                            (
+                                safe_q_move_tensor[:, head_index]
+                                - safe_q_stay_tensor[:, head_index]
+                            ),
+                            head_mask,
+                        ),
+                        f"UAV_{head_index}_NEW_TEACHER_P_MOVE_MEAN": float(
+                            teacher_probabilities[:, head_index, 1]
+                            .mean()
+                            .detach()
+                            .cpu()
+                        ),
+                        f"UAV_{head_index}_OLD_TEACHER_P_MOVE_MEAN": float(
+                            old_operation_teacher_probabilities[:, head_index, 1]
+                            .mean()
+                            .detach()
+                            .cpu()
+                        ),
+                    }
+                )
             uav_operation_full_rollout_kl_current = float(operation_full_rollout_kl)
         with torch.no_grad():
             if self._uses_exact_cache_credit():
