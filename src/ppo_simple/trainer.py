@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import errno
 import hashlib
 import importlib.util
 import json
 import math
+import multiprocessing as mp
 import random
 import sys
 import time
@@ -54,6 +56,13 @@ from .policy import (
 )
 from .cache_action_q import CacheActionQCritic
 from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
+from .exact_q_parallel import (
+    ExactQHeadPlan,
+    ExactQTransitionPlan,
+    evaluate_transition as evaluate_exact_q_transition,
+    initialize_worker as initialize_exact_q_worker,
+    new_timing_profile as new_exact_q_timing_profile,
+)
 from .primitive_control import PrimitiveTensorSpec, _intermediate_observation
 from .rollout import (
     SimpleRollout,
@@ -1658,6 +1667,10 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
                 "EXACT_Q_REWARD_ASSEMBLY_RUNTIME": "reward_assembly_runtime",
                 "EXACT_Q_CRITIC_RUNTIME": "critic_runtime",
                 "EXACT_Q_OTHER_RUNTIME": "other_runtime",
+                "PARALLEL_WORKER_STARTUP_RUNTIME": "parallel_worker_startup_runtime",
+                "WORK_ITEM_SERIALIZATION_RUNTIME": "work_item_serialization_runtime",
+                "RESULT_MERGE_RUNTIME": "result_merge_runtime",
+                "EXACT_Q_PARALLEL_WORKERS": "parallel_worker_count",
             }
             total_runtime = float(update.uav_operation_credit_runtime_seconds)
             if math.isfinite(total_runtime) and total_runtime > 0.0:
@@ -2757,9 +2770,13 @@ class PPOV2Trainer:
         critic_learning_rate_override: float | None = None,
         lr_experiment_axis: str | None = None,
         lr_experiment_value: float | None = None,
+        exact_q_parallel_workers: int = 1,
     ) -> None:
         _require_torch()
         self.context = context
+        self.exact_q_parallel_workers = int(exact_q_parallel_workers)
+        if self.exact_q_parallel_workers not in {1, 2, 4}:
+            raise ValueError("exact_q_parallel_workers must be one of 1, 2, or 4")
         self.hyperparameters = hyperparameters_from_project(context.cfg)
         self.configured_actor_learning_rate = float(
             self.hyperparameters.actor_learning_rate
@@ -3703,7 +3720,7 @@ class PPOV2Trainer:
             raise FloatingPointError("UAV full-rollout KL estimator is non-finite")
         return value
 
-    def _compute_exact_uav_operation_credit(
+    def _compute_exact_uav_operation_credit_legacy(
         self,
         rollout: SimpleRollout,
         *,
@@ -4701,6 +4718,775 @@ class PPOV2Trainer:
             "uav_cf_heads_with_infeasible_stay": int(
                 heads_with_infeasible_stay
             ),
+            "uav_cf_selected_action_infeasible_count": int(
+                selected_action_infeasible_count
+            ),
+            "invalid_full_branch_execute_slot_count": int(
+                invalid_full_branch_execute_slot_count
+            ),
+            "credit_runtime_seconds": credit_runtime_seconds,
+            "timing": dict(timing_profile),
+            "advantage_normalization": advantage_normalization,
+            "advantage_reference_scale": float(advantage_reference_scale),
+            "advantage_centering": False,
+            "advantage_sign_flip_count": sign_flip_count,
+            "ratio_granularity": "OPERATION_ONLY",
+        }
+
+    def _compute_exact_uav_operation_credit(
+        self,
+        rollout: SimpleRollout,
+        *,
+        target_transition_indices: tuple[int, ...] | None = None,
+        use_node_evaluation_cache: bool = True,
+    ) -> dict[str, Any]:
+        """Compute exact-Q credit with a serial RNG plan and staged workers.
+
+        All policy sampling remains in this process and in the original
+        transition/head order.  Workers receive only a deterministic,
+        transition-local plan and return branch rewards/observations.  Critic
+        inference and all PPO work remain in the trainer process.
+        """
+
+        if not self._uses_exact_uav_operation_credit():
+            return {}
+        all_transitions = tuple(rollout.transitions)
+        if target_transition_indices is None:
+            transitions = all_transitions
+        else:
+            selected_indices = tuple(int(index) for index in target_transition_indices)
+            if not selected_indices:
+                raise ValueError("proposed counterfactual target transition selection is empty")
+            if len(set(selected_indices)) != len(selected_indices):
+                raise ValueError("proposed counterfactual target transition selection repeats an index")
+            if any(index < 0 or index >= len(all_transitions) for index in selected_indices):
+                raise IndexError("proposed counterfactual target transition index is out of range")
+            transitions = tuple(all_transitions[index] for index in selected_indices)
+        if not transitions:
+            raise ValueError("proposed operation credit requires a non-empty rollout")
+        uav_ids = tuple(str(value) for value in self.context.action_spec.uav_ids)
+        head_count = len(uav_ids)
+        sample_count = len(transitions)
+        for transition in transitions:
+            if (
+                transition.previous_cache_state is None
+                or transition.previous_uav_positions is None
+                or transition.uav_operation_actions is None
+                or transition.uav_operation_masks is None
+                or transition.uav_operation_probabilities is None
+                or transition.uav_contexts is None
+                or transition.uav_candidate_features is None
+            ):
+                raise ValueError("proposed rollout is missing operation counterfactual tensors")
+
+        first_origin = int(transitions[0].origin_index)
+        last_origin = max(int(transition.origin_index) for transition in transitions)
+        include_bootstrap_step = not bool(
+            all(
+                bool(transition.done)
+                for transition in transitions
+                if int(transition.origin_index) == last_origin
+            )
+        )
+        aligned_span = last_origin - first_origin + 1 + int(include_bootstrap_step)
+        aligned_steps = aligned_train_steps(
+            self.context,
+            origin_start=first_origin,
+            max_steps=aligned_span,
+            include_bootstrap_step=include_bootstrap_step,
+        )
+        if len(aligned_steps) < aligned_span:
+            raise RuntimeError("proposed counterfactual replay is missing aligned next steps")
+        aligned_steps_by_origin = {
+            int(step.origin_index): step for step in aligned_steps
+        }
+        selected_aligned_steps = []
+        for transition in transitions:
+            try:
+                selected_aligned_steps.append(
+                    aligned_steps_by_origin[int(transition.origin_index)]
+                )
+            except KeyError as exc:
+                raise RuntimeError(
+                    "proposed counterfactual replay is missing a selected aligned step"
+                ) from exc
+        for transition, step in zip(transitions, selected_aligned_steps, strict=True):
+            if int(transition.origin_index) != int(step.origin_index):
+                raise RuntimeError("proposed counterfactual replay origin alignment failed")
+
+        q_stay = np.zeros((sample_count, head_count), dtype=np.float64)
+        q_move = np.zeros((sample_count, head_count), dtype=np.float64)
+        baseline = np.zeros((sample_count, head_count), dtype=np.float64)
+        move_candidate_counts = np.zeros((sample_count, head_count), dtype=np.int64)
+        candidate_capacity = int(transitions[0].uav_candidate_features.shape[1])
+        if candidate_capacity <= 0:
+            raise RuntimeError("proposed rollout candidate capacity must be positive")
+        if any(
+            int(transition.uav_candidate_features.shape[1]) != candidate_capacity
+            for transition in transitions
+        ):
+            raise RuntimeError("proposed rollout candidate capacity is not time-aligned")
+        candidate_q_values = np.zeros(
+            (sample_count, head_count, candidate_capacity), dtype=np.float64
+        )
+        candidate_probabilities_values = np.zeros_like(candidate_q_values)
+        candidate_valid_mask = np.zeros(
+            (sample_count, head_count, candidate_capacity), dtype=bool
+        )
+        candidate_proposal_sources = np.full(
+            (sample_count, head_count, candidate_capacity), "", dtype=object
+        )
+        candidate_move_distances = np.full(
+            (sample_count, head_count, candidate_capacity), np.nan, dtype=np.float64
+        )
+        candidate_weighted_mean_residual = np.zeros(
+            (sample_count, head_count), dtype=np.float64
+        )
+        counterfactual_operation_valid_mask = np.zeros(
+            (sample_count, head_count, 2), dtype=bool
+        )
+        timing_profile = new_exact_q_timing_profile()
+        started_at = time.perf_counter()
+        plans: list[ExactQTransitionPlan] = []
+
+        # SERIAL PLAN: this loop is deliberately the only place in the staged
+        # path that can call policy sampling or consume Torch RNG.
+        for transition_index, (transition, step) in enumerate(
+            zip(transitions, selected_aligned_steps, strict=True)
+        ):
+            previous_cache = np.asarray(
+                transition.previous_cache_state, dtype=np.int8
+            ).copy()
+            previous_uav = {
+                str(key): np.asarray(value, dtype=np.float64).copy()
+                for key, value in transition.previous_uav_positions.items()
+            }
+            production_final_uav = {
+                str(key): np.asarray(value, dtype=np.float64).copy()
+                for key, value in transition.next_uav_positions.items()
+            }
+            production_cache_triggers, production_uav_triggers = (
+                self.context.action_spec.action_vector_to_triggers(transition.action)
+            )
+            production_cache_triggers = np.asarray(
+                production_cache_triggers, dtype=np.int8
+            )
+            production_uav_triggers = {
+                str(key): int(value)
+                for key, value in production_uav_triggers.items()
+            }
+            production_cache_actions = tuple(
+                dict(value) for value in transition.cache_conditional_actions
+            )
+            production_uav_actions = tuple(
+                dict(value) for value in transition.uav_conditional_actions
+            )
+            if len(production_uav_actions) != head_count:
+                raise RuntimeError("proposed production UAV action count mismatch")
+            previous_uav_key = tuple(
+                (
+                    str(key),
+                    float(np.asarray(previous_uav[key], dtype=np.float64)[0]),
+                    float(np.asarray(previous_uav[key], dtype=np.float64)[1]),
+                )
+                for key in uav_ids
+            )
+            head_plans: list[ExactQHeadPlan] = []
+            for head_index, uav_id in enumerate(uav_ids):
+                # Preserve the production sampler's sequential conditional UAV
+                # state reconstruction exactly.
+                current_uav = {
+                    str(key): np.asarray(value, dtype=np.float64).copy()
+                    for key, value in transition.previous_uav_positions.items()
+                }
+                enumeration_triggers = {candidate_id: 0 for candidate_id in uav_ids}
+                for prior_index, prior_id in enumerate(uav_ids[:head_index]):
+                    prior_action = production_uav_actions[prior_index]
+                    if str(prior_action.get("conditional_action", "")).upper() == "TARGET_POSITION":
+                        current_uav[prior_id] = np.asarray(
+                            prior_action.get(
+                                "target_position", prior_action["after_position"]
+                            ),
+                            dtype=np.float64,
+                        )
+                        enumeration_triggers[prior_id] = 1
+                enumeration_triggers[uav_id] = 1
+                candidates = uav_configuration.enumerate_uav_target_candidates(
+                    current_uav,
+                    previous_uav,
+                    uav_id,
+                    enumeration_triggers,
+                    self.context.cfg,
+                    self.context.flight_boundary,
+                    scenario_slice=step.scenario_slice,
+                    cache_state=transition.next_cache_state,
+                    cache_nodes=self.context.cache_nodes,
+                    predicted_vehicle_positions=step.predicted_vehicle_positions,
+                )
+                move_count = len(candidates)
+                move_candidate_counts[transition_index, head_index] = move_count
+                if move_count > candidate_capacity:
+                    raise RuntimeError("proposed legal UAV candidates exceed rollout capacity")
+
+                raw_probabilities = np.asarray(
+                    transition.uav_operation_probabilities[head_index],
+                    dtype=np.float64,
+                ).reshape(-1)
+                operation_mask = np.asarray(
+                    transition.uav_operation_masks[head_index], dtype=bool
+                ).reshape(-1)
+                if raw_probabilities.shape != (2,) or operation_mask.shape != (2,):
+                    raise RuntimeError("proposed UAV operation probability/mask shape mismatch")
+                if move_count > 0 and bool(operation_mask[1]):
+                    probability_sum = float(raw_probabilities.sum())
+                    if (
+                        not np.all(np.isfinite(raw_probabilities))
+                        or probability_sum <= 0.0
+                    ):
+                        raise FloatingPointError(
+                            "proposed UAV operation probabilities are non-finite"
+                        )
+                else:
+                    raw_probabilities = np.asarray([1.0, 0.0], dtype=np.float64)
+
+                candidate_probabilities = np.zeros(0, dtype=np.float64)
+                if move_count:
+                    with torch.no_grad():
+                        candidate_sample = self.policy.sample_uav_candidate(
+                            transition.uav_contexts[head_index],
+                            np.asarray(
+                                transition.uav_candidate_features[
+                                    head_index, :move_count
+                                ],
+                                dtype=np.float32,
+                            ),
+                            deterministic=False,
+                        )
+                        candidate_probabilities = torch.softmax(
+                            candidate_sample.logits, dim=-1
+                        ).detach().cpu().numpy().astype(np.float64)
+                    if (
+                        candidate_probabilities.shape != (move_count,)
+                        or not np.all(np.isfinite(candidate_probabilities))
+                        or not np.isclose(
+                            float(candidate_probabilities.sum()), 1.0, atol=1.0e-5
+                        )
+                    ):
+                        raise FloatingPointError(
+                            "proposed candidate probabilities are non-finite or do not sum to one"
+                        )
+                current_position = np.asarray(current_uav[uav_id], dtype=np.float64).copy()
+                head_plans.append(
+                    ExactQHeadPlan(
+                        head_index=int(head_index),
+                        uav_id=str(uav_id),
+                        current_position=current_position,
+                        move_candidates=tuple(candidates),
+                        raw_operation_probabilities=raw_probabilities.copy(),
+                        operation_mask=operation_mask.copy(),
+                        candidate_probabilities=candidate_probabilities.copy(),
+                    )
+                )
+            next_step = (
+                None
+                if bool(transition.done)
+                else aligned_steps_by_origin.get(int(transition.origin_index) + 1)
+            )
+            if not bool(transition.done) and next_step is None:
+                raise RuntimeError(
+                    "proposed counterfactual replay is missing the next aligned step"
+                )
+            plans.append(
+                ExactQTransitionPlan(
+                    transition_index=int(transition_index),
+                    origin_index=int(transition.origin_index),
+                    done=bool(transition.done),
+                    step=step,
+                    next_step=next_step,
+                    previous_cache=previous_cache,
+                    previous_uav=previous_uav,
+                    production_final_uav=production_final_uav,
+                    next_cache_state=np.asarray(
+                        transition.next_cache_state, dtype=np.int8
+                    ).copy(),
+                    production_cache_triggers=production_cache_triggers.copy(),
+                    production_uav_triggers=dict(production_uav_triggers),
+                    production_cache_actions=production_cache_actions,
+                    production_uav_actions=production_uav_actions,
+                    uav_ids=uav_ids,
+                    previous_uav_key=previous_uav_key,
+                    heads=tuple(head_plans),
+                    use_node_evaluation_cache=bool(use_node_evaluation_cache),
+                )
+            )
+
+        worker_startup_runtime = 0.0
+        serialization_runtime = 0.0
+        if self.exact_q_parallel_workers == 1:
+            worker_results = [
+                evaluate_exact_q_transition(plan, self.context) for plan in plans
+            ]
+        else:
+            pool_started_at = time.perf_counter()
+            executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=int(self.exact_q_parallel_workers),
+                mp_context=mp.get_context("spawn"),
+                initializer=initialize_exact_q_worker,
+                initargs=(self.context,),
+            )
+            worker_startup_runtime = max(
+                time.perf_counter() - pool_started_at,
+                0.0,
+            )
+            serialization_started_at = time.perf_counter()
+            futures = [executor.submit(evaluate_exact_q_transition, plan) for plan in plans]
+            serialization_runtime = max(
+                time.perf_counter() - serialization_started_at,
+                0.0,
+            )
+            try:
+                worker_results = [
+                    future.result()
+                    for future in concurrent.futures.as_completed(futures)
+                ]
+            finally:
+                executor.shutdown(wait=True)
+        worker_results.sort(key=lambda result: int(result["transition_index"]))
+        if [int(result["transition_index"]) for result in worker_results] != list(
+            range(sample_count)
+        ):
+            raise RuntimeError("Exact-Q worker results are not a complete transition-index set")
+
+        aggregate_counts = {
+            name: 0
+            for name in (
+                "counterfactual_environment_executions",
+                "branch_request_count",
+                "unique_branch_count",
+                "branch_cache_hit_count",
+                "execute_slot_call_count",
+                "matching_call_count",
+                "kkt_call_count",
+                "kkt_cache_request_count",
+                "kkt_cache_hit_count",
+                "kkt_cache_miss_count",
+                "kkt_solver_call_count",
+                "node_eval_cache_request_count",
+                "node_eval_cache_hit_count",
+                "node_eval_cache_miss_count",
+                "node_eval_full_execution_count",
+                "ideal_utility_request_count",
+                "ideal_utility_cache_hit_count",
+                "ideal_utility_cache_miss_count",
+                "impact_scope_request_count",
+                "impact_scope_compute_count",
+                "impact_scope_reuse_count",
+                "stay_request_count",
+                "stay_infeasible_count",
+                "move_candidate_count",
+                "move_full_branch_feasible_count",
+                "move_full_branch_infeasible_count",
+                "heads_with_no_feasible_move",
+                "heads_with_infeasible_stay",
+                "selected_action_infeasible_count",
+                "invalid_full_branch_execute_slot_count",
+            )
+        }
+
+        merge_started_at = time.perf_counter()
+        for plan, worker_result in zip(plans, worker_results, strict=True):
+            counters = worker_result["counters"]
+            for name in (
+                "counterfactual_environment_executions",
+                "branch_request_count",
+                "unique_branch_count",
+                "branch_cache_hit_count",
+                "execute_slot_call_count",
+                "matching_call_count",
+                "kkt_call_count",
+                "kkt_cache_request_count",
+                "kkt_cache_hit_count",
+                "kkt_cache_miss_count",
+                "kkt_solver_call_count",
+                "node_eval_cache_request_count",
+                "node_eval_cache_hit_count",
+                "node_eval_cache_miss_count",
+                "node_eval_full_execution_count",
+                "ideal_utility_request_count",
+                "ideal_utility_cache_hit_count",
+                "ideal_utility_cache_miss_count",
+                "impact_scope_request_count",
+                "impact_scope_compute_count",
+                "impact_scope_reuse_count",
+                "stay_request_count",
+                "stay_infeasible_count",
+                "move_candidate_count",
+                "move_full_branch_feasible_count",
+                "move_full_branch_infeasible_count",
+                "heads_with_no_feasible_move",
+                "heads_with_infeasible_stay",
+                "selected_action_infeasible_count",
+                "invalid_full_branch_execute_slot_count",
+            ):
+                aggregate_counts[name] += int(counters.get(name, 0))
+            for key, value in worker_result["timing"].items():
+                timing_profile[key] = float(timing_profile.get(key, 0.0)) + float(value)
+
+            for head, head_result in zip(plan.heads, worker_result["head_results"], strict=True):
+                head_index = int(head.head_index)
+                move_candidates = head.move_candidates
+                move_count = len(move_candidates)
+                teacher_operation_mask = np.asarray(
+                    head_result["teacher_operation_mask"], dtype=bool
+                )
+                operation_mask = np.asarray(head.operation_mask, dtype=bool)
+                if teacher_operation_mask.shape != (2,) or operation_mask.shape != (2,):
+                    raise RuntimeError("proposed UAV operation mask shape mismatch")
+                if bool(np.any(teacher_operation_mask & ~operation_mask)):
+                    raise RuntimeError("Exact-Q teacher-valid operation is not rollout-legal")
+                counterfactual_operation_valid_mask[
+                    plan.transition_index, head_index
+                ] = teacher_operation_mask
+
+                raw_probabilities = np.asarray(
+                    head.raw_operation_probabilities, dtype=np.float64
+                ).reshape(-1)
+                if move_count > 0 and bool(operation_mask[1]):
+                    probability_sum = float(raw_probabilities.sum())
+                    if (
+                        not np.all(np.isfinite(raw_probabilities))
+                        or probability_sum <= 0.0
+                    ):
+                        raise FloatingPointError(
+                            "proposed UAV operation probabilities are non-finite"
+                        )
+                    p_stay, p_move = (raw_probabilities / probability_sum).tolist()
+                else:
+                    p_stay, p_move = 1.0, 0.0
+                teacher_probability_values = np.asarray(
+                    [float(p_stay), float(p_move)], dtype=np.float64
+                )
+                teacher_probability_values = np.where(
+                    teacher_operation_mask, teacher_probability_values, 0.0
+                )
+                teacher_probability_sum = float(teacher_probability_values.sum())
+                if (
+                    not math.isfinite(teacher_probability_sum)
+                    or teacher_probability_sum <= 0.0
+                ):
+                    raise FloatingPointError(
+                        "Exact-Q teacher-valid operation probability mass is empty"
+                    )
+                teacher_probability_values /= teacher_probability_sum
+                p_stay, p_move = teacher_probability_values.tolist()
+
+                candidate_probabilities = np.asarray(
+                    head.candidate_probabilities, dtype=np.float64
+                ).copy()
+                move_full_branch_feasible_mask = np.asarray(
+                    head_result["move_full_branch_feasible_mask"], dtype=bool
+                )
+                if move_count:
+                    candidate_probabilities = np.where(
+                        move_full_branch_feasible_mask,
+                        candidate_probabilities,
+                        0.0,
+                    )
+                    candidate_probability_sum = float(candidate_probabilities.sum())
+                    if bool(np.any(move_full_branch_feasible_mask)):
+                        if (
+                            not math.isfinite(candidate_probability_sum)
+                            or candidate_probability_sum <= 0.0
+                        ):
+                            raise FloatingPointError(
+                                "full-branch-valid UAV candidate probability mass is empty"
+                            )
+                        candidate_probabilities /= candidate_probability_sum
+                    else:
+                        candidate_probabilities.fill(0.0)
+
+                branch_rewards = np.asarray(
+                    worker_result["head_results"][head_index]["branch_rewards"],
+                    dtype=np.float64,
+                )
+                branch_observations = worker_result["head_results"][head_index][
+                    "branch_observations"
+                ]
+                branch_labels = worker_result["head_results"][head_index]["branch_labels"]
+                critic_started_at = time.perf_counter()
+                if plan.next_step is None:
+                    next_values = np.zeros(len(branch_rewards), dtype=np.float64)
+                else:
+                    if len(branch_observations) != len(branch_rewards) or any(
+                        observation is None for observation in branch_observations
+                    ):
+                        raise RuntimeError(
+                            "proposed counterfactual branch observation batch is incomplete"
+                        )
+                    next_observation_batch = np.stack(
+                        [
+                            np.asarray(observation, dtype=np.float32)
+                            for observation in branch_observations
+                        ],
+                        axis=0,
+                    )
+                    with torch.no_grad():
+                        if not hasattr(self.policy, "critic_value"):
+                            raise RuntimeError(
+                                "proposed policy does not expose the exact critic_value path"
+                            )
+                        value_tensor = self.policy.critic_value(next_observation_batch)
+                    next_values = (
+                        value_tensor.detach().cpu().numpy().reshape(-1).astype(np.float64)
+                    )
+                    if next_values.shape != (len(branch_rewards),):
+                        raise RuntimeError("proposed counterfactual critic batch shape mismatch")
+                    stay_full_branch_feasible = bool(
+                        head_result["stay_full_branch_feasible"]
+                    )
+                    if stay_full_branch_feasible:
+                        stay_label_index = next(
+                            index
+                            for index, label in enumerate(branch_labels)
+                            if label == ("STAY", None)
+                        )
+                        with torch.no_grad():
+                            _, stay_value_tensor = self.policy(
+                                branch_observations[stay_label_index]
+                            )
+                        next_values[stay_label_index] = float(
+                            stay_value_tensor.detach().cpu().reshape(-1)[0]
+                        )
+                timing_profile["critic_runtime"] += (
+                    time.perf_counter() - critic_started_at
+                )
+                q_values = np.asarray(branch_rewards, dtype=np.float64)
+                q_values += float(self.hyperparameters.gamma) * next_values
+                if not np.all(np.isfinite(q_values)):
+                    raise FloatingPointError("proposed counterfactual Q is non-finite")
+                q_stay_value = 0.0
+                move_values = np.zeros(move_count, dtype=np.float64)
+                for branch_index, (operation, candidate_index) in enumerate(branch_labels):
+                    if operation == "STAY":
+                        q_stay_value = float(q_values[branch_index])
+                    else:
+                        assert candidate_index is not None
+                        move_values[candidate_index] = float(q_values[branch_index])
+                q_stay[plan.transition_index, head_index] = q_stay_value
+                if bool(head_result["stay_full_branch_feasible"]) and not math.isfinite(
+                    q_stay_value
+                ):
+                    raise FloatingPointError("proposed exact-Q STAY value is non-finite")
+                if bool(np.any(move_full_branch_feasible_mask)):
+                    valid_indices = np.flatnonzero(move_full_branch_feasible_mask)
+                    candidate_q_values[
+                        plan.transition_index, head_index, valid_indices
+                    ] = move_values[valid_indices]
+                    for candidate_index in valid_indices.tolist():
+                        candidate = move_candidates[candidate_index]
+                        candidate_proposal_sources[
+                            plan.transition_index, head_index, candidate_index
+                        ] = str(candidate.proposal_source)
+                        candidate_move_distances[
+                            plan.transition_index, head_index, candidate_index
+                        ] = float(
+                            np.linalg.norm(
+                                np.asarray(candidate.target_position, dtype=np.float64)
+                                - np.asarray(candidate.before_position, dtype=np.float64)
+                            )
+                        )
+                    candidate_probabilities_values[
+                        plan.transition_index, head_index, :move_count
+                    ] = candidate_probabilities
+                    candidate_valid_mask[
+                        plan.transition_index, head_index, :move_count
+                    ] = move_full_branch_feasible_mask
+                    q_move_value = float(np.dot(candidate_probabilities, move_values))
+                    q_move[plan.transition_index, head_index] = q_move_value
+                    candidate_weighted_mean_residual[
+                        plan.transition_index, head_index
+                    ] = float(
+                        np.dot(candidate_probabilities, move_values - q_move_value)
+                    )
+                else:
+                    q_move[plan.transition_index, head_index] = 0.0
+                baseline[plan.transition_index, head_index] = (
+                    float(p_stay) * q_stay[plan.transition_index, head_index]
+                    + float(p_move) * q_move[plan.transition_index, head_index]
+                )
+        counterfactual_environment_executions = aggregate_counts[
+            "counterfactual_environment_executions"
+        ]
+        branch_request_count = aggregate_counts["branch_request_count"]
+        unique_branch_count = aggregate_counts["unique_branch_count"]
+        branch_cache_hit_count = aggregate_counts["branch_cache_hit_count"]
+        execute_slot_call_count = aggregate_counts["execute_slot_call_count"]
+        matching_call_count = aggregate_counts["matching_call_count"]
+        kkt_call_count = aggregate_counts["kkt_call_count"]
+        kkt_cache_request_count = aggregate_counts["kkt_cache_request_count"]
+        kkt_cache_hit_count = aggregate_counts["kkt_cache_hit_count"]
+        kkt_cache_miss_count = aggregate_counts["kkt_cache_miss_count"]
+        kkt_solver_call_count = aggregate_counts["kkt_solver_call_count"]
+        node_eval_cache_request_count = aggregate_counts["node_eval_cache_request_count"]
+        node_eval_cache_hit_count = aggregate_counts["node_eval_cache_hit_count"]
+        node_eval_cache_miss_count = aggregate_counts["node_eval_cache_miss_count"]
+        node_eval_full_execution_count = aggregate_counts["node_eval_full_execution_count"]
+        ideal_utility_request_count = aggregate_counts["ideal_utility_request_count"]
+        ideal_utility_cache_hit_count = aggregate_counts["ideal_utility_cache_hit_count"]
+        ideal_utility_cache_miss_count = aggregate_counts["ideal_utility_cache_miss_count"]
+        impact_scope_request_count = aggregate_counts["impact_scope_request_count"]
+        impact_scope_compute_count = aggregate_counts["impact_scope_compute_count"]
+        impact_scope_reuse_count = aggregate_counts["impact_scope_reuse_count"]
+        stay_request_count = aggregate_counts["stay_request_count"]
+        stay_infeasible_count = aggregate_counts["stay_infeasible_count"]
+        move_candidate_count = aggregate_counts["move_candidate_count"]
+        move_full_branch_feasible_count = aggregate_counts[
+            "move_full_branch_feasible_count"
+        ]
+        move_full_branch_infeasible_count = aggregate_counts[
+            "move_full_branch_infeasible_count"
+        ]
+        heads_with_no_feasible_move = aggregate_counts["heads_with_no_feasible_move"]
+        heads_with_infeasible_stay = aggregate_counts["heads_with_infeasible_stay"]
+        selected_action_infeasible_count = aggregate_counts[
+            "selected_action_infeasible_count"
+        ]
+        invalid_full_branch_execute_slot_count = aggregate_counts[
+            "invalid_full_branch_execute_slot_count"
+        ]
+        timing_profile["parallel_worker_startup_runtime"] = float(worker_startup_runtime)
+        timing_profile["work_item_serialization_runtime"] = float(serialization_runtime)
+        timing_profile["parallel_worker_count"] = float(self.exact_q_parallel_workers)
+        timing_profile["result_merge_runtime"] = max(
+            time.perf_counter() - merge_started_at - timing_profile["critic_runtime"],
+            0.0,
+        )
+
+        sampled_operations = np.asarray(
+            [
+                np.asarray(transition.uav_operation_actions, dtype=np.int64)
+                for transition in transitions
+            ],
+            dtype=np.int64,
+        )
+        raw_advantages = np.where(
+            sampled_operations == 0,
+            q_stay - baseline,
+            q_move - baseline,
+        )
+        if not np.all(np.isfinite(raw_advantages)):
+            raise FloatingPointError("proposed operation advantages are non-finite")
+        operation_normalization_mode = (
+            self.hyperparameters.operation_advantage_normalization_mode
+        )
+        if operation_normalization_mode == OPERATION_ADVANTAGE_NORMALIZATION_STD_ONLY:
+            population_std = float(np.std(raw_advantages, ddof=0))
+            if not math.isfinite(population_std):
+                raise FloatingPointError("proposed operation advantage std is non-finite")
+            scaled_advantages = raw_advantages / (population_std + 1.0e-8)
+            advantage_normalization = "STD_ONLY"
+            advantage_reference_scale = float(population_std)
+        elif (
+            operation_normalization_mode
+            == OPERATION_ADVANTAGE_NORMALIZATION_FIXED_REFERENCE_SCALE
+        ):
+            advantage_reference_scale = float(
+                self.hyperparameters.operation_advantage_reference_scale
+            )
+            if (
+                not math.isfinite(advantage_reference_scale)
+                or advantage_reference_scale <= 0.0
+            ):
+                raise FloatingPointError(
+                    "fixed-reference fixed operation advantage reference scale is invalid"
+                )
+            scaled_advantages = raw_advantages / advantage_reference_scale
+            advantage_normalization = "FIXED_REFERENCE_SCALE"
+        else:  # pragma: no cover - validated by hyperparameters_from_project
+            raise ValueError(
+                "unsupported operation advantage normalization mode: "
+                f"{operation_normalization_mode}"
+            )
+        nonzero = raw_advantages != 0.0
+        sign_flip_count = int(
+            np.count_nonzero(
+                nonzero
+                & (np.signbit(raw_advantages) != np.signbit(scaled_advantages))
+            )
+        )
+        if sign_flip_count != 0:
+            raise FloatingPointError("proposed std-only operation scaling flipped a sign")
+        if not np.all(np.isfinite(scaled_advantages)):
+            raise FloatingPointError("proposed scaled operation advantages are non-finite")
+        credit_runtime_seconds = float(time.perf_counter() - started_at)
+        classified_runtime_seconds = sum(
+            float(timing_profile[key])
+            for key in (
+                "matching_runtime",
+                "node_cache_lookup_runtime",
+                "node_eval_miss_runtime",
+                "kkt_runtime",
+                "branch_state_build_runtime",
+                "reward_assembly_runtime",
+                "critic_runtime",
+            )
+        )
+        timing_profile["other_runtime"] = (
+            credit_runtime_seconds - classified_runtime_seconds
+        )
+        return {
+            "raw_advantages": raw_advantages.astype(np.float32),
+            "scaled_advantages": scaled_advantages.astype(np.float32),
+            "q_stay": q_stay.astype(np.float32),
+            "q_move": q_move.astype(np.float32),
+            "baseline": baseline.astype(np.float32),
+            "counterfactual_environment_executions": int(
+                counterfactual_environment_executions
+            ),
+            "uav_exact_q_branch_request_count": int(branch_request_count),
+            "uav_exact_q_unique_branch_count": int(unique_branch_count),
+            "uav_exact_q_duplicate_branch_count": int(
+                branch_request_count - unique_branch_count
+            ),
+            "uav_exact_q_cache_hit_count": int(branch_cache_hit_count),
+            "execute_slot_call_count": int(execute_slot_call_count),
+            "matching_call_count": int(matching_call_count),
+            "kkt_call_count": int(kkt_call_count),
+            "kkt_cache_request_count": int(kkt_cache_request_count),
+            "kkt_cache_hit_count": int(kkt_cache_hit_count),
+            "kkt_cache_miss_count": int(kkt_cache_miss_count),
+            "kkt_solver_call_count": int(kkt_solver_call_count),
+            "node_eval_cache_request_count": int(node_eval_cache_request_count),
+            "node_eval_cache_hit_count": int(node_eval_cache_hit_count),
+            "node_eval_cache_miss_count": int(node_eval_cache_miss_count),
+            "node_eval_full_execution_count": int(node_eval_full_execution_count),
+            "ideal_utility_request_count": int(ideal_utility_request_count),
+            "ideal_utility_cache_hit_count": int(ideal_utility_cache_hit_count),
+            "ideal_utility_cache_miss_count": int(ideal_utility_cache_miss_count),
+            "impact_scope_request_count": int(impact_scope_request_count),
+            "impact_scope_compute_count": int(impact_scope_compute_count),
+            "impact_scope_reuse_count": int(impact_scope_reuse_count),
+            "mean_move_candidate_count": float(np.mean(move_candidate_counts)),
+            "move_candidate_counts": move_candidate_counts,
+            "candidate_q_values": candidate_q_values,
+            "candidate_probabilities": candidate_probabilities_values,
+            "candidate_valid_mask": candidate_valid_mask,
+            "candidate_proposal_sources": candidate_proposal_sources,
+            "candidate_move_distances": candidate_move_distances,
+            "candidate_q_move": q_move.copy(),
+            "candidate_weighted_mean_residual": candidate_weighted_mean_residual,
+            "counterfactual_operation_valid_mask": counterfactual_operation_valid_mask,
+            "uav_cf_stay_request_count": int(stay_request_count),
+            "uav_cf_stay_infeasible_count": int(stay_infeasible_count),
+            "uav_cf_move_candidate_count": int(move_candidate_count),
+            "uav_cf_move_full_branch_feasible_count": int(
+                move_full_branch_feasible_count
+            ),
+            "uav_cf_move_full_branch_infeasible_count": int(
+                move_full_branch_infeasible_count
+            ),
+            "uav_cf_heads_with_no_feasible_move": int(heads_with_no_feasible_move),
+            "uav_cf_heads_with_infeasible_stay": int(heads_with_infeasible_stay),
             "uav_cf_selected_action_infeasible_count": int(
                 selected_action_infeasible_count
             ),
@@ -8555,6 +9341,7 @@ def run_training(
     critic_learning_rate_override: float | None = None,
     lr_experiment_axis: str | None = None,
     lr_experiment_value: float | None = None,
+    exact_q_parallel_workers: int = 1,
     resume: bool = False,
     verbose: bool = False,
 ) -> None:
@@ -8688,6 +9475,7 @@ def run_training(
         critic_learning_rate_override=critic_learning_rate_override,
         lr_experiment_axis=lr_experiment_axis,
         lr_experiment_value=lr_experiment_value,
+        exact_q_parallel_workers=exact_q_parallel_workers,
     )
     config_hash = _config_hash(config_path)
     completed_episodes = 0
@@ -9853,6 +10641,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="runtime critic learning-rate override; default: use config",
     )
+    parser.add_argument(
+        "--exact-q-parallel-workers",
+        type=int,
+        choices=(1, 2, 4),
+        default=1,
+        help="staged deterministic UAV Exact-Q transition workers",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--verbose",
@@ -9894,6 +10689,7 @@ def main(argv: list[str] | None = None) -> int:
         episode_generation_device=args.episode_generation_device,
         actor_learning_rate_override=args.actor_learning_rate,
         critic_learning_rate_override=args.critic_learning_rate,
+        exact_q_parallel_workers=args.exact_q_parallel_workers,
         resume=bool(args.resume),
         verbose=bool(args.verbose),
     )

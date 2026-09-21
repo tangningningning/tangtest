@@ -7,6 +7,9 @@ name = "adaptive-cache-mec"
 version = "0.1.0"
 description = "Adaptive cache and MEC research environment"
 requires-python = ">=3.10"
+dependencies = [
+    "numba>=0.67.0",
+]
 
 [project.scripts]
 ppo-train = "ppo_simple.trainer:main"

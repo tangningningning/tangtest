@@ -163,5 +163,6 @@ PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m ppo_simpl
     --run-dir "$RUN_DIR" \
     --episode-pool "$EPISODE_POOL" \
     --episode-seed-start "$EPISODE_SEED_START" \
+    --exact-q-parallel-workers 4 \
     2> >(tee -a "$RUN_DIR/server_stderr.log" >&2) \
     | tee -a "$RUN_DIR/server_stdout.log"
