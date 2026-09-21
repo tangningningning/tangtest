@@ -10,6 +10,8 @@
 
 adaptive_cache_mec.zip
 
+.data/episode_pools/
+
 .reports/
 
 __pycache__/

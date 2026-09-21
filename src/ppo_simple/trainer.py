@@ -672,6 +672,12 @@ class UpdateResult:
     uav_exact_q_node_eval_cache_hit_count: int = 0
     uav_exact_q_node_eval_cache_miss_count: int = 0
     uav_exact_q_node_eval_full_execution_count: int = 0
+    uav_exact_q_ideal_utility_request_count: int = 0
+    uav_exact_q_ideal_utility_cache_hit_count: int = 0
+    uav_exact_q_ideal_utility_cache_miss_count: int = 0
+    uav_exact_q_impact_scope_request_count: int = 0
+    uav_exact_q_impact_scope_compute_count: int = 0
+    uav_exact_q_impact_scope_reuse_count: int = 0
     uav_operation_mean_move_candidate_count: float = math.nan
     uav_operation_credit_runtime_seconds: float = math.nan
     uav_operation_timing: dict[str, float] | None = None
@@ -1588,11 +1594,53 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
                 "NODE_EVAL_FULL_EXECUTION_COUNT": int(
                     update.uav_exact_q_node_eval_full_execution_count
                 ),
+                "IDEAL_UTILITY_REQUEST_COUNT": int(
+                    update.uav_exact_q_ideal_utility_request_count
+                ),
+                "IDEAL_UTILITY_CACHE_HIT_COUNT": int(
+                    update.uav_exact_q_ideal_utility_cache_hit_count
+                ),
+                "IDEAL_UTILITY_CACHE_MISS_COUNT": int(
+                    update.uav_exact_q_ideal_utility_cache_miss_count
+                ),
+                "IDEAL_UTILITY_CACHE_HIT_RATE": float(
+                    update.uav_exact_q_ideal_utility_cache_hit_count
+                    / update.uav_exact_q_ideal_utility_request_count
+                    if update.uav_exact_q_ideal_utility_request_count > 0
+                    else 0.0
+                ),
+                "IMPACT_SCOPE_REQUEST_COUNT": int(
+                    update.uav_exact_q_impact_scope_request_count
+                ),
+                "IMPACT_SCOPE_COMPUTE_COUNT": int(
+                    update.uav_exact_q_impact_scope_compute_count
+                ),
+                "IMPACT_SCOPE_REUSE_COUNT": int(
+                    update.uav_exact_q_impact_scope_reuse_count
+                ),
+                "IMPACT_SCOPE_REUSE_RATE": float(
+                    update.uav_exact_q_impact_scope_reuse_count
+                    / update.uav_exact_q_impact_scope_request_count
+                    if update.uav_exact_q_impact_scope_request_count > 0
+                    else 0.0
+                ),
             }
         )
         if update.uav_operation_timing is not None:
             timing_fields = {
                 "EXACT_Q_MATCHING_RUNTIME": "matching_runtime",
+                "MATCHING_PROFILE_TOTAL_RUNTIME": "matching_runtime",
+                "MATCHING_FEASIBLE_TARGET_RUNTIME": "matching_feasible_target_runtime",
+                "MATCHING_CANDIDATE_GENERATION_RUNTIME": "matching_candidate_generation_runtime",
+                "MATCHING_CANDIDATE_BUILD_RUNTIME": "matching_candidate_generation_runtime",
+                "MATCHING_IMPACT_SCOPE_RUNTIME": "matching_impact_scope_runtime",
+                "MATCHING_UPPER_BOUND_RUNTIME": "matching_upper_bound_runtime",
+                "MATCHING_IDEAL_UTILITY_RUNTIME": "matching_ideal_utility_runtime",
+                "MATCHING_CHANNEL_RATE_RUNTIME": "matching_channel_rate_runtime",
+                "MATCHING_EXACT_EVAL_ORCHESTRATION_RUNTIME": "matching_exact_eval_orchestration_runtime",
+                "MATCHING_EXACT_EVAL_CONTROL_RUNTIME": "matching_exact_eval_orchestration_runtime",
+                "MATCHING_REPLAY_TIEBREAK_RUNTIME": "matching_replay_tiebreak_runtime",
+                "MATCHING_OTHER_RUNTIME": "matching_other_runtime",
                 "EXACT_Q_NODE_CACHE_LOOKUP_RUNTIME": "node_cache_lookup_runtime",
                 # Node-evaluation miss time excludes the separately reported
                 # KKT allocation time so the categories remain disjoint.
@@ -1619,6 +1667,107 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
                         continue
                     fields[metric_name] = value
                     fields[f"{metric_name}_FRACTION"] = value / total_runtime
+                exact_eval_subhotspot_fields = {
+                    "EXACT_EVAL_KKT_CONVERSION_RUNTIME": "exact_eval_kkt_conversion_runtime",
+                    "EXACT_EVAL_STATE_COPY_RUNTIME": "exact_eval_state_copy_runtime",
+                    "EXACT_EVAL_AFFECTED_NODE_PREP_RUNTIME": "exact_eval_affected_node_prep_runtime",
+                    "EXACT_EVAL_NODE_CALL_ORCHESTRATION_RUNTIME": "exact_eval_node_call_orchestration_runtime",
+                    "EXACT_EVAL_RESULT_MERGE_RUNTIME": "exact_eval_result_merge_runtime",
+                    "EXACT_EVAL_NON_EDGE_PREP_RUNTIME": "exact_eval_non_edge_prep_runtime",
+                    "EXACT_EVAL_TARGET_COUNT_BUILD_RUNTIME": "exact_eval_target_count_build_runtime",
+                    "EXACT_EVAL_UTILITY_SUM_RUNTIME": "exact_eval_utility_sum_runtime",
+                    "EXACT_EVAL_OTHER_RUNTIME": "exact_eval_other_runtime",
+                }
+                exact_eval_control_runtime = float(
+                    update.uav_operation_timing.get(
+                        "matching_exact_eval_orchestration_runtime", 0.0
+                    )
+                )
+                classified_subhotspot_runtime = 0.0
+                for metric_name, timing_key in exact_eval_subhotspot_fields.items():
+                    value = float(update.uav_operation_timing.get(timing_key, 0.0))
+                    if not math.isfinite(value):
+                        continue
+                    fields[metric_name] = value
+                    if exact_eval_control_runtime > 0.0:
+                        fields[f"{metric_name}_FRACTION"] = (
+                            value / exact_eval_control_runtime
+                        )
+                    classified_subhotspot_runtime += value
+                fields["EXACT_EVAL_RECORD_BOOKKEEPING_RUNTIME"] = float(
+                    update.uav_operation_timing.get(
+                        "exact_eval_record_bookkeeping_runtime", 0.0
+                    )
+                )
+                fields["EXACT_EVAL_SUBHOTSPOT_CLASSIFIED_RUNTIME"] = (
+                    classified_subhotspot_runtime
+                )
+                fields["EXACT_EVAL_UNCLASSIFIED_RUNTIME"] = (
+                    exact_eval_control_runtime - classified_subhotspot_runtime
+                )
+                fields["CURRENT_KKT_CONVERSION_CALL_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "current_kkt_conversion_call_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CANDIDATE_KKT_CONVERSION_CALL_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "candidate_kkt_conversion_call_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["EXACT_EVAL_STATE_COPY_CALL_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "exact_eval_state_copy_call_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CURRENT_KKT_CONTEXT_REQUEST_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "current_kkt_context_request_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CURRENT_KKT_CONTEXT_REUSE_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "current_kkt_context_reuse_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CANDIDATE_KKT_CONTEXT_REQUEST_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "candidate_kkt_context_request_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CANDIDATE_KKT_CONTEXT_REUSE_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "candidate_kkt_context_reuse_count", 0.0
+                            )
+                        )
+                    )
+                )
     routing_metrics = {
         "UAV_OPERATION_FULL_ROLLOUT_KL": float(
             update.uav_operation_full_rollout_kl
@@ -3685,6 +3834,24 @@ class PPOV2Trainer:
         node_eval_cache_hit_count = 0
         node_eval_cache_miss_count = 0
         node_eval_full_execution_count = 0
+        ideal_utility_request_count = 0
+        ideal_utility_cache_hit_count = 0
+        ideal_utility_cache_miss_count = 0
+        impact_scope_request_count = 0
+        impact_scope_compute_count = 0
+        impact_scope_reuse_count = 0
+        counterfactual_operation_valid_mask = np.zeros(
+            (sample_count, head_count, 2), dtype=bool
+        )
+        stay_request_count = 0
+        stay_infeasible_count = 0
+        move_candidate_count = 0
+        move_full_branch_feasible_count = 0
+        move_full_branch_infeasible_count = 0
+        heads_with_no_feasible_move = 0
+        heads_with_infeasible_stay = 0
+        selected_action_infeasible_count = 0
+        invalid_full_branch_execute_slot_count = 0
         started_at = time.perf_counter()
         timing_profile = {
             "matching_runtime": 0.0,
@@ -3698,10 +3865,27 @@ class PPOV2Trainer:
             "reward_energy_aggregation_runtime": 0.0,
             "reward_cost_aggregation_runtime": 0.0,
             "reward_final_combination_runtime": 0.0,
-            "branch_state_build_runtime": 0.0,
-            "reward_assembly_runtime": 0.0,
-            "critic_runtime": 0.0,
-        }
+                "branch_state_build_runtime": 0.0,
+                "reward_assembly_runtime": 0.0,
+                "critic_runtime": 0.0,
+                "exact_eval_kkt_conversion_runtime": 0.0,
+                "exact_eval_state_copy_runtime": 0.0,
+                "exact_eval_affected_node_prep_runtime": 0.0,
+                "exact_eval_node_call_orchestration_runtime": 0.0,
+                "exact_eval_result_merge_runtime": 0.0,
+                "exact_eval_non_edge_prep_runtime": 0.0,
+                "exact_eval_target_count_build_runtime": 0.0,
+                "exact_eval_utility_sum_runtime": 0.0,
+                "exact_eval_record_bookkeeping_runtime": 0.0,
+                "exact_eval_other_runtime": 0.0,
+                "current_kkt_conversion_call_count": 0.0,
+                "candidate_kkt_conversion_call_count": 0.0,
+                "exact_eval_state_copy_call_count": 0.0,
+                "current_kkt_context_request_count": 0.0,
+                "current_kkt_context_reuse_count": 0.0,
+                "candidate_kkt_context_request_count": 0.0,
+                "candidate_kkt_context_reuse_count": 0.0,
+            }
 
         def _position_dict(source: dict[str, Any]) -> dict[str, np.ndarray]:
             return {
@@ -3737,6 +3921,25 @@ class PPOV2Trainer:
             if operation == "MOVE":
                 action["target_position"] = [float(value) for value in after]
             return action
+
+        def _full_branch_is_feasible(
+            previous_positions: dict[str, np.ndarray],
+            final_positions: dict[str, np.ndarray],
+            triggers: dict[str, int],
+        ) -> bool:
+            """Reuse the authoritative complete-transition UAV validator."""
+
+            try:
+                uav_configuration.validate_uav_configuration_transition(
+                    previous_positions,
+                    final_positions,
+                    triggers,
+                    self.context.cfg,
+                    self.context.flight_boundary,
+                )
+            except ValueError:
+                return False
+            return True
 
         for transition_index, (transition, step) in enumerate(
             zip(transitions, selected_aligned_steps, strict=True)
@@ -3819,8 +4022,97 @@ class PPOV2Trainer:
                 move_candidates = candidates
                 move_count = len(move_candidates)
                 move_candidate_counts[transition_index, head_index] = move_count
+                move_candidate_count += move_count
                 if move_count > int(transition.uav_candidate_features.shape[1]):
                     raise RuntimeError("proposed legal UAV candidates exceed rollout capacity")
+
+                stay_request_count += 1
+                stay_branch_final_uav = {
+                    key: value.copy() for key, value in production_final_uav.items()
+                }
+                stay_branch_final_uav[uav_id] = current_uav[uav_id].copy()
+                stay_branch_triggers = dict(production_uav_triggers)
+                stay_branch_triggers[uav_id] = 0
+                stay_full_branch_feasible = _full_branch_is_feasible(
+                    previous_uav,
+                    stay_branch_final_uav,
+                    stay_branch_triggers,
+                )
+                if not stay_full_branch_feasible:
+                    stay_infeasible_count += 1
+                    heads_with_infeasible_stay += 1
+
+                move_full_branch_feasible_mask = np.zeros(move_count, dtype=bool)
+                for candidate_index, candidate in enumerate(move_candidates):
+                    branch_final_uav = {
+                        key: value.copy() for key, value in production_final_uav.items()
+                    }
+                    branch_final_uav[uav_id] = np.asarray(
+                        candidate.target_position,
+                        dtype=np.float64,
+                    ).copy()
+                    branch_triggers = dict(production_uav_triggers)
+                    branch_triggers[uav_id] = 1
+                    move_full_branch_feasible_mask[candidate_index] = (
+                        _full_branch_is_feasible(
+                            previous_uav,
+                            branch_final_uav,
+                            branch_triggers,
+                        )
+                    )
+                move_full_branch_feasible_count += int(
+                    move_full_branch_feasible_mask.sum()
+                )
+                move_full_branch_infeasible_count += int(
+                    (~move_full_branch_feasible_mask).sum()
+                )
+                if not bool(np.any(move_full_branch_feasible_mask)):
+                    heads_with_no_feasible_move += 1
+
+                teacher_operation_mask = np.asarray(
+                    [
+                        bool(stay_full_branch_feasible),
+                        bool(np.any(move_full_branch_feasible_mask)),
+                    ],
+                    dtype=bool,
+                )
+                if not bool(np.any(teacher_operation_mask)):
+                    raise RuntimeError(
+                        "Exact-Q counterfactual operation has no feasible operation"
+                    )
+                counterfactual_operation_valid_mask[
+                    transition_index, head_index
+                ] = teacher_operation_mask
+
+                production_action = production_uav_actions[head_index]
+                production_operation = str(
+                    production_action.get("conditional_action", "")
+                ).upper()
+                if production_operation == "STAY":
+                    selected_full_branch_feasible = stay_full_branch_feasible
+                elif production_operation == "TARGET_POSITION":
+                    selected_index_value = production_action.get("selected_index")
+                    if selected_index_value is None:
+                        raise RuntimeError(
+                            "production MOVE action is missing selected_index"
+                        )
+                    selected_index_value = int(selected_index_value)
+                    if selected_index_value < 0 or selected_index_value >= move_count:
+                        raise RuntimeError(
+                            "production MOVE action selected_index is out of range"
+                        )
+                    selected_full_branch_feasible = bool(
+                        move_full_branch_feasible_mask[selected_index_value]
+                    )
+                else:
+                    raise RuntimeError(
+                        "production UAV action has an unsupported conditional_action"
+                    )
+                if not selected_full_branch_feasible:
+                    selected_action_infeasible_count += 1
+                    raise RuntimeError(
+                        "PRODUCTION_SELECTED_BRANCH_FULL_FEASIBLE = NO"
+                    )
 
                 raw_probabilities = np.asarray(
                     transition.uav_operation_probabilities[head_index],
@@ -3831,6 +4123,10 @@ class PPOV2Trainer:
                 ).reshape(-1)
                 if raw_probabilities.shape != (2,) or operation_mask.shape != (2,):
                     raise RuntimeError("proposed UAV operation probability/mask shape mismatch")
+                if bool(np.any(teacher_operation_mask & ~operation_mask)):
+                    raise RuntimeError(
+                        "Exact-Q teacher-valid operation is not rollout-legal"
+                    )
                 if move_count > 0 and bool(operation_mask[1]):
                     probability_sum = float(raw_probabilities.sum())
                     if (
@@ -3847,6 +4143,25 @@ class PPOV2Trainer:
                     # The masked production operation distribution has only
                     # STAY when no legal MOVE exists.
                     p_stay, p_move = 1.0, 0.0
+                teacher_probability_values = np.asarray(
+                    [float(p_stay), float(p_move)],
+                    dtype=np.float64,
+                )
+                teacher_probability_values = np.where(
+                    teacher_operation_mask,
+                    teacher_probability_values,
+                    0.0,
+                )
+                teacher_probability_sum = float(teacher_probability_values.sum())
+                if (
+                    not math.isfinite(teacher_probability_sum)
+                    or teacher_probability_sum <= 0.0
+                ):
+                    raise FloatingPointError(
+                        "Exact-Q teacher-valid operation probability mass is empty"
+                    )
+                teacher_probability_values /= teacher_probability_sum
+                p_stay, p_move = teacher_probability_values.tolist()
 
                 if move_count:
                     with torch.no_grad():
@@ -3873,11 +4188,23 @@ class PPOV2Trainer:
                         raise FloatingPointError(
                             "proposed candidate probabilities are non-finite or do not sum to one"
                         )
-                    if self._uses_exact_uav_candidate_credit():
-                        candidate_probability_sum = float(candidate_probabilities.sum())
-                        candidate_probabilities = (
-                            candidate_probabilities / candidate_probability_sum
-                        )
+                    candidate_probabilities = np.where(
+                        move_full_branch_feasible_mask,
+                        candidate_probabilities,
+                        0.0,
+                    )
+                    candidate_probability_sum = float(candidate_probabilities.sum())
+                    if bool(np.any(move_full_branch_feasible_mask)):
+                        if (
+                            not math.isfinite(candidate_probability_sum)
+                            or candidate_probability_sum <= 0.0
+                        ):
+                            raise FloatingPointError(
+                                "full-branch-valid UAV candidate probability mass is empty"
+                            )
+                        candidate_probabilities /= candidate_probability_sum
+                    else:
+                        candidate_probabilities.fill(0.0)
                 else:
                     candidate_probabilities = np.zeros(0, dtype=np.float64)
 
@@ -3905,6 +4232,10 @@ class PPOV2Trainer:
                     nonlocal kkt_cache_miss_count, kkt_solver_call_count
                     nonlocal node_eval_cache_request_count, node_eval_cache_hit_count
                     nonlocal node_eval_cache_miss_count, node_eval_full_execution_count
+                    nonlocal ideal_utility_request_count
+                    nonlocal ideal_utility_cache_hit_count, ideal_utility_cache_miss_count
+                    nonlocal impact_scope_request_count, impact_scope_compute_count
+                    nonlocal impact_scope_reuse_count
                     branch_state_started_at = time.perf_counter()
                     branch_final_uav = {
                         key: value.copy() for key, value in production_final_uav.items()
@@ -4033,6 +4364,24 @@ class PPOV2Trainer:
                     node_eval_full_execution_count += int(
                         result.matching_summary.get("NODE_EVAL_FULL_EXECUTION_COUNT", 0)
                     )
+                    ideal_utility_request_count += int(
+                        result.matching_summary.get("IDEAL_UTILITY_REQUEST_COUNT", 0)
+                    )
+                    ideal_utility_cache_hit_count += int(
+                        result.matching_summary.get("IDEAL_UTILITY_CACHE_HIT_COUNT", 0)
+                    )
+                    ideal_utility_cache_miss_count += int(
+                        result.matching_summary.get("IDEAL_UTILITY_CACHE_MISS_COUNT", 0)
+                    )
+                    impact_scope_request_count += int(
+                        result.matching_summary.get("IMPACT_SCOPE_REQUEST_COUNT", 0)
+                    )
+                    impact_scope_compute_count += int(
+                        result.matching_summary.get("IMPACT_SCOPE_COMPUTE_COUNT", 0)
+                    )
+                    impact_scope_reuse_count += int(
+                        result.matching_summary.get("IMPACT_SCOPE_REUSE_COUNT", 0)
+                    )
                     if not result.step_feasible:
                         raise RuntimeError(
                             "proposed counterfactual transition is infeasible: "
@@ -4072,24 +4421,33 @@ class PPOV2Trainer:
                 target_before = current_uav[uav_id].copy()
                 branch_rewards: list[float] = []
                 branch_observations: list[np.ndarray | None] = []
-                stay_reward, stay_observation = _evaluate_branch(
-                    "STAY",
-                    None,
-                    target_before,
-                    target_before,
-                )
-                branch_rewards.append(stay_reward)
-                branch_observations.append(stay_observation)
-                if move_count:
-                    for candidate_index, candidate in enumerate(move_candidates):
-                        move_reward, move_observation = _evaluate_branch(
-                            "MOVE",
-                            candidate_index,
-                            np.asarray(candidate.before_position, dtype=np.float64),
-                            np.asarray(candidate.target_position, dtype=np.float64),
-                        )
-                        branch_rewards.append(move_reward)
-                        branch_observations.append(move_observation)
+                branch_labels: list[tuple[str, int | None]] = []
+                if stay_full_branch_feasible:
+                    stay_reward, stay_observation = _evaluate_branch(
+                        "STAY",
+                        None,
+                        target_before,
+                        target_before,
+                    )
+                    branch_rewards.append(stay_reward)
+                    branch_observations.append(stay_observation)
+                    branch_labels.append(("STAY", None))
+                for candidate_index, candidate in enumerate(move_candidates):
+                    if not bool(move_full_branch_feasible_mask[candidate_index]):
+                        continue
+                    move_reward, move_observation = _evaluate_branch(
+                        "MOVE",
+                        candidate_index,
+                        np.asarray(candidate.before_position, dtype=np.float64),
+                        np.asarray(candidate.target_position, dtype=np.float64),
+                    )
+                    branch_rewards.append(move_reward)
+                    branch_observations.append(move_observation)
+                    branch_labels.append(("MOVE", candidate_index))
+                if not branch_rewards:
+                    raise RuntimeError(
+                        "Exact-Q counterfactual branch set is unexpectedly empty"
+                    )
 
                 critic_started_at = time.perf_counter()
                 if next_step is None:
@@ -4101,10 +4459,11 @@ class PPOV2Trainer:
                         raise RuntimeError(
                             "proposed counterfactual branch observation batch is incomplete"
                         )
-                    # Every branch above has already gone through the exact
-                    # environment/Matching/KKT path.  Only the critic inference
-                    # is batched here; branch order is STAY followed by the
-                    # stable legal MOVE candidate order.
+                    # Every valid branch above has already gone through the
+                    # exact environment/Matching/KKT path.  Only the critic
+                    # inference is batched here; the labels retain STAY and
+                    # the original MOVE candidate indices without compaction
+                    # of the stored candidate tensors.
                     next_observation_batch = np.stack(
                         [
                             np.asarray(observation, dtype=np.float32)
@@ -4125,16 +4484,22 @@ class PPOV2Trainer:
                         raise RuntimeError(
                             "proposed counterfactual critic batch shape mismatch"
                         )
-                    # Preserve the historical scalar STAY critic result exactly.
-                    # The MOVE candidates still use the batched path; this one
-                    # extra scalar call is negligible relative to the exact
-                    # Matching/KKT branches and keeps the operation-side PPO
-                    # loss within its stricter numerical equivalence gate.
-                    with torch.no_grad():
-                        _, stay_value_tensor = self.policy(branch_observations[0])
-                    next_values[0] = float(
-                        stay_value_tensor.detach().cpu().reshape(-1)[0]
-                    )
+                    # Preserve the historical scalar STAY critic result exactly
+                    # whenever STAY is a valid branch.  MOVE candidates still
+                    # use the batched path.
+                    if stay_full_branch_feasible:
+                        stay_label_index = next(
+                            index
+                            for index, label in enumerate(branch_labels)
+                            if label == ("STAY", None)
+                        )
+                        with torch.no_grad():
+                            _, stay_value_tensor = self.policy(
+                                branch_observations[stay_label_index]
+                            )
+                        next_values[stay_label_index] = float(
+                            stay_value_tensor.detach().cpu().reshape(-1)[0]
+                        )
                 timing_profile["critic_runtime"] += (
                     time.perf_counter() - critic_started_at
                 )
@@ -4142,48 +4507,60 @@ class PPOV2Trainer:
                 q_values += float(self.hyperparameters.gamma) * next_values
                 if not np.all(np.isfinite(q_values)):
                     raise FloatingPointError("proposed counterfactual Q is non-finite")
-                stay_q = float(q_values[0])
-                q_stay[transition_index, head_index] = stay_q
-                if move_count:
-                    move_values = q_values[1:]
+                q_stay_value = 0.0
+                move_values = np.zeros(move_count, dtype=np.float64)
+                for branch_index, (operation, candidate_index) in enumerate(
+                    branch_labels
+                ):
+                    if operation == "STAY":
+                        q_stay_value = float(q_values[branch_index])
+                    else:
+                        assert candidate_index is not None
+                        move_values[candidate_index] = float(q_values[branch_index])
+                q_stay[transition_index, head_index] = q_stay_value
+                if stay_full_branch_feasible and not math.isfinite(q_stay_value):
+                    raise FloatingPointError("proposed exact-Q STAY value is non-finite")
+                if bool(np.any(move_full_branch_feasible_mask)):
+                    valid_indices = np.flatnonzero(move_full_branch_feasible_mask)
                     candidate_q_values[
-                        transition_index, head_index, :move_count
-                    ] = move_values
-                    candidate_proposal_sources[
-                        transition_index, head_index, :move_count
-                    ] = [str(candidate.proposal_source) for candidate in move_candidates]
-                    candidate_move_distances[
-                        transition_index, head_index, :move_count
-                    ] = [
-                        float(
+                        transition_index, head_index, valid_indices
+                    ] = move_values[valid_indices]
+                    for candidate_index in valid_indices.tolist():
+                        candidate = move_candidates[candidate_index]
+                        candidate_proposal_sources[
+                            transition_index, head_index, candidate_index
+                        ] = str(candidate.proposal_source)
+                        candidate_move_distances[
+                            transition_index, head_index, candidate_index
+                        ] = float(
                             np.linalg.norm(
                                 np.asarray(candidate.target_position, dtype=np.float64)
                                 - np.asarray(candidate.before_position, dtype=np.float64)
                             )
                         )
-                        for candidate in move_candidates
-                    ]
                     candidate_probabilities_values[
                         transition_index, head_index, :move_count
                     ] = candidate_probabilities
                     candidate_valid_mask[
                         transition_index, head_index, :move_count
-                    ] = True
-                    q_move[transition_index, head_index] = float(
+                    ] = move_full_branch_feasible_mask
+                    q_move_value = float(
                         np.dot(candidate_probabilities, move_values)
                     )
+                    q_move[transition_index, head_index] = q_move_value
                     candidate_weighted_mean_residual[
                         transition_index, head_index
                     ] = float(
                         np.dot(
                             candidate_probabilities,
-                            move_values - q_move[transition_index, head_index],
+                            move_values - q_move_value,
                         )
                     )
                 else:
-                    # No MOVE branch exists, so its counterfactual value is
-                    # made equal to STAY and the masked MOVE probability is 0.
-                    q_move[transition_index, head_index] = stay_q
+                    # No full-branch-valid MOVE exists.  The safe placeholder
+                    # is never selected by the validity mask or used in the
+                    # operation baseline/teacher.
+                    q_move[transition_index, head_index] = 0.0
                 baseline[transition_index, head_index] = (
                     float(p_stay) * q_stay[transition_index, head_index]
                     + float(p_move) * q_move[transition_index, head_index]
@@ -4293,6 +4670,12 @@ class PPOV2Trainer:
             "node_eval_cache_hit_count": int(node_eval_cache_hit_count),
             "node_eval_cache_miss_count": int(node_eval_cache_miss_count),
             "node_eval_full_execution_count": int(node_eval_full_execution_count),
+            "ideal_utility_request_count": int(ideal_utility_request_count),
+            "ideal_utility_cache_hit_count": int(ideal_utility_cache_hit_count),
+            "ideal_utility_cache_miss_count": int(ideal_utility_cache_miss_count),
+            "impact_scope_request_count": int(impact_scope_request_count),
+            "impact_scope_compute_count": int(impact_scope_compute_count),
+            "impact_scope_reuse_count": int(impact_scope_reuse_count),
             "mean_move_candidate_count": float(np.mean(move_candidate_counts)),
             "move_candidate_counts": move_candidate_counts,
             "candidate_q_values": candidate_q_values,
@@ -4302,6 +4685,28 @@ class PPOV2Trainer:
             "candidate_move_distances": candidate_move_distances,
             "candidate_q_move": q_move.copy(),
             "candidate_weighted_mean_residual": candidate_weighted_mean_residual,
+            "counterfactual_operation_valid_mask": counterfactual_operation_valid_mask,
+            "uav_cf_stay_request_count": int(stay_request_count),
+            "uav_cf_stay_infeasible_count": int(stay_infeasible_count),
+            "uav_cf_move_candidate_count": int(move_candidate_count),
+            "uav_cf_move_full_branch_feasible_count": int(
+                move_full_branch_feasible_count
+            ),
+            "uav_cf_move_full_branch_infeasible_count": int(
+                move_full_branch_infeasible_count
+            ),
+            "uav_cf_heads_with_no_feasible_move": int(
+                heads_with_no_feasible_move
+            ),
+            "uav_cf_heads_with_infeasible_stay": int(
+                heads_with_infeasible_stay
+            ),
+            "uav_cf_selected_action_infeasible_count": int(
+                selected_action_infeasible_count
+            ),
+            "invalid_full_branch_execute_slot_count": int(
+                invalid_full_branch_execute_slot_count
+            ),
             "credit_runtime_seconds": credit_runtime_seconds,
             "timing": dict(timing_profile),
             "advantage_normalization": advantage_normalization,
@@ -4386,7 +4791,8 @@ class PPOV2Trainer:
         q_stay: Any,
         candidate_q_values: Any,
         candidate_valid_mask: Any,
-        operation_masks: Any,
+        operation_valid_mask: Any,
+        rollout_operation_masks: Any,
         temperature: float,
         reference_scale: float,
     ) -> tuple[Any, Any, Any, Any]:
@@ -4403,13 +4809,24 @@ class PPOV2Trainer:
             candidate_valid_mask, dtype=torch.bool, device=q_values.device
         )
         stay_q = torch.as_tensor(q_stay, dtype=torch.float32, device=q_values.device)
-        masks = torch.as_tensor(operation_masks, dtype=torch.bool, device=q_values.device)
+        teacher_masks = torch.as_tensor(
+            operation_valid_mask,
+            dtype=torch.bool,
+            device=q_values.device,
+        )
+        rollout_masks = torch.as_tensor(
+            rollout_operation_masks,
+            dtype=torch.bool,
+            device=q_values.device,
+        )
         if q_values.shape != valid.shape or q_values.ndim < 1:
             raise ValueError("operation teacher candidate Q shape mismatch")
         if stay_q.shape != q_values.shape[:-1]:
             raise ValueError("operation teacher STAY Q shape mismatch")
-        if masks.shape != stay_q.shape + (2,):
-            raise ValueError("operation teacher operation mask shape mismatch")
+        if teacher_masks.shape != stay_q.shape + (2,):
+            raise ValueError("operation teacher validity mask shape mismatch")
+        if rollout_masks.shape != teacher_masks.shape:
+            raise ValueError("operation teacher rollout mask shape mismatch")
         scale = float(reference_scale)
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError("operation teacher reference scale must be positive and finite")
@@ -4421,23 +4838,26 @@ class PPOV2Trainer:
             temperature,
         ).to(q_values.device)
         q_move_teacher = torch.sum(candidate_teacher * q_values, dim=-1)
-        move_legal = valid.any(dim=-1)
-        if bool(torch.any(move_legal & ~masks[..., 1]).item()) or bool(
-            torch.any(~move_legal & masks[..., 1]).item()
-        ):
+        move_legal = teacher_masks[..., 1]
+        if bool(torch.any(teacher_masks & ~rollout_masks).item()):
             raise ValueError(
-                "Exact-Q candidate legality disagrees with the rollout MOVE mask"
+                "Exact-Q teacher-valid operation is not rollout-legal"
             )
+        if bool(torch.any(~teacher_masks.any(dim=-1)).item()):
+            raise ValueError("Exact-Q operation teacher has no valid operation")
+        stay_legal = teacher_masks[..., 0]
+        both_legal = stay_legal & move_legal
         delta = q_move_teacher - stay_q
-        move_probability = torch.sigmoid(delta / scale)
+        move_probability = torch.where(
+            both_legal,
+            torch.sigmoid(delta / scale),
+            torch.where(move_legal, torch.ones_like(delta), torch.zeros_like(delta)),
+        )
         raw_teacher = torch.stack(
             (1.0 - move_probability, move_probability),
             dim=-1,
         )
-        stay_only = torch.zeros_like(raw_teacher)
-        stay_only[..., 0] = 1.0
-        raw_teacher = torch.where(move_legal.unsqueeze(-1), raw_teacher, stay_only)
-        teacher = cls._masked_operation_probabilities(raw_teacher, masks)
+        teacher = cls._masked_operation_probabilities(raw_teacher, teacher_masks)
         if not bool(torch.all(torch.isfinite(teacher)).item()):
             raise FloatingPointError("operation teacher is non-finite")
         return teacher.detach(), q_move_teacher.detach(), move_probability.detach(), move_legal
@@ -4891,6 +5311,49 @@ class PPOV2Trainer:
                 rollout,
                 uav_operation_credit,
             )
+            uav_operation_diagnostics.update(
+                {
+                    "UAV_CF_STAY_REQUEST_COUNT": int(
+                        uav_operation_credit.get("uav_cf_stay_request_count", 0)
+                    ),
+                    "UAV_CF_STAY_INFEASIBLE_COUNT": int(
+                        uav_operation_credit.get("uav_cf_stay_infeasible_count", 0)
+                    ),
+                    "UAV_CF_MOVE_CANDIDATE_COUNT": int(
+                        uav_operation_credit.get("uav_cf_move_candidate_count", 0)
+                    ),
+                    "UAV_CF_MOVE_FULL_BRANCH_FEASIBLE_COUNT": int(
+                        uav_operation_credit.get(
+                            "uav_cf_move_full_branch_feasible_count", 0
+                        )
+                    ),
+                    "UAV_CF_MOVE_FULL_BRANCH_INFEASIBLE_COUNT": int(
+                        uav_operation_credit.get(
+                            "uav_cf_move_full_branch_infeasible_count", 0
+                        )
+                    ),
+                    "UAV_CF_HEADS_WITH_NO_FEASIBLE_MOVE": int(
+                        uav_operation_credit.get(
+                            "uav_cf_heads_with_no_feasible_move", 0
+                        )
+                    ),
+                    "UAV_CF_HEADS_WITH_INFEASIBLE_STAY": int(
+                        uav_operation_credit.get(
+                            "uav_cf_heads_with_infeasible_stay", 0
+                        )
+                    ),
+                    "UAV_CF_SELECTED_ACTION_INFEASIBLE_COUNT": int(
+                        uav_operation_credit.get(
+                            "uav_cf_selected_action_infeasible_count", 0
+                        )
+                    ),
+                    "INVALID_FULL_BRANCH_EXECUTE_SLOT_COUNT": int(
+                        uav_operation_credit.get(
+                            "invalid_full_branch_execute_slot_count", 0
+                        )
+                    ),
+                }
+            )
         cache_credit: dict[str, Any] = {}
         cache_proposal_diagnostics: dict[str, Any] | None = None
         if cache_credit:
@@ -4966,6 +5429,7 @@ class PPOV2Trainer:
         uav_operation_teacher_move_probabilities_t = None
         uav_operation_q_move_teacher_t = None
         uav_operation_move_legal_t = None
+        uav_operation_teacher_valid_mask_t = None
         if self._uses_exact_uav_candidate_credit():
             for key in (
                 "candidate_q_values",
@@ -5082,6 +5546,17 @@ class PPOV2Trainer:
                 dtype=torch.float32,
                 device=self.device,
             )
+            uav_operation_teacher_valid_mask_t = torch.as_tensor(
+                uav_operation_credit["counterfactual_operation_valid_mask"],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if tuple(uav_operation_teacher_valid_mask_t.shape) != tuple(
+                uav_operation_masks.shape
+            ):
+                raise RuntimeError(
+                    "Exact-Q counterfactual operation validity mask shape mismatch"
+                )
             (
                 uav_operation_teacher_probabilities_t,
                 uav_operation_q_move_teacher_t,
@@ -5091,6 +5566,7 @@ class PPOV2Trainer:
                 q_stay_t,
                 conditional_candidate_q_values_t,
                 conditional_candidate_valid_mask_t,
+                uav_operation_teacher_valid_mask_t,
                 uav_operation_masks,
                 self.uav_exact_q_listwise_temperature,
                 hyper.operation_advantage_reference_scale,
@@ -5693,6 +6169,7 @@ class PPOV2Trainer:
                                 and uav_candidate_old_log_probs is not None
                                 and uav_operation_teacher_probabilities_t is not None
                                 and uav_operation_q_move_teacher_t is not None
+                                and uav_operation_teacher_valid_mask_t is not None
                                 and conditional_candidate_q_values_t is not None
                                 and conditional_candidate_valid_mask_t is not None
                             )
@@ -5700,13 +6177,18 @@ class PPOV2Trainer:
                                 evaluation.uav_operation_log_probs
                                 - uav_operation_old_log_probs[indices]
                             )
-                            operation_advantage = (
+                            operation_q_stay = torch.as_tensor(
+                                uav_operation_credit["q_stay"],
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            operation_advantage = torch.where(
+                                uav_operation_teacher_valid_mask_t[indices].all(dim=-1),
                                 uav_operation_q_move_teacher_t[indices]
-                                - torch.as_tensor(
-                                    uav_operation_credit["q_stay"],
-                                    dtype=torch.float32,
-                                    device=self.device,
-                                )[indices]
+                                - operation_q_stay[indices],
+                                torch.zeros_like(
+                                    uav_operation_q_move_teacher_t[indices]
+                                ),
                             )
                             operation_teacher_policy_loss = self._operation_teacher_kl(
                                 evaluation.uav_operation_log_probs_all,
@@ -6727,6 +7209,7 @@ class PPOV2Trainer:
             assert uav_operation_q_move_teacher_t is not None
             assert conditional_candidate_q_values_t is not None
             assert conditional_candidate_valid_mask_t is not None
+            assert uav_operation_teacher_valid_mask_t is not None
             with torch.no_grad():
                 final_operation_evaluation = self.policy.evaluate_joint_cache_uav_operation(
                     observations,
@@ -6765,20 +7248,46 @@ class PPOV2Trainer:
             )
             q_move_teacher_tensor = uav_operation_q_move_teacher_t
             candidate_valid = conditional_candidate_valid_mask_t
-            move_legal = candidate_valid.any(dim=-1)
+            operation_valid = uav_operation_teacher_valid_mask_t
+            stay_legal = operation_valid[..., 0]
+            move_legal = operation_valid[..., 1]
+            both_legal = stay_legal & move_legal
+            safe_q_stay_tensor = torch.where(
+                stay_legal,
+                q_stay_tensor,
+                torch.zeros_like(q_stay_tensor),
+            )
+            safe_q_move_tensor = torch.where(
+                move_legal,
+                q_move_tensor,
+                torch.zeros_like(q_move_tensor),
+            )
+            safe_q_move_teacher_tensor = torch.where(
+                move_legal,
+                q_move_teacher_tensor,
+                torch.zeros_like(q_move_teacher_tensor),
+            )
             candidate_q_masked = torch.where(
                 candidate_valid,
                 conditional_candidate_q_values_t,
-                torch.full_like(conditional_candidate_q_values_t, -float("inf")),
+                torch.zeros_like(conditional_candidate_q_values_t),
             )
-            q_move_best_tensor = candidate_q_masked.amax(dim=-1)
+            q_move_best_tensor = torch.where(
+                move_legal,
+                candidate_q_masked.amax(dim=-1),
+                torch.zeros_like(q_move_tensor),
+            )
+            valid_final_operation_probabilities = self._masked_operation_probabilities(
+                final_operation_probabilities,
+                operation_valid,
+            )
             policy_expected_q = (
-                final_operation_probabilities[..., 0] * q_stay_tensor
-                + final_operation_probabilities[..., 1] * q_move_tensor
+                valid_final_operation_probabilities[..., 0] * safe_q_stay_tensor
+                + valid_final_operation_probabilities[..., 1] * safe_q_move_tensor
             )
             teacher_expected_q = (
-                teacher_probabilities[..., 0] * q_stay_tensor
-                + teacher_probabilities[..., 1] * q_move_teacher_tensor
+                teacher_probabilities[..., 0] * safe_q_stay_tensor
+                + teacher_probabilities[..., 1] * safe_q_move_teacher_tensor
             )
             operation_exact_q_regret = torch.clamp(
                 teacher_expected_q - policy_expected_q,
@@ -6808,22 +7317,34 @@ class PPOV2Trainer:
                 old_uav_operation_probabilities=uav_operation_old_probabilities_t,
             )
             q_move_teacher_better = move_legal & (
-                q_move_teacher_tensor > q_stay_tensor
+                both_legal & (q_move_teacher_tensor > safe_q_stay_tensor)
             )
-            q_move_best_better = move_legal & (q_move_best_tensor > q_stay_tensor)
+            q_move_best_better = both_legal & (
+                q_move_best_tensor > safe_q_stay_tensor
+            )
+            q_comparison_mask = both_legal
             uav_operation_teacher_diagnostics = {
-                "Q_MOVE_POLICY_MEAN": float(q_move_tensor.mean().detach().cpu()),
+                "Q_MOVE_POLICY_MEAN": _active_mean(
+                    safe_q_move_tensor, move_legal
+                ),
                 "Q_MOVE_TEACHER_MEAN": _active_mean(
-                    q_move_teacher_tensor, move_legal
+                    safe_q_move_teacher_tensor, move_legal
                 ),
                 "Q_MOVE_BEST_MEAN": _active_mean(q_move_best_tensor, move_legal),
-                "Q_STAY_MEAN": float(q_stay_tensor.mean().detach().cpu()),
-                "MOVE_POLICY_BETTER_THAN_STAY_FRACTION": float(
-                    (q_move_tensor > q_stay_tensor)
-                    .to(torch.float32)
-                    .mean()
-                    .detach()
-                    .cpu()
+                "Q_STAY_MEAN": _active_mean(safe_q_stay_tensor, stay_legal),
+                "MOVE_POLICY_BETTER_THAN_STAY_FRACTION": (
+                    None
+                    if not bool(torch.any(q_comparison_mask).item())
+                    else float(
+                        (
+                            safe_q_move_tensor[q_comparison_mask]
+                            > safe_q_stay_tensor[q_comparison_mask]
+                        )
+                        .to(torch.float32)
+                        .mean()
+                        .detach()
+                        .cpu()
+                    )
                 ),
                 "MOVE_TEACHER_BETTER_THAN_STAY_FRACTION": (
                     None
@@ -6841,7 +7362,7 @@ class PPOV2Trainer:
                     teacher_probabilities[..., 1].mean().detach().cpu()
                 ),
                 "OPERATION_POLICY_MOVE_PROB_MEAN": float(
-                    final_operation_probabilities[..., 1].mean().detach().cpu()
+                    valid_final_operation_probabilities[..., 1].mean().detach().cpu()
                 ),
                 "OPERATION_TEACHER_POLICY_KL": float(
                     self._operation_teacher_kl(
@@ -6860,6 +7381,41 @@ class PPOV2Trainer:
                 ),
                 "OPERATION_EXACT_Q_REGRET": float(
                     operation_exact_q_regret.mean().detach().cpu()
+                ),
+                "UAV_CF_STAY_REQUEST_COUNT": int(
+                    uav_operation_credit.get("uav_cf_stay_request_count", 0)
+                ),
+                "UAV_CF_STAY_INFEASIBLE_COUNT": int(
+                    uav_operation_credit.get("uav_cf_stay_infeasible_count", 0)
+                ),
+                "UAV_CF_MOVE_CANDIDATE_COUNT": int(
+                    uav_operation_credit.get("uav_cf_move_candidate_count", 0)
+                ),
+                "UAV_CF_MOVE_FULL_BRANCH_FEASIBLE_COUNT": int(
+                    uav_operation_credit.get(
+                        "uav_cf_move_full_branch_feasible_count", 0
+                    )
+                ),
+                "UAV_CF_MOVE_FULL_BRANCH_INFEASIBLE_COUNT": int(
+                    uav_operation_credit.get(
+                        "uav_cf_move_full_branch_infeasible_count", 0
+                    )
+                ),
+                "UAV_CF_HEADS_WITH_NO_FEASIBLE_MOVE": int(
+                    uav_operation_credit.get("uav_cf_heads_with_no_feasible_move", 0)
+                ),
+                "UAV_CF_HEADS_WITH_INFEASIBLE_STAY": int(
+                    uav_operation_credit.get("uav_cf_heads_with_infeasible_stay", 0)
+                ),
+                "UAV_CF_SELECTED_ACTION_INFEASIBLE_COUNT": int(
+                    uav_operation_credit.get(
+                        "uav_cf_selected_action_infeasible_count", 0
+                    )
+                ),
+                "INVALID_FULL_BRANCH_EXECUTE_SLOT_COUNT": int(
+                    uav_operation_credit.get(
+                        "invalid_full_branch_execute_slot_count", 0
+                    )
                 ),
                 "UAV_OPERATION_FULL_ROLLOUT_KL": float(operation_full_rollout_kl),
             }
@@ -7177,6 +7733,24 @@ class PPOV2Trainer:
             ),
             uav_exact_q_node_eval_full_execution_count=int(
                 uav_operation_credit.get("node_eval_full_execution_count", 0)
+            ),
+            uav_exact_q_ideal_utility_request_count=int(
+                uav_operation_credit.get("ideal_utility_request_count", 0)
+            ),
+            uav_exact_q_ideal_utility_cache_hit_count=int(
+                uav_operation_credit.get("ideal_utility_cache_hit_count", 0)
+            ),
+            uav_exact_q_ideal_utility_cache_miss_count=int(
+                uav_operation_credit.get("ideal_utility_cache_miss_count", 0)
+            ),
+            uav_exact_q_impact_scope_request_count=int(
+                uav_operation_credit.get("impact_scope_request_count", 0)
+            ),
+            uav_exact_q_impact_scope_compute_count=int(
+                uav_operation_credit.get("impact_scope_compute_count", 0)
+            ),
+            uav_exact_q_impact_scope_reuse_count=int(
+                uav_operation_credit.get("impact_scope_reuse_count", 0)
             ),
             uav_operation_mean_move_candidate_count=float(
                 uav_operation_credit.get("mean_move_candidate_count", math.nan)

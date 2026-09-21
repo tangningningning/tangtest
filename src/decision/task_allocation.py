@@ -26,11 +26,41 @@ from typing import Any
 
 import numpy as np
 
+try:
+    import numba
+except ModuleNotFoundError:  # pragma: no cover - server fallback without Numba
+    numba = None  # type: ignore[assignment]
+
 from common import project_config, system_model
 from decision import cache_configuration, uav_configuration
 from scenario import task_scenario
 
 LOCAL_PREFIX = "LOCAL:"
+
+
+def _profile_add(
+    timing_profile: dict[str, float] | None,
+    key: str,
+    elapsed: float,
+) -> None:
+    if timing_profile is not None:
+        timing_profile[key] = float(timing_profile.get(key, 0.0)) + max(
+            float(elapsed),
+            0.0,
+        )
+
+
+_EXACT_EVAL_SUBHOTSPOT_RUNTIME_KEYS = (
+    "exact_eval_kkt_conversion_runtime",
+    "exact_eval_state_copy_runtime",
+    "exact_eval_affected_node_prep_runtime",
+    "exact_eval_node_call_orchestration_runtime",
+    "exact_eval_result_merge_runtime",
+    "exact_eval_non_edge_prep_runtime",
+    "exact_eval_target_count_build_runtime",
+    "exact_eval_utility_sum_runtime",
+    "exact_eval_other_runtime",
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +102,12 @@ class TransferExchangeMatchingResult:
     node_eval_cache_hits: int = 0
     node_eval_cache_misses: int = 0
     node_eval_full_executions: int = 0
+    ideal_utility_cache_requests: int = 0
+    ideal_utility_cache_hits: int = 0
+    ideal_utility_cache_misses: int = 0
+    impact_scope_requests: int = 0
+    impact_scope_computes: int = 0
+    impact_scope_reuses: int = 0
 
 
 def local_target(task_id: str) -> str:
@@ -102,6 +138,7 @@ def build_feasible_targets(
     vehicle_positions: dict[str, np.ndarray] | None = None,
     service_node_positions: dict[str, np.ndarray] | None = None,
     cache_config: cache_configuration.CacheOptimizationConfig | None = None,
+    timing_profile: dict[str, float] | None = None,
 ) -> dict[str, list[str]]:
     """按缓存可用性和当前物理路径构造 N_v^fea。
 
@@ -129,6 +166,8 @@ def build_feasible_targets(
             "正式 Cloud 候选门控必须同时提供车辆位置、服务节点位置和 cache_config。"
         )
     feasible: dict[str, list[str]] = {}
+    feasible_started_at = time.perf_counter() if timing_profile is not None else 0.0
+    channel_rate_runtime = 0.0
     for task in sorted(tasks, key=lambda item: _stable_id_key(item.task_id)):
         targets: list[str] = []
         if task.service_id in local_cache_state.get(task.vehicle_id, set()):
@@ -137,21 +176,40 @@ def build_feasible_targets(
         for node_index, node_id in enumerate(node_ids):
             if int(edge_cache[node_index, task.service_id]) != 1:
                 continue
-            if physical_context and not _edge_path_is_feasible(
-                task,
-                node_id,
-                vehicle_positions,
-                service_node_positions,
-                cache_nodes,
-                cache_config,
-            ):
-                continue
+            if physical_context:
+                channel_started_at = (
+                    time.perf_counter() if timing_profile is not None else 0.0
+                )
+                path_is_feasible = _edge_path_is_feasible(
+                    task,
+                    node_id,
+                    vehicle_positions,
+                    service_node_positions,
+                    cache_nodes,
+                    cache_config,
+                )
+                if timing_profile is not None:
+                    channel_rate_runtime += time.perf_counter() - channel_started_at
+                if not path_is_feasible:
+                    continue
             edge_targets.append(node_id)
         if edge_targets:
             targets.extend(edge_targets)
         else:
             targets.append(CLOUD)
         feasible[task.task_id] = targets
+    if timing_profile is not None:
+        total_runtime = time.perf_counter() - feasible_started_at
+        _profile_add(
+            timing_profile,
+            "matching_channel_rate_runtime",
+            channel_rate_runtime,
+        )
+        _profile_add(
+            timing_profile,
+            "matching_feasible_target_runtime",
+            max(total_runtime - channel_rate_runtime, 0.0),
+        )
     return feasible
 
 
@@ -178,6 +236,7 @@ def evaluate_matching_candidate(
     cache_config: cache_configuration.CacheOptimizationConfig,
     kkt_cache: KKTResourceAllocationCache | None = None,
     node_evaluation_cache: NodeEvaluationCache | None = None,
+    timing_profile: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
     """薄 adapter：Matching层 LOCAL:v -> KKT层 LOCAL。"""
 
@@ -237,6 +296,7 @@ def _candidate_impact_scope(
     candidate_kkt: dict[str, str],
     affected_task_ids: list[str],
     cache_nodes: dict[str, Any],
+    timing_profile: dict[str, float] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Return the exact affected edge nodes and impacted task IDs.
 
@@ -244,6 +304,7 @@ def _candidate_impact_scope(
     the scope must include every task sharing a current or candidate edge node.
     """
 
+    started_at = time.perf_counter() if timing_profile is not None else 0.0
     affected_edge_nodes: set[str] = set()
     for task_id in affected_task_ids:
         for target in (current_kkt[task_id], candidate_kkt[task_id]):
@@ -262,6 +323,11 @@ def _candidate_impact_scope(
             or candidate_kkt[task.task_id] in affected_edge_nodes
         ):
             impacted_task_ids.add(task.task_id)
+    _profile_add(
+        timing_profile,
+        "matching_impact_scope_runtime",
+        time.perf_counter() - started_at if timing_profile is not None else 0.0,
+    )
     return affected_edge_nodes, impacted_task_ids
 
 
@@ -280,6 +346,10 @@ def enumerate_best_operation(
     evaluation_mode: str = "incremental",
     kkt_cache: KKTResourceAllocationCache | None = None,
     node_evaluation_cache: NodeEvaluationCache | None = None,
+    timing_profile: dict[str, float] | None = None,
+    ideal_utility_cache: dict[tuple[str, str], float] | None = None,
+    ideal_utility_cache_stats: dict[str, int] | None = None,
+    impact_scope_stats: dict[str, int] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
     """枚举全部合法 transfer/exchange，返回本轮最大增益候选。
 
@@ -308,11 +378,15 @@ def enumerate_best_operation(
         "exchange_upper_bound_pruned": 0,
         "full_evaluator_calls": 0,
     }
-    current_kkt = (
-        _to_kkt_matching(current_matching)
-        if evaluation_mode == "incremental"
-        else None
-    )
+    if evaluation_mode == "incremental":
+        current_kkt = _to_kkt_matching(current_matching)
+        if timing_profile is not None:
+            timing_profile["current_kkt_conversion_call_count"] = (
+                float(timing_profile.get("current_kkt_conversion_call_count", 0.0))
+                + 1.0
+            )
+    else:
+        current_kkt = None
 
     candidate_metadata: list[dict[str, Any]] = []
     original_index = 0
@@ -334,10 +408,18 @@ def enumerate_best_operation(
                 "new_targets": list(new_targets),
                 "matching": candidate_matching,
                 "upper_delta": None,
+                "candidate_kkt": None,
+                "impact_scope": None,
             }
         )
         original_index += 1
 
+    candidate_generation_started_at = (
+        time.perf_counter() if timing_profile is not None else 0.0
+    )
+    transfer_generation_started_at = (
+        time.perf_counter() if timing_profile is not None else 0.0
+    )
     for task_id in task_ids:
         old_target = current_matching[task_id]
         for target in sorted(feasible_targets[task_id], key=str):
@@ -354,6 +436,15 @@ def enumerate_best_operation(
                 candidate_matching,
             )
 
+    transfer_generation_runtime = (
+        time.perf_counter() - transfer_generation_started_at
+        if timing_profile is not None
+        else 0.0
+    )
+
+    exchange_generation_started_at = (
+        time.perf_counter() if timing_profile is not None else 0.0
+    )
     for left_index, left_task in enumerate(task_ids):
         for right_task in task_ids[left_index + 1 :]:
             left_target = current_matching[left_task]
@@ -375,6 +466,19 @@ def enumerate_best_operation(
                 candidate_matching,
             )
 
+    exchange_generation_runtime = (
+        time.perf_counter() - exchange_generation_started_at
+        if timing_profile is not None
+        else 0.0
+    )
+    _profile_add(
+        timing_profile,
+        "matching_candidate_generation_runtime",
+        time.perf_counter() - candidate_generation_started_at
+        if timing_profile is not None
+        else transfer_generation_runtime + exchange_generation_runtime,
+    )
+
     tie_tolerance = tolerance * 0.1
     if evaluation_mode == "incremental":
         if current_kkt is None:
@@ -385,12 +489,32 @@ def enumerate_best_operation(
             stats["upper_bound_screen_calls"] += 1
             candidate_matching = metadata["matching"]
             candidate_kkt = _to_kkt_matching(candidate_matching)
-            _, impacted_task_ids = _candidate_impact_scope(
+            if timing_profile is not None:
+                timing_profile["candidate_kkt_conversion_call_count"] = (
+                    float(timing_profile.get("candidate_kkt_conversion_call_count", 0.0))
+                    + 1.0
+                )
+            metadata["candidate_kkt"] = candidate_kkt
+            if impact_scope_stats is not None:
+                impact_scope_stats["requests"] += 1
+                impact_scope_stats["computes"] += 1
+            impact_scope = _candidate_impact_scope(
                 tasks,
                 current_kkt,
                 candidate_kkt,
                 metadata["affected_tasks"],
                 cache_nodes,
+                timing_profile=timing_profile,
+            )
+            metadata["impact_scope"] = impact_scope
+            _, impacted_task_ids = impact_scope
+            upper_started_at = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
+            ideal_before = (
+                float(timing_profile.get("matching_ideal_utility_runtime", 0.0))
+                if timing_profile is not None
+                else 0.0
             )
             metadata["upper_delta"] = _strict_ideal_resource_upper_delta(
                 tasks,
@@ -401,7 +525,20 @@ def enumerate_best_operation(
                 service_node_positions,
                 cache_nodes,
                 cache_config,
+                timing_profile=timing_profile,
+                ideal_utility_cache=ideal_utility_cache,
+                ideal_utility_cache_stats=ideal_utility_cache_stats,
             )
+            if timing_profile is not None:
+                ideal_elapsed = (
+                    float(timing_profile.get("matching_ideal_utility_runtime", 0.0))
+                    - ideal_before
+                )
+                _profile_add(
+                    timing_profile,
+                    "matching_upper_bound_runtime",
+                    time.perf_counter() - upper_started_at - ideal_elapsed,
+                )
 
     exact_records: dict[int, KKTMatchingEvaluation] = {}
     global_exact_lower_bound = float("-inf")
@@ -411,6 +548,29 @@ def enumerate_best_operation(
         nonlocal global_exact_lower_bound, max_delta
         candidate_matching = metadata["matching"]
         stats["full_evaluator_calls"] += 1
+        evaluation_started_at = (
+            time.perf_counter() if timing_profile is not None else 0.0
+        )
+        node_cache_before = (
+            float(timing_profile.get("node_cache_lookup_runtime", 0.0))
+            if timing_profile is not None
+            else 0.0
+        )
+        node_eval_before = (
+            float(timing_profile.get("node_eval_miss_runtime", 0.0))
+            if timing_profile is not None
+            else 0.0
+        )
+        kkt_before = (
+            float(timing_profile.get("kkt_runtime", 0.0))
+            if timing_profile is not None
+            else 0.0
+        )
+        impact_before = (
+            float(timing_profile.get("matching_impact_scope_runtime", 0.0))
+            if timing_profile is not None
+            else 0.0
+        )
         if evaluation_mode == "full":
             evaluation = evaluate_matching_candidate(
                 tasks,
@@ -422,8 +582,39 @@ def enumerate_best_operation(
                 cache_config,
                 kkt_cache=kkt_cache,
                 node_evaluation_cache=node_evaluation_cache,
+                timing_profile=timing_profile,
             )
         else:
+            precomputed_candidate_kkt = metadata.get("candidate_kkt")
+            if timing_profile is not None:
+                timing_profile["current_kkt_context_request_count"] = (
+                    float(
+                        timing_profile.get("current_kkt_context_request_count", 0.0)
+                    )
+                    + 1.0
+                )
+                timing_profile["candidate_kkt_context_request_count"] = (
+                    float(
+                        timing_profile.get("candidate_kkt_context_request_count", 0.0)
+                    )
+                    + 1.0
+                )
+                if current_kkt is not None:
+                    timing_profile["current_kkt_context_reuse_count"] = (
+                        float(
+                            timing_profile.get("current_kkt_context_reuse_count", 0.0)
+                        )
+                        + 1.0
+                    )
+                if precomputed_candidate_kkt is not None:
+                    timing_profile["candidate_kkt_context_reuse_count"] = (
+                        float(
+                            timing_profile.get(
+                                "candidate_kkt_context_reuse_count", 0.0
+                            )
+                        )
+                        + 1.0
+                    )
             evaluation = evaluate_matching_candidate_incremental(
                 tasks,
                 current_matching,
@@ -437,6 +628,27 @@ def enumerate_best_operation(
                 cache_config,
                 kkt_cache=kkt_cache,
                 node_evaluation_cache=node_evaluation_cache,
+                timing_profile=timing_profile,
+                precomputed_current_kkt=current_kkt,
+                precomputed_candidate_kkt=precomputed_candidate_kkt,
+                precomputed_impact_scope=metadata["impact_scope"],
+                impact_scope_stats=impact_scope_stats,
+            )
+        if timing_profile is not None:
+            nested_runtime = (
+                float(timing_profile.get("node_cache_lookup_runtime", 0.0))
+                - node_cache_before
+                + float(timing_profile.get("node_eval_miss_runtime", 0.0))
+                - node_eval_before
+                + float(timing_profile.get("kkt_runtime", 0.0))
+                - kkt_before
+                + float(timing_profile.get("matching_impact_scope_runtime", 0.0))
+                - impact_before
+            )
+            _profile_add(
+                timing_profile,
+                "matching_exact_eval_orchestration_runtime",
+                time.perf_counter() - evaluation_started_at - nested_runtime,
             )
         exact_records[int(metadata["original_index"])] = evaluation
         stats["candidate_evaluations_total"] += 1
@@ -493,6 +705,7 @@ def enumerate_best_operation(
 
     # Replay semantic selection in generator order. Exact results are never
     # evaluated a second time here.
+    replay_started_at = time.perf_counter() if timing_profile is not None else 0.0
     best: dict[str, Any] | None = None
     for metadata in candidate_metadata:
         index = int(metadata["original_index"])
@@ -511,6 +724,13 @@ def enumerate_best_operation(
             "evaluation": evaluation,
         }
         best = _better_candidate(best, candidate, tie_tolerance)
+    _profile_add(
+        timing_profile,
+        "matching_replay_tiebreak_runtime",
+        time.perf_counter() - replay_started_at
+        if timing_profile is not None
+        else 0.0,
+    )
 
     if max_delta == float("-inf"):
         max_delta = 0.0
@@ -564,6 +784,7 @@ def optimize_task_matching(
     evaluation_mode: str = "incremental",
     kkt_cache: KKTResourceAllocationCache | None = None,
     node_evaluation_cache: NodeEvaluationCache | None = None,
+    timing_profile: dict[str, float] | None = None,
 ) -> TransferExchangeMatchingResult:
     """在当前 slot 的缓存和无线状态下执行稳定匹配。"""
 
@@ -589,8 +810,42 @@ def optimize_task_matching(
     )
     if kkt_cache is None:
         kkt_cache = KKTResourceAllocationCache()
+    matching_started_at = time.perf_counter() if timing_profile is not None else 0.0
+    profile_before = (
+        {
+            key: float(timing_profile.get(key, 0.0))
+            for key in (
+                "node_cache_lookup_runtime",
+                "node_eval_miss_runtime",
+                "kkt_runtime",
+                "matching_feasible_target_runtime",
+                "matching_channel_rate_runtime",
+                "matching_candidate_generation_runtime",
+                "matching_impact_scope_runtime",
+                "matching_upper_bound_runtime",
+                "matching_ideal_utility_runtime",
+                "matching_exact_eval_orchestration_runtime",
+                "matching_replay_tiebreak_runtime",
+                *_EXACT_EVAL_SUBHOTSPOT_RUNTIME_KEYS,
+                "exact_eval_record_bookkeeping_runtime",
+            )
+        }
+        if timing_profile is not None
+        else {}
+    )
     max_updates, tolerance = _matching_config(project_cfg)
     tasks = sorted(tasks, key=lambda task: _stable_id_key(task.task_id))
+    ideal_utility_cache: dict[tuple[str, str], float] = {}
+    ideal_utility_cache_stats = {
+        "requests": 0,
+        "hits": 0,
+        "misses": 0,
+    }
+    impact_scope_stats = {
+        "requests": 0,
+        "computes": 0,
+        "reuses": 0,
+    }
     if not tasks:
         return TransferExchangeMatchingResult(
             matching={},
@@ -636,11 +891,30 @@ def optimize_task_matching(
         vehicle_positions=vehicle_positions,
         service_node_positions=service_node_positions,
         cache_config=cache_config,
+        timing_profile=timing_profile,
     )
     current_matching = {
         task.task_id: feasible_targets[task.task_id][0]
         for task in tasks
     }
+    current_eval_started_at = (
+        time.perf_counter() if timing_profile is not None else 0.0
+    )
+    current_node_cache_before = (
+        float(timing_profile.get("node_cache_lookup_runtime", 0.0))
+        if timing_profile is not None
+        else 0.0
+    )
+    current_node_eval_before = (
+        float(timing_profile.get("node_eval_miss_runtime", 0.0))
+        if timing_profile is not None
+        else 0.0
+    )
+    current_kkt_before = (
+        float(timing_profile.get("kkt_runtime", 0.0))
+        if timing_profile is not None
+        else 0.0
+    )
     current_eval = evaluate_matching_candidate(
         tasks,
         current_matching,
@@ -651,7 +925,23 @@ def optimize_task_matching(
         cache_config,
         kkt_cache=kkt_cache,
         node_evaluation_cache=node_evaluation_cache,
+        timing_profile=timing_profile,
     )
+    if timing_profile is not None:
+        _profile_add(
+            timing_profile,
+            "matching_exact_eval_orchestration_runtime",
+            time.perf_counter()
+            - current_eval_started_at
+            - (
+                float(timing_profile.get("node_cache_lookup_runtime", 0.0))
+                - current_node_cache_before
+                + float(timing_profile.get("node_eval_miss_runtime", 0.0))
+                - current_node_eval_before
+                + float(timing_profile.get("kkt_runtime", 0.0))
+                - current_kkt_before
+            ),
+        )
     if not current_eval.resource_feasible:
         raise AssertionError("Cloud门控后的初始matching应资源可行。")
 
@@ -689,6 +979,10 @@ def optimize_task_matching(
             evaluation_mode=evaluation_mode,
             kkt_cache=kkt_cache,
             node_evaluation_cache=node_evaluation_cache,
+            timing_profile=timing_profile,
+            ideal_utility_cache=ideal_utility_cache,
+            ideal_utility_cache_stats=ideal_utility_cache_stats,
+            impact_scope_stats=impact_scope_stats,
         )
         for key, value in stats.items():
             counters[key] += value
@@ -733,6 +1027,10 @@ def optimize_task_matching(
             evaluation_mode=evaluation_mode,
             kkt_cache=kkt_cache,
             node_evaluation_cache=node_evaluation_cache,
+            timing_profile=timing_profile,
+            ideal_utility_cache=ideal_utility_cache,
+            ideal_utility_cache_stats=ideal_utility_cache_stats,
+            impact_scope_stats=impact_scope_stats,
         )
         # 复检也是候选评价的一部分，便于复杂度记录。
         for key, value in check_stats.items():
@@ -746,6 +1044,48 @@ def optimize_task_matching(
         raise AssertionError("最终matching违反cache feasibility。")
     if not current_eval.resource_feasible or not _resource_constraints_ok(current_eval, project_cfg):
         raise AssertionError("最终KKT resource feasibility失败。")
+
+    if timing_profile is not None:
+        profile_delta = {
+            key: float(timing_profile.get(key, 0.0)) - profile_before.get(key, 0.0)
+            for key in profile_before
+        }
+        nested_runtime = (
+            profile_delta["node_cache_lookup_runtime"]
+            + profile_delta["node_eval_miss_runtime"]
+            + profile_delta["kkt_runtime"]
+        )
+        explicit_runtime = sum(
+            profile_delta[key]
+            for key in (
+                "matching_feasible_target_runtime",
+                "matching_channel_rate_runtime",
+                "matching_candidate_generation_runtime",
+                "matching_impact_scope_runtime",
+                "matching_upper_bound_runtime",
+                "matching_ideal_utility_runtime",
+                "matching_exact_eval_orchestration_runtime",
+                "matching_replay_tiebreak_runtime",
+            )
+        )
+        _profile_add(
+            timing_profile,
+            "matching_other_runtime",
+            time.perf_counter() - matching_started_at - nested_runtime - explicit_runtime,
+        )
+        exact_eval_control_runtime = profile_delta[
+            "matching_exact_eval_orchestration_runtime"
+        ]
+        classified_subhotspot_runtime = sum(
+            profile_delta[key]
+            for key in _EXACT_EVAL_SUBHOTSPOT_RUNTIME_KEYS
+            if key != "exact_eval_other_runtime"
+        )
+        _profile_add(
+            timing_profile,
+            "exact_eval_other_runtime",
+            exact_eval_control_runtime - classified_subhotspot_runtime,
+        )
 
     return TransferExchangeMatchingResult(
         matching=current_matching,
@@ -796,6 +1136,12 @@ def optimize_task_matching(
             if node_evaluation_cache is not None
             else 0
         ),
+        ideal_utility_cache_requests=int(ideal_utility_cache_stats["requests"]),
+        ideal_utility_cache_hits=int(ideal_utility_cache_stats["hits"]),
+        ideal_utility_cache_misses=int(ideal_utility_cache_stats["misses"]),
+        impact_scope_requests=int(impact_scope_stats["requests"]),
+        impact_scope_computes=int(impact_scope_stats["computes"]),
+        impact_scope_reuses=int(impact_scope_stats["reuses"]),
         stop_reason=stop_reason,
         transfer_exchange_stable=transfer_exchange_stable,
         stable_check_passed=stable_check_passed,
@@ -1501,6 +1847,7 @@ def _ideal_task_utility(
     service_node_positions: dict[str, np.ndarray],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    timing_profile: dict[str, float] | None = None,
 ) -> float:
     """Evaluate one task at the no-sharing ideal resource point.
 
@@ -1509,6 +1856,7 @@ def _ideal_task_utility(
     the KKT allocator.
     """
 
+    started_at = time.perf_counter() if timing_profile is not None else 0.0
     if target == LOCAL or target == local_target(task.task_id):
         result = system_model.local_execution(
             task.cpu_cycles,
@@ -1551,7 +1899,7 @@ def _ideal_task_utility(
         delay = float(edge["total_delay_s"])
         energy = float(edge["vehicle_energy_j"])
 
-    return float(
+    utility = float(
         system_model.task_utility(
             delay,
             energy,
@@ -1561,6 +1909,12 @@ def _ideal_task_utility(
             cache_config.omega_e,
         )
     )
+    _profile_add(
+        timing_profile,
+        "matching_ideal_utility_runtime",
+        time.perf_counter() - started_at if timing_profile is not None else 0.0,
+    )
+    return utility
 
 
 def _strict_ideal_resource_upper_delta(
@@ -1572,6 +1926,9 @@ def _strict_ideal_resource_upper_delta(
     service_node_positions: dict[str, np.ndarray],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
+    timing_profile: dict[str, float] | None = None,
+    ideal_utility_cache: dict[tuple[str, str], float] | None = None,
+    ideal_utility_cache_stats: dict[str, int] | None = None,
 ) -> float | None:
     """Return a conservative strict upper bound for candidate ``delta_J``."""
 
@@ -1581,14 +1938,27 @@ def _strict_ideal_resource_upper_delta(
         if task.task_id not in impacted_task_ids:
             continue
         current_utility = float(current_utilities[task.task_id])
-        ideal_utility = _ideal_task_utility(
-            task,
-            candidate_matching[task.task_id],
-            vehicle_positions,
-            service_node_positions,
-            cache_nodes,
-            cache_config,
-        )
+        cache_key = (str(task.task_id), str(candidate_matching[task.task_id]))
+        if ideal_utility_cache_stats is not None:
+            ideal_utility_cache_stats["requests"] += 1
+        if ideal_utility_cache is not None and cache_key in ideal_utility_cache:
+            if ideal_utility_cache_stats is not None:
+                ideal_utility_cache_stats["hits"] += 1
+            ideal_utility = ideal_utility_cache[cache_key]
+        else:
+            if ideal_utility_cache_stats is not None:
+                ideal_utility_cache_stats["misses"] += 1
+            ideal_utility = _ideal_task_utility(
+                task,
+                candidate_matching[task.task_id],
+                vehicle_positions,
+                service_node_positions,
+                cache_nodes,
+                cache_config,
+                timing_profile=timing_profile,
+            )
+            if ideal_utility_cache is not None:
+                ideal_utility_cache[cache_key] = float(ideal_utility)
         if not math.isfinite(current_utility) or not math.isfinite(ideal_utility):
             return None
         terms.append(ideal_utility - current_utility)
@@ -1599,6 +1969,69 @@ def _strict_ideal_resource_upper_delta(
     # mathematically safe upper bound infinitesimally too small at the prune
     # boundary.  The pruning comparison itself remains strict '<'.
     return float(math.nextafter(upper_delta, math.inf))
+
+
+if numba is not None:
+
+    @numba.njit(parallel=False, fastmath=False)
+    def _solve_kkt_fraction_allocation_numba(
+        coeff: np.ndarray,
+        epsilon: float,
+        tolerance: float,
+        max_iterations: int,
+    ) -> tuple[np.ndarray, float, int, float]:
+        """Pure numeric KKT core; status values are translated by the wrapper."""
+
+        n = int(coeff.size)
+        if n == 0:
+            return np.empty(0, dtype=np.float64), 0.0, 0, 0.0
+        if epsilon * n > 1.0 + tolerance:
+            return np.empty(0, dtype=np.float64), np.nan, 1, 0.0
+        if np.any(~np.isfinite(coeff)) or np.any(coeff < 0.0):
+            return np.empty(0, dtype=np.float64), np.nan, 2, 0.0
+        if n == 1:
+            return np.ones(1, dtype=np.float64), 0.0, 0, 1.0
+        positive = coeff > 0.0
+        if not bool(np.any(positive)):
+            return np.full(n, 1.0 / n, dtype=np.float64), 0.0, 0, 1.0
+
+        positive_coeff = coeff[positive]
+        allocation_scratch = np.zeros(n, dtype=np.float64)
+        clipped_allocation = np.empty(n, dtype=np.float64)
+
+        low = 0.0
+        high = 1.0
+        while True:
+            allocation_scratch[positive] = np.sqrt(positive_coeff / high)
+            np.clip(allocation_scratch, epsilon, 1.0, out=clipped_allocation)
+            total = float(np.sum(clipped_allocation))
+            if total <= 1.0 or high >= 1.0e300:
+                break
+            high *= 2.0
+
+        if not np.isfinite(high):
+            return np.empty(0, dtype=np.float64), np.nan, 3, 0.0
+        mid = high
+        allocation_scratch[positive] = np.sqrt(positive_coeff / high)
+        np.clip(allocation_scratch, epsilon, 1.0, out=clipped_allocation)
+        for _ in range(max_iterations):
+            mid = 0.5 * (low + high)
+            allocation_scratch[positive] = np.sqrt(positive_coeff / mid)
+            np.clip(allocation_scratch, epsilon, 1.0, out=clipped_allocation)
+            total = float(np.sum(clipped_allocation))
+            if abs(total - 1.0) <= tolerance:
+                break
+            if total > 1.0:
+                low = mid
+            else:
+                high = mid
+        total = float(np.sum(clipped_allocation))
+        if total > 1.0 + max(tolerance * 10.0, 1e-10):
+            return np.empty(0, dtype=np.float64), mid, 4, total
+        return clipped_allocation.copy(), mid, 0, total
+
+else:
+    _solve_kkt_fraction_allocation_numba = None
 
 
 def solve_kkt_fraction_allocation(
@@ -1615,6 +2048,23 @@ def solve_kkt_fraction_allocation(
     """
 
     coeff = np.asarray(coefficients, dtype=np.float64)
+    if _solve_kkt_fraction_allocation_numba is not None:
+        allocation, lam, status, total = _solve_kkt_fraction_allocation_numba(
+            coeff,
+            float(epsilon),
+            float(tolerance),
+            int(max_iterations),
+        )
+        if status == 1:
+            return [], math.nan, False, f"epsilon * N = {epsilon * coeff.size} > 1"
+        if status == 2:
+            return [], math.nan, False, "KKT coefficient 必须 finite 且非负。"
+        if status == 3:
+            return [], math.nan, False, "KKT bisection high bound overflow。"
+        if status == 4:
+            return [], float(lam), False, f"KKT allocation sum {total} > 1。"
+        return [float(value) for value in allocation], float(lam), True, ""
+
     n = int(coeff.size)
     if n == 0:
         return [], 0.0, True, ""
@@ -2117,14 +2567,52 @@ def evaluate_matching_candidate_incremental(
     cache_config: cache_configuration.CacheOptimizationConfig,
     kkt_cache: KKTResourceAllocationCache | None = None,
     node_evaluation_cache: NodeEvaluationCache | None = None,
+    timing_profile: dict[str, float] | None = None,
+    precomputed_impact_scope: tuple[set[str], set[str]] | None = None,
+    impact_scope_stats: dict[str, int] | None = None,
+    precomputed_current_kkt: dict[str, str] | None = None,
+    precomputed_candidate_kkt: dict[str, str] | None = None,
 ) -> KKTMatchingEvaluation:
     """只重算 candidate 受影响 edge nodes，返回完整 KKT matching evaluation。"""
 
     if not current_evaluation.resource_feasible:
         raise ValueError("incremental evaluator 要求 current evaluation 可行。")
 
-    current_kkt = _to_kkt_matching(current_matching)
-    candidate_kkt = _to_kkt_matching(candidate_matching)
+    if precomputed_current_kkt is None:
+        kkt_conversion_started_at = (
+            time.perf_counter() if timing_profile is not None else 0.0
+        )
+        current_kkt = _to_kkt_matching(current_matching)
+        if timing_profile is not None:
+            _profile_add(
+                timing_profile,
+                "exact_eval_kkt_conversion_runtime",
+                time.perf_counter() - kkt_conversion_started_at,
+            )
+            timing_profile["current_kkt_conversion_call_count"] = (
+                float(timing_profile.get("current_kkt_conversion_call_count", 0.0))
+                + 1.0
+            )
+    else:
+        current_kkt = precomputed_current_kkt
+
+    if precomputed_candidate_kkt is None:
+        kkt_conversion_started_at = (
+            time.perf_counter() if timing_profile is not None else 0.0
+        )
+        candidate_kkt = _to_kkt_matching(candidate_matching)
+        if timing_profile is not None:
+            _profile_add(
+                timing_profile,
+                "exact_eval_kkt_conversion_runtime",
+                time.perf_counter() - kkt_conversion_started_at,
+            )
+            timing_profile["candidate_kkt_conversion_call_count"] = (
+                float(timing_profile.get("candidate_kkt_conversion_call_count", 0.0))
+                + 1.0
+            )
+    else:
+        candidate_kkt = precomputed_candidate_kkt
     task_ids = {task.task_id for task in tasks}
     if set(current_kkt) != task_ids or set(candidate_kkt) != task_ids:
         raise ValueError("current/candidate matching 的任务集合不一致。")
@@ -2133,28 +2621,54 @@ def evaluate_matching_candidate_incremental(
     if not set(affected_ids).issubset(task_ids):
         raise ValueError("affected_task_ids 包含未知任务。")
 
-    affected_edge_nodes, impacted_task_ids = _candidate_impact_scope(
-        tasks,
-        current_kkt,
-        candidate_kkt,
-        affected_ids,
-        cache_nodes,
-    )
+    if precomputed_impact_scope is None:
+        if impact_scope_stats is not None:
+            impact_scope_stats["requests"] += 1
+            impact_scope_stats["computes"] += 1
+        affected_edge_nodes, impacted_task_ids = _candidate_impact_scope(
+            tasks,
+            current_kkt,
+            candidate_kkt,
+            affected_ids,
+            cache_nodes,
+            timing_profile=timing_profile,
+        )
+    else:
+        if impact_scope_stats is not None:
+            impact_scope_stats["requests"] += 1
+            impact_scope_stats["reuses"] += 1
+        affected_edge_nodes, impacted_task_ids = precomputed_impact_scope
 
+    state_copy_started_at = (
+        time.perf_counter() if timing_profile is not None else 0.0
+    )
     cpu_allocations = dict(current_evaluation.cpu_allocations)
     bandwidth_allocations = dict(current_evaluation.bandwidth_allocations)
     cpu_resource_sums = dict(current_evaluation.cpu_resource_sums)
     bandwidth_resource_sums = dict(current_evaluation.bandwidth_resource_sums)
+    per_task_delay = dict(current_evaluation.per_task_delay_s)
+    per_task_energy = dict(current_evaluation.per_task_vehicle_energy_j)
+    per_task_utility = dict(current_evaluation.per_task_utility)
+    if timing_profile is not None:
+        _profile_add(
+            timing_profile,
+            "exact_eval_state_copy_runtime",
+            time.perf_counter() - state_copy_started_at,
+        )
+        timing_profile["exact_eval_state_copy_call_count"] = (
+            float(timing_profile.get("exact_eval_state_copy_call_count", 0.0))
+            + 1.0
+        )
+
+    affected_node_prep_started_at = (
+        time.perf_counter() if timing_profile is not None else 0.0
+    )
     nodes_to_clear = set(affected_edge_nodes)
     for node_id in nodes_to_clear:
         cpu_allocations.pop(node_id, None)
         bandwidth_allocations.pop(node_id, None)
         cpu_resource_sums.pop(node_id, None)
         bandwidth_resource_sums.pop(node_id, None)
-
-    per_task_delay = dict(current_evaluation.per_task_delay_s)
-    per_task_energy = dict(current_evaluation.per_task_vehicle_energy_j)
-    per_task_utility = dict(current_evaluation.per_task_utility)
 
     def infeasible(reason: str) -> KKTMatchingEvaluation:
         return KKTMatchingEvaluation(
@@ -2172,7 +2686,7 @@ def evaluate_matching_candidate_incremental(
             bandwidth_resource_sums={},
         )
 
-    recomputed_task_ids: set[str] = set()
+    affected_node_work: list[tuple[str, list[Task], dict[str, str]]] = []
     for node_id in sorted(affected_edge_nodes, key=str):
         node_tasks = [
             task for task in tasks if candidate_kkt[task.task_id] == node_id
@@ -2180,6 +2694,33 @@ def evaluate_matching_candidate_incremental(
         if not node_tasks:
             continue
         node_matching = {task.task_id: node_id for task in node_tasks}
+        affected_node_work.append((node_id, node_tasks, node_matching))
+    _profile_add(
+        timing_profile,
+        "exact_eval_affected_node_prep_runtime",
+        time.perf_counter() - affected_node_prep_started_at
+        if timing_profile is not None
+        else 0.0,
+    )
+
+    node_call_started_at = time.perf_counter() if timing_profile is not None else 0.0
+    node_cache_before = (
+        float(timing_profile.get("node_cache_lookup_runtime", 0.0))
+        if timing_profile is not None
+        else 0.0
+    )
+    node_eval_before = (
+        float(timing_profile.get("node_eval_miss_runtime", 0.0))
+        if timing_profile is not None
+        else 0.0
+    )
+    kkt_before = (
+        float(timing_profile.get("kkt_runtime", 0.0))
+        if timing_profile is not None
+        else 0.0
+    )
+    node_evaluations: list[tuple[str, list[Task], KKTMatchingEvaluation]] = []
+    for node_id, node_tasks, node_matching in affected_node_work:
         node_evaluation = evaluate_matching_with_kkt(
             node_tasks,
             node_matching,
@@ -2192,10 +2733,43 @@ def evaluate_matching_candidate_incremental(
             node_evaluation_cache=node_evaluation_cache,
         )
         if not node_evaluation.resource_feasible:
+            if timing_profile is not None:
+                nested_runtime = (
+                    float(timing_profile.get("node_cache_lookup_runtime", 0.0))
+                    - node_cache_before
+                    + float(timing_profile.get("node_eval_miss_runtime", 0.0))
+                    - node_eval_before
+                    + float(timing_profile.get("kkt_runtime", 0.0))
+                    - kkt_before
+                )
+                _profile_add(
+                    timing_profile,
+                    "exact_eval_node_call_orchestration_runtime",
+                    time.perf_counter() - node_call_started_at - nested_runtime,
+                )
             return infeasible(
                 f"{node_id} incremental KKT infeasible: "
                 f"{node_evaluation.infeasible_reason}"
             )
+        node_evaluations.append((node_id, node_tasks, node_evaluation))
+    if timing_profile is not None:
+        nested_runtime = (
+            float(timing_profile.get("node_cache_lookup_runtime", 0.0))
+            - node_cache_before
+            + float(timing_profile.get("node_eval_miss_runtime", 0.0))
+            - node_eval_before
+            + float(timing_profile.get("kkt_runtime", 0.0))
+            - kkt_before
+        )
+        _profile_add(
+            timing_profile,
+            "exact_eval_node_call_orchestration_runtime",
+            time.perf_counter() - node_call_started_at - nested_runtime,
+        )
+
+    result_merge_started_at = time.perf_counter() if timing_profile is not None else 0.0
+    recomputed_task_ids: set[str] = set()
+    for node_id, node_tasks, node_evaluation in node_evaluations:
         cpu_allocations[node_id] = dict(node_evaluation.cpu_allocations[node_id])
         bandwidth_allocations[node_id] = dict(
             node_evaluation.bandwidth_allocations[node_id]
@@ -2206,17 +2780,35 @@ def evaluate_matching_candidate_incremental(
         per_task_energy.update(node_evaluation.per_task_vehicle_energy_j)
         per_task_utility.update(node_evaluation.per_task_utility)
         recomputed_task_ids.update(task.task_id for task in node_tasks)
+    _profile_add(
+        timing_profile,
+        "exact_eval_result_merge_runtime",
+        time.perf_counter() - result_merge_started_at
+        if timing_profile is not None
+        else 0.0,
+    )
 
+    non_edge_prep_started_at = time.perf_counter() if timing_profile is not None else 0.0
     non_edge_tasks = [
         task
         for task in tasks
         if task.task_id in impacted_task_ids
         and candidate_kkt[task.task_id] in (LOCAL, CLOUD)
     ]
+    non_edge_matching = {
+        task.task_id: candidate_kkt[task.task_id] for task in non_edge_tasks
+    }
+    _profile_add(
+        timing_profile,
+        "exact_eval_non_edge_prep_runtime",
+        time.perf_counter() - non_edge_prep_started_at
+        if timing_profile is not None
+        else 0.0,
+    )
     if non_edge_tasks:
         non_edge_evaluation = evaluate_matching_with_kkt(
             non_edge_tasks,
-            {task.task_id: candidate_kkt[task.task_id] for task in non_edge_tasks},
+            non_edge_matching,
             vehicle_positions,
             service_node_positions,
             project_cfg,
@@ -2230,6 +2822,9 @@ def evaluate_matching_candidate_incremental(
                 f"incremental non-edge evaluation infeasible: "
                 f"{non_edge_evaluation.infeasible_reason}"
             )
+        result_merge_started_at = (
+            time.perf_counter() if timing_profile is not None else 0.0
+        )
         per_task_delay.update(non_edge_evaluation.per_task_delay_s)
         per_task_energy.update(non_edge_evaluation.per_task_vehicle_energy_j)
         per_task_utility.update(non_edge_evaluation.per_task_utility)
@@ -2241,11 +2836,19 @@ def evaluate_matching_candidate_incremental(
             cpu_resource_sums[CLOUD] = non_edge_evaluation.cpu_resource_sums[CLOUD]
             bandwidth_resource_sums[CLOUD] = non_edge_evaluation.bandwidth_resource_sums[CLOUD]
         recomputed_task_ids.update(task.task_id for task in non_edge_tasks)
+        _profile_add(
+            timing_profile,
+            "exact_eval_result_merge_runtime",
+            time.perf_counter() - result_merge_started_at
+            if timing_profile is not None
+            else 0.0,
+        )
 
     if recomputed_task_ids != impacted_task_ids:
         missing = sorted(impacted_task_ids - recomputed_task_ids, key=_stable_id_key)
         raise AssertionError(f"incremental evaluator 未覆盖 impacted tasks：{missing}")
 
+    target_count_started_at = time.perf_counter() if timing_profile is not None else 0.0
     per_task_execution_target = {
         task.task_id: candidate_kkt[task.task_id] for task in tasks
     }
@@ -2253,10 +2856,25 @@ def evaluate_matching_candidate_incremental(
     for task in tasks:
         target = candidate_kkt[task.task_id]
         per_node_task_counts[target] = per_node_task_counts.get(target, 0) + 1
+    _profile_add(
+        timing_profile,
+        "exact_eval_target_count_build_runtime",
+        time.perf_counter() - target_count_started_at
+        if timing_profile is not None
+        else 0.0,
+    )
 
+    utility_sum_started_at = time.perf_counter() if timing_profile is not None else 0.0
     task_utility_sum = 0.0
     for task in tasks:
         task_utility_sum += float(per_task_utility[task.task_id])
+    _profile_add(
+        timing_profile,
+        "exact_eval_utility_sum_runtime",
+        time.perf_counter() - utility_sum_started_at
+        if timing_profile is not None
+        else 0.0,
+    )
 
     return KKTMatchingEvaluation(
         resource_feasible=True,

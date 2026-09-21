@@ -92,6 +92,12 @@ def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) ->
         "NODE_EVAL_CACHE_HIT_COUNT": result.node_eval_cache_hits,
         "NODE_EVAL_CACHE_MISS_COUNT": result.node_eval_cache_misses,
         "NODE_EVAL_FULL_EXECUTION_COUNT": result.node_eval_full_executions,
+        "IDEAL_UTILITY_REQUEST_COUNT": result.ideal_utility_cache_requests,
+        "IDEAL_UTILITY_CACHE_HIT_COUNT": result.ideal_utility_cache_hits,
+        "IDEAL_UTILITY_CACHE_MISS_COUNT": result.ideal_utility_cache_misses,
+        "IMPACT_SCOPE_REQUEST_COUNT": result.impact_scope_requests,
+        "IMPACT_SCOPE_COMPUTE_COUNT": result.impact_scope_computes,
+        "IMPACT_SCOPE_REUSE_COUNT": result.impact_scope_reuses,
         "stop_reason": result.stop_reason,
         "transfer_exchange_stable": result.transfer_exchange_stable,
         "stable_check_passed": result.stable_check_passed,
@@ -425,6 +431,7 @@ def execute_slot(
         cache_config,
         kkt_cache=matching_kkt_cache,
         node_evaluation_cache=node_evaluation_cache,
+        timing_profile=exact_q_timing_profile,
     )
     if exact_q_timing_profile is not None:
         exact_q_matching_elapsed = time.perf_counter() - exact_q_matching_started_at
