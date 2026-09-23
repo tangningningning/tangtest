@@ -60,6 +60,11 @@ class PolicyEvaluation:
     # masked operation categorical and, when the operation is not NO_CHANGE,
     # the selected candidate categorical.
     cache_node_log_probs: Any | None = None
+    # Full masked per-head categorical log-probabilities.  These are detached
+    # by callers when used for diagnostics; exposing them here avoids a second
+    # policy implementation for Cache old-vs-new distribution checks.
+    cache_operation_log_probs_all: Any | None = None
+    cache_candidate_log_probs_all: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -1238,6 +1243,8 @@ class AdaptiveCacheOnlyActorCritic(
             cache_log_prob=operation_log_prob + candidate_log_prob,
             cache_entropy=operation_entropy + candidate_entropy,
             cache_node_log_probs=operation_node_log_prob + candidate_node_log_prob,
+            cache_operation_log_probs_all=operation_distribution.logits,
+            cache_candidate_log_probs_all=candidate_distribution.logits,
         )
 
 class AdaptiveReplicaAwareCacheOnlyActorCritic(
@@ -1597,6 +1604,8 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
             cache_entropy=cache_evaluation.entropy,
             uav_entropy=operation_entropy + candidate_entropy,
             cache_node_log_probs=cache_evaluation.cache_node_log_probs,
+            cache_operation_log_probs_all=cache_evaluation.cache_operation_log_probs_all,
+            cache_candidate_log_probs_all=cache_evaluation.cache_candidate_log_probs_all,
         )
 
 
@@ -1841,6 +1850,30 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             raise RuntimeError("proposed actor gradient groups do not cover the actor.")
         return groups
 
+    def actor_gradient_clipping_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
+        """Return disjoint Cache/UAV clipping groups without changing Adam."""
+
+        groups = self.actor_gradient_parameter_groups()
+        if groups.get("shared", ()):
+            raise RuntimeError(
+                "proposed actor clipping cannot split shared actor parameters"
+            )
+        clipping_groups = {
+            "cache": groups["cache_encoder"] + groups["cache"],
+            "uav": groups["uav_encoder"] + groups["uav"],
+        }
+        clipping_ids = [
+            id(parameter)
+            for parameters in clipping_groups.values()
+            for parameter in parameters
+        ]
+        if len(set(clipping_ids)) != len(clipping_ids):
+            raise RuntimeError("proposed Cache/UAV clipping groups overlap")
+        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
+        if set(clipping_ids) != actor_ids:
+            raise RuntimeError("proposed Cache/UAV clipping groups do not cover the actor")
+        return clipping_groups
+
     def sample_cache_trigger(
         self,
         observation: Any,
@@ -2052,6 +2085,8 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             cache_log_prob=trigger_log_prob + candidate_log_prob,
             cache_entropy=trigger_entropy + candidate_entropy,
             cache_node_log_probs=trigger_node_log_probs + candidate_node_log_probs,
+            cache_operation_log_probs_all=trigger_distribution.logits,
+            cache_candidate_log_probs_all=candidate_distribution.logits,
         )
 
 

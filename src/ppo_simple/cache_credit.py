@@ -505,6 +505,247 @@ def _branch_q_values(trainer: Any, branches: list[dict[str, Any]]) -> np.ndarray
     return q_values
 
 
+def _tdq_summary(values: np.ndarray) -> dict[str, float]:
+    """Summarize finite one-step trigger TD-Q differences."""
+
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError("Cache trigger TD-Q summary requires finite values")
+    return {
+        "mean": float(np.mean(array)),
+        "std": float(np.std(array)),
+        "p10": float(np.percentile(array, 10.0)),
+        "p50": float(np.percentile(array, 50.0)),
+        "p90": float(np.percentile(array, 90.0)),
+        "abs_max": float(np.max(np.abs(array))),
+    }
+
+
+def normalize_cache_trigger_tdq(
+    raw_credit: Any,
+    valid_mask: Any,
+    *,
+    epsilon: float = 1.0e-8,
+) -> tuple[np.ndarray, float]:
+    """Scale one-step trigger TD-Q credit by std without centering.
+
+    This is deliberately a pure numerical helper.  It is shared by the
+    production TD-Q trigger path and small in-memory validation cases; it
+    does not alter the reward, critic, or counterfactual evaluator.
+    """
+
+    raw = np.asarray(raw_credit, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if raw.shape != valid.shape or raw.ndim != 2:
+        raise ValueError("Cache trigger TD-Q credit/mask shape mismatch")
+    if not math.isfinite(float(epsilon)) or float(epsilon) <= 0.0:
+        raise ValueError("Cache trigger TD-Q epsilon must be positive and finite")
+    values = raw[valid]
+    if values.size == 0 or not np.all(np.isfinite(values)):
+        raise ValueError("Cache trigger TD-Q has no finite valid credit")
+    scale = float(np.std(values) + float(epsilon))
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise FloatingPointError("Cache trigger TD-Q scale is non-finite")
+    normalized = np.zeros_like(raw, dtype=np.float64)
+    normalized[valid] = raw[valid] / scale
+    if not np.all(np.isfinite(normalized)):
+        raise FloatingPointError("normalized Cache trigger TD-Q is non-finite")
+    return normalized, scale
+
+
+def compute_one_step_tdq_cache_trigger_credit(
+    trainer: Any,
+    rollout: Any,
+    *,
+    target_transition_indices: tuple[int, ...] | None = None,
+    target_node_indices: tuple[int, ...] | None = None,
+    epsilon: float = 1.0e-8,
+) -> dict[str, Any]:
+    """Compute detached per-head one-step TD-Q trigger credit.
+
+    The function reuses the existing Cache counterfactual branch executor and
+    critic bootstrap.  It executes exactly one counterfactual branch per
+    valid head: UPDATE is compared with KEEP, while KEEP is compared with the
+    detached highest-probability legal UPDATE candidate.  No candidate-level
+    Q teacher or optimizer operation is performed here.
+    """
+
+    all_transitions = tuple(rollout.transitions)
+    if not all_transitions:
+        raise ValueError("Cache trigger TD-Q credit requires a non-empty rollout")
+    if target_transition_indices is None:
+        selected_indices = tuple(range(len(all_transitions)))
+    else:
+        selected_indices = tuple(int(index) for index in target_transition_indices)
+        if not selected_indices or len(set(selected_indices)) != len(selected_indices):
+            raise ValueError("Cache TD-Q transition indices must be non-empty and unique")
+        if any(index < 0 or index >= len(all_transitions) for index in selected_indices):
+            raise IndexError("Cache TD-Q transition index is out of range")
+    transitions = tuple(all_transitions[index] for index in selected_indices)
+    origin_start = min(int(item.origin_index) for item in transitions)
+    origin_end = max(int(item.origin_index) for item in transitions)
+    from .trainer import aligned_train_steps
+
+    support_step_count = origin_end - origin_start + 1
+    if not any(
+        bool(item.done) and int(item.origin_index) == origin_end
+        for item in transitions
+    ):
+        support_step_count += 1
+    aligned_steps = aligned_train_steps(
+        trainer.context,
+        origin_start,
+        support_step_count,
+        include_bootstrap_step=False,
+    )
+    steps_by_origin = {int(step.origin_index): step for step in aligned_steps}
+    node_count = len(trainer.context.action_spec.cache_node_ids)
+    if target_node_indices is None:
+        node_indices = tuple(range(node_count))
+    else:
+        node_indices = tuple(int(index) for index in target_node_indices)
+        if not node_indices or len(set(node_indices)) != len(node_indices):
+            raise ValueError("Cache TD-Q node indices must be non-empty and unique")
+        if any(index < 0 or index >= node_count for index in node_indices):
+            raise IndexError("Cache TD-Q node index is out of range")
+    if not bool(getattr(trainer.policy, "true_binary_trigger", False)):
+        raise RuntimeError("Cache trigger TD-Q requires the binary KEEP/UPDATE policy")
+    if rollout.cache_candidate_features is None:
+        raise ValueError("Rollout does not expose Cache candidate tensors")
+    feature_dim = int(rollout.cache_candidate_features.shape[3])
+    sample_count = len(transitions)
+    raw_credit = np.full((sample_count, node_count), np.nan, dtype=np.float64)
+    valid_mask = np.zeros((sample_count, node_count), dtype=bool)
+    trigger_old_probabilities = np.zeros(
+        (sample_count, node_count, 2), dtype=np.float64
+    )
+    reference_candidate_indices = np.full(
+        (sample_count, node_count), -1, dtype=np.int64
+    )
+    environment_executions = 0
+    started_at = time.perf_counter()
+
+    for sample_index, transition in enumerate(transitions):
+        step = steps_by_origin.get(int(transition.origin_index))
+        if step is None:
+            raise RuntimeError("Cache TD-Q replay is missing the aligned current step")
+        next_step = steps_by_origin.get(int(transition.origin_index) + 1)
+        if not bool(transition.done) and next_step is None:
+            raise RuntimeError("Cache TD-Q replay is missing the aligned next step")
+        actual_next_observation = None
+        if not bool(transition.done):
+            actual_next_observation = _intermediate_observation(
+                np.asarray(transition.next_cache_state, dtype=np.int8),
+                transition.next_uav_positions,
+                next_step,
+                trainer.context,
+            )
+        for node_index in node_indices:
+            state = _node_policy_state(
+                trainer,
+                transition,
+                step,
+                node_index,
+                feature_dim,
+            )
+            trigger_old_probabilities[sample_index, node_index] = (
+                float(state["p_keep"]),
+                float(state["p_update"]),
+            )
+            if transition.cache_operation_actions is not None:
+                actual_action = int(transition.cache_operation_actions[node_index])
+            else:
+                actual_action = int(np.asarray(transition.action, dtype=np.int8)[node_index])
+            if actual_action not in (0, 1):
+                raise RuntimeError("Cache TD-Q trigger action is not KEEP/UPDATE")
+            reference_candidate = None
+            if actual_action == 0:
+                probabilities = np.asarray(
+                    state["candidate_probabilities"], dtype=np.float64
+                )
+                if not len(state["candidates"]):
+                    continue
+                if len(probabilities) != len(state["candidates"]):
+                    raise RuntimeError("Cache TD-Q candidate probability shape mismatch")
+                if not np.all(np.isfinite(probabilities)) or np.any(probabilities < 0.0):
+                    raise FloatingPointError("Cache TD-Q candidate probabilities are invalid")
+                reference_index = int(np.argmax(probabilities))
+                reference_candidate_indices[sample_index, node_index] = reference_index
+                reference_candidate = state["candidates"][reference_index]
+
+            actual_branch = {
+                "reward": float(transition.reward),
+                "next_observation": actual_next_observation,
+            }
+            counterfactual_branch = _execute_cache_branch(
+                trainer,
+                transition,
+                step,
+                next_step,
+                node_index,
+                state,
+                reference_candidate,
+            )
+            q_values = _branch_q_values(
+                trainer,
+                [actual_branch, counterfactual_branch],
+            )
+            raw_credit[sample_index, node_index] = float(q_values[0] - q_values[1])
+            valid_mask[sample_index, node_index] = True
+            environment_executions += 1
+
+    normalized_credit, scale = normalize_cache_trigger_tdq(
+        np.where(valid_mask, raw_credit, 0.0),
+        valid_mask,
+        epsilon=epsilon,
+    )
+    valid_raw = raw_credit[valid_mask]
+    valid_normalized = normalized_credit[valid_mask]
+    raw_stats = _tdq_summary(valid_raw)
+    runtime_seconds = float(time.perf_counter() - started_at)
+    head_count = int(environment_executions)
+    projected_runtime = float(
+        runtime_seconds
+        / float(max(head_count, 1))
+        * float(300 * node_count)
+    )
+    return {
+        "trigger_advantages": normalized_credit.astype(np.float32),
+        "trigger_raw_tdq": raw_credit.astype(np.float32),
+        "trigger_valid_mask": valid_mask,
+        "trigger_old_probabilities": trigger_old_probabilities.astype(np.float32),
+        "trigger_reference_candidate_indices": reference_candidate_indices,
+        "trigger_advantage_mean_abs": float(np.mean(np.abs(valid_normalized))),
+        "trigger_advantage_mean_abs_by_role": {},
+        "candidate_advantage_mean_abs": math.nan,
+        "trigger_weighted_mean_residual": np.zeros_like(normalized_credit),
+        "candidate_weighted_mean_residual": np.zeros_like(normalized_credit),
+        "counterfactual_environment_executions": int(environment_executions),
+        "logical_branch_count": int(environment_executions),
+        "credit_runtime_seconds": runtime_seconds,
+        "cache_trigger_advantage_source": "ONE_STEP_TD_Q_DIFFERENCE",
+        "cache_candidate_advantage_source": "GLOBAL_GAE",
+        "candidate_value_source": "GLOBAL_GAE",
+        "advantage_normalization": "STD_ONLY",
+        "advantage_centering": False,
+        "tdq_raw_mean": raw_stats["mean"],
+        "tdq_raw_std": raw_stats["std"],
+        "tdq_raw_p10": raw_stats["p10"],
+        "tdq_raw_p50": raw_stats["p50"],
+        "tdq_raw_p90": raw_stats["p90"],
+        "tdq_raw_abs_max": raw_stats["abs_max"],
+        "tdq_scale": float(scale),
+        "tdq_normalized_abs_p90": float(np.percentile(np.abs(valid_normalized), 90.0)),
+        "tdq_normalized_abs_max": float(np.max(np.abs(valid_normalized))),
+        "one_step_tdq_branches_executed": int(environment_executions),
+        "one_step_tdq_runtime_seconds": runtime_seconds,
+        "seconds_per_cache_head": float(
+            runtime_seconds / float(max(head_count, 1))
+        ),
+        "projected_300_slot_runtime_seconds": projected_runtime,
+    }
+
+
 def _rank_correlation(predicted: np.ndarray, exact: np.ndarray) -> float:
     """Return a dependency-free Spearman-style rank correlation."""
 

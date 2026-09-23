@@ -277,10 +277,42 @@ def build_run_manifest(
             if is_proposed_joint
             else "LEGACY_GLOBAL_GAE"
         ),
-        "cache_trigger_advantage_source": "GLOBAL_GAE",
-        "cache_candidate_advantage_source": "GLOBAL_GAE",
-        "cache_trigger_ratio_granularity": "WHOLE_CACHE_JOINT",
-        "cache_candidate_ratio_granularity": "WHOLE_CACHE_JOINT",
+        "cache_trigger_advantage_source": str(
+            getattr(
+                trainer,
+                "cache_trigger_advantage_source",
+                project_config.get_config_value(
+                    context.cfg,
+                    "algorithm.ppo.cache_trigger_advantage_source",
+                    "GLOBAL_GAE",
+                ),
+            )
+        ),
+        "cache_candidate_advantage_source": str(
+            getattr(
+                trainer,
+                "cache_candidate_advantage_source",
+                project_config.get_config_value(
+                    context.cfg,
+                    "algorithm.ppo.cache_candidate_advantage_source",
+                    "GLOBAL_GAE",
+                ),
+            )
+        ),
+        "cache_trigger_ratio_granularity": str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_trigger_ratio_granularity",
+                "WHOLE_CACHE_JOINT",
+            )
+        ),
+        "cache_candidate_ratio_granularity": str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_candidate_ratio_granularity",
+                "WHOLE_CACHE_JOINT",
+            )
+        ),
         "cache_surrogate_reduction": "NOT_USED_FOR_PRODUCTION_CREDIT",
         "CACHE_POLICY_CREDIT_SOURCE": "ACTUAL_ROLLOUT_GAE",
         "CACHE_ACTION_Q_CRITIC_INITIALIZED": bool(

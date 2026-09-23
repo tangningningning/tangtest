@@ -88,6 +88,26 @@ def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) ->
         "KKT_CACHE_HIT_COUNT": result.kkt_cache_hits,
         "KKT_CACHE_MISS_COUNT": result.kkt_cache_misses,
         "KKT_SOLVER_CALL_COUNT": result.kkt_solver_calls,
+        "KKT_SOLVE_COUNT": result.kkt_solve_count,
+        "KKT_CONVERGED_COUNT": result.kkt_converged_count,
+        "KKT_MAX_ITER_HIT_COUNT": result.kkt_max_iterations_hit_count,
+        "KKT_FINITE_COUNT": result.kkt_finite_count,
+        "KKT_ITERATION_MEAN": result.kkt_iteration_mean,
+        "KKT_ITERATION_P95": result.kkt_iteration_p95,
+        "KKT_ITERATION_MAX": result.kkt_iteration_max,
+        "KKT_RESOURCE_RESIDUAL_MEAN": result.kkt_resource_residual_mean,
+        "KKT_RESOURCE_RESIDUAL_MAX": result.kkt_resource_residual_max,
+        "KKT_STATIONARITY_RESIDUAL_MEAN": result.kkt_stationarity_residual_mean,
+        "KKT_STATIONARITY_RESIDUAL_MAX": result.kkt_stationarity_residual_max,
+        "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": (
+            result.kkt_complementary_slackness_residual_mean
+        ),
+        "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": (
+            result.kkt_complementary_slackness_residual_max
+        ),
+        "KKT_SOLVE_DIAGNOSTICS": [
+            dict(record) for record in result.kkt_solve_diagnostics
+        ],
         "NODE_EVAL_CACHE_REQUEST_COUNT": result.node_eval_cache_requests,
         "NODE_EVAL_CACHE_HIT_COUNT": result.node_eval_cache_hits,
         "NODE_EVAL_CACHE_MISS_COUNT": result.node_eval_cache_misses,
@@ -99,6 +119,11 @@ def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) ->
         "IMPACT_SCOPE_COMPUTE_COUNT": result.impact_scope_computes,
         "IMPACT_SCOPE_REUSE_COUNT": result.impact_scope_reuses,
         "stop_reason": result.stop_reason,
+        # Diagnostic aliases only: the Matching decision logic continues to
+        # use the original stop_reason values above.
+        "MAX_UPDATES_REACHED": result.stop_reason == "stopped_by_max_updates",
+        "NO_IMPROVING_TRANSFER_EXCHANGE": result.stop_reason
+        == "converged_by_no_improvement",
         "transfer_exchange_stable": result.transfer_exchange_stable,
         "stable_check_passed": result.stable_check_passed,
         "max_remaining_delta": result.max_remaining_delta,

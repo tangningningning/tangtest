@@ -108,6 +108,100 @@ class TransferExchangeMatchingResult:
     impact_scope_requests: int = 0
     impact_scope_computes: int = 0
     impact_scope_reuses: int = 0
+    kkt_solve_count: int = 0
+    kkt_converged_count: int = 0
+    kkt_max_iterations_hit_count: int = 0
+    kkt_finite_count: int = 0
+    kkt_iteration_mean: float = 0.0
+    kkt_iteration_p95: float = 0.0
+    kkt_iteration_max: int = 0
+    kkt_resource_residual_mean: float = math.nan
+    kkt_resource_residual_max: float = math.nan
+    kkt_stationarity_residual_mean: float = math.nan
+    kkt_stationarity_residual_max: float = math.nan
+    kkt_complementary_slackness_residual_mean: float = math.nan
+    kkt_complementary_slackness_residual_max: float = math.nan
+    kkt_solve_diagnostics: tuple[dict[str, Any], ...] = ()
+
+
+def _kkt_diagnostics_summary(
+    records: Any,
+) -> dict[str, Any]:
+    """Aggregate direct diagnostics for the KKT solves in one Matching call."""
+
+    typed_records = tuple(records)
+    iterations = np.asarray(
+        [int(record.iterations) for record in typed_records], dtype=np.float64
+    )
+    resource_residuals = np.asarray(
+        [
+            float(record.resource_sum_residual)
+            for record in typed_records
+            if math.isfinite(float(record.resource_sum_residual))
+        ],
+        dtype=np.float64,
+    )
+    stationarity_residuals = np.asarray(
+        [
+            float(record.stationarity_residual)
+            for record in typed_records
+            if math.isfinite(float(record.stationarity_residual))
+        ],
+        dtype=np.float64,
+    )
+    complementary_residuals = np.asarray(
+        [
+            float(record.complementary_slackness_residual)
+            for record in typed_records
+            if math.isfinite(float(record.complementary_slackness_residual))
+        ],
+        dtype=np.float64,
+    )
+
+    def _mean(values: np.ndarray) -> float:
+        return 0.0 if values.size == 0 else float(np.mean(values))
+
+    def _max(values: np.ndarray) -> float:
+        return math.nan if values.size == 0 else float(np.max(values))
+
+    return {
+        "solve_count": int(len(typed_records)),
+        "converged_count": int(
+            sum(bool(record.converged_by_tolerance) for record in typed_records)
+        ),
+        "max_iterations_hit_count": int(
+            sum(bool(record.hit_max_bisection_iterations) for record in typed_records)
+        ),
+        "finite_count": int(sum(bool(record.finite) for record in typed_records)),
+        "iteration_mean": _mean(iterations),
+        "iteration_p95": (
+            0.0 if iterations.size == 0 else float(np.percentile(iterations, 95.0))
+        ),
+        "iteration_max": int(np.max(iterations)) if iterations.size else 0,
+        "resource_residual_mean": _mean(resource_residuals),
+        "resource_residual_max": _max(resource_residuals),
+        "stationarity_residual_mean": _mean(stationarity_residuals),
+        "stationarity_residual_max": _max(stationarity_residuals),
+        "complementary_slackness_residual_mean": _mean(complementary_residuals),
+        "complementary_slackness_residual_max": _max(complementary_residuals),
+        "solve_diagnostics": tuple(
+            {
+                "iterations": int(record.iterations),
+                "converged_by_tolerance": bool(record.converged_by_tolerance),
+                "hit_max_bisection_iterations": bool(
+                    record.hit_max_bisection_iterations
+                ),
+                "final_resource_sum": float(record.final_resource_sum),
+                "resource_sum_residual": float(record.resource_sum_residual),
+                "finite": bool(record.finite),
+                "stationarity_residual": float(record.stationarity_residual),
+                "complementary_slackness_residual": float(
+                    record.complementary_slackness_residual
+                ),
+            }
+            for record in typed_records
+        ),
+    }
 
 
 def local_target(task_id: str) -> str:
@@ -810,6 +904,7 @@ def optimize_task_matching(
     )
     if kkt_cache is None:
         kkt_cache = KKTResourceAllocationCache()
+    kkt_diagnostics_before = len(kkt_cache.diagnostic_records)
     matching_started_at = time.perf_counter() if timing_profile is not None else 0.0
     profile_before = (
         {
@@ -847,6 +942,9 @@ def optimize_task_matching(
         "reuses": 0,
     }
     if not tasks:
+        kkt_summary = _kkt_diagnostics_summary(
+            kkt_cache.diagnostic_records[kkt_diagnostics_before:]
+        )
         return TransferExchangeMatchingResult(
             matching={},
             execution_variables={},
@@ -881,6 +979,32 @@ def optimize_task_matching(
             max_remaining_delta=0.0,
             history=[],
             feasible_targets={},
+            kkt_solve_count=int(kkt_summary["solve_count"]),
+            kkt_converged_count=int(kkt_summary["converged_count"]),
+            kkt_max_iterations_hit_count=int(
+                kkt_summary["max_iterations_hit_count"]
+            ),
+            kkt_finite_count=int(kkt_summary["finite_count"]),
+            kkt_iteration_mean=float(kkt_summary["iteration_mean"]),
+            kkt_iteration_p95=float(kkt_summary["iteration_p95"]),
+            kkt_iteration_max=int(kkt_summary["iteration_max"]),
+            kkt_resource_residual_mean=float(
+                kkt_summary["resource_residual_mean"]
+            ),
+            kkt_resource_residual_max=float(kkt_summary["resource_residual_max"]),
+            kkt_stationarity_residual_mean=float(
+                kkt_summary["stationarity_residual_mean"]
+            ),
+            kkt_stationarity_residual_max=float(
+                kkt_summary["stationarity_residual_max"]
+            ),
+            kkt_complementary_slackness_residual_mean=float(
+                kkt_summary["complementary_slackness_residual_mean"]
+            ),
+            kkt_complementary_slackness_residual_max=float(
+                kkt_summary["complementary_slackness_residual_max"]
+            ),
+            kkt_solve_diagnostics=tuple(kkt_summary["solve_diagnostics"]),
         )
 
     feasible_targets = build_feasible_targets(
@@ -1087,6 +1211,9 @@ def optimize_task_matching(
             exact_eval_control_runtime - classified_subhotspot_runtime,
         )
 
+    kkt_summary = _kkt_diagnostics_summary(
+        kkt_cache.diagnostic_records[kkt_diagnostics_before:]
+    )
     return TransferExchangeMatchingResult(
         matching=current_matching,
         execution_variables=matching_to_execution_variables(current_matching),
@@ -1142,6 +1269,30 @@ def optimize_task_matching(
         impact_scope_requests=int(impact_scope_stats["requests"]),
         impact_scope_computes=int(impact_scope_stats["computes"]),
         impact_scope_reuses=int(impact_scope_stats["reuses"]),
+        kkt_solve_count=int(kkt_summary["solve_count"]),
+        kkt_converged_count=int(kkt_summary["converged_count"]),
+        kkt_max_iterations_hit_count=int(
+            kkt_summary["max_iterations_hit_count"]
+        ),
+        kkt_finite_count=int(kkt_summary["finite_count"]),
+        kkt_iteration_mean=float(kkt_summary["iteration_mean"]),
+        kkt_iteration_p95=float(kkt_summary["iteration_p95"]),
+        kkt_iteration_max=int(kkt_summary["iteration_max"]),
+        kkt_resource_residual_mean=float(kkt_summary["resource_residual_mean"]),
+        kkt_resource_residual_max=float(kkt_summary["resource_residual_max"]),
+        kkt_stationarity_residual_mean=float(
+            kkt_summary["stationarity_residual_mean"]
+        ),
+        kkt_stationarity_residual_max=float(
+            kkt_summary["stationarity_residual_max"]
+        ),
+        kkt_complementary_slackness_residual_mean=float(
+            kkt_summary["complementary_slackness_residual_mean"]
+        ),
+        kkt_complementary_slackness_residual_max=float(
+            kkt_summary["complementary_slackness_residual_max"]
+        ),
+        kkt_solve_diagnostics=tuple(kkt_summary["solve_diagnostics"]),
         stop_reason=stop_reason,
         transfer_exchange_stable=transfer_exchange_stable,
         stable_check_passed=stable_check_passed,
@@ -1489,6 +1640,26 @@ def _summary(result: TransferExchangeMatchingResult) -> dict[str, Any]:
         "KKT_CACHE_HIT_COUNT": result.kkt_cache_hits,
         "KKT_CACHE_MISS_COUNT": result.kkt_cache_misses,
         "KKT_SOLVER_CALL_COUNT": result.kkt_solver_calls,
+        "KKT_SOLVE_COUNT": result.kkt_solve_count,
+        "KKT_CONVERGED_COUNT": result.kkt_converged_count,
+        "KKT_MAX_ITER_HIT_COUNT": result.kkt_max_iterations_hit_count,
+        "KKT_FINITE_COUNT": result.kkt_finite_count,
+        "KKT_ITERATION_MEAN": result.kkt_iteration_mean,
+        "KKT_ITERATION_P95": result.kkt_iteration_p95,
+        "KKT_ITERATION_MAX": result.kkt_iteration_max,
+        "KKT_RESOURCE_RESIDUAL_MEAN": result.kkt_resource_residual_mean,
+        "KKT_RESOURCE_RESIDUAL_MAX": result.kkt_resource_residual_max,
+        "KKT_STATIONARITY_RESIDUAL_MEAN": result.kkt_stationarity_residual_mean,
+        "KKT_STATIONARITY_RESIDUAL_MAX": result.kkt_stationarity_residual_max,
+        "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": (
+            result.kkt_complementary_slackness_residual_mean
+        ),
+        "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": (
+            result.kkt_complementary_slackness_residual_max
+        ),
+        "KKT_SOLVE_DIAGNOSTICS": [
+            dict(record) for record in result.kkt_solve_diagnostics
+        ],
         "stop_reason": result.stop_reason,
         "stable": result.transfer_exchange_stable,
         "stable_check_passed": result.stable_check_passed,
@@ -1562,6 +1733,20 @@ class KKTConfig:
 
 
 @dataclass(frozen=True)
+class KKTAllocationDiagnostics:
+    """Read-only diagnostics produced by one resource-fraction solve."""
+
+    iterations: int
+    converged_by_tolerance: bool
+    hit_max_bisection_iterations: bool
+    final_resource_sum: float
+    resource_sum_residual: float
+    finite: bool
+    stationarity_residual: float = math.nan
+    complementary_slackness_residual: float = math.nan
+
+
+@dataclass(frozen=True)
 class Task:
     task_id: str
     vehicle_id: str
@@ -1580,6 +1765,7 @@ class KKTResourceAllocationResult:
     per_node_bandwidth_sum: dict[str, float]
     cpu_multipliers: dict[str, float]
     bandwidth_multipliers: dict[str, float]
+    kkt_diagnostics: tuple[KKTAllocationDiagnostics, ...] = ()
 
 
 def _exact_position_key(node_position: np.ndarray) -> tuple[float, float]:
@@ -1614,6 +1800,43 @@ class KKTResourceAllocationCache:
     hits: int = 0
     misses: int = 0
     solver_calls: int = 0
+    diagnostic_solve_count: int = 0
+    diagnostic_converged_count: int = 0
+    diagnostic_max_iterations_hit_count: int = 0
+    diagnostic_finite_count: int = 0
+    diagnostic_records: list[KKTAllocationDiagnostics] = field(default_factory=list)
+    diagnostic_iterations: list[int] = field(default_factory=list)
+    diagnostic_resource_residuals: list[float] = field(default_factory=list)
+    diagnostic_stationarity_residuals: list[float] = field(default_factory=list)
+    diagnostic_complementary_slackness_residuals: list[float] = field(
+        default_factory=list
+    )
+
+    def record_diagnostics(self, diagnostics: KKTAllocationDiagnostics) -> None:
+        """Record one solver result without affecting cache or allocation logic."""
+
+        self.diagnostic_solve_count += 1
+        self.diagnostic_converged_count += int(
+            diagnostics.converged_by_tolerance
+        )
+        self.diagnostic_max_iterations_hit_count += int(
+            diagnostics.hit_max_bisection_iterations
+        )
+        self.diagnostic_finite_count += int(diagnostics.finite)
+        self.diagnostic_records.append(diagnostics)
+        self.diagnostic_iterations.append(int(diagnostics.iterations))
+        if math.isfinite(diagnostics.resource_sum_residual):
+            self.diagnostic_resource_residuals.append(
+                float(diagnostics.resource_sum_residual)
+            )
+        if math.isfinite(diagnostics.stationarity_residual):
+            self.diagnostic_stationarity_residuals.append(
+                float(diagnostics.stationarity_residual)
+            )
+        if math.isfinite(diagnostics.complementary_slackness_residual):
+            self.diagnostic_complementary_slackness_residuals.append(
+                float(diagnostics.complementary_slackness_residual)
+            )
 
     def get_or_compute(
         self,
@@ -1979,21 +2202,21 @@ if numba is not None:
         epsilon: float,
         tolerance: float,
         max_iterations: int,
-    ) -> tuple[np.ndarray, float, int, float]:
+    ) -> tuple[np.ndarray, float, int, float, int, bool]:
         """Pure numeric KKT core; status values are translated by the wrapper."""
 
         n = int(coeff.size)
         if n == 0:
-            return np.empty(0, dtype=np.float64), 0.0, 0, 0.0
+            return np.empty(0, dtype=np.float64), 0.0, 0, 0.0, 0, True
         if epsilon * n > 1.0 + tolerance:
-            return np.empty(0, dtype=np.float64), np.nan, 1, 0.0
+            return np.empty(0, dtype=np.float64), np.nan, 1, 0.0, 0, False
         if np.any(~np.isfinite(coeff)) or np.any(coeff < 0.0):
-            return np.empty(0, dtype=np.float64), np.nan, 2, 0.0
+            return np.empty(0, dtype=np.float64), np.nan, 2, 0.0, 0, False
         if n == 1:
-            return np.ones(1, dtype=np.float64), 0.0, 0, 1.0
+            return np.ones(1, dtype=np.float64), 0.0, 0, 1.0, 0, True
         positive = coeff > 0.0
         if not bool(np.any(positive)):
-            return np.full(n, 1.0 / n, dtype=np.float64), 0.0, 0, 1.0
+            return np.full(n, 1.0 / n, dtype=np.float64), 0.0, 0, 1.0, 0, True
 
         positive_coeff = coeff[positive]
         allocation_scratch = np.zeros(n, dtype=np.float64)
@@ -2010,16 +2233,20 @@ if numba is not None:
             high *= 2.0
 
         if not np.isfinite(high):
-            return np.empty(0, dtype=np.float64), np.nan, 3, 0.0
+            return np.empty(0, dtype=np.float64), np.nan, 3, 0.0, 0, False
         mid = high
         allocation_scratch[positive] = np.sqrt(positive_coeff / high)
         np.clip(allocation_scratch, epsilon, 1.0, out=clipped_allocation)
+        iterations = 0
+        converged = False
         for _ in range(max_iterations):
+            iterations += 1
             mid = 0.5 * (low + high)
             allocation_scratch[positive] = np.sqrt(positive_coeff / mid)
             np.clip(allocation_scratch, epsilon, 1.0, out=clipped_allocation)
             total = float(np.sum(clipped_allocation))
             if abs(total - 1.0) <= tolerance:
+                converged = True
                 break
             if total > 1.0:
                 low = mid
@@ -2027,11 +2254,132 @@ if numba is not None:
                 high = mid
         total = float(np.sum(clipped_allocation))
         if total > 1.0 + max(tolerance * 10.0, 1e-10):
-            return np.empty(0, dtype=np.float64), mid, 4, total
-        return clipped_allocation.copy(), mid, 0, total
+            return (
+                np.empty(0, dtype=np.float64),
+                mid,
+                4,
+                total,
+                iterations,
+                converged,
+            )
+        return (
+            clipped_allocation.copy(),
+            mid,
+            0,
+            total,
+            iterations,
+            converged,
+        )
 
 else:
     _solve_kkt_fraction_allocation_numba = None
+
+
+def _kkt_allocation_diagnostics(
+    coefficients: np.ndarray,
+    allocation: Any,
+    multiplier: float,
+    epsilon: float,
+    tolerance: float,
+    iterations: int,
+    converged_by_tolerance: bool,
+    hit_max_bisection_iterations: bool,
+    final_resource_sum: float,
+) -> KKTAllocationDiagnostics:
+    """Compute direct KKT residuals from one completed solve."""
+
+    coeff = np.asarray(coefficients, dtype=np.float64).reshape(-1)
+    values = np.asarray(allocation, dtype=np.float64).reshape(-1)
+    finite = bool(
+        np.all(np.isfinite(coeff))
+        and np.all(np.isfinite(values))
+        and math.isfinite(float(multiplier))
+        and math.isfinite(float(final_resource_sum))
+    )
+    resource_active = bool(coeff.size > 0 and np.any(coeff > 0.0))
+    resource_residual = (
+        abs(float(final_resource_sum) - 1.0)
+        if finite and resource_active
+        else math.nan
+    )
+    stationarity_residual = math.nan
+    complementary_slackness_residual = math.nan
+    if finite and values.shape == coeff.shape and values.size > 0:
+        if np.any(values <= 0.0):
+            finite = False
+        else:
+            bound_tolerance = max(float(tolerance) * 10.0, 1.0e-12)
+            gradient = -coeff / np.square(values) + float(multiplier)
+            stationarity_terms: list[float] = []
+            complementary_terms: list[float] = []
+            for value, derivative in zip(values, gradient, strict=True):
+                if value <= float(epsilon) + bound_tolerance:
+                    # Lower-bound multiplier alpha = max(derivative, 0).
+                    stationarity_terms.append(max(-float(derivative), 0.0))
+                    complementary_terms.append(
+                        max(float(derivative), 0.0)
+                        * max(float(value) - float(epsilon), 0.0)
+                    )
+                elif value >= 1.0 - bound_tolerance:
+                    # Upper-bound multiplier beta = max(-derivative, 0).
+                    stationarity_terms.append(max(float(derivative), 0.0))
+                    complementary_terms.append(
+                        max(-float(derivative), 0.0) * max(1.0 - float(value), 0.0)
+                    )
+                else:
+                    stationarity_terms.append(abs(float(derivative)))
+                    complementary_terms.append(0.0)
+            stationarity_residual = float(max(stationarity_terms, default=0.0))
+            complementary_slackness_residual = float(
+                max(
+                    abs(float(multiplier) * (float(final_resource_sum) - 1.0)),
+                    max(complementary_terms, default=0.0),
+                )
+            )
+    return KKTAllocationDiagnostics(
+        iterations=int(iterations),
+        converged_by_tolerance=bool(converged_by_tolerance),
+        hit_max_bisection_iterations=bool(hit_max_bisection_iterations),
+        final_resource_sum=float(final_resource_sum),
+        resource_sum_residual=float(resource_residual),
+        finite=bool(finite),
+        stationarity_residual=float(stationarity_residual),
+        complementary_slackness_residual=float(complementary_slackness_residual),
+    )
+
+
+def _kkt_solver_return(
+    coefficients: np.ndarray,
+    allocation: Any,
+    multiplier: float,
+    ok: bool,
+    reason: str,
+    epsilon: float,
+    tolerance: float,
+    iterations: int,
+    converged_by_tolerance: bool,
+    hit_max_bisection_iterations: bool,
+    final_resource_sum: float,
+    return_diagnostics: bool,
+) -> Any:
+    diagnostics = _kkt_allocation_diagnostics(
+        coefficients,
+        allocation,
+        multiplier,
+        epsilon,
+        tolerance,
+        iterations,
+        converged_by_tolerance,
+        hit_max_bisection_iterations,
+        final_resource_sum,
+    )
+    result = (
+        [float(value) for value in np.asarray(allocation, dtype=np.float64).reshape(-1)],
+        float(multiplier),
+        bool(ok),
+        str(reason),
+    )
+    return result + (diagnostics,) if return_diagnostics else result
 
 
 def solve_kkt_fraction_allocation(
@@ -2039,7 +2387,9 @@ def solve_kkt_fraction_allocation(
     epsilon: float,
     tolerance: float,
     max_iterations: int,
-) -> tuple[list[float], float, bool, str]:
+    *,
+    return_diagnostics: bool = False,
+) -> Any:
     """解 min sum c_i / r_i, epsilon <= r_i <= 1, sum r_i <= 1。
 
     对正系数任务使用 ``r_i=clip(sqrt(c_i/lambda), epsilon, 1)``，并用确定性
@@ -2049,34 +2399,76 @@ def solve_kkt_fraction_allocation(
 
     coeff = np.asarray(coefficients, dtype=np.float64)
     if _solve_kkt_fraction_allocation_numba is not None:
-        allocation, lam, status, total = _solve_kkt_fraction_allocation_numba(
+        allocation, lam, status, total, iterations, converged = (
+            _solve_kkt_fraction_allocation_numba(
             coeff,
             float(epsilon),
             float(tolerance),
             int(max_iterations),
+            )
+        )
+        hit_max = bool(
+            int(max_iterations) > 0
+            and int(iterations) >= int(max_iterations)
+            and not bool(converged)
         )
         if status == 1:
-            return [], math.nan, False, f"epsilon * N = {epsilon * coeff.size} > 1"
+            return _kkt_solver_return(
+                coeff, [], math.nan, False,
+                f"epsilon * N = {epsilon * coeff.size} > 1",
+                epsilon, tolerance, iterations, converged, hit_max, total,
+                return_diagnostics,
+            )
         if status == 2:
-            return [], math.nan, False, "KKT coefficient 必须 finite 且非负。"
+            return _kkt_solver_return(
+                coeff, [], math.nan, False, "KKT coefficient 必须 finite 且非负。",
+                epsilon, tolerance, iterations, converged, hit_max, total,
+                return_diagnostics,
+            )
         if status == 3:
-            return [], math.nan, False, "KKT bisection high bound overflow。"
+            return _kkt_solver_return(
+                coeff, [], math.nan, False, "KKT bisection high bound overflow。",
+                epsilon, tolerance, iterations, converged, hit_max, total,
+                return_diagnostics,
+            )
         if status == 4:
-            return [], float(lam), False, f"KKT allocation sum {total} > 1。"
-        return [float(value) for value in allocation], float(lam), True, ""
+            return _kkt_solver_return(
+                coeff, [], float(lam), False, f"KKT allocation sum {total} > 1。",
+                epsilon, tolerance, iterations, converged, hit_max, total,
+                return_diagnostics,
+            )
+        return _kkt_solver_return(
+            coeff, allocation, float(lam), True, "", epsilon, tolerance,
+            iterations, converged, hit_max, total, return_diagnostics,
+        )
 
     n = int(coeff.size)
     if n == 0:
-        return [], 0.0, True, ""
+        return _kkt_solver_return(
+            coeff, [], 0.0, True, "", epsilon, tolerance, 0, True, False, 0.0,
+            return_diagnostics,
+        )
     if epsilon * n > 1.0 + tolerance:
-        return [], math.nan, False, f"epsilon * N = {epsilon * n} > 1"
+        return _kkt_solver_return(
+            coeff, [], math.nan, False, f"epsilon * N = {epsilon * n} > 1",
+            epsilon, tolerance, 0, False, False, 0.0, return_diagnostics,
+        )
     if np.any(~np.isfinite(coeff)) or np.any(coeff < 0.0):
-        return [], math.nan, False, "KKT coefficient 必须 finite 且非负。"
+        return _kkt_solver_return(
+            coeff, [], math.nan, False, "KKT coefficient 必须 finite 且非负。",
+            epsilon, tolerance, 0, False, False, 0.0, return_diagnostics,
+        )
     if n == 1:
-        return [1.0], 0.0, True, ""
+        return _kkt_solver_return(
+            coeff, [1.0], 0.0, True, "", epsilon, tolerance, 0, True, False, 1.0,
+            return_diagnostics,
+        )
     positive = coeff > 0.0
     if not bool(np.any(positive)):
-        return [1.0 / n] * n, 0.0, True, ""
+        return _kkt_solver_return(
+            coeff, [1.0 / n] * n, 0.0, True, "", epsilon, tolerance, 0, True,
+            False, 1.0, return_diagnostics,
+        )
     positive_coeff = coeff[positive]
     allocation_scratch = np.zeros(n, dtype=np.float64)
     clipped_allocation = np.empty(n, dtype=np.float64)
@@ -2095,14 +2487,21 @@ def solve_kkt_fraction_allocation(
     while float(np.sum(alloc_for(high))) > 1.0 and high < 1.0e300:
         high *= 2.0
     if not math.isfinite(high):
-        return [], math.nan, False, "KKT bisection high bound overflow。"
+        return _kkt_solver_return(
+            coeff, [], math.nan, False, "KKT bisection high bound overflow。",
+            epsilon, tolerance, 0, False, False, 0.0, return_diagnostics,
+        )
     mid = high
     allocation = alloc_for(high)
+    iterations = 0
+    converged = False
     for _ in range(max_iterations):
+        iterations += 1
         mid = 0.5 * (low + high)
         allocation = alloc_for(mid)
         total = float(np.sum(allocation))
         if abs(total - 1.0) <= tolerance:
+            converged = True
             break
         if total > 1.0:
             low = mid
@@ -2110,9 +2509,21 @@ def solve_kkt_fraction_allocation(
             high = mid
     # 正系数目标随资源增加下降，因此正常可行时尽量用满资源。
     total = float(np.sum(allocation))
+    hit_max = bool(
+        int(max_iterations) > 0
+        and int(iterations) >= int(max_iterations)
+        and not bool(converged)
+    )
     if total > 1.0 + max(tolerance * 10.0, 1e-10):
-        return [], mid, False, f"KKT allocation sum {total} > 1。"
-    return [float(value) for value in allocation], float(mid), True, ""
+        return _kkt_solver_return(
+            coeff, [], mid, False, f"KKT allocation sum {total} > 1。",
+            epsilon, tolerance, iterations, converged, hit_max, total,
+            return_diagnostics,
+        )
+    return _kkt_solver_return(
+        coeff, allocation, float(mid), True, "", epsilon, tolerance,
+        iterations, converged, hit_max, total, return_diagnostics,
+    )
 
 
 def _group_edge_tasks(
@@ -2152,6 +2563,7 @@ def allocate_resources_kkt(
     bw_sums: dict[str, float] = {}
     cpu_mu: dict[str, float] = {}
     bw_nu: dict[str, float] = {}
+    kkt_diagnostics: list[KKTAllocationDiagnostics] = []
 
     for node_id, node_tasks in grouped.items():
         def compute_node_result() -> KKTResourceAllocationResult:
@@ -2179,18 +2591,31 @@ def allocate_resources_kkt(
             solver_started_at = (
                 time.perf_counter() if timing_profile is not None else 0.0
             )
-            cpu_values, mu, ok, reason = solve_kkt_fraction_allocation(
+            cpu_values, mu, ok, reason, cpu_diagnostics = solve_kkt_fraction_allocation(
                 cpu_coeff,
                 kkt_cfg.min_cpu_fraction,
                 kkt_cfg.bisection_tolerance,
                 kkt_cfg.max_bisection_iterations,
+                return_diagnostics=True,
             )
+            if kkt_cache is not None:
+                kkt_cache.record_diagnostics(cpu_diagnostics)
             if timing_profile is not None:
                 timing_profile["kkt_solver_core_runtime"] += (
                     time.perf_counter() - solver_started_at
                 )
             if not ok:
-                return KKTResourceAllocationResult(False, f"{node_id} CPU infeasible: {reason}", {}, {}, {}, {}, {}, {})
+                return KKTResourceAllocationResult(
+                    False,
+                    f"{node_id} CPU infeasible: {reason}",
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    (cpu_diagnostics,),
+                )
 
             coefficient_started_at = (
                 time.perf_counter() if timing_profile is not None else 0.0
@@ -2224,18 +2649,31 @@ def allocate_resources_kkt(
             solver_started_at = (
                 time.perf_counter() if timing_profile is not None else 0.0
             )
-            bw_values, nu, ok, reason = solve_kkt_fraction_allocation(
+            bw_values, nu, ok, reason, bw_diagnostics = solve_kkt_fraction_allocation(
                 bw_coeff,
                 kkt_cfg.min_bandwidth_fraction,
                 kkt_cfg.bisection_tolerance,
                 kkt_cfg.max_bisection_iterations,
+                return_diagnostics=True,
             )
+            if kkt_cache is not None:
+                kkt_cache.record_diagnostics(bw_diagnostics)
             if timing_profile is not None:
                 timing_profile["kkt_solver_core_runtime"] += (
                     time.perf_counter() - solver_started_at
                 )
             if not ok:
-                return KKTResourceAllocationResult(False, f"{node_id} bandwidth infeasible: {reason}", {}, {}, {}, {}, {}, {})
+                return KKTResourceAllocationResult(
+                    False,
+                    f"{node_id} bandwidth infeasible: {reason}",
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    (cpu_diagnostics, bw_diagnostics),
+                )
 
             result_assembly_started_at = (
                 time.perf_counter() if timing_profile is not None else 0.0
@@ -2257,6 +2695,7 @@ def allocate_resources_kkt(
                 {node_id: float(sum(bw_values))},
                 {node_id: float(mu)},
                 {node_id: float(nu)},
+                (cpu_diagnostics, bw_diagnostics),
             )
             if timing_profile is not None:
                 timing_profile["kkt_result_assembly_runtime"] += (
@@ -2275,6 +2714,7 @@ def allocate_resources_kkt(
             )
         if not node_result.feasible:
             return node_result
+        kkt_diagnostics.extend(node_result.kkt_diagnostics)
         cpu_alloc.update(node_result.cpu_allocations)
         bw_alloc.update(node_result.bandwidth_allocations)
         cpu_sums.update(node_result.per_node_cpu_sum)
@@ -2294,6 +2734,7 @@ def allocate_resources_kkt(
         bw_sums,
         cpu_mu,
         bw_nu,
+        tuple(kkt_diagnostics),
     )
 
 

@@ -177,7 +177,7 @@ def evaluate_transition(plan: ExactQTransitionPlan, context: Any | None = None) 
         raise RuntimeError("Exact-Q worker context is not initialized")
 
     timing_profile = new_timing_profile()
-    counters: dict[str, int] = {
+    counters: dict[str, Any] = {
         "counterfactual_environment_executions": 0,
         "branch_request_count": 0,
         "unique_branch_count": 0,
@@ -208,6 +208,10 @@ def evaluate_transition(plan: ExactQTransitionPlan, context: Any | None = None) 
         "heads_with_infeasible_stay": 0,
         "selected_action_infeasible_count": 0,
         "invalid_full_branch_execute_slot_count": 0,
+        "matching_natural_stable_count": 0,
+        "matching_max_updates_hit_count": 0,
+        "matching_update_counts": [],
+        "kkt_solve_diagnostics": [],
     }
     slot_branch_cache: dict[tuple[Any, ...], tuple[float, np.ndarray | None]] = {}
     transition_kkt_cache = task_allocation.KKTResourceAllocationCache()
@@ -409,6 +413,17 @@ def evaluate_transition(plan: ExactQTransitionPlan, context: Any | None = None) 
             reward_assembly_started_at = time.perf_counter()
             counters["counterfactual_environment_executions"] += 1
             summary = result.matching_summary
+            stop_reason = str(summary.get("stop_reason", ""))
+            if stop_reason == "converged_by_no_improvement":
+                counters["matching_natural_stable_count"] += 1
+            elif stop_reason == "stopped_by_max_updates":
+                counters["matching_max_updates_hit_count"] += 1
+            if "updates" in summary:
+                counters["matching_update_counts"].append(int(summary["updates"]))
+            counters["kkt_solve_diagnostics"].extend(
+                dict(record)
+                for record in summary.get("KKT_SOLVE_DIAGNOSTICS", [])
+            )
             counters["kkt_call_count"] += int(summary.get("kkt_cache_requests", 0))
             counters["kkt_cache_request_count"] += int(
                 summary.get("KKT_CACHE_REQUEST_COUNT", 0)

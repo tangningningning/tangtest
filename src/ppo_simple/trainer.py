@@ -55,6 +55,7 @@ from .policy import (
     BernoulliActorCritic,
 )
 from .cache_action_q import CacheActionQCritic
+from .cache_credit import compute_one_step_tdq_cache_trigger_credit
 from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
 from .exact_q_parallel import (
     ExactQHeadPlan,
@@ -127,6 +128,17 @@ DEFAULT_OPERATION_ADVANTAGE_NORMALIZATION_MODE = (
 DEFAULT_OPERATION_ADVANTAGE_REFERENCE_SCALE = 0.02
 CANDIDATE_POLICY_IMPROVEMENT_LEGACY_PPO = "LEGACY_PPO"
 CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE = "EXACT_Q_LISTWISE"
+CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE = "GLOBAL_GAE"
+CACHE_TRIGGER_ADVANTAGE_ONE_STEP_TDQ = "ONE_STEP_TD_Q_DIFFERENCE"
+CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE = "GLOBAL_GAE"
+CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT = "WHOLE_CACHE_JOINT"
+CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD = "PER_CACHE_HEAD"
+CACHE_RATIO_GRANULARITIES = frozenset(
+    {
+        CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
+        CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD,
+    }
+)
 DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE = 1.0
 CRITIC_VALUE_SCALE_NONE = "none"
 CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
@@ -218,6 +230,192 @@ def _gradient_group_norm(parameters: Any) -> float:
     return float(torch.sqrt(squared_norm).detach().cpu())
 
 
+def _gradient_clip_coefficient(preclip_norm: float, max_norm: float) -> float:
+    """Return the coefficient implied by ``clip_grad_norm_`` for diagnostics."""
+
+    norm = float(preclip_norm)
+    limit = float(max_norm)
+    if not math.isfinite(norm) or not math.isfinite(limit) or limit <= 0.0:
+        raise ValueError("gradient clipping norms must be finite and positive")
+    if norm <= 0.0:
+        return 1.0
+    return float(min(1.0, limit / norm))
+
+
+def _clip_disjoint_actor_gradient_groups(
+    cache_parameters: Any,
+    uav_parameters: Any,
+    max_norm: float,
+) -> dict[str, float]:
+    """Clip Cache and UAV actor gradients independently for one optimizer step."""
+
+    cache_parameters_tuple = tuple(cache_parameters)
+    uav_parameters_tuple = tuple(uav_parameters)
+    cache_ids = {id(parameter) for parameter in cache_parameters_tuple}
+    uav_ids = {id(parameter) for parameter in uav_parameters_tuple}
+    if cache_ids & uav_ids:
+        raise RuntimeError("Cache/UAV actor clipping groups overlap")
+    cache_preclip_norm = _gradient_group_norm(cache_parameters_tuple)
+    uav_preclip_norm = _gradient_group_norm(uav_parameters_tuple)
+    cache_clip_coefficient = _gradient_clip_coefficient(cache_preclip_norm, max_norm)
+    uav_clip_coefficient = _gradient_clip_coefficient(uav_preclip_norm, max_norm)
+    if cache_parameters_tuple and cache_clip_coefficient < 1.0:
+        torch.nn.utils.clip_grad_norm_(cache_parameters_tuple, max_norm)
+    if uav_parameters_tuple and uav_clip_coefficient < 1.0:
+        torch.nn.utils.clip_grad_norm_(uav_parameters_tuple, max_norm)
+    return {
+        "cache_preclip_norm": float(cache_preclip_norm),
+        "cache_clip_coefficient": float(cache_clip_coefficient),
+        "uav_preclip_norm": float(uav_preclip_norm),
+        "uav_clip_coefficient": float(uav_clip_coefficient),
+    }
+
+
+def _module_parameter_delta_norm(before_parameters: dict[str, Any], module: Any) -> float:
+    """Return a named-parameter delta norm for diagnostics only."""
+
+    delta_squared = 0.0
+    current_names = set()
+    for name, parameter in module.named_parameters():
+        key = str(name)
+        current_names.add(key)
+        if key not in before_parameters:
+            raise RuntimeError(f"diagnostic module parameter disappeared: {key}")
+        delta_squared += float(
+            torch.sum((parameter.detach() - before_parameters[key]) ** 2).cpu()
+        )
+    if current_names != set(before_parameters):
+        raise RuntimeError("diagnostic module parameter names changed during PPO update")
+    return float(np.sqrt(delta_squared))
+
+
+def _matching_termination_metrics(
+    summaries: Any,
+) -> dict[str, Any]:
+    """Aggregate Matching stop reasons without touching Matching decisions."""
+
+    natural_stable_count = 0
+    max_updates_hit_count = 0
+    update_counts: list[int] = []
+    for summary in summaries:
+        if not summary or not isinstance(summary, dict):
+            continue
+        stop_reason = str(summary.get("stop_reason", ""))
+        if stop_reason == "converged_by_no_improvement":
+            natural_stable_count += 1
+        elif stop_reason == "stopped_by_max_updates":
+            max_updates_hit_count += 1
+        if "updates" not in summary:
+            continue
+        update_count = int(summary["updates"])
+        if update_count < 0:
+            raise ValueError("Matching update count must be non-negative")
+        update_counts.append(update_count)
+    return _matching_metrics_from_counts(
+        natural_stable_count,
+        max_updates_hit_count,
+        update_counts,
+    )
+
+
+def _matching_metrics_from_counts(
+    natural_stable_count: int,
+    max_updates_hit_count: int,
+    update_counts: Any,
+) -> dict[str, Any]:
+    """Build the same Matching metrics from Exact-Q worker aggregates."""
+
+    counts_list = [int(value) for value in update_counts]
+    if any(value < 0 for value in counts_list):
+        raise ValueError("Matching update count must be non-negative")
+    if not counts_list:
+        return {
+            "natural_stable_count": int(natural_stable_count),
+            "max_updates_hit_count": int(max_updates_hit_count),
+            "max_updates_hit_rate": 0.0,
+            "update_count_mean": 0.0,
+            "update_count_p95": 0.0,
+            "update_count_max": 0,
+        }
+    counts = np.asarray(counts_list, dtype=np.float64)
+    return {
+        "natural_stable_count": int(natural_stable_count),
+        "max_updates_hit_count": int(max_updates_hit_count),
+        "max_updates_hit_rate": float(max_updates_hit_count / len(counts_list)),
+        "update_count_mean": float(np.mean(counts)),
+        "update_count_p95": float(np.percentile(counts, 95.0)),
+        "update_count_max": int(np.max(counts)),
+    }
+
+
+def _kkt_metrics_from_diagnostics(records: Any) -> dict[str, Any]:
+    """Aggregate read-only KKT solve diagnostics from Matching summaries."""
+
+    normalized: list[dict[str, Any]] = []
+    for record in records or ():
+        if not isinstance(record, dict):
+            continue
+        normalized.append(record)
+
+    solve_count = len(normalized)
+    converged_count = sum(
+        bool(record.get("converged_by_tolerance", False))
+        for record in normalized
+    )
+    max_iter_hit_count = sum(
+        bool(record.get("hit_max_bisection_iterations", False))
+        for record in normalized
+    )
+    finite_count = sum(bool(record.get("finite", False)) for record in normalized)
+
+    def finite_values(field: str) -> np.ndarray:
+        values = []
+        for record in normalized:
+            try:
+                value = float(record.get(field, math.nan))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        return np.asarray(values, dtype=np.float64)
+
+    iterations = finite_values("iterations")
+    resource_residuals = finite_values("resource_sum_residual")
+    stationarity_residuals = finite_values("stationarity_residual")
+    complementary_residuals = finite_values("complementary_slackness_residual")
+
+    def mean(values: np.ndarray) -> float:
+        return 0.0 if values.size == 0 else float(np.mean(values))
+
+    def maximum(values: np.ndarray) -> float:
+        return math.nan if values.size == 0 else float(np.max(values))
+
+    return {
+        "solve_count": int(solve_count),
+        "converged_count": int(converged_count),
+        "converged_rate": (
+            float(converged_count / solve_count) if solve_count else 0.0
+        ),
+        "max_iter_hit_count": int(max_iter_hit_count),
+        "max_iter_hit_rate": (
+            float(max_iter_hit_count / solve_count) if solve_count else 0.0
+        ),
+        "finite_count": int(finite_count),
+        "finite_rate": float(finite_count / solve_count) if solve_count else 0.0,
+        "iteration_mean": mean(iterations),
+        "iteration_p95": (
+            0.0 if iterations.size == 0 else float(np.percentile(iterations, 95.0))
+        ),
+        "iteration_max": int(np.max(iterations)) if iterations.size else 0,
+        "resource_residual_mean": mean(resource_residuals),
+        "resource_residual_max": maximum(resource_residuals),
+        "stationarity_residual_mean": mean(stationarity_residuals),
+        "stationarity_residual_max": maximum(stationarity_residuals),
+        "complementary_slackness_residual_mean": mean(complementary_residuals),
+        "complementary_slackness_residual_max": maximum(complementary_residuals),
+    }
+
+
 def _branch_specific_kl_gate_transition(
     *,
     cache_active: bool,
@@ -301,6 +499,84 @@ def _branch_specific_kl_gate_transition(
         "uav_active_next": next_uav_active,
         "remaining_epochs_suppressed": int(remaining_epochs),
     }
+
+
+def _candidate_kl_gate_transition(
+    *,
+    candidate_active: bool,
+    candidate_epoch_kl_mean: float,
+    candidate_epoch_kl_p90: float,
+    target_kl: float | None,
+    update_epoch: int,
+    update_epochs: int,
+) -> dict[str, Any]:
+    """Apply the candidate-only KL gate after one complete PPO epoch.
+
+    This gate is intentionally independent from the operation KL gate.  It
+    only changes candidate activity for later epochs; it never changes the
+    operation state or the detached Exact-Q teacher.
+    """
+
+    epoch_index = int(update_epoch)
+    total_epochs = int(update_epochs)
+    if epoch_index < 0 or total_epochs <= 0 or epoch_index >= total_epochs:
+        raise ValueError("invalid PPO update epoch for candidate KL gate")
+    if target_kl is None:
+        over_target: bool | None = None
+        trigger_source = "NONE"
+    else:
+        target = float(target_kl)
+        if not math.isfinite(target) or target <= 0.0:
+            raise ValueError("candidate target_kl must be positive and finite")
+        mean_over_target = bool(
+            math.isfinite(float(candidate_epoch_kl_mean))
+            and float(candidate_epoch_kl_mean) >= target
+        )
+        p90_over_target = bool(
+            math.isfinite(float(candidate_epoch_kl_p90))
+            and float(candidate_epoch_kl_p90) >= target
+        )
+        over_target = bool(mean_over_target or p90_over_target)
+        if mean_over_target and p90_over_target:
+            trigger_source = "BOTH"
+        elif mean_over_target:
+            trigger_source = "MEAN"
+        elif p90_over_target:
+            trigger_source = "P90"
+        else:
+            trigger_source = "NONE"
+    remaining_epochs = max(total_epochs - epoch_index - 1, 0)
+    newly_stopped = bool(
+        remaining_epochs > 0
+        and bool(candidate_active)
+        and over_target is True
+    )
+    return {
+        "candidate_over_target": over_target,
+        "candidate_kl_gate_statistic": "MEAN_OR_P90",
+        "candidate_kl_gate_trigger_source": trigger_source,
+        "candidate_newly_stopped": newly_stopped,
+        "candidate_active_next": bool(candidate_active) and not newly_stopped,
+        "remaining_epochs_suppressed": int(remaining_epochs),
+    }
+
+
+def _set_uav_branch_requires_grad(
+    policy: Any,
+    *,
+    operation_active: bool,
+    candidate_active: bool,
+) -> bool:
+    """Apply the operation/candidate/encoder active-state contract."""
+
+    encoder_active = bool(operation_active or candidate_active)
+    for parameter in policy.uav_operation_head.parameters():
+        parameter.requires_grad_(bool(operation_active))
+    for parameter in policy.uav_candidate_scorer.parameters():
+        parameter.requires_grad_(bool(candidate_active))
+    for parameter in policy.uav_encoder.parameters():
+        parameter.requires_grad_(encoder_active)
+    return encoder_active
 
 
 def _branch_actor_policy_loss(
@@ -409,11 +685,13 @@ class PPOV2Hyperparameters:
     max_grad_norm: float
     update_epochs: int
     target_kl: float | None
+    uav_candidate_target_kl: float | None
     num_minibatches: int
     hidden_sizes: tuple[int, ...]
     advantage_normalization_mode: str
     operation_advantage_normalization_mode: str
     operation_advantage_reference_scale: float
+    uav_candidate_q_reference_scale: float
     critic_value_scale_mode: str
     critic_value_scale_epsilon: float
     critic_value_scale_warmup_samples: int
@@ -531,12 +809,28 @@ class UpdateResult:
     cache_approx_kl: float = math.nan
     uav_approx_kl: float = math.nan
     cache_clip_fraction: float = math.nan
+    cache_per_head_old_new_kl_mean: float = math.nan
+    cache_per_head_old_new_kl_p50: float = math.nan
+    cache_per_head_old_new_kl_p90: float = math.nan
+    cache_per_head_old_new_kl_max: float = math.nan
+    cache_per_head_ratio_mean: float = math.nan
+    cache_per_head_ratio_p90: float = math.nan
+    cache_per_head_ratio_max: float = math.nan
+    cache_per_head_clip_fraction: float = math.nan
+    cache_ratio_granularity: str = CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT
+    whole_cache_joint_ratio_used_for_loss: bool = True
+    whole_cache_joint_ratio_diagnostic_only: bool = False
     uav_clip_fraction: float = math.nan
     cache_entropy: float = math.nan
     uav_entropy: float = math.nan
     cache_head_gradient_norm: float = math.nan
     uav_head_gradient_norm: float = math.nan
     shared_actor_gradient_norm: float = math.nan
+    cache_actor_grad_norm_preclip_by_update_epoch: tuple[float, ...] = ()
+    cache_actor_grad_clip_coefficient_by_update_epoch: tuple[float, ...] = ()
+    uav_actor_grad_norm_preclip_by_update_epoch: tuple[float, ...] = ()
+    uav_actor_grad_clip_coefficient_by_update_epoch: tuple[float, ...] = ()
+    combined_actor_grad_norm_postclip_by_update_epoch: tuple[float, ...] = ()
     cache_policy_loss: float = math.nan
     cache_trigger_policy_loss: float = math.nan
     cache_candidate_policy_loss: float = math.nan
@@ -550,7 +844,61 @@ class UpdateResult:
     uav_candidate_advantage_weighted_mean_residual: float = math.nan
     uav_candidate_advantage_normalization: str = ""
     uav_candidate_advantage_source: str = ""
+    # Frozen Exact-Q candidate-policy diagnostics.  These are measured after
+    # the PPO update against the same detached teacher used by the loss.
+    uav_candidate_policy_entropy_mean: float = math.nan
+    uav_candidate_teacher_entropy_mean: float = math.nan
+    uav_candidate_best_policy_prob_mean: float = math.nan
+    uav_candidate_best_policy_prob_median: float = math.nan
+    uav_candidate_best_policy_rank_mean: float = math.nan
+    uav_candidate_best_policy_top1_rate: float = math.nan
+    uav_candidate_best_policy_top3_rate: float = math.nan
+    uav_candidate_logit_std_mean: float = math.nan
+    uav_candidate_logit_range_mean: float = math.nan
+    uav_candidate_confidence_mean: float = math.nan
+    uav_candidate_confidence_p10: float = math.nan
+    uav_candidate_confidence_p50: float = math.nan
+    uav_candidate_confidence_p90: float = math.nan
+    uav_candidate_confidence_saturation_rate: float = math.nan
+    uav_candidate_scorer_gradient_norm_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_scorer_parameter_delta_norm_by_update_epoch: tuple[float, ...] = ()
+    uav_encoder_gradient_norm_by_update_epoch: tuple[float, ...] = ()
+    uav_encoder_parameter_delta_norm_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_old_new_kl_mean_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_old_new_kl_p90_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_old_new_kl_max_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_argmax_flip_rate_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_best_policy_prob_change_mean_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_best_policy_prob_change_p10_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_old_new_kl_mean: float = math.nan
+    uav_candidate_old_new_kl_p50: float = math.nan
+    uav_candidate_old_new_kl_p90: float = math.nan
+    uav_candidate_old_new_kl_max: float = math.nan
+    uav_candidate_argmax_flip_rate: float = math.nan
+    uav_candidate_best_policy_prob_change_mean: float = math.nan
+    uav_candidate_best_policy_prob_change_p10: float = math.nan
+    uav_candidate_target_kl: float = math.nan
+    uav_candidate_kl_gate_statistic: str = "MEAN_OR_P90"
+    uav_candidate_kl_gate_trigger_source: str = "NONE"
+    uav_candidate_kl_stop_epoch: int | None = None
+    uav_candidate_active_per_update_epoch: tuple[bool, ...] = ()
+    uav_candidate_suppressed_update_epochs: int = 0
     # Exact node-specific Cache credit diagnostics.
+    cache_trigger_advantage_source: str = CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE
+    cache_candidate_advantage_source: str = CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE
+    cache_trigger_tdq_raw_mean: float = math.nan
+    cache_trigger_tdq_raw_std: float = math.nan
+    cache_trigger_tdq_raw_p10: float = math.nan
+    cache_trigger_tdq_raw_p50: float = math.nan
+    cache_trigger_tdq_raw_p90: float = math.nan
+    cache_trigger_tdq_raw_abs_max: float = math.nan
+    cache_trigger_tdq_scale: float = math.nan
+    cache_trigger_tdq_normalized_abs_p90: float = math.nan
+    cache_trigger_tdq_normalized_abs_max: float = math.nan
+    one_step_tdq_branches_executed: int = 0
+    one_step_tdq_runtime_seconds: float = math.nan
+    seconds_per_cache_head: float = math.nan
+    projected_300_slot_runtime_seconds: float = math.nan
     cache_trigger_advantage_mean_abs: float = math.nan
     cache_candidate_advantage_mean_abs: float = math.nan
     cache_trigger_advantage_weighted_mean_residual: float = math.nan
@@ -652,6 +1000,9 @@ class UpdateResult:
     uav_operation_steps_suppressed: int = 0
     uav_candidate_full_steps: int = 0
     uav_candidate_only_steps_after_operation_stop: int = 0
+    uav_candidate_optimizer_step_count: int = 0
+    uav_encoder_optimizer_step_count: int = 0
+    uav_candidate_scorer_encoder_step_gap: int = 0
     uav_operation_full_rollout_kl: float = math.nan
     uav_operation_teacher_diagnostics: dict[str, Any] | None = None
     uav_operation_head_parameter_delta_norm: float = math.nan
@@ -699,6 +1050,50 @@ class UpdateResult:
     # writing per-transition raw arrays to JSONL.
     uav_operation_diagnostics: dict[str, Any] | None = None
     uav_operation_diagnostic_arrays: dict[str, np.ndarray] | None = None
+    matching_natural_stable_count: int = 0
+    matching_max_updates_hit_count: int = 0
+    matching_max_updates_hit_rate: float = 0.0
+    matching_update_count_mean: float = 0.0
+    matching_update_count_p95: float = 0.0
+    matching_update_count_max: int = 0
+    matching_cf_natural_stable_count: int = 0
+    matching_cf_max_updates_hit_count: int = 0
+    matching_cf_max_updates_hit_rate: float = 0.0
+    matching_cf_update_count_mean: float = 0.0
+    matching_cf_update_count_p95: float = 0.0
+    matching_cf_update_count_max: int = 0
+    kkt_solve_count: int = 0
+    kkt_converged_count: int = 0
+    kkt_converged_rate: float = 0.0
+    kkt_max_iter_hit_count: int = 0
+    kkt_max_iter_hit_rate: float = 0.0
+    kkt_finite_count: int = 0
+    kkt_finite_rate: float = 0.0
+    kkt_iteration_mean: float = 0.0
+    kkt_iteration_p95: float = 0.0
+    kkt_iteration_max: int = 0
+    kkt_resource_residual_mean: float = math.nan
+    kkt_resource_residual_max: float = math.nan
+    kkt_stationarity_residual_mean: float = math.nan
+    kkt_stationarity_residual_max: float = math.nan
+    kkt_complementary_slackness_residual_mean: float = math.nan
+    kkt_complementary_slackness_residual_max: float = math.nan
+    matching_cf_kkt_solve_count: int = 0
+    matching_cf_kkt_converged_count: int = 0
+    matching_cf_kkt_converged_rate: float = 0.0
+    matching_cf_kkt_max_iter_hit_count: int = 0
+    matching_cf_kkt_max_iter_hit_rate: float = 0.0
+    matching_cf_kkt_finite_count: int = 0
+    matching_cf_kkt_finite_rate: float = 0.0
+    matching_cf_kkt_iteration_mean: float = 0.0
+    matching_cf_kkt_iteration_p95: float = 0.0
+    matching_cf_kkt_iteration_max: int = 0
+    matching_cf_kkt_resource_residual_mean: float = math.nan
+    matching_cf_kkt_resource_residual_max: float = math.nan
+    matching_cf_kkt_stationarity_residual_mean: float = math.nan
+    matching_cf_kkt_stationarity_residual_max: float = math.nan
+    matching_cf_kkt_complementary_slackness_residual_mean: float = math.nan
+    matching_cf_kkt_complementary_slackness_residual_max: float = math.nan
 
 
 @dataclass(frozen=True)
@@ -1271,6 +1666,382 @@ def _exact_q_policy_quality_metrics(
     return result
 
 
+def _uav_candidate_policy_metrics(
+    probabilities: Any,
+    teacher_probabilities: Any,
+    q_values: Any,
+    valid_mask: Any,
+    logits: Any,
+) -> dict[str, float]:
+    """Summarize legal UAV candidate distributions on a frozen update batch."""
+
+    policy = np.asarray(probabilities, dtype=np.float64)
+    teacher = np.asarray(teacher_probabilities, dtype=np.float64)
+    q = np.asarray(q_values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    raw_logits = np.asarray(logits, dtype=np.float64)
+    if not (
+        policy.shape == teacher.shape == q.shape == valid.shape == raw_logits.shape
+    ) or policy.ndim < 1:
+        raise ValueError("UAV candidate diagnostic tensor shapes do not match")
+
+    policy_entropies: list[float] = []
+    teacher_entropies: list[float] = []
+    best_policy_probabilities: list[float] = []
+    best_policy_ranks: list[float] = []
+    best_top1: list[float] = []
+    best_top3: list[float] = []
+    logit_stds: list[float] = []
+    logit_ranges: list[float] = []
+    for prefix in np.ndindex(q.shape[:-1]):
+        legal = np.flatnonzero(valid[prefix])
+        if legal.size == 0:
+            continue
+        p = policy[prefix][legal]
+        t = teacher[prefix][legal]
+        q_row = q[prefix][legal]
+        logits_row = raw_logits[prefix][legal]
+        if (
+            not np.all(np.isfinite(p))
+            or not np.all(np.isfinite(t))
+            or not np.all(np.isfinite(q_row))
+            or not np.all(np.isfinite(logits_row))
+            or np.any(p < 0.0)
+            or np.any(t < 0.0)
+        ):
+            raise FloatingPointError("UAV candidate diagnostic contains NaN/Inf")
+        p_sum = float(np.sum(p))
+        t_sum = float(np.sum(t))
+        if p_sum <= 0.0 or t_sum <= 0.0:
+            raise FloatingPointError("UAV candidate diagnostic has empty legal mass")
+        p = p / p_sum
+        t = t / t_sum
+        policy_entropies.append(
+            float(-np.sum(np.where(p > 0.0, p * np.log(np.maximum(p, 1.0e-12)), 0.0)))
+        )
+        teacher_entropies.append(
+            float(-np.sum(np.where(t > 0.0, t * np.log(np.maximum(t, 1.0e-12)), 0.0)))
+        )
+        best_q = float(np.max(q_row))
+        best_mask = np.isclose(q_row, best_q, rtol=1.0e-10, atol=1.0e-10)
+        descending = np.argsort(-p, kind="stable")
+        best_positions = np.flatnonzero(best_mask)
+        best_policy_probabilities.append(float(np.sum(p[best_mask])))
+        best_policy_ranks.append(
+            float(1 + min(int(np.flatnonzero(descending == position)[0]) for position in best_positions))
+        )
+        best_top1.append(float(bool(np.any(best_mask[descending[:1]]))))
+        best_top3.append(float(bool(np.any(best_mask[descending[: min(3, len(descending))]]))))
+        logit_stds.append(float(np.std(logits_row)))
+        logit_ranges.append(float(np.max(logits_row) - np.min(logits_row)))
+
+    if not policy_entropies:
+        return {
+            "policy_entropy_mean": math.nan,
+            "teacher_entropy_mean": math.nan,
+            "best_policy_prob_mean": math.nan,
+            "best_policy_prob_median": math.nan,
+            "best_policy_rank_mean": math.nan,
+            "best_policy_top1_rate": math.nan,
+            "best_policy_top3_rate": math.nan,
+            "logit_std_mean": math.nan,
+            "logit_range_mean": math.nan,
+        }
+    result = {
+        "policy_entropy_mean": float(np.mean(policy_entropies)),
+        "teacher_entropy_mean": float(np.mean(teacher_entropies)),
+        "best_policy_prob_mean": float(np.mean(best_policy_probabilities)),
+        "best_policy_prob_median": float(np.median(best_policy_probabilities)),
+        "best_policy_rank_mean": float(np.mean(best_policy_ranks)),
+        "best_policy_top1_rate": float(np.mean(best_top1)),
+        "best_policy_top3_rate": float(np.mean(best_top3)),
+        "logit_std_mean": float(np.mean(logit_stds)),
+        "logit_range_mean": float(np.mean(logit_ranges)),
+    }
+    if not all(math.isfinite(value) for value in result.values()):
+        raise FloatingPointError("UAV candidate diagnostic is non-finite")
+    return result
+
+
+def _uav_candidate_old_new_drift_summary(
+    kl_values: Any,
+    argmax_flip_values: Any,
+    best_policy_prob_change_values: Any,
+) -> dict[str, Any]:
+    """Summarize old-vs-new legal candidate distributions.
+
+    Each entry is one legal candidate head.  The arrays are retained by the
+    caller so the final update-level percentiles are over legal heads, rather
+    than over already-aggregated epoch means.
+    """
+
+    kl = np.asarray(kl_values, dtype=np.float64).reshape(-1)
+    flips = np.asarray(argmax_flip_values, dtype=np.float64).reshape(-1)
+    best_changes = np.asarray(
+        best_policy_prob_change_values, dtype=np.float64
+    ).reshape(-1)
+    if not (kl.shape == flips.shape == best_changes.shape):
+        raise ValueError("UAV candidate drift value shapes do not match")
+    if kl.size == 0:
+        return {
+            "kl_values": kl,
+            "argmax_flip_values": flips,
+            "best_policy_prob_change_values": best_changes,
+            "kl_mean": math.nan,
+            "kl_p50": math.nan,
+            "kl_p90": math.nan,
+            "kl_max": math.nan,
+            "argmax_flip_rate": math.nan,
+            "best_policy_prob_change_mean": math.nan,
+            "best_policy_prob_change_p10": math.nan,
+        }
+    if not (
+        np.all(np.isfinite(kl))
+        and np.all(np.isfinite(flips))
+        and np.all(np.isfinite(best_changes))
+    ):
+        raise FloatingPointError("UAV candidate old-vs-new drift is non-finite")
+    return {
+        "kl_values": kl,
+        "argmax_flip_values": flips,
+        "best_policy_prob_change_values": best_changes,
+        "kl_mean": float(np.mean(kl)),
+        "kl_p50": float(np.percentile(kl, 50.0)),
+        "kl_p90": float(np.percentile(kl, 90.0)),
+        "kl_max": float(np.max(kl)),
+        "argmax_flip_rate": float(np.mean(flips)),
+        "best_policy_prob_change_mean": float(np.mean(best_changes)),
+        "best_policy_prob_change_p10": float(
+            np.percentile(best_changes, 10.0)
+        ),
+    }
+
+
+def _uav_candidate_old_new_drift_metrics(
+    old_probabilities: Any,
+    new_probabilities: Any,
+    teacher_probabilities: Any,
+    q_values: Any,
+    valid_mask: Any,
+) -> dict[str, Any]:
+    """Measure policy drift on the fixed legal Exact-Q candidate heads.
+
+    The old and new distributions are renormalized over the detached legal
+    mask only.  The best-policy probability change is the probability mass of
+    the detached highest-Q candidate set, so tied Q candidates are treated as
+    a set rather than as a single arbitrary index.
+    """
+
+    old = np.asarray(old_probabilities, dtype=np.float64)
+    new = np.asarray(new_probabilities, dtype=np.float64)
+    teacher = np.asarray(teacher_probabilities, dtype=np.float64)
+    q = np.asarray(q_values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if not (old.shape == new.shape == teacher.shape == q.shape == valid.shape):
+        raise ValueError("UAV candidate old-vs-new tensor shapes do not match")
+    if old.ndim < 1:
+        raise ValueError("UAV candidate old-vs-new tensors must have a candidate axis")
+
+    kl_values: list[float] = []
+    argmax_flip_values: list[float] = []
+    best_policy_prob_change_values: list[float] = []
+    for prefix in np.ndindex(q.shape[:-1]):
+        legal = np.flatnonzero(valid[prefix])
+        if legal.size == 0:
+            continue
+        old_row = old[prefix][legal]
+        new_row = new[prefix][legal]
+        teacher_row = teacher[prefix][legal]
+        q_row = q[prefix][legal]
+        if not (
+            np.all(np.isfinite(old_row))
+            and np.all(np.isfinite(new_row))
+            and np.all(np.isfinite(teacher_row))
+            and np.all(np.isfinite(q_row))
+            and np.all(old_row >= 0.0)
+            and np.all(new_row >= 0.0)
+            and np.all(teacher_row >= 0.0)
+        ):
+            raise FloatingPointError(
+                "UAV candidate old-vs-new drift contains NaN/Inf or negative mass"
+            )
+        old_sum = float(np.sum(old_row))
+        new_sum = float(np.sum(new_row))
+        teacher_sum = float(np.sum(teacher_row))
+        if old_sum <= 0.0 or new_sum <= 0.0 or teacher_sum <= 0.0:
+            raise FloatingPointError(
+                "UAV candidate old-vs-new drift has empty legal probability mass"
+            )
+        old_row = old_row / old_sum
+        new_row = new_row / new_sum
+        teacher_row = teacher_row / teacher_sum
+        positive = old_row > 0.0
+        kl = float(
+            np.sum(
+                old_row[positive]
+                * (
+                    np.log(np.maximum(old_row[positive], 1.0e-300))
+                    - np.log(np.maximum(new_row[positive], 1.0e-300))
+                )
+            )
+        )
+        kl_values.append(max(0.0, kl))
+        argmax_flip_values.append(
+            float(int(np.argmax(old_row)) != int(np.argmax(new_row)))
+        )
+        best_q = float(np.max(q_row))
+        best_mask = np.isclose(q_row, best_q, rtol=1.0e-10, atol=1.0e-10)
+        # The teacher is the detached Exact-Q target used by the loss.  Keep
+        # it in the validation path so this diagnostic cannot silently drift
+        # to a different target tensor.
+        if not np.isclose(float(np.sum(teacher_row)), 1.0, atol=1.0e-8):
+            raise FloatingPointError("UAV candidate teacher mass is not normalized")
+        best_policy_prob_change_values.append(
+            float(np.sum(new_row[best_mask]) - np.sum(old_row[best_mask]))
+        )
+    return _uav_candidate_old_new_drift_summary(
+        kl_values,
+        argmax_flip_values,
+        best_policy_prob_change_values,
+    )
+
+
+def _cache_per_head_ppo_loss(
+    ratios: Any,
+    advantages: Any,
+    clip_epsilon: float,
+) -> Any:
+    """Compute the global-GAE PPO surrogate averaged over Cache heads."""
+
+    if torch is None:  # pragma: no cover - guarded by the trainer constructor
+        raise RuntimeError("Cache per-head PPO loss requires torch")
+    ratio_t = torch.as_tensor(ratios)
+    advantage_t = torch.as_tensor(advantages, device=ratio_t.device)
+    if ratio_t.ndim != 2 or advantage_t.ndim != 1:
+        raise ValueError("Cache per-head PPO tensors must be [B,H] and [B]")
+    if int(ratio_t.shape[0]) != int(advantage_t.shape[0]):
+        raise ValueError("Cache per-head ratio/advantage batch shape mismatch")
+    if not math.isfinite(float(clip_epsilon)) or float(clip_epsilon) <= 0.0:
+        raise ValueError("Cache per-head clip_epsilon must be positive and finite")
+    head_advantages = advantage_t.unsqueeze(-1).expand_as(ratio_t)
+    unclipped = ratio_t * head_advantages
+    clipped = torch.clamp(
+        ratio_t,
+        1.0 - float(clip_epsilon),
+        1.0 + float(clip_epsilon),
+    ) * head_advantages
+    return -torch.minimum(unclipped, clipped).mean()
+
+
+def _cache_per_head_old_new_kl(
+    old_operation_log_probs: Any,
+    new_operation_log_probs: Any,
+    old_candidate_log_probs: Any,
+    new_candidate_log_probs: Any,
+    operation_masks: Any,
+    candidate_masks: Any,
+) -> Any:
+    """Return old-policy-to-new-policy KL for each Cache head.
+
+    The per-head action space is KEEP plus each legal UPDATE candidate.  The
+    UPDATE probability is the trigger probability times the conditional
+    candidate probability, so this exactly matches the atomic-action logp
+    used by the Stage2A loss.  Masks are fixed rollout masks and padded
+    candidates contribute zero.
+    """
+
+    if torch is None:  # pragma: no cover - guarded by the trainer constructor
+        raise RuntimeError("Cache per-head KL requires torch")
+    old_operation = torch.as_tensor(old_operation_log_probs)
+    new_operation = torch.as_tensor(
+        new_operation_log_probs,
+        dtype=old_operation.dtype,
+        device=old_operation.device,
+    )
+    old_candidate = torch.as_tensor(
+        old_candidate_log_probs,
+        dtype=old_operation.dtype,
+        device=old_operation.device,
+    )
+    new_candidate = torch.as_tensor(
+        new_candidate_log_probs,
+        dtype=old_operation.dtype,
+        device=old_operation.device,
+    )
+    operation_mask = torch.as_tensor(
+        operation_masks,
+        dtype=torch.bool,
+        device=old_operation.device,
+    )
+    candidate_mask = torch.as_tensor(
+        candidate_masks,
+        dtype=torch.bool,
+        device=old_operation.device,
+    )
+    if old_operation.ndim != 3 or int(old_operation.shape[-1]) != 2:
+        raise ValueError("Cache operation log-probabilities must be [B,H,2]")
+    if tuple(new_operation.shape) != tuple(old_operation.shape):
+        raise ValueError("Cache old/new operation log-probability shape mismatch")
+    if old_candidate.ndim != 3 or tuple(new_candidate.shape) != tuple(old_candidate.shape):
+        raise ValueError("Cache old/new candidate log-probability shape mismatch")
+    if tuple(operation_mask.shape) != tuple(old_operation.shape):
+        raise ValueError("Cache operation mask shape mismatch")
+    if tuple(candidate_mask.shape) != tuple(old_candidate.shape):
+        raise ValueError("Cache candidate mask shape mismatch")
+    if not bool(torch.all(torch.any(operation_mask, dim=-1)).item()):
+        raise ValueError("Cache operation mask blocks every action")
+    if not bool(torch.all(torch.any(candidate_mask, dim=-1)).item()):
+        raise ValueError("Cache candidate mask blocks every candidate")
+    for values, mask, label in (
+        (old_operation, operation_mask, "old operation"),
+        (new_operation, operation_mask, "new operation"),
+        (old_candidate, candidate_mask, "old candidate"),
+        (new_candidate, candidate_mask, "new candidate"),
+    ):
+        if not bool(torch.all(torch.isfinite(values[mask])).item()):
+            raise FloatingPointError(f"Cache {label} log-probabilities are non-finite")
+
+    safe_old_operation = torch.where(
+        operation_mask, old_operation, torch.zeros_like(old_operation)
+    )
+    safe_new_operation = torch.where(
+        operation_mask, new_operation, torch.zeros_like(new_operation)
+    )
+    safe_old_candidate = torch.where(
+        candidate_mask, old_candidate, torch.zeros_like(old_candidate)
+    )
+    safe_new_candidate = torch.where(
+        candidate_mask, new_candidate, torch.zeros_like(new_candidate)
+    )
+    old_operation_probabilities = torch.where(
+        operation_mask,
+        torch.exp(safe_old_operation),
+        torch.zeros_like(safe_old_operation),
+    )
+    old_candidate_probabilities = torch.where(
+        candidate_mask,
+        torch.exp(safe_old_candidate),
+        torch.zeros_like(safe_old_candidate),
+    )
+    old_keep = old_operation_probabilities[..., 0]
+    old_update = old_operation_probabilities[..., 1]
+    keep_kl = old_keep * (
+        safe_old_operation[..., 0] - safe_new_operation[..., 0]
+    )
+    update_log_delta = (
+        safe_old_operation[..., 1].unsqueeze(-1)
+        + safe_old_candidate
+        - safe_new_operation[..., 1].unsqueeze(-1)
+        - safe_new_candidate
+    )
+    update_kl = (
+        old_update.unsqueeze(-1)
+        * old_candidate_probabilities
+        * update_log_delta
+    ).sum(dim=-1)
+    return torch.clamp(keep_kl + update_kl, min=0.0)
+
+
 def _proposal_source_diagnostics(
     q_values: Any,
     valid_mask: Any,
@@ -1337,14 +2108,41 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         "cache_approx_kl": float(update.cache_approx_kl),
         "uav_approx_kl": float(update.uav_approx_kl),
         "cache_clip_fraction": float(update.cache_clip_fraction),
+        "CACHE_PER_HEAD_OLD_NEW_KL_MEAN": float(
+            update.cache_per_head_old_new_kl_mean
+        ),
+        "CACHE_PER_HEAD_OLD_NEW_KL_P50": float(
+            update.cache_per_head_old_new_kl_p50
+        ),
+        "CACHE_PER_HEAD_OLD_NEW_KL_P90": float(
+            update.cache_per_head_old_new_kl_p90
+        ),
+        "CACHE_PER_HEAD_OLD_NEW_KL_MAX": float(
+            update.cache_per_head_old_new_kl_max
+        ),
+        "CACHE_PER_HEAD_RATIO_MEAN": float(update.cache_per_head_ratio_mean),
+        "CACHE_PER_HEAD_RATIO_P90": float(update.cache_per_head_ratio_p90),
+        "CACHE_PER_HEAD_RATIO_MAX": float(update.cache_per_head_ratio_max),
+        "CACHE_PER_HEAD_CLIP_FRACTION": float(update.cache_per_head_clip_fraction),
         "uav_clip_fraction": float(update.uav_clip_fraction),
         "cache_entropy": float(update.cache_entropy),
         "uav_entropy": float(update.uav_entropy),
         "cache_head_gradient_norm": float(update.cache_head_gradient_norm),
         "uav_head_gradient_norm": float(update.uav_head_gradient_norm),
-        "shared_actor_gradient_norm": float(update.shared_actor_gradient_norm),
-    }
+            "shared_actor_gradient_norm": float(update.shared_actor_gradient_norm),
+        }
     fields = values if all(math.isfinite(value) for value in values.values()) else {}
+    fields.update(
+        {
+            "CACHE_RATIO_GRANULARITY": str(update.cache_ratio_granularity),
+            "WHOLE_CACHE_JOINT_RATIO_USED_FOR_LOSS": bool(
+                update.whole_cache_joint_ratio_used_for_loss
+            ),
+            "WHOLE_CACHE_JOINT_RATIO_DIAGNOSTIC_ONLY": bool(
+                update.whole_cache_joint_ratio_diagnostic_only
+            ),
+        }
+    )
     policy_losses = {
         "cache_policy_loss": float(update.cache_policy_loss),
         "cache_trigger_policy_loss": float(update.cache_trigger_policy_loss),
@@ -1375,6 +2173,167 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         fields["candidate_advantage_source"] = str(
             update.uav_candidate_advantage_source
         )
+    candidate_policy_metrics = {
+        "UAV_CANDIDATE_POLICY_ENTROPY_MEAN": float(
+            update.uav_candidate_policy_entropy_mean
+        ),
+        "UAV_CANDIDATE_TEACHER_ENTROPY_MEAN": float(
+            update.uav_candidate_teacher_entropy_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_MEAN": float(
+            update.uav_candidate_best_policy_prob_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_MEDIAN": float(
+            update.uav_candidate_best_policy_prob_median
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_RANK_MEAN": float(
+            update.uav_candidate_best_policy_rank_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_TOP1_RATE": float(
+            update.uav_candidate_best_policy_top1_rate
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_TOP3_RATE": float(
+            update.uav_candidate_best_policy_top3_rate
+        ),
+        "UAV_CANDIDATE_LOGIT_STD_MEAN": float(update.uav_candidate_logit_std_mean),
+        "UAV_CANDIDATE_LOGIT_RANGE_MEAN": float(
+            update.uav_candidate_logit_range_mean
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_policy_metrics.values()):
+        fields.update(candidate_policy_metrics)
+    candidate_confidence_metrics = {
+        "UAV_CANDIDATE_CONFIDENCE_MEAN": float(
+            update.uav_candidate_confidence_mean
+        ),
+        "UAV_CANDIDATE_CONFIDENCE_P10": float(update.uav_candidate_confidence_p10),
+        "UAV_CANDIDATE_CONFIDENCE_P50": float(update.uav_candidate_confidence_p50),
+        "UAV_CANDIDATE_CONFIDENCE_P90": float(update.uav_candidate_confidence_p90),
+        "UAV_CANDIDATE_CONFIDENCE_SATURATION_RATE": float(
+            update.uav_candidate_confidence_saturation_rate
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_confidence_metrics.values()):
+        fields.update(candidate_confidence_metrics)
+    fields.update(
+        {
+            "CACHE_ACTOR_GRAD_NORM_PRECLIP": [
+                float(value)
+                for value in update.cache_actor_grad_norm_preclip_by_update_epoch
+            ],
+            "CACHE_ACTOR_GRAD_CLIP_COEFFICIENT": [
+                float(value)
+                for value in update.cache_actor_grad_clip_coefficient_by_update_epoch
+            ],
+            "UAV_ACTOR_GRAD_NORM_PRECLIP": [
+                float(value)
+                for value in update.uav_actor_grad_norm_preclip_by_update_epoch
+            ],
+            "UAV_ACTOR_GRAD_CLIP_COEFFICIENT": [
+                float(value)
+                for value in update.uav_actor_grad_clip_coefficient_by_update_epoch
+            ],
+            "COMBINED_ACTOR_GRAD_NORM_POSTCLIP": [
+                float(value)
+                for value in update.combined_actor_grad_norm_postclip_by_update_epoch
+            ],
+            "UAV_CANDIDATE_SCORER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_scorer_gradient_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_SCORER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_scorer_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_gradient_norm_by_update_epoch
+            ],
+            "UAV_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_OLD_NEW_KL_MEAN_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_old_new_kl_mean_by_update_epoch
+            ],
+            "UAV_CANDIDATE_OLD_NEW_KL_P90_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_old_new_kl_p90_by_update_epoch
+            ],
+            "UAV_CANDIDATE_OLD_NEW_KL_MAX_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_old_new_kl_max_by_update_epoch
+            ],
+            "UAV_CANDIDATE_ARGMAX_FLIP_RATE_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_argmax_flip_rate_by_update_epoch
+            ],
+            "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_MEAN_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_best_policy_prob_change_mean_by_update_epoch
+            ],
+            "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_P10_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_best_policy_prob_change_p10_by_update_epoch
+            ],
+        }
+    )
+    combined_postclip = np.asarray(
+        update.combined_actor_grad_norm_postclip_by_update_epoch,
+        dtype=np.float64,
+    )
+    if combined_postclip.size:
+        fields.update(
+            {
+                "COMBINED_POSTCLIP_NORM_MEAN": float(np.mean(combined_postclip)),
+                "COMBINED_POSTCLIP_NORM_MAX": float(np.max(combined_postclip)),
+                "COMBINED_POSTCLIP_GT_0P5_FRACTION": float(
+                    np.mean(combined_postclip > 0.5)
+                ),
+            }
+        )
+    candidate_drift_metrics = {
+        "UAV_CANDIDATE_OLD_NEW_KL_MEAN": float(
+            update.uav_candidate_old_new_kl_mean
+        ),
+        "UAV_CANDIDATE_OLD_NEW_KL_P50": float(update.uav_candidate_old_new_kl_p50),
+        "UAV_CANDIDATE_OLD_NEW_KL_P90": float(update.uav_candidate_old_new_kl_p90),
+        "UAV_CANDIDATE_OLD_NEW_KL_MAX": float(update.uav_candidate_old_new_kl_max),
+        "UAV_CANDIDATE_ARGMAX_FLIP_RATE": float(
+            update.uav_candidate_argmax_flip_rate
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_MEAN": float(
+            update.uav_candidate_best_policy_prob_change_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_P10": float(
+            update.uav_candidate_best_policy_prob_change_p10
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_drift_metrics.values()):
+        fields.update(candidate_drift_metrics)
+    candidate_gate_metrics = {
+        "UAV_CANDIDATE_TARGET_KL": float(update.uav_candidate_target_kl),
+    }
+    if all(math.isfinite(value) for value in candidate_gate_metrics.values()):
+        fields.update(candidate_gate_metrics)
+    fields.update(
+        {
+            "UAV_CANDIDATE_KL_GATE_STATISTIC": str(
+                update.uav_candidate_kl_gate_statistic
+            ),
+            "UAV_CANDIDATE_KL_GATE_TRIGGER_SOURCE": str(
+                update.uav_candidate_kl_gate_trigger_source
+            ),
+            "UAV_CANDIDATE_KL_STOP_EPOCH": update.uav_candidate_kl_stop_epoch,
+            "UAV_CANDIDATE_ACTIVE_PER_UPDATE_EPOCH": [
+                bool(value) for value in update.uav_candidate_active_per_update_epoch
+            ],
+            "UAV_CANDIDATE_SUPPRESSED_UPDATE_EPOCHS": int(
+                update.uav_candidate_suppressed_update_epochs
+            ),
+        }
+    )
     scorer_deltas = {
         "cache_target_scorer_parameter_delta_norm": float(
             update.cache_target_scorer_parameter_delta_norm
@@ -1425,6 +2384,16 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         fields["cache_proposal_diagnostics"] = dict(update.cache_proposal_diagnostics)
     if update.uav_proposal_diagnostics is not None:
         fields["uav_proposal_diagnostics"] = dict(update.uav_proposal_diagnostics)
+    fields.update(
+        {
+            "CACHE_TRIGGER_ADVANTAGE_SOURCE": str(
+                update.cache_trigger_advantage_source
+            ),
+            "CACHE_CANDIDATE_ADVANTAGE_SOURCE": str(
+                update.cache_candidate_advantage_source
+            ),
+        }
+    )
     cache_credit_metrics = {
         "cache_trigger_advantage_mean_abs": float(
             update.cache_trigger_advantage_mean_abs
@@ -1440,6 +2409,35 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         ),
         "cache_credit_runtime_seconds": float(update.cache_credit_runtime_seconds),
     }
+    fields.update(
+        {
+            "CACHE_TRIGGER_TDQ_RAW_MEAN": float(update.cache_trigger_tdq_raw_mean),
+            "CACHE_TRIGGER_TDQ_RAW_STD": float(update.cache_trigger_tdq_raw_std),
+            "CACHE_TRIGGER_TDQ_RAW_P10": float(update.cache_trigger_tdq_raw_p10),
+            "CACHE_TRIGGER_TDQ_RAW_P50": float(update.cache_trigger_tdq_raw_p50),
+            "CACHE_TRIGGER_TDQ_RAW_P90": float(update.cache_trigger_tdq_raw_p90),
+            "CACHE_TRIGGER_TDQ_RAW_ABS_MAX": float(
+                update.cache_trigger_tdq_raw_abs_max
+            ),
+            "CACHE_TRIGGER_TDQ_SCALE": float(update.cache_trigger_tdq_scale),
+            "CACHE_TRIGGER_TDQ_NORMALIZED_ABS_P90": float(
+                update.cache_trigger_tdq_normalized_abs_p90
+            ),
+            "CACHE_TRIGGER_TDQ_NORMALIZED_ABS_MAX": float(
+                update.cache_trigger_tdq_normalized_abs_max
+            ),
+            "ONE_STEP_TDQ_BRANCHES_EXECUTED": int(
+                update.one_step_tdq_branches_executed
+            ),
+            "ONE_STEP_TDQ_RUNTIME_SECONDS": float(
+                update.one_step_tdq_runtime_seconds
+            ),
+            "SECONDS_PER_CACHE_HEAD": float(update.seconds_per_cache_head),
+            "PROJECTED_300_SLOT_RUNTIME_SECONDS": float(
+                update.projected_300_slot_runtime_seconds
+            ),
+        }
+    )
     if all(math.isfinite(value) for value in cache_credit_metrics.values()):
         fields.update(cache_credit_metrics)
         fields["cache_credit_counterfactual_env_executions"] = int(
@@ -1802,6 +2800,15 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
             "UAV_CANDIDATE_ONLY_STEPS_AFTER_OPERATION_STOP": int(
                 update.uav_candidate_only_steps_after_operation_stop
             ),
+            "UAV_CANDIDATE_OPTIMIZER_STEP_COUNT": int(
+                update.uav_candidate_optimizer_step_count
+            ),
+            "UAV_ENCODER_OPTIMIZER_STEP_COUNT": int(
+                update.uav_encoder_optimizer_step_count
+            ),
+            "UAV_CANDIDATE_SCORER_ENCODER_STEP_GAP": int(
+                update.uav_candidate_scorer_encoder_step_gap
+            ),
         }
     )
     if update.uav_operation_teacher_diagnostics is not None:
@@ -1814,6 +2821,104 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
     }
     if all(math.isfinite(value) for value in encoder_gradient_norms.values()):
         fields.update(encoder_gradient_norms)
+    fields.update(
+        {
+            "MATCHING_NATURAL_STABLE_COUNT": int(
+                update.matching_natural_stable_count
+            ),
+            "MATCHING_MAX_UPDATES_HIT_COUNT": int(
+                update.matching_max_updates_hit_count
+            ),
+            "MATCHING_MAX_UPDATES_HIT_RATE": float(
+                update.matching_max_updates_hit_rate
+            ),
+            "MATCHING_UPDATE_COUNT_MEAN": float(update.matching_update_count_mean),
+            "MATCHING_UPDATE_COUNT_P95": float(update.matching_update_count_p95),
+            "MATCHING_UPDATE_COUNT_MAX": int(update.matching_update_count_max),
+            "MATCHING_CF_NATURAL_STABLE_COUNT": int(
+                update.matching_cf_natural_stable_count
+            ),
+            "MATCHING_CF_MAX_UPDATES_HIT_COUNT": int(
+                update.matching_cf_max_updates_hit_count
+            ),
+            "MATCHING_CF_MAX_UPDATES_HIT_RATE": float(
+                update.matching_cf_max_updates_hit_rate
+            ),
+            "MATCHING_CF_UPDATE_COUNT_MEAN": float(
+                update.matching_cf_update_count_mean
+            ),
+            "MATCHING_CF_UPDATE_COUNT_P95": float(
+                update.matching_cf_update_count_p95
+            ),
+            "MATCHING_CF_UPDATE_COUNT_MAX": int(
+                update.matching_cf_update_count_max
+            ),
+            "KKT_SOLVE_COUNT": int(update.kkt_solve_count),
+            "KKT_CONVERGED_COUNT": int(update.kkt_converged_count),
+            "KKT_CONVERGED_RATE": float(update.kkt_converged_rate),
+            "KKT_MAX_ITER_HIT_COUNT": int(update.kkt_max_iter_hit_count),
+            "KKT_MAX_ITER_HIT_RATE": float(update.kkt_max_iter_hit_rate),
+            "KKT_FINITE_COUNT": int(update.kkt_finite_count),
+            "KKT_FINITE_RATE": float(update.kkt_finite_rate),
+            "KKT_ITERATION_MEAN": float(update.kkt_iteration_mean),
+            "KKT_ITERATION_P95": float(update.kkt_iteration_p95),
+            "KKT_ITERATION_MAX": int(update.kkt_iteration_max),
+            "KKT_RESOURCE_RESIDUAL_MEAN": float(
+                update.kkt_resource_residual_mean
+            ),
+            "KKT_RESOURCE_RESIDUAL_MAX": float(update.kkt_resource_residual_max),
+            "KKT_STATIONARITY_RESIDUAL_MEAN": float(
+                update.kkt_stationarity_residual_mean
+            ),
+            "KKT_STATIONARITY_RESIDUAL_MAX": float(
+                update.kkt_stationarity_residual_max
+            ),
+            "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": float(
+                update.kkt_complementary_slackness_residual_mean
+            ),
+            "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": float(
+                update.kkt_complementary_slackness_residual_max
+            ),
+            "KKT_CF_SOLVE_COUNT": int(update.matching_cf_kkt_solve_count),
+            "KKT_CF_CONVERGED_COUNT": int(
+                update.matching_cf_kkt_converged_count
+            ),
+            "KKT_CF_CONVERGED_RATE": float(
+                update.matching_cf_kkt_converged_rate
+            ),
+            "KKT_CF_MAX_ITER_HIT_COUNT": int(
+                update.matching_cf_kkt_max_iter_hit_count
+            ),
+            "KKT_CF_MAX_ITER_HIT_RATE": float(
+                update.matching_cf_kkt_max_iter_hit_rate
+            ),
+            "KKT_CF_FINITE_COUNT": int(update.matching_cf_kkt_finite_count),
+            "KKT_CF_FINITE_RATE": float(update.matching_cf_kkt_finite_rate),
+            "KKT_CF_ITERATION_MEAN": float(
+                update.matching_cf_kkt_iteration_mean
+            ),
+            "KKT_CF_ITERATION_P95": float(update.matching_cf_kkt_iteration_p95),
+            "KKT_CF_ITERATION_MAX": int(update.matching_cf_kkt_iteration_max),
+            "KKT_CF_RESOURCE_RESIDUAL_MEAN": float(
+                update.matching_cf_kkt_resource_residual_mean
+            ),
+            "KKT_CF_RESOURCE_RESIDUAL_MAX": float(
+                update.matching_cf_kkt_resource_residual_max
+            ),
+            "KKT_CF_STATIONARITY_RESIDUAL_MEAN": float(
+                update.matching_cf_kkt_stationarity_residual_mean
+            ),
+            "KKT_CF_STATIONARITY_RESIDUAL_MAX": float(
+                update.matching_cf_kkt_stationarity_residual_max
+            ),
+            "KKT_CF_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": float(
+                update.matching_cf_kkt_complementary_slackness_residual_mean
+            ),
+            "KKT_CF_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": float(
+                update.matching_cf_kkt_complementary_slackness_residual_max
+            ),
+        }
+    )
     return fields
 
 
@@ -2496,6 +3601,25 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
     hidden_sizes = tuple(int(value) for value in get(cfg, "algorithm.ppo.hidden_sizes"))
     learning_rate = float(get(cfg, "algorithm.ppo.learning_rate"))
     raw_target_kl = get(cfg, "algorithm.ppo.target_kl")
+    operation_reference_scale = float(
+        get(
+            cfg,
+            "algorithm.ppo.operation_advantage_reference_scale",
+            DEFAULT_OPERATION_ADVANTAGE_REFERENCE_SCALE,
+        )
+    )
+    candidate_reference_scale = float(
+        get(
+            cfg,
+            "algorithm.ppo.uav_candidate_q_reference_scale",
+            operation_reference_scale,
+        )
+    )
+    raw_candidate_target_kl = get(
+        cfg,
+        "algorithm.ppo.uav_candidate_target_kl",
+        raw_target_kl,
+    )
     values = PPOV2Hyperparameters(
         gamma=float(get(cfg, "algorithm.ppo.gamma")),
         gae_lambda=float(get(cfg, "algorithm.ppo.gae_lambda")),
@@ -2512,6 +3636,11 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         max_grad_norm=float(get(cfg, "algorithm.ppo.max_grad_norm")),
         update_epochs=int(get(cfg, "algorithm.ppo.update_epochs")),
         target_kl=(None if raw_target_kl is None else float(raw_target_kl)),
+        uav_candidate_target_kl=(
+            None
+            if raw_candidate_target_kl is None
+            else float(raw_candidate_target_kl)
+        ),
         num_minibatches=int(get(cfg, "algorithm.ppo.num_minibatches")),
         hidden_sizes=hidden_sizes,
         advantage_normalization_mode=str(
@@ -2529,11 +3658,10 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
             )
         ),
         operation_advantage_reference_scale=float(
-            get(
-                cfg,
-                "algorithm.ppo.operation_advantage_reference_scale",
-                DEFAULT_OPERATION_ADVANTAGE_REFERENCE_SCALE,
-            )
+            operation_reference_scale
+        ),
+        uav_candidate_q_reference_scale=float(
+            candidate_reference_scale
         ),
         critic_value_scale_mode=str(
             get(
@@ -2580,6 +3708,13 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
         not math.isfinite(values.target_kl) or values.target_kl <= 0.0
     ):
         raise ValueError("target_kl 必须是正的有限数，或省略以禁用 KL protection。")
+    if values.uav_candidate_target_kl is not None and (
+        not math.isfinite(values.uav_candidate_target_kl)
+        or values.uav_candidate_target_kl <= 0.0
+    ):
+        raise ValueError(
+            "uav_candidate_target_kl 必须是正的有限数，或省略以禁用 candidate KL gate。"
+        )
     if values.advantage_normalization_mode not in {
         ADVANTAGE_NORMALIZATION_CENTERED_STD,
         ADVANTAGE_NORMALIZATION_STD_ONLY,
@@ -2601,6 +3736,13 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOV2Hyperparameters:
     ):
         raise ValueError(
             "operation_advantage_reference_scale 必须是正的有限数。"
+        )
+    if (
+        not math.isfinite(values.uav_candidate_q_reference_scale)
+        or values.uav_candidate_q_reference_scale <= 0.0
+    ):
+        raise ValueError(
+            "uav_candidate_q_reference_scale 必须是正的有限数。"
         )
     if values.critic_value_scale_mode not in {
         CRITIC_VALUE_SCALE_NONE,
@@ -2845,6 +3987,67 @@ class PPOV2Trainer:
                 CANDIDATE_POLICY_IMPROVEMENT_LEGACY_PPO,
             )
         )
+        self.cache_trigger_ratio_granularity = str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_trigger_ratio_granularity",
+                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
+            )
+        )
+        self.cache_candidate_ratio_granularity = str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_candidate_ratio_granularity",
+                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
+            )
+        )
+        self.cache_trigger_advantage_source = str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_trigger_advantage_source",
+                CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE,
+            )
+        )
+        self.cache_candidate_advantage_source = str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_candidate_advantage_source",
+                CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE,
+            )
+        )
+        if self.cache_trigger_advantage_source not in {
+            CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE,
+            CACHE_TRIGGER_ADVANTAGE_ONE_STEP_TDQ,
+        }:
+            raise ValueError(
+                "algorithm.ppo.cache_trigger_advantage_source must be "
+                "GLOBAL_GAE or ONE_STEP_TD_Q_DIFFERENCE"
+            )
+        if self.cache_candidate_advantage_source != CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE:
+            raise ValueError(
+                "algorithm.ppo.cache_candidate_advantage_source must be GLOBAL_GAE"
+            )
+        if context.policy_schema in PROPOSED_POLICY_SCHEMAS and (
+            self.cache_candidate_advantage_source != CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE
+        ):
+            raise ValueError(
+                "the proposed joint schema requires Cache candidate credit GLOBAL_GAE"
+            )
+        if self.cache_trigger_ratio_granularity not in CACHE_RATIO_GRANULARITIES:
+            raise ValueError(
+                "algorithm.ppo.cache_trigger_ratio_granularity must be "
+                "WHOLE_CACHE_JOINT or PER_CACHE_HEAD"
+            )
+        if self.cache_candidate_ratio_granularity not in CACHE_RATIO_GRANULARITIES:
+            raise ValueError(
+                "algorithm.ppo.cache_candidate_ratio_granularity must be "
+                "WHOLE_CACHE_JOINT or PER_CACHE_HEAD"
+            )
+        if self.cache_trigger_ratio_granularity != self.cache_candidate_ratio_granularity:
+            raise ValueError(
+                "Cache trigger/candidate ratio granularity must use one shared mode"
+            )
+        self.cache_ratio_granularity = self.cache_trigger_ratio_granularity
         if self.candidate_policy_improvement not in {
             CANDIDATE_POLICY_IMPROVEMENT_LEGACY_PPO,
             CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE,
@@ -5092,6 +6295,10 @@ class PPOV2Trainer:
                 "invalid_full_branch_execute_slot_count",
             )
         }
+        matching_cf_natural_stable_count = 0
+        matching_cf_max_updates_hit_count = 0
+        matching_cf_update_counts: list[int] = []
+        matching_cf_kkt_diagnostics: list[dict[str, Any]] = []
 
         merge_started_at = time.perf_counter()
         for plan, worker_result in zip(plans, worker_results, strict=True):
@@ -5129,6 +6336,20 @@ class PPOV2Trainer:
                 "invalid_full_branch_execute_slot_count",
             ):
                 aggregate_counts[name] += int(counters.get(name, 0))
+            matching_cf_natural_stable_count += int(
+                counters.get("matching_natural_stable_count", 0)
+            )
+            matching_cf_max_updates_hit_count += int(
+                counters.get("matching_max_updates_hit_count", 0)
+            )
+            matching_cf_update_counts.extend(
+                int(value) for value in counters.get("matching_update_counts", [])
+            )
+            matching_cf_kkt_diagnostics.extend(
+                dict(record)
+                for record in counters.get("kkt_solve_diagnostics", [])
+                if isinstance(record, dict)
+            )
             for key, value in worker_result["timing"].items():
                 timing_profile[key] = float(timing_profile.get(key, 0.0)) + float(value)
 
@@ -5361,6 +6582,14 @@ class PPOV2Trainer:
             time.perf_counter() - merge_started_at - timing_profile["critic_runtime"],
             0.0,
         )
+        matching_cf_metrics = _matching_metrics_from_counts(
+            matching_cf_natural_stable_count,
+            matching_cf_max_updates_hit_count,
+            matching_cf_update_counts,
+        )
+        matching_cf_kkt_metrics = _kkt_metrics_from_diagnostics(
+            matching_cf_kkt_diagnostics
+        )
 
         sampled_operations = np.asarray(
             [
@@ -5493,6 +6722,72 @@ class PPOV2Trainer:
             "invalid_full_branch_execute_slot_count": int(
                 invalid_full_branch_execute_slot_count
             ),
+            "matching_cf_natural_stable_count": int(
+                matching_cf_metrics["natural_stable_count"]
+            ),
+            "matching_cf_max_updates_hit_count": int(
+                matching_cf_metrics["max_updates_hit_count"]
+            ),
+            "matching_cf_max_updates_hit_rate": float(
+                matching_cf_metrics["max_updates_hit_rate"]
+            ),
+            "matching_cf_update_count_mean": float(
+                matching_cf_metrics["update_count_mean"]
+            ),
+            "matching_cf_update_count_p95": float(
+                matching_cf_metrics["update_count_p95"]
+            ),
+            "matching_cf_update_count_max": int(
+                matching_cf_metrics["update_count_max"]
+            ),
+            "matching_cf_kkt_solve_count": int(
+                matching_cf_kkt_metrics["solve_count"]
+            ),
+            "matching_cf_kkt_converged_count": int(
+                matching_cf_kkt_metrics["converged_count"]
+            ),
+            "matching_cf_kkt_converged_rate": float(
+                matching_cf_kkt_metrics["converged_rate"]
+            ),
+            "matching_cf_kkt_max_iter_hit_count": int(
+                matching_cf_kkt_metrics["max_iter_hit_count"]
+            ),
+            "matching_cf_kkt_max_iter_hit_rate": float(
+                matching_cf_kkt_metrics["max_iter_hit_rate"]
+            ),
+            "matching_cf_kkt_finite_count": int(
+                matching_cf_kkt_metrics["finite_count"]
+            ),
+            "matching_cf_kkt_finite_rate": float(
+                matching_cf_kkt_metrics["finite_rate"]
+            ),
+            "matching_cf_kkt_iteration_mean": float(
+                matching_cf_kkt_metrics["iteration_mean"]
+            ),
+            "matching_cf_kkt_iteration_p95": float(
+                matching_cf_kkt_metrics["iteration_p95"]
+            ),
+            "matching_cf_kkt_iteration_max": int(
+                matching_cf_kkt_metrics["iteration_max"]
+            ),
+            "matching_cf_kkt_resource_residual_mean": float(
+                matching_cf_kkt_metrics["resource_residual_mean"]
+            ),
+            "matching_cf_kkt_resource_residual_max": float(
+                matching_cf_kkt_metrics["resource_residual_max"]
+            ),
+            "matching_cf_kkt_stationarity_residual_mean": float(
+                matching_cf_kkt_metrics["stationarity_residual_mean"]
+            ),
+            "matching_cf_kkt_stationarity_residual_max": float(
+                matching_cf_kkt_metrics["stationarity_residual_max"]
+            ),
+            "matching_cf_kkt_complementary_slackness_residual_mean": float(
+                matching_cf_kkt_metrics["complementary_slackness_residual_mean"]
+            ),
+            "matching_cf_kkt_complementary_slackness_residual_max": float(
+                matching_cf_kkt_metrics["complementary_slackness_residual_max"]
+            ),
             "credit_runtime_seconds": credit_runtime_seconds,
             "timing": dict(timing_profile),
             "advantage_normalization": advantage_normalization,
@@ -5544,6 +6839,43 @@ class PPOV2Trainer:
         logits = logits.masked_fill(~safe_valid, -float("inf"))
         teacher = torch.softmax(logits, dim=-1)
         return torch.where(valid & active_heads, teacher, torch.zeros_like(teacher)).detach()
+
+    @staticmethod
+    def _exact_q_listwise_confidence(
+        q_values: Any,
+        candidate_valid_mask: Any,
+        reference_scale: float,
+    ) -> Any:
+        """Return detached per-head confidence from legal-candidate Q spread.
+
+        The population standard deviation uses exactly the same legal mask and
+        per-head centering convention as ``_exact_q_listwise_teacher``.  This
+        helper intentionally does not alter the standardized teacher logits.
+        """
+
+        q_tensor = torch.as_tensor(q_values, dtype=torch.float32)
+        valid = torch.as_tensor(
+            candidate_valid_mask, dtype=torch.bool, device=q_tensor.device
+        )
+        if q_tensor.shape != valid.shape or q_tensor.ndim < 1:
+            raise ValueError("exact-Q confidence tensor shape mismatch")
+        scale = float(reference_scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("exact-Q confidence reference scale must be positive and finite")
+        if not bool(torch.all(torch.isfinite(q_tensor[valid])).item()):
+            raise FloatingPointError("exact-Q confidence received non-finite legal Q values")
+        legal_count = valid.sum(dim=-1, keepdim=True)
+        active_heads = legal_count > 0
+        safe_q = torch.where(valid, q_tensor, torch.zeros_like(q_tensor))
+        count = legal_count.clamp_min(1).to(torch.float32)
+        mean = safe_q.sum(dim=-1, keepdim=True) / count
+        centered = torch.where(valid, safe_q - mean, torch.zeros_like(safe_q))
+        variance = (centered.square().sum(dim=-1, keepdim=True) / count).clamp_min(0.0)
+        q_std = torch.sqrt(variance).squeeze(-1)
+        confidence = torch.clamp(q_std / scale, min=0.0, max=1.0)
+        return torch.where(
+            active_heads.squeeze(-1), confidence, torch.zeros_like(confidence)
+        ).detach()
 
     @staticmethod
     def _masked_operation_probabilities(probabilities: Any, masks: Any) -> Any:
@@ -5743,8 +7075,9 @@ class PPOV2Trainer:
         q_values: Any,
         candidate_valid_mask: Any,
         temperature: float,
+        confidence_reference_scale: float | None = None,
     ) -> tuple[Any, Any]:
-        """Return KL(teacher(Q) || current candidate policy) and the teacher."""
+        """Return optional-confidence-weighted KL and the detached teacher."""
 
         log_probs = torch.as_tensor(candidate_log_probs, dtype=torch.float32)
         valid = torch.as_tensor(
@@ -5773,6 +7106,19 @@ class PPOV2Trainer:
             ),
             dim=-1,
         )
+        if confidence_reference_scale is not None:
+            confidence = cls._exact_q_listwise_confidence(
+                q_tensor,
+                valid,
+                confidence_reference_scale,
+            ).to(log_probs.device)
+            if tuple(confidence.shape) != tuple(active_heads.shape):
+                raise ValueError("exact-Q confidence head shape mismatch")
+            if not bool(torch.all(torch.isfinite(confidence)).item()):
+                raise FloatingPointError("exact-Q confidence is non-finite")
+            if bool(torch.any(confidence < 0.0).item()):
+                raise ValueError("exact-Q confidence is negative")
+            kl = kl * confidence.detach()
         return kl[active_heads].mean(), teacher
 
     def _cache_policy_terms(
@@ -5792,8 +7138,10 @@ class PPOV2Trainer:
         helper.
         """
 
-        if not self._uses_exact_cache_credit():
-            raise RuntimeError("Exact Cache cache policy terms requested for a non-Exact Cache policy")
+        if not self._uses_binary_cache_trigger() and not self._uses_exact_cache_credit():
+            raise RuntimeError(
+                "Cache trigger/candidate policy terms require a supported Cache policy"
+            )
         contexts = torch.as_tensor(
             cache_contexts, dtype=torch.float32, device=self.device
         )
@@ -5896,7 +7244,7 @@ class PPOV2Trainer:
                 ).unsqueeze(-1) * group_probabilities
         return selected_log_prob, candidate_probabilities
 
-    def _conditional_candidate_probabilities(
+    def _conditional_candidate_logits(
         self,
         contexts: Any,
         candidate_features: Any,
@@ -5904,7 +7252,7 @@ class PPOV2Trainer:
         feature_dim: int,
         scorer: Any,
     ) -> Any:
-        """Forward a frozen candidate batch through one target scorer."""
+        """Forward a candidate batch through one scorer and return raw logits."""
 
         contexts_t = torch.as_tensor(contexts, dtype=torch.float32, device=self.device)
         features_t = torch.as_tensor(
@@ -5928,6 +7276,25 @@ class PPOV2Trainer:
             scorer,
         )
         scores = flat_scores.reshape(batch_size, head_count, candidate_count)
+        return scores, valid_t
+
+    def _conditional_candidate_probabilities(
+        self,
+        contexts: Any,
+        candidate_features: Any,
+        candidate_valid_mask: Any,
+        feature_dim: int,
+        scorer: Any,
+    ) -> Any:
+        """Forward a frozen candidate batch through one target scorer."""
+
+        scores, valid_t = self._conditional_candidate_logits(
+            contexts,
+            candidate_features,
+            candidate_valid_mask,
+            feature_dim,
+            scorer,
+        )
         active = valid_t.any(dim=-1)
         safe_valid = valid_t | ~active.unsqueeze(-1)
         logits = scores.masked_fill(~safe_valid, -float("inf"))
@@ -5964,6 +7331,16 @@ class PPOV2Trainer:
             if not np.isfinite(critic_return_scale) or critic_return_scale <= 0.0:
                 raise FloatingPointError("PPO v2 critic return scale 非 finite。")
         sample_count = int(rollout.observations.shape[0])
+        matching_actual_metrics = _matching_termination_metrics(
+            transition.matching_summary for transition in rollout.transitions
+        )
+        matching_actual_kkt_metrics = _kkt_metrics_from_diagnostics(
+            record
+            for transition in rollout.transitions
+            for record in transition.matching_summary.get(
+                "KKT_SOLVE_DIAGNOSTICS", []
+            )
+        )
         if self.context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
             if sample_count != self.context.episode_slots:
                 raise ValueError(
@@ -6087,6 +7464,14 @@ class PPOV2Trainer:
         branch_diagnostics_enabled = (
             self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS
         )
+        cache_trigger_tdq_enabled = (
+            self.cache_trigger_advantage_source
+            == CACHE_TRIGGER_ADVANTAGE_ONE_STEP_TDQ
+        )
+        if cache_trigger_tdq_enabled and not branch_diagnostics_enabled:
+            raise RuntimeError(
+                "ONE_STEP_TD_Q_DIFFERENCE Cache trigger credit requires the proposed joint policy"
+            )
         branchwise_policy_enabled = exact_uav_credit_enabled
         branch_kl_instrumentation_enabled = exact_uav_credit_enabled
         branch_specific_kl_gate_enabled = (
@@ -6198,8 +7583,13 @@ class PPOV2Trainer:
                 }
             )
         cache_credit: dict[str, Any] = {}
+        if cache_trigger_tdq_enabled:
+            cache_credit = compute_one_step_tdq_cache_trigger_credit(
+                self,
+                rollout,
+            )
         cache_proposal_diagnostics: dict[str, Any] | None = None
-        if cache_credit:
+        if cache_credit and "candidate_q_values" in cache_credit:
             cache_proposal_diagnostics = _proposal_source_diagnostics(
                 cache_credit["candidate_q_values"],
                 cache_credit["candidate_valid_mask"],
@@ -6267,6 +7657,9 @@ class PPOV2Trainer:
         conditional_candidate_advantages_t = None
         conditional_candidate_valid_mask_t = None
         conditional_candidate_weighted_mean_residual_t = None
+        conditional_candidate_confidence_t = None
+        uav_candidate_confidence_values: list[float] = []
+        uav_candidate_teacher_probabilities_t = None
         uav_operation_old_probabilities_t = None
         uav_operation_teacher_probabilities_t = None
         uav_operation_teacher_move_probabilities_t = None
@@ -6313,6 +7706,16 @@ class PPOV2Trainer:
                 dtype=torch.float32,
                 device=self.device,
             )
+            uav_candidate_teacher_probabilities_t = self._exact_q_listwise_teacher(
+                conditional_candidate_q_values_t,
+                conditional_candidate_valid_mask_t,
+                self.uav_exact_q_listwise_temperature,
+            ).detach()
+            conditional_candidate_confidence_t = self._exact_q_listwise_confidence(
+                conditional_candidate_q_values_t,
+                conditional_candidate_valid_mask_t,
+                hyper.uav_candidate_q_reference_scale,
+            ).detach()
             expected_candidate_shape = (
                 sample_count,
                 int(uav_operation_actions.shape[1]),
@@ -6329,6 +7732,12 @@ class PPOV2Trainer:
                         f"conditional candidate {name} shape mismatch: "
                         f"expected={expected_candidate_shape}, got={tuple(tensor.shape)}"
                     )
+            if tuple(conditional_candidate_confidence_t.shape) != expected_candidate_shape[:-1]:
+                raise RuntimeError(
+                    "conditional candidate confidence shape mismatch: "
+                    f"expected={expected_candidate_shape[:-1]}, "
+                    f"got={tuple(conditional_candidate_confidence_t.shape)}"
+                )
             if tuple(conditional_candidate_weighted_mean_residual_t.shape) != tuple(
                 uav_operation_actions.shape
             ):
@@ -6351,6 +7760,13 @@ class PPOV2Trainer:
                 torch.all(torch.isfinite(conditional_candidate_advantages_t)).item()
             ):
                 raise FloatingPointError("conditional candidate candidate advantages are non-finite")
+            assert conditional_candidate_confidence_t is not None
+            confidence_values = conditional_candidate_confidence_t[
+                conditional_candidate_valid_mask_t.any(dim=-1)
+            ].detach().cpu().numpy()
+            uav_candidate_confidence_values.extend(
+                float(value) for value in confidence_values.reshape(-1)
+            )
         if exact_uav_credit_enabled:
             if not self._uses_exact_uav_candidate_credit():
                 raise RuntimeError(
@@ -6546,9 +7962,55 @@ class PPOV2Trainer:
 
         cache_target_policy_probabilities_before = None
         uav_target_policy_probabilities_before = None
+        uav_candidate_old_mask = None
+        uav_candidate_old_logits = None
+        uav_candidate_old_probabilities = None
+        cache_old_operation_log_probs_all = None
+        cache_old_candidate_log_probs_all = None
         cache_exact_q_quality: dict[str, float] | None = None
         uav_exact_q_quality: dict[str, float] | None = None
+        uav_candidate_policy_metrics: dict[str, float] | None = None
+        uav_candidate_old_new_drift: dict[str, Any] | None = None
         with torch.no_grad():
+            if branch_diagnostics_enabled:
+                if (
+                    cache_operation_masks is None
+                    or cache_operation_actions is None
+                    or cache_candidate_features is None
+                    or cache_candidate_masks is None
+                    or cache_selected_indices is None
+                ):
+                    raise RuntimeError(
+                        "Cache old-policy diagnostic tensors are unavailable"
+                    )
+                cache_old_policy_evaluation = (
+                    self.policy.evaluate_cache_operation_primitive(
+                        observations,
+                        cache_contexts,
+                        cache_operation_masks,
+                        cache_operation_actions,
+                        cache_candidate_features,
+                        cache_candidate_masks,
+                        cache_selected_indices,
+                    )
+                )
+                if (
+                    cache_old_policy_evaluation.cache_operation_log_probs_all is None
+                    or cache_old_policy_evaluation.cache_candidate_log_probs_all is None
+                ):
+                    raise RuntimeError(
+                        "Cache old-policy full distributions are unavailable"
+                    )
+                cache_old_operation_log_probs_all = (
+                    cache_old_policy_evaluation.cache_operation_log_probs_all
+                    .detach()
+                    .clone()
+                )
+                cache_old_candidate_log_probs_all = (
+                    cache_old_policy_evaluation.cache_candidate_log_probs_all
+                    .detach()
+                    .clone()
+                )
             if self._uses_exact_cache_credit():
                 if (
                     cache_candidate_features_t is None
@@ -6579,16 +8041,30 @@ class PPOV2Trainer:
                     or conditional_candidate_q_values_t is None
                 ):
                     raise RuntimeError("UAV exact-Q tensors are unavailable for gate diagnostics")
+                uav_candidate_old_mask = (
+                    conditional_candidate_valid_mask_t.detach().clone()
+                )
+                uav_candidate_old_logits, _ = self._conditional_candidate_logits(
+                    uav_contexts,
+                    uav_candidate_features,
+                    uav_candidate_old_mask,
+                    int(self.policy.uav_feature_dim),
+                    self.policy.uav_candidate_scorer,
+                )
+                uav_candidate_old_logits = uav_candidate_old_logits.detach().clone()
                 uav_target_policy_probabilities_before = (
                     self._conditional_candidate_probabilities(
                         uav_contexts,
                         uav_candidate_features,
-                        conditional_candidate_valid_mask_t,
+                        uav_candidate_old_mask,
                         int(self.policy.uav_feature_dim),
                         self.policy.uav_candidate_scorer,
                     )
                     .detach()
                     .clone()
+                )
+                uav_candidate_old_probabilities = (
+                    uav_target_policy_probabilities_before.detach().clone()
                 )
                 uav_exact_q_quality = _exact_q_policy_quality_metrics(
                     uav_target_policy_probabilities_before.detach().cpu().numpy(),
@@ -6640,6 +8116,28 @@ class PPOV2Trainer:
         uav_head_gradient_norm_values: list[float] = []
         cache_encoder_gradient_norm_values: list[float] = []
         uav_encoder_gradient_norm_values: list[float] = []
+        uav_candidate_scorer_gradient_norm_values: list[float] = []
+        cache_actor_grad_norm_preclip_by_update_epoch: list[float] = []
+        cache_actor_grad_clip_coefficient_by_update_epoch: list[float] = []
+        uav_actor_grad_norm_preclip_by_update_epoch: list[float] = []
+        uav_actor_grad_clip_coefficient_by_update_epoch: list[float] = []
+        combined_actor_grad_norm_postclip_by_update_epoch: list[float] = []
+        uav_candidate_scorer_gradient_norm_by_update_epoch: list[float] = []
+        uav_candidate_scorer_parameter_delta_norm_by_update_epoch: list[float] = []
+        uav_encoder_gradient_norm_by_update_epoch: list[float] = []
+        uav_encoder_parameter_delta_norm_by_update_epoch: list[float] = []
+        uav_candidate_old_new_kl_mean_by_update_epoch: list[float] = []
+        uav_candidate_old_new_kl_p90_by_update_epoch: list[float] = []
+        uav_candidate_old_new_kl_max_by_update_epoch: list[float] = []
+        uav_candidate_argmax_flip_rate_by_update_epoch: list[float] = []
+        uav_candidate_best_policy_prob_change_mean_by_update_epoch: list[float] = []
+        uav_candidate_best_policy_prob_change_p10_by_update_epoch: list[float] = []
+        uav_candidate_old_new_kl_values: list[float] = []
+        uav_candidate_argmax_flip_values: list[float] = []
+        uav_candidate_best_policy_prob_change_values: list[float] = []
+        cache_per_head_old_new_kl_values: list[float] = []
+        cache_per_head_ratio_values: list[float] = []
+        cache_per_head_clipped_values: list[float] = []
         uav_operation_full_rollout_kl_values: list[float] = []
         shared_actor_gradient_norm_values: list[float] = []
         kl_minibatch_diagnostics: list[dict[str, Any]] = []
@@ -6657,16 +8155,24 @@ class PPOV2Trainer:
         actor_parameters: list[Any] | None = None
         critic_parameters: list[Any] | None = None
         branch_gradient_parameter_groups: dict[str, tuple[Any, ...]] | None = None
+        actor_gradient_clipping_parameter_groups: dict[str, tuple[Any, ...]] | None = None
         kl_early_stop_triggered = False
         ppo_update_epochs_executed = 0
         cache_active = True
-        uav_active = True
+        uav_operation_active = True
+        uav_candidate_active = bool(
+            exact_uav_credit_enabled and self._uses_exact_uav_candidate_credit()
+        )
         cache_active_per_update_epoch: list[bool] = []
         uav_active_per_update_epoch: list[bool] = []
+        uav_candidate_active_per_update_epoch: list[bool] = []
         cache_stop_epoch: int | None = None
         uav_stop_epoch: int | None = None
+        uav_candidate_kl_stop_epoch: int | None = None
+        uav_candidate_kl_gate_trigger_source = "NONE"
         cache_suppressed_update_epochs = 0
         uav_suppressed_update_epochs = 0
+        uav_candidate_suppressed_update_epochs = 0
         cache_independent_stop = False
         uav_independent_stop = False
         both_inactive_stop = False
@@ -6679,6 +8185,8 @@ class PPOV2Trainer:
         uav_operation_steps_suppressed = 0
         uav_candidate_full_steps = 0
         uav_candidate_only_steps_after_operation_stop = 0
+        uav_candidate_optimizer_step_count = 0
+        uav_encoder_optimizer_step_count = 0
         uav_operation_full_rollout_kl_current: float | None = None
         global_critic_steps = 0
         cache_minibatches_planned = int(hyper.update_epochs * hyper.num_minibatches)
@@ -6718,46 +8226,113 @@ class PPOV2Trainer:
                         "Joint Cache/UAV policy does not expose branch gradient groups"
                     )
                 branch_gradient_parameter_groups = group_builder()
+                if self.policy.architecture_id == "adaptive_joint_cache_uav_ppo":
+                    clipping_group_builder = getattr(
+                        self.policy,
+                        "actor_gradient_clipping_parameter_groups",
+                        None,
+                    )
+                    if clipping_group_builder is None:
+                        raise RuntimeError(
+                            "proposed actor does not expose disjoint clipping groups"
+                        )
+                    actor_gradient_clipping_parameter_groups = (
+                        clipping_group_builder()
+                    )
         minibatch_size = sample_count // hyper.num_minibatches
         for update_epoch in range(hyper.update_epochs):
             cache_active_this_epoch = bool(cache_active)
-            uav_active_this_epoch = bool(uav_active)
+            uav_operation_active_this_epoch = bool(uav_operation_active)
+            uav_candidate_active_this_epoch = bool(
+                uav_candidate_active
+                if exact_uav_credit_enabled
+                else uav_operation_active_this_epoch
+            )
+            uav_encoder_active_this_epoch = bool(
+                uav_operation_active_this_epoch or uav_candidate_active_this_epoch
+            )
+            # The legacy ``uav_active_*`` fields remain operation-gate
+            # diagnostics;
+            # candidate activity is tracked independently from this epoch on.
+            uav_active_this_epoch = uav_operation_active_this_epoch
+            uav_candidate_scorer_before_epoch: dict[str, Any] | None = None
+            uav_encoder_before_epoch: dict[str, Any] | None = None
+            if exact_uav_credit_enabled:
+                uav_candidate_scorer_before_epoch = {
+                    str(name): parameter.detach().clone()
+                    for name, parameter in self.policy.uav_candidate_scorer.named_parameters()
+                }
+                uav_encoder_before_epoch = {
+                    str(name): parameter.detach().clone()
+                    for name, parameter in self.policy.uav_encoder.named_parameters()
+                }
+            candidate_gradient_epoch_start = len(
+                uav_candidate_scorer_gradient_norm_values
+            )
+            encoder_gradient_epoch_start = len(uav_encoder_gradient_norm_values)
             if branch_specific_kl_gate_enabled:
                 cache_active_per_update_epoch.append(cache_active_this_epoch)
                 uav_active_per_update_epoch.append(uav_active_this_epoch)
+            if exact_uav_credit_enabled:
+                uav_candidate_active_per_update_epoch.append(
+                    uav_candidate_active_this_epoch
+                )
             permutation = torch.randperm(sample_count, device=self.device)
             update_epoch_approximate_kls: list[float] = []
             update_epoch_cache_approx_kls: list[float] = []
             update_epoch_uav_approx_kls: list[float] = []
             update_epoch_uav_operation_full_rollout_kls: list[float] = []
+            cache_actor_grad_norm_preclip_epoch_values: list[float] = []
+            cache_actor_grad_clip_coefficient_epoch_values: list[float] = []
+            uav_actor_grad_norm_preclip_epoch_values: list[float] = []
+            uav_actor_grad_clip_coefficient_epoch_values: list[float] = []
+            combined_actor_grad_norm_postclip_epoch_values: list[float] = []
+            candidate_epoch_old_new_kl = math.nan
+            candidate_epoch_over_target: bool | None = None
+            candidate_epoch_kl_gate_trigger_source = "NONE"
+            candidate_newly_stopped = False
             epoch_diagnostic_start = len(kl_minibatch_diagnostics)
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
                 cache_active_this_minibatch = bool(cache_active)
-                uav_active_this_minibatch = bool(uav_active)
+                uav_operation_active_this_minibatch = bool(uav_operation_active)
                 uav_candidate_active_this_minibatch = bool(
-                    (
-                        exact_uav_credit_enabled
-                        and self._uses_exact_uav_candidate_credit()
-                    )
-                    or uav_active_this_minibatch
+                    uav_candidate_active
+                    if exact_uav_credit_enabled
+                    else uav_operation_active_this_minibatch
                 )
+                uav_encoder_active_this_minibatch = bool(
+                    uav_operation_active_this_minibatch
+                    or uav_candidate_active_this_minibatch
+                )
+                # Preserve the legacy name for operation-only diagnostics and
+                # the existing operation KL gate bookkeeping below.
+                uav_active_this_minibatch = uav_operation_active_this_minibatch
                 if exact_uav_credit_enabled:
-                    if uav_active_this_minibatch:
+                    if (
+                        uav_operation_active_this_minibatch
+                        and uav_candidate_active_this_minibatch
+                    ):
                         uav_operation_steps_executed += 1
                         uav_candidate_full_steps += 1
-                    else:
+                    elif uav_operation_active_this_minibatch:
+                        uav_operation_steps_executed += 1
+                    elif uav_candidate_active_this_minibatch:
                         uav_operation_steps_suppressed += 1
                         uav_candidate_only_steps_after_operation_stop += 1
-                    # The candidate scorer remains trainable for every
-                    # proposed minibatch.  Once the operation KL gate closes,
-                    # only the binary operation head and its UAV encoder are
-                    # frozen; the candidate scorer still receives Exact-Q
-                    # listwise gradients.
-                    for parameter in self.policy.uav_operation_head.parameters():
-                        parameter.requires_grad_(uav_active_this_minibatch)
-                    for parameter in self.policy.uav_encoder.parameters():
-                        parameter.requires_grad_(uav_active_this_minibatch)
+                    else:
+                        uav_operation_steps_suppressed += 1
+                    # Operation, candidate scorer, and UAV encoder have
+                    # independent active states.  The encoder follows the
+                    # union so candidate-only updates cannot be desynchronized
+                    # from their scorer.
+                    helper_encoder_active = _set_uav_branch_requires_grad(
+                        self.policy,
+                        operation_active=uav_operation_active_this_minibatch,
+                        candidate_active=uav_candidate_active_this_minibatch,
+                    )
+                    if helper_encoder_active != uav_encoder_active_this_minibatch:
+                        raise RuntimeError("UAV encoder active-state contract diverged")
                 uav_approx_kl_after_step: float | None = None
                 uav_operation_full_rollout_kl_after_step: float | None = None
                 uav_stop_triggered_after_step = False
@@ -6911,10 +8486,32 @@ class PPOV2Trainer:
                         evaluation.cache_entropy.detach(),
                         evaluation.uav_entropy.detach(),
                     )
-                    cache_node_delta = None
-                    cache_node_ratio = None
+                    if evaluation.cache_node_log_probs is None:
+                        raise RuntimeError(
+                            "Cache evaluation did not expose per-head log-probabilities"
+                        )
+                    cache_node_delta = evaluation.cache_node_log_probs - (
+                        cache_operation_old_log_probs[indices]
+                        + cache_candidate_old_log_probs[indices]
+                    )
+                    cache_node_ratio = torch.exp(cache_node_delta)
+                    cache_per_head_ratio_values.extend(
+                        float(value)
+                        for value in cache_node_ratio.detach().cpu().reshape(-1).tolist()
+                    )
+                    cache_per_head_clipped_values.extend(
+                        float(value)
+                        for value in (
+                            torch.abs(cache_node_ratio.detach() - 1.0)
+                            > hyper.clip_epsilon
+                        )
+                        .to(torch.float32)
+                        .cpu()
+                        .reshape(-1)
+                        .tolist()
+                    )
                     if branchwise_policy_enabled:
-                        if self._uses_exact_cache_credit():
+                        if self._uses_exact_cache_credit() and not cache_trigger_tdq_enabled:
                             assert (
                                 cache_trigger_advantages_t is not None
                                 and cache_trigger_old_probabilities_t is not None
@@ -6993,19 +8590,162 @@ class PPOV2Trainer:
                                 trigger_advantage.detach(),
                                 candidate_policy_loss.detach(),
                             )
-                        else:
-                            cache_branch_unclipped = (
-                                cache_branch_ratio * advantages_t[indices]
+                        elif cache_trigger_tdq_enabled:
+                            assert (
+                                cache_credit
+                                and cache_trigger_advantages_t is None
+                                and cache_operation_actions is not None
+                                and cache_operation_masks is not None
+                                and cache_candidate_features is not None
+                                and cache_candidate_masks is not None
+                                and cache_candidate_old_log_probs is not None
+                                and cache_selected_indices is not None
                             )
-                            cache_branch_clipped = torch.clamp(
-                                cache_branch_ratio,
+                            tdq_trigger_advantages = torch.as_tensor(
+                                cache_credit["trigger_advantages"],
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            tdq_trigger_old_probabilities = torch.as_tensor(
+                                cache_credit["trigger_old_probabilities"],
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            if tuple(tdq_trigger_advantages.shape) != tuple(
+                                cache_operation_actions.shape
+                            ):
+                                raise RuntimeError(
+                                    "Cache TD-Q trigger advantage shape mismatch"
+                                )
+                            if tuple(tdq_trigger_old_probabilities.shape) != (
+                                sample_count,
+                                int(cache_operation_actions.shape[1]),
+                                2,
+                            ):
+                                raise RuntimeError(
+                                    "Cache TD-Q trigger probability shape mismatch"
+                                )
+                            cache_candidate_operation_indices = torch.zeros_like(
+                                cache_candidate_masks[indices], dtype=torch.long
+                            )
+                            cache_trigger_new_log_probs, cache_candidate_new_probabilities = (
+                                self._cache_policy_terms(
+                                    cache_contexts[indices],
+                                    cache_operation_masks[indices],
+                                    cache_operation_actions[indices],
+                                    cache_candidate_features[indices],
+                                    cache_candidate_operation_indices,
+                                    cache_candidate_masks[indices],
+                                )
+                            )
+                            selected_update = cache_operation_actions[indices] != 0
+                            old_selected_probability = torch.where(
+                                selected_update,
+                                tdq_trigger_old_probabilities[indices, ..., 1],
+                                tdq_trigger_old_probabilities[indices, ..., 0],
+                            )
+                            trigger_ratio = torch.exp(
+                                cache_trigger_new_log_probs
+                                - torch.log(old_selected_probability.clamp_min(1.0e-12))
+                            )
+                            trigger_advantage = tdq_trigger_advantages[indices]
+                            trigger_unclipped = trigger_ratio * trigger_advantage
+                            trigger_clipped = torch.clamp(
+                                trigger_ratio,
                                 1.0 - hyper.clip_epsilon,
                                 1.0 + hyper.clip_epsilon,
-                            ) * advantages_t[indices]
-                            cache_branch_policy_loss = -torch.minimum(
-                                cache_branch_unclipped,
-                                cache_branch_clipped,
+                            ) * trigger_advantage
+                            trigger_policy_loss = -torch.minimum(
+                                trigger_unclipped,
+                                trigger_clipped,
                             ).mean()
+                            cache_trigger_policy_loss_values.append(
+                                float(trigger_policy_loss.detach().cpu())
+                            )
+
+                            selected_indices = cache_selected_indices[indices]
+                            selected_valid = cache_candidate_masks[indices].gather(
+                                -1, selected_indices.unsqueeze(-1)
+                            ).squeeze(-1)
+                            if not bool(torch.all(selected_valid).item()):
+                                raise RuntimeError(
+                                    "Cache TD-Q candidate selected index is masked"
+                                )
+                            selected_candidate_probability = (
+                                cache_candidate_new_probabilities.gather(
+                                    -1, selected_indices.unsqueeze(-1)
+                                ).squeeze(-1)
+                            )
+                            candidate_ratio = torch.where(
+                                selected_update,
+                                torch.exp(
+                                    torch.log(
+                                        selected_candidate_probability.clamp_min(
+                                            1.0e-12
+                                        )
+                                    )
+                                    - cache_candidate_old_log_probs[indices]
+                                ),
+                                torch.ones_like(selected_candidate_probability),
+                            )
+                            candidate_advantage = advantages_t[indices].unsqueeze(-1).expand_as(
+                                candidate_ratio
+                            )
+                            candidate_unclipped = candidate_ratio * candidate_advantage
+                            candidate_clipped = torch.clamp(
+                                candidate_ratio,
+                                1.0 - hyper.clip_epsilon,
+                                1.0 + hyper.clip_epsilon,
+                            ) * candidate_advantage
+                            candidate_surrogate = torch.minimum(
+                                candidate_unclipped,
+                                candidate_clipped,
+                            )
+                            if bool(torch.any(selected_update).item()):
+                                candidate_policy_loss = -candidate_surrogate[
+                                    selected_update
+                                ].mean()
+                                cache_candidate_policy_loss_values.append(
+                                    float(candidate_policy_loss.detach().cpu())
+                                )
+                            else:
+                                candidate_policy_loss = candidate_ratio.sum() * 0.0
+                            cache_branch_policy_loss = 0.5 * (
+                                trigger_policy_loss + candidate_policy_loss
+                            )
+                            branch_metric_tensors += (
+                                trigger_ratio.detach(),
+                                candidate_ratio.detach(),
+                                trigger_advantage.detach(),
+                                candidate_policy_loss.detach(),
+                            )
+                        else:
+                            if (
+                                self.cache_ratio_granularity
+                                == CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD
+                            ):
+                                if cache_node_ratio is None:
+                                    raise RuntimeError(
+                                        "Cache per-head ratio was not computed"
+                                    )
+                                cache_branch_policy_loss = _cache_per_head_ppo_loss(
+                                    cache_node_ratio,
+                                    advantages_t[indices],
+                                    hyper.clip_epsilon,
+                                )
+                            else:
+                                cache_branch_unclipped = (
+                                    cache_branch_ratio * advantages_t[indices]
+                                )
+                                cache_branch_clipped = torch.clamp(
+                                    cache_branch_ratio,
+                                    1.0 - hyper.clip_epsilon,
+                                    1.0 + hyper.clip_epsilon,
+                                ) * advantages_t[indices]
+                                cache_branch_policy_loss = -torch.minimum(
+                                    cache_branch_unclipped,
+                                    cache_branch_clipped,
+                                ).mean()
                         if exact_uav_credit_enabled:
                             assert (
                                 evaluation.uav_operation_log_probs is not None
@@ -7065,6 +8805,9 @@ class PPOV2Trainer:
                                     conditional_candidate_q_values_t[indices],
                                     candidate_valid,
                                     self.uav_exact_q_listwise_temperature,
+                                    confidence_reference_scale=(
+                                        hyper.uav_candidate_q_reference_scale
+                                    ),
                                 )
                                 candidate_active = candidate_valid
                                 candidate_residual = (
@@ -7114,18 +8857,25 @@ class PPOV2Trainer:
                                     ].mean()
                                 else:
                                     candidate_policy_loss = candidate_ratio.sum() * 0.0
-                            # The proposed UAV branch is the mean of the
-                            # full-information operation teacher KL and the
-                            # unchanged candidate Exact-Q listwise KL.  After
-                            # the operation KL stop, candidate-only updates
-                            # retain the candidate half while the operation
-                            # head/encoder are frozen.
-                            if uav_active_this_minibatch:
+                            # Keep the 0.5 branch scale while allowing the
+                            # operation and candidate heads to stop
+                            # independently.  Candidate-only epochs update
+                            # the scorer and UAV encoder together.
+                            if (
+                                uav_operation_active_this_minibatch
+                                and uav_candidate_active_this_minibatch
+                            ):
                                 uav_branch_policy_loss = 0.5 * (
                                     operation_policy_loss + candidate_policy_loss
                                 )
-                            else:
+                            elif uav_operation_active_this_minibatch:
+                                uav_branch_policy_loss = 0.5 * operation_policy_loss
+                            elif uav_candidate_active_this_minibatch:
                                 uav_branch_policy_loss = 0.5 * candidate_policy_loss
+                            else:
+                                uav_branch_policy_loss = 0.0 * (
+                                    operation_policy_loss + candidate_policy_loss
+                                )
                             branch_metric_tensors += (
                                 operation_ratio.detach(),
                                 candidate_ratio.detach(),
@@ -7142,7 +8892,10 @@ class PPOV2Trainer:
                                         branch_policy_loss
                                         + 0.5 * cache_branch_policy_loss
                                     )
-                                if uav_candidate_active_this_minibatch:
+                                if (
+                                    uav_operation_active_this_minibatch
+                                    or uav_candidate_active_this_minibatch
+                                ):
                                     branch_policy_loss = (
                                         branch_policy_loss + uav_branch_policy_loss
                                     )
@@ -7310,18 +9063,23 @@ class PPOV2Trainer:
                         # those parameters entirely, which is the required
                         # hard freeze after a Cache minibatch KL crossing.
                         if exact_uav_credit_enabled:
-                            # The proposed candidate scorer is intentionally
-                            # still active after the operation stop.  Clear
-                            # only operation-head/encoder gradients, while
-                            # preserving candidate-scorer gradients.
+                            # Clear each UAV module independently.  In
+                            # particular, operation-stop must preserve the
+                            # candidate scorer and encoder, while
+                            # candidate-stop must not leave stale Adam state
+                            # eligible for a scorer update.
                             _clear_inactive_branch_gradients(
                                 branch_gradient_parameter_groups,
                                 cache_active=cache_active_this_minibatch,
                                 uav_active=True,
                             )
-                            if not uav_active_this_minibatch:
+                            if not uav_operation_active_this_minibatch:
                                 for parameter in self.policy.uav_operation_head.parameters():
                                     parameter.grad = None
+                            if not uav_candidate_active_this_minibatch:
+                                for parameter in self.policy.uav_candidate_scorer.parameters():
+                                    parameter.grad = None
+                            if not uav_encoder_active_this_minibatch:
                                 for parameter in self.policy.uav_encoder.parameters():
                                     parameter.grad = None
                         else:
@@ -7367,6 +9125,11 @@ class PPOV2Trainer:
                             if "uav_encoder" in branch_gradient_parameter_groups
                             else math.nan
                         )
+                        uav_candidate_scorer_gradient_norm_value = (
+                            _gradient_group_norm(
+                                self.policy.uav_candidate_scorer.parameters()
+                            )
+                        )
                         if not all(
                             np.isfinite(value)
                             for value in (
@@ -7380,8 +9143,9 @@ class PPOV2Trainer:
                                 np.isfinite(value)
                                 for value in (
                                     cache_encoder_gradient_norm_value,
-                                    uav_encoder_gradient_norm_value,
-                                )
+                                uav_encoder_gradient_norm_value,
+                                uav_candidate_scorer_gradient_norm_value,
+                            )
                             )
                         ):
                             raise FloatingPointError(
@@ -7403,8 +9167,12 @@ class PPOV2Trainer:
                             uav_encoder_gradient_norm_values.append(
                                 uav_encoder_gradient_norm_value
                             )
+                            uav_candidate_scorer_gradient_norm_values.append(
+                                uav_candidate_scorer_gradient_norm_value
+                            )
                     actor_update_active = bool(
                         cache_active_this_minibatch
+                        or uav_operation_active_this_minibatch
                         or uav_candidate_active_this_minibatch
                     )
                     if not actor_update_active:
@@ -7414,12 +9182,53 @@ class PPOV2Trainer:
                             )
                         actor_gradient_norm_value = 0.0
                     else:
-                        actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                            actor_parameters, hyper.max_grad_norm
-                        )
-                        actor_gradient_norm_value = float(
-                            actor_gradient_norm.detach().cpu()
-                        )
+                        if actor_gradient_clipping_parameter_groups is not None:
+                            clipping_metrics = _clip_disjoint_actor_gradient_groups(
+                                actor_gradient_clipping_parameter_groups["cache"],
+                                actor_gradient_clipping_parameter_groups["uav"],
+                                hyper.max_grad_norm,
+                            )
+                            cache_actor_grad_norm_preclip_epoch_values.append(
+                                clipping_metrics["cache_preclip_norm"]
+                            )
+                            cache_actor_grad_clip_coefficient_epoch_values.append(
+                                clipping_metrics["cache_clip_coefficient"]
+                            )
+                            uav_actor_grad_norm_preclip_epoch_values.append(
+                                clipping_metrics["uav_preclip_norm"]
+                            )
+                            uav_actor_grad_clip_coefficient_epoch_values.append(
+                                clipping_metrics["uav_clip_coefficient"]
+                            )
+                            combined_actor_grad_norm_postclip_epoch_values.append(
+                                float(
+                                    math.sqrt(
+                                        min(
+                                            clipping_metrics["cache_preclip_norm"],
+                                            hyper.max_grad_norm,
+                                        )
+                                        ** 2
+                                        + min(
+                                            clipping_metrics["uav_preclip_norm"],
+                                            hyper.max_grad_norm,
+                                        )
+                                        ** 2
+                                    )
+                                )
+                            )
+                            actor_gradient_norm_value = float(
+                                math.sqrt(
+                                    clipping_metrics["cache_preclip_norm"] ** 2
+                                    + clipping_metrics["uav_preclip_norm"] ** 2
+                                )
+                            )
+                        else:
+                            actor_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                                actor_parameters, hyper.max_grad_norm
+                            )
+                            actor_gradient_norm_value = float(
+                                actor_gradient_norm.detach().cpu()
+                            )
                         if not np.isfinite(actor_gradient_norm_value):
                             raise FloatingPointError(
                                 "PPO v5 actor gradient norm 非 finite。"
@@ -7427,6 +9236,11 @@ class PPOV2Trainer:
                         self.actor_optimizer.step()
                         self.actor_optimizer_steps += 1
                         self.optimizer_steps = self.actor_optimizer_steps
+                        if exact_uav_credit_enabled:
+                            if uav_candidate_active_this_minibatch:
+                                uav_candidate_optimizer_step_count += 1
+                            if uav_encoder_active_this_minibatch:
+                                uav_encoder_optimizer_step_count += 1
                         if (
                             branch_specific_kl_gate_enabled
                             and exact_uav_credit_enabled
@@ -7476,7 +9290,7 @@ class PPOV2Trainer:
                                 > hyper.target_kl
                             ):
                                 uav_stop_triggered_after_step = True
-                                uav_active = False
+                                uav_operation_active = False
                                 if uav_stop_epoch is None:
                                     uav_stop_epoch = int(update_epoch + 1)
                                     uav_suppressed_update_epochs = int(
@@ -7747,7 +9561,7 @@ class PPOV2Trainer:
                             "uav_stop_triggered_after_step": bool(
                                 uav_stop_triggered_after_step
                             ),
-                            "uav_active_next_minibatch": bool(uav_active),
+                            "uav_active_next_minibatch": bool(uav_operation_active),
                             "joint_gate_triggered_after_epoch": False,
                             "remaining_update_epochs_suppressed": 0,
                         }
@@ -7755,6 +9569,204 @@ class PPOV2Trainer:
                 gradient_norm_values.append(gradient_norm_value)
                 actor_gradient_norm_values.append(actor_gradient_norm_value)
                 critic_gradient_norm_values.append(critic_gradient_norm_value)
+            if actor_gradient_clipping_parameter_groups is not None:
+                cache_actor_grad_norm_preclip_by_update_epoch.append(
+                    float(np.mean(cache_actor_grad_norm_preclip_epoch_values))
+                    if cache_actor_grad_norm_preclip_epoch_values
+                    else 0.0
+                )
+                cache_actor_grad_clip_coefficient_by_update_epoch.append(
+                    float(np.mean(cache_actor_grad_clip_coefficient_epoch_values))
+                    if cache_actor_grad_clip_coefficient_epoch_values
+                    else 1.0
+                )
+                uav_actor_grad_norm_preclip_by_update_epoch.append(
+                    float(np.mean(uav_actor_grad_norm_preclip_epoch_values))
+                    if uav_actor_grad_norm_preclip_epoch_values
+                    else 0.0
+                )
+                uav_actor_grad_clip_coefficient_by_update_epoch.append(
+                    float(np.mean(uav_actor_grad_clip_coefficient_epoch_values))
+                    if uav_actor_grad_clip_coefficient_epoch_values
+                    else 1.0
+                )
+                combined_actor_grad_norm_postclip_by_update_epoch.append(
+                    float(np.mean(combined_actor_grad_norm_postclip_epoch_values))
+                    if combined_actor_grad_norm_postclip_epoch_values
+                    else 0.0
+                )
+            if exact_uav_credit_enabled:
+                if (
+                    uav_candidate_old_mask is None
+                    or uav_candidate_old_logits is None
+                    or uav_candidate_old_probabilities is None
+                    or uav_candidate_teacher_probabilities_t is None
+                    or conditional_candidate_q_values_t is None
+                ):
+                    raise RuntimeError(
+                        "UAV candidate old-policy diagnostic snapshots are unavailable"
+                    )
+                # Re-evaluate only the fixed rollout tensors captured at the
+                # start of this PPO update.  This is a no-grad diagnostic
+                # forward and does not participate in the next optimizer step.
+                with torch.no_grad():
+                    uav_candidate_epoch_new_probabilities = (
+                        self._conditional_candidate_probabilities(
+                            uav_contexts,
+                            uav_candidate_features,
+                            uav_candidate_old_mask,
+                            int(self.policy.uav_feature_dim),
+                            self.policy.uav_candidate_scorer,
+                        )
+                    )
+                drift = _uav_candidate_old_new_drift_metrics(
+                    uav_candidate_old_probabilities.detach().cpu().numpy(),
+                    uav_candidate_epoch_new_probabilities.detach().cpu().numpy(),
+                    uav_candidate_teacher_probabilities_t.detach().cpu().numpy(),
+                    conditional_candidate_q_values_t.detach().cpu().numpy(),
+                    uav_candidate_old_mask.detach().cpu().numpy(),
+                )
+                candidate_epoch_old_new_kl = float(drift["kl_mean"])
+                candidate_transition = _candidate_kl_gate_transition(
+                    candidate_active=bool(uav_candidate_active),
+                    candidate_epoch_kl_mean=candidate_epoch_old_new_kl,
+                    candidate_epoch_kl_p90=float(drift["kl_p90"]),
+                    target_kl=hyper.uav_candidate_target_kl,
+                    update_epoch=update_epoch,
+                    update_epochs=hyper.update_epochs,
+                )
+                candidate_epoch_over_target = candidate_transition[
+                    "candidate_over_target"
+                ]
+                candidate_epoch_kl_gate_trigger_source = str(
+                    candidate_transition["candidate_kl_gate_trigger_source"]
+                )
+                candidate_newly_stopped = bool(
+                    candidate_transition["candidate_newly_stopped"]
+                )
+                if candidate_newly_stopped:
+                    if uav_candidate_kl_gate_trigger_source == "NONE":
+                        uav_candidate_kl_gate_trigger_source = (
+                            candidate_epoch_kl_gate_trigger_source
+                        )
+                    uav_candidate_active = bool(
+                        candidate_transition["candidate_active_next"]
+                    )
+                    if uav_candidate_kl_stop_epoch is None:
+                        uav_candidate_kl_stop_epoch = int(update_epoch + 1)
+                        uav_candidate_suppressed_update_epochs = int(
+                            candidate_transition["remaining_epochs_suppressed"]
+                        )
+                uav_candidate_old_new_kl_mean_by_update_epoch.append(
+                    float(drift["kl_mean"])
+                )
+                uav_candidate_old_new_kl_p90_by_update_epoch.append(
+                    float(drift["kl_p90"])
+                )
+                uav_candidate_old_new_kl_max_by_update_epoch.append(
+                    float(drift["kl_max"])
+                )
+                uav_candidate_argmax_flip_rate_by_update_epoch.append(
+                    float(drift["argmax_flip_rate"])
+                )
+                uav_candidate_best_policy_prob_change_mean_by_update_epoch.append(
+                    float(drift["best_policy_prob_change_mean"])
+                )
+                uav_candidate_best_policy_prob_change_p10_by_update_epoch.append(
+                    float(drift["best_policy_prob_change_p10"])
+                )
+                uav_candidate_old_new_kl_values.extend(
+                    float(value) for value in drift["kl_values"]
+                )
+                uav_candidate_argmax_flip_values.extend(
+                    float(value) for value in drift["argmax_flip_values"]
+                )
+                uav_candidate_best_policy_prob_change_values.extend(
+                    float(value)
+                    for value in drift["best_policy_prob_change_values"]
+                )
+                if (
+                    uav_candidate_scorer_before_epoch is None
+                    or uav_encoder_before_epoch is None
+                ):
+                    raise RuntimeError("UAV epoch diagnostic snapshots are unavailable")
+                candidate_epoch_gradients = (
+                    uav_candidate_scorer_gradient_norm_values[
+                        candidate_gradient_epoch_start:
+                    ]
+                )
+                encoder_epoch_gradients = uav_encoder_gradient_norm_values[
+                    encoder_gradient_epoch_start:
+                ]
+                uav_candidate_scorer_gradient_norm_by_update_epoch.append(
+                    float(np.mean(candidate_epoch_gradients))
+                    if candidate_epoch_gradients
+                    else 0.0
+                )
+                uav_encoder_gradient_norm_by_update_epoch.append(
+                    float(np.mean(encoder_epoch_gradients))
+                    if encoder_epoch_gradients
+                    else 0.0
+                )
+                uav_candidate_scorer_parameter_delta_norm_by_update_epoch.append(
+                    _module_parameter_delta_norm(
+                        uav_candidate_scorer_before_epoch,
+                        self.policy.uav_candidate_scorer,
+                    )
+                )
+                uav_encoder_parameter_delta_norm_by_update_epoch.append(
+                    _module_parameter_delta_norm(
+                        uav_encoder_before_epoch,
+                        self.policy.uav_encoder,
+                    )
+                )
+            if branch_diagnostics_enabled:
+                if (
+                    cache_old_operation_log_probs_all is None
+                    or cache_old_candidate_log_probs_all is None
+                    or cache_operation_masks is None
+                    or cache_candidate_masks is None
+                ):
+                    raise RuntimeError(
+                        "Cache old-vs-new per-head diagnostic state is unavailable"
+                    )
+                with torch.no_grad():
+                    cache_epoch_policy_evaluation = (
+                        self.policy.evaluate_cache_operation_primitive(
+                            observations,
+                            cache_contexts,
+                            cache_operation_masks,
+                            cache_operation_actions,
+                            cache_candidate_features,
+                            cache_candidate_masks,
+                            cache_selected_indices,
+                        )
+                    )
+                if (
+                    cache_epoch_policy_evaluation.cache_operation_log_probs_all
+                    is None
+                    or cache_epoch_policy_evaluation.cache_candidate_log_probs_all
+                    is None
+                ):
+                    raise RuntimeError(
+                        "Cache new-policy full distributions are unavailable"
+                    )
+                cache_epoch_kl = _cache_per_head_old_new_kl(
+                    cache_old_operation_log_probs_all,
+                    cache_epoch_policy_evaluation.cache_operation_log_probs_all,
+                    cache_old_candidate_log_probs_all,
+                    cache_epoch_policy_evaluation.cache_candidate_log_probs_all,
+                    cache_operation_masks,
+                    cache_candidate_masks,
+                )
+                if not bool(torch.all(torch.isfinite(cache_epoch_kl)).item()):
+                    raise FloatingPointError(
+                        "Cache per-head old-vs-new KL is non-finite"
+                    )
+                cache_per_head_old_new_kl_values.extend(
+                    float(value)
+                    for value in cache_epoch_kl.detach().cpu().reshape(-1).tolist()
+                )
             ppo_update_epochs_executed += 1
             joint_gate_triggered = False
             if (
@@ -7832,7 +9844,7 @@ class PPOV2Trainer:
                             if cache_minibatch_kl_control_enabled
                             else cache_active_this_epoch
                         ),
-                        uav_active=bool(uav_active),
+                        uav_active=bool(uav_operation_active),
                         cache_epoch_kl=cache_epoch_approx_kl,
                         uav_epoch_kl=uav_operation_epoch_full_rollout_kl,
                         target_kl=target_kl_value,
@@ -7855,7 +9867,7 @@ class PPOV2Trainer:
                         transition["both_inactive_stop"]
                     )
                     cache_active = bool(transition["cache_active_next"])
-                    uav_active = bool(transition["uav_active_next"])
+                    uav_operation_active = bool(transition["uav_active_next"])
                     if cache_newly_stopped and cache_stop_epoch is None:
                         cache_stop_epoch = int(update_epoch + 1)
                         cache_suppressed_update_epochs = int(
@@ -7900,7 +9912,7 @@ class PPOV2Trainer:
                             cache_active
                         )
                         minibatch_record["uav_active_next_epoch"] = bool(
-                            uav_active
+                            uav_operation_active
                         )
                         minibatch_record["cache_independent_stop"] = bool(
                             cache_independent_stop_event
@@ -7929,6 +9941,26 @@ class PPOV2Trainer:
                         ),
                         "cache_over_target": cache_epoch_over_target,
                         "uav_over_target": uav_epoch_over_target,
+                        "uav_candidate_old_new_kl": candidate_epoch_old_new_kl,
+                        "uav_candidate_target_kl": (
+                            None
+                            if hyper.uav_candidate_target_kl is None
+                            else float(hyper.uav_candidate_target_kl)
+                        ),
+                        "uav_candidate_kl_gate_statistic": "MEAN_OR_P90",
+                        "uav_candidate_kl_gate_trigger_source": (
+                            candidate_epoch_kl_gate_trigger_source
+                        ),
+                        "uav_candidate_over_target": candidate_epoch_over_target,
+                        "uav_candidate_active": bool(
+                            uav_candidate_active_this_epoch
+                        ),
+                        "uav_candidate_active_next_epoch": bool(
+                            uav_candidate_active
+                        ),
+                        "uav_candidate_stop_triggered": bool(
+                            candidate_newly_stopped
+                        ),
                         "joint_over_target": (
                             None
                             if target_kl_value is None
@@ -7956,7 +9988,7 @@ class PPOV2Trainer:
                             "cache_active": bool(cache_active_this_epoch),
                             "uav_active": bool(uav_active_this_epoch),
                             "cache_active_next_epoch": bool(cache_active),
-                            "uav_active_next_epoch": bool(uav_active),
+                            "uav_active_next_epoch": bool(uav_operation_active),
                             "cache_stop_epoch": cache_stop_epoch,
                             "uav_stop_epoch": uav_stop_epoch,
                             "cache_suppressed_update_epochs": int(
@@ -7989,6 +10021,8 @@ class PPOV2Trainer:
             # trainability before the next rollout/update while retaining the
             # parameter-delta diagnostics captured below.
             for parameter in self.policy.uav_operation_head.parameters():
+                parameter.requires_grad_(True)
+            for parameter in self.policy.uav_candidate_scorer.parameters():
                 parameter.requires_grad_(True)
             for parameter in self.policy.uav_encoder.parameters():
                 parameter.requires_grad_(True)
@@ -8409,11 +10443,12 @@ class PPOV2Trainer:
                 assert uav_target_policy_probabilities_before is not None
                 assert conditional_candidate_valid_mask_t is not None
                 assert conditional_candidate_q_values_t is not None
+                assert uav_candidate_old_mask is not None
                 uav_target_policy_probabilities_after = (
                     self._conditional_candidate_probabilities(
                         uav_contexts,
                         uav_candidate_features,
-                        conditional_candidate_valid_mask_t,
+                        uav_candidate_old_mask,
                         int(self.policy.uav_feature_dim),
                         self.policy.uav_candidate_scorer,
                     )
@@ -8422,8 +10457,124 @@ class PPOV2Trainer:
                     uav_target_policy_probabilities_before.detach().cpu().numpy(),
                     uav_target_policy_probabilities_after.detach().cpu().numpy(),
                     conditional_candidate_q_values_t.detach().cpu().numpy(),
-                    conditional_candidate_valid_mask_t.detach().cpu().numpy(),
+                    (
+                        uav_candidate_old_mask.detach().cpu().numpy()
+                        if uav_candidate_old_mask is not None
+                        else conditional_candidate_valid_mask_t.detach().cpu().numpy()
+                    ),
                 )
+                if uav_candidate_teacher_probabilities_t is None:
+                    raise RuntimeError("UAV candidate teacher is unavailable for diagnostics")
+                if (
+                    uav_candidate_old_mask is None
+                    or uav_candidate_old_logits is None
+                    or uav_candidate_old_probabilities is None
+                ):
+                    raise RuntimeError(
+                        "UAV candidate old-policy diagnostic snapshots are unavailable"
+                    )
+                candidate_batch, candidate_heads, candidate_count = [
+                    int(value) for value in uav_candidate_features.shape[:3]
+                ]
+                candidate_scores, _ = self._conditional_candidate_logits(
+                    uav_contexts,
+                    uav_candidate_features,
+                    uav_candidate_old_mask,
+                    int(self.policy.uav_feature_dim),
+                    self.policy.uav_candidate_scorer,
+                )
+                uav_candidate_policy_metrics = _uav_candidate_policy_metrics(
+                    uav_target_policy_probabilities_after.detach().cpu().numpy(),
+                    uav_candidate_teacher_probabilities_t.detach().cpu().numpy(),
+                    conditional_candidate_q_values_t.detach().cpu().numpy(),
+                    uav_candidate_old_mask.detach().cpu().numpy(),
+                    candidate_scores.reshape(
+                        candidate_batch,
+                        candidate_heads,
+                        candidate_count,
+                    )
+                    .detach()
+                    .cpu()
+                    .numpy(),
+                )
+                uav_candidate_old_new_drift = _uav_candidate_old_new_drift_summary(
+                    uav_candidate_old_new_kl_values,
+                    uav_candidate_argmax_flip_values,
+                    uav_candidate_best_policy_prob_change_values,
+                )
+        uav_candidate_confidence_array = np.asarray(
+            uav_candidate_confidence_values, dtype=np.float64
+        )
+        if uav_candidate_confidence_array.size:
+            if not np.all(np.isfinite(uav_candidate_confidence_array)):
+                raise FloatingPointError("UAV candidate confidence is non-finite")
+            uav_candidate_confidence_metrics = {
+                "mean": float(np.mean(uav_candidate_confidence_array)),
+                "p10": float(np.percentile(uav_candidate_confidence_array, 10.0)),
+                "p50": float(np.percentile(uav_candidate_confidence_array, 50.0)),
+                "p90": float(np.percentile(uav_candidate_confidence_array, 90.0)),
+                "saturation_rate": float(
+                    np.mean(uav_candidate_confidence_array >= 0.999)
+                ),
+            }
+        else:
+            uav_candidate_confidence_metrics = {
+                "mean": math.nan,
+                "p10": math.nan,
+                "p50": math.nan,
+                "p90": math.nan,
+                "saturation_rate": math.nan,
+            }
+        cache_per_head_kl_array = np.asarray(
+            cache_per_head_old_new_kl_values,
+            dtype=np.float64,
+        )
+        cache_per_head_ratio_array = np.asarray(
+            cache_per_head_ratio_values,
+            dtype=np.float64,
+        )
+        cache_per_head_clipped_array = np.asarray(
+            cache_per_head_clipped_values,
+            dtype=np.float64,
+        )
+        if cache_per_head_kl_array.size:
+            if not np.all(np.isfinite(cache_per_head_kl_array)):
+                raise FloatingPointError("Cache per-head KL diagnostics are non-finite")
+            cache_per_head_kl_metrics = {
+                "mean": float(np.mean(cache_per_head_kl_array)),
+                "p50": float(np.percentile(cache_per_head_kl_array, 50.0)),
+                "p90": float(np.percentile(cache_per_head_kl_array, 90.0)),
+                "max": float(np.max(cache_per_head_kl_array)),
+            }
+        else:
+            cache_per_head_kl_metrics = {
+                "mean": math.nan,
+                "p50": math.nan,
+                "p90": math.nan,
+                "max": math.nan,
+            }
+        if cache_per_head_ratio_array.size:
+            if not np.all(np.isfinite(cache_per_head_ratio_array)):
+                raise FloatingPointError(
+                    "Cache per-head ratio diagnostics are non-finite"
+                )
+            if not np.all(np.isfinite(cache_per_head_clipped_array)):
+                raise FloatingPointError(
+                    "Cache per-head clip diagnostics are non-finite"
+                )
+            cache_per_head_ratio_metrics = {
+                "mean": float(np.mean(cache_per_head_ratio_array)),
+                "p90": float(np.percentile(cache_per_head_ratio_array, 90.0)),
+                "max": float(np.max(cache_per_head_ratio_array)),
+                "clip_fraction": float(np.mean(cache_per_head_clipped_array)),
+            }
+        else:
+            cache_per_head_ratio_metrics = {
+                "mean": math.nan,
+                "p90": math.nan,
+                "max": math.nan,
+                "clip_fraction": math.nan,
+            }
         return UpdateResult(
             policy_loss=policy_loss_value,
             value_loss=value_loss_value,
@@ -8476,6 +10627,25 @@ class PPOV2Trainer:
                 if cache_clip_fraction_values
                 else math.nan
             ),
+            cache_per_head_old_new_kl_mean=float(cache_per_head_kl_metrics["mean"]),
+            cache_per_head_old_new_kl_p50=float(cache_per_head_kl_metrics["p50"]),
+            cache_per_head_old_new_kl_p90=float(cache_per_head_kl_metrics["p90"]),
+            cache_per_head_old_new_kl_max=float(cache_per_head_kl_metrics["max"]),
+            cache_per_head_ratio_mean=float(cache_per_head_ratio_metrics["mean"]),
+            cache_per_head_ratio_p90=float(cache_per_head_ratio_metrics["p90"]),
+            cache_per_head_ratio_max=float(cache_per_head_ratio_metrics["max"]),
+            cache_per_head_clip_fraction=float(
+                cache_per_head_ratio_metrics["clip_fraction"]
+            ),
+            cache_ratio_granularity=str(self.cache_ratio_granularity),
+            whole_cache_joint_ratio_used_for_loss=(
+                self.cache_ratio_granularity
+                == CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT
+            ),
+            whole_cache_joint_ratio_diagnostic_only=(
+                self.cache_ratio_granularity
+                == CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD
+            ),
             uav_clip_fraction=(
                 float(np.mean(uav_clip_fraction_values))
                 if uav_clip_fraction_values
@@ -8505,6 +10675,25 @@ class PPOV2Trainer:
                 float(np.mean(shared_actor_gradient_norm_values))
                 if shared_actor_gradient_norm_values
                 else math.nan
+            ),
+            cache_actor_grad_norm_preclip_by_update_epoch=tuple(
+                float(value)
+                for value in cache_actor_grad_norm_preclip_by_update_epoch
+            ),
+            cache_actor_grad_clip_coefficient_by_update_epoch=tuple(
+                float(value)
+                for value in cache_actor_grad_clip_coefficient_by_update_epoch
+            ),
+            uav_actor_grad_norm_preclip_by_update_epoch=tuple(
+                float(value) for value in uav_actor_grad_norm_preclip_by_update_epoch
+            ),
+            uav_actor_grad_clip_coefficient_by_update_epoch=tuple(
+                float(value)
+                for value in uav_actor_grad_clip_coefficient_by_update_epoch
+            ),
+            combined_actor_grad_norm_postclip_by_update_epoch=tuple(
+                float(value)
+                for value in combined_actor_grad_norm_postclip_by_update_epoch
             ),
             cache_encoder_gradient_norm=(
                 float(np.mean(cache_encoder_gradient_norm_values))
@@ -8569,6 +10758,156 @@ class PPOV2Trainer:
                 if self._uses_exact_uav_candidate_credit()
                 else ""
             ),
+            uav_candidate_policy_entropy_mean=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["policy_entropy_mean"])
+            ),
+            uav_candidate_teacher_entropy_mean=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["teacher_entropy_mean"])
+            ),
+            uav_candidate_best_policy_prob_mean=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["best_policy_prob_mean"])
+            ),
+            uav_candidate_best_policy_prob_median=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["best_policy_prob_median"])
+            ),
+            uav_candidate_best_policy_rank_mean=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["best_policy_rank_mean"])
+            ),
+            uav_candidate_best_policy_top1_rate=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["best_policy_top1_rate"])
+            ),
+            uav_candidate_best_policy_top3_rate=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["best_policy_top3_rate"])
+            ),
+            uav_candidate_logit_std_mean=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["logit_std_mean"])
+            ),
+            uav_candidate_logit_range_mean=(
+                math.nan
+                if uav_candidate_policy_metrics is None
+                else float(uav_candidate_policy_metrics["logit_range_mean"])
+            ),
+            uav_candidate_confidence_mean=float(
+                uav_candidate_confidence_metrics["mean"]
+            ),
+            uav_candidate_confidence_p10=float(
+                uav_candidate_confidence_metrics["p10"]
+            ),
+            uav_candidate_confidence_p50=float(
+                uav_candidate_confidence_metrics["p50"]
+            ),
+            uav_candidate_confidence_p90=float(
+                uav_candidate_confidence_metrics["p90"]
+            ),
+            uav_candidate_confidence_saturation_rate=float(
+                uav_candidate_confidence_metrics["saturation_rate"]
+            ),
+            uav_candidate_scorer_gradient_norm_by_update_epoch=tuple(
+                float(value)
+                for value in uav_candidate_scorer_gradient_norm_by_update_epoch
+            ),
+            uav_candidate_scorer_parameter_delta_norm_by_update_epoch=tuple(
+                float(value)
+                for value in uav_candidate_scorer_parameter_delta_norm_by_update_epoch
+            ),
+            uav_encoder_gradient_norm_by_update_epoch=tuple(
+                float(value) for value in uav_encoder_gradient_norm_by_update_epoch
+            ),
+            uav_encoder_parameter_delta_norm_by_update_epoch=tuple(
+                float(value)
+                for value in uav_encoder_parameter_delta_norm_by_update_epoch
+            ),
+            uav_candidate_old_new_kl_mean_by_update_epoch=tuple(
+                float(value) for value in uav_candidate_old_new_kl_mean_by_update_epoch
+            ),
+            uav_candidate_old_new_kl_p90_by_update_epoch=tuple(
+                float(value) for value in uav_candidate_old_new_kl_p90_by_update_epoch
+            ),
+            uav_candidate_old_new_kl_max_by_update_epoch=tuple(
+                float(value) for value in uav_candidate_old_new_kl_max_by_update_epoch
+            ),
+            uav_candidate_argmax_flip_rate_by_update_epoch=tuple(
+                float(value) for value in uav_candidate_argmax_flip_rate_by_update_epoch
+            ),
+            uav_candidate_best_policy_prob_change_mean_by_update_epoch=tuple(
+                float(value)
+                for value in uav_candidate_best_policy_prob_change_mean_by_update_epoch
+            ),
+            uav_candidate_best_policy_prob_change_p10_by_update_epoch=tuple(
+                float(value)
+                for value in uav_candidate_best_policy_prob_change_p10_by_update_epoch
+            ),
+            uav_candidate_old_new_kl_mean=(
+                math.nan
+                if uav_candidate_old_new_drift is None
+                else float(uav_candidate_old_new_drift["kl_mean"])
+            ),
+            uav_candidate_old_new_kl_p50=(
+                math.nan
+                if uav_candidate_old_new_drift is None
+                else float(uav_candidate_old_new_drift["kl_p50"])
+            ),
+            uav_candidate_old_new_kl_p90=(
+                math.nan
+                if uav_candidate_old_new_drift is None
+                else float(uav_candidate_old_new_drift["kl_p90"])
+            ),
+            uav_candidate_old_new_kl_max=(
+                math.nan
+                if uav_candidate_old_new_drift is None
+                else float(uav_candidate_old_new_drift["kl_max"])
+            ),
+            uav_candidate_argmax_flip_rate=(
+                math.nan
+                if uav_candidate_old_new_drift is None
+                else float(uav_candidate_old_new_drift["argmax_flip_rate"])
+            ),
+            uav_candidate_best_policy_prob_change_mean=(
+                math.nan
+                if uav_candidate_old_new_drift is None
+                else float(uav_candidate_old_new_drift["best_policy_prob_change_mean"])
+            ),
+            uav_candidate_best_policy_prob_change_p10=(
+                math.nan
+                if uav_candidate_old_new_drift is None
+                else float(uav_candidate_old_new_drift["best_policy_prob_change_p10"])
+            ),
+            uav_candidate_target_kl=(
+                math.nan
+                if not exact_uav_credit_enabled
+                else (
+                    math.nan
+                    if hyper.uav_candidate_target_kl is None
+                    else float(hyper.uav_candidate_target_kl)
+                )
+            ),
+            uav_candidate_kl_gate_statistic="MEAN_OR_P90",
+            uav_candidate_kl_gate_trigger_source=str(
+                uav_candidate_kl_gate_trigger_source
+            ),
+            uav_candidate_kl_stop_epoch=uav_candidate_kl_stop_epoch,
+            uav_candidate_active_per_update_epoch=tuple(
+                uav_candidate_active_per_update_epoch
+            ),
+            uav_candidate_suppressed_update_epochs=int(
+                uav_candidate_suppressed_update_epochs
+            ),
             uav_branch_old_log_probs=uav_branch_old_log_probs_values,
             uav_branch_new_log_probs=uav_branch_new_log_probs_values,
             uav_branch_ratios=uav_branch_ratios_values,
@@ -8605,6 +10944,14 @@ class PPOV2Trainer:
             uav_candidate_full_steps=int(uav_candidate_full_steps),
             uav_candidate_only_steps_after_operation_stop=int(
                 uav_candidate_only_steps_after_operation_stop
+            ),
+            uav_candidate_optimizer_step_count=int(
+                uav_candidate_optimizer_step_count
+            ),
+            uav_encoder_optimizer_step_count=int(uav_encoder_optimizer_step_count),
+            uav_candidate_scorer_encoder_step_gap=int(
+                uav_candidate_optimizer_step_count
+                - uav_encoder_optimizer_step_count
             ),
             uav_operation_full_rollout_kl=(
                 float(uav_operation_full_rollout_kl_current)
@@ -8739,6 +11086,189 @@ class PPOV2Trainer:
             ),
             uav_operation_diagnostics=uav_operation_diagnostics,
             uav_operation_diagnostic_arrays=uav_operation_diagnostic_arrays,
+            matching_natural_stable_count=int(
+                matching_actual_metrics["natural_stable_count"]
+            ),
+            matching_max_updates_hit_count=int(
+                matching_actual_metrics["max_updates_hit_count"]
+            ),
+            matching_max_updates_hit_rate=float(
+                matching_actual_metrics["max_updates_hit_rate"]
+            ),
+            matching_update_count_mean=float(
+                matching_actual_metrics["update_count_mean"]
+            ),
+            matching_update_count_p95=float(
+                matching_actual_metrics["update_count_p95"]
+            ),
+            matching_update_count_max=int(
+                matching_actual_metrics["update_count_max"]
+            ),
+            matching_cf_natural_stable_count=int(
+                uav_operation_credit.get("matching_cf_natural_stable_count", 0)
+            ),
+            matching_cf_max_updates_hit_count=int(
+                uav_operation_credit.get("matching_cf_max_updates_hit_count", 0)
+            ),
+            matching_cf_max_updates_hit_rate=float(
+                uav_operation_credit.get("matching_cf_max_updates_hit_rate", 0.0)
+            ),
+            matching_cf_update_count_mean=float(
+                uav_operation_credit.get("matching_cf_update_count_mean", 0.0)
+            ),
+            matching_cf_update_count_p95=float(
+                uav_operation_credit.get("matching_cf_update_count_p95", 0.0)
+            ),
+            matching_cf_update_count_max=int(
+                uav_operation_credit.get("matching_cf_update_count_max", 0)
+            ),
+            kkt_solve_count=int(matching_actual_kkt_metrics["solve_count"]),
+            kkt_converged_count=int(
+                matching_actual_kkt_metrics["converged_count"]
+            ),
+            kkt_converged_rate=float(
+                matching_actual_kkt_metrics["converged_rate"]
+            ),
+            kkt_max_iter_hit_count=int(
+                matching_actual_kkt_metrics["max_iter_hit_count"]
+            ),
+            kkt_max_iter_hit_rate=float(
+                matching_actual_kkt_metrics["max_iter_hit_rate"]
+            ),
+            kkt_finite_count=int(matching_actual_kkt_metrics["finite_count"]),
+            kkt_finite_rate=float(matching_actual_kkt_metrics["finite_rate"]),
+            kkt_iteration_mean=float(matching_actual_kkt_metrics["iteration_mean"]),
+            kkt_iteration_p95=float(matching_actual_kkt_metrics["iteration_p95"]),
+            kkt_iteration_max=int(matching_actual_kkt_metrics["iteration_max"]),
+            kkt_resource_residual_mean=float(
+                matching_actual_kkt_metrics["resource_residual_mean"]
+            ),
+            kkt_resource_residual_max=float(
+                matching_actual_kkt_metrics["resource_residual_max"]
+            ),
+            kkt_stationarity_residual_mean=float(
+                matching_actual_kkt_metrics["stationarity_residual_mean"]
+            ),
+            kkt_stationarity_residual_max=float(
+                matching_actual_kkt_metrics["stationarity_residual_max"]
+            ),
+            kkt_complementary_slackness_residual_mean=float(
+                matching_actual_kkt_metrics[
+                    "complementary_slackness_residual_mean"
+                ]
+            ),
+            kkt_complementary_slackness_residual_max=float(
+                matching_actual_kkt_metrics[
+                    "complementary_slackness_residual_max"
+                ]
+            ),
+            matching_cf_kkt_solve_count=int(
+                uav_operation_credit.get("matching_cf_kkt_solve_count", 0)
+            ),
+            matching_cf_kkt_converged_count=int(
+                uav_operation_credit.get("matching_cf_kkt_converged_count", 0)
+            ),
+            matching_cf_kkt_converged_rate=float(
+                uav_operation_credit.get("matching_cf_kkt_converged_rate", 0.0)
+            ),
+            matching_cf_kkt_max_iter_hit_count=int(
+                uav_operation_credit.get("matching_cf_kkt_max_iter_hit_count", 0)
+            ),
+            matching_cf_kkt_max_iter_hit_rate=float(
+                uav_operation_credit.get("matching_cf_kkt_max_iter_hit_rate", 0.0)
+            ),
+            matching_cf_kkt_finite_count=int(
+                uav_operation_credit.get("matching_cf_kkt_finite_count", 0)
+            ),
+            matching_cf_kkt_finite_rate=float(
+                uav_operation_credit.get("matching_cf_kkt_finite_rate", 0.0)
+            ),
+            matching_cf_kkt_iteration_mean=float(
+                uav_operation_credit.get("matching_cf_kkt_iteration_mean", 0.0)
+            ),
+            matching_cf_kkt_iteration_p95=float(
+                uav_operation_credit.get("matching_cf_kkt_iteration_p95", 0.0)
+            ),
+            matching_cf_kkt_iteration_max=int(
+                uav_operation_credit.get("matching_cf_kkt_iteration_max", 0)
+            ),
+            matching_cf_kkt_resource_residual_mean=float(
+                uav_operation_credit.get(
+                    "matching_cf_kkt_resource_residual_mean", math.nan
+                )
+            ),
+            matching_cf_kkt_resource_residual_max=float(
+                uav_operation_credit.get(
+                    "matching_cf_kkt_resource_residual_max", math.nan
+                )
+            ),
+            matching_cf_kkt_stationarity_residual_mean=float(
+                uav_operation_credit.get(
+                    "matching_cf_kkt_stationarity_residual_mean", math.nan
+                )
+            ),
+            matching_cf_kkt_stationarity_residual_max=float(
+                uav_operation_credit.get(
+                    "matching_cf_kkt_stationarity_residual_max", math.nan
+                )
+            ),
+            matching_cf_kkt_complementary_slackness_residual_mean=float(
+                uav_operation_credit.get(
+                    "matching_cf_kkt_complementary_slackness_residual_mean",
+                    math.nan,
+                )
+            ),
+            matching_cf_kkt_complementary_slackness_residual_max=float(
+                uav_operation_credit.get(
+                    "matching_cf_kkt_complementary_slackness_residual_max",
+                    math.nan,
+                )
+            ),
+            cache_trigger_advantage_source=str(
+                self.cache_trigger_advantage_source
+            ),
+            cache_candidate_advantage_source=str(
+                self.cache_candidate_advantage_source
+            ),
+            cache_trigger_tdq_raw_mean=float(
+                cache_credit.get("tdq_raw_mean", math.nan)
+            ),
+            cache_trigger_tdq_raw_std=float(
+                cache_credit.get("tdq_raw_std", math.nan)
+            ),
+            cache_trigger_tdq_raw_p10=float(
+                cache_credit.get("tdq_raw_p10", math.nan)
+            ),
+            cache_trigger_tdq_raw_p50=float(
+                cache_credit.get("tdq_raw_p50", math.nan)
+            ),
+            cache_trigger_tdq_raw_p90=float(
+                cache_credit.get("tdq_raw_p90", math.nan)
+            ),
+            cache_trigger_tdq_raw_abs_max=float(
+                cache_credit.get("tdq_raw_abs_max", math.nan)
+            ),
+            cache_trigger_tdq_scale=float(
+                cache_credit.get("tdq_scale", math.nan)
+            ),
+            cache_trigger_tdq_normalized_abs_p90=float(
+                cache_credit.get("tdq_normalized_abs_p90", math.nan)
+            ),
+            cache_trigger_tdq_normalized_abs_max=float(
+                cache_credit.get("tdq_normalized_abs_max", math.nan)
+            ),
+            one_step_tdq_branches_executed=int(
+                cache_credit.get("one_step_tdq_branches_executed", 0)
+            ),
+            one_step_tdq_runtime_seconds=float(
+                cache_credit.get("one_step_tdq_runtime_seconds", math.nan)
+            ),
+            seconds_per_cache_head=float(
+                cache_credit.get("seconds_per_cache_head", math.nan)
+            ),
+            projected_300_slot_runtime_seconds=float(
+                cache_credit.get("projected_300_slot_runtime_seconds", math.nan)
+            ),
             cache_trigger_advantage_mean_abs=(
                 float(cache_credit.get("trigger_advantage_mean_abs", math.nan))
                 if cache_credit
@@ -9047,6 +11577,12 @@ class PPOV2Trainer:
             **learning_rate_metadata,
             "cache_credit_granularity": None,
             "cache_kl_control": str(self.cache_kl_control),
+            "cache_trigger_advantage_source": str(
+                self.cache_trigger_advantage_source
+            ),
+            "cache_candidate_advantage_source": str(
+                self.cache_candidate_advantage_source
+            ),
             **self.cache_surrogate_metadata(),
             "configuration_control_mode": self.context.configuration_control_mode,
             "advantage_normalization_mode": (
@@ -9224,7 +11760,14 @@ class PPOV2Trainer:
         )
         return checkpoint
 
-    def load_checkpoint(self, checkpoint: Path, config_hash: str) -> TrainingCursor:
+    def load_checkpoint(
+        self,
+        checkpoint: Path,
+        config_hash: str,
+        *,
+        current_config_path: str | Path | None = None,
+        checkpoint_config_path: str | Path | None = None,
+    ) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
         _validate_learning_rate_metadata(
             payload.get("learning_rate_metadata"),
@@ -9372,7 +11915,20 @@ class PPOV2Trainer:
             self.context.configuration_control_mode
         ):
             raise ValueError("PPO checkpoint configuration_control_mode mismatch.")
-        if payload.get("method") != PPO_V2_METHOD or payload.get("config_sha256") != config_hash:
+        config_hash_matches = payload.get("config_sha256") == config_hash
+        ratio_only_resume = False
+        if not config_hash_matches and (
+            current_config_path is not None
+            and checkpoint_config_path is not None
+        ):
+            ratio_only_resume = _configs_match_except_cache_ratio_granularity(
+                current_config_path,
+                checkpoint_config_path,
+                str(payload.get("config_sha256", "")),
+            )
+        if payload.get("method") != PPO_V2_METHOD or not (
+            config_hash_matches or ratio_only_resume
+        ):
             raise ValueError("PPO v2 checkpoint method/config hash mismatch.")
         if int(payload.get("action_dim")) != int(self.context.action_spec.action_dim):
             raise ValueError("PPO v2 checkpoint action_dim 不匹配。")
@@ -9485,6 +12041,76 @@ def _config_hash(config_path: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _configs_match_except_cache_ratio_granularity(
+    current_config_path: str | Path,
+    checkpoint_config_path: str | Path,
+    checkpoint_config_hash: str,
+) -> bool:
+    """Allow only the explicit Stage2A Cache ratio migration on resume."""
+
+    current_path = Path(current_config_path)
+    checkpoint_path = Path(checkpoint_config_path)
+    if not current_path.is_file() or not checkpoint_path.is_file():
+        return False
+    if _config_hash(checkpoint_path) != str(checkpoint_config_hash):
+        return False
+    try:
+        current = project_config.load_config(
+            current_path,
+            require_artifacts=False,
+        )
+        checkpoint = project_config.load_config(
+            checkpoint_path,
+            require_artifacts=False,
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+    current_ratio_values = {
+        str(
+            project_config.get_config_value(
+                current,
+                f"algorithm.ppo.{field}",
+                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
+            )
+        )
+        for field in (
+            "cache_trigger_ratio_granularity",
+            "cache_candidate_ratio_granularity",
+        )
+    }
+    checkpoint_ratio_values = {
+        str(
+            project_config.get_config_value(
+                checkpoint,
+                f"algorithm.ppo.{field}",
+                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
+            )
+        )
+        for field in (
+            "cache_trigger_ratio_granularity",
+            "cache_candidate_ratio_granularity",
+        )
+    }
+    if current_ratio_values != {CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD}:
+        return False
+    if checkpoint_ratio_values != {CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT}:
+        return False
+
+    def normalized(config: dict[str, Any]) -> dict[str, Any]:
+        value = json.loads(json.dumps(config))
+        value.pop("_meta", None)
+        ppo = value.get("algorithm", {}).get("ppo", {})
+        for field in (
+            "cache_trigger_ratio_granularity",
+            "cache_candidate_ratio_granularity",
+        ):
+            if field in ppo:
+                ppo[field] = "__CACHE_RATIO_GRANULARITY__"
+        return value
+
+    return normalized(current) == normalized(checkpoint)
+
+
 def _run_protocol_metadata(
     context: EnvironmentContext,
     rollout_steps: int,
@@ -9517,6 +12143,7 @@ def run_training(
     lr_experiment_value: float | None = None,
     exact_q_parallel_workers: int = 1,
     resume: bool = False,
+    checkpoint_config_path: str | Path | None = None,
     verbose: bool = False,
 ) -> None:
     _require_torch()
@@ -9679,7 +12306,12 @@ def run_training(
     if resume:
         if not checkpoint.exists():
             raise FileNotFoundError(f"resume checkpoint 不存在：{checkpoint}")
-        cursor = trainer.load_checkpoint(checkpoint, config_hash)
+        cursor = trainer.load_checkpoint(
+            checkpoint,
+            config_hash,
+            current_config_path=config_path,
+            checkpoint_config_path=checkpoint_config_path,
+        )
         completed_episodes = cursor.completed_episodes
         current_train_origin = cursor.current_train_origin
         current_cache_state = cursor.current_cache_state
@@ -10822,6 +13454,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="staged deterministic UAV Exact-Q transition workers",
     )
+    parser.add_argument(
+        "--checkpoint-config",
+        default=None,
+        help=(
+            "read-only source config for the explicit Stage2A Cache ratio-only "
+            "checkpoint migration"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--verbose",
@@ -10865,6 +13505,7 @@ def main(argv: list[str] | None = None) -> int:
         critic_learning_rate_override=args.critic_learning_rate,
         exact_q_parallel_workers=args.exact_q_parallel_workers,
         resume=bool(args.resume),
+        checkpoint_config_path=args.checkpoint_config,
         verbose=bool(args.verbose),
     )
     return 0
