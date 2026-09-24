@@ -405,18 +405,26 @@ lambda_cache = 0.1
 lambda_movement = 1.76e-5
 uav_movement_cost_weight = 0.50
 cache_cost_weight = 0.1
-# T_ref/E_ref 采用正式 train origins（slot 0..239）中 arrival=1 任务在 TV local CPU
-# 上的 P95 尺度；test origins（slot 240..299）不参与参考值拟合。
-# 这样参考值主要由 train-only 任务工作负载和车辆本地计算能力决定，
+# T_ref/E_ref 是 frozen train-only calibration constants；Validation/Test 未参与拟合。
+# 当前正式协议按相互独立的完整 realizations 划分，不做单个 episode 的
+# Train/Test origin 切分：
+# Training: environment_data/proposed_joint_training，seeds 20001–20300，
+# 300 complete realizations，每个 realization 300 slots。
+# Validation: environment_data/proposed_joint_validation，seeds 30001–30030，
+# 30 complete realizations。
+# Test: environment_data/proposed_joint_test，seeds 40001–40100，
+# 100 complete realizations。
+# 三个 split 的 seed 区间互不重叠，每个 realization 均完整覆盖 300 slots。
+# 这样参考值主要由训练校准任务工作负载和车辆本地计算能力决定，
 # 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
 # 因此适合作为不同算法统一使用的归一化基准。
-# train origins 共 3343 个到达任务；cpu_cycles P95=30,628,985,166.15863 cycle；
+# 历史训练校准样本共 3343 个到达任务；cpu_cycles P95=30,628,985,166.15863 cycle；
 # 在 1.0e9 cycle/s 的 TV CPU 上对应 30.6289851662 s。
 T_ref = 30.6289851662
 # 这样参考值主要由任务工作负载和车辆本地计算能力决定，
 # 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
 # 因此适合作为不同算法统一使用的归一化基准。
-# 使用同一 train-only P95 工作负载和 kappa=1.0e-28，Local energy P95=3.06289851662 J。
+# 使用同一训练校准 P95 工作负载和 kappa=1.0e-28，Local energy P95=3.06289851662 J。
 E_ref = 3.06289851662
 
 [prediction.vehicle]
@@ -587,7 +595,8 @@ critic_value_scale_epsilon = 1.0e-8
 critic_value_scale_warmup_samples = 64
 
 [algorithm.ppo.data_protocol]
-# 独立的完整 Episode 协议；本任务暂不轮换 Episode realization。
+# 独立的完整 Episode 协议。每个训练 realization 的 0..299 均用于训练；
+# validation/test 由完整且不同 seed 的 realization 构成。
 protocol = "full_episode_randomized"
 episode_slots = 300
 train_origin_start = 0
@@ -598,7 +607,7 @@ terminal_origin = 299
 [parameter_status]
 # 参数状态：
 # CONFIRMED_DATA：由当前真实生成数据或明确软件设置确定。
-# TRAIN_ONLY_CALIBRATION：严格由 train origins 派生，可复现但不使用 test 数据。
+# TRAIN_ONLY_CALIBRATION：由 Train split 数据拟合并冻结；Validation/Test 不参与拟合。
 # EXPERIMENT_DESIGN：实验设计选择，不是数据或文献物理常数。
 # ALGORITHM_DESIGN：预测/配置算法的设计参数，不属于 system-model 物理合同。
 # LITERATURE_DERIVED：由明确文献模型推导的等效参数；不是文献直接测量或直接表格常数。

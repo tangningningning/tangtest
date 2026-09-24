@@ -81,6 +81,7 @@ from .uav_operation_diagnostics import (
 PPO_V2_METHOD = "ppo_simple_v2"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
+CHECKPOINT_INTERVAL_EPOCHS = 10
 CHECKPOINT_VERSION = 2
 PRIMITIVE_CHECKPOINT_VERSION = 3
 VALUE_NORMALIZED_CHECKPOINT_VERSION = 4
@@ -561,22 +562,33 @@ def _candidate_kl_gate_transition(
     }
 
 
+def _uav_candidate_effective_active(
+    *,
+    operation_active: bool,
+    candidate_kl_active: bool,
+) -> bool:
+    """A MOVE child policy is active only while its parent remains active."""
+
+    return bool(operation_active) and bool(candidate_kl_active)
+
+
 def _set_uav_branch_requires_grad(
     policy: Any,
     *,
     operation_active: bool,
     candidate_active: bool,
-) -> bool:
-    """Apply the operation/candidate/encoder active-state contract."""
+) -> tuple[bool, bool]:
+    """Apply independent operation and candidate parameter activity."""
 
-    encoder_active = bool(operation_active or candidate_active)
     for parameter in policy.uav_operation_head.parameters():
         parameter.requires_grad_(bool(operation_active))
     for parameter in policy.uav_candidate_scorer.parameters():
         parameter.requires_grad_(bool(candidate_active))
     for parameter in policy.uav_encoder.parameters():
-        parameter.requires_grad_(encoder_active)
-    return encoder_active
+        parameter.requires_grad_(bool(operation_active))
+    for parameter in policy.uav_candidate_encoder.parameters():
+        parameter.requires_grad_(bool(candidate_active))
+    return bool(operation_active), bool(candidate_active)
 
 
 def _branch_actor_policy_loss(
@@ -864,6 +876,8 @@ class UpdateResult:
     uav_candidate_scorer_parameter_delta_norm_by_update_epoch: tuple[float, ...] = ()
     uav_encoder_gradient_norm_by_update_epoch: tuple[float, ...] = ()
     uav_encoder_parameter_delta_norm_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_encoder_gradient_norm_by_update_epoch: tuple[float, ...] = ()
+    uav_candidate_encoder_parameter_delta_norm_by_update_epoch: tuple[float, ...] = ()
     uav_candidate_old_new_kl_mean_by_update_epoch: tuple[float, ...] = ()
     uav_candidate_old_new_kl_p90_by_update_epoch: tuple[float, ...] = ()
     uav_candidate_old_new_kl_max_by_update_epoch: tuple[float, ...] = ()
@@ -883,6 +897,10 @@ class UpdateResult:
     uav_candidate_kl_stop_epoch: int | None = None
     uav_candidate_active_per_update_epoch: tuple[bool, ...] = ()
     uav_candidate_suppressed_update_epochs: int = 0
+    uav_candidate_effective_kl_at_gate: float = math.nan
+    uav_candidate_effective_kl_immediately_after_gate: float = math.nan
+    uav_candidate_effective_kl_after_gate: float = math.nan
+    uav_candidate_post_gate_drift_from_gate: float = math.nan
     # Exact node-specific Cache credit diagnostics.
     cache_trigger_advantage_source: str = CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE
     cache_candidate_advantage_source: str = CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE
@@ -972,6 +990,7 @@ class UpdateResult:
     uav_branch_clipped: np.ndarray | None = None
     cache_encoder_gradient_norm: float = math.nan
     uav_encoder_gradient_norm: float = math.nan
+    uav_candidate_encoder_gradient_norm: float = math.nan
     kl_minibatch_diagnostics: tuple[dict[str, Any], ...] = ()
     kl_epoch_diagnostics: tuple[dict[str, Any], ...] = ()
     kl_gate_mode: str = KL_GATE_MODE_JOINT
@@ -993,20 +1012,21 @@ class UpdateResult:
     cache_minibatches_executed: int = 0
     cache_minibatches_suppressed: int = 0
     uav_minibatches_executed: int = 0
-    # Proposed UAV operation/candidate routing diagnostics.  Operation steps
-    # count full-information binary-teacher updates; candidate updates remain
-    # active after the operation KL gate freezes the operation head/encoder.
+    # Proposed UAV operation/candidate routing diagnostics.  Candidate is a
+    # child of MOVE, so its activity is suppressed whenever operation stops.
     uav_operation_steps_executed: int = 0
     uav_operation_steps_suppressed: int = 0
     uav_candidate_full_steps: int = 0
     uav_candidate_only_steps_after_operation_stop: int = 0
     uav_candidate_optimizer_step_count: int = 0
-    uav_encoder_optimizer_step_count: int = 0
+    uav_operation_encoder_optimizer_step_count: int = 0
+    uav_candidate_encoder_optimizer_step_count: int = 0
     uav_candidate_scorer_encoder_step_gap: int = 0
     uav_operation_full_rollout_kl: float = math.nan
     uav_operation_teacher_diagnostics: dict[str, Any] | None = None
     uav_operation_head_parameter_delta_norm: float = math.nan
     uav_encoder_parameter_delta_norm: float = math.nan
+    uav_candidate_encoder_parameter_delta_norm: float = math.nan
     global_critic_steps: int = 0
     # Proposed operation-credit diagnostics.  These are populated only for
     # the proposed schema and are deliberately separate from the legacy global-GAE
@@ -2249,9 +2269,25 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
                 float(value)
                 for value in update.uav_encoder_gradient_norm_by_update_epoch
             ],
+            "UAV_OPERATION_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_gradient_norm_by_update_epoch
+            ],
             "UAV_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
                 float(value)
                 for value in update.uav_encoder_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_OPERATION_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_encoder_gradient_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_encoder_parameter_delta_norm_by_update_epoch
             ],
             "UAV_CANDIDATE_OLD_NEW_KL_MEAN_BY_UPDATE_EPOCH": [
                 float(value)
@@ -2317,6 +2353,27 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
     }
     if all(math.isfinite(value) for value in candidate_gate_metrics.values()):
         fields.update(candidate_gate_metrics)
+    candidate_effective_kl_metrics = {
+        "UAV_CANDIDATE_EFFECTIVE_KL_AT_GATE": float(
+            update.uav_candidate_effective_kl_at_gate
+        ),
+        "UAV_CANDIDATE_EFFECTIVE_KL_IMMEDIATELY_AFTER_GATE": float(
+            update.uav_candidate_effective_kl_immediately_after_gate
+        ),
+        "UAV_CANDIDATE_EFFECTIVE_KL_AFTER_GATE": float(
+            update.uav_candidate_effective_kl_after_gate
+        ),
+        "UAV_CANDIDATE_POST_GATE_DRIFT_FROM_GATE": float(
+            update.uav_candidate_post_gate_drift_from_gate
+        ),
+    }
+    fields.update(
+        {
+            key: value
+            for key, value in candidate_effective_kl_metrics.items()
+            if math.isfinite(value)
+        }
+    )
     fields.update(
         {
             "UAV_CANDIDATE_KL_GATE_STATISTIC": str(
@@ -2786,8 +2843,11 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         "uav_operation_head_parameter_delta_norm": float(
             update.uav_operation_head_parameter_delta_norm
         ),
-        "uav_encoder_parameter_delta_norm": float(
+        "uav_operation_encoder_parameter_delta_norm": float(
             update.uav_encoder_parameter_delta_norm
+        ),
+        "uav_candidate_encoder_parameter_delta_norm": float(
+            update.uav_candidate_encoder_parameter_delta_norm
         ),
     }
     if all(math.isfinite(value) for value in routing_metrics.values()):
@@ -2803,8 +2863,14 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
             "UAV_CANDIDATE_OPTIMIZER_STEP_COUNT": int(
                 update.uav_candidate_optimizer_step_count
             ),
-            "UAV_ENCODER_OPTIMIZER_STEP_COUNT": int(
-                update.uav_encoder_optimizer_step_count
+            "UAV_CANDIDATE_SCORER_OPTIMIZER_STEP_COUNT": int(
+                update.uav_candidate_optimizer_step_count
+            ),
+            "UAV_OPERATION_ENCODER_OPTIMIZER_STEP_COUNT": int(
+                update.uav_operation_encoder_optimizer_step_count
+            ),
+            "UAV_CANDIDATE_ENCODER_OPTIMIZER_STEP_COUNT": int(
+                update.uav_candidate_encoder_optimizer_step_count
             ),
             "UAV_CANDIDATE_SCORER_ENCODER_STEP_GAP": int(
                 update.uav_candidate_scorer_encoder_step_gap
@@ -2817,7 +2883,10 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         fields.update(dict(update.uav_operation_diagnostics))
     encoder_gradient_norms = {
         "cache_encoder_gradient_norm": float(update.cache_encoder_gradient_norm),
-        "uav_encoder_gradient_norm": float(update.uav_encoder_gradient_norm),
+        "uav_operation_encoder_gradient_norm": float(update.uav_encoder_gradient_norm),
+        "uav_candidate_encoder_gradient_norm": float(
+            update.uav_candidate_encoder_gradient_norm
+        ),
     }
     if all(math.isfinite(value) for value in encoder_gradient_norms.values()):
         fields.update(encoder_gradient_norms)
@@ -8084,6 +8153,7 @@ class PPOV2Trainer:
         }
         uav_operation_head_before: dict[str, Any] | None = None
         uav_encoder_before: dict[str, Any] | None = None
+        uav_candidate_encoder_before: dict[str, Any] | None = None
         if exact_uav_credit_enabled:
             uav_operation_head_before = {
                 str(name): parameter.detach().clone()
@@ -8092,6 +8162,10 @@ class PPOV2Trainer:
             uav_encoder_before = {
                 str(name): parameter.detach().clone()
                 for name, parameter in self.policy.uav_encoder.named_parameters()
+            }
+            uav_candidate_encoder_before = {
+                str(name): parameter.detach().clone()
+                for name, parameter in self.policy.uav_candidate_encoder.named_parameters()
             }
         policy_loss_value = 0.0
         value_loss_value = 0.0
@@ -8117,6 +8191,7 @@ class PPOV2Trainer:
         cache_encoder_gradient_norm_values: list[float] = []
         uav_encoder_gradient_norm_values: list[float] = []
         uav_candidate_scorer_gradient_norm_values: list[float] = []
+        uav_candidate_encoder_gradient_norm_values: list[float] = []
         cache_actor_grad_norm_preclip_by_update_epoch: list[float] = []
         cache_actor_grad_clip_coefficient_by_update_epoch: list[float] = []
         uav_actor_grad_norm_preclip_by_update_epoch: list[float] = []
@@ -8126,6 +8201,8 @@ class PPOV2Trainer:
         uav_candidate_scorer_parameter_delta_norm_by_update_epoch: list[float] = []
         uav_encoder_gradient_norm_by_update_epoch: list[float] = []
         uav_encoder_parameter_delta_norm_by_update_epoch: list[float] = []
+        uav_candidate_encoder_gradient_norm_by_update_epoch: list[float] = []
+        uav_candidate_encoder_parameter_delta_norm_by_update_epoch: list[float] = []
         uav_candidate_old_new_kl_mean_by_update_epoch: list[float] = []
         uav_candidate_old_new_kl_p90_by_update_epoch: list[float] = []
         uav_candidate_old_new_kl_max_by_update_epoch: list[float] = []
@@ -8186,7 +8263,14 @@ class PPOV2Trainer:
         uav_candidate_full_steps = 0
         uav_candidate_only_steps_after_operation_stop = 0
         uav_candidate_optimizer_step_count = 0
-        uav_encoder_optimizer_step_count = 0
+        uav_operation_encoder_optimizer_step_count = 0
+        uav_candidate_encoder_optimizer_step_count = 0
+        uav_candidate_effective_kl_at_gate = math.nan
+        uav_candidate_effective_kl_immediately_after_gate = math.nan
+        uav_candidate_effective_kl_after_gate = math.nan
+        uav_candidate_post_gate_drift_from_gate = math.nan
+        uav_candidate_probabilities_at_gate: Any | None = None
+        uav_candidate_protected_step_counts_at_gate: tuple[int, int] | None = None
         uav_operation_full_rollout_kl_current: float | None = None
         global_critic_steps = 0
         cache_minibatches_planned = int(hyper.update_epochs * hyper.num_minibatches)
@@ -8243,13 +8327,16 @@ class PPOV2Trainer:
         for update_epoch in range(hyper.update_epochs):
             cache_active_this_epoch = bool(cache_active)
             uav_operation_active_this_epoch = bool(uav_operation_active)
-            uav_candidate_active_this_epoch = bool(
-                uav_candidate_active
+            uav_candidate_active_this_epoch = (
+                _uav_candidate_effective_active(
+                    operation_active=uav_operation_active_this_epoch,
+                    candidate_kl_active=uav_candidate_active,
+                )
                 if exact_uav_credit_enabled
                 else uav_operation_active_this_epoch
             )
-            uav_encoder_active_this_epoch = bool(
-                uav_operation_active_this_epoch or uav_candidate_active_this_epoch
+            uav_operation_encoder_active_this_epoch = bool(
+                uav_operation_active_this_epoch
             )
             # The legacy ``uav_active_*`` fields remain operation-gate
             # diagnostics;
@@ -8257,6 +8344,7 @@ class PPOV2Trainer:
             uav_active_this_epoch = uav_operation_active_this_epoch
             uav_candidate_scorer_before_epoch: dict[str, Any] | None = None
             uav_encoder_before_epoch: dict[str, Any] | None = None
+            uav_candidate_encoder_before_epoch: dict[str, Any] | None = None
             if exact_uav_credit_enabled:
                 uav_candidate_scorer_before_epoch = {
                     str(name): parameter.detach().clone()
@@ -8266,10 +8354,17 @@ class PPOV2Trainer:
                     str(name): parameter.detach().clone()
                     for name, parameter in self.policy.uav_encoder.named_parameters()
                 }
+                uav_candidate_encoder_before_epoch = {
+                    str(name): parameter.detach().clone()
+                    for name, parameter in self.policy.uav_candidate_encoder.named_parameters()
+                }
             candidate_gradient_epoch_start = len(
                 uav_candidate_scorer_gradient_norm_values
             )
             encoder_gradient_epoch_start = len(uav_encoder_gradient_norm_values)
+            candidate_encoder_gradient_epoch_start = len(
+                uav_candidate_encoder_gradient_norm_values
+            )
             if branch_specific_kl_gate_enabled:
                 cache_active_per_update_epoch.append(cache_active_this_epoch)
                 uav_active_per_update_epoch.append(uav_active_this_epoch)
@@ -8296,19 +8391,28 @@ class PPOV2Trainer:
                 indices = permutation[start : start + minibatch_size]
                 cache_active_this_minibatch = bool(cache_active)
                 uav_operation_active_this_minibatch = bool(uav_operation_active)
-                uav_candidate_active_this_minibatch = bool(
-                    uav_candidate_active
+                uav_candidate_active_this_minibatch = (
+                    _uav_candidate_effective_active(
+                        operation_active=uav_operation_active_this_minibatch,
+                        candidate_kl_active=uav_candidate_active,
+                    )
                     if exact_uav_credit_enabled
                     else uav_operation_active_this_minibatch
                 )
-                uav_encoder_active_this_minibatch = bool(
+                uav_operation_encoder_active_this_minibatch = bool(
                     uav_operation_active_this_minibatch
-                    or uav_candidate_active_this_minibatch
                 )
                 # Preserve the legacy name for operation-only diagnostics and
                 # the existing operation KL gate bookkeeping below.
                 uav_active_this_minibatch = uav_operation_active_this_minibatch
                 if exact_uav_credit_enabled:
+                    if (
+                        not uav_operation_active_this_minibatch
+                        and uav_candidate_active_this_minibatch
+                    ):
+                        raise AssertionError(
+                            "UAV candidate update cannot run after operation stop"
+                        )
                     if (
                         uav_operation_active_this_minibatch
                         and uav_candidate_active_this_minibatch
@@ -8322,17 +8426,20 @@ class PPOV2Trainer:
                         uav_candidate_only_steps_after_operation_stop += 1
                     else:
                         uav_operation_steps_suppressed += 1
-                    # Operation, candidate scorer, and UAV encoder have
-                    # independent active states.  The encoder follows the
-                    # union so candidate-only updates cannot be desynchronized
-                    # from their scorer.
-                    helper_encoder_active = _set_uav_branch_requires_grad(
+                    # The MOVE candidate has a branch-specific encoder.  Each
+                    # representation follows only its own active state.
+                    helper_encoder_states = _set_uav_branch_requires_grad(
                         self.policy,
                         operation_active=uav_operation_active_this_minibatch,
                         candidate_active=uav_candidate_active_this_minibatch,
                     )
-                    if helper_encoder_active != uav_encoder_active_this_minibatch:
-                        raise RuntimeError("UAV encoder active-state contract diverged")
+                    if helper_encoder_states != (
+                        uav_operation_encoder_active_this_minibatch,
+                        uav_candidate_active_this_minibatch,
+                    ):
+                        raise RuntimeError(
+                            "UAV branch encoder active-state contract diverged"
+                        )
                 uav_approx_kl_after_step: float | None = None
                 uav_operation_full_rollout_kl_after_step: float | None = None
                 uav_stop_triggered_after_step = False
@@ -9063,11 +9170,10 @@ class PPOV2Trainer:
                         # those parameters entirely, which is the required
                         # hard freeze after a Cache minibatch KL crossing.
                         if exact_uav_credit_enabled:
-                            # Clear each UAV module independently.  In
-                            # particular, operation-stop must preserve the
-                            # candidate scorer and encoder, while
-                            # candidate-stop must not leave stale Adam state
-                            # eligible for a scorer update.
+                            # Clear each UAV module independently.  Operation
+                            # stop preserves all MOVE-child parameters;
+                            # candidate stop clears scorer and candidate encoder
+                            # gradients so Adam momentum cannot move them.
                             _clear_inactive_branch_gradients(
                                 branch_gradient_parameter_groups,
                                 cache_active=cache_active_this_minibatch,
@@ -9079,7 +9185,9 @@ class PPOV2Trainer:
                             if not uav_candidate_active_this_minibatch:
                                 for parameter in self.policy.uav_candidate_scorer.parameters():
                                     parameter.grad = None
-                            if not uav_encoder_active_this_minibatch:
+                                for parameter in self.policy.uav_candidate_encoder.parameters():
+                                    parameter.grad = None
+                            if not uav_operation_encoder_active_this_minibatch:
                                 for parameter in self.policy.uav_encoder.parameters():
                                     parameter.grad = None
                         else:
@@ -9125,6 +9233,16 @@ class PPOV2Trainer:
                             if "uav_encoder" in branch_gradient_parameter_groups
                             else math.nan
                         )
+                        uav_candidate_encoder_gradient_norm_value = (
+                            _gradient_group_norm(
+                                branch_gradient_parameter_groups[
+                                    "uav_candidate_encoder"
+                                ]
+                            )
+                            if "uav_candidate_encoder"
+                            in branch_gradient_parameter_groups
+                            else math.nan
+                        )
                         uav_candidate_scorer_gradient_norm_value = (
                             _gradient_group_norm(
                                 self.policy.uav_candidate_scorer.parameters()
@@ -9143,9 +9261,10 @@ class PPOV2Trainer:
                                 np.isfinite(value)
                                 for value in (
                                     cache_encoder_gradient_norm_value,
-                                uav_encoder_gradient_norm_value,
-                                uav_candidate_scorer_gradient_norm_value,
-                            )
+                                    uav_encoder_gradient_norm_value,
+                                    uav_candidate_encoder_gradient_norm_value,
+                                    uav_candidate_scorer_gradient_norm_value,
+                                )
                             )
                         ):
                             raise FloatingPointError(
@@ -9166,6 +9285,9 @@ class PPOV2Trainer:
                             )
                             uav_encoder_gradient_norm_values.append(
                                 uav_encoder_gradient_norm_value
+                            )
+                            uav_candidate_encoder_gradient_norm_values.append(
+                                uav_candidate_encoder_gradient_norm_value
                             )
                             uav_candidate_scorer_gradient_norm_values.append(
                                 uav_candidate_scorer_gradient_norm_value
@@ -9239,8 +9361,9 @@ class PPOV2Trainer:
                         if exact_uav_credit_enabled:
                             if uav_candidate_active_this_minibatch:
                                 uav_candidate_optimizer_step_count += 1
-                            if uav_encoder_active_this_minibatch:
-                                uav_encoder_optimizer_step_count += 1
+                                uav_candidate_encoder_optimizer_step_count += 1
+                            if uav_operation_encoder_active_this_minibatch:
+                                uav_operation_encoder_optimizer_step_count += 1
                         if (
                             branch_specific_kl_gate_enabled
                             and exact_uav_credit_enabled
@@ -9291,6 +9414,11 @@ class PPOV2Trainer:
                             ):
                                 uav_stop_triggered_after_step = True
                                 uav_operation_active = False
+                                uav_candidate_active = False
+                                uav_candidate_suppressed_update_epochs = max(
+                                    uav_candidate_suppressed_update_epochs,
+                                    max(hyper.update_epochs - update_epoch - 1, 0),
+                                )
                                 if uav_stop_epoch is None:
                                     uav_stop_epoch = int(update_epoch + 1)
                                     uav_suppressed_update_epochs = int(
@@ -9562,6 +9690,12 @@ class PPOV2Trainer:
                                 uav_stop_triggered_after_step
                             ),
                             "uav_active_next_minibatch": bool(uav_operation_active),
+                            "uav_candidate_active_next_minibatch": (
+                                _uav_candidate_effective_active(
+                                    operation_active=uav_operation_active,
+                                    candidate_kl_active=uav_candidate_active,
+                                )
+                            ),
                             "joint_gate_triggered_after_epoch": False,
                             "remaining_update_epochs_suppressed": 0,
                         }
@@ -9628,7 +9762,10 @@ class PPOV2Trainer:
                 )
                 candidate_epoch_old_new_kl = float(drift["kl_mean"])
                 candidate_transition = _candidate_kl_gate_transition(
-                    candidate_active=bool(uav_candidate_active),
+                    candidate_active=_uav_candidate_effective_active(
+                        operation_active=uav_operation_active,
+                        candidate_kl_active=uav_candidate_active,
+                    ),
                     candidate_epoch_kl_mean=candidate_epoch_old_new_kl,
                     candidate_epoch_kl_p90=float(drift["kl_p90"]),
                     target_kl=hyper.uav_candidate_target_kl,
@@ -9656,6 +9793,116 @@ class PPOV2Trainer:
                         uav_candidate_kl_stop_epoch = int(update_epoch + 1)
                         uav_candidate_suppressed_update_epochs = int(
                             candidate_transition["remaining_epochs_suppressed"]
+                        )
+                    uav_candidate_probabilities_at_gate = (
+                        uav_candidate_epoch_new_probabilities.detach().clone()
+                    )
+                    uav_candidate_protected_step_counts_at_gate = (
+                        int(uav_candidate_optimizer_step_count),
+                        int(uav_candidate_encoder_optimizer_step_count),
+                    )
+                    uav_candidate_effective_kl_at_gate = float(drift["kl_mean"])
+                    with torch.no_grad():
+                        candidate_probabilities_immediately_after_gate = (
+                            self._conditional_candidate_probabilities(
+                                uav_contexts,
+                                uav_candidate_features,
+                                uav_candidate_old_mask,
+                                int(self.policy.uav_feature_dim),
+                                self.policy.uav_candidate_scorer,
+                            )
+                        )
+                    immediate_drift = _uav_candidate_old_new_drift_metrics(
+                        uav_candidate_old_probabilities.detach().cpu().numpy(),
+                        candidate_probabilities_immediately_after_gate
+                        .detach()
+                        .cpu()
+                        .numpy(),
+                        uav_candidate_teacher_probabilities_t.detach()
+                        .cpu()
+                        .numpy(),
+                        conditional_candidate_q_values_t.detach().cpu().numpy(),
+                        uav_candidate_old_mask.detach().cpu().numpy(),
+                    )
+                    uav_candidate_effective_kl_immediately_after_gate = float(
+                        immediate_drift["kl_mean"]
+                    )
+                    uav_candidate_effective_kl_after_gate = float(
+                        immediate_drift["kl_mean"]
+                    )
+                    immediate_post_gate_drift = _uav_candidate_old_new_drift_metrics(
+                        uav_candidate_probabilities_at_gate.detach()
+                        .cpu()
+                        .numpy(),
+                        candidate_probabilities_immediately_after_gate.detach()
+                        .cpu()
+                        .numpy(),
+                        uav_candidate_teacher_probabilities_t.detach()
+                        .cpu()
+                        .numpy(),
+                        conditional_candidate_q_values_t.detach().cpu().numpy(),
+                        uav_candidate_old_mask.detach().cpu().numpy(),
+                    )
+                    uav_candidate_post_gate_drift_from_gate = float(
+                        immediate_post_gate_drift["kl_mean"]
+                    )
+                    if uav_candidate_post_gate_drift_from_gate > 1.0e-6:
+                        raise RuntimeError(
+                            "UAV candidate effective policy changed immediately after KL gate"
+                        )
+                if uav_candidate_probabilities_at_gate is not None:
+                    post_gate_effective_drift = _uav_candidate_old_new_drift_metrics(
+                        uav_candidate_old_probabilities.detach().cpu().numpy(),
+                        uav_candidate_epoch_new_probabilities.detach()
+                        .cpu()
+                        .numpy(),
+                        uav_candidate_teacher_probabilities_t.detach()
+                        .cpu()
+                        .numpy(),
+                        conditional_candidate_q_values_t.detach().cpu().numpy(),
+                        uav_candidate_old_mask.detach().cpu().numpy(),
+                    )
+                    post_gate_representation_drift = (
+                        _uav_candidate_old_new_drift_metrics(
+                            uav_candidate_probabilities_at_gate.detach()
+                            .cpu()
+                            .numpy(),
+                            uav_candidate_epoch_new_probabilities.detach()
+                            .cpu()
+                            .numpy(),
+                            uav_candidate_teacher_probabilities_t.detach()
+                            .cpu()
+                            .numpy(),
+                            conditional_candidate_q_values_t.detach()
+                            .cpu()
+                            .numpy(),
+                            uav_candidate_old_mask.detach().cpu().numpy(),
+                        )
+                    )
+                    uav_candidate_effective_kl_after_gate = float(
+                        post_gate_effective_drift["kl_mean"]
+                    )
+                    uav_candidate_post_gate_drift_from_gate = max(
+                        uav_candidate_post_gate_drift_from_gate,
+                        float(post_gate_representation_drift["kl_mean"]),
+                    )
+                    if uav_candidate_protected_step_counts_at_gate != (
+                        int(uav_candidate_optimizer_step_count),
+                        int(uav_candidate_encoder_optimizer_step_count),
+                    ):
+                        raise RuntimeError(
+                            "UAV candidate-protected optimizer steps increased after KL gate"
+                        )
+                    if (
+                        uav_candidate_post_gate_drift_from_gate > 1.0e-6
+                        or abs(
+                            uav_candidate_effective_kl_after_gate
+                            - uav_candidate_effective_kl_immediately_after_gate
+                        )
+                        > 1.0e-6
+                    ):
+                        raise RuntimeError(
+                            "UAV candidate effective policy drifted after KL gate"
                         )
                 uav_candidate_old_new_kl_mean_by_update_epoch.append(
                     float(drift["kl_mean"])
@@ -9688,6 +9935,7 @@ class PPOV2Trainer:
                 if (
                     uav_candidate_scorer_before_epoch is None
                     or uav_encoder_before_epoch is None
+                    or uav_candidate_encoder_before_epoch is None
                 ):
                     raise RuntimeError("UAV epoch diagnostic snapshots are unavailable")
                 candidate_epoch_gradients = (
@@ -9698,6 +9946,11 @@ class PPOV2Trainer:
                 encoder_epoch_gradients = uav_encoder_gradient_norm_values[
                     encoder_gradient_epoch_start:
                 ]
+                candidate_encoder_epoch_gradients = (
+                    uav_candidate_encoder_gradient_norm_values[
+                        candidate_encoder_gradient_epoch_start:
+                    ]
+                )
                 uav_candidate_scorer_gradient_norm_by_update_epoch.append(
                     float(np.mean(candidate_epoch_gradients))
                     if candidate_epoch_gradients
@@ -9706,6 +9959,11 @@ class PPOV2Trainer:
                 uav_encoder_gradient_norm_by_update_epoch.append(
                     float(np.mean(encoder_epoch_gradients))
                     if encoder_epoch_gradients
+                    else 0.0
+                )
+                uav_candidate_encoder_gradient_norm_by_update_epoch.append(
+                    float(np.mean(candidate_encoder_epoch_gradients))
+                    if candidate_encoder_epoch_gradients
                     else 0.0
                 )
                 uav_candidate_scorer_parameter_delta_norm_by_update_epoch.append(
@@ -9718,6 +9976,12 @@ class PPOV2Trainer:
                     _module_parameter_delta_norm(
                         uav_encoder_before_epoch,
                         self.policy.uav_encoder,
+                    )
+                )
+                uav_candidate_encoder_parameter_delta_norm_by_update_epoch.append(
+                    _module_parameter_delta_norm(
+                        uav_candidate_encoder_before_epoch,
+                        self.policy.uav_candidate_encoder,
                     )
                 )
             if branch_diagnostics_enabled:
@@ -9868,6 +10132,14 @@ class PPOV2Trainer:
                     )
                     cache_active = bool(transition["cache_active_next"])
                     uav_operation_active = bool(transition["uav_active_next"])
+                    if not uav_operation_active:
+                        # Operation is the parent of MOVE candidate policy.
+                        # Once it stops, candidate activity is absorbing too.
+                        uav_candidate_active = False
+                        uav_candidate_suppressed_update_epochs = max(
+                            uav_candidate_suppressed_update_epochs,
+                            int(transition["remaining_epochs_suppressed"]),
+                        )
                     if cache_newly_stopped and cache_stop_epoch is None:
                         cache_stop_epoch = int(update_epoch + 1)
                         cache_suppressed_update_epochs = int(
@@ -9956,7 +10228,10 @@ class PPOV2Trainer:
                             uav_candidate_active_this_epoch
                         ),
                         "uav_candidate_active_next_epoch": bool(
-                            uav_candidate_active
+                            _uav_candidate_effective_active(
+                                operation_active=uav_operation_active,
+                                candidate_kl_active=uav_candidate_active,
+                            )
                         ),
                         "uav_candidate_stop_triggered": bool(
                             candidate_newly_stopped
@@ -10026,6 +10301,8 @@ class PPOV2Trainer:
                 parameter.requires_grad_(True)
             for parameter in self.policy.uav_encoder.parameters():
                 parameter.requires_grad_(True)
+            for parameter in self.policy.uav_candidate_encoder.parameters():
+                parameter.requires_grad_(True)
         if self.hyperparameters.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
             self.critic_return_statistics.update(returns)
         if branch_diagnostics_enabled:
@@ -10071,6 +10348,7 @@ class PPOV2Trainer:
         if exact_uav_credit_enabled:
             assert uav_operation_head_before is not None
             assert uav_encoder_before is not None
+            assert uav_candidate_encoder_before is not None
             uav_operation_head_parameter_delta_norm = _named_parameter_delta_norm(
                 uav_operation_head_before,
                 self.policy.uav_operation_head,
@@ -10079,9 +10357,16 @@ class PPOV2Trainer:
                 uav_encoder_before,
                 self.policy.uav_encoder,
             )
+            uav_candidate_encoder_parameter_delta_norm = (
+                _named_parameter_delta_norm(
+                    uav_candidate_encoder_before,
+                    self.policy.uav_candidate_encoder,
+                )
+            )
         else:
             uav_operation_head_parameter_delta_norm = math.nan
             uav_encoder_parameter_delta_norm = math.nan
+            uav_candidate_encoder_parameter_delta_norm = math.nan
         uav_operation_teacher_diagnostics: dict[str, Any] | None = None
         if exact_uav_credit_enabled:
             assert uav_operation_masks is not None
@@ -10575,6 +10860,18 @@ class PPOV2Trainer:
                 "max": math.nan,
                 "clip_fraction": math.nan,
             }
+        if exact_uav_credit_enabled:
+            if uav_candidate_only_steps_after_operation_stop != 0:
+                raise RuntimeError(
+                    "UAV candidate-only optimizer steps occurred after operation stop"
+                )
+            if (
+                uav_candidate_optimizer_step_count
+                != uav_candidate_encoder_optimizer_step_count
+            ):
+                raise RuntimeError(
+                    "UAV candidate scorer/encoder optimizer steps are desynchronized"
+                )
         return UpdateResult(
             policy_loss=policy_loss_value,
             value_loss=value_loss_value,
@@ -10705,6 +11002,11 @@ class PPOV2Trainer:
                 if uav_encoder_gradient_norm_values
                 else math.nan
             ),
+            uav_candidate_encoder_gradient_norm=(
+                float(np.mean(uav_candidate_encoder_gradient_norm_values))
+                if uav_candidate_encoder_gradient_norm_values
+                else math.nan
+            ),
             cache_policy_loss=(
                 float(np.mean(cache_policy_loss_values))
                 if cache_policy_loss_values
@@ -10833,6 +11135,14 @@ class PPOV2Trainer:
                 float(value)
                 for value in uav_encoder_parameter_delta_norm_by_update_epoch
             ),
+            uav_candidate_encoder_gradient_norm_by_update_epoch=tuple(
+                float(value)
+                for value in uav_candidate_encoder_gradient_norm_by_update_epoch
+            ),
+            uav_candidate_encoder_parameter_delta_norm_by_update_epoch=tuple(
+                float(value)
+                for value in uav_candidate_encoder_parameter_delta_norm_by_update_epoch
+            ),
             uav_candidate_old_new_kl_mean_by_update_epoch=tuple(
                 float(value) for value in uav_candidate_old_new_kl_mean_by_update_epoch
             ),
@@ -10908,6 +11218,18 @@ class PPOV2Trainer:
             uav_candidate_suppressed_update_epochs=int(
                 uav_candidate_suppressed_update_epochs
             ),
+            uav_candidate_effective_kl_at_gate=float(
+                uav_candidate_effective_kl_at_gate
+            ),
+            uav_candidate_effective_kl_immediately_after_gate=float(
+                uav_candidate_effective_kl_immediately_after_gate
+            ),
+            uav_candidate_effective_kl_after_gate=float(
+                uav_candidate_effective_kl_after_gate
+            ),
+            uav_candidate_post_gate_drift_from_gate=float(
+                uav_candidate_post_gate_drift_from_gate
+            ),
             uav_branch_old_log_probs=uav_branch_old_log_probs_values,
             uav_branch_new_log_probs=uav_branch_new_log_probs_values,
             uav_branch_ratios=uav_branch_ratios_values,
@@ -10948,10 +11270,15 @@ class PPOV2Trainer:
             uav_candidate_optimizer_step_count=int(
                 uav_candidate_optimizer_step_count
             ),
-            uav_encoder_optimizer_step_count=int(uav_encoder_optimizer_step_count),
+            uav_operation_encoder_optimizer_step_count=int(
+                uav_operation_encoder_optimizer_step_count
+            ),
+            uav_candidate_encoder_optimizer_step_count=int(
+                uav_candidate_encoder_optimizer_step_count
+            ),
             uav_candidate_scorer_encoder_step_gap=int(
                 uav_candidate_optimizer_step_count
-                - uav_encoder_optimizer_step_count
+                - uav_candidate_encoder_optimizer_step_count
             ),
             uav_operation_full_rollout_kl=(
                 float(uav_operation_full_rollout_kl_current)
@@ -10963,6 +11290,9 @@ class PPOV2Trainer:
                 uav_operation_head_parameter_delta_norm
             ),
             uav_encoder_parameter_delta_norm=float(uav_encoder_parameter_delta_norm),
+            uav_candidate_encoder_parameter_delta_norm=float(
+                uav_candidate_encoder_parameter_delta_norm
+            ),
             global_critic_steps=int(global_critic_steps),
             uav_operation_advantages_raw=(
                 None
@@ -11569,6 +11899,7 @@ class PPOV2Trainer:
         learning_rate_metadata = self.learning_rate_metadata()
         payload = {
             "checkpoint_version": self._expected_checkpoint_version(),
+            "architecture_version": int(getattr(self.policy, "architecture_version", 1)),
             "method": PPO_V2_METHOD,
             "policy_schema": self.policy.architecture_id,
             "experiment_id": learning_rate_metadata["experiment_id"],
@@ -11827,6 +12158,14 @@ class PPOV2Trainer:
         expected_version = self._expected_checkpoint_version()
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
+        stored_architecture_version = payload.get("architecture_version")
+        if (stored_architecture_version is not None and
+                int(stored_architecture_version) != int(getattr(self.policy, "architecture_version", 1))):
+            raise ValueError(
+                "Checkpoint architecture mismatch: "
+                f"checkpoint={stored_architecture_version}, "
+                f"runtime={getattr(self.policy, 'architecture_version', 1)}"
+            )
         checkpoint_cache_kl_control = str(
             payload.get("cache_kl_control", DEFAULT_CACHE_KL_CONTROL)
         )
@@ -13192,6 +13531,24 @@ def run_training(
                     rollout.next_uav_positions,
                     config_hash,
                     int(rollout_steps),
+                    best_epoch=best_epoch,
+                    best_epoch_return=best_epoch_return,
+                    next_pool_index=next_pool_index,
+                    episode_seed_start=episode_seed_start,
+                )
+            if (
+                context.policy_schema in PROPOSED_POLICY_SCHEMAS
+                and completed_episodes % CHECKPOINT_INTERVAL_EPOCHS == 0
+            ):
+                trainer.save_checkpoint(
+                    run_path,
+                    completed_episodes,
+                    next_train_origin,
+                    rollout.next_cache_state,
+                    rollout.next_uav_positions,
+                    config_hash,
+                    int(rollout_steps),
+                    filename=f"epoch_{completed_episodes:03d}_checkpoint.pt",
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
                     next_pool_index=next_pool_index,

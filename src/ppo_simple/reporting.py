@@ -216,6 +216,7 @@ def build_run_manifest(
         context.cfg.get("_meta", {}).get("config_path", config_path)
     ).resolve()
     learning_rate_metadata = trainer.learning_rate_metadata()
+    training_provenance = context.cfg.get("training_provenance", {})
     q_cache_manifest_fields: dict[str, Any] = {}
     if getattr(trainer, "q_cache_optimizer", None) is not None:
         q_cache_manifest_fields = {
@@ -242,6 +243,19 @@ def build_run_manifest(
         cache_surrogate_manifest_fields = dict(trainer.cache_surrogate_metadata())
     return {
         "experiment_type": "main_training",
+        "architecture_version": int(getattr(trainer.policy, "architecture_version", 1)),
+        "initial_actor_sha256": training_provenance.get("ACTOR_INITIAL_STATE_SHA256"),
+        "initial_critic_sha256": training_provenance.get("CRITIC_INITIAL_STATE_SHA256"),
+        "initial_uav_candidate_encoder_sha256": training_provenance.get(
+            "INITIAL_UAV_CANDIDATE_ENCODER_SHA256"
+        ),
+        "uav_candidate_encoder_initialization": (
+            "deterministic deepcopy of the seeded base UAV encoder before optimization"
+            if is_proposed_joint else None
+        ),
+        "checkpoint_interval_epochs": 10 if is_proposed_joint else None,
+        "best_train_return_checkpoint_role": "TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION",
+        "final_checkpoint_selection_metric": "validation_mean_episode_return" if is_proposed_joint else None,
         "git_commit_sha": git_sha,
         "git_dirty": git_dirty,
         "config_path": str(resolved_config_path),

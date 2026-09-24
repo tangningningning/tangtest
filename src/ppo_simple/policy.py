@@ -1616,14 +1616,15 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
 
     The joint base constructor creates the shared encoder and all existing
     heads in the historical initialization order.  The encoder is then cloned
-    into two independent modules without consuming additional random numbers;
-    the critic and all head/scorer initialization therefore remain unchanged.
+    into independent Cache, UAV operation, and UAV candidate representations
+    without consuming additional random numbers; the critic and all
+    head/scorer initialization therefore remain unchanged.
     """
 
     architecture_id = (
         "adaptive_joint_cache_replica_aware_uav_operation_decoupled_encoder"
     )
-    architecture_version = 1
+    architecture_version = 2
 
     def __init__(
         self,
@@ -1647,6 +1648,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
         original_encoder = self.encoder
         self.cache_encoder = deepcopy(original_encoder)
         self.uav_encoder = deepcopy(original_encoder)
+        self.uav_candidate_encoder = deepcopy(original_encoder)
         del self.encoder
 
     def _default_actor_encoder(self) -> Any:
@@ -1656,7 +1658,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
         if scorer is self.cache_candidate_scorer:
             return self.cache_encoder
         if scorer is self.uav_candidate_scorer:
-            return self.uav_encoder
+            return self.uav_candidate_encoder
         raise ValueError("candidate scorer has no registered branch encoder")
 
     def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
@@ -1683,6 +1685,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
         modules = (
             self.cache_encoder,
             self.uav_encoder,
+            self.uav_candidate_encoder,
             self.cache_operation_head,
             self.cache_candidate_scorer,
             self.uav_operation_head,
@@ -1717,6 +1720,9 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
             ),
             "cache_encoder": tuple(self.cache_encoder.parameters()),
             "uav_encoder": tuple(self.uav_encoder.parameters()),
+            "uav_candidate_encoder": tuple(
+                self.uav_candidate_encoder.parameters()
+            ),
             "shared": (),
         }
         group_ids = [
@@ -1745,7 +1751,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
     """
 
     architecture_id = "adaptive_joint_cache_uav_ppo"
-    architecture_version = 1
+    architecture_version = 2
     trigger_order = ("KEEP", "UPDATE")
     true_binary_trigger = True
 
@@ -1802,6 +1808,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         modules = (
             self.cache_encoder,
             self.uav_encoder,
+            self.uav_candidate_encoder,
             self.cache_trigger_head,
             self.cache_candidate_scorer,
             self.uav_operation_head,
@@ -1836,6 +1843,9 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             ),
             "cache_encoder": tuple(self.cache_encoder.parameters()),
             "uav_encoder": tuple(self.uav_encoder.parameters()),
+            "uav_candidate_encoder": tuple(
+                self.uav_candidate_encoder.parameters()
+            ),
             "shared": (),
         }
         group_ids = [
@@ -1860,7 +1870,11 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             )
         clipping_groups = {
             "cache": groups["cache_encoder"] + groups["cache"],
-            "uav": groups["uav_encoder"] + groups["uav"],
+            "uav": (
+                groups["uav_encoder"]
+                + groups["uav_candidate_encoder"]
+                + groups["uav"]
+            ),
         }
         clipping_ids = [
             id(parameter)

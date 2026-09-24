@@ -1,0 +1,43 @@
+{
+  "formal_sweep_preflight": "PASS",
+  "architecture_version": 2,
+  "target_epochs_each": 300,
+  "critic_learning_rate": 0.001,
+  "resume": false,
+  "fresh_initialization": true,
+  "checkpoint_interval_epochs": 10,
+  "exact_q_parallel_workers": 4,
+  "train_episode_pool": "environment_data/proposed_joint_training",
+  "train_seed_start": 20001,
+  "train_seed_end": 20300,
+  "train_episode_order": "ascending seed order shared across all runs",
+  "episode_slots": 300,
+  "data_protocol": "full_episode_randomized",
+  "validation_called": false,
+  "test_called": false,
+  "initial_actor_sha256": "b61e2085642cf76a621a7a18a81143b68df85dffb62a7e5909ec3ca5e351f0c6",
+  "initial_critic_sha256": "a5e6d1b7efd16a41398ddeffacc83637b7de0bda476690f076294fac99676c86",
+  "initial_uav_candidate_encoder_sha256": "113acb3c00e8a4eb266ca5fa31940a5ff7bbed76d1668eedb1eae12877b638b1",
+  "runs": [
+    {
+      "run_name": "stage2c_corrected_fresh300_actor_lr_1e_minus_4",
+      "actor_learning_rate": 0.0001,
+      "artifact_directory": "runs/stage2c_corrected_fresh300_actor_lr_1e_minus_4"
+    },
+    {
+      "run_name": "stage2c_corrected_fresh300_actor_lr_5e_minus_4",
+      "actor_learning_rate": 0.0005,
+      "artifact_directory": "runs/stage2c_corrected_fresh300_actor_lr_5e_minus_4"
+    },
+    {
+      "run_name": "stage2c_corrected_fresh300_actor_lr_1e_minus_3",
+      "actor_learning_rate": 0.001,
+      "artifact_directory": "runs/stage2c_corrected_fresh300_actor_lr_1e_minus_3"
+    },
+    {
+      "run_name": "stage2c_corrected_fresh300_actor_lr_5e_minus_3",
+      "actor_learning_rate": 0.005,
+      "artifact_directory": "runs/stage2c_corrected_fresh300_actor_lr_5e_minus_3"
+    }
+  ]
+}
