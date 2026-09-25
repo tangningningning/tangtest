@@ -3,7 +3,7 @@
 
 from pathlib import Path
 
-from stage2b_fresh300_runner_common import FreshRunnerSpec, run_fresh300
+from fresh300_runner_common import FreshRunnerSpec, run_fresh300
 
 
 RUN_SPEC = FreshRunnerSpec(
