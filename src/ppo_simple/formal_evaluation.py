@@ -16,6 +16,7 @@ from common import project_config
 from .evaluation_metrics import EXECUTION_CLASSES, aggregate_episode_task_metrics
 from .policy import AdaptiveJointCacheUAVPPOActorCritic
 from .primitive_control import PrimitiveTensorSpec
+from .reporting import checkpoint_run_directory, resolve_checkpoint_reference
 from .rollout import collect_rollout
 from .trainer import (
     _kkt_metrics_from_diagnostics,
@@ -28,7 +29,7 @@ from .trainer import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SPLIT_MANIFEST = PROJECT_ROOT / "environment_data" / "data_split_manifest.json"
-REQUIRED_ARCHITECTURE_VERSION = 2
+REQUIRED_ARCHITECTURE_VERSION = 3
 SELECTION_METRIC = "mean_episode_return"
 
 
@@ -101,7 +102,10 @@ def _checkpoint_architecture(payload: dict[str, Any]) -> tuple[int, str]:
     if not isinstance(state, dict):
         raise ValueError("checkpoint lacks policy_state_dict")
     has_candidate_encoder = any(key.startswith("uav_candidate_encoder.") for key in state)
-    signature_version = 2 if has_candidate_encoder else 1
+    has_binary_cache_trigger = any(key.startswith("cache_trigger_head.") for key in state)
+    signature_version = (
+        3 if has_binary_cache_trigger else 2 if has_candidate_encoder else 1
+    )
     if explicit is None:
         return signature_version, "strict_policy_state_dict_signature"
     version = int(explicit)
@@ -111,6 +115,7 @@ def _checkpoint_architecture(payload: dict[str, Any]) -> tuple[int, str]:
 
 
 def load_frozen_policy(checkpoint: Path, context: Any) -> tuple[Any, dict[str, Any]]:
+    checkpoint = resolve_checkpoint_reference(checkpoint).resolve(strict=True)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError("checkpoint root must be a mapping")
@@ -126,7 +131,7 @@ def load_frozen_policy(checkpoint: Path, context: Any) -> tuple[Any, dict[str, A
         raise ValueError("checkpoint observation_dim mismatch")
     if int(payload.get("action_dim", -1)) != context.action_spec.action_dim:
         raise ValueError("checkpoint action_dim mismatch")
-    training_config_path = checkpoint.parent / "run_config.toml"
+    training_config_path = checkpoint_run_directory(checkpoint) / "run_config.toml"
     if training_config_path.is_file():
         training_config_sha256 = _file_hash(training_config_path)
         if training_config_sha256 != payload.get("config_sha256"):
@@ -309,14 +314,21 @@ def run_evaluation(*, checkpoint: Path, split: str, data_root: Path,
     expected_root = PROJECT_ROOT / "environment_data" / split_contract["directory"]
     if data_root.resolve() != expected_root.resolve():
         raise ValueError(f"data_root does not match {split} split manifest")
-    checkpoint = checkpoint.resolve(strict=True)
+    checkpoint = resolve_checkpoint_reference(checkpoint).resolve(strict=True)
     selection = None
     if split == "test":
         if selection_metadata is None:
             raise ValueError("test evaluation requires validation_selection.json")
         selection = json.loads(selection_metadata.read_text(encoding="utf-8"))
+        selected_checkpoint_value = selection.get("selected_checkpoint_path")
         if (selection.get("selection_metric") != SELECTION_METRIC or
-                Path(selection.get("selected_checkpoint_path", "")).resolve() != checkpoint):
+                not isinstance(selected_checkpoint_value, str) or
+                not selected_checkpoint_value):
+            raise ValueError("test checkpoint was not frozen by validation selection")
+        selected_checkpoint = resolve_checkpoint_reference(
+            Path(selected_checkpoint_value)
+        ).resolve()
+        if selected_checkpoint != checkpoint:
             raise ValueError("test checkpoint was not frozen by validation selection")
         if selection.get("selected_checkpoint_sha256") != _file_hash(checkpoint):
             raise ValueError("test checkpoint SHA256 differs from validation selection")

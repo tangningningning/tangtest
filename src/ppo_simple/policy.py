@@ -1431,6 +1431,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         uav_candidate_features: Any,
         uav_candidate_masks: Any,
         uav_candidate_selected_indices: Any,
+        cache_trigger_aux: Any,
     ) -> PolicyEvaluation:
         """Recompute the full joint log-probability without the old trigger head."""
 
@@ -1442,6 +1443,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
             cache_candidate_features,
             cache_candidate_masks,
             cache_candidate_selected_indices,
+            cache_trigger_aux,
         )
         observations_t, _ = self._observations(observations)
         operation_contexts_t = torch.as_tensor(
@@ -1751,7 +1753,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
     """
 
     architecture_id = "adaptive_joint_cache_uav_ppo"
-    architecture_version = 2
+    architecture_version = 3
     trigger_order = ("KEEP", "UPDATE")
     true_binary_trigger = True
 
@@ -1784,25 +1786,59 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             num_uav_heads=num_uav_heads,
         )
         del self.cache_operation_head
-        self.cache_trigger_head = nn.Linear(
-            self.hidden_dim,
-            self.num_cache_heads * len(self.trigger_order),
+        if (int(cache_feature_dim) - 25) % 6 != 0:
+            raise ValueError(
+                "proposed target cache feature dimension cannot determine service count"
+            )
+        self.trigger_service_count = (int(cache_feature_dim) - 25) // 6
+        if self.trigger_service_count <= 0:
+            raise ValueError("proposed Trigger requires at least one service")
+        self.trigger_workload_dim = self.trigger_service_count * 3
+        self.trigger_candidate_summary_dim = 1 + int(cache_feature_dim)
+        self.trigger_aux_dim = (
+            self.trigger_workload_dim + self.trigger_candidate_summary_dim
+        )
+        self.cache_trigger_head = nn.ModuleList(
+            nn.Linear(self.hidden_dim + self.trigger_aux_dim, len(self.trigger_order))
+            for _ in range(self.num_cache_heads)
         )
 
-    def _trigger_logits(self, observations: Any) -> tuple[Any, bool]:
+    def _trigger_logits(
+        self,
+        observations: Any,
+        trigger_aux: Any,
+    ) -> tuple[Any, bool]:
         obs, single = self._observations(observations)
+        auxiliary = torch.as_tensor(
+            trigger_aux,
+            dtype=torch.float32,
+            device=obs.device,
+        )
+        if auxiliary.ndim == 1 and single:
+            auxiliary = auxiliary.unsqueeze(0)
+        if tuple(auxiliary.shape) != (int(obs.shape[0]), self.trigger_aux_dim):
+            raise ValueError(
+                "Cache Trigger auxiliary input must be [B,trigger_aux_dim]"
+            )
+        if not bool(torch.all(torch.isfinite(auxiliary)).item()):
+            raise ValueError("Cache Trigger auxiliary input contains NaN/Inf")
+        if auxiliary.requires_grad:
+            raise RuntimeError("Cache Trigger auxiliary input must be detached")
         hidden = self.cache_encoder(obs)
-        logits = self.cache_trigger_head(hidden).reshape(
-            int(obs.shape[0]),
-            self.num_cache_heads,
-            len(self.trigger_order),
+        trigger_input = torch.cat([hidden, auxiliary], dim=-1)
+        logits = torch.stack(
+            [head(trigger_input) for head in self.cache_trigger_head], dim=1
         )
         return (logits.squeeze(0) if single else logits), single
 
-    def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
+    def _operation_logits(
+        self,
+        observations: Any,
+        trigger_aux: Any,
+    ) -> tuple[Any, bool]:
         """Compatibility alias exposing the binary trigger logits only."""
 
-        return self._trigger_logits(observations)
+        return self._trigger_logits(observations, trigger_aux)
 
     def actor_parameters(self) -> tuple[Any, ...]:
         modules = (
@@ -1893,9 +1929,10 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         observation: Any,
         head_index: int,
         trigger_mask: Any,
+        trigger_aux: Any,
         deterministic: bool = False,
     ) -> OperationPolicySample:
-        logits, single = self._trigger_logits(observation)
+        logits, single = self._trigger_logits(observation, trigger_aux)
         if not single or tuple(logits.shape) != (
             self.num_cache_heads,
             len(self.trigger_order),
@@ -1941,6 +1978,21 @@ class AdaptiveJointCacheUAVPPOActorCritic(
     ) -> CandidatePolicySample:
         """Sample from the one unified legal target-configuration set."""
 
+        scores = self.score_cache_update_candidates(
+            observation,
+            candidate_features,
+        )
+        return self.sample_cache_update_candidate_from_logits(
+            scores, deterministic=deterministic
+        )
+
+    def score_cache_update_candidates(
+        self,
+        observation: Any,
+        candidate_features: Any,
+    ) -> Any:
+        """Score candidates once with the unchanged production scorer path."""
+
         scores, single = self._candidate_scores(
             observation,
             candidate_features,
@@ -1948,8 +2000,22 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             self.cache_candidate_scorer,
         )
         if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
-            raise ValueError("candidate sampling requires one context")
-        distribution = torch.distributions.Categorical(logits=scores.squeeze(0))
+            raise ValueError("candidate scoring requires one context")
+        return scores.squeeze(0)
+
+    @staticmethod
+    def sample_cache_update_candidate_from_logits(
+        candidate_logits: Any,
+        deterministic: bool = False,
+    ) -> CandidatePolicySample:
+        """Sample from the exact candidate logits already used by Trigger."""
+
+        scores = torch.as_tensor(candidate_logits, dtype=torch.float32)
+        if scores.ndim != 1 or int(scores.numel()) == 0:
+            raise ValueError("candidate logits must be a non-empty vector")
+        if not bool(torch.all(torch.isfinite(scores)).item()):
+            raise ValueError("candidate logits contain NaN/Inf")
+        distribution = torch.distributions.Categorical(logits=scores)
         selected = (
             int(torch.argmax(distribution.logits).item())
             if deterministic
@@ -1976,6 +2042,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         candidate_features: Any,
         candidate_masks: Any,
         candidate_selected_indices: Any,
+        trigger_aux: Any,
     ) -> PolicyEvaluation:
         """Evaluate binary triggers plus unified conditional candidates."""
 
@@ -2010,6 +2077,11 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             dtype=torch.long,
             device=observations_t.device,
         )
+        trigger_aux_t = torch.as_tensor(
+            trigger_aux,
+            dtype=torch.float32,
+            device=observations_t.device,
+        )
         if contexts_t.ndim != 3:
             raise ValueError("operation_contexts must be [B,H,observation_dim]")
         batch_size, head_count, observation_dim = [int(value) for value in contexts_t.shape]
@@ -2027,8 +2099,19 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             raise ValueError("trigger action index out of range")
         if not bool(torch.all(torch.any(masks_t, dim=-1)).item()):
             raise ValueError("trigger mask cannot block every trigger")
+        if tuple(trigger_aux_t.shape) != (
+            batch_size,
+            head_count,
+            self.trigger_aux_dim,
+        ):
+            raise ValueError("Cache Trigger auxiliary tensor shape mismatch")
+        if trigger_aux_t.requires_grad:
+            raise RuntimeError("PPO Cache Trigger auxiliary must be detached")
         flat_contexts = contexts_t.reshape(batch_size * head_count, observation_dim)
-        all_logits, _ = self._trigger_logits(flat_contexts)
+        flat_aux = trigger_aux_t.reshape(
+            batch_size * head_count, self.trigger_aux_dim
+        )
+        all_logits, _ = self._trigger_logits(flat_contexts, flat_aux)
         trigger_logits = all_logits.reshape(
             batch_size,
             head_count,

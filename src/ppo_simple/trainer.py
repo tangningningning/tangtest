@@ -40,7 +40,10 @@ from .plotting import (
 from .reporting import (
     RUN_MANIFEST_FILENAME,
     RUN_SUMMARY_FILENAME,
+    checkpoint_path_for_resume,
+    checkpoint_path_for_write,
     ensure_fresh_run_dir_is_clean,
+    ensure_run_artifact_directories,
     update_run_summary,
     write_run_manifest,
 )
@@ -4851,6 +4854,7 @@ class PPOV2Trainer:
         *,
         observations: Any,
         cache_contexts: Any,
+        cache_trigger_aux: Any | None,
         operation_masks: Any,
         operation_actions: Any,
         candidate_features: Any,
@@ -4868,7 +4872,7 @@ class PPOV2Trainer:
         """
 
         with torch.no_grad():
-            evaluation = self.policy.evaluate_cache_operation_primitive(
+            cache_arguments = (
                 observations,
                 cache_contexts,
                 operation_masks,
@@ -4877,6 +4881,16 @@ class PPOV2Trainer:
                 candidate_masks,
                 selected_indices,
             )
+            if isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic):
+                if cache_trigger_aux is None:
+                    raise RuntimeError("V3 Cache KL evaluation requires stored Trigger auxiliary")
+                evaluation = self.policy.evaluate_cache_operation_primitive(
+                    *cache_arguments, cache_trigger_aux
+                )
+            else:
+                evaluation = self.policy.evaluate_cache_operation_primitive(
+                    *cache_arguments
+                )
             if evaluation.cache_log_prob is None:
                 raise RuntimeError(
                     "Cache branch KL evaluation did not expose cache_log_prob"
@@ -4899,6 +4913,7 @@ class PPOV2Trainer:
         *,
         observations: Any,
         cache_contexts: Any,
+        cache_trigger_aux: Any | None,
         cache_operation_masks: Any,
         cache_operation_actions: Any,
         cache_candidate_features: Any,
@@ -4935,6 +4950,7 @@ class PPOV2Trainer:
                 uav_candidate_features,
                 uav_candidate_masks,
                 uav_selected_indices,
+                cache_trigger_aux,
             )
             if evaluation.uav_operation_log_probs_all is None:
                 raise RuntimeError(
@@ -7198,6 +7214,7 @@ class PPOV2Trainer:
         candidate_features: Any,
         candidate_operation_indices: Any,
         candidate_valid_mask: Any,
+        cache_trigger_aux: Any | None = None,
     ) -> tuple[Any, Any]:
         """Return node-only trigger log-probs and node-conditional candidate probs.
 
@@ -7247,7 +7264,30 @@ class PPOV2Trainer:
             raise ValueError("Exact Cache candidate tensor shape mismatch")
         flat_contexts = contexts.reshape(batch_size * node_count, observation_dim)
         if self._uses_binary_cache_trigger():
-            all_logits, _ = self.policy._trigger_logits(flat_contexts)
+            if isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic):
+                if cache_trigger_aux is None:
+                    raise RuntimeError(
+                        "V3 Cache Trigger PPO update requires the stored rollout auxiliary"
+                    )
+                auxiliary = torch.as_tensor(
+                    cache_trigger_aux, dtype=torch.float32, device=self.device
+                )
+                if tuple(auxiliary.shape) != (
+                    batch_size,
+                    node_count,
+                    self.policy.trigger_aux_dim,
+                ):
+                    raise ValueError("stored Cache Trigger auxiliary shape mismatch")
+                if auxiliary.requires_grad:
+                    raise RuntimeError("stored Cache Trigger auxiliary is not detached")
+                flat_auxiliary = auxiliary.reshape(
+                    batch_size * node_count, self.policy.trigger_aux_dim
+                )
+                all_logits, _ = self.policy._trigger_logits(
+                    flat_contexts, flat_auxiliary
+                )
+            else:
+                all_logits, _ = self.policy._trigger_logits(flat_contexts)
         else:
             all_logits, _ = self.policy._operation_logits(flat_contexts)
         all_logits = all_logits.reshape(
@@ -7453,6 +7493,66 @@ class PPOV2Trainer:
         cache_contexts = torch.as_tensor(
             rollout.cache_contexts, dtype=torch.float32, device=self.device
         )
+        cache_trigger_aux = None
+        if isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic):
+            trigger_snapshot_fields = (
+                rollout.cache_trigger_node_local_workload,
+                rollout.cache_trigger_candidate_summary,
+                rollout.cache_trigger_aux,
+                rollout.cache_trigger_legal_candidate_counts,
+                rollout.cache_trigger_node_local_workload_norms,
+                rollout.cache_trigger_candidate_summary_norms,
+                rollout.cache_trigger_aux_norms,
+            )
+            if any(value is None for value in trigger_snapshot_fields):
+                raise RuntimeError(
+                    "V3 rollout is missing detached Cache Trigger auxiliary snapshots"
+                )
+            workload_snapshot = np.asarray(
+                rollout.cache_trigger_node_local_workload, dtype=np.float32
+            )
+            candidate_summary_snapshot = np.asarray(
+                rollout.cache_trigger_candidate_summary, dtype=np.float32
+            )
+            trigger_aux_snapshot = np.asarray(
+                rollout.cache_trigger_aux, dtype=np.float32
+            )
+            if workload_snapshot.shape[:2] != (
+                len(rollout.transitions),
+                self.policy.num_cache_heads,
+            ) or candidate_summary_snapshot.shape[:2] != (
+                len(rollout.transitions),
+                self.policy.num_cache_heads,
+            ):
+                raise RuntimeError("V3 rollout Trigger snapshot head dimensions mismatch")
+            expected_trigger_aux = np.concatenate(
+                [
+                    workload_snapshot.reshape(
+                        len(rollout.transitions), self.policy.num_cache_heads, -1
+                    ),
+                    candidate_summary_snapshot,
+                ],
+                axis=-1,
+            ).astype(np.float32, copy=False)
+            if trigger_aux_snapshot.shape != expected_trigger_aux.shape or not np.array_equal(
+                trigger_aux_snapshot, expected_trigger_aux
+            ):
+                raise RuntimeError(
+                    "V3 rollout Trigger auxiliary drifted from its stored components"
+                )
+            if not np.all(np.isfinite(trigger_aux_snapshot)):
+                raise FloatingPointError("stored V3 Trigger auxiliary is non-finite")
+            if float(rollout.pre_trigger_and_execution_candidate_logit_max_diff) > 1.0e-7:
+                raise RuntimeError(
+                    "rollout pre-trigger/execution candidate logits exceeded tolerance"
+                )
+            cache_trigger_aux = torch.as_tensor(
+                trigger_aux_snapshot.copy(),
+                dtype=torch.float32,
+                device=self.device,
+            ).detach()
+            if cache_trigger_aux.requires_grad:
+                raise RuntimeError("PPO Trigger auxiliary snapshot must remain detached")
         cache_candidate_features = torch.as_tensor(
             rollout.cache_candidate_features, dtype=torch.float32, device=self.device
         )
@@ -7707,6 +7807,7 @@ class PPOV2Trainer:
                 selected_indices=cache_selected_indices,
                 old_operation_log_probs=cache_operation_old_log_probs,
                 old_candidate_log_probs=cache_candidate_old_log_probs,
+                cache_trigger_aux=cache_trigger_aux,
             )
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
@@ -8061,6 +8162,7 @@ class PPOV2Trainer:
                         cache_candidate_features,
                         cache_candidate_masks,
                         cache_selected_indices,
+                        cache_trigger_aux,
                     )
                 )
                 if (
@@ -8324,7 +8426,18 @@ class PPOV2Trainer:
                         clipping_group_builder()
                     )
         minibatch_size = sample_count // hyper.num_minibatches
+        frozen_trigger_aux_snapshot = (
+            None
+            if cache_trigger_aux is None
+            else cache_trigger_aux.detach().clone()
+        )
         for update_epoch in range(hyper.update_epochs):
+            if frozen_trigger_aux_snapshot is not None and not torch.equal(
+                cache_trigger_aux, frozen_trigger_aux_snapshot
+            ):
+                raise RuntimeError(
+                    "Cache Trigger auxiliary changed during PPO update; rollout snapshot must be reused"
+                )
             cache_active_this_epoch = bool(cache_active)
             uav_operation_active_this_epoch = bool(uav_operation_active)
             uav_candidate_active_this_epoch = (
@@ -8470,6 +8583,7 @@ class PPOV2Trainer:
                         uav_candidate_features[indices],
                         uav_candidate_masks[indices],
                         uav_selected_indices[indices],
+                        cache_trigger_aux[indices],
                     )
                 elif self.context.configuration_control_mode == "policy_primitive_cache_operation":
                     if not isinstance(
@@ -8638,6 +8752,7 @@ class PPOV2Trainer:
                                     cache_candidate_features_t[indices],
                                     cache_candidate_operation_indices_t[indices],
                                     cache_candidate_valid_mask_t[indices],
+                                    cache_trigger_aux[indices],
                                 )
                             )
                             selected_update = cache_operation_actions[indices] != 0
@@ -8743,6 +8858,7 @@ class PPOV2Trainer:
                                     cache_candidate_features[indices],
                                     cache_candidate_operation_indices,
                                     cache_candidate_masks[indices],
+                                    cache_trigger_aux[indices],
                                 )
                             )
                             selected_update = cache_operation_actions[indices] != 0
@@ -9397,6 +9513,7 @@ class PPOV2Trainer:
                                     old_uav_operation_probabilities=(
                                         uav_operation_old_probabilities_t
                                     ),
+                                    cache_trigger_aux=cache_trigger_aux,
                                 )
                             )
                             # Keep the legacy minibatch field populated while
@@ -9543,6 +9660,7 @@ class PPOV2Trainer:
                                 selected_indices=cache_selected_indices,
                                 old_operation_log_probs=cache_operation_old_log_probs,
                                 old_candidate_log_probs=cache_candidate_old_log_probs,
+                                cache_trigger_aux=cache_trigger_aux,
                             )
                         )
                         if cache_kl_control_previous is None:
@@ -10004,6 +10122,7 @@ class PPOV2Trainer:
                             cache_candidate_features,
                             cache_candidate_masks,
                             cache_selected_indices,
+                            cache_trigger_aux,
                         )
                     )
                 if (
@@ -10392,6 +10511,7 @@ class PPOV2Trainer:
                     uav_candidate_features,
                     uav_candidate_masks,
                     uav_selected_indices,
+                    cache_trigger_aux,
                 )
             if final_operation_evaluation.uav_operation_log_probs_all is None:
                 raise RuntimeError(
@@ -10488,6 +10608,7 @@ class PPOV2Trainer:
                 uav_candidate_masks=uav_candidate_masks,
                 uav_selected_indices=uav_selected_indices,
                 old_uav_operation_probabilities=uav_operation_old_probabilities_t,
+                cache_trigger_aux=cache_trigger_aux,
             )
             q_move_listwise_teacher_better = both_legal & (
                 safe_q_move_listwise_teacher_tensor > safe_q_stay_tensor
@@ -12073,7 +12194,12 @@ class PPOV2Trainer:
         episode_seed_start: int | None = None,
     ) -> Path:
         run_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint = run_dir / filename
+        checkpoint = checkpoint_path_for_write(
+            run_dir,
+            filename,
+            int(getattr(self.policy, "architecture_version", 1)),
+        )
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             self.checkpoint_payload(
                 completed_episodes,
@@ -12159,12 +12285,26 @@ class PPOV2Trainer:
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
         stored_architecture_version = payload.get("architecture_version")
-        if (stored_architecture_version is not None and
-                int(stored_architecture_version) != int(getattr(self.policy, "architecture_version", 1))):
+        runtime_architecture_version = int(
+            getattr(self.policy, "architecture_version", 1)
+        )
+        if isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic) and (
+            stored_architecture_version is None
+            or int(stored_architecture_version) != runtime_architecture_version
+        ):
+            raise ValueError(
+                "V3 proposed policy requires a checkpoint with matching architecture "
+                f"metadata: checkpoint={stored_architecture_version}, "
+                f"runtime={runtime_architecture_version}"
+            )
+        if (
+            stored_architecture_version is not None
+            and int(stored_architecture_version) != runtime_architecture_version
+        ):
             raise ValueError(
                 "Checkpoint architecture mismatch: "
                 f"checkpoint={stored_architecture_version}, "
-                f"runtime={getattr(self.policy, 'architecture_version', 1)}"
+                f"runtime={runtime_architecture_version}"
             )
         checkpoint_cache_kl_control = str(
             payload.get("cache_kl_control", DEFAULT_CACHE_KL_CONTROL)
@@ -12617,13 +12757,17 @@ def run_training(
         lr_experiment_value=lr_experiment_value,
         exact_q_parallel_workers=exact_q_parallel_workers,
     )
+    architecture_version = int(getattr(trainer.policy, "architecture_version", 1))
+    ensure_run_artifact_directories(run_path, architecture_version)
     config_hash = _config_hash(config_path)
     completed_episodes = 0
     next_pool_index = 0
     current_train_origin = context.train_origin_start
     current_cache_state = np.asarray(context.initial_cache, dtype=np.int8).copy()
     current_uav_positions = _copy_uav_positions(context.initial_uav)
-    checkpoint = run_path / CHECKPOINT_FILENAME
+    checkpoint = checkpoint_path_for_resume(
+        run_path, CHECKPOINT_FILENAME, architecture_version
+    )
     episode_metrics_path = run_path / "episode_metrics.jsonl"
     update_metrics_path = run_path / "update_metrics.jsonl"
     critic_diagnostics_path = run_path / "critic_diagnostics.jsonl"
@@ -13018,6 +13162,7 @@ def run_training(
             next_pool_index=next_pool_index,
             episode_seed_start=episode_seed_start,
         )
+        checkpoint_relative_path = checkpoint_path.relative_to(run_path).as_posix()
         cache_count = len(context.action_spec.cache_node_ids)
         transition_count = len(rollout.transitions)
         cache_requests = int(rollout.actions[:, :cache_count].sum())
@@ -13341,7 +13486,7 @@ def run_training(
                 "global_critic_steps": int(update.global_critic_steps),
                 "total_loss": float(update.total_loss),
                 "total_loss_finite": bool(np.isfinite(update.total_loss)),
-                "checkpoint": str(checkpoint_path),
+                "checkpoint": checkpoint_relative_path,
                 **cache_operation_metrics,
                 **_branch_update_metric_fields(update),
                 **_branch_kl_update_metric_fields(update),
@@ -13645,7 +13790,7 @@ def run_training(
                         "max": float(max(episode_critic_gradient_norm_maxs)),
                     },
                     "finite_checks": episode_finite,
-                    "checkpoint": str(checkpoint_path),
+                    "checkpoint": checkpoint_relative_path,
                     "wall_clock_runtime_seconds": epoch_runtime_seconds,
                     "rollout_runtime_seconds": rollout_runtime_seconds,
                     "update_runtime_seconds": update_runtime_seconds,

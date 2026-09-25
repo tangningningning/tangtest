@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import torch
 
+from common import project_config
 from decision import cache_configuration, uav_configuration
 
 from . import interface
@@ -153,6 +155,17 @@ class CacheOperationPrimitiveSelectionResult:
     cache_old_log_probs: np.ndarray
     cache_conditional_actions: tuple[dict[str, Any], ...]
     cache_candidate_counts: np.ndarray
+    cache_trigger_node_local_workload: np.ndarray
+    cache_trigger_candidate_summary: np.ndarray
+    cache_trigger_aux: np.ndarray
+    cache_trigger_legal_candidate_counts: np.ndarray
+    cache_trigger_node_local_workload_norms: np.ndarray
+    cache_trigger_candidate_summary_norms: np.ndarray
+    cache_trigger_aux_norms: np.ndarray
+    cache_trigger_weighted_loaded_mb: np.ndarray
+    cache_trigger_weighted_cache_cost: np.ndarray
+    cache_trigger_weighted_predicted_demand_gain: np.ndarray
+    pre_trigger_and_execution_candidate_logit_max_diff: float
 
 
 @dataclass(frozen=True)
@@ -176,6 +189,17 @@ class JointCacheUavOperationPrimitiveSelectionResult:
     cache_old_log_probs: np.ndarray
     cache_conditional_actions: tuple[dict[str, Any], ...]
     cache_candidate_counts: np.ndarray
+    cache_trigger_node_local_workload: np.ndarray
+    cache_trigger_candidate_summary: np.ndarray
+    cache_trigger_aux: np.ndarray
+    cache_trigger_legal_candidate_counts: np.ndarray
+    cache_trigger_node_local_workload_norms: np.ndarray
+    cache_trigger_candidate_summary_norms: np.ndarray
+    cache_trigger_aux_norms: np.ndarray
+    cache_trigger_weighted_loaded_mb: np.ndarray
+    cache_trigger_weighted_cache_cost: np.ndarray
+    cache_trigger_weighted_predicted_demand_gain: np.ndarray
+    pre_trigger_and_execution_candidate_logit_max_diff: float
     uav_operation_actions: np.ndarray
     uav_operation_masks: np.ndarray
     uav_operation_old_log_probs: np.ndarray
@@ -460,6 +484,71 @@ def _cache_target_configuration_feature(
     if values.shape != (expected_dim,) or not np.all(np.isfinite(values)):
         raise AssertionError("target cache configuration feature shape/finite check failed")
     return values.astype(np.float32)
+
+
+def _build_update_candidate_policy_summary(
+    candidate_features: np.ndarray | None,
+    candidate_logits: Any | None,
+    *,
+    candidate_capacity: int,
+    service_count: int,
+    cache_capacity_mb: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Summarize the behavior candidate policy without exposing Q/reward data."""
+
+    feature_dim = 25 + 6 * int(service_count)
+    summary = np.zeros(1 + feature_dim, dtype=np.float32)
+    diagnostics = {
+        "weighted_loaded_mb": 0.0,
+        "weighted_cache_cost": 0.0,
+        "weighted_predicted_demand_gain": 0.0,
+    }
+    if candidate_features is None:
+        if candidate_logits is not None:
+            raise ValueError("empty candidate set cannot have candidate logits")
+        return summary, np.zeros(0, dtype=np.float32), diagnostics
+
+    features = np.asarray(candidate_features, dtype=np.float32)
+    logits = torch.as_tensor(candidate_logits, dtype=torch.float32).detach()
+    if features.ndim != 2 or features.shape[1] != feature_dim:
+        raise ValueError("candidate summary feature dimensions are inconsistent")
+    if features.shape[0] <= 0 or tuple(logits.shape) != (features.shape[0],):
+        raise ValueError("candidate summary logits do not align with legal targets")
+    if features.shape[0] > int(candidate_capacity):
+        raise ValueError("legal Cache candidate count exceeds fixed candidate capacity")
+    if not np.all(np.isfinite(features)) or not bool(
+        torch.all(torch.isfinite(logits)).item()
+    ):
+        raise FloatingPointError("candidate summary inputs contain NaN/Inf")
+
+    probabilities_t = torch.softmax(logits, dim=-1).detach()
+    probabilities = probabilities_t.cpu().numpy().astype(np.float32, copy=False)
+    weighted_features = probabilities @ features
+    summary[0] = float(features.shape[0]) / float(max(int(candidate_capacity), 1))
+    summary[1:] = weighted_features
+
+    scalar_start = 4 + 6 * int(service_count)
+    demand_gain_start = 4 + 5 * int(service_count)
+    loaded_ratio_index = scalar_start + 3
+    cache_cost_index = scalar_start + 11
+    diagnostics["weighted_loaded_mb"] = float(
+        np.dot(probabilities, features[:, loaded_ratio_index])
+        * max(float(cache_capacity_mb), 0.0)
+    )
+    per_candidate_cost = np.expm1(
+        np.maximum(features[:, cache_cost_index].astype(np.float64), 0.0)
+    )
+    diagnostics["weighted_cache_cost"] = float(
+        np.dot(probabilities.astype(np.float64), per_candidate_cost)
+    )
+    diagnostics["weighted_predicted_demand_gain"] = float(
+        np.dot(probabilities, np.sum(features[:, demand_gain_start : demand_gain_start + service_count], axis=1))
+    )
+    if not np.all(np.isfinite(summary)) or not all(
+        np.isfinite(value) for value in diagnostics.values()
+    ):
+        raise FloatingPointError("candidate policy summary is non-finite")
+    return summary, probabilities, diagnostics
 
 
 def _normalized_xy(
@@ -1227,6 +1316,64 @@ def sample_and_apply_cache_reconfiguration_configuration(
         context.cache_nodes,
         current_uav,
     )
+    input_jitter = float(
+        project_config.get_config_value(context.cfg, "task.input_relative_jitter", 0.0)
+    )
+    load_jitter = float(
+        project_config.get_config_value(context.cfg, "task.load_relative_jitter", 0.0)
+    )
+    cache_trigger_node_local_workload = (
+        cache_configuration.node_local_predicted_service_workload(
+            step.scenario_slice,
+            proposal_cache_nodes,
+            context.cache_cfg,
+            context.service_catalog,
+            input_relative_jitter=input_jitter,
+            load_relative_jitter=load_jitter,
+        )
+    )
+    if cache_trigger_node_local_workload.shape != (
+        tensor_spec.num_cache_heads,
+        int(context.service_catalog["num_services"]),
+        3,
+    ):
+        raise AssertionError("node-local Trigger workload shape mismatch")
+    if cache_trigger_node_local_workload.shape[1] * 3 != int(
+        getattr(policy, "trigger_workload_dim", -1)
+    ):
+        raise AssertionError("policy and node-local Trigger workload dimensions differ")
+    trigger_candidate_summary_dim = 1 + int(tensor_spec.cache_feature_dim)
+    trigger_aux_dim = int(getattr(policy, "trigger_aux_dim", -1))
+    if trigger_aux_dim != cache_trigger_node_local_workload.shape[1] * 3 + trigger_candidate_summary_dim:
+        raise AssertionError("policy and Trigger auxiliary dimensions differ")
+    cache_trigger_candidate_summary = np.zeros(
+        (tensor_spec.num_cache_heads, trigger_candidate_summary_dim),
+        dtype=np.float32,
+    )
+    cache_trigger_aux = np.zeros(
+        (tensor_spec.num_cache_heads, trigger_aux_dim), dtype=np.float32
+    )
+    cache_trigger_legal_candidate_counts = np.zeros(
+        tensor_spec.num_cache_heads, dtype=np.int64
+    )
+    cache_trigger_node_local_workload_norms = np.linalg.norm(
+        cache_trigger_node_local_workload.reshape(tensor_spec.num_cache_heads, -1),
+        axis=-1,
+    ).astype(np.float32)
+    cache_trigger_candidate_summary_norms = np.zeros(
+        tensor_spec.num_cache_heads, dtype=np.float32
+    )
+    cache_trigger_aux_norms = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
+    cache_trigger_weighted_loaded_mb = np.zeros(
+        tensor_spec.num_cache_heads, dtype=np.float32
+    )
+    cache_trigger_weighted_cache_cost = np.zeros(
+        tensor_spec.num_cache_heads, dtype=np.float32
+    )
+    cache_trigger_weighted_predicted_demand_gain = np.zeros(
+        tensor_spec.num_cache_heads, dtype=np.float32
+    )
+    candidate_logit_max_diff = 0.0
 
     operation_actions = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
     operation_masks = np.zeros(
@@ -1276,6 +1423,86 @@ def sample_and_apply_cache_reconfiguration_configuration(
             context.cache_cfg,
         )
         update_candidates = candidates
+        count = len(update_candidates)
+        if count > tensor_spec.cache_max_candidates:
+            raise AssertionError("Cache candidate count exceeds padded capacity")
+        pre_trigger_candidate_logits: Any | None = None
+        candidate_features: np.ndarray | None = None
+        if count > 0:
+            node_demand = cache_configuration.node_specific_predicted_demand(
+                step.scenario_slice,
+                node_index,
+                proposal_cache_nodes,
+                context.cache_cfg,
+            )
+            observed_usage = cache_configuration.observed_local_service_usage(
+                context.local_cache,
+                int(context.service_catalog["num_services"]),
+            )
+            hypothetical_triggers = cache_triggers.copy()
+            hypothetical_triggers[node_index] = 1
+            candidate_features = np.stack(
+                [
+                    _cache_target_configuration_feature(
+                        candidate,
+                        cache,
+                        previous_cache,
+                        hypothetical_triggers,
+                        node_demand,
+                        observed_usage,
+                        context,
+                    )
+                    for candidate in update_candidates
+                ]
+            ).astype(np.float32, copy=False)
+            with torch.no_grad():
+                pre_trigger_candidate_logits = policy.score_cache_update_candidates(
+                    conditional_context,
+                    candidate_features,
+                ).detach()
+            summary, _, candidate_summary_diagnostics = (
+                _build_update_candidate_policy_summary(
+                    candidate_features,
+                    pre_trigger_candidate_logits,
+                    candidate_capacity=tensor_spec.cache_max_candidates,
+                    service_count=int(context.service_catalog["num_services"]),
+                    cache_capacity_mb=float(
+                        context.cache_nodes["capacities_mb"][node_index]
+                    ),
+                )
+            )
+            cache_trigger_weighted_loaded_mb[node_index] = float(
+                candidate_summary_diagnostics["weighted_loaded_mb"]
+            )
+            cache_trigger_weighted_cache_cost[node_index] = float(
+                candidate_summary_diagnostics["weighted_cache_cost"]
+            )
+            cache_trigger_weighted_predicted_demand_gain[node_index] = float(
+                candidate_summary_diagnostics["weighted_predicted_demand_gain"]
+            )
+        else:
+            summary, _, _ = _build_update_candidate_policy_summary(
+                None,
+                None,
+                candidate_capacity=tensor_spec.cache_max_candidates,
+                service_count=int(context.service_catalog["num_services"]),
+                cache_capacity_mb=float(
+                    context.cache_nodes["capacities_mb"][node_index]
+                ),
+            )
+        cache_trigger_legal_candidate_counts[node_index] = count
+        cache_trigger_candidate_summary[node_index] = summary
+        cache_trigger_candidate_summary_norms[node_index] = float(
+            np.linalg.norm(summary)
+        )
+        trigger_aux = np.concatenate(
+            [
+                cache_trigger_node_local_workload[node_index].reshape(-1),
+                summary,
+            ]
+        ).astype(np.float32, copy=False)
+        cache_trigger_aux[node_index] = trigger_aux
+        cache_trigger_aux_norms[node_index] = float(np.linalg.norm(trigger_aux))
         operation_mask = np.asarray(
             [True, bool(update_candidates)],
             dtype=bool,
@@ -1284,6 +1511,7 @@ def sample_and_apply_cache_reconfiguration_configuration(
             conditional_context,
             node_index,
             operation_mask,
+            trigger_aux=trigger_aux,
             deterministic=bool(deterministic),
         )
         selected_trigger = int(sampled_trigger.selected_index)
@@ -1314,9 +1542,26 @@ def sample_and_apply_cache_reconfiguration_configuration(
                     "head_id": str(node_id),
                     "head_index": node_index,
                     "candidate_count": 0,
+                    "legal_update_candidate_count": count,
                     "selected_index": None,
                     "conditional_action": "KEEP",
                     "actual_changed": False,
+                    "TRIGGER_NODE_LOCAL_WORKLOAD_NORM": float(
+                        cache_trigger_node_local_workload_norms[node_index]
+                    ),
+                    "TRIGGER_CANDIDATE_SUMMARY_NORM": float(
+                        cache_trigger_candidate_summary_norms[node_index]
+                    ),
+                    "TRIGGER_AUX_NORM": float(cache_trigger_aux_norms[node_index]),
+                    "weighted_loaded_mb": float(
+                        cache_trigger_weighted_loaded_mb[node_index]
+                    ),
+                    "weighted_cache_cost": float(
+                        cache_trigger_weighted_cache_cost[node_index]
+                    ),
+                    "weighted_predicted_demand_gain": float(
+                        cache_trigger_weighted_predicted_demand_gain[node_index]
+                    ),
                 }
             )
             continue
@@ -1324,38 +1569,25 @@ def sample_and_apply_cache_reconfiguration_configuration(
         if not update_candidates:
             raise AssertionError("selected UPDATE without a legal candidate")
         cache_triggers[node_index] = 1
-        node_demand = cache_configuration.node_specific_predicted_demand(
-            step.scenario_slice,
-            node_index,
-            proposal_cache_nodes,
-            context.cache_cfg,
-        )
-        observed_usage = cache_configuration.observed_local_service_usage(
-            context.local_cache,
-            int(context.service_catalog["num_services"]),
-        )
-        candidate_features = np.stack(
-            [
-                _cache_target_configuration_feature(
-                    candidate,
-                    cache,
-                    previous_cache,
-                    cache_triggers,
-                    node_demand,
-                    observed_usage,
-                    context,
-                )
-                for candidate in update_candidates
-            ]
-        )
-        count = len(update_candidates)
-        if count > tensor_spec.cache_max_candidates:
-            raise AssertionError("Cache candidate count exceeds padded capacity")
-        sampled_candidate = policy.sample_cache_update_candidate(
-            conditional_context,
-            candidate_features,
+        if candidate_features is None or pre_trigger_candidate_logits is None:
+            raise AssertionError("UPDATE requires pre-trigger candidate scoring results")
+        sampled_candidate = policy.sample_cache_update_candidate_from_logits(
+            pre_trigger_candidate_logits,
             deterministic=bool(deterministic),
         )
+        scored_distribution_logits = torch.distributions.Categorical(
+            logits=pre_trigger_candidate_logits
+        ).logits
+        candidate_logit_diff = float(
+            torch.max(
+                torch.abs(sampled_candidate.logits - scored_distribution_logits)
+            ).detach().cpu()
+        )
+        candidate_logit_max_diff = max(candidate_logit_max_diff, candidate_logit_diff)
+        if candidate_logit_diff > 1.0e-7:
+            raise AssertionError(
+                "pre-trigger and execution candidate logits diverged"
+            )
         selected_index = int(sampled_candidate.selected_index)
         selected = update_candidates[selected_index]
         applied = cache_configuration.apply_cache_target_configuration(
@@ -1380,11 +1612,29 @@ def sample_and_apply_cache_reconfiguration_configuration(
                 "head_id": str(node_id),
                 "head_index": node_index,
                 "candidate_count": count,
+                "legal_update_candidate_count": count,
                 "selected_index": selected_index,
                 "conditional_action": "TARGET_CONFIGURATION",
                 "target_cache": selected.target_node_cache.astype(int).tolist(),
                 "proposal_source": selected.proposal_source,
                 "actual_changed": bool(applied["actual_changed"]),
+                "TRIGGER_NODE_LOCAL_WORKLOAD_NORM": float(
+                    cache_trigger_node_local_workload_norms[node_index]
+                ),
+                "TRIGGER_CANDIDATE_SUMMARY_NORM": float(
+                    cache_trigger_candidate_summary_norms[node_index]
+                ),
+                "TRIGGER_AUX_NORM": float(cache_trigger_aux_norms[node_index]),
+                "weighted_loaded_mb": float(
+                    cache_trigger_weighted_loaded_mb[node_index]
+                ),
+                "weighted_cache_cost": float(
+                    cache_trigger_weighted_cache_cost[node_index]
+                ),
+                "weighted_predicted_demand_gain": float(
+                    cache_trigger_weighted_predicted_demand_gain[node_index]
+                ),
+                "PRE_TRIGGER_AND_EXECUTION_CANDIDATE_LOGIT_MAX_DIFF": candidate_logit_diff,
             }
         )
 
@@ -1423,6 +1673,17 @@ def sample_and_apply_cache_reconfiguration_configuration(
         cache_old_log_probs=cache_old_log_probs,
         cache_conditional_actions=tuple(cache_actions),
         cache_candidate_counts=cache_counts,
+        cache_trigger_node_local_workload=cache_trigger_node_local_workload.copy(),
+        cache_trigger_candidate_summary=cache_trigger_candidate_summary.copy(),
+        cache_trigger_aux=cache_trigger_aux.copy(),
+        cache_trigger_legal_candidate_counts=cache_trigger_legal_candidate_counts.copy(),
+        cache_trigger_node_local_workload_norms=cache_trigger_node_local_workload_norms.copy(),
+        cache_trigger_candidate_summary_norms=cache_trigger_candidate_summary_norms.copy(),
+        cache_trigger_aux_norms=cache_trigger_aux_norms.copy(),
+        cache_trigger_weighted_loaded_mb=cache_trigger_weighted_loaded_mb.copy(),
+        cache_trigger_weighted_cache_cost=cache_trigger_weighted_cache_cost.copy(),
+        cache_trigger_weighted_predicted_demand_gain=cache_trigger_weighted_predicted_demand_gain.copy(),
+        pre_trigger_and_execution_candidate_logit_max_diff=float(candidate_logit_max_diff),
     )
 
 
@@ -1716,6 +1977,19 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
         cache_old_log_probs=cache_result.cache_old_log_probs,
         cache_conditional_actions=cache_result.cache_conditional_actions,
         cache_candidate_counts=cache_result.cache_candidate_counts,
+        cache_trigger_node_local_workload=cache_result.cache_trigger_node_local_workload,
+        cache_trigger_candidate_summary=cache_result.cache_trigger_candidate_summary,
+        cache_trigger_aux=cache_result.cache_trigger_aux,
+        cache_trigger_legal_candidate_counts=cache_result.cache_trigger_legal_candidate_counts,
+        cache_trigger_node_local_workload_norms=cache_result.cache_trigger_node_local_workload_norms,
+        cache_trigger_candidate_summary_norms=cache_result.cache_trigger_candidate_summary_norms,
+        cache_trigger_aux_norms=cache_result.cache_trigger_aux_norms,
+        cache_trigger_weighted_loaded_mb=cache_result.cache_trigger_weighted_loaded_mb,
+        cache_trigger_weighted_cache_cost=cache_result.cache_trigger_weighted_cache_cost,
+        cache_trigger_weighted_predicted_demand_gain=cache_result.cache_trigger_weighted_predicted_demand_gain,
+        pre_trigger_and_execution_candidate_logit_max_diff=(
+            cache_result.pre_trigger_and_execution_candidate_logit_max_diff
+        ),
         uav_operation_actions=uav_operation_actions,
         uav_operation_masks=uav_operation_masks,
         uav_operation_old_log_probs=uav_operation_old_log_probs,

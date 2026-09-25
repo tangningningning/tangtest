@@ -31,6 +31,7 @@ from .evaluation_metrics import (
     execution_ratio_statistics,
 )
 from .interface import _copy_uav_positions
+from .reporting import resolve_checkpoint_reference
 from .rollout import collect_rollout
 from .trainer import (
     PPOV2Trainer,
@@ -356,7 +357,9 @@ def evaluate_pool(
 
     project_root = project_config.find_project_root()
     config_file = _resolve_path(project_root, config_path)
-    checkpoint = _resolve_path(project_root, checkpoint_path)
+    checkpoint = resolve_checkpoint_reference(
+        _resolve_path(project_root, checkpoint_path)
+    ).resolve(strict=True)
     pool_path = _resolve_path(project_root, episode_pool)
     output_path = _resolve_path(project_root, run_dir)
     if not config_file.is_file():

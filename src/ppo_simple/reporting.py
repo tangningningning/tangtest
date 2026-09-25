@@ -20,6 +20,8 @@ from .plotting import (
 
 RUN_MANIFEST_FILENAME = "run_manifest.json"
 RUN_SUMMARY_FILENAME = "run_summary.json"
+CHECKPOINTS_DIRECTORY = "checkpoints"
+PLOTS_DIRECTORY = "plots"
 FRESH_RUN_ARTIFACTS = (
     RUN_MANIFEST_FILENAME,
     RUN_SUMMARY_FILENAME,
@@ -29,9 +31,77 @@ FRESH_RUN_ARTIFACTS = (
     "slot_metrics.jsonl",
     "latest_checkpoint.pt",
     "best_train_return_checkpoint.pt",
+    f"{CHECKPOINTS_DIRECTORY}/latest_checkpoint.pt",
+    f"{CHECKPOINTS_DIRECTORY}/best_train_return_checkpoint.pt",
     f"plots/{TRAINING_EPOCH_RETURN_PLOT_FILENAME}",
     f"plots/{TRAINING_SLOT_REWARD_PLOT_FILENAME}",
 )
+
+
+def checkpoint_path_for_write(
+    run_dir: Path, filename: str, architecture_version: int
+) -> Path:
+    """Return the canonical output path for this policy architecture."""
+
+    run_path = Path(run_dir)
+    if int(architecture_version) >= 3:
+        return run_path / CHECKPOINTS_DIRECTORY / filename
+    return run_path / filename
+
+
+def checkpoint_path_for_resume(
+    run_dir: Path, filename: str, architecture_version: int
+) -> Path:
+    """Prefer the canonical checkpoint and allow a legacy root-level read."""
+
+    run_path = Path(run_dir)
+    canonical = run_path / CHECKPOINTS_DIRECTORY / filename
+    legacy = run_path / filename
+    if canonical.is_file():
+        return canonical
+    if legacy.is_file():
+        return legacy
+    return checkpoint_path_for_write(run_path, filename, architecture_version)
+
+
+def resolve_checkpoint_reference(checkpoint: Path) -> Path:
+    """Resolve a V3 checkpoint path, falling back to a legacy root-level file."""
+
+    path = Path(checkpoint).expanduser()
+    if path.is_dir():
+        if path.name == CHECKPOINTS_DIRECTORY:
+            return checkpoint_path_for_resume(path.parent, "latest_checkpoint.pt", 3)
+        return checkpoint_path_for_resume(path, "latest_checkpoint.pt", 3)
+    if path.parent.name == CHECKPOINTS_DIRECTORY:
+        run_path = path.parent.parent
+    else:
+        run_path = path.parent
+    canonical = run_path / CHECKPOINTS_DIRECTORY / path.name
+    legacy = run_path / path.name
+    if canonical.is_file():
+        return canonical
+    if legacy.is_file():
+        return legacy
+    return canonical
+
+
+def checkpoint_run_directory(checkpoint: Path) -> Path:
+    """Return the run root for either a canonical or legacy checkpoint path."""
+
+    path = Path(checkpoint)
+    if path.parent.name == CHECKPOINTS_DIRECTORY:
+        return path.parent.parent
+    return path.parent
+
+
+def ensure_run_artifact_directories(run_dir: Path, architecture_version: int) -> None:
+    """Create V3+ checkpoint and plot directories without moving legacy files."""
+
+    if int(architecture_version) < 3:
+        return
+    run_path = Path(run_dir)
+    (run_path / CHECKPOINTS_DIRECTORY).mkdir(parents=True, exist_ok=True)
+    (run_path / PLOTS_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
 
 def ensure_fresh_run_dir_is_clean(run_dir: Path) -> None:
@@ -50,6 +120,13 @@ def ensure_fresh_run_dir_is_clean(run_dir: Path) -> None:
         for relative_path in FRESH_RUN_ARTIFACTS
         if (run_path / relative_path).exists()
     ]
+    for checkpoint_directory in (run_path / CHECKPOINTS_DIRECTORY, run_path):
+        if checkpoint_directory.is_dir():
+            existing_artifacts.extend(
+                str(path.relative_to(run_path))
+                for path in checkpoint_directory.glob("*.pt")
+                if str(path.relative_to(run_path)) not in existing_artifacts
+            )
     if existing_artifacts:
         raise RuntimeError(
             "fresh PPO run-dir already contains experiment artifacts; "

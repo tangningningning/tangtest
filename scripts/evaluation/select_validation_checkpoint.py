@@ -22,19 +22,21 @@ def _path(value: str) -> Path:
 
 
 def discover_periodic_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
-    checkpoints = []
-    for path in run_dir.iterdir():
-        match = re.fullmatch(r"epoch_(\d{3})_checkpoint\.pt", path.name)
-        if match and path.is_file():
+    checkpoints_by_epoch: dict[int, Path] = {}
+    for directory in (run_dir / "checkpoints", run_dir):
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            match = re.fullmatch(r"epoch_(\d{3})_checkpoint\.pt", path.name)
+            if not match or not path.is_file():
+                continue
             epoch = int(match.group(1))
             if epoch <= 0 or epoch % 10:
                 raise ValueError(f"invalid periodic checkpoint epoch: {path}")
-            checkpoints.append((epoch, path))
-    checkpoints.sort()
+            checkpoints_by_epoch.setdefault(epoch, path)
+    checkpoints = sorted(checkpoints_by_epoch.items())
     if not checkpoints:
         raise FileNotFoundError("run has no epoch_XXX_checkpoint.pt files")
-    if len({epoch for epoch, _ in checkpoints}) != len(checkpoints):
-        raise ValueError("duplicate periodic checkpoint epoch")
     expected_epochs = list(range(10, 301, 10))
     actual_epochs = [epoch for epoch, _ in checkpoints]
     if actual_epochs != expected_epochs:

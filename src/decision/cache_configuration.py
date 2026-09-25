@@ -1504,35 +1504,24 @@ def predicted_vehicle_service_demand(
     return np.sum(by_horizon, axis=0)
 
 
-def node_specific_predicted_demand(
+def _node_predicted_serviceability_weights(
     origin_scenario: dict[str, Any],
     node_index: int,
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> np.ndarray:
-    """Estimate ``D_pred[m,f]`` using predicted vehicles serviceable by node m."""
+    """Return the existing prediction-only node/vehicle coverage weights."""
 
-    num_services = int(origin_scenario["rho_hat"].shape[-1])
-    arrival = np.asarray(origin_scenario["arrival"], dtype=np.float64)
     positions = np.asarray(origin_scenario["positions_xy"], dtype=np.float64)
-    scenarios, horizons, _ = [int(value) for value in arrival.shape]
-    vehicles = int(positions.shape[2])
-    demand = predicted_vehicle_service_demand_by_horizon(
-        origin_scenario,
-        num_services,
-        beta_discount=config.beta_discount,
-    )
-    # The helper above averages over scenarios.  Align the node geometry with
-    # that same scenario-averaged vehicle/horizon tensor.
+    if positions.ndim != 4 or positions.shape[-1] != 2:
+        raise ValueError("prediction scenario positions_xy must be [S,H,V,2]")
+    _, horizons, vehicles, _ = positions.shape
     vehicle_ids = [str(value) for value in origin_scenario["vehicle_ids"].tolist()]
     role = str(cache_nodes["node_roles"][int(node_index)]).upper()
     node_id = str(cache_nodes["node_ids"][int(node_index)])
     node_vehicle_index = vehicle_ids.index(node_id) if role == "SV" else None
-    result = np.zeros(num_services, dtype=np.float64)
-    # ``demand`` is averaged over S already; use the mean predicted position at
-    # each horizon to avoid any realization leakage and keep proposal order
-    # independent of scenario iteration details.
     mean_positions = np.mean(positions, axis=0)
+    weights = np.zeros((horizons, vehicles), dtype=np.float64)
     for horizon in range(horizons):
         if role == "SV":
             node_xy = mean_positions[horizon, int(node_vehicle_index)]
@@ -1544,12 +1533,177 @@ def node_specific_predicted_demand(
             distance = float(
                 np.linalg.norm(mean_positions[horizon, vehicle_index] - node_xy)
             )
-            weight = _serviceability_weight(distance, role, config)
-            if weight > 0.0:
-                result += weight * demand[horizon, vehicle_index]
+            weights[horizon, vehicle_index] = _serviceability_weight(
+                distance, role, config
+            )
+    return weights
+
+
+def node_specific_predicted_demand(
+    origin_scenario: dict[str, Any],
+    node_index: int,
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+) -> np.ndarray:
+    """Estimate ``D_pred[m,f]`` using predicted vehicles serviceable by node m."""
+
+    num_services = int(origin_scenario["rho_hat"].shape[-1])
+    arrival = np.asarray(origin_scenario["arrival"], dtype=np.float64)
+    demand = predicted_vehicle_service_demand_by_horizon(
+        origin_scenario,
+        num_services,
+        beta_discount=config.beta_discount,
+    )
+    weights = _node_predicted_serviceability_weights(
+        origin_scenario, node_index, cache_nodes, config
+    )
+    if weights.shape != demand.shape[:2]:
+        raise ValueError("predicted demand and serviceability horizons do not align")
+    result = np.einsum("hv,hvf->f", weights, demand)
     if not np.all(np.isfinite(result)) or np.any(result < -1.0e-12):
         raise FloatingPointError("node-specific predicted demand is invalid")
     return np.maximum(result, 0.0).astype(np.float64)
+
+
+def node_local_predicted_service_workload(
+    origin_scenario: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+    service_catalog: dict[str, Any],
+    *,
+    input_relative_jitter: float = 0.0,
+    load_relative_jitter: float = 0.0,
+) -> np.ndarray:
+    """Build normalized ``[cache_head, service, (request,bits,cycles)]`` data.
+
+    The request-mass channel calls ``node_specific_predicted_demand`` directly,
+    preserving its prediction-scenario, horizon-discount, geometry and
+    node-serviceability semantics.  Input and CPU work use the same scenario
+    events and coverage weights.  Normalization scales are fixed by the
+    configured forecast dimensions, service catalog, and jitter limits.
+    """
+
+    arrival = np.asarray(origin_scenario.get("arrival"), dtype=np.float64)
+    service_id = np.asarray(origin_scenario.get("service_id"), dtype=np.int64)
+    input_bits = np.asarray(origin_scenario.get("input_size"), dtype=np.float64)
+    cpu_cycles = np.asarray(origin_scenario.get("cpu_cycles"), dtype=np.float64)
+    positions = np.asarray(origin_scenario.get("positions_xy"), dtype=np.float64)
+    if arrival.ndim != 3 or any(
+        value.shape != arrival.shape
+        for value in (service_id, input_bits, cpu_cycles)
+    ):
+        raise ValueError(
+            "prediction scenario arrival/service_id/input_size/cpu_cycles "
+            "must share [S,H,T] shape"
+        )
+    if positions.ndim != 4 or positions.shape[:2] != arrival.shape[:2]:
+        raise ValueError("prediction positions_xy must align with [S,H]")
+    if positions.shape[-1] != 2:
+        raise ValueError("prediction positions_xy must end in coordinate dimension 2")
+    if not 0.0 <= float(input_relative_jitter) < 1.0:
+        raise ValueError("input_relative_jitter must be in [0,1)")
+    if not 0.0 <= float(load_relative_jitter) < 1.0:
+        raise ValueError("load_relative_jitter must be in [0,1)")
+
+    scenario_count, horizon_count, task_vehicle_count = arrival.shape
+    service_count = int(service_catalog["num_services"])
+    vehicle_ids = [str(value) for value in origin_scenario["vehicle_ids"].tolist()]
+    task_vehicle_ids_raw = origin_scenario.get("task_vehicle_ids")
+    task_vehicle_ids = (
+        [str(value) for value in task_vehicle_ids_raw.tolist()]
+        if task_vehicle_ids_raw is not None
+        else []
+    )
+    if positions.shape[2] != len(vehicle_ids) or len(task_vehicle_ids) != task_vehicle_count:
+        raise ValueError("prediction scenario vehicle ID arrays do not align")
+    vehicle_index = {vehicle_id: index for index, vehicle_id in enumerate(vehicle_ids)}
+    try:
+        task_to_vehicle = [vehicle_index[value] for value in task_vehicle_ids]
+    except KeyError as exc:
+        raise ValueError("prediction task references an unknown vehicle") from exc
+
+    mean_input_by_service = np.asarray(
+        service_catalog["mean_input_size_bit"], dtype=np.float64
+    ).reshape(-1)
+    cycles_per_bit = np.asarray(
+        service_catalog["cycles_per_bit"], dtype=np.float64
+    ).reshape(-1)
+    if mean_input_by_service.shape != (service_count,) or cycles_per_bit.shape != (
+        service_count,
+    ):
+        raise ValueError("service workload catalog dimensions are inconsistent")
+    if np.any(mean_input_by_service < 0.0) or np.any(cycles_per_bit < 0.0):
+        raise ValueError("service workload catalog scales must be nonnegative")
+
+    horizon_discount = np.asarray(
+        [float(config.beta_discount) ** horizon for horizon in range(horizon_count)],
+        dtype=np.float64,
+    )
+    request_scale = max(
+        float(task_vehicle_count) * float(np.sum(horizon_discount)), 1.0
+    )
+    max_input = float(np.max(mean_input_by_service)) * (
+        1.0 + float(input_relative_jitter)
+    )
+    max_cycles_per_bit = float(np.max(cycles_per_bit)) * (
+        1.0 + float(load_relative_jitter)
+    )
+    fixed_scales = np.asarray(
+        [
+            request_scale,
+            request_scale * max(max_input, 1.0),
+            request_scale * max(max_input * max_cycles_per_bit, 1.0),
+        ],
+        dtype=np.float64,
+    )
+
+    vehicle_workload_by_horizon = np.zeros(
+        (horizon_count, len(vehicle_ids), service_count, 2), dtype=np.float64
+    )
+    for scenario_index in range(scenario_count):
+        for horizon in range(horizon_count):
+            discount = horizon_discount[horizon]
+            for task_index, full_vehicle_index in enumerate(task_to_vehicle):
+                if arrival[scenario_index, horizon, task_index] <= 0.0:
+                    continue
+                service = int(service_id[scenario_index, horizon, task_index])
+                if 0 <= service < service_count:
+                    scale = discount / max(float(scenario_count), 1.0)
+                    vehicle_workload_by_horizon[horizon, full_vehicle_index, service, 0] += (
+                        scale * input_bits[scenario_index, horizon, task_index]
+                    )
+                    vehicle_workload_by_horizon[horizon, full_vehicle_index, service, 1] += (
+                        scale * cpu_cycles[scenario_index, horizon, task_index]
+                    )
+
+    result = np.zeros(
+        (len(cache_nodes["node_ids"]), service_count, 3), dtype=np.float64
+    )
+    for node_index in range(len(cache_nodes["node_ids"])):
+        # Reuse the formal candidate demand helper for the count channel.
+        result[node_index, :, 0] = node_specific_predicted_demand(
+            origin_scenario, node_index, cache_nodes, config
+        ) / fixed_scales[0]
+        weights = _node_predicted_serviceability_weights(
+            origin_scenario, node_index, cache_nodes, config
+        )
+        aggregated_work = np.einsum(
+            "hv,hvfc->fc", weights, vehicle_workload_by_horizon
+        )
+        if not np.any(vehicle_workload_by_horizon):
+            # Match the formal predicted-demand fallback when a prediction
+            # artifact has no usable event records; catalog means provide the
+            # fixed expected workload scale without using realized tasks.
+            request_mass = result[node_index, :, 0] * fixed_scales[0]
+            aggregated_work[:, 0] = request_mass * mean_input_by_service
+            aggregated_work[:, 1] = (
+                aggregated_work[:, 0] * cycles_per_bit
+            )
+        result[node_index, :, 1:] = aggregated_work / fixed_scales[1:]
+
+    if not np.all(np.isfinite(result)) or np.any(result < -1.0e-12):
+        raise FloatingPointError("node-local predicted workload is invalid")
+    return np.maximum(result, 0.0).astype(np.float32)
 
 
 def observed_local_service_usage(
