@@ -1,27 +1,20 @@
 # Training entrypoints
 
-The PPO implementation remains in `src/ppo_simple/trainer.py`; these files are
-only thin orchestration wrappers. They read the formal 300-realization protocol
-from `configs/experiment_registry.toml`, use the same
-`configs/proposed/system_config.toml`, and call the same `ppo_simple.trainer`.
-
-The two entries are actor-learning-rate sensitivity runs of the same
-`proposed_joint` experiment, not new algorithms, versions, or configurations:
+The PPO implementation remains in `src/ppo_simple/trainer.py`. The current
+formal actor-learning-rate sweep consists of four independent Stage2D V3
+fresh-initialization runners, each using the shared
+`stage2d_v3_runner_common.py` implementation and
+`configs/proposed/system_config.toml`:
 
 ```text
-python scripts/training/run_proposed_actor_lr_3e_minus_3.py
-python scripts/training/run_proposed_actor_lr_3e_minus_4.py
+python scripts/training/run_stage2d_v3_fresh300_actor_lr_1e_minus_4.py
+python scripts/training/run_stage2d_v3_fresh300_actor_lr_5e_minus_4.py
+python scripts/training/run_stage2d_v3_fresh300_actor_lr_1e_minus_3.py
+python scripts/training/run_stage2d_v3_fresh300_actor_lr_5e_minus_3.py
 ```
 
-They use independent run directories:
-
-```text
-runs/proposed_joint_actor_lr_3e_minus_3
-runs/proposed_joint_actor_lr_3e_minus_4
-```
-
-Only the actor learning rate differs. Both retain the configured critic
-learning rate, the formal realization sequence `20001..20300`, the existing
-Cache/UAV action schema, Exact-Q listwise candidate objective, and UAV KL
-protection. Use `--resume` only with the matching run directory; checkpoint
-metadata rejects cross-LR resume.
+Each runner has its own `runs/stage2d_v3_fresh300_actor_lr_*` directory. They
+share the existing Stage2D V3 protocol: architecture version 3, 300 epochs,
+checkpoint interval 10, training seeds `20001..20300`, and no validation or
+test during training. The configured critic learning rate is retained; the
+actor learning rate is the value encoded by each runner's filename.

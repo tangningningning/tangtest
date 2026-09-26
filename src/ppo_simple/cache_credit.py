@@ -66,13 +66,52 @@ def _replay_cache_prefix(transition: Any, target_index: int) -> tuple[np.ndarray
     return working, previous_cache
 
 
+def _stored_node_cache_trigger_aux(
+    policy: Any,
+    transition: Any,
+    node_index: int,
+    node_count: int,
+) -> np.ndarray | None:
+    """Return the V3 auxiliary row frozen on this rollout transition."""
+
+    if not bool(getattr(policy, "true_binary_trigger", False)):
+        return None
+    auxiliary_dim = getattr(policy, "trigger_aux_dim", None)
+    if auxiliary_dim is None:
+        raise RuntimeError("V3 Cache Trigger policy does not expose trigger_aux_dim")
+    stored_auxiliary = getattr(transition, "cache_trigger_aux", None)
+    if stored_auxiliary is None:
+        raise RuntimeError(
+            "V3 Cache Trigger credit requires stored rollout cache_trigger_aux"
+        )
+    auxiliary = np.asarray(stored_auxiliary, dtype=np.float32)
+    expected_shape = (int(node_count), int(auxiliary_dim))
+    if tuple(auxiliary.shape) != expected_shape:
+        raise RuntimeError(
+            "stored V3 Cache Trigger auxiliary has shape "
+            f"{tuple(auxiliary.shape)}, expected {expected_shape}"
+        )
+    if not np.all(np.isfinite(auxiliary)):
+        raise FloatingPointError("stored V3 Cache Trigger auxiliary is non-finite")
+    return auxiliary[int(node_index)].copy()
+
+
 def _masked_operation_probabilities(
     policy: Any,
     conditional_context: np.ndarray,
     node_index: int,
     operation_mask: np.ndarray,
+    trigger_aux: np.ndarray | None = None,
 ) -> np.ndarray:
-    logits, single = policy._operation_logits(conditional_context)
+    if bool(getattr(policy, "true_binary_trigger", False)):
+        if trigger_aux is None:
+            raise RuntimeError(
+                "V3 Cache Trigger operation logits require stored trigger_aux"
+            )
+        logits, single = policy._operation_logits(conditional_context, trigger_aux)
+    else:
+        # Legacy non-binary policies retain their one-argument operation API.
+        logits, single = policy._operation_logits(conditional_context)
     if not single:
         raise RuntimeError("Cache operation distribution requires one context")
     raw_logits = logits[int(node_index)]
@@ -113,6 +152,12 @@ def _node_policy_state(
     feature_dim: int,
 ) -> dict[str, Any]:
     context = trainer.context
+    trigger_aux = _stored_node_cache_trigger_aux(
+        trainer.policy,
+        transition,
+        node_index,
+        len(context.action_spec.cache_node_ids),
+    )
     working_cache, previous_cache = _replay_cache_prefix(transition, node_index)
     current_uav = _position_dict(transition.previous_uav_positions)
     proposal_cache_nodes = uav_configuration.cache_nodes_with_uav_positions(
@@ -194,6 +239,7 @@ def _node_policy_state(
             np.asarray(conditional_context, dtype=np.float32),
             node_index,
             operation_mask,
+            trigger_aux=trigger_aux,
         )
         p_keep = float(operation_probabilities[0])
         p_update = float(operation_probabilities[1])
@@ -274,6 +320,7 @@ def _node_policy_state(
         np.asarray(conditional_context, dtype=np.float32),
         node_index,
         operation_mask,
+        trigger_aux=trigger_aux,
     )
     p_keep = float(operation_probabilities[0])
     p_update = float(operation_probabilities[1:].sum())
