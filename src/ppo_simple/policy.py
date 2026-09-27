@@ -1753,7 +1753,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
     """
 
     architecture_id = "adaptive_joint_cache_uav_ppo"
-    architecture_version = 4
+    architecture_version = 5
     trigger_order = ("KEEP", "UPDATE")
     true_binary_trigger = True
 
@@ -1786,11 +1786,11 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             num_uav_heads=num_uav_heads,
         )
         del self.cache_operation_head
-        if (int(cache_feature_dim) - 25) % 6 != 0:
+        if (int(cache_feature_dim) - 21) % 6 != 0:
             raise ValueError(
                 "proposed target cache feature dimension cannot determine service count"
             )
-        self.trigger_service_count = (int(cache_feature_dim) - 25) // 6
+        self.trigger_service_count = (int(cache_feature_dim) - 21) // 6
         if self.trigger_service_count <= 0:
             raise ValueError("proposed Trigger requires at least one service")
         self.trigger_workload_dim = self.trigger_service_count * 3

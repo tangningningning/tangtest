@@ -18,7 +18,7 @@ import os
 import sys
 import time
 from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -1763,7 +1763,7 @@ def _greedy_target_configuration(
     return target
 
 
-def enumerate_cache_target_configurations(
+def enumerate_all_cache_target_configurations(
     current_cache_state: np.ndarray,
     node_index: int,
     service_catalog: dict[str, Any],
@@ -1772,12 +1772,10 @@ def enumerate_cache_target_configurations(
     local_cache_state: dict[str, set[int]],
     config: CacheOptimizationConfig,
 ) -> list[CacheTargetCandidate]:
-    """Propose a bounded deterministic set of target cache configurations.
+    """Enumerate every non-KEEP capacity-feasible binary target configuration.
 
-    The proposal intentionally covers low-reconfiguration neighbors, a
-    node-specific demand target, a replica-aware alternative, and deterministic
-    intermediate targets.  Candidate labels describe proposal provenance only;
-    the policy action is always the target binary configuration itself.
+    This routine performs only bit enumeration and capacity checks. It does not
+    evaluate the environment, Matching, KKT, or Exact-Q.
     """
 
     current_cache = np.asarray(current_cache_state, dtype=np.int8)
@@ -1789,63 +1787,216 @@ def enumerate_cache_target_configurations(
     before = current_cache[index].copy()
     capacity = float(cache_nodes["capacities_mb"][index])
     demand = node_specific_predicted_demand(origin_scenario, index, cache_nodes, config)
-    observed_usage = observed_local_service_usage(
-        local_cache_state,
-        int(service_catalog["num_services"]),
-    )
+    service_count = int(service_catalog["num_services"])
+    if service_count > 20:
+        raise ValueError("exhaustive Cache proposal enumeration is capped at 20 services")
+    observed_usage = observed_local_service_usage(local_cache_state, service_count)
     replica_counts = np.sum(current_cache, axis=0).astype(np.float64)
     mean_demand = float(np.mean(demand)) if len(demand) else 0.0
     prediction_target = _greedy_target_configuration(demand, sizes, capacity)
     replica_scores = demand + (mean_demand + 1.0e-12) / (1.0 + replica_counts)
     replica_target = _greedy_target_configuration(replica_scores, sizes, capacity)
-    source_targets: list[tuple[str, np.ndarray]] = []
+    anchor_sources: dict[bytes, str] = {}
 
-    # This generator is reused only as a target-neighborhood constructor.  The
-    # returned labels are intentionally discarded; no primitive type reaches
-    # the proposed policy or its feature tensor.
-    for _, target in generate_node_neighbors(before, sizes, capacity):
-        source_targets.append(("low_reconfiguration", np.asarray(target, dtype=np.int8)))
-    source_targets.append(("prediction", prediction_target))
-    source_targets.append(("replica_aware", replica_target))
+    def add_anchor(source: str, target: np.ndarray) -> None:
+        candidate = np.asarray(target, dtype=np.int8).reshape(-1)
+        if candidate.shape != before.shape or not np.all(np.isin(candidate, [0, 1])):
+            raise ValueError("target cache proposal must be binary and shape-aligned")
+        if np.array_equal(candidate, before) or not is_node_feasible(candidate, sizes, capacity):
+            return
+        anchor_sources.setdefault(np.ascontiguousarray(candidate).tobytes(), source)
+
+    add_anchor("prediction", prediction_target)
+    add_anchor("replica_aware", replica_target)
     for fraction in config.target_intermediate_fractions:
         blended_scores = (
             float(fraction) * demand
             + (1.0 - float(fraction)) * (before.astype(np.float64) * (mean_demand + 1.0e-12))
         )
-        source_targets.append(
-            (
-                "intermediate",
-                _greedy_target_configuration(blended_scores, sizes, capacity),
-            )
+        add_anchor(
+            "intermediate",
+            _greedy_target_configuration(blended_scores, sizes, capacity),
         )
+    for _, target in generate_node_neighbors(before, sizes, capacity):
+        add_anchor("low_reconfiguration", np.asarray(target, dtype=np.int8))
 
     candidates: list[CacheTargetCandidate] = []
-    seen: set[bytes] = set()
-    for source, raw_target in source_targets:
-        target = np.asarray(raw_target, dtype=np.int8).reshape(-1)
-        if target.shape != before.shape or not np.all(np.isin(target, [0, 1])):
-            raise ValueError("target cache proposal must be binary and shape-aligned")
+    for bitset in range(1 << service_count):
+        target = np.fromiter(
+            (((bitset >> service) & 1) for service in range(service_count)),
+            dtype=np.int8,
+            count=service_count,
+        )
         if np.array_equal(target, before) or not is_node_feasible(target, sizes, capacity):
             continue
-        key = np.ascontiguousarray(target, dtype=np.int8).tobytes()
-        if key in seen:
-            continue
-        seen.add(key)
+        key = np.ascontiguousarray(target).tobytes()
         candidates.append(
             CacheTargetCandidate(
                 node_index=index,
                 node_id=str(cache_nodes["node_ids"][index]),
                 before_node_cache=before.copy(),
-                target_node_cache=target.copy(),
-                proposal_source=str(source),
+                target_node_cache=target,
+                proposal_source=anchor_sources.get(key, "exhaustive_feasible"),
             )
         )
-    if len(candidates) > int(config.target_candidate_capacity):
-        raise RuntimeError(
-            "target cache proposal exceeded configured engineering capacity: "
-            f"count={len(candidates)}, capacity={config.target_candidate_capacity}"
-        )
     return candidates
+
+
+def select_cache_target_configurations(
+    candidates: list[CacheTargetCandidate],
+    current_node_cache: np.ndarray,
+    capacity: int,
+    *,
+    predicted_delta_q: np.ndarray | None = None,
+    predicted_sigma: np.ndarray | None = None,
+    diversity_reserve: int = 0,
+) -> list[CacheTargetCandidate]:
+    """Select a bounded proposal set with anchors, surrogate ranks, and diversity."""
+
+    source = list(candidates)
+    if not source:
+        return []
+    limit = int(capacity)
+    if limit <= 0:
+        raise ValueError("target candidate capacity must be positive")
+    reserve = int(diversity_reserve)
+    if reserve < 0 or reserve >= limit:
+        raise ValueError("candidate diversity reserve must be in [0, capacity)")
+    if predicted_delta_q is not None:
+        means = np.asarray(predicted_delta_q, dtype=np.float64).reshape(-1)
+        if means.shape != (len(source),) or not np.all(np.isfinite(means)):
+            raise ValueError("surrogate candidate means are not aligned and finite")
+    else:
+        means = None
+    if predicted_sigma is not None:
+        sigmas = np.asarray(predicted_sigma, dtype=np.float64).reshape(-1)
+        if sigmas.shape != (len(source),) or not np.all(np.isfinite(sigmas)):
+            raise ValueError("surrogate candidate uncertainty is not aligned and finite")
+        sigmas = np.maximum(sigmas, 0.0)
+    else:
+        sigmas = None
+    current = np.asarray(current_node_cache, dtype=np.int8).reshape(-1)
+    if any(np.asarray(item.target_node_cache).shape != current.shape for item in source):
+        raise ValueError("candidate target width does not match current node cache")
+
+    selected: dict[int, str] = {}
+
+    def add(index: int, label: str | None = None) -> None:
+        if len(selected) >= limit or index in selected:
+            return
+        selected[index] = label or source[index].proposal_source
+
+    # Preserve all demand/replica/intermediate anchors before filling the set.
+    anchor_priority = {"prediction": 0, "replica_aware": 1, "intermediate": 2}
+    anchors = sorted(
+        (
+            index
+            for index, item in enumerate(source)
+            if item.proposal_source in anchor_priority
+        ),
+        key=lambda index: (
+            anchor_priority[source[index].proposal_source],
+            np.ascontiguousarray(source[index].target_node_cache).tobytes(),
+        ),
+    )
+    for index in anchors:
+        add(index)
+
+    # Protect the eight closest feasible targets from the reconfiguration cost.
+    hamming = np.asarray(
+        [np.count_nonzero(np.asarray(item.target_node_cache) != current) for item in source],
+        dtype=np.int64,
+    )
+    low_rank = sorted(
+        range(len(source)),
+        key=lambda index: (
+            int(hamming[index]),
+            np.ascontiguousarray(source[index].target_node_cache).tobytes(),
+        ),
+    )
+    for index in low_rank[: min(8, limit)]:
+        add(index, "low_reconfiguration")
+
+    if means is not None and sigmas is not None:
+        high_value_count = min(36, max(1, limit // 2 + 4 - reserve))
+        ucb_count = min(8, max(1, limit // 8))
+        uncertainty_count = min(8, max(1, limit // 8))
+        ucb = means + 2.0 * sigmas
+        for index in np.argsort(-means, kind="mergesort")[:high_value_count]:
+            add(int(index), "surrogate_high_value")
+        for index in np.argsort(-ucb, kind="mergesort")[:ucb_count]:
+            add(int(index), "surrogate_ucb")
+        for index in np.argsort(-sigmas, kind="mergesort")[:uncertainty_count]:
+            add(int(index), "surrogate_uncertainty")
+
+        # Keep one surrogate-ranked target from each feasible Hamming shell.
+        # This protects multi-service replacements that can rank outside the
+        # global top-μ/UCB lists while leaving remaining slots for farthest-point
+        # completion below.
+        for distance in sorted(set(int(value) for value in hamming if value > 0)):
+            shell = np.flatnonzero(hamming == distance)
+            if not len(shell):
+                continue
+            shell_best = max(
+                (int(index) for index in shell),
+                key=lambda index: (
+                    float(means[index]),
+                    tuple(-int(value) for value in source[index].target_node_cache),
+                ),
+            )
+            add(shell_best, "surrogate_hamming_shell")
+
+    # Deterministic Hamming farthest-point completion is policy-independent.
+    while len(selected) < min(limit, len(source)):
+        available = [index for index in range(len(source)) if index not in selected]
+        if not available:
+            break
+        selected_targets = [source[index].target_node_cache for index in selected]
+        next_index = max(
+            available,
+            key=lambda index: (
+                min(
+                    int(np.count_nonzero(source[index].target_node_cache != target))
+                    for target in selected_targets
+                ),
+                tuple(-int(value) for value in source[index].target_node_cache),
+            ),
+        )
+        add(next_index, "hamming_diversity")
+
+    return [replace(source[index], proposal_source=label) for index, label in selected.items()]
+
+
+def enumerate_cache_target_configurations(
+    current_cache_state: np.ndarray,
+    node_index: int,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    origin_scenario: dict[str, Any],
+    local_cache_state: dict[str, set[int]],
+    config: CacheOptimizationConfig,
+    *,
+    predicted_delta_q: np.ndarray | None = None,
+    predicted_sigma: np.ndarray | None = None,
+) -> list[CacheTargetCandidate]:
+    """Build the exhaustive feasible space, then return the bounded proposal."""
+
+    candidates = enumerate_all_cache_target_configurations(
+        current_cache_state,
+        node_index,
+        service_catalog,
+        cache_nodes,
+        origin_scenario,
+        local_cache_state,
+        config,
+    )
+    return select_cache_target_configurations(
+        candidates,
+        np.asarray(current_cache_state, dtype=np.int8)[int(node_index)],
+        int(config.target_candidate_capacity),
+        predicted_delta_q=predicted_delta_q,
+        predicted_sigma=predicted_sigma,
+    )
 
 
 def apply_cache_target_configuration(

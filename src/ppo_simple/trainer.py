@@ -58,7 +58,10 @@ from .policy import (
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
     BernoulliActorCritic,
 )
-from .cache_credit import evaluate_cache_full_information_values
+from .cache_credit import (
+    CACHE_SURROGATE_K_CANDIDATES,
+    evaluate_cache_full_information_values,
+)
 from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
 from .exact_q_parallel import (
     ExactQHeadPlan,
@@ -94,7 +97,7 @@ REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
 # Full-information Cache Trigger/Candidate teachers change the actor objective;
 # proposed-joint checkpoints from earlier Cache objectives cannot be resumed.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 19
+JOINT_PROPOSED_CHECKPOINT_VERSION = 20
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
@@ -105,7 +108,6 @@ CACHE_SURROGATE_HIDDEN_DIM = 64
 CACHE_SURROGATE_LEARNING_RATE = 1.0e-3
 CACHE_SURROGATE_AUDIT_INTERVAL = 20
 CACHE_SURROGATE_AUDIT_WINDOW = 3
-CACHE_SURROGATE_MAX_K = 12
 KL_GATE_MODE_JOINT = "joint"
 KL_GATE_MODE_BRANCH_SPECIFIC = "branch_specific"
 CACHE_KL_CONTROL_EPOCH = "epoch"
@@ -3937,6 +3939,11 @@ class PPOV2Trainer:
             ),
             "uav_candidate_learning_rate",
         )
+        if actor_learning_rate_override is not None:
+            # Actor-LR experiments use one rate for every actor branch.
+            self.cache_learning_rate = self.effective_actor_learning_rate
+            self.uav_operation_learning_rate = self.effective_actor_learning_rate
+            self.uav_candidate_learning_rate = self.effective_actor_learning_rate
         if lr_experiment_axis is None and actor_learning_rate_override is not None:
             lr_experiment_axis = "actor_learning_rate"
         self.lr_experiment_axis = (
@@ -4219,12 +4226,38 @@ class PPOV2Trainer:
         self.cache_surrogate_context_dim: int | None = None
         self.cache_surrogate_feature_dim: int | None = None
         self.cache_surrogate_training_count = 0
+        self.cache_surrogate_objective = str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_surrogate_objective",
+                "MSE",
+            )
+        ).upper()
+        self.cache_surrogate_ranking_weight = float(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_surrogate_ranking_weight",
+                1.0,
+            )
+        )
+        if self.cache_surrogate_objective not in {"MSE", "MSE_PLUS_RANKING"}:
+            raise ValueError("unsupported Cache surrogate objective")
+        if (
+            not math.isfinite(self.cache_surrogate_ranking_weight)
+            or self.cache_surrogate_ranking_weight < 0.0
+        ):
+            raise ValueError("Cache surrogate ranking weight must be finite and non-negative")
         self.cache_surrogate_shadow_complete = False
         self.cache_surrogate_screening_ready = False
         self.cache_surrogate_screening_active = False
         self.cache_surrogate_selected_k: int | None = None
         self.cache_surrogate_audit_history: list[dict[str, Any]] = []
         self.cache_surrogate_audit_statistics: dict[str, Any] | None = None
+        self.cache_surrogate_current_epoch = 0
+        self.cache_surrogate_fallback_count = 0
+        self.cache_surrogate_fallback_epochs: list[int] = []
+        self.cache_surrogate_recovery_count = 0
+        self.cache_surrogate_last_gate_failed = False
         self.cache_surrogate_audit_interval = CACHE_SURROGATE_AUDIT_INTERVAL
         self.cache_surrogate_rng = np.random.default_rng(0xCACE5AFE)
         if context.policy_schema in PROPOSED_POLICY_SCHEMAS:
@@ -4443,7 +4476,10 @@ class PPOV2Trainer:
         conditional_contexts: np.ndarray,
         candidate_features: np.ndarray,
         target_delta_q: np.ndarray,
-    ) -> dict[str, float | int]:
+        *,
+        ranking_group_ids: np.ndarray | list[Any] | None = None,
+        ranking_weight: float | None = None,
+    ) -> dict[str, float | int | str]:
         """Fit only the independent ensemble on labels from exact branches."""
 
         if self.cache_surrogate_ensemble is None or self.cache_surrogate_optimizer is None:
@@ -4481,7 +4517,41 @@ class PPOV2Trainer:
             [member(context_tensor, feature_tensor).squeeze(-1) for member in self.cache_surrogate_ensemble],
             dim=0,
         )
-        loss = torch.mean((predictions - target_tensor.unsqueeze(0)) ** 2)
+        mse_loss = torch.mean((predictions - target_tensor.unsqueeze(0)) ** 2)
+        pairwise_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        objective = self.cache_surrogate_objective
+        effective_ranking_weight = (
+            self.cache_surrogate_ranking_weight
+            if ranking_weight is None
+            else float(ranking_weight)
+        )
+        if objective == "MSE_PLUS_RANKING":
+            if ranking_group_ids is None:
+                raise ValueError("pairwise Cache ranking requires state-head group ids")
+            group_values = np.asarray(ranking_group_ids).reshape(-1)
+            if group_values.shape != (len(targets),):
+                raise ValueError("Cache surrogate ranking group ids are not aligned")
+            pair_left: list[int] = []
+            pair_right: list[int] = []
+            pair_sign: list[float] = []
+            for group_id in dict.fromkeys(group_values.tolist()):
+                members = np.flatnonzero(group_values == group_id)
+                for offset, left in enumerate(members[:-1]):
+                    right = members[offset + 1 :]
+                    delta = targets[int(left)] - targets[right]
+                    ordered = np.flatnonzero(np.abs(delta) > 1.0e-8)
+                    pair_left.extend([int(left)] * len(ordered))
+                    pair_right.extend(int(value) for value in right[ordered])
+                    pair_sign.extend(np.sign(delta[ordered]).astype(float).tolist())
+            if pair_left:
+                left_tensor = torch.as_tensor(pair_left, dtype=torch.long, device=self.device)
+                right_tensor = torch.as_tensor(pair_right, dtype=torch.long, device=self.device)
+                sign_tensor = torch.as_tensor(pair_sign, dtype=torch.float32, device=self.device)
+                pair_differences = predictions[:, left_tensor] - predictions[:, right_tensor]
+                pairwise_loss = torch.nn.functional.softplus(
+                    -pair_differences * sign_tensor.unsqueeze(0)
+                ).mean()
+        loss = mse_loss + effective_ranking_weight * pairwise_loss
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("Cache surrogate regression loss is non-finite")
         loss.backward()
@@ -4499,6 +4569,10 @@ class PPOV2Trainer:
         return {
             "count": int(len(targets)),
             "loss": float(loss.detach().cpu()),
+            "mse_loss": float(mse_loss.detach().cpu()),
+            "pairwise_ranking_loss": float(pairwise_loss.detach().cpu()),
+            "objective": objective,
+            "ranking_weight": effective_ranking_weight,
             "mae": mae,
             "rmse": rmse,
         }
@@ -4531,7 +4605,7 @@ class PPOV2Trainer:
         eligible: list[int] = []
         window_recall: dict[str, float] = {}
         window_p95: dict[str, float] = {}
-        for k in range(1, CACHE_SURROGATE_MAX_K + 1):
+        for k in CACHE_SURROGATE_K_CANDIDATES:
             if k not in recalls or k not in p95_values:
                 continue
             recall = float(np.mean(recalls[k]))
@@ -4547,10 +4621,26 @@ class PPOV2Trainer:
             }
         )
         selected_k = min(eligible) if eligible else None
+        if selected_k is None:
+            self.cache_surrogate_fallback_count += 1
+            epoch = int(self.cache_surrogate_current_epoch)
+            if epoch > 0 and epoch not in self.cache_surrogate_fallback_epochs:
+                self.cache_surrogate_fallback_epochs.append(epoch)
+            self.cache_surrogate_last_gate_failed = True
+        elif self.cache_surrogate_last_gate_failed:
+            self.cache_surrogate_recovery_count += 1
+            self.cache_surrogate_last_gate_failed = False
         self.cache_surrogate_shadow_complete = True
         self.cache_surrogate_selected_k = selected_k
         self.cache_surrogate_screening_ready = selected_k is not None
         self.cache_surrogate_screening_active = selected_k is not None
+        self.cache_surrogate_audit_statistics.update(
+            {
+                "FALLBACK_COUNT": int(self.cache_surrogate_fallback_count),
+                "FALLBACK_EPOCHS": list(self.cache_surrogate_fallback_epochs),
+                "RECOVERY_COUNT": int(self.cache_surrogate_recovery_count),
+            }
+        )
 
     def _uses_binary_cache_trigger(self) -> bool:
         return self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS
@@ -4635,6 +4725,15 @@ class PPOV2Trainer:
             initial_uav=uav_positions,
             bootstrap_step=bootstrap_step,
             terminal_origin_index=self.context.train_origin_end,
+            cache_surrogate_predictor=(
+                self._predict_cache_surrogate
+                if self.cache_surrogate_ensemble is not None
+                else None
+            ),
+            cache_surrogate_ready=bool(
+                self.cache_surrogate_screening_ready
+                and self.cache_surrogate_screening_active
+            ),
         )
 
     def collect_episode(self, max_steps: int | None = None) -> SimpleRollout:
@@ -10641,6 +10740,18 @@ class PPOV2Trainer:
                     "cache_surrogate_audit_history": [
                         dict(item) for item in self.cache_surrogate_audit_history
                     ],
+                    "cache_surrogate_fallback_count": int(
+                        self.cache_surrogate_fallback_count
+                    ),
+                    "cache_surrogate_fallback_epochs": list(
+                        self.cache_surrogate_fallback_epochs
+                    ),
+                    "cache_surrogate_recovery_count": int(
+                        self.cache_surrogate_recovery_count
+                    ),
+                    "cache_surrogate_last_gate_failed": bool(
+                        self.cache_surrogate_last_gate_failed
+                    ),
                     "rng_state": {
                         **payload["rng_state"],
                         "cache_surrogate": self.cache_surrogate_rng.bit_generator.state,
@@ -10959,6 +11070,19 @@ class PPOV2Trainer:
                 dict(item)
                 for item in payload.get("cache_surrogate_audit_history", [])
             ]
+            self.cache_surrogate_fallback_count = int(
+                payload.get("cache_surrogate_fallback_count", 0)
+            )
+            self.cache_surrogate_fallback_epochs = [
+                int(value)
+                for value in payload.get("cache_surrogate_fallback_epochs", [])
+            ]
+            self.cache_surrogate_recovery_count = int(
+                payload.get("cache_surrogate_recovery_count", 0)
+            )
+            self.cache_surrogate_last_gate_failed = bool(
+                payload.get("cache_surrogate_last_gate_failed", False)
+            )
             self.cache_teacher_scale_calibration = dict(
                 payload["cache_teacher_scale_calibration"]
             )
@@ -11531,6 +11655,7 @@ def run_training(
     episode_uav_operation_diagnostic_arrays: list[dict[str, np.ndarray]] = []
 
     while completed_episodes < target_epochs:
+        trainer.cache_surrogate_current_epoch = int(completed_episodes + 1)
         if current_train_origin > context.train_origin_end:
             if seed_based_pool:
                 assert episode_pool_directory is not None

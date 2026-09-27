@@ -1,21 +1,29 @@
-# Training entrypoint and gate status
+# One-epoch runner gate
 
-`src/ppo_simple/trainer.py` is the single PPO training implementation and CLI.
-The current second-stage joint-repair gate is **BLOCKED**: hybrid quality and
-exhaustive Cache proposal coverage failed. Do not start a short or formal
-training run until those gates pass and the registry status is updated.
+The shared one-epoch implementation is `one_epoch_runner_common.py`. Four
+small entrypoints define the actor learning rate and run directory:
 
-After all gates pass, activate the project environment and start a fresh
-20-epoch proposed-policy run from the repository root:
+- `run_one_epoch_actor_lr_1e_minus_4.py`
+- `run_one_epoch_actor_lr_5e_minus_4.py`
+- `run_one_epoch_actor_lr_1e_minus_3.py`
+- `run_one_epoch_actor_lr_5e_minus_3.py`
+
+Verify fresh initialization without rollout, optimizer steps, or run-directory
+creation:
 
 ```powershell
 conda activate adaptive_cache_mec
 $env:PYTHONPATH = 'src'
-python -m ppo_simple.trainer --config configs/proposed/system_config.toml --epochs 20 --run-dir runs/proposed_fresh20
+python scripts/training/run_one_epoch_actor_lr_1e_minus_4.py --verify-initialization
+python scripts/training/run_one_epoch_actor_lr_5e_minus_4.py --verify-initialization
+python scripts/training/run_one_epoch_actor_lr_1e_minus_3.py --verify-initialization
+python scripts/training/run_one_epoch_actor_lr_5e_minus_3.py --verify-initialization
 ```
 
-Do not pass `--resume`; the required run uses fresh initialization. Use the run
-directory for its checkpoints, manifest, and training metrics. Extend to at
-most 30 epochs only if the 20-epoch checkpoint review calls for it. Never use
-this entrypoint for the formal 300-epoch run until the separate formal-readiness
-decision is approved in the current stage report.
+Current status: the proposal-coverage gate failed. Do not execute a training
+runner until the required proposal, Hybrid quality and efficiency, Candidate
+teacher, runner, and regression gates pass. If they pass, execute only the
+5e-4 entrypoint for one complete epoch, with a fresh run directory and no
+resume. The shared entrypoint checks the required PASS fields in
+`reports/second_stage_joint_repair_gate.md` and refuses training otherwise;
+initialization verification remains available while gates are blocked.

@@ -632,6 +632,15 @@ def update_run_manifest_teacher_state(path: Path, trainer: Any) -> dict[str, Any
             "cache_surrogate_audit_statistics": getattr(
                 trainer, "cache_surrogate_audit_statistics", None
             ),
+            "cache_surrogate_fallback_count": int(
+                getattr(trainer, "cache_surrogate_fallback_count", 0)
+            ),
+            "cache_surrogate_fallback_epochs": list(
+                getattr(trainer, "cache_surrogate_fallback_epochs", [])
+            ),
+            "cache_surrogate_recovery_count": int(
+                getattr(trainer, "cache_surrogate_recovery_count", 0)
+            ),
         }
     )
     _write_json(manifest_path, payload)

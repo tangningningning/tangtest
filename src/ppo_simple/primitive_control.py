@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -41,12 +41,6 @@ REPLICA_AWARE_CACHE_FEATURE_NAMES = (
 )
 REPLICA_AWARE_CACHE_FEATURE_DIM = len(REPLICA_AWARE_CACHE_FEATURE_NAMES)
 TARGET_RECONFIGURATION_CONTROL_MODE = "adaptive_joint_cache_uav_reconfiguration"
-TARGET_CACHE_PROPOSAL_SOURCES = (
-    "low_reconfiguration",
-    "prediction",
-    "replica_aware",
-    "intermediate",
-)
 TARGET_UAV_PROPOSAL_SOURCES = (
     "demand_centroid",
     "projected_demand",
@@ -82,7 +76,7 @@ class PrimitiveTensorSpec:
             num_uav_heads=uav_count,
             observation_dim=int(context.observation_spec.observation_dim),
             cache_feature_dim=(
-                25 + 6 * service_count
+                21 + 6 * service_count
                 if target_reconfiguration
                 else (
                     17
@@ -437,10 +431,6 @@ def _cache_target_configuration_feature(
         [float(role == "SV"), float(role == "RSU"), float(role == "UAV")],
         dtype=np.float64,
     )
-    source_feature = np.asarray(
-        [float(candidate.proposal_source == value) for value in TARGET_CACHE_PROPOSAL_SOURCES],
-        dtype=np.float64,
-    )
     scalar_features = np.asarray(
         [
             before_used / max(capacity, 1.0e-12),
@@ -477,13 +467,95 @@ def _cache_target_configuration_feature(
             demand_after,
             demand_gain,
             scalar_features,
-            source_feature,
         ]
     )
-    expected_dim = 25 + 6 * service_count
+    expected_dim = 21 + 6 * service_count
     if values.shape != (expected_dim,) or not np.all(np.isfinite(values)):
         raise AssertionError("target cache configuration feature shape/finite check failed")
     return values.astype(np.float32)
+
+
+def _target_cache_proposals_with_features(
+    current_cache: np.ndarray,
+    previous_cache: np.ndarray,
+    sequential_triggers: np.ndarray,
+    node_index: int,
+    conditional_context: np.ndarray,
+    step: Any,
+    context: Any,
+    proposal_cache_nodes: dict[str, Any],
+    *,
+    surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
+    surrogate_ready: bool = False,
+) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
+    """Create cheap features for all feasible targets, then select at capacity."""
+
+    all_candidates = cache_configuration.enumerate_all_cache_target_configurations(
+        current_cache,
+        int(node_index),
+        context.service_catalog,
+        proposal_cache_nodes,
+        step.scenario_slice,
+        context.local_cache,
+        context.cache_cfg,
+    )
+    if not all_candidates:
+        return [], np.zeros(
+            (0, 21 + 6 * int(context.service_catalog["num_services"])),
+            dtype=np.float32,
+        )
+    node_demand = cache_configuration.node_specific_predicted_demand(
+        step.scenario_slice,
+        int(node_index),
+        proposal_cache_nodes,
+        context.cache_cfg,
+    )
+    observed_usage = cache_configuration.observed_local_service_usage(
+        context.local_cache,
+        int(context.service_catalog["num_services"]),
+    )
+    all_features = np.stack(
+        [
+            _cache_target_configuration_feature(
+                candidate,
+                current_cache,
+                previous_cache,
+                sequential_triggers,
+                node_demand,
+                observed_usage,
+                context,
+            )
+            for candidate in all_candidates
+        ]
+    ).astype(np.float32, copy=False)
+    predicted_delta_q = None
+    predicted_sigma = None
+    if surrogate_ready and surrogate_predictor is not None:
+        predicted_delta_q, predicted_sigma = surrogate_predictor(
+            np.asarray(conditional_context, dtype=np.float32), all_features
+        )
+    selected = cache_configuration.select_cache_target_configurations(
+        all_candidates,
+        np.asarray(current_cache, dtype=np.int8)[int(node_index)],
+        int(context.cache_cfg.target_candidate_capacity),
+        predicted_delta_q=predicted_delta_q,
+        predicted_sigma=predicted_sigma,
+        diversity_reserve=min(
+            12,
+            max(0, int(context.cache_cfg.target_candidate_capacity) - 1),
+        ),
+    )
+    selected_index_by_configuration = {
+        np.ascontiguousarray(candidate.target_node_cache).tobytes(): index
+        for index, candidate in enumerate(all_candidates)
+    }
+    selected_indices = [
+        selected_index_by_configuration[
+            np.ascontiguousarray(candidate.target_node_cache).tobytes()
+        ]
+        for candidate in selected
+    ]
+    return selected, all_features[np.asarray(selected_indices, dtype=np.int64)]
 
 
 def _build_update_candidate_set_summary(
@@ -495,7 +567,7 @@ def _build_update_candidate_set_summary(
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Pool a legal candidate set without using Candidate policy probabilities."""
 
-    feature_dim = 25 + 6 * int(service_count)
+    feature_dim = 21 + 6 * int(service_count)
     summary = np.zeros(1 + 2 * feature_dim, dtype=np.float32)
     diagnostics = {
         "mean_loaded_mb": 0.0,
@@ -1293,6 +1365,8 @@ def sample_and_apply_cache_reconfiguration_configuration(
     tensor_spec: PrimitiveTensorSpec,
     *,
     deterministic: bool = False,
+    cache_surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
+    cache_surrogate_ready: bool = False,
 ) -> CacheOperationPrimitiveSelectionResult:
     """Sample KEEP/UPDATE and one target-configuration conditional head."""
 
@@ -1408,48 +1482,25 @@ def sample_and_apply_cache_reconfiguration_configuration(
             step,
             context,
         )
-        candidates = cache_configuration.enumerate_cache_target_configurations(
+        hypothetical_triggers = cache_triggers.copy()
+        hypothetical_triggers[node_index] = 1
+        update_candidates, candidate_features = _target_cache_proposals_with_features(
             cache,
+            previous_cache,
+            hypothetical_triggers,
             node_index,
-            context.service_catalog,
+            conditional_context,
+            step,
+            context,
             proposal_cache_nodes,
-            step.scenario_slice,
-            context.local_cache,
-            context.cache_cfg,
+            surrogate_predictor=cache_surrogate_predictor,
+            surrogate_ready=bool(cache_surrogate_ready),
         )
-        update_candidates = candidates
         count = len(update_candidates)
         if count > tensor_spec.cache_max_candidates:
             raise AssertionError("Cache candidate count exceeds padded capacity")
         pre_trigger_candidate_logits: Any | None = None
-        candidate_features: np.ndarray | None = None
         if count > 0:
-            node_demand = cache_configuration.node_specific_predicted_demand(
-                step.scenario_slice,
-                node_index,
-                proposal_cache_nodes,
-                context.cache_cfg,
-            )
-            observed_usage = cache_configuration.observed_local_service_usage(
-                context.local_cache,
-                int(context.service_catalog["num_services"]),
-            )
-            hypothetical_triggers = cache_triggers.copy()
-            hypothetical_triggers[node_index] = 1
-            candidate_features = np.stack(
-                [
-                    _cache_target_configuration_feature(
-                        candidate,
-                        cache,
-                        previous_cache,
-                        hypothetical_triggers,
-                        node_demand,
-                        observed_usage,
-                        context,
-                    )
-                    for candidate in update_candidates
-                ]
-            ).astype(np.float32, copy=False)
             with torch.no_grad():
                 pre_trigger_candidate_logits = policy.score_cache_update_candidates(
                     conditional_context,
@@ -1690,6 +1741,8 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
     tensor_spec: PrimitiveTensorSpec,
     *,
     deterministic: bool = False,
+    cache_surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
+    cache_surrogate_ready: bool = False,
 ) -> JointCacheUavOperationPrimitiveSelectionResult:
     """Run target-cache reconfiguration followed by sequential STAY/MOVE decisions."""
 
@@ -1705,6 +1758,8 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
         context,
         tensor_spec,
         deterministic=bool(deterministic),
+        cache_surrogate_predictor=cache_surrogate_predictor,
+        cache_surrogate_ready=bool(cache_surrogate_ready),
     )
     current_uav = {
         uav_id: np.asarray(previous_uav_positions[uav_id], dtype=np.float64).copy()

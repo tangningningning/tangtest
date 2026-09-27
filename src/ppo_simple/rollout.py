@@ -238,6 +238,8 @@ def collect_rollout(
     conditional_action_mode: str | None = None,
     policy_diagnostic_callback: Callable[[int, Any], None] | None = None,
     action_transform: Callable[[np.ndarray], Any] | None = None,
+    cache_surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
+    cache_surrogate_ready: bool = False,
 ) -> SimpleRollout:
     """Collect one contiguous request rollout from a supplied environment state.
 
@@ -307,6 +309,8 @@ def collect_rollout(
                 context,
                 tensor_spec,
                 deterministic=bool(deterministic),
+                cache_surrogate_predictor=cache_surrogate_predictor,
+                cache_surrogate_ready=bool(cache_surrogate_ready),
             )
             sample = PolicySample(
                 action=np.asarray(joint_primitive.derived_action, dtype=np.int8),

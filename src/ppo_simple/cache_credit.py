@@ -19,13 +19,14 @@ from decision import cache_configuration, slot_environment, uav_configuration
 
 from .primitive_control import (
     _cache_candidate_feature,
-    _cache_target_configuration_feature,
     _intermediate_observation,
+    _target_cache_proposals_with_features,
 )
 from .rollout import _check_request_contract, _check_reward
 
 
 OPERATION_ORDER = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
+CACHE_SURROGATE_K_CANDIDATES = (4, 6, 8, 10, 12)
 
 
 def _position_dict(values: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -172,15 +173,6 @@ def _node_policy_state(
         # The proposed mainline enumerates complete target configurations.  No
         # primitive operation label reaches the policy, replay, or candidate
         # tensor; proposal_source is diagnostics-only provenance.
-        update_candidates = cache_configuration.enumerate_cache_target_configurations(
-            working_cache,
-            node_index,
-            context.service_catalog,
-            proposal_cache_nodes,
-            step.scenario_slice,
-            context.local_cache,
-            context.cache_cfg,
-        )
         action_map = _production_action_map(transition)
         sequential_triggers = np.zeros(
             len(context.action_spec.cache_node_ids), dtype=np.int8
@@ -189,31 +181,26 @@ def _node_policy_state(
             if str(action_map[index].get("conditional_action", "")).upper() != "KEEP":
                 sequential_triggers[index] = 1
         sequential_triggers[node_index] = 1
+        update_candidates, unified_features = _target_cache_proposals_with_features(
+            working_cache,
+            previous_cache,
+            sequential_triggers,
+            node_index,
+            np.asarray(conditional_context, dtype=np.float32),
+            step,
+            context,
+            proposal_cache_nodes,
+            surrogate_predictor=(
+                trainer._predict_cache_surrogate
+                if getattr(trainer, "cache_surrogate_ensemble", None) is not None
+                else None
+            ),
+            surrogate_ready=bool(
+                getattr(trainer, "cache_surrogate_screening_ready", False)
+                and getattr(trainer, "cache_surrogate_screening_active", False)
+            ),
+        )
         if update_candidates:
-            node_demand = cache_configuration.node_specific_predicted_demand(
-                step.scenario_slice,
-                node_index,
-                proposal_cache_nodes,
-                context.cache_cfg,
-            )
-            observed_usage = cache_configuration.observed_local_service_usage(
-                context.local_cache,
-                int(context.service_catalog["num_services"]),
-            )
-            unified_features = np.stack(
-                [
-                    _cache_target_configuration_feature(
-                        candidate,
-                        working_cache,
-                        previous_cache,
-                        sequential_triggers,
-                        node_demand,
-                        observed_usage,
-                        context,
-                    )
-                    for candidate in update_candidates
-                ]
-            ).astype(np.float32)
             candidate_probabilities = _candidate_probabilities(
                 trainer.policy,
                 np.asarray(conditional_context, dtype=np.float32),
@@ -588,11 +575,14 @@ def _rank_correlation(predicted: np.ndarray, exact: np.ndarray) -> float:
 def _screening_gate_metrics(rows: list[dict[str, np.ndarray]]) -> dict[str, Any]:
     """Aggregate full-Exact rows for K selection and safety gating."""
 
-    max_k = 12
-    recall_values: dict[int, list[float]] = {k: [] for k in range(1, max_k + 1)}
-    regret_values: dict[int, list[float]] = {k: [] for k in range(1, max_k + 1)}
+    recall_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
+    regret_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
     normalized_regret_values: dict[int, list[float]] = {
-        k: [] for k in range(1, max_k + 1)
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
     }
     rank_values: list[float] = []
     for row in rows:
@@ -609,7 +599,7 @@ def _screening_gate_metrics(rows: list[dict[str, np.ndarray]]) -> dict[str, Any]
         best_mask = np.isclose(exact_q, best_q, rtol=1.0e-10, atol=1.0e-10)
         ranking = np.argsort(-predicted, kind="mergesort")
         q_range = float(np.max(exact_q) - np.min(exact_q))
-        for k in range(1, min(max_k, len(predicted)) + 1):
+        for k in CACHE_SURROGATE_K_CANDIDATES:
             top = ranking[:k]
             recall_values[k].append(float(np.any(best_mask[top])))
             selected_best_q = float(np.max(exact_q[top]))
@@ -901,6 +891,7 @@ def evaluate_cache_full_information_values(
     exact_context_labels: list[np.ndarray] = []
     exact_feature_labels: list[np.ndarray] = []
     exact_delta_labels: list[float] = []
+    exact_group_labels: list[int] = []
     screening_rows: list[dict[str, np.ndarray]] = []
     surrogate_ready = bool(
         not force_full_exact
@@ -1086,6 +1077,9 @@ def evaluate_cache_full_information_values(
                     exact_delta_labels.append(
                         float(exact_by_index[int(candidate_index)] - keep_value)
                     )
+                    exact_group_labels.append(
+                        int(sample_index * node_count + node_index)
+                    )
                 if full_exact_row:
                     exact_delta = exact_by_index - keep_value
                     screening_rows.append(
@@ -1211,11 +1205,12 @@ def evaluate_cache_full_information_values(
             np.asarray(exact_context_labels, dtype=np.float32).reshape(
                 -1, int(trainer.cache_surrogate_context_dim)
             ),
-            np.asarray(exact_feature_labels, dtype=np.float32).reshape(
-                -1, int(trainer.cache_surrogate_feature_dim)
-            ),
-            np.asarray(exact_delta_labels, dtype=np.float32),
-        )
+                np.asarray(exact_feature_labels, dtype=np.float32).reshape(
+                    -1, int(trainer.cache_surrogate_feature_dim)
+                ),
+                np.asarray(exact_delta_labels, dtype=np.float32),
+                ranking_group_ids=np.asarray(exact_group_labels, dtype=np.int64),
+            )
     surrogate_training_runtime_seconds = float(
         time.perf_counter() - surrogate_train_started
     )
