@@ -97,7 +97,7 @@ REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
 # Full-information Cache Trigger/Candidate teachers change the actor objective;
 # proposed-joint checkpoints from earlier Cache objectives cannot be resumed.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 20
+JOINT_PROPOSED_CHECKPOINT_VERSION = 21
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
@@ -6674,27 +6674,45 @@ class PPOV2Trainer:
                 raise RuntimeError(
                     "Cache UPDATE action/head shape differs from candidate rollout tensors"
                 )
-            # KEEP behavior does not materialize its counterfactual UPDATE set.
-            # The evaluator reconstructs that complete set from state; only
-            # sampled UPDATE rows must preserve rollout candidate ordering.
+            # The evaluator forms the policy set after full-universe Hybrid
+            # ranking. Sampled UPDATE targets must remain present, but their
+            # index may change relative to the provisional rollout set.
             if np.any(update_heads):
-                if not np.array_equal(
-                    rollout_candidate_mask[update_heads],
-                    evaluated_candidate_mask[update_heads],
-                ):
-                    raise RuntimeError(
-                        "full-information Cache candidate ordering/mask differs on UPDATE rows"
-                    )
-                selected_update_masks = evaluated_candidate_mask[update_heads]
-                if not np.allclose(
-                    rollout_candidate_features[update_heads][selected_update_masks],
-                    evaluated_candidate_features[update_heads][selected_update_masks],
-                    rtol=0.0,
-                    atol=1.0e-6,
-                ):
-                    raise RuntimeError(
-                        "full-information Cache candidate features differ on UPDATE rows"
-                    )
+                if rollout.cache_selected_indices is None:
+                    raise RuntimeError("Cache UPDATE rows lack selected candidate indices")
+                selected_indices = np.asarray(
+                    rollout.cache_selected_indices, dtype=np.int64
+                )
+                for transition_index, head_index in np.argwhere(update_heads):
+                    selected_index = int(selected_indices[transition_index, head_index])
+                    if (
+                        selected_index < 0
+                        or selected_index >= rollout_candidate_mask.shape[2]
+                        or not rollout_candidate_mask[
+                            transition_index, head_index, selected_index
+                        ]
+                    ):
+                        raise RuntimeError("Cache UPDATE selected candidate is invalid")
+                    selected_feature = rollout_candidate_features[
+                        transition_index, head_index, selected_index
+                    ]
+                    legal_features = evaluated_candidate_features[
+                        transition_index,
+                        head_index,
+                        evaluated_candidate_mask[transition_index, head_index],
+                    ]
+                    if not any(
+                        np.allclose(
+                            selected_feature,
+                            candidate_feature,
+                            rtol=0.0,
+                            atol=1.0e-6,
+                        )
+                        for candidate_feature in legal_features
+                    ):
+                        raise RuntimeError(
+                            "post-Hybrid Cache policy set dropped the sampled UPDATE target"
+                        )
             with torch.no_grad():
                 cache_old_operation_log_probs_all = (
                     self._cache_trigger_log_probabilities_all(

@@ -475,20 +475,16 @@ def _cache_target_configuration_feature(
     return values.astype(np.float32)
 
 
-def _target_cache_proposals_with_features(
+def _all_cache_target_configurations_with_features(
     current_cache: np.ndarray,
     previous_cache: np.ndarray,
     sequential_triggers: np.ndarray,
     node_index: int,
-    conditional_context: np.ndarray,
     step: Any,
     context: Any,
     proposal_cache_nodes: dict[str, Any],
-    *,
-    surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
-    surrogate_ready: bool = False,
 ) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
-    """Create cheap features for all feasible targets, then select at capacity."""
+    """Enumerate the complete feasible universe and compute only cheap features."""
 
     all_candidates = cache_configuration.enumerate_all_cache_target_configurations(
         current_cache,
@@ -528,6 +524,35 @@ def _target_cache_proposals_with_features(
             for candidate in all_candidates
         ]
     ).astype(np.float32, copy=False)
+    return all_candidates, all_features
+
+
+def _target_cache_proposals_with_features(
+    current_cache: np.ndarray,
+    previous_cache: np.ndarray,
+    sequential_triggers: np.ndarray,
+    node_index: int,
+    conditional_context: np.ndarray,
+    step: Any,
+    context: Any,
+    proposal_cache_nodes: dict[str, Any],
+    *,
+    surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
+    surrogate_ready: bool = False,
+) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
+    """Build the provisional rollout set from the complete feasible universe."""
+
+    all_candidates, all_features = _all_cache_target_configurations_with_features(
+        current_cache,
+        previous_cache,
+        sequential_triggers,
+        node_index,
+        step,
+        context,
+        proposal_cache_nodes,
+    )
+    if not all_candidates:
+        return all_candidates, all_features
     predicted_delta_q = None
     predicted_sigma = None
     if surrogate_ready and surrogate_predictor is not None:

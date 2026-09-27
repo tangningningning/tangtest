@@ -1850,6 +1850,7 @@ def select_cache_target_configurations(
     predicted_delta_q: np.ndarray | None = None,
     predicted_sigma: np.ndarray | None = None,
     diversity_reserve: int = 0,
+    required_indices: tuple[int, ...] = (),
 ) -> list[CacheTargetCandidate]:
     """Select a bounded proposal set with anchors, surrogate ranks, and diversity."""
 
@@ -1882,9 +1883,16 @@ def select_cache_target_configurations(
     selected: dict[int, str] = {}
 
     def add(index: int, label: str | None = None) -> None:
+        if index < 0 or index >= len(source):
+            raise IndexError("required Cache candidate index is out of range")
         if len(selected) >= limit or index in selected:
             return
         selected[index] = label or source[index].proposal_source
+
+    # Hybrid-confirmed and production-selected targets cannot be displaced by
+    # anchors when the policy tensor reaches capacity.
+    for index in dict.fromkeys(int(value) for value in required_indices):
+        add(index, "required")
 
     # Preserve all demand/replica/intermediate anchors before filling the set.
     anchor_priority = {"prediction": 0, "replica_aware": 1, "intermediate": 2}

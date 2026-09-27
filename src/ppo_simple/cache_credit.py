@@ -18,6 +18,7 @@ import torch
 from decision import cache_configuration, slot_environment, uav_configuration
 
 from .primitive_control import (
+    _all_cache_target_configurations_with_features,
     _cache_candidate_feature,
     _intermediate_observation,
     _target_cache_proposals_with_features,
@@ -26,7 +27,7 @@ from .rollout import _check_request_contract, _check_reward
 
 
 OPERATION_ORDER = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
-CACHE_SURROGATE_K_CANDIDATES = (4, 6, 8, 10, 12)
+CACHE_SURROGATE_K_CANDIDATES = (4, 6, 8, 10, 12, 16)
 
 
 def _position_dict(values: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -572,7 +573,41 @@ def _rank_correlation(predicted: np.ndarray, exact: np.ndarray) -> float:
     return float(np.sum(predicted_centered * exact_centered) / denominator)
 
 
-def _screening_gate_metrics(rows: list[dict[str, np.ndarray]]) -> dict[str, Any]:
+def _hybrid_exact_indices(
+    predicted_delta: np.ndarray,
+    predicted_sigma: np.ndarray,
+    selected_k: int,
+    *,
+    anchor_indices: tuple[int, ...] = (),
+    production_selected_index: int | None = None,
+    random_audit_index: int | None = None,
+) -> list[int]:
+    """Choose the Exact-Q subset from the complete feasible universe."""
+
+    predicted = np.asarray(predicted_delta, dtype=np.float64).reshape(-1)
+    sigma = np.asarray(predicted_sigma, dtype=np.float64).reshape(-1)
+    if predicted.shape != sigma.shape or not np.all(np.isfinite(predicted)) or not np.all(
+        np.isfinite(sigma)
+    ):
+        raise ValueError("full-universe Hybrid scores are invalid")
+    if not len(predicted):
+        return []
+    k = max(1, min(int(selected_k), len(predicted)))
+    selected = set(int(index) for index in anchor_indices)
+    if production_selected_index is not None:
+        selected.add(int(production_selected_index))
+    selected.update(int(index) for index in np.argsort(-predicted, kind="mergesort")[:k])
+    ucb = predicted + 2.0 * np.maximum(sigma, 0.0)
+    selected.update(int(index) for index in np.argsort(-ucb, kind="mergesort")[:k])
+    selected.add(int(np.argmax(sigma)))
+    if random_audit_index is not None:
+        selected.add(int(random_audit_index))
+    if any(index < 0 or index >= len(predicted) for index in selected):
+        raise IndexError("Hybrid Exact-Q subset index is out of range")
+    return sorted(selected)
+
+
+def _screening_gate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate full-Exact rows for K selection and safety gating."""
 
     recall_values: dict[int, list[float]] = {
@@ -584,7 +619,24 @@ def _screening_gate_metrics(rows: list[dict[str, np.ndarray]]) -> dict[str, Any]
     normalized_regret_values: dict[int, list[float]] = {
         k: [] for k in CACHE_SURROGATE_K_CANDIDATES
     }
-    rank_values: list[float] = []
+    top3_overlap_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
+    trigger_sign_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
+    rank_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
+    mae_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
+    squared_residual_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
+    exact_count_values: dict[int, list[float]] = {
+        k: [] for k in CACHE_SURROGATE_K_CANDIDATES
+    }
     for row in rows:
         predicted = np.asarray(row["predicted_delta_q"], dtype=np.float64).reshape(-1)
         exact_q = np.asarray(row["exact_q"], dtype=np.float64).reshape(-1)
@@ -592,21 +644,51 @@ def _screening_gate_metrics(rows: list[dict[str, np.ndarray]]) -> dict[str, Any]
             continue
         if not np.all(np.isfinite(predicted)) or not np.all(np.isfinite(exact_q)):
             raise FloatingPointError("Cache screening gate inputs are non-finite")
-        rank = _rank_correlation(predicted, exact_q)
-        if np.isfinite(rank):
-            rank_values.append(rank)
         best_q = float(np.max(exact_q))
         best_mask = np.isclose(exact_q, best_q, rtol=1.0e-10, atol=1.0e-10)
-        ranking = np.argsort(-predicted, kind="mergesort")
         q_range = float(np.max(exact_q) - np.min(exact_q))
+        exact_top3 = set(np.argsort(-exact_q, kind="mergesort")[: min(3, len(exact_q))])
+        anchors = tuple(int(value) for value in row.get("anchor_indices", ()))
+        production_index_value = row.get("production_selected_index")
+        production_index = (
+            None if production_index_value is None else int(production_index_value)
+        )
+        random_index_value = row.get("random_audit_index")
+        random_index = None if random_index_value is None else int(random_index_value)
         for k in CACHE_SURROGATE_K_CANDIDATES:
-            top = ranking[:k]
-            recall_values[k].append(float(np.any(best_mask[top])))
-            selected_best_q = float(np.max(exact_q[top]))
-            regret = max(0.0, best_q - selected_best_q)
+            exact_indices = _hybrid_exact_indices(
+                predicted,
+                np.asarray(row["predicted_sigma"], dtype=np.float64),
+                k,
+                anchor_indices=anchors,
+                production_selected_index=production_index,
+                random_audit_index=random_index,
+            )
+            hybrid = predicted.copy()
+            hybrid[np.asarray(exact_indices, dtype=np.int64)] = exact_q[
+                np.asarray(exact_indices, dtype=np.int64)
+            ]
+            ranking = np.argsort(-hybrid, kind="mergesort")
+            hybrid_best = int(ranking[0])
+            recall_values[k].append(float(best_mask[hybrid_best]))
+            regret = max(0.0, best_q - float(exact_q[hybrid_best]))
             normalized = regret / (q_range + 1.0e-12)
             regret_values[k].append(regret)
             normalized_regret_values[k].append(normalized)
+            hybrid_top3 = set(ranking[: min(3, len(ranking))])
+            top3_overlap_values[k].append(
+                float(len(exact_top3 & hybrid_top3) / max(len(exact_top3), 1))
+            )
+            trigger_sign_values[k].append(
+                float((best_q >= 0.0) == (float(np.max(hybrid)) >= 0.0))
+            )
+            rank = _rank_correlation(hybrid, exact_q)
+            if np.isfinite(rank):
+                rank_values[k].append(rank)
+            residual = hybrid - exact_q
+            mae_values[k].extend(np.abs(residual).tolist())
+            squared_residual_values[k].extend(np.square(residual).tolist())
+            exact_count_values[k].append(float(len(exact_indices)))
 
     def _stats(values: list[float]) -> dict[str, float | None]:
         if not values:
@@ -655,8 +737,30 @@ def _screening_gate_metrics(rows: list[dict[str, np.ndarray]]) -> dict[str, Any]
         "regret_at_k": regret_by_k,
         "normalized_regret_at_k": normalized_regret_by_k,
         "normalized_regret_p95_at_k": normalized_p95,
+        "top3_overlap_at_k": {
+            str(k): float(np.mean(values)) for k, values in top3_overlap_values.items() if values
+        },
+        "trigger_sign_agreement_at_k": {
+            str(k): float(np.mean(values)) for k, values in trigger_sign_values.items() if values
+        },
+        "rank_correlation_at_k": {
+            str(k): float(np.mean(values)) for k, values in rank_values.items() if values
+        },
+        "delta_q_mae_at_k": {
+            str(k): float(np.mean(values)) for k, values in mae_values.items() if values
+        },
+        "delta_q_rmse_at_k": {
+            str(k): float(np.sqrt(np.mean(values)))
+            for k, values in squared_residual_values.items()
+            if values
+        },
+        "exact_evaluated_count_mean_at_k": {
+            str(k): float(np.mean(values)) for k, values in exact_count_values.items() if values
+        },
         "rank_correlation": (
-            None if not rank_values else float(np.mean(np.asarray(rank_values)))
+            None
+            if not rank_values[CACHE_SURROGATE_K_CANDIDATES[-1]]
+            else float(np.mean(rank_values[CACHE_SURROGATE_K_CANDIDATES[-1]]))
         ),
     }
 
@@ -673,17 +777,23 @@ def _selected_cache_candidate_index(
     operation_actions = getattr(transition, "cache_operation_actions", None)
     if operation_actions is not None and int(operation_actions[node_index]) == 0:
         return None
-    selected_indices = getattr(transition, "cache_selected_indices", None)
-    if selected_indices is not None:
-        selected_index = int(selected_indices[node_index])
-        if 0 <= selected_index < len(candidates):
-            return selected_index
     actions = _production_action_map(transition)
     action = actions.get(int(node_index), {})
     target = action.get("target_cache")
-    if target is None:
+    target_array = None if target is None else np.asarray(target, dtype=np.int8)
+    selected_indices = getattr(transition, "cache_selected_indices", None)
+    if selected_indices is not None:
+        selected_index = int(selected_indices[node_index])
+        if 0 <= selected_index < len(candidates) and (
+            target_array is None
+            or np.array_equal(
+                target_array,
+                np.asarray(candidates[selected_index].target_node_cache, dtype=np.int8),
+            )
+        ):
+            return selected_index
+    if target_array is None:
         return None
-    target_array = np.asarray(target, dtype=np.int8)
     for candidate_index, candidate in enumerate(candidates):
         if np.array_equal(
             target_array,
@@ -892,7 +1002,9 @@ def evaluate_cache_full_information_values(
     exact_feature_labels: list[np.ndarray] = []
     exact_delta_labels: list[float] = []
     exact_group_labels: list[int] = []
-    screening_rows: list[dict[str, np.ndarray]] = []
+    screening_rows: list[dict[str, Any]] = []
+    feasible_universe_counts: list[int] = []
+    policy_best_recalled: list[float] = []
     surrogate_ready = bool(
         not force_full_exact
         and getattr(trainer, "cache_surrogate_screening_ready", False)
@@ -922,33 +1034,40 @@ def evaluate_cache_full_information_values(
                 node_index,
                 feature_dim,
             )
-            candidates = tuple(state["candidates"])
-            count = len(candidates)
-            if count > candidate_capacity:
-                raise RuntimeError(
-                    "legal Cache candidate count exceeds rollout capacity: "
-                    f"count={count}, capacity={candidate_capacity}"
+            action_map = _production_action_map(transition)
+            sequential_triggers = np.zeros(node_count, dtype=np.int8)
+            for earlier_index in range(node_index):
+                if (
+                    str(action_map[earlier_index].get("conditional_action", "")).upper()
+                    != "KEEP"
+                ):
+                    sequential_triggers[earlier_index] = 1
+            sequential_triggers[node_index] = 1
+            proposal_cache_nodes = uav_configuration.cache_nodes_with_uav_positions(
+                trainer.context.cache_nodes,
+                _position_dict(transition.previous_uav_positions),
+            )
+            universe_candidates_list, universe_features = (
+                _all_cache_target_configurations_with_features(
+                    state["working_cache"],
+                    state["previous_cache"],
+                    sequential_triggers,
+                    node_index,
+                    step,
+                    trainer.context,
+                    proposal_cache_nodes,
                 )
-            candidate_counts[sample_index, node_index] = count
-            logical_candidate_count += count
+            )
+            universe_candidates = tuple(universe_candidates_list)
+            universe_count = len(universe_candidates)
+            feasible_universe_counts.append(universe_count)
+            logical_candidate_count += universe_count
             keep_branch_count += 1
             trigger_policy_probabilities[sample_index, node_index] = (
                 float(state["p_keep"]),
                 float(state["p_update"]),
             )
-            if count:
-                features = np.stack(state["candidate_features"]).astype(
-                    np.float32, copy=False
-                )
-                candidate_features[sample_index, node_index, :count] = features
-                candidate_operation_indices[sample_index, node_index, :count] = (
-                    np.asarray(state["candidate_operations"], dtype=np.int64)
-                )
-                candidate_policy_probabilities[sample_index, node_index, :count] = (
-                    np.asarray(state["candidate_probabilities"], dtype=np.float64)
-                )
-                candidate_valid[sample_index, node_index, :count] = True
-            for candidate in (None, *candidates):
+            for candidate in (None, *universe_candidates):
                 full_exact_branch_keys.add(
                     _cache_branch_identity(
                         transition,
@@ -958,71 +1077,69 @@ def evaluate_cache_full_information_values(
                     )
                 )
 
-            predicted_delta = np.zeros(count, dtype=np.float64)
-            predicted_sigma = np.zeros(count, dtype=np.float64)
+            predicted_delta = np.zeros(universe_count, dtype=np.float64)
+            predicted_sigma = np.zeros(universe_count, dtype=np.float64)
             if (
-                count
+                universe_count
                 and not force_full_exact
                 and getattr(trainer, "cache_surrogate_ensemble", None) is not None
             ):
                 inference_started = time.perf_counter()
                 predicted_delta, predicted_sigma = trainer._predict_cache_surrogate(
                     np.asarray(state["conditional_context"], dtype=np.float32),
-                    np.stack(state["candidate_features"]).astype(np.float32),
+                    universe_features,
                 )
                 surrogate_inference_runtime_seconds += time.perf_counter() - inference_started
                 predicted_delta = np.asarray(predicted_delta, dtype=np.float64)
                 predicted_sigma = np.asarray(predicted_sigma, dtype=np.float64)
-            if count:
-                candidate_predicted_delta_q[sample_index, node_index, :count] = predicted_delta
-                candidate_predicted_sigma[sample_index, node_index, :count] = predicted_sigma
-
             periodic_audit = bool(
                 surrogate_ready
-                and count
+                and universe_count
                 and (int(transition.origin_index) - int(trainer.context.train_origin_start))
                 % max(int(getattr(trainer, "cache_surrogate_audit_interval", 20)), 1)
                 == 0
             )
             full_exact_row = bool(force_full_exact or not surrogate_ready or periodic_audit)
+            production_selected_index = _selected_cache_candidate_index(
+                transition,
+                node_index,
+                list(universe_candidates),
+            )
+            anchor_indices = tuple(
+                index
+                for index, candidate in enumerate(universe_candidates)
+                if str(candidate.proposal_source)
+                in {"prediction", "replica_aware", "intermediate"}
+            )
+            random_audit_index = (
+                None
+                if not universe_count
+                else int(surrogate_rng.integers(0, universe_count))
+            )
             if full_exact_row:
-                exact_indices = list(range(count))
+                exact_indices = list(range(universe_count))
                 if periodic_audit:
                     full_exact_audit_count += 1
             else:
-                selected = set()
-                selected_rollout = _selected_cache_candidate_index(
-                    transition,
-                    node_index,
-                    list(candidates),
-                )
-                if selected_rollout is not None:
-                    selected.add(int(selected_rollout))
                 selected_k = max(
                     1,
                     min(
                         int(getattr(trainer, "cache_surrogate_selected_k", None) or 1),
-                        count,
+                        universe_count,
                     ),
                 )
-                selected.update(
-                    int(index)
-                    for index in np.argsort(-predicted_delta, kind="mergesort")[:selected_k]
+                exact_indices = _hybrid_exact_indices(
+                    predicted_delta,
+                    predicted_sigma,
+                    selected_k,
+                    anchor_indices=anchor_indices,
+                    production_selected_index=production_selected_index,
+                    random_audit_index=random_audit_index,
                 )
-                ucb = predicted_delta + 2.0 * predicted_sigma
-                selected.update(
-                    int(index)
-                    for index in np.argsort(-ucb, kind="mergesort")[:selected_k]
-                )
-                selected.add(int(np.argmax(predicted_sigma)))
-                unselected = sorted(set(range(count)) - selected)
-                if unselected:
-                    selected.add(int(surrogate_rng.choice(np.asarray(unselected, dtype=np.int64))))
-                exact_indices = sorted(selected)
             exact_candidate_count += len(exact_indices)
-            surrogate_candidate_count += count - len(exact_indices)
+            surrogate_candidate_count += universe_count - len(exact_indices)
             branch_candidates: list[Any | None] = [None]
-            branch_candidates.extend(candidates[index] for index in exact_indices)
+            branch_candidates.extend(universe_candidates[index] for index in exact_indices)
             exact_values: list[float] = []
             for candidate in branch_candidates:
                 identity = _cache_branch_identity(
@@ -1050,21 +1167,71 @@ def evaluate_cache_full_information_values(
                 exact_values.append(q_value)
             keep_value = float(exact_values[0])
             q_keep[sample_index, node_index] = keep_value
-            if count:
-                candidate_q[sample_index, node_index, :count] = keep_value + predicted_delta
-                exact_by_index = np.full(count, np.nan, dtype=np.float64)
+            if universe_count:
+                hybrid_q = keep_value + predicted_delta
+                exact_by_index = np.full(universe_count, np.nan, dtype=np.float64)
                 if exact_indices:
                     exact_by_index[np.asarray(exact_indices, dtype=np.int64)] = np.asarray(
                         exact_values[1:], dtype=np.float64
                     )
-                    candidate_q[sample_index, node_index, np.asarray(exact_indices)] = (
-                        exact_by_index[np.asarray(exact_indices)]
+                    hybrid_q[np.asarray(exact_indices, dtype=np.int64)] = exact_by_index[
+                        np.asarray(exact_indices, dtype=np.int64)
+                    ]
+                hybrid_delta = hybrid_q - keep_value
+                universe_best_index = int(np.argmax(hybrid_q))
+                required_indices = [universe_best_index]
+                if production_selected_index is not None:
+                    required_indices.append(int(production_selected_index))
+                policy_candidates = cache_configuration.select_cache_target_configurations(
+                    list(universe_candidates),
+                    np.asarray(state["working_cache"], dtype=np.int8)[node_index],
+                    candidate_capacity,
+                    predicted_delta_q=hybrid_delta,
+                    predicted_sigma=predicted_sigma,
+                    diversity_reserve=min(12, max(0, candidate_capacity - 1)),
+                    required_indices=tuple(required_indices),
+                )
+                universe_index_by_configuration = {
+                    np.ascontiguousarray(candidate.target_node_cache).tobytes(): index
+                    for index, candidate in enumerate(universe_candidates)
+                }
+                policy_indices = np.asarray(
+                    [
+                        universe_index_by_configuration[
+                            np.ascontiguousarray(candidate.target_node_cache).tobytes()
+                        ]
+                        for candidate in policy_candidates
+                    ],
+                    dtype=np.int64,
+                )
+                count = len(policy_indices)
+                if count > candidate_capacity:
+                    raise RuntimeError("post-Hybrid policy Candidate set exceeds capacity")
+                candidate_counts[sample_index, node_index] = count
+                policy_best_recalled.append(float(universe_best_index in set(policy_indices)))
+                candidate_features[sample_index, node_index, :count] = universe_features[
+                    policy_indices
+                ]
+                candidate_operation_indices[sample_index, node_index, :count] = 0
+                candidate_policy_probabilities[sample_index, node_index, :count] = (
+                    _candidate_probabilities(
+                        trainer.policy,
+                        np.asarray(state["conditional_context"], dtype=np.float32),
+                        universe_features[policy_indices],
                     )
-                    candidate_exact_evaluated[sample_index, node_index, np.asarray(exact_indices)] = True
+                )
+                candidate_valid[sample_index, node_index, :count] = True
+                candidate_q[sample_index, node_index, :count] = hybrid_q[policy_indices]
+                candidate_predicted_delta_q[sample_index, node_index, :count] = predicted_delta[
+                    policy_indices
+                ]
+                candidate_predicted_sigma[sample_index, node_index, :count] = predicted_sigma[
+                    policy_indices
+                ]
+                policy_exact = np.isfinite(exact_by_index[policy_indices])
+                candidate_exact_evaluated[sample_index, node_index, :count] = policy_exact
                 candidate_q_sources[sample_index, node_index, :count] = np.where(
-                    candidate_exact_evaluated[sample_index, node_index, :count],
-                    "EXACT_Q",
-                    "SURROGATE_Q",
+                    policy_exact, "EXACT_Q", "SURROGATE_Q"
                 )
                 exact_target_indices = np.asarray(exact_indices, dtype=np.int64)
                 for candidate_index in exact_target_indices:
@@ -1072,7 +1239,7 @@ def evaluate_cache_full_information_values(
                         np.asarray(state["conditional_context"], dtype=np.float32)
                     )
                     exact_feature_labels.append(
-                        np.asarray(state["candidate_features"][int(candidate_index)], dtype=np.float32)
+                        np.asarray(universe_features[int(candidate_index)], dtype=np.float32)
                     )
                     exact_delta_labels.append(
                         float(exact_by_index[int(candidate_index)] - keep_value)
@@ -1085,7 +1252,11 @@ def evaluate_cache_full_information_values(
                     screening_rows.append(
                         {
                             "predicted_delta_q": predicted_delta.copy(),
+                            "predicted_sigma": predicted_sigma.copy(),
                             "exact_q": exact_delta.copy(),
+                            "anchor_indices": anchor_indices,
+                            "production_selected_index": production_selected_index,
+                            "random_audit_index": random_audit_index,
                         }
                     )
         full_exact_environment_baseline += len(full_exact_branch_keys)
@@ -1278,6 +1449,22 @@ def evaluate_cache_full_information_values(
         "candidate_features": candidate_features,
         "candidate_operation_indices": candidate_operation_indices,
         "candidate_counts": candidate_counts,
+        "feasible_universe_counts": np.asarray(feasible_universe_counts, dtype=np.int64),
+        "feasible_universe_enumeration_coverage": 1.0,
+        "full_universe_candidate_count_mean": (
+            float(np.mean(feasible_universe_counts)) if feasible_universe_counts else 0.0
+        ),
+        "full_universe_candidate_count_p90": (
+            float(np.percentile(feasible_universe_counts, 90.0))
+            if feasible_universe_counts
+            else 0.0
+        ),
+        "full_universe_candidate_count_max": (
+            int(np.max(feasible_universe_counts)) if feasible_universe_counts else 0
+        ),
+        "policy_candidate_best_recall": (
+            float(np.mean(policy_best_recalled)) if policy_best_recalled else 1.0
+        ),
         "counterfactual_environment_executions": int(environment_executions),
         "logical_candidate_count": int(logical_candidate_count),
         "keep_branch_count": int(keep_branch_count),
