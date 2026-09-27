@@ -260,6 +260,8 @@ def _actual_optimizers(trainer: Any) -> tuple[Any, Any]:
     critic_optimizer = getattr(trainer, "critic_optimizer", None)
     shared_optimizer = getattr(trainer, "optimizer", None)
     if actor_optimizer is None:
+        actor_optimizer = getattr(trainer, "cache_optimizer", None)
+    if actor_optimizer is None:
         actor_optimizer = shared_optimizer
     if critic_optimizer is None:
         critic_optimizer = shared_optimizer
@@ -599,6 +601,41 @@ def write_run_manifest(
     current["current_target_epochs"] = int(target_epochs)
     _write_json(path, current)
     return current
+
+
+def update_run_manifest_teacher_state(path: Path, trainer: Any) -> dict[str, Any]:
+    """Persist calibrated training-only Cache teacher and screening state."""
+
+    manifest_path = Path(path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"run manifest is missing: {manifest_path}")
+    payload = _read_json(manifest_path)
+    if hasattr(trainer, "cache_credit_metadata"):
+        payload.update(trainer.cache_credit_metadata())
+    payload.update(
+        {
+            "cache_teacher_scale_calibration": dict(
+                getattr(trainer, "cache_teacher_scale_calibration", {}) or {}
+            ),
+            "cache_surrogate_training_count": int(
+                getattr(trainer, "cache_surrogate_training_count", 0)
+            ),
+            "cache_surrogate_screening_ready": bool(
+                getattr(trainer, "cache_surrogate_screening_ready", False)
+            ),
+            "cache_surrogate_screening_active": bool(
+                getattr(trainer, "cache_surrogate_screening_active", False)
+            ),
+            "cache_surrogate_selected_k": getattr(
+                trainer, "cache_surrogate_selected_k", None
+            ),
+            "cache_surrogate_audit_statistics": getattr(
+                trainer, "cache_surrogate_audit_statistics", None
+            ),
+        }
+    )
+    _write_json(manifest_path, payload)
+    return payload
 
 
 def _episode_records(path: Path) -> tuple[list[dict[str, Any]], bool]:

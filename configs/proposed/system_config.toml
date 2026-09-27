@@ -541,9 +541,9 @@ method = "ppo_simple_v2"
 # modes remain only for preserved baselines. v2 appends one normalized finite-horizon time-to-go
 # state feature; v1 remains available only for its preserved baseline checkpoint.
 configuration_control_mode = "adaptive_joint_cache_uav_reconfiguration"
-# Proposed joint mainline: Cache uses the actual-rollout global GAE PPO credit;
-# the UAV operation and candidate teachers remain the existing Exact-Q teachers.
-# Cache counterfactual/Action-Q modules are diagnostic history only.
+# Proposed joint mainline: Cache Trigger and Candidate share the full-information
+# best-update/candidate-specific value teacher. UAV Operation and Candidate use
+# independent Exact-Q teachers and optimizer/KL branches.
 policy_schema = "adaptive_joint_cache_uav_ppo"
 kl_gate_mode = "branch_specific"
 hidden_sizes = [128, 128]
@@ -563,6 +563,7 @@ max_grad_norm = 0.5
 # 后续实验如需要再进行有限敏感性分析。
 update_epochs = 4
 target_kl = 0.10
+cache_kl_control = "minibatch_early_stop"
 num_minibatches = 10
 # 300 transitions / 10 minibatches = 30 samples per minibatch.
 minibatch_size = 30
@@ -579,11 +580,15 @@ uav_operation_advantage_source = "FULL_INFORMATION_EXACT_Q_TEACHER"
 uav_candidate_advantage_source = "EXACT_Q_LISTWISE"
 candidate_advantage_normalization = "EXACT_Q_LISTWISE"
 # Formal Cache credit shares one fixed-downstream full-exact value evaluator.
-cache_trigger_teacher_temperature = 1.0
-cache_candidate_teacher_temperature = 1.0
+cache_teacher_scale_mode = "training_rollout_mad"
+cache_teacher_scale_epsilon = 1.0e-3
+cache_teacher_scale_max = 1.0e3
+cache_learning_rate = 5.0e-4
+uav_operation_learning_rate = 5.0e-4
+uav_candidate_learning_rate = 5.0e-4
 cache_trigger_credit_source = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 cache_candidate_credit_source = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
-cache_value_evaluator = "FULL_EXACT"
+cache_value_evaluator = "HYBRID_EXACT_SURROGATE"
 cache_downstream_mode = "FIXED_DOWNSTREAM"
 cache_counterfactual_mode = "FULL_EXACT_CORRECTNESS_GATE"
 cache_trigger_policy = "TRUE_BINARY_KEEP_UPDATE"

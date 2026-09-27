@@ -1753,7 +1753,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
     """
 
     architecture_id = "adaptive_joint_cache_uav_ppo"
-    architecture_version = 3
+    architecture_version = 4
     trigger_order = ("KEEP", "UPDATE")
     true_binary_trigger = True
 
@@ -1794,7 +1794,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         if self.trigger_service_count <= 0:
             raise ValueError("proposed Trigger requires at least one service")
         self.trigger_workload_dim = self.trigger_service_count * 3
-        self.trigger_candidate_summary_dim = 1 + int(cache_feature_dim)
+        self.trigger_candidate_summary_dim = 1 + 2 * int(cache_feature_dim)
         self.trigger_aux_dim = (
             self.trigger_workload_dim + self.trigger_candidate_summary_dim
         )
@@ -1864,25 +1864,28 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             "cache": tuple(
                 parameter
                 for module in (
+                    self.cache_encoder,
                     self.cache_trigger_head,
                     self.cache_candidate_scorer,
                 )
                 for parameter in module.parameters()
             ),
-            "uav": tuple(
+            "uav_operation": tuple(
                 parameter
                 for module in (
+                    self.uav_encoder,
                     self.uav_operation_head,
+                )
+                for parameter in module.parameters()
+            ),
+            "uav_candidate": tuple(
+                parameter
+                for module in (
+                    self.uav_candidate_encoder,
                     self.uav_candidate_scorer,
                 )
                 for parameter in module.parameters()
             ),
-            "cache_encoder": tuple(self.cache_encoder.parameters()),
-            "uav_encoder": tuple(self.uav_encoder.parameters()),
-            "uav_candidate_encoder": tuple(
-                self.uav_candidate_encoder.parameters()
-            ),
-            "shared": (),
         }
         group_ids = [
             id(parameter)
@@ -1895,34 +1898,6 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         if set(group_ids) != actor_ids:
             raise RuntimeError("proposed actor gradient groups do not cover the actor.")
         return groups
-
-    def actor_gradient_clipping_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
-        """Return disjoint Cache/UAV clipping groups without changing Adam."""
-
-        groups = self.actor_gradient_parameter_groups()
-        if groups.get("shared", ()):
-            raise RuntimeError(
-                "proposed actor clipping cannot split shared actor parameters"
-            )
-        clipping_groups = {
-            "cache": groups["cache_encoder"] + groups["cache"],
-            "uav": (
-                groups["uav_encoder"]
-                + groups["uav_candidate_encoder"]
-                + groups["uav"]
-            ),
-        }
-        clipping_ids = [
-            id(parameter)
-            for parameters in clipping_groups.values()
-            for parameter in parameters
-        ]
-        if len(set(clipping_ids)) != len(clipping_ids):
-            raise RuntimeError("proposed Cache/UAV clipping groups overlap")
-        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
-        if set(clipping_ids) != actor_ids:
-            raise RuntimeError("proposed Cache/UAV clipping groups do not cover the actor")
-        return clipping_groups
 
     def sample_cache_trigger(
         self,

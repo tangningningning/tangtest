@@ -162,9 +162,9 @@ class CacheOperationPrimitiveSelectionResult:
     cache_trigger_node_local_workload_norms: np.ndarray
     cache_trigger_candidate_summary_norms: np.ndarray
     cache_trigger_aux_norms: np.ndarray
-    cache_trigger_weighted_loaded_mb: np.ndarray
-    cache_trigger_weighted_cache_cost: np.ndarray
-    cache_trigger_weighted_predicted_demand_gain: np.ndarray
+    cache_trigger_mean_loaded_mb: np.ndarray
+    cache_trigger_mean_cache_cost: np.ndarray
+    cache_trigger_mean_predicted_demand_gain: np.ndarray
     pre_trigger_and_execution_candidate_logit_max_diff: float
 
 
@@ -196,9 +196,9 @@ class JointCacheUavOperationPrimitiveSelectionResult:
     cache_trigger_node_local_workload_norms: np.ndarray
     cache_trigger_candidate_summary_norms: np.ndarray
     cache_trigger_aux_norms: np.ndarray
-    cache_trigger_weighted_loaded_mb: np.ndarray
-    cache_trigger_weighted_cache_cost: np.ndarray
-    cache_trigger_weighted_predicted_demand_gain: np.ndarray
+    cache_trigger_mean_loaded_mb: np.ndarray
+    cache_trigger_mean_cache_cost: np.ndarray
+    cache_trigger_mean_predicted_demand_gain: np.ndarray
     pre_trigger_and_execution_candidate_logit_max_diff: float
     uav_operation_actions: np.ndarray
     uav_operation_masks: np.ndarray
@@ -486,69 +486,64 @@ def _cache_target_configuration_feature(
     return values.astype(np.float32)
 
 
-def _build_update_candidate_policy_summary(
+def _build_update_candidate_set_summary(
     candidate_features: np.ndarray | None,
-    candidate_logits: Any | None,
     *,
     candidate_capacity: int,
     service_count: int,
     cache_capacity_mb: float,
-) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
-    """Summarize the behavior candidate policy without exposing Q/reward data."""
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Pool a legal candidate set without using Candidate policy probabilities."""
 
     feature_dim = 25 + 6 * int(service_count)
-    summary = np.zeros(1 + feature_dim, dtype=np.float32)
+    summary = np.zeros(1 + 2 * feature_dim, dtype=np.float32)
     diagnostics = {
-        "weighted_loaded_mb": 0.0,
-        "weighted_cache_cost": 0.0,
-        "weighted_predicted_demand_gain": 0.0,
+        "mean_loaded_mb": 0.0,
+        "mean_cache_cost": 0.0,
+        "mean_predicted_demand_gain": 0.0,
     }
     if candidate_features is None:
-        if candidate_logits is not None:
-            raise ValueError("empty candidate set cannot have candidate logits")
-        return summary, np.zeros(0, dtype=np.float32), diagnostics
+        return summary, diagnostics
 
     features = np.asarray(candidate_features, dtype=np.float32)
-    logits = torch.as_tensor(candidate_logits, dtype=torch.float32).detach()
     if features.ndim != 2 or features.shape[1] != feature_dim:
         raise ValueError("candidate summary feature dimensions are inconsistent")
-    if features.shape[0] <= 0 or tuple(logits.shape) != (features.shape[0],):
-        raise ValueError("candidate summary logits do not align with legal targets")
+    if features.shape[0] <= 0:
+        raise ValueError("candidate summary requires at least one legal target")
     if features.shape[0] > int(candidate_capacity):
         raise ValueError("legal Cache candidate count exceeds fixed candidate capacity")
-    if not np.all(np.isfinite(features)) or not bool(
-        torch.all(torch.isfinite(logits)).item()
-    ):
+    if not np.all(np.isfinite(features)):
         raise FloatingPointError("candidate summary inputs contain NaN/Inf")
 
-    probabilities_t = torch.softmax(logits, dim=-1).detach()
-    probabilities = probabilities_t.cpu().numpy().astype(np.float32, copy=False)
-    weighted_features = probabilities @ features
+    mean_features = np.mean(features, axis=0, dtype=np.float64).astype(np.float32)
+    max_features = np.max(features, axis=0).astype(np.float32)
     summary[0] = float(features.shape[0]) / float(max(int(candidate_capacity), 1))
-    summary[1:] = weighted_features
+    summary[1 : 1 + feature_dim] = mean_features
+    summary[1 + feature_dim :] = max_features
 
     scalar_start = 4 + 6 * int(service_count)
     demand_gain_start = 4 + 5 * int(service_count)
     loaded_ratio_index = scalar_start + 3
     cache_cost_index = scalar_start + 11
-    diagnostics["weighted_loaded_mb"] = float(
-        np.dot(probabilities, features[:, loaded_ratio_index])
+    diagnostics["mean_loaded_mb"] = float(
+        np.mean(features[:, loaded_ratio_index], dtype=np.float64)
         * max(float(cache_capacity_mb), 0.0)
     )
     per_candidate_cost = np.expm1(
         np.maximum(features[:, cache_cost_index].astype(np.float64), 0.0)
     )
-    diagnostics["weighted_cache_cost"] = float(
-        np.dot(probabilities.astype(np.float64), per_candidate_cost)
-    )
-    diagnostics["weighted_predicted_demand_gain"] = float(
-        np.dot(probabilities, np.sum(features[:, demand_gain_start : demand_gain_start + service_count], axis=1))
+    diagnostics["mean_cache_cost"] = float(np.mean(per_candidate_cost))
+    diagnostics["mean_predicted_demand_gain"] = float(
+        np.mean(
+            np.sum(features[:, demand_gain_start : demand_gain_start + service_count], axis=1),
+            dtype=np.float64,
+        )
     )
     if not np.all(np.isfinite(summary)) or not all(
         np.isfinite(value) for value in diagnostics.values()
     ):
         raise FloatingPointError("candidate policy summary is non-finite")
-    return summary, probabilities, diagnostics
+    return summary, diagnostics
 
 
 def _normalized_xy(
@@ -1342,7 +1337,7 @@ def sample_and_apply_cache_reconfiguration_configuration(
         getattr(policy, "trigger_workload_dim", -1)
     ):
         raise AssertionError("policy and node-local Trigger workload dimensions differ")
-    trigger_candidate_summary_dim = 1 + int(tensor_spec.cache_feature_dim)
+    trigger_candidate_summary_dim = 1 + 2 * int(tensor_spec.cache_feature_dim)
     trigger_aux_dim = int(getattr(policy, "trigger_aux_dim", -1))
     if trigger_aux_dim != cache_trigger_node_local_workload.shape[1] * 3 + trigger_candidate_summary_dim:
         raise AssertionError("policy and Trigger auxiliary dimensions differ")
@@ -1364,13 +1359,13 @@ def sample_and_apply_cache_reconfiguration_configuration(
         tensor_spec.num_cache_heads, dtype=np.float32
     )
     cache_trigger_aux_norms = np.zeros(tensor_spec.num_cache_heads, dtype=np.float32)
-    cache_trigger_weighted_loaded_mb = np.zeros(
+    cache_trigger_mean_loaded_mb = np.zeros(
         tensor_spec.num_cache_heads, dtype=np.float32
     )
-    cache_trigger_weighted_cache_cost = np.zeros(
+    cache_trigger_mean_cache_cost = np.zeros(
         tensor_spec.num_cache_heads, dtype=np.float32
     )
-    cache_trigger_weighted_predicted_demand_gain = np.zeros(
+    cache_trigger_mean_predicted_demand_gain = np.zeros(
         tensor_spec.num_cache_heads, dtype=np.float32
     )
     candidate_logit_max_diff = 0.0
@@ -1460,10 +1455,9 @@ def sample_and_apply_cache_reconfiguration_configuration(
                     conditional_context,
                     candidate_features,
                 ).detach()
-            summary, _, candidate_summary_diagnostics = (
-                _build_update_candidate_policy_summary(
+            summary, candidate_summary_diagnostics = (
+                _build_update_candidate_set_summary(
                     candidate_features,
-                    pre_trigger_candidate_logits,
                     candidate_capacity=tensor_spec.cache_max_candidates,
                     service_count=int(context.service_catalog["num_services"]),
                     cache_capacity_mb=float(
@@ -1471,18 +1465,17 @@ def sample_and_apply_cache_reconfiguration_configuration(
                     ),
                 )
             )
-            cache_trigger_weighted_loaded_mb[node_index] = float(
-                candidate_summary_diagnostics["weighted_loaded_mb"]
+            cache_trigger_mean_loaded_mb[node_index] = float(
+                candidate_summary_diagnostics["mean_loaded_mb"]
             )
-            cache_trigger_weighted_cache_cost[node_index] = float(
-                candidate_summary_diagnostics["weighted_cache_cost"]
+            cache_trigger_mean_cache_cost[node_index] = float(
+                candidate_summary_diagnostics["mean_cache_cost"]
             )
-            cache_trigger_weighted_predicted_demand_gain[node_index] = float(
-                candidate_summary_diagnostics["weighted_predicted_demand_gain"]
+            cache_trigger_mean_predicted_demand_gain[node_index] = float(
+                candidate_summary_diagnostics["mean_predicted_demand_gain"]
             )
         else:
-            summary, _, _ = _build_update_candidate_policy_summary(
-                None,
+            summary, _ = _build_update_candidate_set_summary(
                 None,
                 candidate_capacity=tensor_spec.cache_max_candidates,
                 service_count=int(context.service_catalog["num_services"]),
@@ -1553,14 +1546,14 @@ def sample_and_apply_cache_reconfiguration_configuration(
                         cache_trigger_candidate_summary_norms[node_index]
                     ),
                     "TRIGGER_AUX_NORM": float(cache_trigger_aux_norms[node_index]),
-                    "weighted_loaded_mb": float(
-                        cache_trigger_weighted_loaded_mb[node_index]
+                    "mean_loaded_mb": float(
+                        cache_trigger_mean_loaded_mb[node_index]
                     ),
-                    "weighted_cache_cost": float(
-                        cache_trigger_weighted_cache_cost[node_index]
+                    "mean_cache_cost": float(
+                        cache_trigger_mean_cache_cost[node_index]
                     ),
-                    "weighted_predicted_demand_gain": float(
-                        cache_trigger_weighted_predicted_demand_gain[node_index]
+                    "mean_predicted_demand_gain": float(
+                        cache_trigger_mean_predicted_demand_gain[node_index]
                     ),
                 }
             )
@@ -1625,14 +1618,14 @@ def sample_and_apply_cache_reconfiguration_configuration(
                     cache_trigger_candidate_summary_norms[node_index]
                 ),
                 "TRIGGER_AUX_NORM": float(cache_trigger_aux_norms[node_index]),
-                "weighted_loaded_mb": float(
-                    cache_trigger_weighted_loaded_mb[node_index]
+                "mean_loaded_mb": float(
+                    cache_trigger_mean_loaded_mb[node_index]
                 ),
-                "weighted_cache_cost": float(
-                    cache_trigger_weighted_cache_cost[node_index]
+                "mean_cache_cost": float(
+                    cache_trigger_mean_cache_cost[node_index]
                 ),
-                "weighted_predicted_demand_gain": float(
-                    cache_trigger_weighted_predicted_demand_gain[node_index]
+                "mean_predicted_demand_gain": float(
+                    cache_trigger_mean_predicted_demand_gain[node_index]
                 ),
                 "PRE_TRIGGER_AND_EXECUTION_CANDIDATE_LOGIT_MAX_DIFF": candidate_logit_diff,
             }
@@ -1680,9 +1673,9 @@ def sample_and_apply_cache_reconfiguration_configuration(
         cache_trigger_node_local_workload_norms=cache_trigger_node_local_workload_norms.copy(),
         cache_trigger_candidate_summary_norms=cache_trigger_candidate_summary_norms.copy(),
         cache_trigger_aux_norms=cache_trigger_aux_norms.copy(),
-        cache_trigger_weighted_loaded_mb=cache_trigger_weighted_loaded_mb.copy(),
-        cache_trigger_weighted_cache_cost=cache_trigger_weighted_cache_cost.copy(),
-        cache_trigger_weighted_predicted_demand_gain=cache_trigger_weighted_predicted_demand_gain.copy(),
+        cache_trigger_mean_loaded_mb=cache_trigger_mean_loaded_mb.copy(),
+        cache_trigger_mean_cache_cost=cache_trigger_mean_cache_cost.copy(),
+        cache_trigger_mean_predicted_demand_gain=cache_trigger_mean_predicted_demand_gain.copy(),
         pre_trigger_and_execution_candidate_logit_max_diff=float(candidate_logit_max_diff),
     )
 
@@ -1984,9 +1977,9 @@ def sample_and_apply_joint_cache_uav_operation_configuration(
         cache_trigger_node_local_workload_norms=cache_result.cache_trigger_node_local_workload_norms,
         cache_trigger_candidate_summary_norms=cache_result.cache_trigger_candidate_summary_norms,
         cache_trigger_aux_norms=cache_result.cache_trigger_aux_norms,
-        cache_trigger_weighted_loaded_mb=cache_result.cache_trigger_weighted_loaded_mb,
-        cache_trigger_weighted_cache_cost=cache_result.cache_trigger_weighted_cache_cost,
-        cache_trigger_weighted_predicted_demand_gain=cache_result.cache_trigger_weighted_predicted_demand_gain,
+        cache_trigger_mean_loaded_mb=cache_result.cache_trigger_mean_loaded_mb,
+        cache_trigger_mean_cache_cost=cache_result.cache_trigger_mean_cache_cost,
+        cache_trigger_mean_predicted_demand_gain=cache_result.cache_trigger_mean_predicted_demand_gain,
         pre_trigger_and_execution_candidate_logit_max_diff=(
             cache_result.pre_trigger_and_execution_candidate_logit_max_diff
         ),

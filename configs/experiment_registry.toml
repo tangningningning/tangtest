@@ -55,7 +55,7 @@ execution_ratios = [
 
 [methods.proposed_joint]
 category = "proposed"
-status = "CACHE_GAE_UAV_EXACT_TEACHER_DATAFLOW_CORRECTION_PENDING_ONE_EPOCH_GATE"
+status = "SECOND_STAGE_GATE_BLOCKED_HYBRID_AND_PROPOSAL_COVERAGE"
 prediction = true
 adaptive_cache = true
 adaptive_uav = true
@@ -68,7 +68,7 @@ config = "configs/proposed/system_config.toml"
 checkpoint = ""
 training_entrypoint = "ppo-train"
 evaluation_entrypoint = "src/ppo_simple/evaluator.py"
-notes = "Formal Cache policy credit is sampled PPO from actual rollout rewards and global normalized GAE; no Cache Action-Q, surrogate, or Cache counterfactual executes in production. The unchanged UAV operation teacher is FULL_INFORMATION_EXACT_Q_TEACHER and its candidate teacher is EXACT_Q_LISTWISE. The fresh provenance-verified seed=20001 realization and one-epoch gate are the next structural checks; no final-test seed is implied. Generation, training, and frozen-checkpoint evaluation use configs/proposed/system_config.toml."
+notes = "Second-stage repair is implemented, but fresh short training is blocked by the fixed train-only gate: hybrid exact-best recall/regret fail and the one-time exhaustive Cache proposal coverage audit misses global feasible optima. Production falls back to FULL_EXACT until its surrogate quality gate passes. Cache credit uses FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER and CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER with train-only robust-MAD teacher scales; UAV Operation uses the Exact-Q listwise Candidate teacher. Do not launch 20-30 epoch training or formal 300 epoch training until the blockers are resolved and gates rerun. No validation/test data or final-test seed was used."
 
 [methods.ablation_cache_only]
 category = "ablation"

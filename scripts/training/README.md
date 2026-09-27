@@ -1,20 +1,21 @@
-# Training entrypoints
+# Training entrypoint and gate status
 
-The PPO implementation remains in `src/ppo_simple/trainer.py`. The current
-formal actor-learning-rate sweep consists of four independent Stage2D V3
-fresh-initialization runners, each using the shared
-`stage2d_v3_runner_common.py` implementation and
-`configs/proposed/system_config.toml`:
+`src/ppo_simple/trainer.py` is the single PPO training implementation and CLI.
+The current second-stage joint-repair gate is **BLOCKED**: hybrid quality and
+exhaustive Cache proposal coverage failed. Do not start a short or formal
+training run until those gates pass and the registry status is updated.
 
-```text
-python scripts/training/run_stage2d_v3_fresh300_actor_lr_1e_minus_4.py
-python scripts/training/run_stage2d_v3_fresh300_actor_lr_5e_minus_4.py
-python scripts/training/run_stage2d_v3_fresh300_actor_lr_1e_minus_3.py
-python scripts/training/run_stage2d_v3_fresh300_actor_lr_5e_minus_3.py
+After all gates pass, activate the project environment and start a fresh
+20-epoch proposed-policy run from the repository root:
+
+```powershell
+conda activate adaptive_cache_mec
+$env:PYTHONPATH = 'src'
+python -m ppo_simple.trainer --config configs/proposed/system_config.toml --epochs 20 --run-dir runs/proposed_fresh20
 ```
 
-Each runner has its own `runs/stage2d_v3_fresh300_actor_lr_*` directory. They
-share the existing Stage2D V3 protocol: architecture version 3, 300 epochs,
-checkpoint interval 10, training seeds `20001..20300`, and no validation or
-test during training. The configured critic learning rate is retained; the
-actor learning rate is the value encoded by each runner's filename.
+Do not pass `--resume`; the required run uses fresh initialization. Use the run
+directory for its checkpoints, manifest, and training metrics. Extend to at
+most 30 epochs only if the 20-epoch checkpoint review calls for it. Never use
+this entrypoint for the formal 300-epoch run until the separate formal-readiness
+decision is approved in the current stage report.

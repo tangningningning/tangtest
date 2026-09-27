@@ -114,9 +114,9 @@ class SimpleTransition:
     cache_trigger_node_local_workload_norms: np.ndarray | None = None
     cache_trigger_candidate_summary_norms: np.ndarray | None = None
     cache_trigger_aux_norms: np.ndarray | None = None
-    cache_trigger_weighted_loaded_mb: np.ndarray | None = None
-    cache_trigger_weighted_cache_cost: np.ndarray | None = None
-    cache_trigger_weighted_predicted_demand_gain: np.ndarray | None = None
+    cache_trigger_mean_loaded_mb: np.ndarray | None = None
+    cache_trigger_mean_cache_cost: np.ndarray | None = None
+    cache_trigger_mean_predicted_demand_gain: np.ndarray | None = None
     pre_trigger_and_execution_candidate_logit_max_diff: float = 0.0
 
 
@@ -161,9 +161,9 @@ class SimpleRollout:
     cache_trigger_node_local_workload_norms: np.ndarray | None = None
     cache_trigger_candidate_summary_norms: np.ndarray | None = None
     cache_trigger_aux_norms: np.ndarray | None = None
-    cache_trigger_weighted_loaded_mb: np.ndarray | None = None
-    cache_trigger_weighted_cache_cost: np.ndarray | None = None
-    cache_trigger_weighted_predicted_demand_gain: np.ndarray | None = None
+    cache_trigger_mean_loaded_mb: np.ndarray | None = None
+    cache_trigger_mean_cache_cost: np.ndarray | None = None
+    cache_trigger_mean_predicted_demand_gain: np.ndarray | None = None
     pre_trigger_and_execution_candidate_logit_max_diff: float = 0.0
 
 
@@ -480,9 +480,9 @@ def collect_rollout(
         cache_trigger_node_local_workload_norms: np.ndarray | None = None
         cache_trigger_candidate_summary_norms: np.ndarray | None = None
         cache_trigger_aux_norms: np.ndarray | None = None
-        cache_trigger_weighted_loaded_mb: np.ndarray | None = None
-        cache_trigger_weighted_cache_cost: np.ndarray | None = None
-        cache_trigger_weighted_predicted_demand_gain: np.ndarray | None = None
+        cache_trigger_mean_loaded_mb: np.ndarray | None = None
+        cache_trigger_mean_cache_cost: np.ndarray | None = None
+        cache_trigger_mean_predicted_demand_gain: np.ndarray | None = None
         pre_trigger_candidate_logit_max_diff = 0.0
         cache_operation_actions: np.ndarray | None = None
         cache_operation_masks: np.ndarray | None = None
@@ -527,14 +527,14 @@ def collect_rollout(
                 joint_primitive.cache_trigger_candidate_summary_norms
             )
             cache_trigger_aux_norms = joint_primitive.cache_trigger_aux_norms
-            cache_trigger_weighted_loaded_mb = (
-                joint_primitive.cache_trigger_weighted_loaded_mb
+            cache_trigger_mean_loaded_mb = (
+                joint_primitive.cache_trigger_mean_loaded_mb
             )
-            cache_trigger_weighted_cache_cost = (
-                joint_primitive.cache_trigger_weighted_cache_cost
+            cache_trigger_mean_cache_cost = (
+                joint_primitive.cache_trigger_mean_cache_cost
             )
-            cache_trigger_weighted_predicted_demand_gain = (
-                joint_primitive.cache_trigger_weighted_predicted_demand_gain
+            cache_trigger_mean_predicted_demand_gain = (
+                joint_primitive.cache_trigger_mean_predicted_demand_gain
             )
             pre_trigger_candidate_logit_max_diff = (
                 joint_primitive.pre_trigger_and_execution_candidate_logit_max_diff
@@ -838,20 +838,20 @@ def collect_rollout(
                     if cache_trigger_aux_norms is None
                     else cache_trigger_aux_norms.copy()
                 ),
-                cache_trigger_weighted_loaded_mb=(
+                cache_trigger_mean_loaded_mb=(
                     None
-                    if cache_trigger_weighted_loaded_mb is None
-                    else cache_trigger_weighted_loaded_mb.copy()
+                    if cache_trigger_mean_loaded_mb is None
+                    else cache_trigger_mean_loaded_mb.copy()
                 ),
-                cache_trigger_weighted_cache_cost=(
+                cache_trigger_mean_cache_cost=(
                     None
-                    if cache_trigger_weighted_cache_cost is None
-                    else cache_trigger_weighted_cache_cost.copy()
+                    if cache_trigger_mean_cache_cost is None
+                    else cache_trigger_mean_cache_cost.copy()
                 ),
-                cache_trigger_weighted_predicted_demand_gain=(
+                cache_trigger_mean_predicted_demand_gain=(
                     None
-                    if cache_trigger_weighted_predicted_demand_gain is None
-                    else cache_trigger_weighted_predicted_demand_gain.copy()
+                    if cache_trigger_mean_predicted_demand_gain is None
+                    else cache_trigger_mean_predicted_demand_gain.copy()
                 ),
                 pre_trigger_and_execution_candidate_logit_max_diff=(
                     float(pre_trigger_candidate_logit_max_diff)
@@ -1025,14 +1025,14 @@ def collect_rollout(
         cache_trigger_aux_norms=stack_optional_transition_field(
             "cache_trigger_aux_norms", np.float32
         ),
-        cache_trigger_weighted_loaded_mb=stack_optional_transition_field(
-            "cache_trigger_weighted_loaded_mb", np.float32
+        cache_trigger_mean_loaded_mb=stack_optional_transition_field(
+            "cache_trigger_mean_loaded_mb", np.float32
         ),
-        cache_trigger_weighted_cache_cost=stack_optional_transition_field(
-            "cache_trigger_weighted_cache_cost", np.float32
+        cache_trigger_mean_cache_cost=stack_optional_transition_field(
+            "cache_trigger_mean_cache_cost", np.float32
         ),
-        cache_trigger_weighted_predicted_demand_gain=stack_optional_transition_field(
-            "cache_trigger_weighted_predicted_demand_gain", np.float32
+        cache_trigger_mean_predicted_demand_gain=stack_optional_transition_field(
+            "cache_trigger_mean_predicted_demand_gain", np.float32
         ),
         pre_trigger_and_execution_candidate_logit_max_diff=max(
             float(item.pre_trigger_and_execution_candidate_logit_max_diff)

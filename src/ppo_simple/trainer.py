@@ -45,6 +45,7 @@ from .reporting import (
     ensure_fresh_run_dir_is_clean,
     ensure_run_artifact_directories,
     update_run_summary,
+    update_run_manifest_teacher_state,
     write_run_manifest,
 )
 from .policy import (
@@ -57,7 +58,6 @@ from .policy import (
     AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic,
     BernoulliActorCritic,
 )
-from .cache_action_q import CacheActionQCritic
 from .cache_credit import evaluate_cache_full_information_values
 from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
 from .exact_q_parallel import (
@@ -94,18 +94,11 @@ REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
 # Full-information Cache Trigger/Candidate teachers change the actor objective;
 # proposed-joint checkpoints from earlier Cache objectives cannot be resumed.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 18
+JOINT_PROPOSED_CHECKPOINT_VERSION = 19
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
 CACHE_DOWNSTREAM_MODE = "FIXED_DOWNSTREAM"
-CACHE_VALUE_MODEL = "NONE"
-CACHE_AUDIT_MODE = "DIAGNOSTIC_ONLY"
-CACHE_ACTUAL_ACTION_Q_SOURCE = "NONE"
-CACHE_UNEXECUTED_ACTION_Q_SOURCE = "NONE"
-CACHE_ACTION_Q_HIDDEN_DIM = 64
-CACHE_ACTION_Q_LEARNING_RATE = 1.0e-3
-CACHE_ACTION_Q_AUDIT_INTERVAL = 20
 CACHE_SURROGATE_TYPE = "DELTA_Q_ENSEMBLE"
 CACHE_SURROGATE_ENSEMBLE_SIZE = 3
 CACHE_SURROGATE_HIDDEN_DIM = 64
@@ -152,9 +145,6 @@ PROPOSED_POLICY_SCHEMAS = frozenset(
     {AdaptiveJointCacheUAVPPOActorCritic.architecture_id}
 )
 CANDIDATE_CREDIT_POLICY_SCHEMAS = PROPOSED_POLICY_SCHEMAS
-# Exact Cache-Q/Action-Q remains available only to explicit diagnostic
-# runners; no production policy schema may enter that path.
-EXACT_CACHE_CREDIT_POLICY_SCHEMAS = frozenset()
 JOINT_CACHE_UAV_POLICY_SCHEMAS = PROPOSED_POLICY_SCHEMAS
 BRANCH_SPECIFIC_KL_POLICY_SCHEMAS = PROPOSED_POLICY_SCHEMAS
 CACHE_OPERATION_POLICY_SCHEMAS = (
@@ -500,7 +490,7 @@ def _candidate_kl_gate_transition(
     update_epoch: int,
     update_epochs: int,
 ) -> dict[str, Any]:
-    """Apply the candidate-only KL gate after one complete PPO epoch.
+    """Apply the candidate-only KL gate using the current policy divergence.
 
     This gate is intentionally independent from the operation KL gate.  It
     only changes candidate activity for later epochs; it never changes the
@@ -549,16 +539,6 @@ def _candidate_kl_gate_transition(
         "candidate_active_next": bool(candidate_active) and not newly_stopped,
         "remaining_epochs_suppressed": int(remaining_epochs),
     }
-
-
-def _uav_candidate_effective_active(
-    *,
-    operation_active: bool,
-    candidate_kl_active: bool,
-) -> bool:
-    """A MOVE child policy is active only while its parent remains active."""
-
-    return bool(operation_active) and bool(candidate_kl_active)
 
 
 def _set_uav_branch_requires_grad(
@@ -921,35 +901,13 @@ class UpdateResult:
     cache_surrogate_screening_ready: bool = False
     cache_surrogate_selected_k: int | None = None
     cache_surrogate_audit_statistics: dict[str, Any] | None = None
-    cache_total_logical_branches: int = 0
-    cache_full_exact_audit_branches: int = 0
-    cache_normal_slot_counterfactual_branches: int = 0
-    cache_counterfactual_executions_avoided: int = 0
-    cache_q_critic_mae: float = math.nan
-    cache_q_critic_rmse: float = math.nan
-    cache_q_critic_rank_correlation: float = math.nan
-    cache_q_critic_argmax_accuracy: float = math.nan
-    cache_q_critic_recall_at_3: float = math.nan
-    cache_q_critic_recall_at_5: float = math.nan
-    cache_q_critic_selected_exact_regret: dict[str, Any] | None = None
-    cache_q_critic_normalized_regret_p95: float = math.nan
-    cache_q_critic_usable_for_policy_credit: str = "INCONCLUSIVE"
-    cache_q_critic_train_seconds: float = math.nan
-    cache_q_critic_inference_seconds: float = math.nan
-    cache_audit_exact_seconds: float = math.nan
-    cache_heldout_audit_before_training: bool = False
-    cache_actual_action_q_anchor: str = "NO"
-    cache_q_critic_audit_metrics: dict[str, Any] | None = None
+    cache_surrogate_gate_metrics: dict[str, Any] | None = None
+    cache_teacher_scale_calibration: dict[str, Any] | None = None
+    cache_trigger_delta_best_statistics: dict[str, Any] | None = None
+    cache_trigger_teacher_statistics: dict[str, Any] | None = None
+    cache_candidate_teacher_statistics: dict[str, Any] | None = None
     cache_target_scorer_parameter_delta_norm: float = math.nan
     uav_target_scorer_parameter_delta_norm: float = math.nan
-    cache_top1_exact_q_accuracy_before: float = math.nan
-    cache_top1_exact_q_accuracy_after: float = math.nan
-    cache_mean_exact_q_regret_before: float = math.nan
-    cache_mean_exact_q_regret_after: float = math.nan
-    cache_expected_exact_q_before: float = math.nan
-    cache_expected_exact_q_after: float = math.nan
-    cache_expected_exact_q_delta: float = math.nan
-    cache_target_policy_kl_old_new: float = math.nan
     uav_top1_exact_q_accuracy_before: float = math.nan
     uav_top1_exact_q_accuracy_after: float = math.nan
     uav_mean_exact_q_regret_before: float = math.nan
@@ -989,12 +947,18 @@ class UpdateResult:
     cache_minibatches_executed: int = 0
     cache_minibatches_suppressed: int = 0
     uav_minibatches_executed: int = 0
-    # Proposed UAV operation/candidate routing diagnostics.  Candidate is a
-    # child of MOVE, so its activity is suppressed whenever operation stops.
+    # Proposed branch optimizer and independent KL-gate diagnostics.
+    cache_optimizer_steps_this_update: int = 0
+    uav_operation_optimizer_steps_this_update: int = 0
+    uav_candidate_optimizer_steps_this_update: int = 0
     uav_operation_steps_executed: int = 0
     uav_operation_steps_suppressed: int = 0
     uav_candidate_full_steps: int = 0
     uav_candidate_only_steps_after_operation_stop: int = 0
+    uav_operation_stop_minibatch: int | None = None
+    uav_candidate_stop_minibatch: int | None = None
+    uav_operation_minibatches_suppressed: int = 0
+    uav_candidate_minibatches_suppressed: int = 0
     uav_candidate_optimizer_step_count: int = 0
     uav_operation_encoder_optimizer_step_count: int = 0
     uav_candidate_encoder_optimizer_step_count: int = 0
@@ -2039,6 +2003,52 @@ def _cache_per_head_old_new_kl(
     return torch.clamp(keep_kl + update_kl, min=0.0)
 
 
+def _candidate_probability_log_distribution(
+    probabilities: Any,
+    candidate_valid_mask: Any,
+) -> tuple[Any, Any]:
+    """Return normalized candidate log probabilities and a safe KL mask.
+
+    A state with no legal UPDATE candidates still has a well-defined Cache
+    action distribution: KEEP is the only action.  Candidate policies return
+    all-zero probabilities for such rows, so use a masked unit-mass sentinel
+    solely for the UPDATE conditional distribution in the KL calculation.
+    """
+
+    if torch is None:  # pragma: no cover - guarded by the trainer constructor
+        raise RuntimeError("candidate distributions require torch")
+    probability_t = torch.as_tensor(probabilities)
+    valid_t = torch.as_tensor(
+        candidate_valid_mask,
+        dtype=torch.bool,
+        device=probability_t.device,
+    )
+    if probability_t.ndim != 3 or tuple(valid_t.shape) != tuple(probability_t.shape):
+        raise ValueError("Cache candidate probability/mask shape mismatch")
+    if int(probability_t.shape[-1]) < 1:
+        raise ValueError("Cache candidate distributions require a padded candidate")
+    active = valid_t.any(dim=-1)
+    fallback = torch.zeros_like(valid_t)
+    fallback[..., 0] = ~active
+    kl_mask = valid_t | fallback
+    safe_probabilities = torch.where(
+        valid_t, probability_t, torch.zeros_like(probability_t)
+    )
+    fallback_probabilities = torch.zeros_like(probability_t)
+    fallback_probabilities[..., 0] = 1.0
+    safe_probabilities = torch.where(
+        active.unsqueeze(-1), safe_probabilities, fallback_probabilities
+    )
+    if not bool(torch.all(torch.isfinite(safe_probabilities[kl_mask])).item()):
+        raise FloatingPointError("Cache candidate probabilities are non-finite")
+    log_probabilities = torch.where(
+        kl_mask,
+        torch.log(safe_probabilities.clamp_min(1.0e-12)),
+        torch.zeros_like(safe_probabilities),
+    )
+    return log_probabilities, kl_mask
+
+
 def _proposal_source_diagnostics(
     q_values: Any,
     valid_mask: Any,
@@ -2372,22 +2382,6 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
     if all(math.isfinite(value) for value in scorer_deltas.values()):
         fields.update(scorer_deltas)
     exact_q_quality = {
-        "cache_top1_exact_q_accuracy_before": float(
-            update.cache_top1_exact_q_accuracy_before
-        ),
-        "cache_top1_exact_q_accuracy_after": float(
-            update.cache_top1_exact_q_accuracy_after
-        ),
-        "cache_mean_exact_q_regret_before": float(
-            update.cache_mean_exact_q_regret_before
-        ),
-        "cache_mean_exact_q_regret_after": float(
-            update.cache_mean_exact_q_regret_after
-        ),
-        "cache_expected_exact_q_before": float(update.cache_expected_exact_q_before),
-        "cache_expected_exact_q_after": float(update.cache_expected_exact_q_after),
-        "cache_expected_exact_q_delta": float(update.cache_expected_exact_q_delta),
-        "cache_target_policy_kl_old_new": float(update.cache_target_policy_kl_old_new),
         "uav_top1_exact_q_accuracy_before": float(
             update.uav_top1_exact_q_accuracy_before
         ),
@@ -2448,6 +2442,38 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
             "CACHE_TEACHER_EVALUATION_RUNTIME_SECONDS": float(
                 update.cache_credit_runtime_seconds
             ),
+            "CACHE_EXACT_CANDIDATE_COUNT": int(
+                update.cache_exact_candidate_count
+            ),
+            "CACHE_SURROGATE_CANDIDATE_COUNT": int(
+                update.cache_surrogate_candidate_count
+            ),
+            "CACHE_COUNTERFACTUAL_EXECUTIONS_SAVED": int(
+                update.cache_counterfactual_executions_saved
+            ),
+            "CACHE_COUNTERFACTUAL_EXECUTION_REDUCTION_RATIO": float(
+                update.cache_counterfactual_execution_reduction_fraction
+            ),
+            "CACHE_SURROGATE_SCREENING_ACTIVE": bool(
+                update.cache_surrogate_screening_active
+            ),
+            "CACHE_SURROGATE_SCREENING_READY": bool(
+                update.cache_surrogate_screening_ready
+            ),
+            "CACHE_SURROGATE_SELECTED_K": update.cache_surrogate_selected_k,
+            "CACHE_SURROGATE_DELTA_Q_MAE": float(
+                update.cache_surrogate_delta_q_mae
+            ),
+            "CACHE_SURROGATE_DELTA_Q_RMSE": float(
+                update.cache_surrogate_delta_q_rmse
+            ),
+            "CACHE_SURROGATE_GATE_METRICS": update.cache_surrogate_gate_metrics,
+            "CACHE_TEACHER_SCALE_CALIBRATION": update.cache_teacher_scale_calibration,
+            "CACHE_TRIGGER_DELTA_Q_STATISTICS": (
+                update.cache_trigger_delta_best_statistics
+            ),
+            "CACHE_TRIGGER_TEACHER_STATISTICS": update.cache_trigger_teacher_statistics,
+            "CACHE_CANDIDATE_TEACHER_STATISTICS": update.cache_candidate_teacher_statistics,
         }
     )
     if math.isfinite(float(update.uav_operation_credit_runtime_seconds)):
@@ -2873,6 +2899,33 @@ def _branch_kl_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
                 record["uav_trigger_suppressed_cache_update"]
                 for record in update.kl_epoch_diagnostics
             )
+        ),
+        "CACHE_OPTIMIZER_STEPS_THIS_UPDATE": int(
+            update.cache_optimizer_steps_this_update
+        ),
+        "UAV_OPERATION_OPTIMIZER_STEPS_THIS_UPDATE": int(
+            update.uav_operation_optimizer_steps_this_update
+        ),
+        "UAV_CANDIDATE_OPTIMIZER_STEPS_THIS_UPDATE": int(
+            update.uav_candidate_optimizer_steps_this_update
+        ),
+        "CACHE_MINIBATCHES_SUPPRESSED": int(update.cache_minibatches_suppressed),
+        "UAV_OPERATION_MINIBATCHES_SUPPRESSED": int(
+            update.uav_operation_minibatches_suppressed
+        ),
+        "UAV_CANDIDATE_MINIBATCHES_SUPPRESSED": int(
+            update.uav_candidate_minibatches_suppressed
+        ),
+        "UAV_OPERATION_STOP_MINIBATCH": update.uav_operation_stop_minibatch,
+        "UAV_CANDIDATE_STOP_MINIBATCH": update.uav_candidate_stop_minibatch,
+        "CACHE_KL_MINIBATCH_EARLY_STOP_ACTIVE": bool(
+            update.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP
+        ),
+        "uav_candidate_active_per_update_epoch": [
+            bool(value) for value in update.uav_candidate_active_per_update_epoch
+        ],
+        "UAV_CANDIDATE_ONLY_STEPS_AFTER_OPERATION_STOP": int(
+            update.uav_candidate_only_steps_after_operation_stop
         ),
     }
     if update.cache_active_per_update_epoch or update.uav_active_per_update_epoch:
@@ -3860,6 +3913,30 @@ class PPOV2Trainer:
                 "critic_learning_rate_override",
             )
         )
+        self.cache_learning_rate = _validate_learning_rate_value(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_learning_rate",
+                self.effective_actor_learning_rate,
+            ),
+            "cache_learning_rate",
+        )
+        self.uav_operation_learning_rate = _validate_learning_rate_value(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.uav_operation_learning_rate",
+                self.effective_actor_learning_rate,
+            ),
+            "uav_operation_learning_rate",
+        )
+        self.uav_candidate_learning_rate = _validate_learning_rate_value(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.uav_candidate_learning_rate",
+                self.effective_actor_learning_rate,
+            ),
+            "uav_candidate_learning_rate",
+        )
         if lr_experiment_axis is None and actor_learning_rate_override is not None:
             lr_experiment_axis = "actor_learning_rate"
         self.lr_experiment_axis = (
@@ -3931,11 +4008,42 @@ class PPOV2Trainer:
         }.items():
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field} 必须是正的有限数。")
+        self.cache_teacher_scale_epsilon = float(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_teacher_scale_epsilon",
+                1.0e-3,
+            )
+        )
+        self.cache_teacher_scale_max = float(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_teacher_scale_max",
+                1.0e3,
+            )
+        )
+        if (
+            not math.isfinite(self.cache_teacher_scale_epsilon)
+            or self.cache_teacher_scale_epsilon <= 0.0
+            or not math.isfinite(self.cache_teacher_scale_max)
+            or self.cache_teacher_scale_max < self.cache_teacher_scale_epsilon
+        ):
+            raise ValueError("Cache teacher scale bounds are invalid")
+        self.cache_teacher_scale_calibration: dict[str, Any] = {}
+        self.cache_teacher_scale_mode = str(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_teacher_scale_mode",
+                "training_rollout_mad",
+            )
+        )
+        if self.cache_teacher_scale_mode != "training_rollout_mad":
+            raise ValueError("unsupported Cache teacher scale mode")
         if context.policy_schema in PROPOSED_POLICY_SCHEMAS:
             cache_credit_identity = {
                 "cache_trigger_credit_source": CACHE_TRIGGER_CREDIT_SOURCE,
                 "cache_candidate_credit_source": CACHE_CANDIDATE_CREDIT_SOURCE,
-                "cache_value_evaluator": "FULL_EXACT",
+                "cache_value_evaluator": "HYBRID_EXACT_SURROGATE",
                 "cache_downstream_mode": CACHE_DOWNSTREAM_MODE,
                 "cache_counterfactual_mode": CACHE_COUNTERFACTUAL_MODE,
             }
@@ -3964,10 +4072,6 @@ class PPOV2Trainer:
         }:
             raise ValueError(
                 "algorithm.ppo.cache_kl_control 只支持 epoch/minibatch_early_stop。"
-            )
-        if self.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP:
-            raise ValueError(
-                "minibatch_early_stop cache KL control is not part of the proposed mainline."
             )
         if (
             self.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP
@@ -4123,7 +4227,7 @@ class PPOV2Trainer:
         self.cache_surrogate_audit_statistics: dict[str, Any] | None = None
         self.cache_surrogate_audit_interval = CACHE_SURROGATE_AUDIT_INTERVAL
         self.cache_surrogate_rng = np.random.default_rng(0xCACE5AFE)
-        if self._uses_exact_cache_credit():
+        if context.policy_schema in PROPOSED_POLICY_SCHEMAS:
             primitive_spec = PrimitiveTensorSpec.create(context)
             self.cache_surrogate_context_dim = int(
                 context.observation_spec.observation_dim
@@ -4143,44 +4247,16 @@ class PPOV2Trainer:
                 self.cache_surrogate_ensemble.parameters(),
                 lr=CACHE_SURROGATE_LEARNING_RATE,
             )
-        # The proposed Cache mainline uses one fresh, policy-independent
-        # action-conditioned residual Q critic.  It is intentionally separate
-        # from the PPO global critic: the latter supplies detached V(s), while
-        # this module learns only A_phi(s, a).
-        self.cache_action_q_context_dim: int | None = None
-        self.cache_action_q_node_count: int | None = None
-        self.cache_action_q_feature_dim: int | None = None
-        self.cache_action_q_critic: Any | None = None
-        self.cache_action_q_optimizer: Any | None = None
-        self.cache_action_q_training_count = 0
-        self.cache_action_q_optimizer_steps = 0
-        self.cache_action_q_audit_interval = CACHE_ACTION_Q_AUDIT_INTERVAL
-        self.cache_action_q_audit_statistics: dict[str, Any] | None = None
-        self.cache_action_q_sparse_mode = False
-        if self._uses_exact_cache_credit():
-            primitive_spec = PrimitiveTensorSpec.create(context)
-            self.cache_action_q_context_dim = int(context.observation_spec.observation_dim)
-            self.cache_action_q_node_count = int(primitive_spec.num_cache_heads)
-            self.cache_action_q_feature_dim = int(primitive_spec.cache_feature_dim)
-            self.cache_action_q_critic = CacheActionQCritic(
-                self.cache_action_q_context_dim,
-                self.cache_action_q_node_count,
-                self.cache_action_q_feature_dim,
-                CACHE_ACTION_Q_HIDDEN_DIM,
-            ).to(self.device)
-            policy_parameter_ids = {id(parameter) for parameter in self.policy.parameters()}
-            action_q_parameter_ids = {
-                id(parameter) for parameter in self.cache_action_q_critic.parameters()
-            }
-            if policy_parameter_ids & action_q_parameter_ids:
-                raise RuntimeError("Cache Action-Q critic shares parameters with PPO policy")
-            self.cache_action_q_optimizer = torch.optim.Adam(
-                self.cache_action_q_critic.parameters(),
-                lr=CACHE_ACTION_Q_LEARNING_RATE,
-            )
         self.optimizer_steps = 0
         self.actor_optimizer_steps = 0
         self.critic_optimizer_steps = 0
+        self.cache_optimizer = None
+        self.uav_operation_optimizer = None
+        self.uav_candidate_optimizer = None
+        self.cache_optimizer_steps = 0
+        self.uav_operation_optimizer_steps = 0
+        self.uav_candidate_optimizer_steps = 0
+        self.proposed_actor_parameter_groups: dict[str, tuple[Any, ...]] | None = None
         if self._uses_separate_optimization():
             if not isinstance(
                 self.policy,
@@ -4195,10 +4271,52 @@ class PPOV2Trainer:
                 raise RuntimeError("V5 actor/critic optimizer parameter groups contain duplicates.")
             if actor_ids & critic_ids:
                 raise RuntimeError("V5 actor/critic optimizer parameter groups overlap.")
-            self.actor_optimizer = torch.optim.Adam(
-                actor_parameters,
-                lr=self.effective_actor_learning_rate,
-            )
+            if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                group_builder = getattr(
+                    self.policy,
+                    "actor_gradient_parameter_groups",
+                    None,
+                )
+                if group_builder is None:
+                    raise TypeError("proposed policy lacks branch parameter groups")
+                branch_groups = group_builder()
+                expected_groups = {"cache", "uav_operation", "uav_candidate"}
+                if set(branch_groups) != expected_groups:
+                    raise RuntimeError(
+                        "proposed policy optimizer groups must be Cache, UAV Operation, and UAV Candidate"
+                    )
+                self.proposed_actor_parameter_groups = branch_groups
+                branch_ids: set[int] = set()
+                for branch_name, parameters in branch_groups.items():
+                    parameter_ids = {id(parameter) for parameter in parameters}
+                    if not parameters or len(parameter_ids) != len(parameters):
+                        raise RuntimeError(
+                            f"proposed {branch_name} optimizer group is empty or duplicated"
+                        )
+                    if branch_ids & parameter_ids:
+                        raise RuntimeError("proposed actor optimizer groups overlap")
+                    branch_ids |= parameter_ids
+                if branch_ids != actor_ids:
+                    raise RuntimeError(
+                        "proposed branch optimizer groups do not cover all actor parameters"
+                    )
+                self.actor_optimizer = None
+                self.cache_optimizer = torch.optim.Adam(
+                    branch_groups["cache"], lr=self.cache_learning_rate
+                )
+                self.uav_operation_optimizer = torch.optim.Adam(
+                    branch_groups["uav_operation"],
+                    lr=self.uav_operation_learning_rate,
+                )
+                self.uav_candidate_optimizer = torch.optim.Adam(
+                    branch_groups["uav_candidate"],
+                    lr=self.uav_candidate_learning_rate,
+                )
+            else:
+                self.actor_optimizer = torch.optim.Adam(
+                    actor_parameters,
+                    lr=self.effective_actor_learning_rate,
+                )
             self.critic_optimizer = torch.optim.Adam(
                 critic_parameters,
                 lr=self.effective_critic_learning_rate,
@@ -4238,6 +4356,9 @@ class PPOV2Trainer:
             "effective_critic_learning_rate": float(
                 self.effective_critic_learning_rate
             ),
+            "cache_learning_rate": float(self.cache_learning_rate),
+            "uav_operation_learning_rate": float(self.uav_operation_learning_rate),
+            "uav_candidate_learning_rate": float(self.uav_candidate_learning_rate),
             "actor_learning_rate_overridden": bool(
                 self.actor_learning_rate_overridden
             ),
@@ -4261,9 +4382,6 @@ class PPOV2Trainer:
     def _uses_exact_uav_candidate_credit(self) -> bool:
         return self.policy.architecture_id in CANDIDATE_CREDIT_POLICY_SCHEMAS
 
-    def _uses_exact_cache_credit(self) -> bool:
-        return self.policy.architecture_id in EXACT_CACHE_CREDIT_POLICY_SCHEMAS
-
     def cache_credit_metadata(self) -> dict[str, Any]:
         """Return the active Cache teacher and evaluator identity."""
 
@@ -4272,105 +4390,19 @@ class PPOV2Trainer:
         return {
             "CACHE_TRIGGER_CREDIT_SOURCE": CACHE_TRIGGER_CREDIT_SOURCE,
             "CACHE_CANDIDATE_CREDIT_SOURCE": CACHE_CANDIDATE_CREDIT_SOURCE,
-            "CACHE_VALUE_EVALUATOR": "FULL_EXACT",
+            "CACHE_VALUE_EVALUATOR": "HYBRID_EXACT_SURROGATE",
             "CACHE_DOWNSTREAM_MODE": CACHE_DOWNSTREAM_MODE,
             "CACHE_COUNTERFACTUAL_MODE": CACHE_COUNTERFACTUAL_MODE,
+            "CACHE_TEACHER_SCALE_MODE": "CLIPPED_RUNNING_MAD",
+            "CACHE_TEACHER_SCALE_SOURCE": "TRAIN_ROLLOUT_ONLY",
+            "CACHE_TEACHER_SCALE_EPSILON": float(self.cache_teacher_scale_epsilon),
+            "CACHE_TEACHER_SCALE_MAX": float(self.cache_teacher_scale_max),
             "CACHE_TRIGGER_TEACHER_TEMPERATURE": float(
                 self.cache_trigger_teacher_temperature
             ),
             "CACHE_CANDIDATE_TEACHER_TEMPERATURE": float(
                 self.cache_candidate_teacher_temperature
             ),
-        }
-
-    def _predict_cache_action_q(
-        self,
-        conditional_contexts: np.ndarray,
-        node_identities: np.ndarray,
-        is_update: np.ndarray,
-        candidate_features: np.ndarray,
-    ) -> np.ndarray:
-        """Return detached residual Action-Q predictions."""
-
-        if self.cache_action_q_critic is None:
-            raise RuntimeError("Cache Action-Q critic is not initialized")
-        with torch.no_grad():
-            residual = self.cache_action_q_critic(
-                conditional_contexts,
-                node_identities,
-                is_update,
-                candidate_features,
-            ).detach().cpu().numpy().reshape(-1)
-        if not np.all(np.isfinite(residual)):
-            raise FloatingPointError("Cache Action-Q residual prediction is non-finite")
-        return residual.astype(np.float64)
-
-    def _train_cache_action_q(
-        self,
-        conditional_contexts: np.ndarray,
-        node_identities: np.ndarray,
-        is_update: np.ndarray,
-        candidate_features: np.ndarray,
-        target_residual: np.ndarray,
-    ) -> dict[str, float | int]:
-        """Fit only the independent Action-Q residual critic."""
-
-        if self.cache_action_q_critic is None or self.cache_action_q_optimizer is None:
-            raise RuntimeError("Cache Action-Q optimizer is not initialized")
-        contexts = np.asarray(conditional_contexts, dtype=np.float32)
-        nodes = np.asarray(node_identities, dtype=np.float32)
-        updates = np.asarray(is_update, dtype=np.float32)
-        features = np.asarray(candidate_features, dtype=np.float32)
-        targets = np.asarray(target_residual, dtype=np.float32).reshape(-1)
-        count = len(targets)
-        if contexts.shape != (count, int(self.cache_action_q_context_dim)):
-            raise ValueError("Cache Action-Q context label shape mismatch")
-        if nodes.shape != (count, int(self.cache_action_q_node_count)):
-            raise ValueError("Cache Action-Q node label shape mismatch")
-        if updates.shape != (count, 1):
-            raise ValueError("Cache Action-Q is_update label shape mismatch")
-        if features.shape != (count, int(self.cache_action_q_feature_dim)):
-            raise ValueError("Cache Action-Q feature label shape mismatch")
-        if not all(
-            np.all(np.isfinite(value))
-            for value in (contexts, nodes, updates, features, targets)
-        ):
-            raise FloatingPointError("Cache Action-Q labels contain NaN/Inf")
-        if count == 0:
-            return {"count": 0, "loss": math.nan, "mae": math.nan, "rmse": math.nan}
-        context_tensor = torch.as_tensor(contexts, dtype=torch.float32, device=self.device)
-        node_tensor = torch.as_tensor(nodes, dtype=torch.float32, device=self.device)
-        update_tensor = torch.as_tensor(updates, dtype=torch.float32, device=self.device)
-        feature_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device)
-        target_tensor = torch.as_tensor(targets, dtype=torch.float32, device=self.device)
-        self.cache_action_q_optimizer.zero_grad(set_to_none=True)
-        prediction = self.cache_action_q_critic(
-            context_tensor,
-            node_tensor,
-            update_tensor,
-            feature_tensor,
-        )
-        loss = torch.mean((prediction - target_tensor) ** 2)
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError("Cache Action-Q regression loss is non-finite")
-        loss.backward()
-        if any(parameter.grad is not None for parameter in self.policy.parameters()):
-            raise RuntimeError("Cache Action-Q loss produced a PPO policy gradient")
-        torch.nn.utils.clip_grad_norm_(
-            self.cache_action_q_critic.parameters(), max_norm=10.0
-        )
-        self.cache_action_q_optimizer.step()
-        self.cache_action_q_training_count += count
-        self.cache_action_q_optimizer_steps += 1
-        with torch.no_grad():
-            residual = prediction - target_tensor
-            mae = float(torch.mean(torch.abs(residual)).detach().cpu())
-            rmse = float(torch.sqrt(torch.mean(residual**2)).detach().cpu())
-        return {
-            "count": int(count),
-            "loss": float(loss.detach().cpu()),
-            "mae": mae,
-            "rmse": rmse,
         }
 
     def _predict_cache_surrogate(
@@ -4476,7 +4508,7 @@ class PPOV2Trainer:
 
         if not cache_credit:
             return
-        gate_metrics = cache_credit.get("gate_metrics")
+        gate_metrics = cache_credit.get("surrogate_gate_metrics")
         if not bool(cache_credit.get("full_exact_evaluation", False)) or not gate_metrics:
             return
         if int(gate_metrics.get("row_count", 0)) <= 0:
@@ -4618,63 +4650,96 @@ class PPOV2Trainer:
             requested_steps,
         )
 
-    def _evaluate_cache_branch_approx_kl_full_rollout(
+    def _cache_full_candidate_log_probs(
         self,
         *,
-        observations: Any,
+        cache_contexts: Any,
+        candidate_features: Any,
+        candidate_valid_mask: Any,
+    ) -> tuple[Any, Any]:
+        """Evaluate the candidate conditional on every legal UPDATE action."""
+
+        probabilities = self._conditional_candidate_probabilities(
+            cache_contexts,
+            candidate_features,
+            candidate_valid_mask,
+            int(self.policy.cache_feature_dim),
+            self.policy.cache_candidate_scorer,
+        )
+        return _candidate_probability_log_distribution(
+            probabilities, candidate_valid_mask
+        )
+
+    def _cache_full_distribution_kl_per_head(
+        self,
+        *,
         cache_contexts: Any,
         cache_trigger_aux: Any | None,
         operation_masks: Any,
-        operation_actions: Any,
         candidate_features: Any,
-        candidate_masks: Any,
-        selected_indices: Any,
+        candidate_valid_mask: Any,
+        frozen_candidate_kl_mask: Any,
+        old_operation_log_probs: Any,
+        old_candidate_log_probs: Any,
+    ) -> Any:
+        """Compute exact old-to-new KL over KEEP and every legal UPDATE."""
+
+        with torch.no_grad():
+            new_operation_log_probs = self._cache_trigger_log_probabilities_all(
+                cache_contexts, operation_masks, cache_trigger_aux
+            )
+            new_candidate_log_probs, current_candidate_kl_mask = (
+                self._cache_full_candidate_log_probs(
+                    cache_contexts=cache_contexts,
+                    candidate_features=candidate_features,
+                    candidate_valid_mask=candidate_valid_mask,
+                )
+            )
+            frozen_candidate_kl_mask = torch.as_tensor(
+                frozen_candidate_kl_mask,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if not torch.equal(current_candidate_kl_mask, frozen_candidate_kl_mask):
+                raise RuntimeError("Cache candidate KL mask changed during evaluation")
+            return _cache_per_head_old_new_kl(
+                old_operation_log_probs,
+                new_operation_log_probs,
+                old_candidate_log_probs,
+                new_candidate_log_probs,
+                operation_masks,
+                frozen_candidate_kl_mask,
+            )
+
+    def _evaluate_cache_full_distribution_kl(
+        self,
+        *,
+        cache_contexts: Any,
+        cache_trigger_aux: Any | None,
+        operation_masks: Any,
+        candidate_features: Any,
+        candidate_valid_mask: Any,
+        frozen_candidate_kl_mask: Any,
         old_operation_log_probs: Any,
         old_candidate_log_probs: Any,
     ) -> float:
-        """Evaluate the production sampled Cache branch KL on one full rollout.
+        """Evaluate complete Cache action-distribution drift on the rollout."""
 
-        This is the same estimator used by the existing per-minibatch branch
-        diagnostics, but it is evaluated on the complete frozen rollout after
-        an actor optimizer step so the minibatch control observes cumulative
-        policy drift rather than a pre-step minibatch-local value.
-        """
-
-        with torch.no_grad():
-            cache_arguments = (
-                observations,
-                cache_contexts,
-                operation_masks,
-                operation_actions,
-                candidate_features,
-                candidate_masks,
-                selected_indices,
-            )
-            if isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic):
-                if cache_trigger_aux is None:
-                    raise RuntimeError("V3 Cache KL evaluation requires stored Trigger auxiliary")
-                evaluation = self.policy.evaluate_cache_operation_primitive(
-                    *cache_arguments, cache_trigger_aux
-                )
-            else:
-                evaluation = self.policy.evaluate_cache_operation_primitive(
-                    *cache_arguments
-                )
-            if evaluation.cache_log_prob is None:
-                raise RuntimeError(
-                    "Cache branch KL evaluation did not expose cache_log_prob"
-                )
-            old_cache_log_prob = (
-                old_operation_log_probs + old_candidate_log_probs
-            ).sum(dim=-1)
-            delta = evaluation.cache_log_prob - old_cache_log_prob
-            if not bool(torch.all(torch.isfinite(delta)).item()):
-                raise FloatingPointError(
-                    "Cache full-rollout KL estimator produced NaN/Inf"
-                )
-            value = float(torch.mean(-delta).detach().cpu())
+        values = self._cache_full_distribution_kl_per_head(
+            cache_contexts=cache_contexts,
+            cache_trigger_aux=cache_trigger_aux,
+            operation_masks=operation_masks,
+            candidate_features=candidate_features,
+            candidate_valid_mask=candidate_valid_mask,
+            frozen_candidate_kl_mask=frozen_candidate_kl_mask,
+            old_operation_log_probs=old_operation_log_probs,
+            old_candidate_log_probs=old_candidate_log_probs,
+        )
+        if not bool(torch.all(torch.isfinite(values)).item()):
+            raise FloatingPointError("Cache full-distribution KL is non-finite")
+        value = float(torch.mean(values).detach().cpu())
         if not math.isfinite(value):
-            raise FloatingPointError("Cache full-rollout KL estimator is non-finite")
+            raise FloatingPointError("Cache full-distribution KL is non-finite")
         return value
 
     def _evaluate_uav_branch_approx_kl_full_rollout(
@@ -4776,1019 +4841,6 @@ class PPOV2Trainer:
         if not math.isfinite(value):
             raise FloatingPointError("UAV full-rollout KL estimator is non-finite")
         return value
-
-    def _compute_exact_uav_operation_credit_legacy(
-        self,
-        rollout: SimpleRollout,
-        *,
-        target_transition_indices: tuple[int, ...] | None = None,
-        use_node_evaluation_cache: bool = True,
-    ) -> dict[str, Any]:
-        """Compute detached per-UAV counterfactual one-step TD credit.
-
-        This is intentionally a trainer-side replay of the already collected
-        target transition.  Cache actions and every non-target UAV action are
-        copied from production; only the target STAY/target-position branch is
-        replaced.
-        Each branch goes through the real ``execute_slot`` path with a direct
-        primitive configuration override, so Matching/KKT and all frozen
-        reward/cost semantics remain authoritative.
-        """
-
-        if not self._uses_exact_uav_operation_credit():
-            return {}
-        all_transitions = tuple(rollout.transitions)
-        if target_transition_indices is None:
-            transitions = all_transitions
-        else:
-            selected_indices = tuple(int(index) for index in target_transition_indices)
-            if not selected_indices:
-                raise ValueError("proposed counterfactual target transition selection is empty")
-            if len(set(selected_indices)) != len(selected_indices):
-                raise ValueError("proposed counterfactual target transition selection repeats an index")
-            if any(index < 0 or index >= len(all_transitions) for index in selected_indices):
-                raise IndexError("proposed counterfactual target transition index is out of range")
-            transitions = tuple(all_transitions[index] for index in selected_indices)
-        if not transitions:
-            raise ValueError("proposed operation credit requires a non-empty rollout")
-        uav_ids = tuple(str(value) for value in self.context.action_spec.uav_ids)
-        head_count = len(uav_ids)
-        sample_count = len(transitions)
-        for transition in transitions:
-            if (
-                transition.previous_cache_state is None
-                or transition.previous_uav_positions is None
-                or transition.uav_operation_actions is None
-                or transition.uav_operation_masks is None
-                or transition.uav_operation_probabilities is None
-                or transition.uav_contexts is None
-                or transition.uav_candidate_features is None
-            ):
-                raise ValueError("proposed rollout is missing operation counterfactual tensors")
-
-        first_origin = int(transitions[0].origin_index)
-        last_origin = max(int(transition.origin_index) for transition in transitions)
-        include_bootstrap_step = not bool(
-            all(
-                bool(transition.done)
-                for transition in transitions
-                if int(transition.origin_index) == last_origin
-            )
-        )
-        aligned_span = last_origin - first_origin + 1 + int(include_bootstrap_step)
-        aligned_steps = aligned_train_steps(
-            self.context,
-            origin_start=first_origin,
-            max_steps=aligned_span,
-            include_bootstrap_step=include_bootstrap_step,
-        )
-        if len(aligned_steps) < aligned_span:
-            raise RuntimeError("proposed counterfactual replay is missing aligned next steps")
-        aligned_steps_by_origin = {
-            int(step.origin_index): step for step in aligned_steps
-        }
-        selected_aligned_steps = []
-        for transition in transitions:
-            try:
-                selected_aligned_steps.append(
-                    aligned_steps_by_origin[int(transition.origin_index)]
-                )
-            except KeyError as exc:
-                raise RuntimeError(
-                    "proposed counterfactual replay is missing a selected aligned step"
-                ) from exc
-        for transition, step in zip(transitions, selected_aligned_steps, strict=True):
-            if int(transition.origin_index) != int(step.origin_index):
-                raise RuntimeError("proposed counterfactual replay origin alignment failed")
-
-        q_stay = np.zeros((sample_count, head_count), dtype=np.float64)
-        q_move = np.zeros((sample_count, head_count), dtype=np.float64)
-        baseline = np.zeros((sample_count, head_count), dtype=np.float64)
-        move_candidate_counts = np.zeros((sample_count, head_count), dtype=np.int64)
-        candidate_capacity = int(transitions[0].uav_candidate_features.shape[1])
-        if candidate_capacity <= 0:
-            raise RuntimeError("proposed rollout candidate capacity must be positive")
-        if any(
-            int(transition.uav_candidate_features.shape[1]) != candidate_capacity
-            for transition in transitions
-        ):
-            raise RuntimeError("proposed rollout candidate capacity is not time-aligned")
-        # The exact branch evaluator below already produces Q_c for every legal
-        # MOVE candidate.  Keep those values and the same frozen-policy
-        # probabilities so the candidate update can consume them without another
-        # execute_slot/Matching/KKT enumeration.
-        candidate_q_values = np.zeros(
-            (sample_count, head_count, candidate_capacity), dtype=np.float64
-        )
-        candidate_probabilities_values = np.zeros_like(candidate_q_values)
-        candidate_valid_mask = np.zeros(
-            (sample_count, head_count, candidate_capacity), dtype=bool
-        )
-        candidate_proposal_sources = np.full(
-            (sample_count, head_count, candidate_capacity), "", dtype=object
-        )
-        candidate_move_distances = np.full(
-            (sample_count, head_count, candidate_capacity), np.nan, dtype=np.float64
-        )
-        candidate_weighted_mean_residual = np.zeros(
-            (sample_count, head_count), dtype=np.float64
-        )
-        counterfactual_environment_executions = 0
-        branch_request_count = 0
-        unique_branch_count = 0
-        branch_cache_hit_count = 0
-        execute_slot_call_count = 0
-        matching_call_count = 0
-        kkt_call_count = 0
-        kkt_cache_request_count = 0
-        kkt_cache_hit_count = 0
-        kkt_cache_miss_count = 0
-        kkt_solver_call_count = 0
-        node_eval_cache_request_count = 0
-        node_eval_cache_hit_count = 0
-        node_eval_cache_miss_count = 0
-        node_eval_full_execution_count = 0
-        ideal_utility_request_count = 0
-        ideal_utility_cache_hit_count = 0
-        ideal_utility_cache_miss_count = 0
-        impact_scope_request_count = 0
-        impact_scope_compute_count = 0
-        impact_scope_reuse_count = 0
-        counterfactual_operation_valid_mask = np.zeros(
-            (sample_count, head_count, 2), dtype=bool
-        )
-        stay_request_count = 0
-        stay_infeasible_count = 0
-        move_candidate_count = 0
-        move_full_branch_feasible_count = 0
-        move_full_branch_infeasible_count = 0
-        heads_with_no_feasible_move = 0
-        heads_with_infeasible_stay = 0
-        selected_action_infeasible_count = 0
-        invalid_full_branch_execute_slot_count = 0
-        started_at = time.perf_counter()
-        timing_profile = {
-            "matching_runtime": 0.0,
-            "node_cache_lookup_runtime": 0.0,
-            "node_eval_miss_runtime": 0.0,
-            "kkt_runtime": 0.0,
-            "kkt_coefficient_build_runtime": 0.0,
-            "kkt_solver_core_runtime": 0.0,
-            "kkt_result_assembly_runtime": 0.0,
-            "reward_delay_aggregation_runtime": 0.0,
-            "reward_energy_aggregation_runtime": 0.0,
-            "reward_cost_aggregation_runtime": 0.0,
-            "reward_final_combination_runtime": 0.0,
-                "branch_state_build_runtime": 0.0,
-                "reward_assembly_runtime": 0.0,
-                "critic_runtime": 0.0,
-                "exact_eval_kkt_conversion_runtime": 0.0,
-                "exact_eval_state_copy_runtime": 0.0,
-                "exact_eval_affected_node_prep_runtime": 0.0,
-                "exact_eval_node_call_orchestration_runtime": 0.0,
-                "exact_eval_result_merge_runtime": 0.0,
-                "exact_eval_non_edge_prep_runtime": 0.0,
-                "exact_eval_target_count_build_runtime": 0.0,
-                "exact_eval_utility_sum_runtime": 0.0,
-                "exact_eval_record_bookkeeping_runtime": 0.0,
-                "exact_eval_other_runtime": 0.0,
-                "current_kkt_conversion_call_count": 0.0,
-                "candidate_kkt_conversion_call_count": 0.0,
-                "exact_eval_state_copy_call_count": 0.0,
-                "current_kkt_context_request_count": 0.0,
-                "current_kkt_context_reuse_count": 0.0,
-                "candidate_kkt_context_request_count": 0.0,
-                "candidate_kkt_context_reuse_count": 0.0,
-            }
-
-        def _position_dict(source: dict[str, Any]) -> dict[str, np.ndarray]:
-            return {
-                uav_id: np.asarray(source[uav_id], dtype=np.float64).copy()
-                for uav_id in uav_ids
-            }
-
-        def _target_action(
-            uav_id: str,
-            head_index: int,
-            candidate_count: int,
-            operation: str,
-            before: np.ndarray,
-            after: np.ndarray,
-            selected_index: int | None,
-            proposal_source: str | None = None,
-        ) -> dict[str, Any]:
-            action = {
-                "head_type": "uav",
-                "head_id": uav_id,
-                "head_index": int(head_index),
-                "candidate_count": int(candidate_count),
-                "selected_index": selected_index,
-                "conditional_action": (
-                    "STAY" if operation == "STAY" else "TARGET_POSITION"
-                ),
-                "before_position": [float(value) for value in before],
-                "after_position": [float(value) for value in after],
-                "actual_moved": bool(operation == "MOVE"),
-            }
-            if proposal_source is not None:
-                action["proposal_source"] = str(proposal_source)
-            if operation == "MOVE":
-                action["target_position"] = [float(value) for value in after]
-            return action
-
-        def _full_branch_is_feasible(
-            previous_positions: dict[str, np.ndarray],
-            final_positions: dict[str, np.ndarray],
-            triggers: dict[str, int],
-        ) -> bool:
-            """Reuse the authoritative complete-transition UAV validator."""
-
-            try:
-                uav_configuration.validate_uav_configuration_transition(
-                    previous_positions,
-                    final_positions,
-                    triggers,
-                    self.context.cfg,
-                    self.context.flight_boundary,
-                )
-            except ValueError:
-                return False
-            return True
-
-        for transition_index, (transition, step) in enumerate(
-            zip(transitions, selected_aligned_steps, strict=True)
-        ):
-            previous_cache = np.asarray(
-                transition.previous_cache_state, dtype=np.int8
-            ).copy()
-            previous_uav = _position_dict(transition.previous_uav_positions)
-            production_final_uav = _position_dict(transition.next_uav_positions)
-            production_cache_triggers, production_uav_triggers = (
-                self.context.action_spec.action_vector_to_triggers(transition.action)
-            )
-            production_cache_triggers = np.asarray(
-                production_cache_triggers, dtype=np.int8
-            )
-            production_uav_triggers = {
-                str(key): int(value)
-                for key, value in production_uav_triggers.items()
-            }
-            production_cache_actions = tuple(
-                dict(value) for value in transition.cache_conditional_actions
-            )
-            production_uav_actions = [
-                dict(value) for value in transition.uav_conditional_actions
-            ]
-            if len(production_uav_actions) != head_count:
-                raise RuntimeError("proposed production UAV action count mismatch")
-
-            # This memo is deliberately created inside one transition.  The
-            # actual tasks, vehicle positions, scenario slice, previous
-            # UAV positions, and next exogenous state are therefore fixed by
-            # construction; the key still includes every mutable
-            # configuration input and never uses candidate index as identity.
-            slot_branch_cache: dict[
-                tuple[Any, ...], tuple[float, np.ndarray | None]
-            ] = {}
-            transition_kkt_cache = task_allocation.KKTResourceAllocationCache()
-            transition_node_evaluation_cache = (
-                task_allocation.NodeEvaluationCache(timing_profile=timing_profile)
-                if use_node_evaluation_cache
-                else None
-            )
-            previous_uav_key = tuple(
-                (
-                    str(key),
-                    float(np.asarray(previous_uav[key], dtype=np.float64)[0]),
-                    float(np.asarray(previous_uav[key], dtype=np.float64)[1]),
-                )
-                for key in uav_ids
-            )
-
-            for head_index, uav_id in enumerate(uav_ids):
-                # Reconstruct exactly the sequential conditional state used
-                # by the production sampler for this head.
-                current_uav = _position_dict(transition.previous_uav_positions)
-                enumeration_triggers = {candidate_id: 0 for candidate_id in uav_ids}
-                for prior_index, prior_id in enumerate(uav_ids[:head_index]):
-                    prior_action = production_uav_actions[prior_index]
-                    if str(prior_action.get("conditional_action", "")).upper() == "TARGET_POSITION":
-                        current_uav[prior_id] = np.asarray(
-                            prior_action.get(
-                                "target_position", prior_action["after_position"]
-                            ),
-                            dtype=np.float64,
-                        )
-                        enumeration_triggers[prior_id] = 1
-                enumeration_triggers[uav_id] = 1
-                candidates = uav_configuration.enumerate_uav_target_candidates(
-                    current_uav,
-                    previous_uav,
-                    uav_id,
-                    enumeration_triggers,
-                    self.context.cfg,
-                    self.context.flight_boundary,
-                    scenario_slice=step.scenario_slice,
-                    cache_state=transition.next_cache_state,
-                    cache_nodes=self.context.cache_nodes,
-                    predicted_vehicle_positions=step.predicted_vehicle_positions,
-                )
-                move_candidates = candidates
-                move_count = len(move_candidates)
-                move_candidate_counts[transition_index, head_index] = move_count
-                move_candidate_count += move_count
-                if move_count > int(transition.uav_candidate_features.shape[1]):
-                    raise RuntimeError("proposed legal UAV candidates exceed rollout capacity")
-
-                stay_request_count += 1
-                stay_branch_final_uav = {
-                    key: value.copy() for key, value in production_final_uav.items()
-                }
-                stay_branch_final_uav[uav_id] = current_uav[uav_id].copy()
-                stay_branch_triggers = dict(production_uav_triggers)
-                stay_branch_triggers[uav_id] = 0
-                stay_full_branch_feasible = _full_branch_is_feasible(
-                    previous_uav,
-                    stay_branch_final_uav,
-                    stay_branch_triggers,
-                )
-                if not stay_full_branch_feasible:
-                    stay_infeasible_count += 1
-                    heads_with_infeasible_stay += 1
-
-                move_full_branch_feasible_mask = np.zeros(move_count, dtype=bool)
-                for candidate_index, candidate in enumerate(move_candidates):
-                    branch_final_uav = {
-                        key: value.copy() for key, value in production_final_uav.items()
-                    }
-                    branch_final_uav[uav_id] = np.asarray(
-                        candidate.target_position,
-                        dtype=np.float64,
-                    ).copy()
-                    branch_triggers = dict(production_uav_triggers)
-                    branch_triggers[uav_id] = 1
-                    move_full_branch_feasible_mask[candidate_index] = (
-                        _full_branch_is_feasible(
-                            previous_uav,
-                            branch_final_uav,
-                            branch_triggers,
-                        )
-                    )
-                move_full_branch_feasible_count += int(
-                    move_full_branch_feasible_mask.sum()
-                )
-                move_full_branch_infeasible_count += int(
-                    (~move_full_branch_feasible_mask).sum()
-                )
-                if not bool(np.any(move_full_branch_feasible_mask)):
-                    heads_with_no_feasible_move += 1
-
-                teacher_operation_mask = np.asarray(
-                    [
-                        bool(stay_full_branch_feasible),
-                        bool(np.any(move_full_branch_feasible_mask)),
-                    ],
-                    dtype=bool,
-                )
-                if not bool(np.any(teacher_operation_mask)):
-                    raise RuntimeError(
-                        "Exact-Q counterfactual operation has no feasible operation"
-                    )
-                counterfactual_operation_valid_mask[
-                    transition_index, head_index
-                ] = teacher_operation_mask
-
-                production_action = production_uav_actions[head_index]
-                production_operation = str(
-                    production_action.get("conditional_action", "")
-                ).upper()
-                if production_operation == "STAY":
-                    selected_full_branch_feasible = stay_full_branch_feasible
-                elif production_operation == "TARGET_POSITION":
-                    selected_index_value = production_action.get("selected_index")
-                    if selected_index_value is None:
-                        raise RuntimeError(
-                            "production MOVE action is missing selected_index"
-                        )
-                    selected_index_value = int(selected_index_value)
-                    if selected_index_value < 0 or selected_index_value >= move_count:
-                        raise RuntimeError(
-                            "production MOVE action selected_index is out of range"
-                        )
-                    selected_full_branch_feasible = bool(
-                        move_full_branch_feasible_mask[selected_index_value]
-                    )
-                else:
-                    raise RuntimeError(
-                        "production UAV action has an unsupported conditional_action"
-                    )
-                if not selected_full_branch_feasible:
-                    selected_action_infeasible_count += 1
-                    raise RuntimeError(
-                        "PRODUCTION_SELECTED_BRANCH_FULL_FEASIBLE = NO"
-                    )
-
-                raw_probabilities = np.asarray(
-                    transition.uav_operation_probabilities[head_index],
-                    dtype=np.float64,
-                ).reshape(-1)
-                operation_mask = np.asarray(
-                    transition.uav_operation_masks[head_index], dtype=bool
-                ).reshape(-1)
-                if raw_probabilities.shape != (2,) or operation_mask.shape != (2,):
-                    raise RuntimeError("proposed UAV operation probability/mask shape mismatch")
-                if bool(np.any(teacher_operation_mask & ~operation_mask)):
-                    raise RuntimeError(
-                        "Exact-Q teacher-valid operation is not rollout-legal"
-                    )
-                if move_count > 0 and bool(operation_mask[1]):
-                    probability_sum = float(raw_probabilities.sum())
-                    if (
-                        not np.all(np.isfinite(raw_probabilities))
-                        or probability_sum <= 0.0
-                    ):
-                        raise FloatingPointError(
-                            "proposed UAV operation probabilities are non-finite"
-                        )
-                    p_stay, p_move = (
-                        raw_probabilities / probability_sum
-                    ).tolist()
-                else:
-                    # The masked production operation distribution has only
-                    # STAY when no legal MOVE exists.
-                    p_stay, p_move = 1.0, 0.0
-                teacher_probability_values = np.asarray(
-                    [float(p_stay), float(p_move)],
-                    dtype=np.float64,
-                )
-                teacher_probability_values = np.where(
-                    teacher_operation_mask,
-                    teacher_probability_values,
-                    0.0,
-                )
-                teacher_probability_sum = float(teacher_probability_values.sum())
-                if (
-                    not math.isfinite(teacher_probability_sum)
-                    or teacher_probability_sum <= 0.0
-                ):
-                    raise FloatingPointError(
-                        "Exact-Q teacher-valid operation probability mass is empty"
-                    )
-                teacher_probability_values /= teacher_probability_sum
-                p_stay, p_move = teacher_probability_values.tolist()
-
-                if move_count:
-                    with torch.no_grad():
-                        candidate_sample = self.policy.sample_uav_candidate(
-                            transition.uav_contexts[head_index],
-                            np.asarray(
-                                transition.uav_candidate_features[
-                                    head_index, :move_count
-                                ],
-                                dtype=np.float32,
-                            ),
-                            deterministic=False,
-                        )
-                        candidate_probabilities = torch.softmax(
-                            candidate_sample.logits, dim=-1
-                        ).detach().cpu().numpy().astype(np.float64)
-                    if (
-                        candidate_probabilities.shape != (move_count,)
-                        or not np.all(np.isfinite(candidate_probabilities))
-                        or not np.isclose(
-                            float(candidate_probabilities.sum()), 1.0, atol=1.0e-5
-                        )
-                    ):
-                        raise FloatingPointError(
-                            "proposed candidate probabilities are non-finite or do not sum to one"
-                        )
-                    candidate_probabilities = np.where(
-                        move_full_branch_feasible_mask,
-                        candidate_probabilities,
-                        0.0,
-                    )
-                    candidate_probability_sum = float(candidate_probabilities.sum())
-                    if bool(np.any(move_full_branch_feasible_mask)):
-                        if (
-                            not math.isfinite(candidate_probability_sum)
-                            or candidate_probability_sum <= 0.0
-                        ):
-                            raise FloatingPointError(
-                                "full-branch-valid UAV candidate probability mass is empty"
-                            )
-                        candidate_probabilities /= candidate_probability_sum
-                    else:
-                        candidate_probabilities.fill(0.0)
-                else:
-                    candidate_probabilities = np.zeros(0, dtype=np.float64)
-
-                next_step = (
-                    None
-                    if bool(transition.done)
-                    else aligned_steps_by_origin.get(int(transition.origin_index) + 1)
-                )
-                if not bool(transition.done) and next_step is None:
-                    raise RuntimeError(
-                        "proposed counterfactual replay is missing the next aligned step"
-                    )
-
-                def _evaluate_branch(
-                    operation: str,
-                    selected_index: int | None,
-                    before: np.ndarray,
-                    after: np.ndarray,
-                ) -> tuple[float, np.ndarray | None]:
-                    nonlocal counterfactual_environment_executions
-                    nonlocal branch_request_count, unique_branch_count
-                    nonlocal branch_cache_hit_count
-                    nonlocal execute_slot_call_count, matching_call_count, kkt_call_count
-                    nonlocal kkt_cache_request_count, kkt_cache_hit_count
-                    nonlocal kkt_cache_miss_count, kkt_solver_call_count
-                    nonlocal node_eval_cache_request_count, node_eval_cache_hit_count
-                    nonlocal node_eval_cache_miss_count, node_eval_full_execution_count
-                    nonlocal ideal_utility_request_count
-                    nonlocal ideal_utility_cache_hit_count, ideal_utility_cache_miss_count
-                    nonlocal impact_scope_request_count, impact_scope_compute_count
-                    nonlocal impact_scope_reuse_count
-                    branch_state_started_at = time.perf_counter()
-                    branch_final_uav = {
-                        key: value.copy() for key, value in production_final_uav.items()
-                    }
-                    branch_final_uav[uav_id] = np.asarray(after, dtype=np.float64).copy()
-                    branch_uav_triggers = dict(production_uav_triggers)
-                    branch_uav_triggers[uav_id] = int(operation == "MOVE")
-                    branch_key = (
-                        int(transition.origin_index),
-                        np.asarray(previous_cache, dtype=np.int8).tobytes(),
-                        np.asarray(transition.next_cache_state, dtype=np.int8).tobytes(),
-                        previous_uav_key,
-                        tuple(
-                            (
-                                str(key),
-                                float(np.asarray(branch_final_uav[key], dtype=np.float64)[0]),
-                                float(np.asarray(branch_final_uav[key], dtype=np.float64)[1]),
-                            )
-                            for key in uav_ids
-                        ),
-                        tuple(
-                            (str(key), int(branch_uav_triggers[key]))
-                            for key in uav_ids
-                        ),
-                    )
-                    branch_request_count += 1
-                    cached = slot_branch_cache.get(branch_key)
-                    if cached is not None:
-                        branch_cache_hit_count += 1
-                        cached_reward, cached_observation = cached
-                        timing_profile["branch_state_build_runtime"] += (
-                            time.perf_counter() - branch_state_started_at
-                        )
-                        return float(cached_reward), (
-                            None
-                            if cached_observation is None
-                            else np.asarray(cached_observation, dtype=np.float32).copy()
-                        )
-                    unique_branch_count += 1
-                    branch_uav_actions = list(production_uav_actions)
-                    branch_uav_actions[head_index] = _target_action(
-                        uav_id,
-                        head_index,
-                        move_count,
-                        operation,
-                        np.asarray(before, dtype=np.float64),
-                        np.asarray(after, dtype=np.float64),
-                        selected_index,
-                        (
-                            move_candidates[selected_index].proposal_source
-                            if operation == "MOVE" and selected_index is not None
-                            else None
-                        ),
-                    )
-                    configuration_override = (
-                        slot_environment.build_policy_target_configuration(
-                            previous_cache,
-                            previous_uav,
-                            transition.next_cache_state,
-                            branch_final_uav,
-                            production_cache_triggers,
-                            branch_uav_triggers,
-                            self.context.service_catalog,
-                            self.context.cfg,
-                            self.context.cache_nodes,
-                            self.context.cache_cfg,
-                            self.context.flight_boundary,
-                            cache_actions=production_cache_actions,
-                            uav_actions=tuple(branch_uav_actions),
-                        )
-                    )
-                    timing_profile["branch_state_build_runtime"] += (
-                        time.perf_counter() - branch_state_started_at
-                    )
-                    execute_slot_call_count += 1
-                    matching_call_count += 1
-                    result = slot_environment.execute_slot(
-                        previous_cache,
-                        previous_uav,
-                        production_cache_triggers,
-                        branch_uav_triggers,
-                        step.scenario_slice,
-                        step.actual_tasks,
-                        step.actual_vehicle_positions,
-                        self.context.local_cache,
-                        self.context.service_catalog,
-                        self.context.cfg,
-                        self.context.cache_nodes,
-                        self.context.cache_cfg,
-                        self.context.flight_boundary,
-                        slot_id=step.slot,
-                        time_s=step.time_s,
-                        performance_profile=None,
-                        configuration_profile=cache_configuration.ConfigurationEvaluationProfile(),
-                        configuration_override=configuration_override,
-                        matching_kkt_cache=transition_kkt_cache,
-                        node_evaluation_cache=transition_node_evaluation_cache,
-                        exact_q_timing_profile=timing_profile,
-                    )
-                    reward_assembly_started_at = time.perf_counter()
-                    counterfactual_environment_executions += 1
-                    kkt_call_count += int(
-                        result.matching_summary.get("kkt_cache_requests", 0)
-                    )
-                    kkt_cache_request_count += int(
-                        result.matching_summary.get("KKT_CACHE_REQUEST_COUNT", 0)
-                    )
-                    kkt_cache_hit_count += int(
-                        result.matching_summary.get("KKT_CACHE_HIT_COUNT", 0)
-                    )
-                    kkt_cache_miss_count += int(
-                        result.matching_summary.get("KKT_CACHE_MISS_COUNT", 0)
-                    )
-                    kkt_solver_call_count += int(
-                        result.matching_summary.get("KKT_SOLVER_CALL_COUNT", 0)
-                    )
-                    node_eval_cache_request_count += int(
-                        result.matching_summary.get("NODE_EVAL_CACHE_REQUEST_COUNT", 0)
-                    )
-                    node_eval_cache_hit_count += int(
-                        result.matching_summary.get("NODE_EVAL_CACHE_HIT_COUNT", 0)
-                    )
-                    node_eval_cache_miss_count += int(
-                        result.matching_summary.get("NODE_EVAL_CACHE_MISS_COUNT", 0)
-                    )
-                    node_eval_full_execution_count += int(
-                        result.matching_summary.get("NODE_EVAL_FULL_EXECUTION_COUNT", 0)
-                    )
-                    ideal_utility_request_count += int(
-                        result.matching_summary.get("IDEAL_UTILITY_REQUEST_COUNT", 0)
-                    )
-                    ideal_utility_cache_hit_count += int(
-                        result.matching_summary.get("IDEAL_UTILITY_CACHE_HIT_COUNT", 0)
-                    )
-                    ideal_utility_cache_miss_count += int(
-                        result.matching_summary.get("IDEAL_UTILITY_CACHE_MISS_COUNT", 0)
-                    )
-                    impact_scope_request_count += int(
-                        result.matching_summary.get("IMPACT_SCOPE_REQUEST_COUNT", 0)
-                    )
-                    impact_scope_compute_count += int(
-                        result.matching_summary.get("IMPACT_SCOPE_COMPUTE_COUNT", 0)
-                    )
-                    impact_scope_reuse_count += int(
-                        result.matching_summary.get("IMPACT_SCOPE_REUSE_COUNT", 0)
-                    )
-                    if not result.step_feasible:
-                        raise RuntimeError(
-                            "proposed counterfactual transition is infeasible: "
-                            f"origin={step.origin_index}, UAV={uav_id}, operation={operation}"
-                        )
-                    _check_request_contract(
-                        previous_cache,
-                        previous_uav,
-                        result,
-                        self.context.action_spec,
-                    )
-                    reward = _check_reward(result)
-                    if next_step is None:
-                        next_observation = None
-                    else:
-                        next_observation = _intermediate_observation(
-                            np.asarray(result.next_cache_state, dtype=np.int8),
-                            result.next_uav_positions,
-                            next_step,
-                            self.context,
-                        )
-                    safe_observation = (
-                        None
-                        if next_observation is None
-                        else np.asarray(next_observation, dtype=np.float32).copy()
-                    )
-                    slot_branch_cache[branch_key] = (float(reward), safe_observation)
-                    timing_profile["reward_assembly_runtime"] += (
-                        time.perf_counter() - reward_assembly_started_at
-                    )
-                    return float(reward), (
-                        None
-                        if safe_observation is None
-                        else safe_observation.copy()
-                    )
-
-                target_before = current_uav[uav_id].copy()
-                branch_rewards: list[float] = []
-                branch_observations: list[np.ndarray | None] = []
-                branch_labels: list[tuple[str, int | None]] = []
-                if stay_full_branch_feasible:
-                    stay_reward, stay_observation = _evaluate_branch(
-                        "STAY",
-                        None,
-                        target_before,
-                        target_before,
-                    )
-                    branch_rewards.append(stay_reward)
-                    branch_observations.append(stay_observation)
-                    branch_labels.append(("STAY", None))
-                for candidate_index, candidate in enumerate(move_candidates):
-                    if not bool(move_full_branch_feasible_mask[candidate_index]):
-                        continue
-                    move_reward, move_observation = _evaluate_branch(
-                        "MOVE",
-                        candidate_index,
-                        np.asarray(candidate.before_position, dtype=np.float64),
-                        np.asarray(candidate.target_position, dtype=np.float64),
-                    )
-                    branch_rewards.append(move_reward)
-                    branch_observations.append(move_observation)
-                    branch_labels.append(("MOVE", candidate_index))
-                if not branch_rewards:
-                    raise RuntimeError(
-                        "Exact-Q counterfactual branch set is unexpectedly empty"
-                    )
-
-                critic_started_at = time.perf_counter()
-                if next_step is None:
-                    next_values = np.zeros(len(branch_rewards), dtype=np.float64)
-                else:
-                    if len(branch_observations) != len(branch_rewards) or any(
-                        observation is None for observation in branch_observations
-                    ):
-                        raise RuntimeError(
-                            "proposed counterfactual branch observation batch is incomplete"
-                        )
-                    # Every valid branch above has already gone through the
-                    # exact environment/Matching/KKT path.  Only the critic
-                    # inference is batched here; the labels retain STAY and
-                    # the original MOVE candidate indices without compaction
-                    # of the stored candidate tensors.
-                    next_observation_batch = np.stack(
-                        [
-                            np.asarray(observation, dtype=np.float32)
-                            for observation in branch_observations
-                        ],
-                        axis=0,
-                    )
-                    with torch.no_grad():
-                        if not hasattr(self.policy, "critic_value"):
-                            raise RuntimeError(
-                                "proposed policy does not expose the exact critic_value path"
-                            )
-                        value_tensor = self.policy.critic_value(next_observation_batch)
-                    next_values = (
-                        value_tensor.detach().cpu().numpy().reshape(-1).astype(np.float64)
-                    )
-                    if next_values.shape != (len(branch_rewards),):
-                        raise RuntimeError(
-                            "proposed counterfactual critic batch shape mismatch"
-                        )
-                    # Preserve the historical scalar STAY critic result exactly
-                    # whenever STAY is a valid branch.  MOVE candidates still
-                    # use the batched path.
-                    if stay_full_branch_feasible:
-                        stay_label_index = next(
-                            index
-                            for index, label in enumerate(branch_labels)
-                            if label == ("STAY", None)
-                        )
-                        with torch.no_grad():
-                            _, stay_value_tensor = self.policy(
-                                branch_observations[stay_label_index]
-                            )
-                        next_values[stay_label_index] = float(
-                            stay_value_tensor.detach().cpu().reshape(-1)[0]
-                        )
-                timing_profile["critic_runtime"] += (
-                    time.perf_counter() - critic_started_at
-                )
-                q_values = np.asarray(branch_rewards, dtype=np.float64)
-                q_values += float(self.hyperparameters.gamma) * next_values
-                if not np.all(np.isfinite(q_values)):
-                    raise FloatingPointError("proposed counterfactual Q is non-finite")
-                q_stay_value = 0.0
-                move_values = np.zeros(move_count, dtype=np.float64)
-                for branch_index, (operation, candidate_index) in enumerate(
-                    branch_labels
-                ):
-                    if operation == "STAY":
-                        q_stay_value = float(q_values[branch_index])
-                    else:
-                        assert candidate_index is not None
-                        move_values[candidate_index] = float(q_values[branch_index])
-                q_stay[transition_index, head_index] = q_stay_value
-                if stay_full_branch_feasible and not math.isfinite(q_stay_value):
-                    raise FloatingPointError("proposed exact-Q STAY value is non-finite")
-                if bool(np.any(move_full_branch_feasible_mask)):
-                    valid_indices = np.flatnonzero(move_full_branch_feasible_mask)
-                    candidate_q_values[
-                        transition_index, head_index, valid_indices
-                    ] = move_values[valid_indices]
-                    for candidate_index in valid_indices.tolist():
-                        candidate = move_candidates[candidate_index]
-                        candidate_proposal_sources[
-                            transition_index, head_index, candidate_index
-                        ] = str(candidate.proposal_source)
-                        candidate_move_distances[
-                            transition_index, head_index, candidate_index
-                        ] = float(
-                            np.linalg.norm(
-                                np.asarray(candidate.target_position, dtype=np.float64)
-                                - np.asarray(candidate.before_position, dtype=np.float64)
-                            )
-                        )
-                    candidate_probabilities_values[
-                        transition_index, head_index, :move_count
-                    ] = candidate_probabilities
-                    candidate_valid_mask[
-                        transition_index, head_index, :move_count
-                    ] = move_full_branch_feasible_mask
-                    q_move_value = float(
-                        np.dot(candidate_probabilities, move_values)
-                    )
-                    q_move[transition_index, head_index] = q_move_value
-                    candidate_weighted_mean_residual[
-                        transition_index, head_index
-                    ] = float(
-                        np.dot(
-                            candidate_probabilities,
-                            move_values - q_move_value,
-                        )
-                    )
-                else:
-                    # No full-branch-valid MOVE exists.  The safe placeholder
-                    # is never selected by the validity mask or used in the
-                    # operation baseline/teacher.
-                    q_move[transition_index, head_index] = 0.0
-                baseline[transition_index, head_index] = (
-                    float(p_stay) * q_stay[transition_index, head_index]
-                    + float(p_move) * q_move[transition_index, head_index]
-                )
-
-        sampled_operations = np.asarray(
-            [
-                np.asarray(transition.uav_operation_actions, dtype=np.int64)
-                for transition in transitions
-            ],
-            dtype=np.int64,
-        )
-        raw_advantages = np.where(
-            sampled_operations == 0,
-            q_stay - baseline,
-            q_move - baseline,
-        )
-        if not np.all(np.isfinite(raw_advantages)):
-            raise FloatingPointError("proposed operation advantages are non-finite")
-        operation_normalization_mode = (
-            self.hyperparameters.operation_advantage_normalization_mode
-        )
-        if (
-            operation_normalization_mode
-            == OPERATION_ADVANTAGE_NORMALIZATION_STD_ONLY
-        ):
-            population_std = float(np.std(raw_advantages, ddof=0))
-            if not math.isfinite(population_std):
-                raise FloatingPointError("proposed operation advantage std is non-finite")
-            scaled_advantages = raw_advantages / (population_std + 1.0e-8)
-            advantage_normalization = "STD_ONLY"
-            advantage_reference_scale = float(population_std)
-        elif (
-            operation_normalization_mode
-            == OPERATION_ADVANTAGE_NORMALIZATION_FIXED_REFERENCE_SCALE
-        ):
-            advantage_reference_scale = float(
-                self.hyperparameters.operation_advantage_reference_scale
-            )
-            if (
-                not math.isfinite(advantage_reference_scale)
-                or advantage_reference_scale <= 0.0
-            ):
-                raise FloatingPointError(
-                    "fixed-reference fixed operation advantage reference scale is invalid"
-                )
-            scaled_advantages = raw_advantages / advantage_reference_scale
-            advantage_normalization = "FIXED_REFERENCE_SCALE"
-        else:  # pragma: no cover - validated by hyperparameters_from_project
-            raise ValueError(
-                "unsupported operation advantage normalization mode: "
-                f"{operation_normalization_mode}"
-            )
-        nonzero = raw_advantages != 0.0
-        sign_flip_count = int(
-            np.count_nonzero(
-                nonzero
-                & (np.signbit(raw_advantages) != np.signbit(scaled_advantages))
-            )
-        )
-        if sign_flip_count != 0:
-            raise FloatingPointError("proposed std-only operation scaling flipped a sign")
-        if not np.all(np.isfinite(scaled_advantages)):
-            raise FloatingPointError("proposed scaled operation advantages are non-finite")
-        credit_runtime_seconds = float(time.perf_counter() - started_at)
-        classified_runtime_seconds = sum(
-            float(timing_profile[key])
-            for key in (
-                "matching_runtime",
-                "node_cache_lookup_runtime",
-                "node_eval_miss_runtime",
-                "kkt_runtime",
-                "branch_state_build_runtime",
-                "reward_assembly_runtime",
-                "critic_runtime",
-            )
-        )
-        timing_profile["other_runtime"] = (
-            credit_runtime_seconds - classified_runtime_seconds
-        )
-        return {
-            "raw_advantages": raw_advantages.astype(np.float32),
-            "scaled_advantages": scaled_advantages.astype(np.float32),
-            "q_stay": q_stay.astype(np.float32),
-            "q_move": q_move.astype(np.float32),
-            "baseline": baseline.astype(np.float32),
-            "counterfactual_environment_executions": int(
-                counterfactual_environment_executions
-            ),
-            "uav_exact_q_branch_request_count": int(branch_request_count),
-            "uav_exact_q_unique_branch_count": int(unique_branch_count),
-            "uav_exact_q_duplicate_branch_count": int(
-                branch_request_count - unique_branch_count
-            ),
-            "uav_exact_q_cache_hit_count": int(branch_cache_hit_count),
-            "execute_slot_call_count": int(execute_slot_call_count),
-            "matching_call_count": int(matching_call_count),
-            # This is the exact number of KKT resource-cache requests made by
-            # the Matching path for the unique UAV exact-Q branches. The
-            # Matching/KKT implementation itself remains unchanged.
-            "kkt_call_count": int(kkt_call_count),
-            "kkt_cache_request_count": int(kkt_cache_request_count),
-            "kkt_cache_hit_count": int(kkt_cache_hit_count),
-            "kkt_cache_miss_count": int(kkt_cache_miss_count),
-            "kkt_solver_call_count": int(kkt_solver_call_count),
-            "node_eval_cache_request_count": int(node_eval_cache_request_count),
-            "node_eval_cache_hit_count": int(node_eval_cache_hit_count),
-            "node_eval_cache_miss_count": int(node_eval_cache_miss_count),
-            "node_eval_full_execution_count": int(node_eval_full_execution_count),
-            "ideal_utility_request_count": int(ideal_utility_request_count),
-            "ideal_utility_cache_hit_count": int(ideal_utility_cache_hit_count),
-            "ideal_utility_cache_miss_count": int(ideal_utility_cache_miss_count),
-            "impact_scope_request_count": int(impact_scope_request_count),
-            "impact_scope_compute_count": int(impact_scope_compute_count),
-            "impact_scope_reuse_count": int(impact_scope_reuse_count),
-            "mean_move_candidate_count": float(np.mean(move_candidate_counts)),
-            "move_candidate_counts": move_candidate_counts,
-            "candidate_q_values": candidate_q_values,
-            "candidate_probabilities": candidate_probabilities_values,
-            "candidate_valid_mask": candidate_valid_mask,
-            "candidate_proposal_sources": candidate_proposal_sources,
-            "candidate_move_distances": candidate_move_distances,
-            "candidate_q_move": q_move.copy(),
-            "candidate_weighted_mean_residual": candidate_weighted_mean_residual,
-            "counterfactual_operation_valid_mask": counterfactual_operation_valid_mask,
-            "uav_cf_stay_request_count": int(stay_request_count),
-            "uav_cf_stay_infeasible_count": int(stay_infeasible_count),
-            "uav_cf_move_candidate_count": int(move_candidate_count),
-            "uav_cf_move_full_branch_feasible_count": int(
-                move_full_branch_feasible_count
-            ),
-            "uav_cf_move_full_branch_infeasible_count": int(
-                move_full_branch_infeasible_count
-            ),
-            "uav_cf_heads_with_no_feasible_move": int(
-                heads_with_no_feasible_move
-            ),
-            "uav_cf_heads_with_infeasible_stay": int(
-                heads_with_infeasible_stay
-            ),
-            "uav_cf_selected_action_infeasible_count": int(
-                selected_action_infeasible_count
-            ),
-            "invalid_full_branch_execute_slot_count": int(
-                invalid_full_branch_execute_slot_count
-            ),
-            "credit_runtime_seconds": credit_runtime_seconds,
-            "timing": dict(timing_profile),
-            "advantage_normalization": advantage_normalization,
-            "advantage_reference_scale": float(advantage_reference_scale),
-            "advantage_centering": False,
-            "advantage_sign_flip_count": sign_flip_count,
-            "ratio_granularity": "OPERATION_ONLY",
-        }
 
     def _compute_exact_uav_operation_credit(
         self,
@@ -6771,12 +5823,12 @@ class PPOV2Trainer:
     ) -> tuple[Any, Any, Any, Any, Any]:
         """Construct the binary operation teacher from frozen rollout values.
 
-        The candidate head continues to use the unchanged legal-candidate
-        Exact-Q listwise teacher.  The operation head instead uses the
-        rollout-time candidate-policy expectation over the same full-branch
-        feasible candidate set.  An inactive candidate set has no MOVE value
-        and is represented only by a masked STAY teacher; it is never assigned
-        a hard-max or fabricated operation target.
+        Both the Candidate teacher and the MOVE value used by the operation
+        teacher come from the same legal-candidate Exact-Q listwise distribution.
+        The rollout candidate probabilities are retained only for a diagnostic
+        comparison. An inactive candidate set has no MOVE value and is
+        represented only by a masked STAY teacher; it is never assigned a
+        hard-max or fabricated operation target.
         """
 
         q_values = torch.as_tensor(candidate_q_values, dtype=torch.float32)
@@ -6870,7 +5922,7 @@ class PPOV2Trainer:
             raise ValueError("Exact-Q operation teacher has no valid operation")
         stay_legal = teacher_masks[..., 0]
         both_legal = stay_legal & move_legal
-        delta = q_move_operation - stay_q
+        delta = q_move_listwise_teacher - stay_q
         move_probability = torch.where(
             both_legal,
             torch.sigmoid(delta / scale),
@@ -6975,153 +6027,6 @@ class PPOV2Trainer:
             kl = kl * confidence.detach()
         return kl[active_heads].mean(), teacher
 
-    def _cache_policy_terms(
-        self,
-        cache_contexts: Any,
-        operation_masks: Any,
-        operation_actions: Any,
-        candidate_features: Any,
-        candidate_operation_indices: Any,
-        candidate_valid_mask: Any,
-        cache_trigger_aux: Any | None = None,
-    ) -> tuple[Any, Any]:
-        """Return node-only trigger log-probs and node-conditional candidate probs.
-
-        The returned candidate probabilities are normalized over all legal
-        target configurations for each node after conditioning on the
-        aggregate UPDATE event.  No whole-Cache joint probability enters this
-        helper.
-        """
-
-        if not self._uses_binary_cache_trigger() and not self._uses_exact_cache_credit():
-            raise RuntimeError(
-                "Cache trigger/candidate policy terms require a supported Cache policy"
-            )
-        contexts = torch.as_tensor(
-            cache_contexts, dtype=torch.float32, device=self.device
-        )
-        masks = torch.as_tensor(
-            operation_masks, dtype=torch.bool, device=self.device
-        )
-        actions = torch.as_tensor(
-            operation_actions, dtype=torch.long, device=self.device
-        )
-        features = torch.as_tensor(
-            candidate_features, dtype=torch.float32, device=self.device
-        )
-        operation_indices = torch.as_tensor(
-            candidate_operation_indices, dtype=torch.long, device=self.device
-        )
-        valid = torch.as_tensor(
-            candidate_valid_mask, dtype=torch.bool, device=self.device
-        )
-        if contexts.ndim != 3 or masks.ndim != 3 or actions.ndim != 2:
-            raise ValueError("Exact Cache node policy tensor rank mismatch")
-        batch_size, node_count, observation_dim = [int(value) for value in contexts.shape]
-        trigger_width = (
-            2
-            if self._uses_binary_cache_trigger()
-            else len(AdaptiveJointCacheUAVPPOActorCritic.operation_order)
-        )
-        if tuple(masks.shape) != (batch_size, node_count, trigger_width):
-            raise ValueError("Exact Cache operation mask shape mismatch")
-        if tuple(actions.shape) != (batch_size, node_count):
-            raise ValueError("Exact Cache operation action shape mismatch")
-        if features.ndim != 4 or tuple(features.shape[:2]) != (batch_size, node_count):
-            raise ValueError("Exact Cache candidate feature shape mismatch")
-        if tuple(operation_indices.shape) != tuple(valid.shape) or tuple(valid.shape) != tuple(features.shape[:3]):
-            raise ValueError("Exact Cache candidate tensor shape mismatch")
-        flat_contexts = contexts.reshape(batch_size * node_count, observation_dim)
-        if self._uses_binary_cache_trigger():
-            if isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic):
-                if cache_trigger_aux is None:
-                    raise RuntimeError(
-                        "V3 Cache Trigger PPO update requires the stored rollout auxiliary"
-                    )
-                auxiliary = torch.as_tensor(
-                    cache_trigger_aux, dtype=torch.float32, device=self.device
-                )
-                if tuple(auxiliary.shape) != (
-                    batch_size,
-                    node_count,
-                    self.policy.trigger_aux_dim,
-                ):
-                    raise ValueError("stored Cache Trigger auxiliary shape mismatch")
-                if auxiliary.requires_grad:
-                    raise RuntimeError("stored Cache Trigger auxiliary is not detached")
-                flat_auxiliary = auxiliary.reshape(
-                    batch_size * node_count, self.policy.trigger_aux_dim
-                )
-                all_logits, _ = self.policy._trigger_logits(
-                    flat_contexts, flat_auxiliary
-                )
-            else:
-                all_logits, _ = self.policy._trigger_logits(flat_contexts)
-        else:
-            all_logits, _ = self.policy._operation_logits(flat_contexts)
-        all_logits = all_logits.reshape(
-            batch_size,
-            node_count,
-            self.policy.num_cache_heads,
-            trigger_width,
-        )
-        head_indices = torch.arange(node_count, dtype=torch.long, device=self.device)
-        logits = all_logits[:, head_indices, head_indices, :]
-        logits = logits.masked_fill(~masks, -float("inf"))
-        operation_probabilities = torch.softmax(logits, dim=-1)
-        p_update = (
-            operation_probabilities[..., 1]
-            if self._uses_binary_cache_trigger()
-            else operation_probabilities[..., 1:].sum(dim=-1)
-        )
-        selected_update = actions != 0
-        selected_probability = torch.where(
-            selected_update,
-            p_update,
-            operation_probabilities[..., 0],
-        )
-        selected_log_prob = torch.log(selected_probability.clamp_min(1.0e-12))
-
-        candidate_count = int(features.shape[2])
-        flat_features = features.reshape(
-            batch_size * node_count,
-            candidate_count,
-            int(features.shape[3]),
-        )
-        raw_scores, _ = self.policy._candidate_scores(
-            flat_contexts,
-            flat_features,
-            self.policy.cache_feature_dim,
-            self.policy.cache_candidate_scorer,
-        )
-        raw_scores = raw_scores.reshape(batch_size, node_count, candidate_count)
-        if self._uses_binary_cache_trigger():
-            unified_logits = raw_scores.masked_fill(~valid, -float("inf"))
-            unified_probabilities = torch.softmax(unified_logits, dim=-1)
-            candidate_probabilities = torch.where(
-                valid,
-                unified_probabilities,
-                torch.zeros_like(unified_probabilities),
-            )
-        else:
-            candidate_probabilities = torch.zeros_like(raw_scores)
-            for operation_index in range(1, len(self.policy.operation_order)):
-                group_mask = valid & (operation_indices == int(operation_index))
-                group_exists = group_mask.any(dim=-1)
-                safe_group_mask = group_mask | (~group_exists).unsqueeze(-1)
-                group_logits = raw_scores.masked_fill(~safe_group_mask, -float("inf"))
-                group_probabilities = torch.softmax(group_logits, dim=-1)
-                group_probabilities = torch.where(
-                    group_mask,
-                    group_probabilities,
-                    torch.zeros_like(group_probabilities),
-                )
-                candidate_probabilities = candidate_probabilities + (
-                    operation_probabilities[..., operation_index]
-                    / p_update.clamp_min(1.0e-12)
-                ).unsqueeze(-1) * group_probabilities
-        return selected_log_prob, candidate_probabilities
-
     def _conditional_candidate_logits(
         self,
         contexts: Any,
@@ -7212,8 +6117,8 @@ class PPOV2Trainer:
             raise RuntimeError("Cache Trigger auxiliary state must be detached")
         flat_auxiliary = auxiliary.reshape(batch_size * node_count, -1)
         logits, single = self.policy._trigger_logits(flat_contexts, flat_auxiliary)
-        if not single:
-            raise RuntimeError("Cache Trigger logits require one context per row")
+        if single:
+            raise RuntimeError("Cache Trigger logits must preserve the flattened batch axis")
         logits = logits.reshape(
             batch_size,
             node_count,
@@ -7499,7 +6404,10 @@ class PPOV2Trainer:
             self.policy.architecture_id in BRANCH_SPECIFIC_KL_POLICY_SCHEMAS
             and self.kl_gate_mode == KL_GATE_MODE_BRANCH_SPECIFIC
         )
-        cache_minibatch_kl_control_enabled = False
+        cache_minibatch_kl_control_enabled = bool(
+            branch_specific_kl_gate_enabled
+            and self.cache_kl_control == CACHE_KL_CONTROL_MINIBATCH_EARLY_STOP
+        )
         cache_candidate_old_log_probs = None
         uav_candidate_old_log_probs = None
         if branch_diagnostics_enabled:
@@ -7608,14 +6516,16 @@ class PPOV2Trainer:
             cache_credit = evaluate_cache_full_information_values(
                 self,
                 rollout,
-                trigger_temperature=self.cache_trigger_teacher_temperature,
-                candidate_temperature=self.cache_candidate_teacher_temperature,
             )
+            self._update_cache_surrogate_gate(cache_credit)
         cache_trigger_teacher_probabilities_t = None
         cache_trigger_teacher_valid_mask_t = None
         cache_candidate_teacher_probabilities_t = None
         cache_full_candidate_valid_mask_t = None
         cache_full_candidate_features_t = None
+        cache_candidate_kl_masks_t = None
+        cache_old_operation_log_probs_all = None
+        cache_old_candidate_log_probs_all = None
         if branch_diagnostics_enabled:
             cache_trigger_teacher_probabilities_t = torch.as_tensor(
                 cache_credit["trigger_teacher_probabilities"],
@@ -7654,19 +6564,68 @@ class PPOV2Trainer:
             evaluated_candidate_features = np.asarray(
                 cache_credit["candidate_features"], dtype=np.float32
             )
-            if not np.array_equal(rollout_candidate_mask, evaluated_candidate_mask):
+            if rollout.cache_operation_actions is None:
                 raise RuntimeError(
-                    "full-information Cache candidate ordering/mask differs from rollout"
+                    "full-information Cache evaluation requires stored operation actions"
                 )
-            if not np.allclose(
-                rollout_candidate_features[evaluated_candidate_mask],
-                evaluated_candidate_features[evaluated_candidate_mask],
-                rtol=0.0,
-                atol=1.0e-6,
-            ):
+            update_heads = (
+                np.asarray(rollout.cache_operation_actions, dtype=np.int64) == 1
+            )
+            if update_heads.shape != rollout_candidate_mask.shape[:2]:
                 raise RuntimeError(
-                    "full-information Cache candidate features differ from rollout order"
+                    "Cache UPDATE action/head shape differs from candidate rollout tensors"
                 )
+            # KEEP behavior does not materialize its counterfactual UPDATE set.
+            # The evaluator reconstructs that complete set from state; only
+            # sampled UPDATE rows must preserve rollout candidate ordering.
+            if np.any(update_heads):
+                if not np.array_equal(
+                    rollout_candidate_mask[update_heads],
+                    evaluated_candidate_mask[update_heads],
+                ):
+                    raise RuntimeError(
+                        "full-information Cache candidate ordering/mask differs on UPDATE rows"
+                    )
+                selected_update_masks = evaluated_candidate_mask[update_heads]
+                if not np.allclose(
+                    rollout_candidate_features[update_heads][selected_update_masks],
+                    evaluated_candidate_features[update_heads][selected_update_masks],
+                    rtol=0.0,
+                    atol=1.0e-6,
+                ):
+                    raise RuntimeError(
+                        "full-information Cache candidate features differ on UPDATE rows"
+                    )
+            with torch.no_grad():
+                cache_old_operation_log_probs_all = (
+                    self._cache_trigger_log_probabilities_all(
+                        cache_contexts,
+                        cache_operation_masks,
+                        cache_trigger_aux,
+                    )
+                    .detach()
+                    .clone()
+                )
+                old_candidate_probabilities = (
+                    self._conditional_candidate_probabilities(
+                        cache_contexts,
+                        cache_full_candidate_features_t,
+                        cache_full_candidate_valid_mask_t,
+                        int(self.policy.cache_feature_dim),
+                        self.policy.cache_candidate_scorer,
+                    )
+                )
+                (
+                    cache_old_candidate_log_probs_all,
+                    cache_candidate_kl_masks_t,
+                ) = _candidate_probability_log_distribution(
+                    old_candidate_probabilities,
+                    cache_full_candidate_valid_mask_t,
+                )
+                cache_old_candidate_log_probs_all = (
+                    cache_old_candidate_log_probs_all.detach().clone()
+                )
+                cache_candidate_kl_masks_t = cache_candidate_kl_masks_t.detach().clone()
         cache_proposal_diagnostics: dict[str, Any] | None = None
         uav_proposal_diagnostics: dict[str, Any] | None = None
         if uav_operation_credit:
@@ -7679,25 +6638,25 @@ class PPOV2Trainer:
         cache_kl_control_previous: float | None = None
         if cache_minibatch_kl_control_enabled:
             if (
-                cache_operation_old_log_probs is None
-                or cache_candidate_old_log_probs is None
+                cache_old_operation_log_probs_all is None
+                or cache_old_candidate_log_probs_all is None
+                or cache_full_candidate_features_t is None
+                or cache_full_candidate_valid_mask_t is None
+                or cache_candidate_kl_masks_t is None
                 or cache_operation_masks is None
-                or cache_operation_actions is None
             ):
                 raise RuntimeError(
                     "minibatch Cache KL control is missing Cache old action tensors"
                 )
-            cache_kl_control_previous = self._evaluate_cache_branch_approx_kl_full_rollout(
-                observations=observations,
+            cache_kl_control_previous = self._evaluate_cache_full_distribution_kl(
                 cache_contexts=cache_contexts,
-                operation_masks=cache_operation_masks,
-                operation_actions=cache_operation_actions,
-                candidate_features=cache_candidate_features,
-                candidate_masks=cache_candidate_masks,
-                selected_indices=cache_selected_indices,
-                old_operation_log_probs=cache_operation_old_log_probs,
-                old_candidate_log_probs=cache_candidate_old_log_probs,
                 cache_trigger_aux=cache_trigger_aux,
+                operation_masks=cache_operation_masks,
+                candidate_features=cache_full_candidate_features_t,
+                candidate_valid_mask=cache_full_candidate_valid_mask_t,
+                frozen_candidate_kl_mask=cache_candidate_kl_masks_t,
+                old_operation_log_probs=cache_old_operation_log_probs_all,
+                old_candidate_log_probs=cache_old_candidate_log_probs_all,
             )
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
@@ -7894,101 +6853,6 @@ class PPOV2Trainer:
                 self.uav_exact_q_listwise_temperature,
                 hyper.operation_advantage_reference_scale,
             )
-        cache_trigger_advantages_t = None
-        cache_trigger_old_probabilities_t = None
-        cache_candidate_features_t = None
-        cache_candidate_operation_indices_t = None
-        cache_candidate_q_values_t = None
-        cache_candidate_old_probabilities_t = None
-        cache_candidate_valid_mask_t = None
-        cache_candidate_advantages_t = None
-        if self._uses_exact_cache_credit():
-            required_cache_keys = (
-                "trigger_advantages",
-                "trigger_old_probabilities",
-                "candidate_features",
-                "candidate_operation_indices",
-                "candidate_q_values",
-                "candidate_probabilities",
-                "candidate_valid_mask",
-                "candidate_q_update",
-            )
-            for key in required_cache_keys:
-                if key not in cache_credit:
-                    raise RuntimeError(f"Exact Cache credit is missing {key}")
-            cache_trigger_advantages_t = torch.as_tensor(
-                cache_credit["trigger_advantages"],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            cache_trigger_old_probabilities_t = torch.as_tensor(
-                cache_credit["trigger_old_probabilities"],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            cache_candidate_features_t = torch.as_tensor(
-                cache_credit["candidate_features"],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            cache_candidate_operation_indices_t = torch.as_tensor(
-                cache_credit["candidate_operation_indices"],
-                dtype=torch.long,
-                device=self.device,
-            )
-            cache_candidate_q_values_t = torch.as_tensor(
-                cache_credit["candidate_q_values"],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            cache_candidate_old_probabilities_t = torch.as_tensor(
-                cache_credit["candidate_probabilities"],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            cache_candidate_valid_mask_t = torch.as_tensor(
-                cache_credit["candidate_valid_mask"],
-                dtype=torch.bool,
-                device=self.device,
-            )
-            cache_candidate_advantages_t = torch.where(
-                cache_candidate_valid_mask_t,
-                cache_candidate_q_values_t
-                - torch.as_tensor(
-                    cache_credit["candidate_q_update"],
-                    dtype=torch.float32,
-                    device=self.device,
-                ).unsqueeze(-1),
-                torch.zeros_like(cache_candidate_q_values_t),
-            )
-            expected_cache_trigger_shape = tuple(cache_operation_actions.shape)
-            if tuple(cache_trigger_advantages_t.shape) != expected_cache_trigger_shape:
-                raise RuntimeError("Exact Cache trigger advantage shape mismatch")
-            if tuple(cache_trigger_old_probabilities_t.shape) != (
-                sample_count,
-                int(cache_operation_actions.shape[1]),
-                2,
-            ):
-                raise RuntimeError("Exact Cache trigger probability shape mismatch")
-            expected_cache_candidate_shape = (
-                sample_count,
-                int(cache_operation_actions.shape[1]),
-                int(cache_candidate_features_t.shape[2]),
-            )
-            for name, tensor in (
-                ("candidate features", cache_candidate_features_t),
-                ("candidate operation indices", cache_candidate_operation_indices_t),
-                ("candidate q values", cache_candidate_q_values_t),
-                ("candidate old probabilities", cache_candidate_old_probabilities_t),
-                ("candidate valid mask", cache_candidate_valid_mask_t),
-                ("candidate advantages", cache_candidate_advantages_t),
-            ):
-                if tuple(tensor.shape[:3]) != expected_cache_candidate_shape:
-                    raise RuntimeError(f"Exact Cache {name} shape mismatch")
-            if not bool(torch.all(torch.isfinite(cache_trigger_advantages_t)).item()):
-                raise FloatingPointError("Exact Cache trigger advantages are non-finite")
-            if not bool(torch.all(torch.isfinite(cache_candidate_advantages_t)).item()):
-                raise FloatingPointError("Exact Cache candidate advantages are non-finite")
         critic_targets_t = (
             (returns_t - critic_target_mean) / critic_return_scale
             if popart_critic
@@ -8020,82 +6884,14 @@ class PPOV2Trainer:
             np.float32, copy=True
         )
 
-        cache_target_policy_probabilities_before = None
         uav_target_policy_probabilities_before = None
         uav_candidate_old_mask = None
         uav_candidate_old_logits = None
         uav_candidate_old_probabilities = None
-        cache_old_operation_log_probs_all = None
-        cache_old_candidate_log_probs_all = None
-        cache_exact_q_quality: dict[str, float] | None = None
         uav_exact_q_quality: dict[str, float] | None = None
         uav_candidate_policy_metrics: dict[str, float] | None = None
         uav_candidate_old_new_drift: dict[str, Any] | None = None
         with torch.no_grad():
-            if branch_diagnostics_enabled:
-                if (
-                    cache_operation_masks is None
-                    or cache_operation_actions is None
-                    or cache_candidate_features is None
-                    or cache_candidate_masks is None
-                    or cache_selected_indices is None
-                ):
-                    raise RuntimeError(
-                        "Cache old-policy diagnostic tensors are unavailable"
-                    )
-                cache_old_policy_evaluation = (
-                    self.policy.evaluate_cache_operation_primitive(
-                        observations,
-                        cache_contexts,
-                        cache_operation_masks,
-                        cache_operation_actions,
-                        cache_candidate_features,
-                        cache_candidate_masks,
-                        cache_selected_indices,
-                        cache_trigger_aux,
-                    )
-                )
-                if (
-                    cache_old_policy_evaluation.cache_operation_log_probs_all is None
-                    or cache_old_policy_evaluation.cache_candidate_log_probs_all is None
-                ):
-                    raise RuntimeError(
-                        "Cache old-policy full distributions are unavailable"
-                    )
-                cache_old_operation_log_probs_all = (
-                    cache_old_policy_evaluation.cache_operation_log_probs_all
-                    .detach()
-                    .clone()
-                )
-                cache_old_candidate_log_probs_all = (
-                    cache_old_policy_evaluation.cache_candidate_log_probs_all
-                    .detach()
-                    .clone()
-                )
-            if self._uses_exact_cache_credit():
-                if (
-                    cache_candidate_features_t is None
-                    or cache_candidate_valid_mask_t is None
-                    or cache_candidate_q_values_t is None
-                ):
-                    raise RuntimeError("Cache exact-Q tensors are unavailable for gate diagnostics")
-                cache_target_policy_probabilities_before = (
-                    self._conditional_candidate_probabilities(
-                        cache_contexts,
-                        cache_candidate_features_t,
-                        cache_candidate_valid_mask_t,
-                        int(self.policy.cache_feature_dim),
-                        self.policy.cache_candidate_scorer,
-                    )
-                    .detach()
-                    .clone()
-                )
-                cache_exact_q_quality = _exact_q_policy_quality_metrics(
-                    cache_target_policy_probabilities_before.detach().cpu().numpy(),
-                    cache_target_policy_probabilities_before.detach().cpu().numpy(),
-                    cache_candidate_q_values_t.detach().cpu().numpy(),
-                    cache_candidate_valid_mask_t.detach().cpu().numpy(),
-                )
             if self._uses_exact_uav_candidate_credit():
                 if (
                     conditional_candidate_valid_mask_t is None
@@ -8227,6 +7023,13 @@ class PPOV2Trainer:
         actor_gradient_clipping_parameter_groups: dict[str, tuple[Any, ...]] | None = None
         kl_early_stop_triggered = False
         ppo_update_epochs_executed = 0
+        cache_optimizer_steps_at_update_start = int(self.cache_optimizer_steps)
+        uav_operation_optimizer_steps_at_update_start = int(
+            self.uav_operation_optimizer_steps
+        )
+        uav_candidate_optimizer_steps_at_update_start = int(
+            self.uav_candidate_optimizer_steps
+        )
         cache_active = True
         uav_operation_active = True
         uav_candidate_active = bool(
@@ -8246,6 +7049,11 @@ class PPOV2Trainer:
         uav_independent_stop = False
         both_inactive_stop = False
         cache_stop_minibatch: int | None = None
+        uav_operation_stop_minibatch: int | None = None
+        uav_candidate_stop_minibatch: int | None = None
+        cache_suppressed_minibatches = 0
+        uav_operation_suppressed_minibatches = 0
+        uav_candidate_suppressed_minibatches = 0
         cache_kl_before_stop: float | None = None
         cache_kl_after_stop: float | None = None
         cache_minibatches_executed = 0
@@ -8289,32 +7097,34 @@ class PPOV2Trainer:
                 raise TypeError("V5 separate optimization requires the V5 actor-critic policy.")
             actor_parameters = list(self.policy.actor_parameters())
             critic_parameters = list(self.policy.critic_parameters())
-            if self.actor_optimizer is None or self.critic_optimizer is None:
-                raise RuntimeError("V5 actor/critic optimizers are not initialized.")
-            if branch_diagnostics_enabled:
-                group_builder = getattr(
-                    self.policy,
-                    "actor_gradient_parameter_groups",
-                    None,
-                )
-                if group_builder is None:
-                    raise RuntimeError(
-                        "Joint Cache/UAV policy does not expose branch gradient groups"
+            if self.critic_optimizer is None:
+                raise RuntimeError("separate critic optimizer is not initialized")
+            proposed_optimizer = self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS
+            if proposed_optimizer:
+                if any(
+                    optimizer is None
+                    for optimizer in (
+                        self.cache_optimizer,
+                        self.uav_operation_optimizer,
+                        self.uav_candidate_optimizer,
                     )
-                branch_gradient_parameter_groups = group_builder()
-                if self.policy.architecture_id == "adaptive_joint_cache_uav_ppo":
-                    clipping_group_builder = getattr(
+                ):
+                    raise RuntimeError("proposed branch optimizers are not initialized")
+                branch_gradient_parameter_groups = self.proposed_actor_parameter_groups
+            elif self.actor_optimizer is None:
+                raise RuntimeError("separate actor optimizer is not initialized")
+            if branch_diagnostics_enabled:
+                if branch_gradient_parameter_groups is None:
+                    group_builder = getattr(
                         self.policy,
-                        "actor_gradient_clipping_parameter_groups",
+                        "actor_gradient_parameter_groups",
                         None,
                     )
-                    if clipping_group_builder is None:
+                    if group_builder is None:
                         raise RuntimeError(
-                            "proposed actor does not expose disjoint clipping groups"
+                            "joint Cache/UAV policy does not expose branch gradient groups"
                         )
-                    actor_gradient_clipping_parameter_groups = (
-                        clipping_group_builder()
-                    )
+                    branch_gradient_parameter_groups = group_builder()
         minibatch_size = sample_count // hyper.num_minibatches
         frozen_trigger_aux_snapshot = (
             None
@@ -8331,10 +7141,7 @@ class PPOV2Trainer:
             cache_active_this_epoch = bool(cache_active)
             uav_operation_active_this_epoch = bool(uav_operation_active)
             uav_candidate_active_this_epoch = (
-                _uav_candidate_effective_active(
-                    operation_active=uav_operation_active_this_epoch,
-                    candidate_kl_active=uav_candidate_active,
-                )
+                bool(uav_candidate_active)
                 if exact_uav_credit_enabled
                 else uav_operation_active_this_epoch
             )
@@ -8392,13 +7199,14 @@ class PPOV2Trainer:
             epoch_diagnostic_start = len(kl_minibatch_diagnostics)
             for start in range(0, sample_count, minibatch_size):
                 indices = permutation[start : start + minibatch_size]
+                minibatch_index = (
+                    update_epoch * hyper.num_minibatches
+                    + start // minibatch_size
+                )
                 cache_active_this_minibatch = bool(cache_active)
                 uav_operation_active_this_minibatch = bool(uav_operation_active)
                 uav_candidate_active_this_minibatch = (
-                    _uav_candidate_effective_active(
-                        operation_active=uav_operation_active_this_minibatch,
-                        candidate_kl_active=uav_candidate_active,
-                    )
+                    bool(uav_candidate_active)
                     if exact_uav_credit_enabled
                     else uav_operation_active_this_minibatch
                 )
@@ -8408,14 +7216,13 @@ class PPOV2Trainer:
                 # Preserve the legacy name for operation-only diagnostics and
                 # the existing operation KL gate bookkeeping below.
                 uav_active_this_minibatch = uav_operation_active_this_minibatch
+                if not cache_active_this_minibatch:
+                    cache_suppressed_minibatches += 1
+                if not uav_operation_active_this_minibatch:
+                    uav_operation_suppressed_minibatches += 1
+                if exact_uav_credit_enabled and not uav_candidate_active_this_minibatch:
+                    uav_candidate_suppressed_minibatches += 1
                 if exact_uav_credit_enabled:
-                    if (
-                        not uav_operation_active_this_minibatch
-                        and uav_candidate_active_this_minibatch
-                    ):
-                        raise AssertionError(
-                            "UAV candidate update cannot run after operation stop"
-                        )
                     if (
                         uav_operation_active_this_minibatch
                         and uav_candidate_active_this_minibatch
@@ -8954,8 +7761,12 @@ class PPOV2Trainer:
                 if self._uses_separate_optimization():
                     assert actor_parameters is not None
                     assert critic_parameters is not None
-                    assert self.actor_optimizer is not None
                     assert self.critic_optimizer is not None
+                    if (
+                        self.policy.architecture_id not in PROPOSED_POLICY_SCHEMAS
+                        and self.actor_optimizer is None
+                    ):
+                        raise RuntimeError("separate actor optimizer is not initialized")
                     actor_loss = (
                         policy_loss - hyper.entropy_coefficient * entropy
                     )
@@ -8972,10 +7783,18 @@ class PPOV2Trainer:
                     ):
                         raise FloatingPointError("PPO v5 actor metrics/loss 非 finite。")
 
-                    # Clear both disjoint groups before the actor backward so a
-                    # stale critic gradient cannot be mistaken for actor output.
+                    # Clear every active optimizer before the actor backward.
                     self.critic_optimizer.zero_grad(set_to_none=True)
-                    self.actor_optimizer.zero_grad(set_to_none=True)
+                    if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                        assert self.cache_optimizer is not None
+                        assert self.uav_operation_optimizer is not None
+                        assert self.uav_candidate_optimizer is not None
+                        self.cache_optimizer.zero_grad(set_to_none=True)
+                        self.uav_operation_optimizer.zero_grad(set_to_none=True)
+                        self.uav_candidate_optimizer.zero_grad(set_to_none=True)
+                    else:
+                        assert self.actor_optimizer is not None
+                        self.actor_optimizer.zero_grad(set_to_none=True)
                     actor_loss.backward()
                     if branch_specific_kl_gate_enabled:
                         if branch_gradient_parameter_groups is None:
@@ -8989,7 +7808,20 @@ class PPOV2Trainer:
                         # stopped branch gradients makes optimizer.step() skip
                         # those parameters entirely, which is the required
                         # hard freeze after a Cache minibatch KL crossing.
-                        if exact_uav_credit_enabled:
+                        if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                            assert branch_gradient_parameter_groups is not None
+                            active_by_branch = {
+                                "cache": cache_active_this_minibatch,
+                                "uav_operation": uav_operation_active_this_minibatch,
+                                "uav_candidate": uav_candidate_active_this_minibatch,
+                            }
+                            for branch_name, is_active in active_by_branch.items():
+                                if not is_active:
+                                    for parameter in branch_gradient_parameter_groups[
+                                        branch_name
+                                    ]:
+                                        parameter.grad = None
+                        elif exact_uav_credit_enabled:
                             # Clear each UAV module independently.  Operation
                             # stop preserves all MOVE-child parameters;
                             # candidate stop clears scorer and candidate encoder
@@ -9030,44 +7862,57 @@ class PPOV2Trainer:
                             raise RuntimeError(
                                 "Joint Cache/UAV branch gradient groups are unavailable"
                             )
-                        cache_head_gradient_norm_value = _gradient_group_norm(
-                            branch_gradient_parameter_groups["cache"]
-                        )
-                        uav_head_gradient_norm_value = _gradient_group_norm(
-                            branch_gradient_parameter_groups["uav"]
-                        )
-                        shared_actor_gradient_norm_value = _gradient_group_norm(
-                            branch_gradient_parameter_groups["shared"]
-                        )
-                        cache_encoder_gradient_norm_value = (
-                            _gradient_group_norm(
-                                branch_gradient_parameter_groups["cache_encoder"]
+                        if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                            cache_head_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["cache"]
                             )
-                            if "cache_encoder" in branch_gradient_parameter_groups
-                            else math.nan
-                        )
-                        uav_encoder_gradient_norm_value = (
-                            _gradient_group_norm(
-                                branch_gradient_parameter_groups["uav_encoder"]
+                            uav_head_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["uav_operation"]
                             )
-                            if "uav_encoder" in branch_gradient_parameter_groups
-                            else math.nan
-                        )
-                        uav_candidate_encoder_gradient_norm_value = (
-                            _gradient_group_norm(
-                                branch_gradient_parameter_groups[
-                                    "uav_candidate_encoder"
-                                ]
+                            shared_actor_gradient_norm_value = 0.0
+                            cache_encoder_gradient_norm_value = cache_head_gradient_norm_value
+                            uav_encoder_gradient_norm_value = uav_head_gradient_norm_value
+                            uav_candidate_encoder_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["uav_candidate"]
                             )
-                            if "uav_candidate_encoder"
-                            in branch_gradient_parameter_groups
-                            else math.nan
-                        )
-                        uav_candidate_scorer_gradient_norm_value = (
-                            _gradient_group_norm(
+                            uav_candidate_scorer_gradient_norm_value = uav_candidate_encoder_gradient_norm_value
+                        else:
+                            cache_head_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["cache"]
+                            )
+                            uav_head_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["uav"]
+                            )
+                            shared_actor_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["shared"]
+                            )
+                            cache_encoder_gradient_norm_value = (
+                                _gradient_group_norm(
+                                    branch_gradient_parameter_groups["cache_encoder"]
+                                )
+                                if "cache_encoder" in branch_gradient_parameter_groups
+                                else math.nan
+                            )
+                            uav_encoder_gradient_norm_value = (
+                                _gradient_group_norm(
+                                    branch_gradient_parameter_groups["uav_encoder"]
+                                )
+                                if "uav_encoder" in branch_gradient_parameter_groups
+                                else math.nan
+                            )
+                            uav_candidate_encoder_gradient_norm_value = (
+                                _gradient_group_norm(
+                                    branch_gradient_parameter_groups[
+                                        "uav_candidate_encoder"
+                                    ]
+                                )
+                                if "uav_candidate_encoder"
+                                in branch_gradient_parameter_groups
+                                else math.nan
+                            )
+                            uav_candidate_scorer_gradient_norm_value = _gradient_group_norm(
                                 self.policy.uav_candidate_scorer.parameters()
                             )
-                        )
                         if not all(
                             np.isfinite(value)
                             for value in (
@@ -9124,44 +7969,58 @@ class PPOV2Trainer:
                             )
                         actor_gradient_norm_value = 0.0
                     else:
-                        if actor_gradient_clipping_parameter_groups is not None:
-                            clipping_metrics = _clip_disjoint_actor_gradient_groups(
-                                actor_gradient_clipping_parameter_groups["cache"],
-                                actor_gradient_clipping_parameter_groups["uav"],
-                                hyper.max_grad_norm,
-                            )
+                        if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                            assert branch_gradient_parameter_groups is not None
+                            proposed_gradient_norms: dict[str, float] = {}
+                            proposed_active = {
+                                "cache": cache_active_this_minibatch,
+                                "uav_operation": uav_operation_active_this_minibatch,
+                                "uav_candidate": uav_candidate_active_this_minibatch,
+                            }
+                            for branch_name, is_active in proposed_active.items():
+                                branch_parameters = list(
+                                    branch_gradient_parameter_groups[branch_name]
+                                )
+                                norm_before_clip = (
+                                    float(
+                                        torch.nn.utils.clip_grad_norm_(
+                                            branch_parameters,
+                                            hyper.max_grad_norm,
+                                        ).detach().cpu()
+                                    )
+                                    if is_active
+                                    else 0.0
+                                )
+                                proposed_gradient_norms[branch_name] = norm_before_clip
+                            cache_norm = proposed_gradient_norms["cache"]
+                            operation_norm = proposed_gradient_norms["uav_operation"]
+                            candidate_norm = proposed_gradient_norms["uav_candidate"]
                             cache_actor_grad_norm_preclip_epoch_values.append(
-                                clipping_metrics["cache_preclip_norm"]
+                                cache_norm
                             )
                             cache_actor_grad_clip_coefficient_epoch_values.append(
-                                clipping_metrics["cache_clip_coefficient"]
+                                min(1.0, hyper.max_grad_norm / max(cache_norm, 1.0e-12))
                             )
                             uav_actor_grad_norm_preclip_epoch_values.append(
-                                clipping_metrics["uav_preclip_norm"]
+                                operation_norm
                             )
                             uav_actor_grad_clip_coefficient_epoch_values.append(
-                                clipping_metrics["uav_clip_coefficient"]
+                                min(1.0, hyper.max_grad_norm / max(operation_norm, 1.0e-12))
                             )
                             combined_actor_grad_norm_postclip_epoch_values.append(
                                 float(
                                     math.sqrt(
-                                        min(
-                                            clipping_metrics["cache_preclip_norm"],
-                                            hyper.max_grad_norm,
-                                        )
-                                        ** 2
-                                        + min(
-                                            clipping_metrics["uav_preclip_norm"],
-                                            hyper.max_grad_norm,
-                                        )
-                                        ** 2
+                                        min(cache_norm, hyper.max_grad_norm) ** 2
+                                        + min(operation_norm, hyper.max_grad_norm) ** 2
+                                        + min(candidate_norm, hyper.max_grad_norm) ** 2
                                     )
                                 )
                             )
                             actor_gradient_norm_value = float(
                                 math.sqrt(
-                                    clipping_metrics["cache_preclip_norm"] ** 2
-                                    + clipping_metrics["uav_preclip_norm"] ** 2
+                                    cache_norm**2
+                                    + operation_norm**2
+                                    + candidate_norm**2
                                 )
                             )
                         else:
@@ -9175,10 +8034,35 @@ class PPOV2Trainer:
                             raise FloatingPointError(
                                 "PPO v5 actor gradient norm 非 finite。"
                             )
-                        self.actor_optimizer.step()
-                        self.actor_optimizer_steps += 1
+                        if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                            assert self.cache_optimizer is not None
+                            assert self.uav_operation_optimizer is not None
+                            assert self.uav_candidate_optimizer is not None
+                            if cache_active_this_minibatch:
+                                self.cache_optimizer.step()
+                                self.cache_optimizer_steps += 1
+                            if uav_operation_active_this_minibatch:
+                                self.uav_operation_optimizer.step()
+                                self.uav_operation_optimizer_steps += 1
+                            if uav_candidate_active_this_minibatch:
+                                self.uav_candidate_optimizer.step()
+                                self.uav_candidate_optimizer_steps += 1
+                            self.actor_optimizer_steps = (
+                                self.cache_optimizer_steps
+                                + self.uav_operation_optimizer_steps
+                                + self.uav_candidate_optimizer_steps
+                            )
+                            if uav_candidate_active_this_minibatch:
+                                uav_candidate_optimizer_step_count += 1
+                                uav_candidate_encoder_optimizer_step_count += 1
+                            if uav_operation_encoder_active_this_minibatch:
+                                uav_operation_encoder_optimizer_step_count += 1
+                        else:
+                            assert self.actor_optimizer is not None
+                            self.actor_optimizer.step()
+                            self.actor_optimizer_steps += 1
                         self.optimizer_steps = self.actor_optimizer_steps
-                        if exact_uav_credit_enabled:
+                        if exact_uav_credit_enabled and self.policy.architecture_id not in PROPOSED_POLICY_SCHEMAS:
                             if uav_candidate_active_this_minibatch:
                                 uav_candidate_optimizer_step_count += 1
                                 uav_candidate_encoder_optimizer_step_count += 1
@@ -9235,21 +8119,104 @@ class PPOV2Trainer:
                             ):
                                 uav_stop_triggered_after_step = True
                                 uav_operation_active = False
-                                uav_candidate_active = False
-                                uav_candidate_suppressed_update_epochs = max(
-                                    uav_candidate_suppressed_update_epochs,
-                                    max(hyper.update_epochs - update_epoch - 1, 0),
-                                )
+                                uav_operation_stop_minibatch = minibatch_index + 1
                                 if uav_stop_epoch is None:
                                     uav_stop_epoch = int(update_epoch + 1)
                                     uav_suppressed_update_epochs = int(
                                         max(hyper.update_epochs - update_epoch - 1, 0)
                                     )
+                    uav_candidate_kl_after_step: float | None = None
+                    uav_candidate_p90_kl_after_step: float | None = None
+                    uav_candidate_stop_triggered_after_step = False
+                    if (
+                        self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS
+                        and exact_uav_credit_enabled
+                        and uav_candidate_active_this_minibatch
+                    ):
+                        if (
+                            uav_candidate_old_mask is None
+                            or uav_candidate_old_probabilities is None
+                            or uav_candidate_teacher_probabilities_t is None
+                            or conditional_candidate_q_values_t is None
+                        ):
+                            raise RuntimeError(
+                                "minibatch Candidate KL control tensors are incomplete"
+                            )
+                        with torch.no_grad():
+                            candidate_probabilities_after_step = (
+                                self._conditional_candidate_probabilities(
+                                    uav_contexts,
+                                    uav_candidate_features,
+                                    uav_candidate_old_mask,
+                                    int(self.policy.uav_feature_dim),
+                                    self.policy.uav_candidate_scorer,
+                                )
+                            )
+                        candidate_drift = _uav_candidate_old_new_drift_metrics(
+                            uav_candidate_old_probabilities.detach().cpu().numpy(),
+                            candidate_probabilities_after_step.detach().cpu().numpy(),
+                            uav_candidate_teacher_probabilities_t.detach().cpu().numpy(),
+                            conditional_candidate_q_values_t.detach().cpu().numpy(),
+                            uav_candidate_old_mask.detach().cpu().numpy(),
+                        )
+                        uav_candidate_kl_after_step = float(candidate_drift["kl_mean"])
+                        uav_candidate_p90_kl_after_step = float(candidate_drift["kl_p90"])
+                        candidate_over_mean = (
+                            hyper.uav_candidate_target_kl is not None
+                            and uav_candidate_kl_after_step > hyper.uav_candidate_target_kl
+                        )
+                        candidate_over_p90 = (
+                            hyper.uav_candidate_target_kl is not None
+                            and uav_candidate_p90_kl_after_step > hyper.uav_candidate_target_kl
+                        )
+                        if candidate_over_mean or candidate_over_p90:
+                            uav_candidate_stop_triggered_after_step = True
+                            uav_candidate_active = False
+                            uav_candidate_stop_minibatch = minibatch_index + 1
+                            uav_candidate_effective_kl_at_gate = uav_candidate_kl_after_step
+                            uav_candidate_kl_gate_trigger_source = (
+                                "BOTH" if candidate_over_mean and candidate_over_p90
+                                else ("MEAN" if candidate_over_mean else "P90")
+                            )
+                            if uav_candidate_kl_stop_epoch is None:
+                                uav_candidate_kl_stop_epoch = int(update_epoch + 1)
+                            uav_candidate_suppressed_update_epochs = max(
+                                uav_candidate_suppressed_update_epochs,
+                                int(
+                                    math.ceil(
+                                        max(
+                                            cache_minibatches_planned
+                                            - (minibatch_index + 1),
+                                            0,
+                                        )
+                                        / max(hyper.num_minibatches, 1)
+                                    )
+                                ),
+                            )
+                            uav_candidate_effective_kl_immediately_after_gate = (
+                                uav_candidate_kl_after_step
+                            )
+                            uav_candidate_effective_kl_after_gate = (
+                                uav_candidate_kl_after_step
+                            )
+                            uav_candidate_post_gate_drift_from_gate = 0.0
+                            uav_candidate_probabilities_at_gate = (
+                                candidate_probabilities_after_step.detach().clone()
+                            )
+                    if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                        assert self.cache_optimizer is not None
+                        assert self.uav_operation_optimizer is not None
+                        assert self.uav_candidate_optimizer is not None
+                        self.cache_optimizer.zero_grad(set_to_none=True)
+                        self.uav_operation_optimizer.zero_grad(set_to_none=True)
+                        self.uav_candidate_optimizer.zero_grad(set_to_none=True)
+                    else:
+                        assert self.actor_optimizer is not None
+                        self.actor_optimizer.zero_grad(set_to_none=True)
 
                     # Rebuild the critic graph after the actor step.  No graph
                     # is retained and the actor group is cleared before critic
                     # backward to enforce the reverse disjointness invariant.
-                    self.actor_optimizer.zero_grad(set_to_none=True)
                     if popart_critic:
                         critic_normalized_values = self.policy.critic_normalized_value(
                             observations[indices]
@@ -9346,25 +8313,25 @@ class PPOV2Trainer:
                     if cache_active_this_minibatch:
                         if (
                             cache_operation_masks is None
-                            or cache_operation_actions is None
-                            or cache_operation_old_log_probs is None
-                            or cache_candidate_old_log_probs is None
+                            or cache_old_operation_log_probs_all is None
+                            or cache_old_candidate_log_probs_all is None
+                            or cache_full_candidate_features_t is None
+                            or cache_full_candidate_valid_mask_t is None
+                            or cache_candidate_kl_masks_t is None
                         ):
                             raise RuntimeError(
                                 "minibatch Cache KL control tensors are incomplete"
                             )
                         cache_approx_kl_after_step = (
-                            self._evaluate_cache_branch_approx_kl_full_rollout(
-                                observations=observations,
+                            self._evaluate_cache_full_distribution_kl(
                                 cache_contexts=cache_contexts,
-                                operation_masks=cache_operation_masks,
-                                operation_actions=cache_operation_actions,
-                                candidate_features=cache_candidate_features,
-                                candidate_masks=cache_candidate_masks,
-                                selected_indices=cache_selected_indices,
-                                old_operation_log_probs=cache_operation_old_log_probs,
-                                old_candidate_log_probs=cache_candidate_old_log_probs,
                                 cache_trigger_aux=cache_trigger_aux,
+                                operation_masks=cache_operation_masks,
+                                candidate_features=cache_full_candidate_features_t,
+                                candidate_valid_mask=cache_full_candidate_valid_mask_t,
+                                frozen_candidate_kl_mask=cache_candidate_kl_masks_t,
+                                old_operation_log_probs=cache_old_operation_log_probs_all,
+                                old_candidate_log_probs=cache_old_candidate_log_probs_all,
                             )
                         )
                         if cache_kl_control_previous is None:
@@ -9379,9 +8346,7 @@ class PPOV2Trainer:
                             cache_active = False
                             if cache_stop_epoch is None:
                                 cache_stop_epoch = int(update_epoch + 1)
-                                cache_stop_minibatch = int(
-                                    start // minibatch_size + 1
-                                )
+                                cache_stop_minibatch = int(minibatch_index + 1)
                                 cache_kl_before_stop = float(
                                     cache_kl_control_previous
                                 )
@@ -9511,12 +8476,24 @@ class PPOV2Trainer:
                             "uav_stop_triggered_after_step": bool(
                                 uav_stop_triggered_after_step
                             ),
+                            "uav_operation_stop_minibatch": uav_operation_stop_minibatch,
+                            "uav_candidate_kl_mean_after_step": (
+                                None
+                                if uav_candidate_kl_after_step is None
+                                else float(uav_candidate_kl_after_step)
+                            ),
+                            "uav_candidate_kl_p90_after_step": (
+                                None
+                                if uav_candidate_p90_kl_after_step is None
+                                else float(uav_candidate_p90_kl_after_step)
+                            ),
+                            "uav_candidate_stop_triggered_after_step": bool(
+                                uav_candidate_stop_triggered_after_step
+                            ),
+                            "uav_candidate_stop_minibatch": uav_candidate_stop_minibatch,
                             "uav_active_next_minibatch": bool(uav_operation_active),
-                            "uav_candidate_active_next_minibatch": (
-                                _uav_candidate_effective_active(
-                                    operation_active=uav_operation_active,
-                                    candidate_kl_active=uav_candidate_active,
-                                )
+                            "uav_candidate_active_next_minibatch": bool(
+                                uav_candidate_active
                             ),
                             "joint_gate_triggered_after_epoch": False,
                             "remaining_update_epochs_suppressed": 0,
@@ -9584,10 +8561,7 @@ class PPOV2Trainer:
                 )
                 candidate_epoch_old_new_kl = float(drift["kl_mean"])
                 candidate_transition = _candidate_kl_gate_transition(
-                    candidate_active=_uav_candidate_effective_active(
-                        operation_active=uav_operation_active,
-                        candidate_kl_active=uav_candidate_active,
-                    ),
+                    candidate_active=bool(uav_candidate_active),
                     candidate_epoch_kl_mean=candidate_epoch_old_new_kl,
                     candidate_epoch_kl_p90=float(drift["kl_p90"]),
                     target_kl=hyper.uav_candidate_target_kl,
@@ -9811,40 +8785,22 @@ class PPOV2Trainer:
                     cache_old_operation_log_probs_all is None
                     or cache_old_candidate_log_probs_all is None
                     or cache_operation_masks is None
-                    or cache_candidate_masks is None
+                    or cache_full_candidate_valid_mask_t is None
+                    or cache_full_candidate_features_t is None
+                    or cache_candidate_kl_masks_t is None
                 ):
                     raise RuntimeError(
                         "Cache old-vs-new per-head diagnostic state is unavailable"
                     )
-                with torch.no_grad():
-                    cache_epoch_policy_evaluation = (
-                        self.policy.evaluate_cache_operation_primitive(
-                            observations,
-                            cache_contexts,
-                            cache_operation_masks,
-                            cache_operation_actions,
-                            cache_candidate_features,
-                            cache_candidate_masks,
-                            cache_selected_indices,
-                            cache_trigger_aux,
-                        )
-                    )
-                if (
-                    cache_epoch_policy_evaluation.cache_operation_log_probs_all
-                    is None
-                    or cache_epoch_policy_evaluation.cache_candidate_log_probs_all
-                    is None
-                ):
-                    raise RuntimeError(
-                        "Cache new-policy full distributions are unavailable"
-                    )
-                cache_epoch_kl = _cache_per_head_old_new_kl(
-                    cache_old_operation_log_probs_all,
-                    cache_epoch_policy_evaluation.cache_operation_log_probs_all,
-                    cache_old_candidate_log_probs_all,
-                    cache_epoch_policy_evaluation.cache_candidate_log_probs_all,
-                    cache_operation_masks,
-                    cache_candidate_masks,
+                cache_epoch_kl = self._cache_full_distribution_kl_per_head(
+                    cache_contexts=cache_contexts,
+                    cache_trigger_aux=cache_trigger_aux,
+                    operation_masks=cache_operation_masks,
+                    candidate_features=cache_full_candidate_features_t,
+                    candidate_valid_mask=cache_full_candidate_valid_mask_t,
+                    frozen_candidate_kl_mask=cache_candidate_kl_masks_t,
+                    old_operation_log_probs=cache_old_operation_log_probs_all,
+                    old_candidate_log_probs=cache_old_candidate_log_probs_all,
                 )
                 if not bool(torch.all(torch.isfinite(cache_epoch_kl)).item()):
                     raise FloatingPointError(
@@ -9938,7 +8894,7 @@ class PPOV2Trainer:
                         update_epoch=update_epoch,
                         update_epochs=hyper.update_epochs,
                         cache_gate_enabled=not cache_minibatch_kl_control_enabled,
-                        uav_gate_enabled=True,
+                        uav_gate_enabled=not cache_minibatch_kl_control_enabled,
                     )
                     cache_newly_stopped = bool(
                         transition["cache_newly_stopped"]
@@ -9955,14 +8911,6 @@ class PPOV2Trainer:
                     )
                     cache_active = bool(transition["cache_active_next"])
                     uav_operation_active = bool(transition["uav_active_next"])
-                    if not uav_operation_active:
-                        # Operation is the parent of MOVE candidate policy.
-                        # Once it stops, candidate activity is absorbing too.
-                        uav_candidate_active = False
-                        uav_candidate_suppressed_update_epochs = max(
-                            uav_candidate_suppressed_update_epochs,
-                            int(transition["remaining_epochs_suppressed"]),
-                        )
                     if cache_newly_stopped and cache_stop_epoch is None:
                         cache_stop_epoch = int(update_epoch + 1)
                         cache_suppressed_update_epochs = int(
@@ -10051,10 +8999,7 @@ class PPOV2Trainer:
                             uav_candidate_active_this_epoch
                         ),
                         "uav_candidate_active_next_epoch": bool(
-                            _uav_candidate_effective_active(
-                                operation_active=uav_operation_active,
-                                candidate_kl_active=uav_candidate_active,
-                            )
+                            uav_candidate_active
                         ),
                         "uav_candidate_stop_triggered": bool(
                             candidate_newly_stopped
@@ -10351,7 +9296,7 @@ class PPOV2Trainer:
             )
             uav_operation_teacher_diagnostics = {
                 "OPERATION_MOVE_VALUE_SOURCE": (
-                    "ROLLOUT_POLICY_CANDIDATE_EXPECTATION"
+                    "LISTWISE_TEACHER_EXPECTATION"
                 ),
                 "OLD_OPERATION_MOVE_VALUE_SOURCE": (
                     "LISTWISE_TEACHER_EXPECTATION"
@@ -10525,30 +9470,6 @@ class PPOV2Trainer:
                 )
             uav_operation_full_rollout_kl_current = float(operation_full_rollout_kl)
         with torch.no_grad():
-            if self._uses_exact_cache_credit():
-                assert cache_target_policy_probabilities_before is not None
-                assert cache_candidate_features_t is not None
-                assert cache_candidate_valid_mask_t is not None
-                assert cache_candidate_q_values_t is not None
-                cache_target_policy_probabilities_after = (
-                    self._conditional_candidate_probabilities(
-                        cache_contexts,
-                        cache_candidate_features_t,
-                        cache_candidate_valid_mask_t,
-                        int(self.policy.cache_feature_dim),
-                        self.policy.cache_candidate_scorer,
-                    )
-                )
-                if str(cache_credit.get("candidate_value_source", "")) in {
-                    "FULL_EXACT_Q",
-                    "FULL_EXACT_AUDIT",
-                }:
-                    cache_exact_q_quality = _exact_q_policy_quality_metrics(
-                        cache_target_policy_probabilities_before.detach().cpu().numpy(),
-                        cache_target_policy_probabilities_after.detach().cpu().numpy(),
-                        cache_candidate_q_values_t.detach().cpu().numpy(),
-                        cache_candidate_valid_mask_t.detach().cpu().numpy(),
-                    )
             if self._uses_exact_uav_candidate_credit():
                 assert uav_target_policy_probabilities_before is not None
                 assert conditional_candidate_valid_mask_t is not None
@@ -10686,9 +9607,15 @@ class PPOV2Trainer:
                 "clip_fraction": math.nan,
             }
         if exact_uav_credit_enabled:
-            if uav_candidate_only_steps_after_operation_stop != 0:
+            if (
+                uav_operation_stop_minibatch is not None
+                and uav_candidate_stop_minibatch is None
+                and uav_candidate_active
+                and uav_candidate_only_steps_after_operation_stop == 0
+                and uav_operation_stop_minibatch < cache_minibatches_planned
+            ):
                 raise RuntimeError(
-                    "UAV candidate-only optimizer steps occurred after operation stop"
+                    "UAV Operation stop incorrectly suppressed the independent Candidate branch"
                 )
             if (
                 uav_candidate_optimizer_step_count
@@ -11098,12 +10025,29 @@ class PPOV2Trainer:
             cache_kl_before_stop=cache_kl_before_stop,
             cache_kl_after_stop=cache_kl_after_stop,
             cache_minibatches_executed=int(cache_minibatches_executed),
-            cache_minibatches_suppressed=int(
-                max(cache_minibatches_planned - cache_minibatches_executed, 0)
-            ),
+            cache_minibatches_suppressed=int(cache_suppressed_minibatches),
             uav_minibatches_executed=int(uav_minibatches_executed),
+            cache_optimizer_steps_this_update=int(
+                self.cache_optimizer_steps - cache_optimizer_steps_at_update_start
+            ),
+            uav_operation_optimizer_steps_this_update=int(
+                self.uav_operation_optimizer_steps
+                - uav_operation_optimizer_steps_at_update_start
+            ),
+            uav_candidate_optimizer_steps_this_update=int(
+                self.uav_candidate_optimizer_steps
+                - uav_candidate_optimizer_steps_at_update_start
+            ),
             uav_operation_steps_executed=int(uav_operation_steps_executed),
             uav_operation_steps_suppressed=int(uav_operation_steps_suppressed),
+            uav_operation_stop_minibatch=uav_operation_stop_minibatch,
+            uav_candidate_stop_minibatch=uav_candidate_stop_minibatch,
+            uav_operation_minibatches_suppressed=int(
+                uav_operation_suppressed_minibatches
+            ),
+            uav_candidate_minibatches_suppressed=int(
+                uav_candidate_suppressed_minibatches
+            ),
             uav_candidate_full_steps=int(uav_candidate_full_steps),
             uav_candidate_only_steps_after_operation_stop=int(
                 uav_candidate_only_steps_after_operation_stop
@@ -11440,54 +10384,101 @@ class PPOV2Trainer:
                 cache_credit.get("logical_candidate_count", 0)
             ),
             cache_exact_candidate_count=int(
-                cache_credit.get("logical_candidate_count", 0)
+                cache_credit.get("exact_candidate_count", 0)
+            ),
+            cache_surrogate_candidate_count=int(
+                cache_credit.get("surrogate_candidate_count", 0)
             ),
             cache_keep_exact_count=int(cache_credit.get("keep_branch_count", 0)),
+            cache_full_exact_audit_count=int(
+                cache_credit.get("full_exact_audit_count", 0)
+            ),
+            cache_counterfactual_executions_saved=max(
+                int(cache_credit.get("full_exact_environment_baseline", 0))
+                - int(cache_credit.get("counterfactual_environment_executions", 0)),
+                0,
+            ),
+            cache_counterfactual_execution_reduction_fraction=(
+                float(
+                    max(
+                        int(cache_credit.get("full_exact_environment_baseline", 0))
+                        - int(cache_credit.get("counterfactual_environment_executions", 0)),
+                        0,
+                    )
+                    / max(int(cache_credit.get("full_exact_environment_baseline", 0)), 1)
+                )
+            ),
+            cache_surrogate_inference_runtime_seconds=float(
+                cache_credit.get("surrogate_inference_runtime_seconds", math.nan)
+            ),
+            cache_surrogate_train_runtime_seconds=float(
+                cache_credit.get("surrogate_training_runtime_seconds", math.nan)
+            ),
+            cache_surrogate_delta_q_mae=float(
+                cache_credit.get("surrogate_delta_q_mae", math.nan)
+            ),
+            cache_surrogate_delta_q_rmse=float(
+                cache_credit.get("surrogate_delta_q_rmse", math.nan)
+            ),
+            cache_surrogate_rank_correlation=(
+                math.nan
+                if not cache_credit.get("surrogate_gate_metrics")
+                or cache_credit["surrogate_gate_metrics"].get("rank_correlation") is None
+                else float(cache_credit["surrogate_gate_metrics"]["rank_correlation"])
+            ),
+            cache_surrogate_uncertainty_mean=float(
+                np.mean(
+                    np.asarray(cache_credit.get("candidate_predicted_sigma", []), dtype=np.float64)[
+                        np.asarray(cache_credit.get("candidate_valid_mask", []), dtype=bool)
+                    ]
+                )
+                if int(cache_credit.get("logical_candidate_count", 0))
+                else math.nan
+            ),
+            cache_surrogate_uncertainty_p90=float(
+                np.percentile(
+                    np.asarray(cache_credit.get("candidate_predicted_sigma", []), dtype=np.float64)[
+                        np.asarray(cache_credit.get("candidate_valid_mask", []), dtype=bool)
+                    ],
+                    90.0,
+                )
+                if int(cache_credit.get("logical_candidate_count", 0))
+                else math.nan
+            ),
+            cache_surrogate_screening_active=bool(
+                cache_credit.get("surrogate_screening_active", False)
+            ),
+            cache_surrogate_screening_ready=bool(
+                self.cache_surrogate_screening_ready
+            ),
+            cache_surrogate_selected_k=self.cache_surrogate_selected_k,
+            cache_surrogate_audit_statistics=(
+                None
+                if self.cache_surrogate_audit_statistics is None
+                else dict(self.cache_surrogate_audit_statistics)
+            ),
+            cache_surrogate_gate_metrics=(
+                None
+                if cache_credit.get("surrogate_gate_metrics") is None
+                else dict(cache_credit["surrogate_gate_metrics"])
+            ),
+            cache_teacher_scale_calibration=dict(
+                cache_credit.get("cache_teacher_scale_calibration", {})
+            ),
+            cache_trigger_delta_best_statistics=dict(
+                cache_credit.get("trigger_delta_best_statistics", {})
+            ),
+            cache_trigger_teacher_statistics=dict(
+                cache_credit.get("trigger_teacher_statistics", {})
+            ),
+            cache_candidate_teacher_statistics=dict(
+                cache_credit.get("candidate_teacher_statistics", {})
+            ),
             cache_target_scorer_parameter_delta_norm=float(
                 cache_target_scorer_parameter_delta_norm
             ),
             uav_target_scorer_parameter_delta_norm=float(
                 uav_target_scorer_parameter_delta_norm
-            ),
-            cache_top1_exact_q_accuracy_before=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["top1_before"])
-            ),
-            cache_top1_exact_q_accuracy_after=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["top1_after"])
-            ),
-            cache_mean_exact_q_regret_before=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["mean_regret_before"])
-            ),
-            cache_mean_exact_q_regret_after=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["mean_regret_after"])
-            ),
-            cache_expected_exact_q_before=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["expected_q_before"])
-            ),
-            cache_expected_exact_q_after=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["expected_q_after"])
-            ),
-            cache_expected_exact_q_delta=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["expected_q_delta"])
-            ),
-            cache_target_policy_kl_old_new=(
-                math.nan
-                if cache_exact_q_quality is None
-                else float(cache_exact_q_quality["policy_kl_old_new"])
             ),
             uav_top1_exact_q_accuracy_before=(
                 math.nan
@@ -11569,6 +10560,15 @@ class PPOV2Trainer:
             "cache_credit_granularity": None,
             "cache_kl_control": str(self.cache_kl_control),
             **self.cache_credit_metadata(),
+            "cache_trigger_teacher_temperature": float(
+                self.cache_trigger_teacher_temperature
+            ),
+            "cache_candidate_teacher_temperature": float(
+                self.cache_candidate_teacher_temperature
+            ),
+            "cache_teacher_scale_calibration": dict(
+                self.cache_teacher_scale_calibration
+            ),
             "configuration_control_mode": self.context.configuration_control_mode,
             "advantage_normalization_mode": (
                 self.hyperparameters.advantage_normalization_mode
@@ -11647,22 +10647,6 @@ class PPOV2Trainer:
                     },
                 }
             )
-        if self.cache_action_q_critic is not None:
-            payload.update(
-                {
-                    "cache_action_q_training_count": int(
-                        self.cache_action_q_training_count
-                    ),
-                    "cache_action_q_optimizer_steps": int(
-                        self.cache_action_q_optimizer_steps
-                    ),
-                    "cache_action_q_audit_statistics": (
-                        None
-                        if self.cache_action_q_audit_statistics is None
-                        else dict(self.cache_action_q_audit_statistics)
-                    ),
-                }
-            )
         if self.cache_surrogate_ensemble is not None:
             if self.cache_surrogate_optimizer is None:
                 raise RuntimeError("Cache surrogate optimizer is not initialized.")
@@ -11672,28 +10656,45 @@ class PPOV2Trainer:
                     "cache_surrogate_optimizer_state_dict": self.cache_surrogate_optimizer.state_dict(),
                 }
             )
-        if self.cache_action_q_critic is not None:
-            if self.cache_action_q_optimizer is None:
-                raise RuntimeError("Cache Action-Q optimizer is not initialized.")
-            payload.update(
-                {
-                    "cache_action_q_state_dict": self.cache_action_q_critic.state_dict(),
-                    "cache_action_q_optimizer_state_dict": self.cache_action_q_optimizer.state_dict(),
-                }
-            )
         if episode_seed_start is not None:
             payload["episode_seed_start"] = int(episode_seed_start)
         if self._uses_separate_optimization():
-            if self.actor_optimizer is None or self.critic_optimizer is None:
-                raise RuntimeError("V5 actor/critic optimizers are not initialized.")
-            payload.update(
-                {
-                    "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
-                    "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
-                    "actor_optimizer_steps": int(self.actor_optimizer_steps),
-                    "critic_optimizer_steps": int(self.critic_optimizer_steps),
-                }
-            )
+            if self.critic_optimizer is None:
+                raise RuntimeError("separate critic optimizer is not initialized")
+            if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                if any(
+                    optimizer is None
+                    for optimizer in (
+                        self.cache_optimizer,
+                        self.uav_operation_optimizer,
+                        self.uav_candidate_optimizer,
+                    )
+                ):
+                    raise RuntimeError("proposed branch optimizers are not initialized")
+                payload.update(
+                    {
+                        "cache_optimizer_state_dict": self.cache_optimizer.state_dict(),
+                        "uav_operation_optimizer_state_dict": self.uav_operation_optimizer.state_dict(),
+                        "uav_candidate_optimizer_state_dict": self.uav_candidate_optimizer.state_dict(),
+                        "cache_optimizer_steps": int(self.cache_optimizer_steps),
+                        "uav_operation_optimizer_steps": int(self.uav_operation_optimizer_steps),
+                        "uav_candidate_optimizer_steps": int(self.uav_candidate_optimizer_steps),
+                        "actor_optimizer_steps": int(self.actor_optimizer_steps),
+                        "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
+                        "critic_optimizer_steps": int(self.critic_optimizer_steps),
+                    }
+                )
+            else:
+                if self.actor_optimizer is None:
+                    raise RuntimeError("separate actor optimizer is not initialized")
+                payload.update(
+                    {
+                        "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
+                        "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
+                        "actor_optimizer_steps": int(self.actor_optimizer_steps),
+                        "critic_optimizer_steps": int(self.critic_optimizer_steps),
+                    }
+                )
         else:
             if self.optimizer is None:
                 raise RuntimeError("PPO optimizer is not initialized.")
@@ -11815,6 +10816,11 @@ class PPOV2Trainer:
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
         for field, expected in self.cache_credit_metadata().items():
+            if field in {
+                "CACHE_TRIGGER_TEACHER_TEMPERATURE",
+                "CACHE_CANDIDATE_TEACHER_TEMPERATURE",
+            }:
+                continue
             if payload.get(field) != expected:
                 raise ValueError(
                     "PPO Cache teacher metadata mismatch; refusing cross-objective resume: "
@@ -11850,34 +10856,6 @@ class PPOV2Trainer:
                 "PPO checkpoint cache_kl_control mismatch; refusing silent "
                 f"cross-mode resume: checkpoint={checkpoint_cache_kl_control}, "
                 f"expected={self.cache_kl_control}."
-            )
-        if self._uses_exact_cache_credit():
-            if self.cache_action_q_critic is None or self.cache_action_q_optimizer is None:
-                raise RuntimeError("Cache Action-Q critic is not initialized for resume")
-            if (
-                "cache_action_q_state_dict" not in payload
-                or "cache_action_q_optimizer_state_dict" not in payload
-            ):
-                raise ValueError(
-                    "Cache Action-Q checkpoint must contain critic and optimizer state."
-                )
-            self.cache_action_q_critic.load_state_dict(
-                payload["cache_action_q_state_dict"], strict=True
-            )
-            self.cache_action_q_optimizer.load_state_dict(
-                payload["cache_action_q_optimizer_state_dict"]
-            )
-            self.cache_action_q_training_count = int(
-                payload.get("cache_action_q_training_count", -1)
-            )
-            self.cache_action_q_optimizer_steps = int(
-                payload.get("cache_action_q_optimizer_steps", -1)
-            )
-            if self.cache_action_q_training_count < 0 or self.cache_action_q_optimizer_steps < 0:
-                raise ValueError("Cache Action-Q training counters must be non-negative")
-            raw_action_q_statistics = payload.get("cache_action_q_audit_statistics")
-            self.cache_action_q_audit_statistics = (
-                None if raw_action_q_statistics is None else dict(raw_action_q_statistics)
             )
         restored_statistics = RunningReturnStatistics()
         if expected_scale_mode in {
@@ -11928,22 +10906,140 @@ class PPOV2Trainer:
         if int(payload.get("action_dim")) != int(self.context.action_spec.action_dim):
             raise ValueError("PPO v2 checkpoint action_dim 不匹配。")
         self.policy.load_state_dict(payload["policy_state_dict"], strict=True)
-        if self._uses_separate_optimization():
-            if self.actor_optimizer is None or self.critic_optimizer is None:
-                raise RuntimeError("V5 actor/critic optimizers are not initialized.")
-            if (
-                "actor_optimizer_state_dict" not in payload
-                or "critic_optimizer_state_dict" not in payload
+        if self.cache_surrogate_ensemble is not None:
+            if self.cache_surrogate_optimizer is None:
+                raise RuntimeError("Cache surrogate optimizer is not initialized")
+            required_surrogate_fields = {
+                "cache_surrogate_state_dict",
+                "cache_surrogate_optimizer_state_dict",
+                "cache_surrogate_training_count",
+                "cache_surrogate_screening_ready",
+                "cache_surrogate_screening_active",
+                "cache_surrogate_selected_k",
+                "cache_surrogate_shadow_complete",
+                "cache_teacher_scale_calibration",
+                "cache_trigger_teacher_temperature",
+                "cache_candidate_teacher_temperature",
+            }
+            missing_surrogate_fields = required_surrogate_fields - set(payload)
+            if missing_surrogate_fields:
+                raise ValueError(
+                    "proposed checkpoint is missing calibrated Cache surrogate state: "
+                    + ", ".join(sorted(missing_surrogate_fields))
+                )
+            self.cache_surrogate_ensemble.load_state_dict(
+                payload["cache_surrogate_state_dict"], strict=True
+            )
+            self.cache_surrogate_optimizer.load_state_dict(
+                payload["cache_surrogate_optimizer_state_dict"]
+            )
+            self.cache_surrogate_training_count = int(
+                payload["cache_surrogate_training_count"]
+            )
+            self.cache_surrogate_screening_ready = bool(
+                payload["cache_surrogate_screening_ready"]
+            )
+            self.cache_surrogate_screening_active = bool(
+                payload["cache_surrogate_screening_active"]
+            )
+            self.cache_surrogate_selected_k = (
+                None
+                if payload["cache_surrogate_selected_k"] is None
+                else int(payload["cache_surrogate_selected_k"])
+            )
+            self.cache_surrogate_shadow_complete = bool(
+                payload["cache_surrogate_shadow_complete"]
+            )
+            self.cache_surrogate_audit_statistics = (
+                None
+                if payload.get("cache_surrogate_audit_statistics") is None
+                else dict(payload["cache_surrogate_audit_statistics"])
+            )
+            self.cache_surrogate_audit_history = [
+                dict(item)
+                for item in payload.get("cache_surrogate_audit_history", [])
+            ]
+            self.cache_teacher_scale_calibration = dict(
+                payload["cache_teacher_scale_calibration"]
+            )
+            for field in (
+                "cache_trigger_teacher_temperature",
+                "cache_candidate_teacher_temperature",
+            ):
+                value = float(payload[field])
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError(f"checkpoint {field} must be positive and finite")
+                setattr(self, field, value)
+            if self.cache_teacher_scale_calibration and (
+                self.cache_teacher_scale_calibration.get("method")
+                != "CLIPPED_RUNNING_MAD"
+                or self.cache_teacher_scale_calibration.get("source")
+                != "TRAIN_ROLLOUT_ONLY"
             ):
                 raise ValueError(
-                    "V5 checkpoint must contain separate actor/critic optimizer state."
+                    "checkpoint Cache teacher scale calibration has incompatible semantics"
                 )
-            self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
-            self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
-            self.actor_optimizer_steps = int(payload.get("actor_optimizer_steps", 0))
-            self.critic_optimizer_steps = int(payload.get("critic_optimizer_steps", 0))
+        if self._uses_separate_optimization():
+            if self.critic_optimizer is None:
+                raise RuntimeError("separate critic optimizer is not initialized")
+            if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                optimizers = {
+                    "cache_optimizer": self.cache_optimizer,
+                    "uav_operation_optimizer": self.uav_operation_optimizer,
+                    "uav_candidate_optimizer": self.uav_candidate_optimizer,
+                }
+                if any(optimizer is None for optimizer in optimizers.values()):
+                    raise RuntimeError("proposed branch optimizers are not initialized")
+                required = {
+                    "cache_optimizer_state_dict",
+                    "uav_operation_optimizer_state_dict",
+                    "uav_candidate_optimizer_state_dict",
+                    "critic_optimizer_state_dict",
+                }
+                if required - set(payload):
+                    raise ValueError("proposed checkpoint lacks independent optimizer states")
+                for name, optimizer in optimizers.items():
+                    optimizer.load_state_dict(payload[name + "_state_dict"])
+                self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
+                self.cache_optimizer_steps = int(payload.get("cache_optimizer_steps", -1))
+                self.uav_operation_optimizer_steps = int(
+                    payload.get("uav_operation_optimizer_steps", -1)
+                )
+                self.uav_candidate_optimizer_steps = int(
+                    payload.get("uav_candidate_optimizer_steps", -1)
+                )
+                if min(
+                    self.cache_optimizer_steps,
+                    self.uav_operation_optimizer_steps,
+                    self.uav_candidate_optimizer_steps,
+                ) < 0:
+                    raise ValueError("proposed optimizer steps must be non-negative")
+                self.actor_optimizer_steps = (
+                    self.cache_optimizer_steps
+                    + self.uav_operation_optimizer_steps
+                    + self.uav_candidate_optimizer_steps
+                )
+                self.critic_optimizer_steps = int(payload.get("critic_optimizer_steps", -1))
+                if self.critic_optimizer_steps < 0:
+                    raise ValueError("critic optimizer steps must be non-negative")
+                if int(payload.get("actor_optimizer_steps", -1)) != self.actor_optimizer_steps:
+                    raise ValueError("proposed actor optimizer step total is inconsistent")
+            else:
+                if self.actor_optimizer is None:
+                    raise RuntimeError("separate actor optimizer is not initialized")
+                if (
+                    "actor_optimizer_state_dict" not in payload
+                    or "critic_optimizer_state_dict" not in payload
+                ):
+                    raise ValueError(
+                        "separate-optimizer checkpoint lacks actor/critic optimizer state"
+                    )
+                self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
+                self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
+                self.actor_optimizer_steps = int(payload.get("actor_optimizer_steps", 0))
+                self.critic_optimizer_steps = int(payload.get("critic_optimizer_steps", 0))
             if self.actor_optimizer_steps < 0 or self.critic_optimizer_steps < 0:
-                raise ValueError("V5 checkpoint optimizer steps must be non-negative.")
+                raise ValueError("separate optimizer steps must be non-negative")
             self.optimizer_steps = self.actor_optimizer_steps
         else:
             if self.optimizer is None:
@@ -12582,6 +11678,10 @@ def run_training(
         update_started_at = time.perf_counter()
         update = trainer.update(rollout)
         update_runtime_seconds = float(time.perf_counter() - update_started_at)
+        update_run_manifest_teacher_state(
+            run_path / RUN_MANIFEST_FILENAME,
+            trainer,
+        )
         if update.uav_operation_diagnostic_arrays is not None:
             episode_uav_operation_diagnostic_arrays.append(
                 update.uav_operation_diagnostic_arrays

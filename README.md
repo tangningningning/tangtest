@@ -50,17 +50,24 @@ Fixed SUMO network
   -> evaluation
 ```
 
-`proposed_joint` is the only production proposed schema.  The exact-Q
-listwise candidate correctness gate passed; formal training has not been run
-by this consolidation task.
+`proposed_joint` is the only production proposed schema. Its second-stage
+repair is implemented, but the train-only joint gate is currently blocked:
+hybrid exact-best recall/regret and exhaustive Cache proposal coverage failed.
+The production evaluator therefore uses its FULL_EXACT fallback, and no short
+or formal training was run. See
+`reports/second_stage_joint_repair_gate.md` for the measured gate results.
 
 The proposed-joint credit contract is:
 
-- Cache trigger credit = exact node counterfactual Q
-- UAV operation advantage = `COUNTERFACTUAL_ONE_STEP_TD`
-- UAV operation PPO ratio = `OPERATION_ONLY`
-- Cache and UAV candidate objective = `EXACT_Q_LISTWISE`
-- Candidate teacher = state-wise standardized exact Q softmax over all legal candidates
+- Cache Trigger credit = `FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER`
+- Cache Candidate credit = `CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER`
+- Cache values use FULL_EXACT as oracle and activate hybrid screening only after
+  its quality gate passes; the current production run is on FULL_EXACT fallback
+- UAV Operation MOVE value = Exact-Q listwise Candidate teacher expectation
+- Cache, UAV Operation, and UAV Candidate use disjoint actor optimizers and
+  independent KL stops; the proposed config enables minibatch early stop
+- Cache teacher scales use bounded train-only robust MAD calibration; fresh
+  initialization is required after the architecture/checkpoint version bump
 
 The proposed policy is the standalone current learned policy schema.  It preserves
 the verified parameter/module layout and checkpoint key set while using a
@@ -76,7 +83,7 @@ non-mainline comparison definitions:
 
 | Method ID | Definition | Status |
 | --- | --- | --- |
-| `proposed_joint` | exact-Q listwise candidate prediction + adaptive Cache + adaptive UAV + learned policy | IMPLEMENTATION GATE PASSED; FORMAL TRAINING PENDING |
+| `proposed_joint` | full-information Cache teacher + gated hybrid evaluator + adaptive UAV + learned policy | SECOND-STAGE GATE BLOCKED; TRAINING NOT RUN |
 | `ablation_cache_only` | prediction + adaptive Cache + fixed UAV + learned policy | NOT YET FORMALLY TRAINED TO 300 |
 | `ablation_joint_no_prediction` | no prediction + adaptive Cache + adaptive UAV + learned policy | NOT YET FORMALLY TRAINED |
 | `baseline_popularity_greedy` | prediction/popularity Cache + fixed UAV + non-learning | IMPLEMENTATION AVAILABLE |
@@ -109,6 +116,9 @@ python scripts/generation/generate_episode_pool.py \
 ```
 
 Train the current proposed mainline through the single PPO implementation:
+
+The current gate is blocked. Do not run this command until the blockers in the
+current-stage report are resolved and all gates pass.
 
 ```text
 ppo-train --config configs/proposed/system_config.toml \

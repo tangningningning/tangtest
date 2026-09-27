@@ -13,8 +13,12 @@ experiments.
 ## CURRENT MAINLINE
 
 - `proposed/system_config.toml` — the single proposed mainline configuration
-  with policy schema `adaptive_joint_cache_uav_ppo` and exact-Q listwise
-  candidate improvement.
+  with policy schema `adaptive_joint_cache_uav_ppo`, FULL_EXACT as the Cache
+  oracle, gated hybrid surrogate screening, train-only robust-MAD Cache teacher
+  scales, and independent Cache/UAV optimizer and KL branches. The current
+  second-stage hybrid and exhaustive proposal-coverage gates failed; the
+  production evaluator remains on FULL_EXACT fallback and short training is
+  blocked until the gates pass.
 - `system_config.toml` — shared artifact-generation/system configuration,
   retained for existing artifact workflows.
 
@@ -42,8 +46,8 @@ workflows; it is not the PPO mainline configuration.
 
 ## Stable method IDs
 
-- `proposed_joint` — exact-Q listwise implementation gate passed; formal
-  training is not yet completed.
+- `proposed_joint` — second-stage gate blocked by hybrid quality and exhaustive
+  proposal coverage; no short or formal training was run.
 - `ablation_cache_only` — NOT YET FORMALLY TRAINED TO 300; cache-only
   configuration and evaluator are available.
 - `ablation_joint_no_prediction` — NOT YET FORMALLY TRAINED; a Joint

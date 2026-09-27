@@ -871,20 +871,38 @@ def validate_config(
     legacy_exact_q_temperature = float(
         get_config_value(config, "algorithm.ppo.exact_q_listwise_temperature", 1.0)
     )
-    cache_trigger_teacher_temperature = float(
+    cache_teacher_scale_mode = str(
         get_config_value(
             config,
-            "algorithm.ppo.cache_trigger_teacher_temperature",
-            1.0,
+            "algorithm.ppo.cache_teacher_scale_mode",
+            "training_rollout_mad",
         )
     )
-    cache_candidate_teacher_temperature = float(
+    cache_teacher_scale_epsilon = float(
         get_config_value(
             config,
-            "algorithm.ppo.cache_candidate_teacher_temperature",
-            1.0,
+            "algorithm.ppo.cache_teacher_scale_epsilon",
+            1.0e-3,
         )
     )
+    cache_teacher_scale_max = float(
+        get_config_value(
+            config,
+            "algorithm.ppo.cache_teacher_scale_max",
+            1.0e3,
+        )
+    )
+    if cache_teacher_scale_mode != "training_rollout_mad":
+        raise ValueError(
+            "algorithm.ppo.cache_teacher_scale_mode only supports training_rollout_mad."
+        )
+    if (
+        not math.isfinite(cache_teacher_scale_epsilon)
+        or cache_teacher_scale_epsilon <= 0.0
+        or not math.isfinite(cache_teacher_scale_max)
+        or cache_teacher_scale_max < cache_teacher_scale_epsilon
+    ):
+        raise ValueError("Cache teacher scale bounds must be positive and finite.")
     uav_exact_q_temperature = float(
         get_config_value(
             config,
@@ -894,8 +912,6 @@ def validate_config(
     )
     for field, value in {
         "exact_q_listwise_temperature": legacy_exact_q_temperature,
-        "cache_trigger_teacher_temperature": cache_trigger_teacher_temperature,
-        "cache_candidate_teacher_temperature": cache_candidate_teacher_temperature,
         "uav_exact_q_listwise_temperature": uav_exact_q_temperature,
     }.items():
         if not math.isfinite(value) or value <= 0.0:
@@ -971,9 +987,19 @@ def validate_config(
         raise ValueError(
             "algorithm.ppo.cache_kl_control 只支持 epoch/minibatch_early_stop。"
         )
-    if cache_kl_control == "minibatch_early_stop":
+    if cache_kl_control == "minibatch_early_stop" and policy_schema != proposed_schema:
         raise ValueError(
-            "algorithm.ppo.cache_kl_control=minibatch_early_stop is not supported by the current mainline."
+            "algorithm.ppo.cache_kl_control=minibatch_early_stop requires the proposed joint policy schema."
+        )
+    if cache_kl_control == "minibatch_early_stop":
+        target_kl = get_config_value(config, "algorithm.ppo.target_kl", None)
+        if target_kl is None or not math.isfinite(float(target_kl)) or float(target_kl) <= 0.0:
+            raise ValueError(
+                "algorithm.ppo.cache_kl_control=minibatch_early_stop requires a positive finite target_kl."
+            )
+    if policy_schema == proposed_schema and cache_kl_control != "minibatch_early_stop":
+        raise ValueError(
+            "the proposed joint policy schema requires minibatch_early_stop Cache KL control."
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
