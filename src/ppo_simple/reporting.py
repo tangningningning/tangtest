@@ -315,9 +315,9 @@ def build_run_manifest(
                 "detached_Q_selected_minus_legal_action_policy_expectation"
             ),
         }
-    cache_surrogate_manifest_fields: dict[str, Any] = {}
-    if hasattr(trainer, "cache_surrogate_metadata"):
-        cache_surrogate_manifest_fields = dict(trainer.cache_surrogate_metadata())
+    cache_credit_manifest_fields: dict[str, Any] = {}
+    if hasattr(trainer, "cache_credit_metadata"):
+        cache_credit_manifest_fields = dict(trainer.cache_credit_metadata())
     return {
         "experiment_type": "main_training",
         "architecture_version": int(getattr(trainer.policy, "architecture_version", 1)),
@@ -368,50 +368,6 @@ def build_run_manifest(
             if is_proposed_joint
             else "LEGACY_GLOBAL_GAE"
         ),
-        "cache_trigger_advantage_source": str(
-            getattr(
-                trainer,
-                "cache_trigger_advantage_source",
-                project_config.get_config_value(
-                    context.cfg,
-                    "algorithm.ppo.cache_trigger_advantage_source",
-                    "GLOBAL_GAE",
-                ),
-            )
-        ),
-        "cache_candidate_advantage_source": str(
-            getattr(
-                trainer,
-                "cache_candidate_advantage_source",
-                project_config.get_config_value(
-                    context.cfg,
-                    "algorithm.ppo.cache_candidate_advantage_source",
-                    "GLOBAL_GAE",
-                ),
-            )
-        ),
-        "cache_trigger_ratio_granularity": str(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.cache_trigger_ratio_granularity",
-                "WHOLE_CACHE_JOINT",
-            )
-        ),
-        "cache_candidate_ratio_granularity": str(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.cache_candidate_ratio_granularity",
-                "WHOLE_CACHE_JOINT",
-            )
-        ),
-        "cache_surrogate_reduction": "NOT_USED_FOR_PRODUCTION_CREDIT",
-        "CACHE_POLICY_CREDIT_SOURCE": "ACTUAL_ROLLOUT_GAE",
-        "CACHE_ACTION_Q_CRITIC_INITIALIZED": bool(
-            getattr(trainer, "cache_action_q_critic", None) is not None
-        ),
-        "CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT": "NO",
-        "CACHE_COUNTERFACTUAL_MODE": "NONE_FOR_PRODUCTION",
-        "CACHE_COUNTERFACTUAL_ENV_EXECUTIONS": 0,
         "critic_value_scale_mode": str(hyper.critic_value_scale_mode),
         "critic_value_scale_epsilon": float(hyper.critic_value_scale_epsilon),
         "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),
@@ -449,15 +405,9 @@ def build_run_manifest(
         ),
         "max_grad_norm": float(hyper.max_grad_norm),
         "entropy_coefficient": float(hyper.entropy_coefficient),
-        "candidate_policy_improvement": str(
-            getattr(trainer, "candidate_policy_improvement", "LEGACY_PPO")
-        ),
-        "exact_q_listwise_temperature": float(
-            getattr(trainer, "exact_q_listwise_temperature", 1.0)
-        ),
         **learning_rate_metadata,
         **q_cache_manifest_fields,
-        **cache_surrogate_manifest_fields,
+        **cache_credit_manifest_fields,
     }
 
 

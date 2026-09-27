@@ -723,6 +723,22 @@ def evaluate_cache_trigger_causal_gate(
         support_count += 1
     from .trainer import aligned_train_steps
 
+    full_information = evaluate_cache_full_information_values(
+        trainer,
+        rollout,
+        target_transition_indices=selected_indices,
+        target_node_indices=node_indices,
+        trigger_temperature=float(
+            getattr(trainer, "cache_trigger_teacher_temperature", 1.0)
+        ),
+        candidate_temperature=float(
+            getattr(trainer, "cache_candidate_teacher_temperature", 1.0)
+        ),
+    )
+    evaluation_position = {
+        int(index): position for position, index in enumerate(selected_indices)
+    }
+
     aligned_steps = aligned_train_steps(
         trainer.context,
         origin_start,
@@ -775,45 +791,21 @@ def evaluate_cache_trigger_causal_gate(
             ):
                 raise FloatingPointError("causal-gate candidate probabilities are invalid")
 
-            keep_branch = _execute_cache_branch(
-                trainer,
-                transition,
-                step,
-                next_step,
-                node_index,
-                state,
-                None,
+            sample_position = evaluation_position[int(transition_index)]
+            q_keep_fixed = float(
+                full_information["q_keep"][sample_position, node_index]
             )
-            q_keep_fixed = float(_branch_q_values(trainer, [keep_branch])[0])
-            fixed_environment_count += 1
-
-            exact_candidate_q = np.full(len(candidates), np.nan, dtype=np.float64)
-            exact_branch_by_identity: dict[
-                tuple[int, bytes, tuple[tuple[str, float, float], ...]], float
-            ] = {}
-            full_exact_update_logical_count += len(candidates)
-            for candidate_index, candidate in enumerate(candidates):
-                identity = _cache_branch_identity(
-                    transition,
-                    node_index,
-                    state,
-                    candidate,
+            exact_candidate_q = np.asarray(
+                full_information["candidate_q_values"][
+                    sample_position, node_index, : len(candidates)
+                ],
+                dtype=np.float64,
+            )
+            if len(candidates) and not np.all(np.isfinite(exact_candidate_q)):
+                raise FloatingPointError(
+                    "causal-gate full-information candidate Q is non-finite"
                 )
-                exact_q = exact_branch_by_identity.get(identity)
-                if exact_q is None:
-                    branch = _execute_cache_branch(
-                        trainer,
-                        transition,
-                        step,
-                        next_step,
-                        node_index,
-                        state,
-                        candidate,
-                    )
-                    exact_q = float(_branch_q_values(trainer, [branch])[0])
-                    exact_branch_by_identity[identity] = exact_q
-                    full_exact_update_environment_count += 1
-                exact_candidate_q[candidate_index] = exact_q
+            full_exact_update_logical_count += len(candidates)
 
             selected_candidate_index: int | None = None
             if actual_action_value == 1:
@@ -947,6 +939,32 @@ def evaluate_cache_trigger_causal_gate(
                 )
                 policy_consistent_environment_count += 1
 
+            trigger_teacher_row = np.asarray(
+                full_information["trigger_teacher_probabilities"][
+                    sample_position, node_index
+                ],
+                dtype=np.float64,
+            )
+            candidate_teacher_row = np.asarray(
+                full_information["candidate_teacher_probabilities"][
+                    sample_position, node_index, : len(candidates)
+                ],
+                dtype=np.float64,
+            )
+            candidate_teacher_top1 = (
+                int(np.argmax(candidate_teacher_row)) if len(candidates) else None
+            )
+            candidate_teacher_best_probability = (
+                float(candidate_teacher_row[best_exact_candidate_index])
+                if best_exact_candidate_index is not None
+                else None
+            )
+            trigger_policy_row = np.asarray(
+                full_information["trigger_policy_probabilities"][
+                    sample_position, node_index
+                ],
+                dtype=np.float64,
+            )
             node_id = str(trainer.context.action_spec.cache_node_ids[node_index])
             rows.append(
                 {
@@ -960,6 +978,26 @@ def evaluate_cache_trigger_causal_gate(
                     "p_update": float(state["p_update"]),
                     "legal_candidate_count": int(len(candidates)),
                     "q_keep_fixed": q_keep_fixed,
+                    "q_best_update_fixed": q_best_exact_update_fixed,
+                    "delta_best": delta_best_exact_fixed,
+                    "best_candidate_index": best_exact_candidate_index,
+                    "trigger_teacher_keep_probability": float(trigger_teacher_row[0]),
+                    "trigger_teacher_update_probability": float(trigger_teacher_row[1]),
+                    "candidate_teacher_top1_index": candidate_teacher_top1,
+                    "candidate_teacher_best_probability": (
+                        None
+                        if candidate_teacher_top1 is None
+                        else float(candidate_teacher_row[candidate_teacher_top1])
+                    ),
+                    "trigger_policy_keep_probability": float(trigger_policy_row[0]),
+                    "trigger_policy_update_probability": float(trigger_policy_row[1]),
+                    "candidate_policy_top1_index": policy_argmax_candidate_index,
+                    "candidate_policy_best_exact_probability": best_candidate_probability,
+                    "trigger_teacher_valid": bool(
+                        full_information["trigger_teacher_valid_mask"][
+                            sample_position, node_index
+                        ]
+                    ),
                     "q_sampled_update_fixed": q_sampled_update_fixed,
                     "q_policy_argmax_update_fixed": q_policy_argmax_update_fixed,
                     "q_best_exact_update_fixed": q_best_exact_update_fixed,
@@ -1001,6 +1039,12 @@ def evaluate_cache_trigger_causal_gate(
                 }
             )
 
+    full_exact_update_logical_count = int(full_information["logical_candidate_count"])
+    fixed_environment_count = int(full_information["keep_branch_count"])
+    full_exact_update_environment_count = int(
+        full_information["counterfactual_environment_executions"]
+        - full_information["keep_branch_count"]
+    )
     runtime_seconds = float(time.perf_counter() - started_at)
     return {
         "policy_consistent_mode": "DETERMINISTIC_FROZEN_POLICY_REPLAY",
@@ -1008,6 +1052,8 @@ def evaluate_cache_trigger_causal_gate(
         "target_transition_indices": list(selected_indices),
         "target_node_indices": list(node_indices),
         "rows": rows,
+        "value_evaluator": str(full_information["value_evaluator"]),
+        "downstream_mode": str(full_information["downstream_mode"]),
         "full_exact_update_logical_configurations": int(
             full_exact_update_logical_count
         ),
@@ -1077,247 +1123,6 @@ def _branch_q_values(trainer: Any, branches: list[dict[str, Any]]) -> np.ndarray
     if not np.all(np.isfinite(q_values)):
         raise FloatingPointError("Exact Cache Q values are non-finite")
     return q_values
-
-
-def _tdq_summary(values: np.ndarray) -> dict[str, float]:
-    """Summarize finite one-step trigger TD-Q differences."""
-
-    array = np.asarray(values, dtype=np.float64).reshape(-1)
-    if array.size == 0 or not np.all(np.isfinite(array)):
-        raise ValueError("Cache trigger TD-Q summary requires finite values")
-    return {
-        "mean": float(np.mean(array)),
-        "std": float(np.std(array)),
-        "p10": float(np.percentile(array, 10.0)),
-        "p50": float(np.percentile(array, 50.0)),
-        "p90": float(np.percentile(array, 90.0)),
-        "abs_max": float(np.max(np.abs(array))),
-    }
-
-
-def normalize_cache_trigger_tdq(
-    raw_credit: Any,
-    valid_mask: Any,
-    *,
-    epsilon: float = 1.0e-8,
-) -> tuple[np.ndarray, float]:
-    """Scale one-step trigger TD-Q credit by std without centering.
-
-    This is deliberately a pure numerical helper.  It is shared by the
-    production TD-Q trigger path and small in-memory validation cases; it
-    does not alter the reward, critic, or counterfactual evaluator.
-    """
-
-    raw = np.asarray(raw_credit, dtype=np.float64)
-    valid = np.asarray(valid_mask, dtype=bool)
-    if raw.shape != valid.shape or raw.ndim != 2:
-        raise ValueError("Cache trigger TD-Q credit/mask shape mismatch")
-    if not math.isfinite(float(epsilon)) or float(epsilon) <= 0.0:
-        raise ValueError("Cache trigger TD-Q epsilon must be positive and finite")
-    values = raw[valid]
-    if values.size == 0 or not np.all(np.isfinite(values)):
-        raise ValueError("Cache trigger TD-Q has no finite valid credit")
-    scale = float(np.std(values) + float(epsilon))
-    if not math.isfinite(scale) or scale <= 0.0:
-        raise FloatingPointError("Cache trigger TD-Q scale is non-finite")
-    normalized = np.zeros_like(raw, dtype=np.float64)
-    normalized[valid] = raw[valid] / scale
-    if not np.all(np.isfinite(normalized)):
-        raise FloatingPointError("normalized Cache trigger TD-Q is non-finite")
-    return normalized, scale
-
-
-def compute_one_step_tdq_cache_trigger_credit(
-    trainer: Any,
-    rollout: Any,
-    *,
-    target_transition_indices: tuple[int, ...] | None = None,
-    target_node_indices: tuple[int, ...] | None = None,
-    epsilon: float = 1.0e-8,
-) -> dict[str, Any]:
-    """Compute detached per-head one-step TD-Q trigger credit.
-
-    The function reuses the existing Cache counterfactual branch executor and
-    critic bootstrap.  It executes exactly one counterfactual branch per
-    valid head: UPDATE is compared with KEEP, while KEEP is compared with the
-    detached highest-probability legal UPDATE candidate.  No candidate-level
-    Q teacher or optimizer operation is performed here.
-    """
-
-    all_transitions = tuple(rollout.transitions)
-    if not all_transitions:
-        raise ValueError("Cache trigger TD-Q credit requires a non-empty rollout")
-    if target_transition_indices is None:
-        selected_indices = tuple(range(len(all_transitions)))
-    else:
-        selected_indices = tuple(int(index) for index in target_transition_indices)
-        if not selected_indices or len(set(selected_indices)) != len(selected_indices):
-            raise ValueError("Cache TD-Q transition indices must be non-empty and unique")
-        if any(index < 0 or index >= len(all_transitions) for index in selected_indices):
-            raise IndexError("Cache TD-Q transition index is out of range")
-    transitions = tuple(all_transitions[index] for index in selected_indices)
-    origin_start = min(int(item.origin_index) for item in transitions)
-    origin_end = max(int(item.origin_index) for item in transitions)
-    from .trainer import aligned_train_steps
-
-    support_step_count = origin_end - origin_start + 1
-    if not any(
-        bool(item.done) and int(item.origin_index) == origin_end
-        for item in transitions
-    ):
-        support_step_count += 1
-    aligned_steps = aligned_train_steps(
-        trainer.context,
-        origin_start,
-        support_step_count,
-        include_bootstrap_step=False,
-    )
-    steps_by_origin = {int(step.origin_index): step for step in aligned_steps}
-    node_count = len(trainer.context.action_spec.cache_node_ids)
-    if target_node_indices is None:
-        node_indices = tuple(range(node_count))
-    else:
-        node_indices = tuple(int(index) for index in target_node_indices)
-        if not node_indices or len(set(node_indices)) != len(node_indices):
-            raise ValueError("Cache TD-Q node indices must be non-empty and unique")
-        if any(index < 0 or index >= node_count for index in node_indices):
-            raise IndexError("Cache TD-Q node index is out of range")
-    if not bool(getattr(trainer.policy, "true_binary_trigger", False)):
-        raise RuntimeError("Cache trigger TD-Q requires the binary KEEP/UPDATE policy")
-    if rollout.cache_candidate_features is None:
-        raise ValueError("Rollout does not expose Cache candidate tensors")
-    feature_dim = int(rollout.cache_candidate_features.shape[3])
-    sample_count = len(transitions)
-    raw_credit = np.full((sample_count, node_count), np.nan, dtype=np.float64)
-    valid_mask = np.zeros((sample_count, node_count), dtype=bool)
-    trigger_old_probabilities = np.zeros(
-        (sample_count, node_count, 2), dtype=np.float64
-    )
-    reference_candidate_indices = np.full(
-        (sample_count, node_count), -1, dtype=np.int64
-    )
-    environment_executions = 0
-    started_at = time.perf_counter()
-
-    for sample_index, transition in enumerate(transitions):
-        step = steps_by_origin.get(int(transition.origin_index))
-        if step is None:
-            raise RuntimeError("Cache TD-Q replay is missing the aligned current step")
-        next_step = steps_by_origin.get(int(transition.origin_index) + 1)
-        if not bool(transition.done) and next_step is None:
-            raise RuntimeError("Cache TD-Q replay is missing the aligned next step")
-        actual_next_observation = None
-        if not bool(transition.done):
-            actual_next_observation = _intermediate_observation(
-                np.asarray(transition.next_cache_state, dtype=np.int8),
-                transition.next_uav_positions,
-                next_step,
-                trainer.context,
-            )
-        for node_index in node_indices:
-            state = _node_policy_state(
-                trainer,
-                transition,
-                step,
-                node_index,
-                feature_dim,
-            )
-            trigger_old_probabilities[sample_index, node_index] = (
-                float(state["p_keep"]),
-                float(state["p_update"]),
-            )
-            if transition.cache_operation_actions is not None:
-                actual_action = int(transition.cache_operation_actions[node_index])
-            else:
-                actual_action = int(np.asarray(transition.action, dtype=np.int8)[node_index])
-            if actual_action not in (0, 1):
-                raise RuntimeError("Cache TD-Q trigger action is not KEEP/UPDATE")
-            reference_candidate = None
-            if actual_action == 0:
-                probabilities = np.asarray(
-                    state["candidate_probabilities"], dtype=np.float64
-                )
-                if not len(state["candidates"]):
-                    continue
-                if len(probabilities) != len(state["candidates"]):
-                    raise RuntimeError("Cache TD-Q candidate probability shape mismatch")
-                if not np.all(np.isfinite(probabilities)) or np.any(probabilities < 0.0):
-                    raise FloatingPointError("Cache TD-Q candidate probabilities are invalid")
-                reference_index = int(np.argmax(probabilities))
-                reference_candidate_indices[sample_index, node_index] = reference_index
-                reference_candidate = state["candidates"][reference_index]
-
-            actual_branch = {
-                "reward": float(transition.reward),
-                "next_observation": actual_next_observation,
-            }
-            counterfactual_branch = _execute_cache_branch(
-                trainer,
-                transition,
-                step,
-                next_step,
-                node_index,
-                state,
-                reference_candidate,
-            )
-            q_values = _branch_q_values(
-                trainer,
-                [actual_branch, counterfactual_branch],
-            )
-            raw_credit[sample_index, node_index] = float(q_values[0] - q_values[1])
-            valid_mask[sample_index, node_index] = True
-            environment_executions += 1
-
-    normalized_credit, scale = normalize_cache_trigger_tdq(
-        np.where(valid_mask, raw_credit, 0.0),
-        valid_mask,
-        epsilon=epsilon,
-    )
-    valid_raw = raw_credit[valid_mask]
-    valid_normalized = normalized_credit[valid_mask]
-    raw_stats = _tdq_summary(valid_raw)
-    runtime_seconds = float(time.perf_counter() - started_at)
-    head_count = int(environment_executions)
-    projected_runtime = float(
-        runtime_seconds
-        / float(max(head_count, 1))
-        * float(300 * node_count)
-    )
-    return {
-        "trigger_advantages": normalized_credit.astype(np.float32),
-        "trigger_raw_tdq": raw_credit.astype(np.float32),
-        "trigger_valid_mask": valid_mask,
-        "trigger_old_probabilities": trigger_old_probabilities.astype(np.float32),
-        "trigger_reference_candidate_indices": reference_candidate_indices,
-        "trigger_advantage_mean_abs": float(np.mean(np.abs(valid_normalized))),
-        "trigger_advantage_mean_abs_by_role": {},
-        "candidate_advantage_mean_abs": math.nan,
-        "trigger_weighted_mean_residual": np.zeros_like(normalized_credit),
-        "candidate_weighted_mean_residual": np.zeros_like(normalized_credit),
-        "counterfactual_environment_executions": int(environment_executions),
-        "logical_branch_count": int(environment_executions),
-        "credit_runtime_seconds": runtime_seconds,
-        "cache_trigger_advantage_source": "ONE_STEP_TD_Q_DIFFERENCE",
-        "cache_candidate_advantage_source": "GLOBAL_GAE",
-        "candidate_value_source": "GLOBAL_GAE",
-        "advantage_normalization": "STD_ONLY",
-        "advantage_centering": False,
-        "tdq_raw_mean": raw_stats["mean"],
-        "tdq_raw_std": raw_stats["std"],
-        "tdq_raw_p10": raw_stats["p10"],
-        "tdq_raw_p50": raw_stats["p50"],
-        "tdq_raw_p90": raw_stats["p90"],
-        "tdq_raw_abs_max": raw_stats["abs_max"],
-        "tdq_scale": float(scale),
-        "tdq_normalized_abs_p90": float(np.percentile(np.abs(valid_normalized), 90.0)),
-        "tdq_normalized_abs_max": float(np.max(np.abs(valid_normalized))),
-        "one_step_tdq_branches_executed": int(environment_executions),
-        "one_step_tdq_runtime_seconds": runtime_seconds,
-        "seconds_per_cache_head": float(
-            runtime_seconds / float(max(head_count, 1))
-        ),
-        "projected_300_slot_runtime_seconds": projected_runtime,
-    }
 
 
 def _rank_correlation(predicted: np.ndarray, exact: np.ndarray) -> float:
@@ -2055,6 +1860,266 @@ def compute_exact_node_specific_cache_credit(
         "advantage_centering": False,
         "ratio_granularity": "NODE_ONLY_AND_NODE_CONDITIONAL",
         "details": details,
+    }
+
+
+def _stable_masked_softmax(
+    values: np.ndarray,
+    mask: np.ndarray,
+    temperature: float,
+) -> np.ndarray:
+    q_values = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(mask, dtype=bool)
+    scale = float(temperature)
+    if q_values.shape != valid.shape or not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Cache teacher Q/mask/temperature is invalid")
+    probabilities = np.zeros_like(q_values, dtype=np.float64)
+    if np.any(valid):
+        legal_logits = q_values[valid] / scale
+        if not np.all(np.isfinite(legal_logits)):
+            raise FloatingPointError("Cache teacher received non-finite legal Q values")
+        legal_logits -= float(np.max(legal_logits))
+        weights = np.exp(legal_logits)
+        probabilities[valid] = weights / float(np.sum(weights))
+    return probabilities
+
+
+def evaluate_cache_full_information_values(
+    trainer: Any,
+    rollout: Any,
+    *,
+    target_transition_indices: tuple[int, ...] | None = None,
+    target_node_indices: tuple[int, ...] | None = None,
+    trigger_temperature: float = 1.0,
+    candidate_temperature: float = 1.0,
+) -> dict[str, Any]:
+    """Evaluate fixed-downstream full-exact Cache values and detached teachers.
+
+    Each state/head shares this result between the binary Trigger and the
+    conditional Candidate policy. Legal UPDATE branches use the existing
+    production environment/Matching/KKT/reward executor and frozen critic
+    bootstrap; identical complete physical branches are deduplicated.
+    """
+
+    trigger_scale = float(trigger_temperature)
+    candidate_scale = float(candidate_temperature)
+    if (
+        not math.isfinite(trigger_scale)
+        or trigger_scale <= 0.0
+        or not math.isfinite(candidate_scale)
+        or candidate_scale <= 0.0
+    ):
+        raise ValueError("Cache teacher temperatures must be positive and finite")
+    transitions = tuple(rollout.transitions)
+    if not transitions:
+        raise ValueError("full-information Cache evaluation requires transitions")
+    if target_transition_indices is None:
+        selected_indices = tuple(range(len(transitions)))
+    else:
+        selected_indices = tuple(int(index) for index in target_transition_indices)
+        if not selected_indices or len(set(selected_indices)) != len(selected_indices):
+            raise ValueError("Cache evaluator transition indices must be non-empty and unique")
+        if any(index < 0 or index >= len(transitions) for index in selected_indices):
+            raise IndexError("Cache evaluator transition index is out of range")
+    node_count = len(trainer.context.action_spec.cache_node_ids)
+    if target_node_indices is None:
+        node_indices = tuple(range(node_count))
+    else:
+        node_indices = tuple(int(index) for index in target_node_indices)
+        if not node_indices or len(set(node_indices)) != len(node_indices):
+            raise ValueError("Cache evaluator node indices must be non-empty and unique")
+        if any(index < 0 or index >= node_count for index in node_indices):
+            raise IndexError("Cache evaluator node index is out of range")
+    if not bool(getattr(trainer.policy, "true_binary_trigger", False)):
+        raise RuntimeError("full-information Cache teacher requires binary KEEP/UPDATE")
+    if rollout.cache_candidate_features is None:
+        raise ValueError("rollout does not expose Cache candidate tensor capacity")
+    candidate_capacity = int(rollout.cache_candidate_features.shape[2])
+    feature_dim = int(rollout.cache_candidate_features.shape[3])
+
+    selected_transitions = tuple(transitions[index] for index in selected_indices)
+    origin_start = min(int(item.origin_index) for item in selected_transitions)
+    origin_end = max(int(item.origin_index) for item in selected_transitions)
+    support_count = origin_end - origin_start + 1
+    if not any(
+        bool(item.done) and int(item.origin_index) == origin_end
+        for item in selected_transitions
+    ):
+        support_count += 1
+    from .trainer import aligned_train_steps
+
+    aligned_steps = aligned_train_steps(
+        trainer.context,
+        origin_start,
+        support_count,
+        include_bootstrap_step=False,
+    )
+    steps_by_origin = {int(item.origin_index): item for item in aligned_steps}
+    sample_count = len(selected_transitions)
+    q_keep = np.full((sample_count, node_count), np.nan, dtype=np.float64)
+    candidate_q = np.full(
+        (sample_count, node_count, candidate_capacity), np.nan, dtype=np.float64
+    )
+    candidate_valid = np.zeros(
+        (sample_count, node_count, candidate_capacity), dtype=bool
+    )
+    candidate_features = np.zeros(
+        (sample_count, node_count, candidate_capacity, feature_dim), dtype=np.float32
+    )
+    candidate_operation_indices = np.zeros(
+        (sample_count, node_count, candidate_capacity), dtype=np.int64
+    )
+    candidate_policy_probabilities = np.zeros_like(candidate_q)
+    trigger_policy_probabilities = np.full(
+        (sample_count, node_count, 2), np.nan, dtype=np.float64
+    )
+    candidate_counts = np.zeros((sample_count, node_count), dtype=np.int64)
+    environment_executions = 0
+    deduplicated_branches = 0
+    logical_candidate_count = 0
+    keep_branch_count = 0
+    started_at = time.perf_counter()
+
+    for sample_index, transition in enumerate(selected_transitions):
+        step = steps_by_origin.get(int(transition.origin_index))
+        if step is None:
+            raise RuntimeError("full-information Cache evaluation lacks current aligned step")
+        next_step = steps_by_origin.get(int(transition.origin_index) + 1)
+        if not bool(transition.done) and next_step is None:
+            raise RuntimeError("full-information Cache evaluation lacks next aligned step")
+        branch_cache: dict[
+            tuple[int, bytes, tuple[tuple[str, float, float], ...]], float
+        ] = {}
+        for node_index in node_indices:
+            state = _node_policy_state(
+                trainer,
+                transition,
+                step,
+                node_index,
+                feature_dim,
+            )
+            candidates = tuple(state["candidates"])
+            count = len(candidates)
+            if count > candidate_capacity:
+                raise RuntimeError(
+                    "legal Cache candidate count exceeds rollout capacity: "
+                    f"count={count}, capacity={candidate_capacity}"
+                )
+            candidate_counts[sample_index, node_index] = count
+            logical_candidate_count += count
+            keep_branch_count += 1
+            trigger_policy_probabilities[sample_index, node_index] = (
+                float(state["p_keep"]),
+                float(state["p_update"]),
+            )
+            if count:
+                features = np.stack(state["candidate_features"]).astype(
+                    np.float32, copy=False
+                )
+                candidate_features[sample_index, node_index, :count] = features
+                candidate_operation_indices[sample_index, node_index, :count] = (
+                    np.asarray(state["candidate_operations"], dtype=np.int64)
+                )
+                candidate_policy_probabilities[sample_index, node_index, :count] = (
+                    np.asarray(state["candidate_probabilities"], dtype=np.float64)
+                )
+                candidate_valid[sample_index, node_index, :count] = True
+
+            branch_values: list[float] = []
+            for candidate in (None, *candidates):
+                identity = _cache_branch_identity(
+                    transition,
+                    node_index,
+                    state,
+                    candidate,
+                )
+                q_value = branch_cache.get(identity)
+                if q_value is None:
+                    branch = _execute_cache_branch(
+                        trainer,
+                        transition,
+                        step,
+                        next_step,
+                        node_index,
+                        state,
+                        candidate,
+                    )
+                    q_value = float(_branch_q_values(trainer, [branch])[0])
+                    branch_cache[identity] = q_value
+                    environment_executions += 1
+                else:
+                    deduplicated_branches += 1
+                branch_values.append(q_value)
+            q_keep[sample_index, node_index] = branch_values[0]
+            if count:
+                candidate_q[sample_index, node_index, :count] = np.asarray(
+                    branch_values[1:], dtype=np.float64
+                )
+
+    q_best = np.full((sample_count, node_count), np.nan, dtype=np.float64)
+    delta_best = np.full_like(q_best, np.nan)
+    best_index = np.full((sample_count, node_count), -1, dtype=np.int64)
+    trigger_teacher = np.zeros((sample_count, node_count, 2), dtype=np.float64)
+    trigger_teacher[..., 0] = 1.0
+    candidate_teacher = np.zeros_like(candidate_q)
+    trigger_valid = candidate_valid.any(axis=-1)
+    for sample_index in range(sample_count):
+        for head_index in node_indices:
+            legal = candidate_valid[sample_index, head_index]
+            if not np.any(legal):
+                continue
+            legal_q = candidate_q[sample_index, head_index, legal]
+            legal_indices = np.flatnonzero(legal)
+            selected = int(legal_indices[int(np.argmax(legal_q))])
+            best_index[sample_index, head_index] = selected
+            q_best[sample_index, head_index] = float(
+                candidate_q[sample_index, head_index, selected]
+            )
+            delta_best[sample_index, head_index] = (
+                q_best[sample_index, head_index] - q_keep[sample_index, head_index]
+            )
+            trigger_teacher[sample_index, head_index] = _stable_masked_softmax(
+                np.asarray(
+                    [q_keep[sample_index, head_index], q_best[sample_index, head_index]],
+                    dtype=np.float64,
+                ),
+                np.asarray([True, True], dtype=bool),
+                trigger_scale,
+            )
+            candidate_teacher[sample_index, head_index] = _stable_masked_softmax(
+                candidate_q[sample_index, head_index],
+                legal,
+                candidate_scale,
+            )
+    if not np.all(np.isfinite(q_keep[:, node_indices])):
+        raise FloatingPointError("full-exact Cache KEEP values are non-finite")
+    if not np.all(np.isfinite(candidate_q[candidate_valid])):
+        raise FloatingPointError("full-exact Cache candidate values are non-finite")
+    return {
+        "q_keep": q_keep.astype(np.float32),
+        "candidate_q_values": candidate_q.astype(np.float32),
+        "candidate_valid_mask": candidate_valid,
+        "best_candidate_index": best_index,
+        "q_best_update": q_best.astype(np.float32),
+        "delta_best": delta_best.astype(np.float32),
+        "trigger_teacher_probabilities": trigger_teacher.astype(np.float32),
+        "trigger_teacher_valid_mask": trigger_valid,
+        "candidate_teacher_probabilities": candidate_teacher.astype(np.float32),
+        "candidate_policy_probabilities": candidate_policy_probabilities.astype(np.float32),
+        "trigger_policy_probabilities": trigger_policy_probabilities.astype(np.float32),
+        "candidate_features": candidate_features,
+        "candidate_operation_indices": candidate_operation_indices,
+        "candidate_counts": candidate_counts,
+        "candidate_exact_evaluated_mask": candidate_valid.copy(),
+        "counterfactual_environment_executions": int(environment_executions),
+        "logical_candidate_count": int(logical_candidate_count),
+        "keep_branch_count": int(keep_branch_count),
+        "deduplicated_branch_count": int(deduplicated_branches),
+        "runtime_seconds": float(time.perf_counter() - started_at),
+        "value_evaluator": "FULL_EXACT",
+        "downstream_mode": "FIXED_DOWNSTREAM",
+        "trigger_temperature": trigger_scale,
+        "candidate_temperature": candidate_scale,
     }
 
 

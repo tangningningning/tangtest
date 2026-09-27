@@ -257,7 +257,6 @@ def evaluate_realization(policy: Any, context: Any, *, split: str,
         "ppo_updates": 0, "backward_calls": 0,
         "actor_optimizer_steps": 0, "critic_optimizer_steps": 0,
         "uav_exact_q_teacher_calls_for_action_selection": 0,
-        "cache_tdq_calls_for_action_selection": 0,
         **execution,
     }
     for role in role_counts:
@@ -380,7 +379,6 @@ def run_evaluation(*, checkpoint: Path, split: str, data_root: Path,
         "critic_optimizer_steps_during_eval": 0,
         "ppo_updates_during_eval": 0,
         "uav_exact_q_teacher_calls_for_action_selection": 0,
-        "cache_tdq_calls_for_action_selection": 0,
     }
     _write_json(output_dir / "evaluation_manifest.json", metadata)
     summary = _aggregate(records, split=split, checkpoint=checkpoint,

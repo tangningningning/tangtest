@@ -868,25 +868,21 @@ def validate_config(
             "LEGACY_GLOBAL_GAE",
         )
     )
-    candidate_policy_improvement = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.candidate_policy_improvement",
-            "LEGACY_PPO",
-        )
-    )
-    if candidate_policy_improvement not in {"LEGACY_PPO", "EXACT_Q_LISTWISE"}:
-        raise ValueError(
-            "algorithm.ppo.candidate_policy_improvement 只支持 LEGACY_PPO/EXACT_Q_LISTWISE。"
-        )
     legacy_exact_q_temperature = float(
         get_config_value(config, "algorithm.ppo.exact_q_listwise_temperature", 1.0)
     )
-    cache_exact_q_temperature = float(
+    cache_trigger_teacher_temperature = float(
         get_config_value(
             config,
-            "algorithm.ppo.cache_exact_q_listwise_temperature",
-            legacy_exact_q_temperature,
+            "algorithm.ppo.cache_trigger_teacher_temperature",
+            1.0,
+        )
+    )
+    cache_candidate_teacher_temperature = float(
+        get_config_value(
+            config,
+            "algorithm.ppo.cache_candidate_teacher_temperature",
+            1.0,
         )
     )
     uav_exact_q_temperature = float(
@@ -898,7 +894,8 @@ def validate_config(
     )
     for field, value in {
         "exact_q_listwise_temperature": legacy_exact_q_temperature,
-        "cache_exact_q_listwise_temperature": cache_exact_q_temperature,
+        "cache_trigger_teacher_temperature": cache_trigger_teacher_temperature,
+        "cache_candidate_teacher_temperature": cache_candidate_teacher_temperature,
         "uav_exact_q_listwise_temperature": uav_exact_q_temperature,
     }.items():
         if not math.isfinite(value) or value <= 0.0:
@@ -912,46 +909,6 @@ def validate_config(
         if candidate_advantage_normalization != "EXACT_Q_LISTWISE":
             raise ValueError(
                 "proposed_joint requires algorithm.ppo.candidate_advantage_normalization=EXACT_Q_LISTWISE."
-            )
-        if candidate_policy_improvement != "EXACT_Q_LISTWISE":
-            raise ValueError(
-                "proposed_joint requires algorithm.ppo.candidate_policy_improvement=EXACT_Q_LISTWISE."
-            )
-        proposed_cache_sources = {
-            "cache_trigger_advantage_source": {
-                "GLOBAL_GAE",
-                "ONE_STEP_TD_Q_DIFFERENCE",
-            },
-            "cache_candidate_advantage_source": {"GLOBAL_GAE"},
-        }
-        for field, allowed in proposed_cache_sources.items():
-            actual = str(get_config_value(config, f"algorithm.ppo.{field}", ""))
-            if actual not in allowed:
-                allowed_text = "/".join(sorted(allowed))
-                raise ValueError(
-                    f"proposed_joint requires algorithm.ppo.{field} in {allowed_text}."
-                )
-        cache_ratio_granularities = {
-            field: str(
-                get_config_value(
-                    config,
-                    f"algorithm.ppo.{field}",
-                    "WHOLE_CACHE_JOINT",
-                )
-            )
-            for field in (
-                "cache_trigger_ratio_granularity",
-                "cache_candidate_ratio_granularity",
-            )
-        }
-        for field, actual in cache_ratio_granularities.items():
-            if actual not in {"WHOLE_CACHE_JOINT", "PER_CACHE_HEAD"}:
-                raise ValueError(
-                    f"proposed_joint does not support {field}={actual!r}."
-                )
-        if len(set(cache_ratio_granularities.values())) != 1:
-            raise ValueError(
-                "proposed_joint Cache trigger/candidate ratio granularity must match."
             )
     if configuration_control_mode in {
         "policy_primitive",

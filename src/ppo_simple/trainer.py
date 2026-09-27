@@ -58,7 +58,7 @@ from .policy import (
     BernoulliActorCritic,
 )
 from .cache_action_q import CacheActionQCritic
-from .cache_credit import compute_one_step_tdq_cache_trigger_credit
+from .cache_credit import evaluate_cache_full_information_values
 from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
 from .exact_q_parallel import (
     ExactQHeadPlan,
@@ -92,15 +92,14 @@ POPART_CHECKPOINT_VERSION = 6
 CACHE_ONLY_CHECKPOINT_VERSION = 7
 REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
-# The proposed Cache objective is now actual-rollout PPO with global GAE.  It
-# is not resume-compatible with the earlier Exact-Q/Action-Q proposed
-# checkpoints, so the version bump is deliberately explicit.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 17
-CACHE_POLICY_CREDIT_SOURCE = "ACTUAL_ROLLOUT_GAE"
-CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT = "NO"
-CACHE_COUNTERFACTUAL_MODE = "NONE_FOR_PRODUCTION"
+# Full-information Cache Trigger/Candidate teachers change the actor objective;
+# proposed-joint checkpoints from earlier Cache objectives cannot be resumed.
+JOINT_PROPOSED_CHECKPOINT_VERSION = 18
+CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
+CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
+CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
+CACHE_DOWNSTREAM_MODE = "FIXED_DOWNSTREAM"
 CACHE_VALUE_MODEL = "NONE"
-CACHE_NORMAL_COUNTERFACTUAL_MODE = "NONE_FOR_PRODUCTION"
 CACHE_AUDIT_MODE = "DIAGNOSTIC_ONLY"
 CACHE_ACTUAL_ACTION_Q_SOURCE = "NONE"
 CACHE_UNEXECUTED_ACTION_Q_SOURCE = "NONE"
@@ -130,19 +129,6 @@ DEFAULT_OPERATION_ADVANTAGE_NORMALIZATION_MODE = (
     OPERATION_ADVANTAGE_NORMALIZATION_STD_ONLY
 )
 DEFAULT_OPERATION_ADVANTAGE_REFERENCE_SCALE = 0.02
-CANDIDATE_POLICY_IMPROVEMENT_LEGACY_PPO = "LEGACY_PPO"
-CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE = "EXACT_Q_LISTWISE"
-CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE = "GLOBAL_GAE"
-CACHE_TRIGGER_ADVANTAGE_ONE_STEP_TDQ = "ONE_STEP_TD_Q_DIFFERENCE"
-CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE = "GLOBAL_GAE"
-CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT = "WHOLE_CACHE_JOINT"
-CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD = "PER_CACHE_HEAD"
-CACHE_RATIO_GRANULARITIES = frozenset(
-    {
-        CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
-        CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD,
-    }
-)
 DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE = 1.0
 CRITIC_VALUE_SCALE_NONE = "none"
 CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
@@ -832,9 +818,6 @@ class UpdateResult:
     cache_per_head_ratio_p90: float = math.nan
     cache_per_head_ratio_max: float = math.nan
     cache_per_head_clip_fraction: float = math.nan
-    cache_ratio_granularity: str = CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT
-    whole_cache_joint_ratio_used_for_loss: bool = True
-    whole_cache_joint_ratio_diagnostic_only: bool = False
     uav_clip_fraction: float = math.nan
     cache_entropy: float = math.nan
     uav_entropy: float = math.nan
@@ -904,30 +887,22 @@ class UpdateResult:
     uav_candidate_effective_kl_immediately_after_gate: float = math.nan
     uav_candidate_effective_kl_after_gate: float = math.nan
     uav_candidate_post_gate_drift_from_gate: float = math.nan
-    # Exact node-specific Cache credit diagnostics.
-    cache_trigger_advantage_source: str = CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE
-    cache_candidate_advantage_source: str = CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE
-    cache_trigger_tdq_raw_mean: float = math.nan
-    cache_trigger_tdq_raw_std: float = math.nan
-    cache_trigger_tdq_raw_p10: float = math.nan
-    cache_trigger_tdq_raw_p50: float = math.nan
-    cache_trigger_tdq_raw_p90: float = math.nan
-    cache_trigger_tdq_raw_abs_max: float = math.nan
-    cache_trigger_tdq_scale: float = math.nan
-    cache_trigger_tdq_normalized_abs_p90: float = math.nan
-    cache_trigger_tdq_normalized_abs_max: float = math.nan
-    one_step_tdq_branches_executed: int = 0
-    one_step_tdq_runtime_seconds: float = math.nan
-    seconds_per_cache_head: float = math.nan
-    projected_300_slot_runtime_seconds: float = math.nan
-    cache_trigger_advantage_mean_abs: float = math.nan
-    cache_candidate_advantage_mean_abs: float = math.nan
-    cache_trigger_advantage_weighted_mean_residual: float = math.nan
-    cache_candidate_advantage_weighted_mean_residual: float = math.nan
-    cache_trigger_advantage_mean_abs_by_role: dict[str, float] | None = None
+    # Full-information Cache teacher diagnostics.
+    cache_trigger_credit_source: str = CACHE_TRIGGER_CREDIT_SOURCE
+    cache_candidate_credit_source: str = CACHE_CANDIDATE_CREDIT_SOURCE
+    cache_value_evaluator: str = "FULL_EXACT"
+    cache_downstream_mode: str = CACHE_DOWNSTREAM_MODE
+    cache_trigger_teacher_temperature: float = math.nan
+    cache_candidate_teacher_temperature: float = math.nan
+    cache_trigger_valid_head_count: int = 0
+    cache_candidate_valid_head_count: int = 0
+    cache_q_keep_mean: float = math.nan
+    cache_q_best_update_mean: float = math.nan
+    cache_delta_best_mean: float = math.nan
     cache_credit_counterfactual_env_executions: int = 0
     cache_credit_runtime_seconds: float = math.nan
-    cache_candidate_q_source: str = ""
+    cache_full_exact_update_branch_count: int = 0
+    cache_deduplicated_branch_count: int = 0
     cache_logical_candidate_count: int = 0
     cache_exact_candidate_count: int = 0
     cache_surrogate_candidate_count: int = 0
@@ -950,7 +925,6 @@ class UpdateResult:
     cache_full_exact_audit_branches: int = 0
     cache_normal_slot_counterfactual_branches: int = 0
     cache_counterfactual_executions_avoided: int = 0
-    cache_candidate_value_source: str = ""
     cache_q_critic_mae: float = math.nan
     cache_q_critic_rmse: float = math.nan
     cache_q_critic_rank_correlation: float = math.nan
@@ -2157,13 +2131,6 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
     fields = values if all(math.isfinite(value) for value in values.values()) else {}
     fields.update(
         {
-            "CACHE_RATIO_GRANULARITY": str(update.cache_ratio_granularity),
-            "WHOLE_CACHE_JOINT_RATIO_USED_FOR_LOSS": bool(
-                update.whole_cache_joint_ratio_used_for_loss
-            ),
-            "WHOLE_CACHE_JOINT_RATIO_DIAGNOSTIC_ONLY": bool(
-                update.whole_cache_joint_ratio_diagnostic_only
-            ),
         }
     )
     policy_losses = {
@@ -2446,166 +2413,43 @@ def _branch_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
         fields["uav_proposal_diagnostics"] = dict(update.uav_proposal_diagnostics)
     fields.update(
         {
-            "CACHE_TRIGGER_ADVANTAGE_SOURCE": str(
-                update.cache_trigger_advantage_source
+            "CACHE_TRIGGER_CREDIT_SOURCE": str(update.cache_trigger_credit_source),
+            "CACHE_CANDIDATE_CREDIT_SOURCE": str(update.cache_candidate_credit_source),
+            "CACHE_VALUE_EVALUATOR": str(update.cache_value_evaluator),
+            "CACHE_DOWNSTREAM_MODE": str(update.cache_downstream_mode),
+            "CACHE_TRIGGER_TEACHER_TEMPERATURE": float(
+                update.cache_trigger_teacher_temperature
             ),
-            "CACHE_CANDIDATE_ADVANTAGE_SOURCE": str(
-                update.cache_candidate_advantage_source
+            "CACHE_CANDIDATE_TEACHER_TEMPERATURE": float(
+                update.cache_candidate_teacher_temperature
             ),
-        }
-    )
-    cache_credit_metrics = {
-        "cache_trigger_advantage_mean_abs": float(
-            update.cache_trigger_advantage_mean_abs
-        ),
-        "cache_candidate_advantage_mean_abs": float(
-            update.cache_candidate_advantage_mean_abs
-        ),
-        "cache_trigger_advantage_weighted_mean_residual": float(
-            update.cache_trigger_advantage_weighted_mean_residual
-        ),
-        "cache_candidate_advantage_weighted_mean_residual": float(
-            update.cache_candidate_advantage_weighted_mean_residual
-        ),
-        "cache_credit_runtime_seconds": float(update.cache_credit_runtime_seconds),
-    }
-    fields.update(
-        {
-            "CACHE_TRIGGER_TDQ_RAW_MEAN": float(update.cache_trigger_tdq_raw_mean),
-            "CACHE_TRIGGER_TDQ_RAW_STD": float(update.cache_trigger_tdq_raw_std),
-            "CACHE_TRIGGER_TDQ_RAW_P10": float(update.cache_trigger_tdq_raw_p10),
-            "CACHE_TRIGGER_TDQ_RAW_P50": float(update.cache_trigger_tdq_raw_p50),
-            "CACHE_TRIGGER_TDQ_RAW_P90": float(update.cache_trigger_tdq_raw_p90),
-            "CACHE_TRIGGER_TDQ_RAW_ABS_MAX": float(
-                update.cache_trigger_tdq_raw_abs_max
+            "CACHE_TRIGGER_VALID_HEAD_COUNT": int(
+                update.cache_trigger_valid_head_count
             ),
-            "CACHE_TRIGGER_TDQ_SCALE": float(update.cache_trigger_tdq_scale),
-            "CACHE_TRIGGER_TDQ_NORMALIZED_ABS_P90": float(
-                update.cache_trigger_tdq_normalized_abs_p90
+            "CACHE_CANDIDATE_VALID_HEAD_COUNT": int(
+                update.cache_candidate_valid_head_count
             ),
-            "CACHE_TRIGGER_TDQ_NORMALIZED_ABS_MAX": float(
-                update.cache_trigger_tdq_normalized_abs_max
+            "CACHE_Q_KEEP_MEAN": float(update.cache_q_keep_mean),
+            "CACHE_Q_BEST_UPDATE_MEAN": float(update.cache_q_best_update_mean),
+            "CACHE_DELTA_BEST_MEAN": float(update.cache_delta_best_mean),
+            "CACHE_LOGICAL_UPDATE_CANDIDATE_COUNT": int(
+                update.cache_logical_candidate_count
             ),
-            "ONE_STEP_TDQ_BRANCHES_EXECUTED": int(
-                update.one_step_tdq_branches_executed
+            "CACHE_FULL_EXACT_KEEP_BRANCH_COUNT": int(update.cache_keep_exact_count),
+            "CACHE_FULL_EXACT_UPDATE_BRANCH_COUNT": int(
+                update.cache_full_exact_update_branch_count
             ),
-            "ONE_STEP_TDQ_RUNTIME_SECONDS": float(
-                update.one_step_tdq_runtime_seconds
+            "CACHE_DEDUPLICATED_BRANCH_COUNT": int(
+                update.cache_deduplicated_branch_count
             ),
-            "SECONDS_PER_CACHE_HEAD": float(update.seconds_per_cache_head),
-            "PROJECTED_300_SLOT_RUNTIME_SECONDS": float(
-                update.projected_300_slot_runtime_seconds
+            "CACHE_COUNTERFACTUAL_ENV_EXECUTIONS": int(
+                update.cache_credit_counterfactual_env_executions
+            ),
+            "CACHE_TEACHER_EVALUATION_RUNTIME_SECONDS": float(
+                update.cache_credit_runtime_seconds
             ),
         }
     )
-    if all(math.isfinite(value) for value in cache_credit_metrics.values()):
-        fields.update(cache_credit_metrics)
-        fields["cache_credit_counterfactual_env_executions"] = int(
-            update.cache_credit_counterfactual_env_executions
-        )
-        if update.cache_trigger_advantage_mean_abs_by_role is not None:
-            fields["cache_trigger_advantage_mean_abs_by_role"] = {
-                str(role): float(value)
-                for role, value in update.cache_trigger_advantage_mean_abs_by_role.items()
-                if math.isfinite(float(value))
-            }
-    hybrid_cache_metrics = {
-        "CACHE_LOGICAL_CANDIDATE_COUNT": int(update.cache_logical_candidate_count),
-        "CACHE_EXACT_CANDIDATE_COUNT": int(update.cache_exact_candidate_count),
-        "CACHE_SURROGATE_CANDIDATE_COUNT": int(
-            update.cache_surrogate_candidate_count
-        ),
-        "CACHE_KEEP_EXACT_COUNT": int(update.cache_keep_exact_count),
-        "CACHE_FULL_EXACT_AUDIT_COUNT": int(update.cache_full_exact_audit_count),
-        "CACHE_COUNTERFACTUAL_ENV_EXECUTIONS": int(
-            update.cache_credit_counterfactual_env_executions
-        ),
-        "CACHE_COUNTERFACTUAL_EXECUTIONS_SAVED": int(
-            update.cache_counterfactual_executions_saved
-        ),
-        "CACHE_COUNTERFACTUAL_EXECUTIONS_AVOIDED": int(
-            update.cache_counterfactual_executions_avoided
-        ),
-        "CACHE_SURROGATE_SCREENING_ACTIVE": bool(
-            update.cache_surrogate_screening_active
-        ),
-        "CACHE_SURROGATE_SCREENING_READY": bool(
-            update.cache_surrogate_screening_ready
-        ),
-        "CACHE_SURROGATE_SELECTED_K": update.cache_surrogate_selected_k,
-        "CACHE_TRIGGER_Q_SOURCE": str(update.cache_candidate_q_source),
-        "CACHE_TOTAL_LOGICAL_BRANCHES": int(update.cache_total_logical_branches),
-        "CACHE_FULL_EXACT_AUDIT_BRANCHES": int(update.cache_full_exact_audit_branches),
-        "CACHE_NORMAL_SLOT_COUNTERFACTUAL_BRANCHES": int(
-            update.cache_normal_slot_counterfactual_branches
-        ),
-        "CACHE_CANDIDATE_VALUE_SOURCE": str(update.cache_candidate_value_source),
-        "CACHE_ACTUAL_ACTION_Q_ANCHOR": str(update.cache_actual_action_q_anchor),
-        "CACHE_HELDOUT_AUDIT_BEFORE_TRAINING": bool(
-            update.cache_heldout_audit_before_training
-        ),
-        "CACHE_Q_CRITIC_USABLE_FOR_POLICY_CREDIT": str(
-            update.cache_q_critic_usable_for_policy_credit
-        ),
-    }
-    fields.update(hybrid_cache_metrics)
-    runtime_metrics = {
-        "CACHE_COUNTERFACTUAL_EXECUTION_REDUCTION_FRACTION": float(
-            update.cache_counterfactual_execution_reduction_fraction
-        ),
-        "SURROGATE_INFERENCE_RUNTIME_SECONDS": float(
-            update.cache_surrogate_inference_runtime_seconds
-        ),
-        "SURROGATE_TRAIN_RUNTIME_SECONDS": float(
-            update.cache_surrogate_train_runtime_seconds
-        ),
-        "CACHE_SURROGATE_DELTA_Q_MAE": float(update.cache_surrogate_delta_q_mae),
-        "CACHE_SURROGATE_DELTA_Q_RMSE": float(update.cache_surrogate_delta_q_rmse),
-        "CACHE_SURROGATE_RANK_CORRELATION": float(
-            update.cache_surrogate_rank_correlation
-        ),
-        "CACHE_SURROGATE_UNCERTAINTY_MEAN": float(
-            update.cache_surrogate_uncertainty_mean
-        ),
-        "CACHE_SURROGATE_UNCERTAINTY_P90": float(
-            update.cache_surrogate_uncertainty_p90
-        ),
-        "CACHE_Q_CRITIC_MAE": float(update.cache_q_critic_mae),
-        "CACHE_Q_CRITIC_RMSE": float(update.cache_q_critic_rmse),
-        "CACHE_Q_CRITIC_RANK_CORRELATION": float(
-            update.cache_q_critic_rank_correlation
-        ),
-        "CACHE_Q_CRITIC_ARGMAX_ACCURACY": float(
-            update.cache_q_critic_argmax_accuracy
-        ),
-        "CACHE_Q_CRITIC_RECALL_AT_3": float(update.cache_q_critic_recall_at_3),
-        "CACHE_Q_CRITIC_RECALL_AT_5": float(update.cache_q_critic_recall_at_5),
-        "CACHE_Q_CRITIC_NORMALIZED_REGRET_P95": float(
-            update.cache_q_critic_normalized_regret_p95
-        ),
-        "CACHE_Q_CRITIC_TRAIN_SECONDS": float(update.cache_q_critic_train_seconds),
-        "CACHE_Q_INFERENCE_SECONDS": float(update.cache_q_critic_inference_seconds),
-        "CACHE_AUDIT_EXACT_SECONDS": float(update.cache_audit_exact_seconds),
-    }
-    fields.update(
-        {
-            key: value
-            for key, value in runtime_metrics.items()
-            if math.isfinite(float(value))
-        }
-    )
-    if update.cache_surrogate_audit_statistics is not None:
-        fields["CACHE_SURROGATE_AUDIT_STATISTICS"] = dict(
-            update.cache_surrogate_audit_statistics
-        )
-    if update.cache_q_critic_selected_exact_regret is not None:
-        fields["CACHE_Q_CRITIC_SELECTED_EXACT_REGRET"] = dict(
-            update.cache_q_critic_selected_exact_regret
-        )
-    if update.cache_q_critic_audit_metrics is not None:
-        fields["CACHE_Q_CRITIC_AUDIT_METRICS"] = dict(
-            update.cache_q_critic_audit_metrics
-        )
     if math.isfinite(float(update.uav_operation_credit_runtime_seconds)):
         fields["uav_operation_credit_runtime_seconds"] = float(
             update.uav_operation_credit_runtime_seconds
@@ -4052,82 +3896,6 @@ class PPOV2Trainer:
                     f"for axis {self.lr_experiment_axis!r}"
                 )
         self.lr_experiment_value = resolved_lr_experiment_value
-        self.candidate_policy_improvement = str(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.candidate_policy_improvement",
-                CANDIDATE_POLICY_IMPROVEMENT_LEGACY_PPO,
-            )
-        )
-        self.cache_trigger_ratio_granularity = str(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.cache_trigger_ratio_granularity",
-                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
-            )
-        )
-        self.cache_candidate_ratio_granularity = str(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.cache_candidate_ratio_granularity",
-                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
-            )
-        )
-        self.cache_trigger_advantage_source = str(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.cache_trigger_advantage_source",
-                CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE,
-            )
-        )
-        self.cache_candidate_advantage_source = str(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.cache_candidate_advantage_source",
-                CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE,
-            )
-        )
-        if self.cache_trigger_advantage_source not in {
-            CACHE_TRIGGER_ADVANTAGE_GLOBAL_GAE,
-            CACHE_TRIGGER_ADVANTAGE_ONE_STEP_TDQ,
-        }:
-            raise ValueError(
-                "algorithm.ppo.cache_trigger_advantage_source must be "
-                "GLOBAL_GAE or ONE_STEP_TD_Q_DIFFERENCE"
-            )
-        if self.cache_candidate_advantage_source != CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE:
-            raise ValueError(
-                "algorithm.ppo.cache_candidate_advantage_source must be GLOBAL_GAE"
-            )
-        if context.policy_schema in PROPOSED_POLICY_SCHEMAS and (
-            self.cache_candidate_advantage_source != CACHE_CANDIDATE_ADVANTAGE_GLOBAL_GAE
-        ):
-            raise ValueError(
-                "the proposed joint schema requires Cache candidate credit GLOBAL_GAE"
-            )
-        if self.cache_trigger_ratio_granularity not in CACHE_RATIO_GRANULARITIES:
-            raise ValueError(
-                "algorithm.ppo.cache_trigger_ratio_granularity must be "
-                "WHOLE_CACHE_JOINT or PER_CACHE_HEAD"
-            )
-        if self.cache_candidate_ratio_granularity not in CACHE_RATIO_GRANULARITIES:
-            raise ValueError(
-                "algorithm.ppo.cache_candidate_ratio_granularity must be "
-                "WHOLE_CACHE_JOINT or PER_CACHE_HEAD"
-            )
-        if self.cache_trigger_ratio_granularity != self.cache_candidate_ratio_granularity:
-            raise ValueError(
-                "Cache trigger/candidate ratio granularity must use one shared mode"
-            )
-        self.cache_ratio_granularity = self.cache_trigger_ratio_granularity
-        if self.candidate_policy_improvement not in {
-            CANDIDATE_POLICY_IMPROVEMENT_LEGACY_PPO,
-            CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE,
-        }:
-            raise ValueError(
-                "algorithm.ppo.candidate_policy_improvement 只支持 "
-                "LEGACY_PPO/EXACT_Q_LISTWISE。"
-            )
         legacy_exact_q_temperature = float(
             project_config.get_config_value(
                 context.cfg,
@@ -4135,11 +3903,18 @@ class PPOV2Trainer:
                 DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE,
             )
         )
-        self.cache_exact_q_listwise_temperature = float(
+        self.cache_trigger_teacher_temperature = float(
             project_config.get_config_value(
                 context.cfg,
-                "algorithm.ppo.cache_exact_q_listwise_temperature",
-                legacy_exact_q_temperature,
+                "algorithm.ppo.cache_trigger_teacher_temperature",
+                DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE,
+            )
+        )
+        self.cache_candidate_teacher_temperature = float(
+            project_config.get_config_value(
+                context.cfg,
+                "algorithm.ppo.cache_candidate_teacher_temperature",
+                DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE,
             )
         )
         self.uav_exact_q_listwise_temperature = float(
@@ -4150,27 +3925,32 @@ class PPOV2Trainer:
             )
         )
         for field, value in {
-            "cache_exact_q_listwise_temperature": self.cache_exact_q_listwise_temperature,
+            "cache_trigger_teacher_temperature": self.cache_trigger_teacher_temperature,
+            "cache_candidate_teacher_temperature": self.cache_candidate_teacher_temperature,
             "uav_exact_q_listwise_temperature": self.uav_exact_q_listwise_temperature,
         }.items():
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field} 必须是正的有限数。")
-        if (
-            self.candidate_policy_improvement
-            == CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE
-            and context.policy_schema not in PROPOSED_POLICY_SCHEMAS
-        ):
-            raise ValueError(
-                "EXACT_Q_LISTWISE candidate improvement is reserved for the proposed joint schema."
-            )
-        if (
-            context.policy_schema in PROPOSED_POLICY_SCHEMAS
-            and self.candidate_policy_improvement
-            != CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE
-        ):
-            raise ValueError(
-                "the proposed joint schema requires candidate_policy_improvement=EXACT_Q_LISTWISE"
-            )
+        if context.policy_schema in PROPOSED_POLICY_SCHEMAS:
+            cache_credit_identity = {
+                "cache_trigger_credit_source": CACHE_TRIGGER_CREDIT_SOURCE,
+                "cache_candidate_credit_source": CACHE_CANDIDATE_CREDIT_SOURCE,
+                "cache_value_evaluator": "FULL_EXACT",
+                "cache_downstream_mode": CACHE_DOWNSTREAM_MODE,
+                "cache_counterfactual_mode": CACHE_COUNTERFACTUAL_MODE,
+            }
+            for field, expected in cache_credit_identity.items():
+                actual = str(
+                    project_config.get_config_value(
+                        context.cfg,
+                        f"algorithm.ppo.{field}",
+                        expected,
+                    )
+                )
+                if actual != expected:
+                    raise ValueError(
+                        f"algorithm.ppo.{field} must be {expected!r}; got {actual!r}"
+                    )
         self.cache_kl_control = str(
             project_config.get_config_value(
                 context.cfg,
@@ -4481,38 +4261,27 @@ class PPOV2Trainer:
     def _uses_exact_uav_candidate_credit(self) -> bool:
         return self.policy.architecture_id in CANDIDATE_CREDIT_POLICY_SCHEMAS
 
-    def _uses_exact_q_listwise_candidate(self) -> bool:
-        return (
-            self.candidate_policy_improvement
-            == CANDIDATE_POLICY_IMPROVEMENT_EXACT_Q_LISTWISE
-        )
-
     def _uses_exact_cache_credit(self) -> bool:
         return self.policy.architecture_id in EXACT_CACHE_CREDIT_POLICY_SCHEMAS
 
-    def cache_action_q_metadata(self) -> dict[str, Any]:
-        """Return formal Cache-credit metadata without advertising Action-Q."""
+    def cache_credit_metadata(self) -> dict[str, Any]:
+        """Return the active Cache teacher and evaluator identity."""
 
+        if self.policy.architecture_id not in PROPOSED_POLICY_SCHEMAS:
+            return {}
         return {
-            "CACHE_POLICY_CREDIT_SOURCE": CACHE_POLICY_CREDIT_SOURCE,
-            "CACHE_ACTION_Q_CRITIC_INITIALIZED": bool(
-                self.cache_action_q_critic is not None
-            ),
-            "CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT": CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT,
+            "CACHE_TRIGGER_CREDIT_SOURCE": CACHE_TRIGGER_CREDIT_SOURCE,
+            "CACHE_CANDIDATE_CREDIT_SOURCE": CACHE_CANDIDATE_CREDIT_SOURCE,
+            "CACHE_VALUE_EVALUATOR": "FULL_EXACT",
+            "CACHE_DOWNSTREAM_MODE": CACHE_DOWNSTREAM_MODE,
             "CACHE_COUNTERFACTUAL_MODE": CACHE_COUNTERFACTUAL_MODE,
-            "CACHE_VALUE_MODEL": CACHE_VALUE_MODEL,
-            "cache_policy_credit_source": CACHE_POLICY_CREDIT_SOURCE,
-            "cache_action_q_critic_initialized": bool(
-                self.cache_action_q_critic is not None
+            "CACHE_TRIGGER_TEACHER_TEMPERATURE": float(
+                self.cache_trigger_teacher_temperature
             ),
-            "cache_action_q_used_for_policy_credit": CACHE_ACTION_Q_USED_FOR_POLICY_CREDIT,
-            "cache_counterfactual_mode": CACHE_COUNTERFACTUAL_MODE,
+            "CACHE_CANDIDATE_TEACHER_TEMPERATURE": float(
+                self.cache_candidate_teacher_temperature
+            ),
         }
-
-    def cache_surrogate_metadata(self) -> dict[str, Any]:
-        """Compatibility alias for old manifest callers."""
-
-        return self.cache_action_q_metadata()
 
     def _predict_cache_action_q(
         self,
@@ -7414,6 +7183,97 @@ class PPOV2Trainer:
             torch.zeros_like(probabilities),
         )
 
+    def _cache_trigger_log_probabilities_all(
+        self,
+        cache_contexts: Any,
+        operation_masks: Any,
+        cache_trigger_aux: Any | None,
+    ) -> Any:
+        """Return masked KEEP/UPDATE log probabilities for every Cache head."""
+
+        contexts = torch.as_tensor(
+            cache_contexts, dtype=torch.float32, device=self.device
+        )
+        masks = torch.as_tensor(
+            operation_masks, dtype=torch.bool, device=self.device
+        )
+        if contexts.ndim != 3 or masks.shape != contexts.shape[:2] + (2,):
+            raise ValueError("Cache Trigger policy tensor shape mismatch")
+        batch_size, node_count, observation_dim = [int(value) for value in contexts.shape]
+        flat_contexts = contexts.reshape(batch_size * node_count, observation_dim)
+        if cache_trigger_aux is None:
+            raise RuntimeError("full-information Cache Trigger is missing stored auxiliary state")
+        auxiliary = torch.as_tensor(
+            cache_trigger_aux, dtype=torch.float32, device=self.device
+        )
+        if tuple(auxiliary.shape[:2]) != (batch_size, node_count):
+            raise ValueError("Cache Trigger auxiliary batch shape mismatch")
+        if auxiliary.requires_grad:
+            raise RuntimeError("Cache Trigger auxiliary state must be detached")
+        flat_auxiliary = auxiliary.reshape(batch_size * node_count, -1)
+        logits, single = self.policy._trigger_logits(flat_contexts, flat_auxiliary)
+        if not single:
+            raise RuntimeError("Cache Trigger logits require one context per row")
+        logits = logits.reshape(
+            batch_size,
+            node_count,
+            self.policy.num_cache_heads,
+            2,
+        )
+        head_indices = torch.arange(node_count, dtype=torch.long, device=self.device)
+        head_logits = logits[:, head_indices, head_indices, :]
+        if not bool(torch.all(masks.any(dim=-1)).item()):
+            raise RuntimeError("Cache Trigger mask blocks every operation")
+        return torch.log_softmax(
+            head_logits.masked_fill(~masks, -float("inf")),
+            dim=-1,
+        )
+
+    @staticmethod
+    def _masked_teacher_kl(
+        student_log_probabilities: Any,
+        teacher_probabilities: Any,
+        valid_action_mask: Any,
+        active_row_mask: Any | None = None,
+    ) -> Any:
+        """KL(teacher || student), reduced only across rows with legal credit."""
+
+        student_log = torch.as_tensor(student_log_probabilities, dtype=torch.float32)
+        teacher = torch.as_tensor(
+            teacher_probabilities, dtype=torch.float32, device=student_log.device
+        )
+        valid_actions = torch.as_tensor(
+            valid_action_mask, dtype=torch.bool, device=student_log.device
+        )
+        if student_log.shape != teacher.shape or teacher.shape != valid_actions.shape:
+            raise ValueError("Cache teacher KL tensor shape mismatch")
+        if active_row_mask is None:
+            active_rows = valid_actions.any(dim=-1)
+        else:
+            active_rows = torch.as_tensor(
+                active_row_mask, dtype=torch.bool, device=student_log.device
+            )
+            if tuple(active_rows.shape) != tuple(student_log.shape[:-1]):
+                raise ValueError("Cache teacher active-row mask shape mismatch")
+        safe_teacher = torch.where(valid_actions, teacher, torch.zeros_like(teacher))
+        safe_student_log = torch.where(
+            valid_actions, student_log, torch.zeros_like(student_log)
+        )
+        per_row = torch.sum(
+            safe_teacher
+            * (
+                torch.log(safe_teacher.clamp_min(1.0e-12))
+                - safe_student_log
+            ),
+            dim=-1,
+        )
+        if not bool(torch.any(active_rows).item()):
+            return student_log.sum() * 0.0
+        result = per_row[active_rows].mean()
+        if not bool(torch.isfinite(result).item()):
+            raise FloatingPointError("Cache teacher KL is non-finite")
+        return result
+
     def update(self, rollout: SimpleRollout) -> UpdateResult:
         hyper = self.hyperparameters
         bootstrap_value = 0.0
@@ -7633,14 +7493,6 @@ class PPOV2Trainer:
         branch_diagnostics_enabled = (
             self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS
         )
-        cache_trigger_tdq_enabled = (
-            self.cache_trigger_advantage_source
-            == CACHE_TRIGGER_ADVANTAGE_ONE_STEP_TDQ
-        )
-        if cache_trigger_tdq_enabled and not branch_diagnostics_enabled:
-            raise RuntimeError(
-                "ONE_STEP_TD_Q_DIFFERENCE Cache trigger credit requires the proposed joint policy"
-            )
         branchwise_policy_enabled = exact_uav_credit_enabled
         branch_kl_instrumentation_enabled = exact_uav_credit_enabled
         branch_specific_kl_gate_enabled = (
@@ -7752,32 +7604,70 @@ class PPOV2Trainer:
                 }
             )
         cache_credit: dict[str, Any] = {}
-        if cache_trigger_tdq_enabled:
-            cache_credit = compute_one_step_tdq_cache_trigger_credit(
+        if branch_diagnostics_enabled:
+            cache_credit = evaluate_cache_full_information_values(
                 self,
                 rollout,
+                trigger_temperature=self.cache_trigger_teacher_temperature,
+                candidate_temperature=self.cache_candidate_teacher_temperature,
             )
-        cache_proposal_diagnostics: dict[str, Any] | None = None
-        if cache_credit and "candidate_q_values" in cache_credit:
-            cache_proposal_diagnostics = _proposal_source_diagnostics(
-                cache_credit["candidate_q_values"],
+        cache_trigger_teacher_probabilities_t = None
+        cache_trigger_teacher_valid_mask_t = None
+        cache_candidate_teacher_probabilities_t = None
+        cache_full_candidate_valid_mask_t = None
+        cache_full_candidate_features_t = None
+        if branch_diagnostics_enabled:
+            cache_trigger_teacher_probabilities_t = torch.as_tensor(
+                cache_credit["trigger_teacher_probabilities"],
+                dtype=torch.float32,
+                device=self.device,
+            ).detach()
+            cache_trigger_teacher_valid_mask_t = torch.as_tensor(
+                cache_credit["trigger_teacher_valid_mask"],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            cache_candidate_teacher_probabilities_t = torch.as_tensor(
+                cache_credit["candidate_teacher_probabilities"],
+                dtype=torch.float32,
+                device=self.device,
+            ).detach()
+            cache_full_candidate_valid_mask_t = torch.as_tensor(
                 cache_credit["candidate_valid_mask"],
-                cache_credit["candidate_proposal_sources"],
-                cache_credit["candidate_hamming_distances"],
+                dtype=torch.bool,
+                device=self.device,
             )
-            cache_proposal_diagnostics.update(
-                {
-                    "cache_candidate_q_source": str(
-                        cache_credit.get("candidate_value_source", "")
-                    ),
-                    "cache_exact_candidate_count": int(
-                        cache_credit.get("exact_candidate_count", 0)
-                    ),
-                    "cache_surrogate_candidate_count": int(
-                        cache_credit.get("action_q_candidate_count", 0)
-                    ),
-                }
+            cache_full_candidate_features_t = torch.as_tensor(
+                cache_credit["candidate_features"],
+                dtype=torch.float32,
+                device=self.device,
             )
+            rollout_candidate_mask = np.asarray(
+                rollout.cache_candidate_masks, dtype=bool
+            )
+            rollout_candidate_features = np.asarray(
+                rollout.cache_candidate_features, dtype=np.float32
+            )
+            evaluated_candidate_mask = np.asarray(
+                cache_credit["candidate_valid_mask"], dtype=bool
+            )
+            evaluated_candidate_features = np.asarray(
+                cache_credit["candidate_features"], dtype=np.float32
+            )
+            if not np.array_equal(rollout_candidate_mask, evaluated_candidate_mask):
+                raise RuntimeError(
+                    "full-information Cache candidate ordering/mask differs from rollout"
+                )
+            if not np.allclose(
+                rollout_candidate_features[evaluated_candidate_mask],
+                evaluated_candidate_features[evaluated_candidate_mask],
+                rtol=0.0,
+                atol=1.0e-6,
+            ):
+                raise RuntimeError(
+                    "full-information Cache candidate features differ from rollout order"
+                )
+        cache_proposal_diagnostics: dict[str, Any] | None = None
         uav_proposal_diagnostics: dict[str, Any] | None = None
         if uav_operation_credit:
             uav_proposal_diagnostics = _proposal_source_diagnostics(
@@ -8732,243 +8622,57 @@ class PPOV2Trainer:
                         .tolist()
                     )
                     if branchwise_policy_enabled:
-                        if self._uses_exact_cache_credit() and not cache_trigger_tdq_enabled:
-                            assert (
-                                cache_trigger_advantages_t is not None
-                                and cache_trigger_old_probabilities_t is not None
-                                and cache_candidate_features_t is not None
-                                and cache_candidate_operation_indices_t is not None
-                                and cache_candidate_old_probabilities_t is not None
-                                and cache_candidate_valid_mask_t is not None
-                                and cache_candidate_advantages_t is not None
-                                and cache_operation_actions is not None
-                                and cache_operation_masks is not None
-                            )
-                            cache_trigger_new_log_probs, cache_candidate_new_probabilities = (
-                                self._cache_policy_terms(
-                                    cache_contexts[indices],
-                                    cache_operation_masks[indices],
-                                    cache_operation_actions[indices],
-                                    cache_candidate_features_t[indices],
-                                    cache_candidate_operation_indices_t[indices],
-                                    cache_candidate_valid_mask_t[indices],
-                                    cache_trigger_aux[indices],
-                                )
-                            )
-                            selected_update = cache_operation_actions[indices] != 0
-                            old_selected_probability = torch.where(
-                                selected_update,
-                                cache_trigger_old_probabilities_t[indices, ..., 1],
-                                cache_trigger_old_probabilities_t[indices, ..., 0],
-                            )
-                            trigger_ratio = torch.exp(
-                                cache_trigger_new_log_probs
-                                - torch.log(old_selected_probability.clamp_min(1.0e-12))
-                            )
-                            trigger_advantage = cache_trigger_advantages_t[indices]
-                            trigger_unclipped = trigger_ratio * trigger_advantage
-                            trigger_clipped = torch.clamp(
-                                trigger_ratio,
-                                1.0 - hyper.clip_epsilon,
-                                1.0 + hyper.clip_epsilon,
-                            ) * trigger_advantage
-                            trigger_surrogate = torch.minimum(
-                                trigger_unclipped,
-                                trigger_clipped,
-                            )
-                            trigger_policy_loss = -trigger_surrogate.mean()
-                            cache_trigger_policy_loss_values.append(
-                                float(trigger_policy_loss.detach().cpu())
-                            )
+                        assert (
+                            cache_operation_masks is not None
+                            and cache_trigger_teacher_probabilities_t is not None
+                            and cache_trigger_teacher_valid_mask_t is not None
+                            and cache_candidate_teacher_probabilities_t is not None
+                            and cache_full_candidate_valid_mask_t is not None
+                            and cache_full_candidate_features_t is not None
+                        )
+                        trigger_log_probabilities = self._cache_trigger_log_probabilities_all(
+                            cache_contexts[indices],
+                            cache_operation_masks[indices],
+                            cache_trigger_aux[indices],
+                        )
+                        trigger_teacher = cache_trigger_teacher_probabilities_t[indices]
+                        trigger_valid_actions = cache_operation_masks[indices]
+                        trigger_active_heads = cache_trigger_teacher_valid_mask_t[indices]
+                        trigger_policy_loss = self._masked_teacher_kl(
+                            trigger_log_probabilities,
+                            trigger_teacher,
+                            trigger_valid_actions,
+                            trigger_active_heads,
+                        )
+                        cache_trigger_policy_loss_values.append(
+                            float(trigger_policy_loss.detach().cpu())
+                        )
 
-                            candidate_valid = cache_candidate_valid_mask_t[indices]
-                            candidate_ratio = torch.where(
-                                candidate_valid,
-                                cache_candidate_new_probabilities
-                                / cache_candidate_old_probabilities_t[indices].clamp_min(
-                                    1.0e-12
-                                ),
-                                torch.ones_like(cache_candidate_new_probabilities),
-                            )
-                            candidate_policy_loss, _ = self._exact_q_listwise_candidate_loss(
-                                torch.log(
-                                    cache_candidate_new_probabilities.clamp_min(
-                                        1.0e-12
-                                    )
-                                ),
-                                cache_candidate_q_values_t[indices],
-                                candidate_valid,
-                                self.cache_exact_q_listwise_temperature,
-                            )
+                        candidate_valid = cache_full_candidate_valid_mask_t[indices]
+                        candidate_student_probabilities = self._conditional_candidate_probabilities(
+                            cache_contexts[indices],
+                            cache_full_candidate_features_t[indices],
+                            candidate_valid,
+                            int(self.policy.cache_feature_dim),
+                            self.policy.cache_candidate_scorer,
+                        )
+                        candidate_teacher = cache_candidate_teacher_probabilities_t[indices]
+                        candidate_policy_loss = self._masked_teacher_kl(
+                            torch.log(candidate_student_probabilities.clamp_min(1.0e-12)),
+                            candidate_teacher,
+                            candidate_valid,
+                        )
+                        if bool(torch.any(candidate_valid.any(dim=-1)).item()):
                             cache_candidate_policy_loss_values.append(
                                 float(candidate_policy_loss.detach().cpu())
                             )
-                            cache_branch_policy_loss = 0.5 * (
-                                trigger_policy_loss + candidate_policy_loss
-                            )
-                            branch_metric_tensors += (
-                                trigger_ratio.detach(),
-                                candidate_ratio.detach(),
-                                trigger_advantage.detach(),
-                                candidate_policy_loss.detach(),
-                            )
-                        elif cache_trigger_tdq_enabled:
-                            assert (
-                                cache_credit
-                                and cache_trigger_advantages_t is None
-                                and cache_operation_actions is not None
-                                and cache_operation_masks is not None
-                                and cache_candidate_features is not None
-                                and cache_candidate_masks is not None
-                                and cache_candidate_old_log_probs is not None
-                                and cache_selected_indices is not None
-                            )
-                            tdq_trigger_advantages = torch.as_tensor(
-                                cache_credit["trigger_advantages"],
-                                dtype=torch.float32,
-                                device=self.device,
-                            )
-                            tdq_trigger_old_probabilities = torch.as_tensor(
-                                cache_credit["trigger_old_probabilities"],
-                                dtype=torch.float32,
-                                device=self.device,
-                            )
-                            if tuple(tdq_trigger_advantages.shape) != tuple(
-                                cache_operation_actions.shape
-                            ):
-                                raise RuntimeError(
-                                    "Cache TD-Q trigger advantage shape mismatch"
-                                )
-                            if tuple(tdq_trigger_old_probabilities.shape) != (
-                                sample_count,
-                                int(cache_operation_actions.shape[1]),
-                                2,
-                            ):
-                                raise RuntimeError(
-                                    "Cache TD-Q trigger probability shape mismatch"
-                                )
-                            cache_candidate_operation_indices = torch.zeros_like(
-                                cache_candidate_masks[indices], dtype=torch.long
-                            )
-                            cache_trigger_new_log_probs, cache_candidate_new_probabilities = (
-                                self._cache_policy_terms(
-                                    cache_contexts[indices],
-                                    cache_operation_masks[indices],
-                                    cache_operation_actions[indices],
-                                    cache_candidate_features[indices],
-                                    cache_candidate_operation_indices,
-                                    cache_candidate_masks[indices],
-                                    cache_trigger_aux[indices],
-                                )
-                            )
-                            selected_update = cache_operation_actions[indices] != 0
-                            old_selected_probability = torch.where(
-                                selected_update,
-                                tdq_trigger_old_probabilities[indices, ..., 1],
-                                tdq_trigger_old_probabilities[indices, ..., 0],
-                            )
-                            trigger_ratio = torch.exp(
-                                cache_trigger_new_log_probs
-                                - torch.log(old_selected_probability.clamp_min(1.0e-12))
-                            )
-                            trigger_advantage = tdq_trigger_advantages[indices]
-                            trigger_unclipped = trigger_ratio * trigger_advantage
-                            trigger_clipped = torch.clamp(
-                                trigger_ratio,
-                                1.0 - hyper.clip_epsilon,
-                                1.0 + hyper.clip_epsilon,
-                            ) * trigger_advantage
-                            trigger_policy_loss = -torch.minimum(
-                                trigger_unclipped,
-                                trigger_clipped,
-                            ).mean()
-                            cache_trigger_policy_loss_values.append(
-                                float(trigger_policy_loss.detach().cpu())
-                            )
-
-                            selected_indices = cache_selected_indices[indices]
-                            selected_valid = cache_candidate_masks[indices].gather(
-                                -1, selected_indices.unsqueeze(-1)
-                            ).squeeze(-1)
-                            if not bool(torch.all(selected_valid).item()):
-                                raise RuntimeError(
-                                    "Cache TD-Q candidate selected index is masked"
-                                )
-                            selected_candidate_probability = (
-                                cache_candidate_new_probabilities.gather(
-                                    -1, selected_indices.unsqueeze(-1)
-                                ).squeeze(-1)
-                            )
-                            candidate_ratio = torch.where(
-                                selected_update,
-                                torch.exp(
-                                    torch.log(
-                                        selected_candidate_probability.clamp_min(
-                                            1.0e-12
-                                        )
-                                    )
-                                    - cache_candidate_old_log_probs[indices]
-                                ),
-                                torch.ones_like(selected_candidate_probability),
-                            )
-                            candidate_advantage = advantages_t[indices].unsqueeze(-1).expand_as(
-                                candidate_ratio
-                            )
-                            candidate_unclipped = candidate_ratio * candidate_advantage
-                            candidate_clipped = torch.clamp(
-                                candidate_ratio,
-                                1.0 - hyper.clip_epsilon,
-                                1.0 + hyper.clip_epsilon,
-                            ) * candidate_advantage
-                            candidate_surrogate = torch.minimum(
-                                candidate_unclipped,
-                                candidate_clipped,
-                            )
-                            if bool(torch.any(selected_update).item()):
-                                candidate_policy_loss = -candidate_surrogate[
-                                    selected_update
-                                ].mean()
-                                cache_candidate_policy_loss_values.append(
-                                    float(candidate_policy_loss.detach().cpu())
-                                )
-                            else:
-                                candidate_policy_loss = candidate_ratio.sum() * 0.0
-                            cache_branch_policy_loss = 0.5 * (
-                                trigger_policy_loss + candidate_policy_loss
-                            )
-                            branch_metric_tensors += (
-                                trigger_ratio.detach(),
-                                candidate_ratio.detach(),
-                                trigger_advantage.detach(),
-                                candidate_policy_loss.detach(),
-                            )
-                        else:
-                            if (
-                                self.cache_ratio_granularity
-                                == CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD
-                            ):
-                                if cache_node_ratio is None:
-                                    raise RuntimeError(
-                                        "Cache per-head ratio was not computed"
-                                    )
-                                cache_branch_policy_loss = _cache_per_head_ppo_loss(
-                                    cache_node_ratio,
-                                    advantages_t[indices],
-                                    hyper.clip_epsilon,
-                                )
-                            else:
-                                cache_branch_unclipped = (
-                                    cache_branch_ratio * advantages_t[indices]
-                                )
-                                cache_branch_clipped = torch.clamp(
-                                    cache_branch_ratio,
-                                    1.0 - hyper.clip_epsilon,
-                                    1.0 + hyper.clip_epsilon,
-                                ) * advantages_t[indices]
-                                cache_branch_policy_loss = -torch.minimum(
-                                    cache_branch_unclipped,
-                                    cache_branch_clipped,
-                                ).mean()
+                        cache_branch_policy_loss = 0.5 * (
+                            trigger_policy_loss + candidate_policy_loss
+                        )
+                        branch_metric_tensors += (
+                            trigger_policy_loss.detach(),
+                            candidate_policy_loss.detach(),
+                        )
                         if exact_uav_credit_enabled:
                             assert (
                                 evaluation.uav_operation_log_probs is not None
@@ -10993,6 +10697,31 @@ class PPOV2Trainer:
                 raise RuntimeError(
                     "UAV candidate scorer/encoder optimizer steps are desynchronized"
                 )
+        cache_teacher_valid = np.asarray(
+            cache_credit.get("candidate_valid_mask", np.zeros((0,), dtype=bool)),
+            dtype=bool,
+        )
+        cache_trigger_valid = np.asarray(
+            cache_credit.get("trigger_teacher_valid_mask", np.zeros((0,), dtype=bool)),
+            dtype=bool,
+        )
+        cache_q_keep_values = np.asarray(
+            cache_credit.get("q_keep", np.zeros((0,), dtype=np.float32)),
+            dtype=np.float64,
+        )
+        cache_q_best_values = np.asarray(
+            cache_credit.get("q_best_update", np.zeros((0,), dtype=np.float32)),
+            dtype=np.float64,
+        )
+        cache_delta_best_values = np.asarray(
+            cache_credit.get("delta_best", np.zeros((0,), dtype=np.float32)),
+            dtype=np.float64,
+        )
+        cache_update_heads = (
+            cache_teacher_valid.any(axis=-1)
+            if cache_teacher_valid.ndim == 3
+            else np.zeros((0,), dtype=bool)
+        )
         return UpdateResult(
             policy_loss=policy_loss_value,
             value_loss=value_loss_value,
@@ -11054,15 +10783,6 @@ class PPOV2Trainer:
             cache_per_head_ratio_max=float(cache_per_head_ratio_metrics["max"]),
             cache_per_head_clip_fraction=float(
                 cache_per_head_ratio_metrics["clip_fraction"]
-            ),
-            cache_ratio_granularity=str(self.cache_ratio_granularity),
-            whole_cache_joint_ratio_used_for_loss=(
-                self.cache_ratio_granularity
-                == CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT
-            ),
-            whole_cache_joint_ratio_diagnostic_only=(
-                self.cache_ratio_granularity
-                == CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD
             ),
             uav_clip_fraction=(
                 float(np.mean(uav_clip_fraction_values))
@@ -11675,235 +11395,54 @@ class PPOV2Trainer:
                     math.nan,
                 )
             ),
-            cache_trigger_advantage_source=str(
-                self.cache_trigger_advantage_source
+            cache_trigger_credit_source=CACHE_TRIGGER_CREDIT_SOURCE,
+            cache_candidate_credit_source=CACHE_CANDIDATE_CREDIT_SOURCE,
+            cache_value_evaluator=str(cache_credit.get("value_evaluator", "N/A")),
+            cache_downstream_mode=str(cache_credit.get("downstream_mode", "N/A")),
+            cache_trigger_teacher_temperature=float(
+                cache_credit.get("trigger_temperature", math.nan)
             ),
-            cache_candidate_advantage_source=str(
-                self.cache_candidate_advantage_source
+            cache_candidate_teacher_temperature=float(
+                cache_credit.get("candidate_temperature", math.nan)
             ),
-            cache_trigger_tdq_raw_mean=float(
-                cache_credit.get("tdq_raw_mean", math.nan)
-            ),
-            cache_trigger_tdq_raw_std=float(
-                cache_credit.get("tdq_raw_std", math.nan)
-            ),
-            cache_trigger_tdq_raw_p10=float(
-                cache_credit.get("tdq_raw_p10", math.nan)
-            ),
-            cache_trigger_tdq_raw_p50=float(
-                cache_credit.get("tdq_raw_p50", math.nan)
-            ),
-            cache_trigger_tdq_raw_p90=float(
-                cache_credit.get("tdq_raw_p90", math.nan)
-            ),
-            cache_trigger_tdq_raw_abs_max=float(
-                cache_credit.get("tdq_raw_abs_max", math.nan)
-            ),
-            cache_trigger_tdq_scale=float(
-                cache_credit.get("tdq_scale", math.nan)
-            ),
-            cache_trigger_tdq_normalized_abs_p90=float(
-                cache_credit.get("tdq_normalized_abs_p90", math.nan)
-            ),
-            cache_trigger_tdq_normalized_abs_max=float(
-                cache_credit.get("tdq_normalized_abs_max", math.nan)
-            ),
-            one_step_tdq_branches_executed=int(
-                cache_credit.get("one_step_tdq_branches_executed", 0)
-            ),
-            one_step_tdq_runtime_seconds=float(
-                cache_credit.get("one_step_tdq_runtime_seconds", math.nan)
-            ),
-            seconds_per_cache_head=float(
-                cache_credit.get("seconds_per_cache_head", math.nan)
-            ),
-            projected_300_slot_runtime_seconds=float(
-                cache_credit.get("projected_300_slot_runtime_seconds", math.nan)
-            ),
-            cache_trigger_advantage_mean_abs=(
-                float(cache_credit.get("trigger_advantage_mean_abs", math.nan))
-                if cache_credit
+            cache_trigger_valid_head_count=int(np.count_nonzero(cache_trigger_valid)),
+            cache_candidate_valid_head_count=int(np.count_nonzero(cache_update_heads)),
+            cache_q_keep_mean=(
+                float(np.mean(cache_q_keep_values[np.isfinite(cache_q_keep_values)]))
+                if np.any(np.isfinite(cache_q_keep_values))
                 else math.nan
             ),
-            cache_candidate_advantage_mean_abs=(
-                float(cache_credit.get("candidate_advantage_mean_abs", math.nan))
-                if cache_credit
+            cache_q_best_update_mean=(
+                float(np.mean(cache_q_best_values[cache_update_heads]))
+                if np.any(cache_update_heads)
                 else math.nan
             ),
-            cache_trigger_advantage_weighted_mean_residual=(
-                float(
-                    np.mean(
-                        np.abs(
-                            np.asarray(
-                                cache_credit.get(
-                                    "trigger_weighted_mean_residual", []
-                                ),
-                                dtype=np.float64,
-                            )
-                        )
-                    )
-                )
-                if cache_credit
+            cache_delta_best_mean=(
+                float(np.mean(cache_delta_best_values[cache_update_heads]))
+                if np.any(cache_update_heads)
                 else math.nan
-            ),
-            cache_candidate_advantage_weighted_mean_residual=(
-                float(
-                    np.mean(
-                        np.abs(
-                            np.asarray(
-                                cache_credit.get(
-                                    "candidate_weighted_mean_residual", []
-                                ),
-                                dtype=np.float64,
-                            )
-                        )
-                    )
-                )
-                if cache_credit
-                else math.nan
-            ),
-            cache_trigger_advantage_mean_abs_by_role=(
-                dict(cache_credit.get("trigger_advantage_mean_abs_by_role", {}))
-                if cache_credit
-                else None
             ),
             cache_credit_counterfactual_env_executions=int(
                 cache_credit.get("counterfactual_environment_executions", 0)
             ),
             cache_credit_runtime_seconds=float(
-                cache_credit.get("credit_runtime_seconds", math.nan)
+                cache_credit.get("runtime_seconds", math.nan)
             ),
-            cache_candidate_q_source=str(
-                cache_credit.get("candidate_value_source", "")
+            cache_full_exact_update_branch_count=max(
+                0,
+                int(cache_credit.get("counterfactual_environment_executions", 0))
+                - int(cache_credit.get("keep_branch_count", 0)),
             ),
-            cache_candidate_value_source=str(
-                cache_credit.get("candidate_value_source", "")
+            cache_deduplicated_branch_count=int(
+                cache_credit.get("deduplicated_branch_count", 0)
             ),
             cache_logical_candidate_count=int(
                 cache_credit.get("logical_candidate_count", 0)
             ),
             cache_exact_candidate_count=int(
-                cache_credit.get("exact_candidate_count", 0)
+                cache_credit.get("logical_candidate_count", 0)
             ),
-            cache_surrogate_candidate_count=int(
-                cache_credit.get("surrogate_candidate_count", 0)
-            ),
-            cache_keep_exact_count=int(cache_credit.get("keep_exact_count", 0)),
-            cache_full_exact_audit_count=int(
-                cache_credit.get("full_exact_audit_count", 0)
-            ),
-            cache_counterfactual_executions_saved=int(
-                cache_credit.get("counterfactual_executions_saved", 0)
-            ),
-            cache_counterfactual_execution_reduction_fraction=float(
-                cache_credit.get(
-                    "counterfactual_execution_reduction_fraction", math.nan
-                )
-            ),
-            cache_surrogate_inference_runtime_seconds=float(
-                cache_credit.get("surrogate_inference_runtime_seconds", math.nan)
-            ),
-            cache_surrogate_train_runtime_seconds=float(
-                cache_credit.get("surrogate_train_runtime_seconds", math.nan)
-            ),
-            cache_surrogate_delta_q_mae=float(
-                cache_credit.get("surrogate_delta_q_mae", math.nan)
-            ),
-            cache_surrogate_delta_q_rmse=float(
-                cache_credit.get("surrogate_delta_q_rmse", math.nan)
-            ),
-            cache_surrogate_rank_correlation=float(
-                cache_credit.get("surrogate_rank_correlation", math.nan)
-            ),
-            cache_surrogate_uncertainty_mean=float(
-                cache_credit.get("surrogate_uncertainty_mean", math.nan)
-            ),
-            cache_surrogate_uncertainty_p90=float(
-                cache_credit.get("surrogate_uncertainty_p90", math.nan)
-            ),
-            cache_surrogate_screening_active=bool(
-                self.cache_surrogate_screening_active
-            ),
-            cache_surrogate_screening_ready=bool(
-                self.cache_surrogate_screening_ready
-            ),
-            cache_surrogate_selected_k=(
-                None
-                if self.cache_surrogate_selected_k is None
-                else int(self.cache_surrogate_selected_k)
-            ),
-            cache_surrogate_audit_statistics=(
-                None
-                if self.cache_surrogate_audit_statistics is None
-                else dict(self.cache_surrogate_audit_statistics)
-            ),
-            cache_total_logical_branches=int(
-                cache_credit.get("total_logical_branch_count", 0)
-            ),
-            cache_full_exact_audit_branches=int(
-                cache_credit.get("full_exact_audit_branch_count", 0)
-            ),
-            cache_normal_slot_counterfactual_branches=int(
-                cache_credit.get("normal_slot_counterfactual_branch_count", 0)
-            ),
-            cache_counterfactual_executions_avoided=int(
-                cache_credit.get("counterfactual_executions_avoided", 0)
-            ),
-            cache_q_critic_mae=float(
-                (cache_credit.get("heldout_audit_metrics") or {}).get("q_mae_stats", {}).get("mean", math.nan)
-            ),
-            cache_q_critic_rmse=float(
-                (cache_credit.get("heldout_audit_metrics") or {}).get("q_rmse_stats", {}).get("mean", math.nan)
-            ),
-            cache_q_critic_rank_correlation=float(
-                (cache_credit.get("heldout_audit_metrics") or {}).get("rank_correlation", math.nan)
-            ),
-            cache_q_critic_argmax_accuracy=float(
-                (cache_credit.get("heldout_audit_metrics") or {}).get("argmax_accuracy", math.nan)
-            ),
-            cache_q_critic_recall_at_3=float(
-                (cache_credit.get("heldout_audit_metrics") or {}).get("recall_at_3", math.nan)
-            ),
-            cache_q_critic_recall_at_5=float(
-                (cache_credit.get("heldout_audit_metrics") or {}).get("recall_at_5", math.nan)
-            ),
-            cache_q_critic_selected_exact_regret=(
-                None
-                if cache_credit.get("heldout_audit_metrics") is None
-                else dict(
-                    cache_credit["heldout_audit_metrics"].get(
-                        "selected_exact_regret_stats", {}
-                    )
-                )
-            ),
-            cache_q_critic_normalized_regret_p95=float(
-                (cache_credit.get("heldout_audit_metrics") or {}).get(
-                    "normalized_regret_p95", math.nan
-                )
-            ),
-            cache_q_critic_usable_for_policy_credit=str(
-                cache_credit.get("cache_q_critic_usable_for_policy_credit", "INCONCLUSIVE")
-            ),
-            cache_q_critic_train_seconds=float(
-                cache_credit.get("cache_q_critic_train_seconds", math.nan)
-            ),
-            cache_q_critic_inference_seconds=float(
-                cache_credit.get("cache_q_critic_inference_seconds", math.nan)
-            ),
-            cache_audit_exact_seconds=float(
-                cache_credit.get("cache_audit_exact_seconds", math.nan)
-            ),
-            cache_heldout_audit_before_training=bool(
-                cache_credit.get("heldout_audit_before_training", False)
-            ),
-            cache_actual_action_q_anchor=str(
-                cache_credit.get("actual_action_q_anchor", "NO")
-            ),
-            cache_q_critic_audit_metrics=(
-                None
-                if cache_credit.get("heldout_audit_metrics") is None
-                else dict(cache_credit["heldout_audit_metrics"])
-            ),
+            cache_keep_exact_count=int(cache_credit.get("keep_branch_count", 0)),
             cache_target_scorer_parameter_delta_norm=float(
                 cache_target_scorer_parameter_delta_norm
             ),
@@ -12029,13 +11568,7 @@ class PPOV2Trainer:
             **learning_rate_metadata,
             "cache_credit_granularity": None,
             "cache_kl_control": str(self.cache_kl_control),
-            "cache_trigger_advantage_source": str(
-                self.cache_trigger_advantage_source
-            ),
-            "cache_candidate_advantage_source": str(
-                self.cache_candidate_advantage_source
-            ),
-            **self.cache_surrogate_metadata(),
+            **self.cache_credit_metadata(),
             "configuration_control_mode": self.context.configuration_control_mode,
             "advantage_normalization_mode": (
                 self.hyperparameters.advantage_normalization_mode
@@ -12221,9 +11754,6 @@ class PPOV2Trainer:
         self,
         checkpoint: Path,
         config_hash: str,
-        *,
-        current_config_path: str | Path | None = None,
-        checkpoint_config_path: str | Path | None = None,
     ) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
         _validate_learning_rate_metadata(
@@ -12284,6 +11814,12 @@ class PPOV2Trainer:
         expected_version = self._expected_checkpoint_version()
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
+        for field, expected in self.cache_credit_metadata().items():
+            if payload.get(field) != expected:
+                raise ValueError(
+                    "PPO Cache teacher metadata mismatch; refusing cross-objective resume: "
+                    f"field={field}, checkpoint={payload.get(field)!r}, expected={expected!r}."
+                )
         stored_architecture_version = payload.get("architecture_version")
         runtime_architecture_version = int(
             getattr(self.policy, "architecture_version", 1)
@@ -12316,14 +11852,6 @@ class PPOV2Trainer:
                 f"expected={self.cache_kl_control}."
             )
         if self._uses_exact_cache_credit():
-            expected_action_q_metadata = self.cache_action_q_metadata()
-            for field, expected in expected_action_q_metadata.items():
-                if payload.get(field) != expected:
-                    raise ValueError(
-                        "PPO Cache Action-Q checkpoint metadata mismatch: "
-                        f"field={field}, checkpoint={payload.get(field)!r}, "
-                        f"expected={expected!r}."
-                    )
             if self.cache_action_q_critic is None or self.cache_action_q_optimizer is None:
                 raise RuntimeError("Cache Action-Q critic is not initialized for resume")
             if (
@@ -12395,19 +11923,7 @@ class PPOV2Trainer:
         ):
             raise ValueError("PPO checkpoint configuration_control_mode mismatch.")
         config_hash_matches = payload.get("config_sha256") == config_hash
-        ratio_only_resume = False
-        if not config_hash_matches and (
-            current_config_path is not None
-            and checkpoint_config_path is not None
-        ):
-            ratio_only_resume = _configs_match_except_cache_ratio_granularity(
-                current_config_path,
-                checkpoint_config_path,
-                str(payload.get("config_sha256", "")),
-            )
-        if payload.get("method") != PPO_V2_METHOD or not (
-            config_hash_matches or ratio_only_resume
-        ):
+        if payload.get("method") != PPO_V2_METHOD or not config_hash_matches:
             raise ValueError("PPO v2 checkpoint method/config hash mismatch.")
         if int(payload.get("action_dim")) != int(self.context.action_spec.action_dim):
             raise ValueError("PPO v2 checkpoint action_dim 不匹配。")
@@ -12520,76 +12036,6 @@ def _config_hash(config_path: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _configs_match_except_cache_ratio_granularity(
-    current_config_path: str | Path,
-    checkpoint_config_path: str | Path,
-    checkpoint_config_hash: str,
-) -> bool:
-    """Allow only the explicit Stage2A Cache ratio migration on resume."""
-
-    current_path = Path(current_config_path)
-    checkpoint_path = Path(checkpoint_config_path)
-    if not current_path.is_file() or not checkpoint_path.is_file():
-        return False
-    if _config_hash(checkpoint_path) != str(checkpoint_config_hash):
-        return False
-    try:
-        current = project_config.load_config(
-            current_path,
-            require_artifacts=False,
-        )
-        checkpoint = project_config.load_config(
-            checkpoint_path,
-            require_artifacts=False,
-        )
-    except (OSError, ValueError, TypeError):
-        return False
-    current_ratio_values = {
-        str(
-            project_config.get_config_value(
-                current,
-                f"algorithm.ppo.{field}",
-                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
-            )
-        )
-        for field in (
-            "cache_trigger_ratio_granularity",
-            "cache_candidate_ratio_granularity",
-        )
-    }
-    checkpoint_ratio_values = {
-        str(
-            project_config.get_config_value(
-                checkpoint,
-                f"algorithm.ppo.{field}",
-                CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT,
-            )
-        )
-        for field in (
-            "cache_trigger_ratio_granularity",
-            "cache_candidate_ratio_granularity",
-        )
-    }
-    if current_ratio_values != {CACHE_RATIO_GRANULARITY_PER_CACHE_HEAD}:
-        return False
-    if checkpoint_ratio_values != {CACHE_RATIO_GRANULARITY_WHOLE_CACHE_JOINT}:
-        return False
-
-    def normalized(config: dict[str, Any]) -> dict[str, Any]:
-        value = json.loads(json.dumps(config))
-        value.pop("_meta", None)
-        ppo = value.get("algorithm", {}).get("ppo", {})
-        for field in (
-            "cache_trigger_ratio_granularity",
-            "cache_candidate_ratio_granularity",
-        ):
-            if field in ppo:
-                ppo[field] = "__CACHE_RATIO_GRANULARITY__"
-        return value
-
-    return normalized(current) == normalized(checkpoint)
-
-
 def _run_protocol_metadata(
     context: EnvironmentContext,
     rollout_steps: int,
@@ -12622,7 +12068,6 @@ def run_training(
     lr_experiment_value: float | None = None,
     exact_q_parallel_workers: int = 1,
     resume: bool = False,
-    checkpoint_config_path: str | Path | None = None,
     verbose: bool = False,
 ) -> None:
     _require_torch()
@@ -12792,8 +12237,6 @@ def run_training(
         cursor = trainer.load_checkpoint(
             checkpoint,
             config_hash,
-            current_config_path=config_path,
-            checkpoint_config_path=checkpoint_config_path,
         )
         completed_episodes = cursor.completed_episodes
         current_train_origin = cursor.current_train_origin
@@ -13956,14 +13399,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="staged deterministic UAV Exact-Q transition workers",
     )
-    parser.add_argument(
-        "--checkpoint-config",
-        default=None,
-        help=(
-            "read-only source config for the explicit Stage2A Cache ratio-only "
-            "checkpoint migration"
-        ),
-    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--verbose",
@@ -14007,7 +13442,6 @@ def main(argv: list[str] | None = None) -> int:
         critic_learning_rate_override=args.critic_learning_rate,
         exact_q_parallel_workers=args.exact_q_parallel_workers,
         resume=bool(args.resume),
-        checkpoint_config_path=args.checkpoint_config,
         verbose=bool(args.verbose),
     )
     return 0
