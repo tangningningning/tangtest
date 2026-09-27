@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -20,10 +21,13 @@ import torch
 from decision import cache_configuration, slot_environment, uav_configuration
 
 from .primitive_control import (
+    PrimitiveTensorSpec,
     _cache_candidate_feature,
     _cache_target_configuration_feature,
     _intermediate_observation,
+    sample_and_apply_joint_cache_uav_operation_configuration,
 )
+from .policy import CandidatePolicySample
 from .rollout import _check_request_contract, _check_reward
 
 
@@ -492,6 +496,529 @@ def _execute_cache_branch(
         "reward": float(reward),
         "next_observation": next_observation,
         "result": result,
+    }
+
+
+class _DeterministicReplayOverrides:
+    """Frozen policy proxy for deterministic downstream replay diagnostics."""
+
+    def __init__(
+        self,
+        policy: Any,
+        forced_triggers: dict[int, int],
+        forced_candidates: dict[int, int],
+    ) -> None:
+        self._policy = policy
+        self._forced_triggers = dict(forced_triggers)
+        self._forced_candidates = dict(forced_candidates)
+        self._active_cache_head: int | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._policy, name)
+
+    def sample_cache_trigger(
+        self,
+        observation: Any,
+        node_index: int,
+        operation_mask: Any,
+        *,
+        trigger_aux: Any,
+        deterministic: bool = False,
+    ) -> Any:
+        node_index = int(node_index)
+        self._active_cache_head = node_index
+        sample = self._policy.sample_cache_trigger(
+            observation,
+            node_index,
+            operation_mask,
+            trigger_aux=trigger_aux,
+            deterministic=True,
+        )
+        forced = self._forced_triggers.get(node_index)
+        if forced is None:
+            return sample
+        return _override_operation_sample(sample, forced)
+
+    def sample_cache_update_candidate_from_logits(
+        self,
+        candidate_logits: Any,
+        deterministic: bool = False,
+    ) -> CandidatePolicySample:
+        sample = self._policy.sample_cache_update_candidate_from_logits(
+            candidate_logits,
+            deterministic=True,
+        )
+        if self._active_cache_head is None:
+            raise RuntimeError("Cache candidate replay has no active Cache head")
+        forced = self._forced_candidates.get(self._active_cache_head)
+        if forced is None:
+            return sample
+        return _override_operation_sample(sample, forced)
+
+
+def _override_operation_sample(sample: Any, selected_index: int) -> Any:
+    selected_index = int(selected_index)
+    logits = torch.as_tensor(sample.logits)
+    distribution = torch.distributions.Categorical(logits=logits)
+    if selected_index < 0 or selected_index >= int(logits.numel()):
+        raise IndexError("forced deterministic replay action is out of range")
+    if not bool(torch.isfinite(distribution.logits[selected_index]).item()):
+        raise ValueError("forced deterministic replay action is masked")
+    selected = torch.as_tensor(
+        selected_index,
+        dtype=torch.long,
+        device=distribution.logits.device,
+    )
+    return replace(
+        sample,
+        selected_index=selected_index,
+        log_prob=distribution.log_prob(selected),
+    )
+
+
+def _execute_policy_consistent_cache_branch(
+    trainer: Any,
+    transition: Any,
+    step: Any,
+    next_step: Any | None,
+    node_index: int,
+    state: dict[str, Any],
+    candidate: Any | None,
+    *,
+    force_update_candidate_index: int | None,
+) -> dict[str, Any]:
+    """Replay later Cache and UAV choices after a forced target-head action."""
+
+    actions = _production_action_map(transition)
+    forced_triggers: dict[int, int] = {}
+    forced_candidates: dict[int, int] = {}
+    for index in range(int(node_index)):
+        record = actions[index]
+        action = str(record.get("conditional_action", "")).upper()
+        if action == "KEEP":
+            forced_triggers[index] = 0
+            continue
+        if action != "TARGET_CONFIGURATION":
+            raise RuntimeError(
+                "policy-consistent replay cannot pin an unknown Cache prefix action: "
+                f"head={index}, action={action!r}"
+            )
+        selected_index = record.get("selected_index")
+        if selected_index is None:
+            raise RuntimeError("production Cache prefix UPDATE lacks selected_index")
+        forced_triggers[index] = 1
+        forced_candidates[index] = int(selected_index)
+
+    forced_triggers[int(node_index)] = 0 if candidate is None else 1
+    if candidate is not None:
+        if force_update_candidate_index is None:
+            raise ValueError("forced UPDATE replay requires an exact candidate index")
+        forced_candidates[int(node_index)] = int(force_update_candidate_index)
+
+    replay_policy = _DeterministicReplayOverrides(
+        trainer.policy,
+        forced_triggers,
+        forced_candidates,
+    )
+    with torch.no_grad():
+        replay = sample_and_apply_joint_cache_uav_operation_configuration(
+            replay_policy,
+            np.asarray(transition.observation, dtype=np.float32),
+            np.asarray(transition.previous_cache_state, dtype=np.int8),
+            transition.previous_uav_positions,
+            step,
+            trainer.context,
+            PrimitiveTensorSpec.create(trainer.context),
+            deterministic=True,
+        )
+
+    expected_prefix = np.asarray(state["working_cache"], dtype=np.int8)
+    if not np.array_equal(
+        np.asarray(replay.final_cache_state, dtype=np.int8)[: int(node_index)],
+        expected_prefix[: int(node_index)],
+    ):
+        raise RuntimeError("deterministic replay changed the fixed Cache prefix")
+    replay_transition = replace(
+        transition,
+        action=np.asarray(replay.derived_action, dtype=np.int8),
+        next_cache_state=np.asarray(replay.final_cache_state, dtype=np.int8).copy(),
+        next_uav_positions={
+            key: tuple(float(value) for value in position)
+            for key, position in replay.final_uav_positions.items()
+        },
+        cache_conditional_actions=tuple(replay.cache_conditional_actions),
+        uav_conditional_actions=tuple(replay.uav_conditional_actions),
+    )
+    return _execute_cache_branch(
+        trainer,
+        replay_transition,
+        step,
+        next_step,
+        node_index,
+        state,
+        candidate,
+    )
+
+
+def _diagnostic_sign(delta: float | None, *, epsilon: float = 1.0e-10) -> str | None:
+    if delta is None:
+        return None
+    if float(delta) > float(epsilon):
+        return "UPDATE_BETTER"
+    if float(delta) < -float(epsilon):
+        return "KEEP_BETTER"
+    return "TIE"
+
+
+def evaluate_cache_trigger_causal_gate(
+    trainer: Any,
+    rollout: Any,
+    *,
+    target_transition_indices: tuple[int, ...],
+    target_node_indices: tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    """Evaluate one small full-exact Cache Trigger causal-gate batch.
+
+    Every legal UPDATE target configuration is evaluated by the current exact
+    environment branch.  The policy-consistent values use deterministic frozen
+    policy replay for later Cache heads and UAV decisions; they are not exact
+    stochastic-policy Q values.  This diagnostic is intentionally not called
+    by the PPO training path.
+    """
+
+    all_transitions = tuple(rollout.transitions)
+    selected_indices = tuple(int(index) for index in target_transition_indices)
+    if not selected_indices or len(set(selected_indices)) != len(selected_indices):
+        raise ValueError("causal-gate transition indices must be non-empty and unique")
+    if len(selected_indices) > 8:
+        raise ValueError("causal-gate diagnostic is limited to eight transitions")
+    if any(index < 0 or index >= len(all_transitions) for index in selected_indices):
+        raise IndexError("causal-gate transition index is out of range")
+
+    node_count = len(trainer.context.action_spec.cache_node_ids)
+    if target_node_indices is None:
+        node_indices = tuple(range(node_count))
+    else:
+        node_indices = tuple(int(index) for index in target_node_indices)
+        if not node_indices or len(set(node_indices)) != len(node_indices):
+            raise ValueError("causal-gate node indices must be non-empty and unique")
+        if any(index < 0 or index >= node_count for index in node_indices):
+            raise IndexError("causal-gate node index is out of range")
+    if node_count != 9:
+        raise ValueError(f"causal-gate expects the configured nine Cache heads, got {node_count}")
+    if not bool(getattr(trainer.policy, "true_binary_trigger", False)):
+        raise RuntimeError("causal-gate requires the binary KEEP/UPDATE policy")
+    if rollout.cache_candidate_features is None:
+        raise ValueError("causal-gate rollout lacks Cache candidate tensors")
+    feature_dim = int(rollout.cache_candidate_features.shape[3])
+
+    transitions = tuple(all_transitions[index] for index in selected_indices)
+    origin_start = min(int(item.origin_index) for item in transitions)
+    origin_end = max(int(item.origin_index) for item in transitions)
+    support_count = origin_end - origin_start + 1
+    if not any(
+        bool(item.done) and int(item.origin_index) == origin_end
+        for item in transitions
+    ):
+        support_count += 1
+    from .trainer import aligned_train_steps
+
+    aligned_steps = aligned_train_steps(
+        trainer.context,
+        origin_start,
+        support_count,
+        include_bootstrap_step=False,
+    )
+    steps_by_origin = {int(item.origin_index): item for item in aligned_steps}
+    rows: list[dict[str, Any]] = []
+    full_exact_update_logical_count = 0
+    full_exact_update_environment_count = 0
+    fixed_environment_count = 0
+    policy_consistent_environment_count = 0
+    started_at = time.perf_counter()
+
+    for transition_index in selected_indices:
+        transition = all_transitions[transition_index]
+        step = steps_by_origin.get(int(transition.origin_index))
+        if step is None:
+            raise RuntimeError("causal-gate replay is missing its current aligned step")
+        next_step = steps_by_origin.get(int(transition.origin_index) + 1)
+        if not bool(transition.done) and next_step is None:
+            raise RuntimeError("causal-gate replay is missing its next aligned step")
+
+        for node_index in node_indices:
+            state = _node_policy_state(
+                trainer,
+                transition,
+                step,
+                node_index,
+                feature_dim,
+            )
+            actual_action_value = (
+                int(transition.cache_operation_actions[node_index])
+                if transition.cache_operation_actions is not None
+                else int(np.asarray(transition.action, dtype=np.int8)[node_index])
+            )
+            if actual_action_value not in (0, 1):
+                raise RuntimeError("causal-gate sampled trigger is not KEEP/UPDATE")
+            actual_action = "UPDATE" if actual_action_value else "KEEP"
+            candidates = tuple(state["candidates"])
+            candidate_probabilities = np.asarray(
+                state["candidate_probabilities"], dtype=np.float64
+            )
+            if len(candidates) != len(candidate_probabilities):
+                raise RuntimeError("causal-gate candidate and policy distributions differ")
+            if len(candidates) and (
+                not np.all(np.isfinite(candidate_probabilities))
+                or np.any(candidate_probabilities < 0.0)
+                or not np.isclose(float(candidate_probabilities.sum()), 1.0)
+            ):
+                raise FloatingPointError("causal-gate candidate probabilities are invalid")
+
+            keep_branch = _execute_cache_branch(
+                trainer,
+                transition,
+                step,
+                next_step,
+                node_index,
+                state,
+                None,
+            )
+            q_keep_fixed = float(_branch_q_values(trainer, [keep_branch])[0])
+            fixed_environment_count += 1
+
+            exact_candidate_q = np.full(len(candidates), np.nan, dtype=np.float64)
+            exact_branch_by_identity: dict[
+                tuple[int, bytes, tuple[tuple[str, float, float], ...]], float
+            ] = {}
+            full_exact_update_logical_count += len(candidates)
+            for candidate_index, candidate in enumerate(candidates):
+                identity = _cache_branch_identity(
+                    transition,
+                    node_index,
+                    state,
+                    candidate,
+                )
+                exact_q = exact_branch_by_identity.get(identity)
+                if exact_q is None:
+                    branch = _execute_cache_branch(
+                        trainer,
+                        transition,
+                        step,
+                        next_step,
+                        node_index,
+                        state,
+                        candidate,
+                    )
+                    exact_q = float(_branch_q_values(trainer, [branch])[0])
+                    exact_branch_by_identity[identity] = exact_q
+                    full_exact_update_environment_count += 1
+                exact_candidate_q[candidate_index] = exact_q
+
+            selected_candidate_index: int | None = None
+            if actual_action_value == 1:
+                if transition.cache_selected_indices is not None:
+                    selected_candidate_index = int(
+                        transition.cache_selected_indices[node_index]
+                    )
+                else:
+                    stored = _production_action_map(transition)[node_index].get(
+                        "selected_index"
+                    )
+                    selected_candidate_index = None if stored is None else int(stored)
+                if selected_candidate_index is None or not (
+                    0 <= selected_candidate_index < len(candidates)
+                ):
+                    raise RuntimeError("sampled UPDATE lacks a matching legal candidate")
+                stored_target = _production_action_map(transition)[node_index].get(
+                    "target_cache"
+                )
+                if stored_target is not None and not np.array_equal(
+                    np.asarray(stored_target, dtype=np.int8),
+                    np.asarray(
+                        candidates[selected_candidate_index].target_node_cache,
+                        dtype=np.int8,
+                    ),
+                ):
+                    raise RuntimeError(
+                        "sampled UPDATE index does not identify the stored target configuration"
+                    )
+
+            policy_argmax_candidate_index: int | None = None
+            best_exact_candidate_index: int | None = None
+            q_sampled_update_fixed: float | None = None
+            q_policy_argmax_update_fixed: float | None = None
+            q_best_exact_update_fixed: float | None = None
+            delta_sampled_fixed: float | None = None
+            delta_policy_argmax_fixed: float | None = None
+            delta_best_exact_fixed: float | None = None
+            selected_rank: int | None = None
+            selected_regret: float | None = None
+            policy_argmax_rank: int | None = None
+            policy_argmax_regret: float | None = None
+            best_candidate_probability: float | None = None
+            q_keep_policy_consistent: float | None = None
+            q_best_policy_consistent: float | None = None
+            delta_best_policy_consistent: float | None = None
+
+            if len(candidates):
+                policy_argmax_candidate_index = int(np.argmax(candidate_probabilities))
+                best_exact_candidate_index = int(np.argmax(exact_candidate_q))
+                q_policy_argmax_update_fixed = float(
+                    exact_candidate_q[policy_argmax_candidate_index]
+                )
+                q_best_exact_update_fixed = float(
+                    exact_candidate_q[best_exact_candidate_index]
+                )
+                delta_policy_argmax_fixed = (
+                    q_policy_argmax_update_fixed - q_keep_fixed
+                )
+                delta_best_exact_fixed = q_best_exact_update_fixed - q_keep_fixed
+                best_candidate_probability = float(
+                    candidate_probabilities[best_exact_candidate_index]
+                )
+                max_q = float(np.max(exact_candidate_q))
+                rank_tolerance = 1.0e-10 * max(1.0, abs(max_q))
+                ranks = 1 + np.sum(
+                    exact_candidate_q[None, :]
+                    > exact_candidate_q[:, None] + rank_tolerance,
+                    axis=1,
+                )
+                policy_argmax_rank = int(ranks[policy_argmax_candidate_index])
+                policy_argmax_regret = max(
+                    0.0,
+                    max_q - float(exact_candidate_q[policy_argmax_candidate_index]),
+                )
+                if selected_candidate_index is not None:
+                    q_sampled_update_fixed = float(
+                        exact_candidate_q[selected_candidate_index]
+                    )
+                    delta_sampled_fixed = q_sampled_update_fixed - q_keep_fixed
+                    selected_rank = int(ranks[selected_candidate_index])
+                    selected_regret = max(
+                        0.0,
+                        max_q - float(exact_candidate_q[selected_candidate_index]),
+                    )
+
+                keep_policy_branch = _execute_policy_consistent_cache_branch(
+                    trainer,
+                    transition,
+                    step,
+                    next_step,
+                    node_index,
+                    state,
+                    None,
+                    force_update_candidate_index=None,
+                )
+                q_keep_policy_consistent = float(
+                    _branch_q_values(trainer, [keep_policy_branch])[0]
+                )
+                policy_consistent_environment_count += 1
+                best_policy_branch = _execute_policy_consistent_cache_branch(
+                    trainer,
+                    transition,
+                    step,
+                    next_step,
+                    node_index,
+                    state,
+                    candidates[best_exact_candidate_index],
+                    force_update_candidate_index=best_exact_candidate_index,
+                )
+                q_best_policy_consistent = float(
+                    _branch_q_values(trainer, [best_policy_branch])[0]
+                )
+                policy_consistent_environment_count += 1
+                delta_best_policy_consistent = (
+                    q_best_policy_consistent - q_keep_policy_consistent
+                )
+            else:
+                keep_policy_branch = _execute_policy_consistent_cache_branch(
+                    trainer,
+                    transition,
+                    step,
+                    next_step,
+                    node_index,
+                    state,
+                    None,
+                    force_update_candidate_index=None,
+                )
+                q_keep_policy_consistent = float(
+                    _branch_q_values(trainer, [keep_policy_branch])[0]
+                )
+                policy_consistent_environment_count += 1
+
+            node_id = str(trainer.context.action_spec.cache_node_ids[node_index])
+            rows.append(
+                {
+                    "transition_index": int(transition_index),
+                    "origin_index": int(transition.origin_index),
+                    "slot": int(transition.slot),
+                    "node_index": int(node_index),
+                    "node_id": node_id,
+                    "actual_action": actual_action,
+                    "p_keep": float(state["p_keep"]),
+                    "p_update": float(state["p_update"]),
+                    "legal_candidate_count": int(len(candidates)),
+                    "q_keep_fixed": q_keep_fixed,
+                    "q_sampled_update_fixed": q_sampled_update_fixed,
+                    "q_policy_argmax_update_fixed": q_policy_argmax_update_fixed,
+                    "q_best_exact_update_fixed": q_best_exact_update_fixed,
+                    "best_exact_candidate_index": best_exact_candidate_index,
+                    "delta_sampled_fixed": delta_sampled_fixed,
+                    "delta_policy_argmax_fixed": delta_policy_argmax_fixed,
+                    "delta_best_exact_fixed": delta_best_exact_fixed,
+                    "selected_candidate_index": selected_candidate_index,
+                    "policy_argmax_candidate_index": policy_argmax_candidate_index,
+                    "selected_candidate_exact_rank": selected_rank,
+                    "policy_argmax_candidate_exact_rank": policy_argmax_rank,
+                    "selected_candidate_exact_regret": selected_regret,
+                    "policy_argmax_candidate_exact_regret": policy_argmax_regret,
+                    "best_exact_candidate_policy_probability": best_candidate_probability,
+                    "q_keep_policy_consistent": q_keep_policy_consistent,
+                    "q_best_update_policy_consistent": q_best_policy_consistent,
+                    "delta_best_policy_consistent": delta_best_policy_consistent,
+                    "fixed_downstream_sign": _diagnostic_sign(delta_best_exact_fixed),
+                    "policy_consistent_sign": _diagnostic_sign(
+                        delta_best_policy_consistent
+                    ),
+                    "downstream_sign_flip": (
+                        _diagnostic_sign(delta_best_exact_fixed)
+                        != _diagnostic_sign(delta_best_policy_consistent)
+                        if delta_best_policy_consistent is not None
+                        else None
+                    ),
+                    "delta_sampled_sign": _diagnostic_sign(delta_sampled_fixed),
+                    "delta_policy_argmax_sign": _diagnostic_sign(
+                        delta_policy_argmax_fixed
+                    ),
+                    "delta_best_exact_sign": _diagnostic_sign(delta_best_exact_fixed),
+                    "cache_changed": bool(
+                        not np.array_equal(
+                            transition.previous_cache_state[node_index],
+                            transition.next_cache_state[node_index],
+                        )
+                    ),
+                }
+            )
+
+    runtime_seconds = float(time.perf_counter() - started_at)
+    return {
+        "policy_consistent_mode": "DETERMINISTIC_FROZEN_POLICY_REPLAY",
+        "q_definition": "Q_UPDATE_MINUS_Q_KEEP",
+        "target_transition_indices": list(selected_indices),
+        "target_node_indices": list(node_indices),
+        "rows": rows,
+        "full_exact_update_logical_configurations": int(
+            full_exact_update_logical_count
+        ),
+        "full_exact_update_environment_branches": int(
+            full_exact_update_environment_count
+        ),
+        "fixed_downstream_environment_branches": int(fixed_environment_count),
+        "policy_consistent_environment_branches": int(
+            policy_consistent_environment_count
+        ),
+        "runtime_seconds": runtime_seconds,
     }
 
 
