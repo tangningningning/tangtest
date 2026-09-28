@@ -105,19 +105,13 @@ class SimpleTransition:
     uav_operation_entropies: np.ndarray | None = None
     uav_operation_probabilities: np.ndarray | None = None
     uav_operation_logit_margins: np.ndarray | None = None
-    # V3 Cache Trigger-only pre-decision features are frozen behavior-policy
+    # Cache Trigger-only pre-decision workload is frozen behavior-policy
     # snapshots. PPO consumes these arrays verbatim across all update epochs.
     cache_trigger_node_local_workload: np.ndarray | None = None
-    cache_trigger_candidate_summary: np.ndarray | None = None
     cache_trigger_aux: np.ndarray | None = None
-    cache_trigger_legal_candidate_counts: np.ndarray | None = None
+    cache_trigger_has_legal_target: np.ndarray | None = None
     cache_trigger_node_local_workload_norms: np.ndarray | None = None
-    cache_trigger_candidate_summary_norms: np.ndarray | None = None
     cache_trigger_aux_norms: np.ndarray | None = None
-    cache_trigger_mean_loaded_mb: np.ndarray | None = None
-    cache_trigger_mean_cache_cost: np.ndarray | None = None
-    cache_trigger_mean_predicted_demand_gain: np.ndarray | None = None
-    pre_trigger_and_execution_candidate_logit_max_diff: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -155,16 +149,10 @@ class SimpleRollout:
     cache_old_log_probs: np.ndarray | None = None
     uav_old_log_probs: np.ndarray | None = None
     cache_trigger_node_local_workload: np.ndarray | None = None
-    cache_trigger_candidate_summary: np.ndarray | None = None
     cache_trigger_aux: np.ndarray | None = None
-    cache_trigger_legal_candidate_counts: np.ndarray | None = None
+    cache_trigger_has_legal_target: np.ndarray | None = None
     cache_trigger_node_local_workload_norms: np.ndarray | None = None
-    cache_trigger_candidate_summary_norms: np.ndarray | None = None
     cache_trigger_aux_norms: np.ndarray | None = None
-    cache_trigger_mean_loaded_mb: np.ndarray | None = None
-    cache_trigger_mean_cache_cost: np.ndarray | None = None
-    cache_trigger_mean_predicted_demand_gain: np.ndarray | None = None
-    pre_trigger_and_execution_candidate_logit_max_diff: float = 0.0
 
 
 def _observation(
@@ -478,16 +466,10 @@ def collect_rollout(
         cache_candidate_counts = np.zeros(tensor_spec.num_cache_heads, dtype=np.int64)
         uav_candidate_counts = np.zeros(tensor_spec.num_uav_heads, dtype=np.int64)
         cache_trigger_node_local_workload: np.ndarray | None = None
-        cache_trigger_candidate_summary: np.ndarray | None = None
         cache_trigger_aux: np.ndarray | None = None
-        cache_trigger_legal_candidate_counts: np.ndarray | None = None
+        cache_trigger_has_legal_target: np.ndarray | None = None
         cache_trigger_node_local_workload_norms: np.ndarray | None = None
-        cache_trigger_candidate_summary_norms: np.ndarray | None = None
         cache_trigger_aux_norms: np.ndarray | None = None
-        cache_trigger_mean_loaded_mb: np.ndarray | None = None
-        cache_trigger_mean_cache_cost: np.ndarray | None = None
-        cache_trigger_mean_predicted_demand_gain: np.ndarray | None = None
-        pre_trigger_candidate_logit_max_diff = 0.0
         cache_operation_actions: np.ndarray | None = None
         cache_operation_masks: np.ndarray | None = None
         cache_operation_log_probs: np.ndarray | None = None
@@ -517,32 +499,14 @@ def collect_rollout(
             cache_trigger_node_local_workload = (
                 joint_primitive.cache_trigger_node_local_workload
             )
-            cache_trigger_candidate_summary = (
-                joint_primitive.cache_trigger_candidate_summary
-            )
             cache_trigger_aux = joint_primitive.cache_trigger_aux
-            cache_trigger_legal_candidate_counts = (
-                joint_primitive.cache_trigger_legal_candidate_counts
+            cache_trigger_has_legal_target = (
+                joint_primitive.cache_trigger_has_legal_target
             )
             cache_trigger_node_local_workload_norms = (
                 joint_primitive.cache_trigger_node_local_workload_norms
             )
-            cache_trigger_candidate_summary_norms = (
-                joint_primitive.cache_trigger_candidate_summary_norms
-            )
             cache_trigger_aux_norms = joint_primitive.cache_trigger_aux_norms
-            cache_trigger_mean_loaded_mb = (
-                joint_primitive.cache_trigger_mean_loaded_mb
-            )
-            cache_trigger_mean_cache_cost = (
-                joint_primitive.cache_trigger_mean_cache_cost
-            )
-            cache_trigger_mean_predicted_demand_gain = (
-                joint_primitive.cache_trigger_mean_predicted_demand_gain
-            )
-            pre_trigger_candidate_logit_max_diff = (
-                joint_primitive.pre_trigger_and_execution_candidate_logit_max_diff
-            )
             uav_contexts = joint_primitive.uav_contexts
             uav_candidate_features = joint_primitive.uav_candidate_features
             uav_candidate_masks = joint_primitive.uav_candidate_masks
@@ -812,53 +776,25 @@ def collect_rollout(
                     if cache_trigger_node_local_workload is None
                     else _snapshot_trigger_feature(cache_trigger_node_local_workload)
                 ),
-                cache_trigger_candidate_summary=(
-                    None
-                    if cache_trigger_candidate_summary is None
-                    else _snapshot_trigger_feature(cache_trigger_candidate_summary)
-                ),
                 cache_trigger_aux=(
                     None
                     if cache_trigger_aux is None
                     else _snapshot_trigger_feature(cache_trigger_aux)
                 ),
-                cache_trigger_legal_candidate_counts=(
+                cache_trigger_has_legal_target=(
                     None
-                    if cache_trigger_legal_candidate_counts is None
-                    else cache_trigger_legal_candidate_counts.copy()
+                    if cache_trigger_has_legal_target is None
+                    else cache_trigger_has_legal_target.copy()
                 ),
                 cache_trigger_node_local_workload_norms=(
                     None
                     if cache_trigger_node_local_workload_norms is None
                     else cache_trigger_node_local_workload_norms.copy()
                 ),
-                cache_trigger_candidate_summary_norms=(
-                    None
-                    if cache_trigger_candidate_summary_norms is None
-                    else cache_trigger_candidate_summary_norms.copy()
-                ),
                 cache_trigger_aux_norms=(
                     None
                     if cache_trigger_aux_norms is None
                     else cache_trigger_aux_norms.copy()
-                ),
-                cache_trigger_mean_loaded_mb=(
-                    None
-                    if cache_trigger_mean_loaded_mb is None
-                    else cache_trigger_mean_loaded_mb.copy()
-                ),
-                cache_trigger_mean_cache_cost=(
-                    None
-                    if cache_trigger_mean_cache_cost is None
-                    else cache_trigger_mean_cache_cost.copy()
-                ),
-                cache_trigger_mean_predicted_demand_gain=(
-                    None
-                    if cache_trigger_mean_predicted_demand_gain is None
-                    else cache_trigger_mean_predicted_demand_gain.copy()
-                ),
-                pre_trigger_and_execution_candidate_logit_max_diff=(
-                    float(pre_trigger_candidate_logit_max_diff)
                 ),
             )
         )
@@ -899,26 +835,17 @@ def collect_rollout(
     stored_trigger_workload = stack_optional_transition_field(
         "cache_trigger_node_local_workload", np.float32
     )
-    stored_candidate_summary = stack_optional_transition_field(
-        "cache_trigger_candidate_summary", np.float32
-    )
     stored_trigger_aux = stack_optional_transition_field(
         "cache_trigger_aux", np.float32
     )
     if stored_trigger_aux is not None:
-        if stored_trigger_workload is None or stored_candidate_summary is None:
-            raise RuntimeError("V3 rollout Trigger auxiliary components are incomplete")
-        expected_trigger_aux = np.concatenate(
-            [
-                stored_trigger_workload.reshape(
-                    len(transitions), stored_trigger_workload.shape[1], -1
-                ),
-                stored_candidate_summary,
-            ],
-            axis=-1,
+        if stored_trigger_workload is None:
+            raise RuntimeError("Trigger workload snapshot is missing")
+        expected_trigger_aux = stored_trigger_workload.reshape(
+            len(transitions), stored_trigger_workload.shape[1], -1
         ).astype(np.float32, copy=False)
         if not np.array_equal(stored_trigger_aux, expected_trigger_aux):
-            raise RuntimeError("stored V3 Trigger auxiliary differs from its frozen parts")
+            raise RuntimeError("stored Trigger auxiliary differs from workload snapshot")
 
     return SimpleRollout(
         transitions=tuple(transitions),
@@ -1015,32 +942,15 @@ def collect_rollout(
             [item.uav_old_log_probs for item in transitions]
         ).astype(np.float32),
         cache_trigger_node_local_workload=stored_trigger_workload,
-        cache_trigger_candidate_summary=stored_candidate_summary,
         cache_trigger_aux=stored_trigger_aux,
-        cache_trigger_legal_candidate_counts=stack_optional_transition_field(
-            "cache_trigger_legal_candidate_counts", np.int64
+        cache_trigger_has_legal_target=stack_optional_transition_field(
+            "cache_trigger_has_legal_target", bool
         ),
         cache_trigger_node_local_workload_norms=stack_optional_transition_field(
             "cache_trigger_node_local_workload_norms", np.float32
         ),
-        cache_trigger_candidate_summary_norms=stack_optional_transition_field(
-            "cache_trigger_candidate_summary_norms", np.float32
-        ),
         cache_trigger_aux_norms=stack_optional_transition_field(
             "cache_trigger_aux_norms", np.float32
-        ),
-        cache_trigger_mean_loaded_mb=stack_optional_transition_field(
-            "cache_trigger_mean_loaded_mb", np.float32
-        ),
-        cache_trigger_mean_cache_cost=stack_optional_transition_field(
-            "cache_trigger_mean_cache_cost", np.float32
-        ),
-        cache_trigger_mean_predicted_demand_gain=stack_optional_transition_field(
-            "cache_trigger_mean_predicted_demand_gain", np.float32
-        ),
-        pre_trigger_and_execution_candidate_logit_max_diff=max(
-            float(item.pre_trigger_and_execution_candidate_logit_max_diff)
-            for item in transitions
         ),
     )
 

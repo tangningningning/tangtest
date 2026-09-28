@@ -69,17 +69,24 @@ def _parameter_hashes(trainer: PPOV2Trainer) -> dict[str, str | None]:
         raise RuntimeError("proposed policy did not initialize its Cache surrogate")
     surrogate_values = list(surrogate.state_dict().items())
 
-    candidate_encoder = getattr(policy, "uav_candidate_encoder", None)
-    candidate_values = (
-        None if candidate_encoder is None else list(candidate_encoder.state_dict().items())
-    )
+    component_modules = {
+        "cache_trigger_encoder": policy.cache_trigger_encoder,
+        "cache_candidate_encoder": policy.cache_candidate_encoder,
+        "cache_trigger_head": policy.cache_trigger_head,
+        "cache_candidate_scorer": policy.cache_candidate_scorer,
+        "uav_operation_encoder": policy.uav_encoder,
+        "uav_operation_head": policy.uav_operation_head,
+        "uav_candidate_encoder": policy.uav_candidate_encoder,
+        "uav_candidate_scorer": policy.uav_candidate_scorer,
+    }
     return {
         "actor_sha256": _hash_tensors(actor_values),
         "critic_sha256": _hash_tensors(critic_values),
         "cache_surrogate_sha256": _hash_tensors(surrogate_values),
-        "uav_candidate_encoder_sha256": (
-            None if candidate_values is None else _hash_tensors(candidate_values)
-        ),
+        **{
+            f"{name}_sha256": _hash_tensors(list(module.state_dict().items()))
+            for name, module in component_modules.items()
+        },
     }
 
 
@@ -175,7 +182,12 @@ def run_one_epoch_runner(
             "optimizer_steps": int(trainer.optimizer_steps),
             "actor_optimizer_steps": int(trainer.actor_optimizer_steps),
             "critic_optimizer_steps": int(trainer.critic_optimizer_steps),
-            "cache_optimizer_steps": int(trainer.cache_optimizer_steps),
+            "cache_trigger_optimizer_steps": int(
+                trainer.cache_trigger_optimizer_steps
+            ),
+            "cache_candidate_optimizer_steps": int(
+                trainer.cache_candidate_optimizer_steps
+            ),
             "uav_operation_optimizer_steps": int(
                 trainer.uav_operation_optimizer_steps
             ),

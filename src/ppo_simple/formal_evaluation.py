@@ -29,7 +29,7 @@ from .trainer import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SPLIT_MANIFEST = PROJECT_ROOT / "environment_data" / "data_split_manifest.json"
-REQUIRED_ARCHITECTURE_VERSION = 5
+REQUIRED_ARCHITECTURE_VERSION = 6
 SELECTION_METRIC = "mean_episode_return"
 
 

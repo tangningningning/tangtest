@@ -1739,6 +1739,43 @@ class CacheTargetCandidate:
     proposal_source: str
 
 
+def has_legal_cache_target_configuration(
+    current_cache_state: np.ndarray,
+    node_index: int,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+) -> bool:
+    """Return whether one different capacity-feasible binary target exists.
+
+    This is the cheap online Trigger mask check.  It is linear in the number
+    of services and deliberately does not enumerate targets, inspect demand,
+    call the surrogate, or evaluate the environment.  For a non-empty
+    feasible row, removing any cached service is legal.  For an empty row, a
+    different target exists exactly when at least one service fits.
+    """
+
+    raw_cache = np.asarray(current_cache_state)
+    service_count = int(service_catalog["num_services"])
+    node_count = len(cache_nodes["node_ids"])
+    if raw_cache.shape != (node_count, service_count):
+        raise ValueError("cache state shape does not match nodes/services")
+    index = int(node_index)
+    if index < 0 or index >= node_count:
+        raise IndexError("cache target node_index 越界")
+    before = np.asarray(raw_cache[index])
+    if not np.all(np.isin(before, [0, 1])):
+        raise ValueError("cache target row must be binary")
+    if bool(np.any(before)):
+        return True
+    sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
+    if sizes.shape != before.shape or not np.all(np.isfinite(sizes)):
+        raise ValueError("service sizes are not finite or shape-aligned")
+    capacity = float(cache_nodes["capacities_mb"][index])
+    if not math.isfinite(capacity) or capacity < 0.0:
+        raise ValueError("cache capacity must be finite and non-negative")
+    return bool(np.any(sizes <= capacity + 1.0e-9))
+
+
 def _greedy_target_configuration(
     scores: np.ndarray,
     service_sizes_mb: np.ndarray,

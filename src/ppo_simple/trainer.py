@@ -95,9 +95,9 @@ POPART_CHECKPOINT_VERSION = 6
 CACHE_ONLY_CHECKPOINT_VERSION = 7
 REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
-# Full-information Cache Trigger/Candidate teachers change the actor objective;
-# proposed-joint checkpoints from earlier Cache objectives cannot be resumed.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 22
+# Trigger-first execution, split Cache encoders/optimizers, and the rollout
+# snapshot schema make every earlier proposed-joint checkpoint incompatible.
+JOINT_PROPOSED_CHECKPOINT_VERSION = 23
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
@@ -4284,10 +4284,12 @@ class PPOV2Trainer:
         self.optimizer_steps = 0
         self.actor_optimizer_steps = 0
         self.critic_optimizer_steps = 0
-        self.cache_optimizer = None
+        self.cache_trigger_optimizer = None
+        self.cache_candidate_optimizer = None
         self.uav_operation_optimizer = None
         self.uav_candidate_optimizer = None
-        self.cache_optimizer_steps = 0
+        self.cache_trigger_optimizer_steps = 0
+        self.cache_candidate_optimizer_steps = 0
         self.uav_operation_optimizer_steps = 0
         self.uav_candidate_optimizer_steps = 0
         self.proposed_actor_parameter_groups: dict[str, tuple[Any, ...]] | None = None
@@ -4314,10 +4316,15 @@ class PPOV2Trainer:
                 if group_builder is None:
                     raise TypeError("proposed policy lacks branch parameter groups")
                 branch_groups = group_builder()
-                expected_groups = {"cache", "uav_operation", "uav_candidate"}
+                expected_groups = {
+                    "cache_trigger",
+                    "cache_candidate",
+                    "uav_operation",
+                    "uav_candidate",
+                }
                 if set(branch_groups) != expected_groups:
                     raise RuntimeError(
-                        "proposed policy optimizer groups must be Cache, UAV Operation, and UAV Candidate"
+                        "proposed policy optimizer groups must be Cache Trigger, Cache Candidate, UAV Operation, and UAV Candidate"
                     )
                 self.proposed_actor_parameter_groups = branch_groups
                 branch_ids: set[int] = set()
@@ -4335,8 +4342,11 @@ class PPOV2Trainer:
                         "proposed branch optimizer groups do not cover all actor parameters"
                     )
                 self.actor_optimizer = None
-                self.cache_optimizer = torch.optim.Adam(
-                    branch_groups["cache"], lr=self.cache_learning_rate
+                self.cache_trigger_optimizer = torch.optim.Adam(
+                    branch_groups["cache_trigger"], lr=self.cache_learning_rate
+                )
+                self.cache_candidate_optimizer = torch.optim.Adam(
+                    branch_groups["cache_candidate"], lr=self.cache_learning_rate
                 )
                 self.uav_operation_optimizer = torch.optim.Adam(
                     branch_groups["uav_operation"],
@@ -4422,6 +4432,12 @@ class PPOV2Trainer:
         if self.policy.architecture_id not in PROPOSED_POLICY_SCHEMAS:
             return {}
         return {
+            "CACHE_TRIGGER_EXECUTION_ORDER": "TRIGGER_FIRST",
+            "CACHE_TRIGGER_INPUT": "STATE_PLUS_NODE_LOCAL_WORKLOAD",
+            "CACHE_TRIGGER_USES_CANDIDATE_SUMMARY": "NO",
+            "CACHE_CANDIDATE_EXECUTION_CONDITIONAL_ON_UPDATE": "YES",
+            "CACHE_TRIGGER_CANDIDATE_ENCODER_SHARED": "NO",
+            "CACHE_TRIGGER_CANDIDATE_OPTIMIZER_SHARED": "NO",
             "CACHE_TRIGGER_CREDIT_SOURCE": CACHE_TRIGGER_CREDIT_SOURCE,
             "CACHE_CANDIDATE_CREDIT_SOURCE": CACHE_CANDIDATE_CREDIT_SOURCE,
             "CACHE_VALUE_EVALUATOR": "HYBRID_EXACT_SURROGATE",
@@ -4965,6 +4981,77 @@ class PPOV2Trainer:
         if not math.isfinite(value):
             raise FloatingPointError("Cache full-distribution KL is non-finite")
         return value
+
+    def _evaluate_cache_component_kls(
+        self,
+        *,
+        cache_contexts: Any,
+        cache_trigger_aux: Any,
+        operation_masks: Any,
+        candidate_features: Any,
+        candidate_valid_mask: Any,
+        frozen_candidate_kl_mask: Any,
+        old_operation_log_probs: Any,
+        old_candidate_log_probs: Any,
+    ) -> tuple[float, float]:
+        """Measure Trigger and conditional Candidate KL independently."""
+
+        with torch.no_grad():
+            masks = torch.as_tensor(operation_masks, dtype=torch.bool, device=self.device)
+            old_trigger = torch.as_tensor(
+                old_operation_log_probs, dtype=torch.float32, device=self.device
+            )
+            new_trigger = self._cache_trigger_log_probabilities_all(
+                cache_contexts, masks, cache_trigger_aux
+            )
+            trigger_probabilities = torch.where(
+                masks, torch.exp(old_trigger), torch.zeros_like(old_trigger)
+            )
+            trigger_kl = torch.sum(
+                torch.where(
+                    masks,
+                    trigger_probabilities * (old_trigger - new_trigger),
+                    torch.zeros_like(old_trigger),
+                ),
+                dim=-1,
+            ).mean()
+
+            new_candidate, current_mask = self._cache_full_candidate_log_probs(
+                cache_contexts=cache_contexts,
+                candidate_features=candidate_features,
+                candidate_valid_mask=candidate_valid_mask,
+            )
+            frozen_mask = torch.as_tensor(
+                frozen_candidate_kl_mask, dtype=torch.bool, device=self.device
+            )
+            if not torch.equal(current_mask, frozen_mask):
+                raise RuntimeError("Cache candidate KL mask changed during evaluation")
+            old_candidate = torch.as_tensor(
+                old_candidate_log_probs, dtype=torch.float32, device=self.device
+            )
+            candidate_probabilities = torch.where(
+                frozen_mask,
+                torch.exp(old_candidate),
+                torch.zeros_like(old_candidate),
+            )
+            per_head_candidate_kl = torch.sum(
+                torch.where(
+                    frozen_mask,
+                    candidate_probabilities * (old_candidate - new_candidate),
+                    torch.zeros_like(old_candidate),
+                ),
+                dim=-1,
+            )
+            active = frozen_mask.any(dim=-1)
+            candidate_kl = (
+                per_head_candidate_kl[active].mean()
+                if bool(torch.any(active).item())
+                else per_head_candidate_kl.sum() * 0.0
+            )
+        values = (float(trigger_kl.cpu()), float(candidate_kl.cpu()))
+        if not all(math.isfinite(value) for value in values):
+            raise FloatingPointError("Cache component KL is non-finite")
+        return values
 
     def _evaluate_uav_branch_approx_kl_full_rollout(
         self,
@@ -6486,22 +6573,17 @@ class PPOV2Trainer:
         if isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic):
             trigger_snapshot_fields = (
                 rollout.cache_trigger_node_local_workload,
-                rollout.cache_trigger_candidate_summary,
                 rollout.cache_trigger_aux,
-                rollout.cache_trigger_legal_candidate_counts,
+                rollout.cache_trigger_has_legal_target,
                 rollout.cache_trigger_node_local_workload_norms,
-                rollout.cache_trigger_candidate_summary_norms,
                 rollout.cache_trigger_aux_norms,
             )
             if any(value is None for value in trigger_snapshot_fields):
                 raise RuntimeError(
-                    "V3 rollout is missing detached Cache Trigger auxiliary snapshots"
+                    "rollout is missing detached Cache Trigger workload snapshots"
                 )
             workload_snapshot = np.asarray(
                 rollout.cache_trigger_node_local_workload, dtype=np.float32
-            )
-            candidate_summary_snapshot = np.asarray(
-                rollout.cache_trigger_candidate_summary, dtype=np.float32
             )
             trigger_aux_snapshot = np.asarray(
                 rollout.cache_trigger_aux, dtype=np.float32
@@ -6509,32 +6591,19 @@ class PPOV2Trainer:
             if workload_snapshot.shape[:2] != (
                 len(rollout.transitions),
                 self.policy.num_cache_heads,
-            ) or candidate_summary_snapshot.shape[:2] != (
-                len(rollout.transitions),
-                self.policy.num_cache_heads,
             ):
-                raise RuntimeError("V3 rollout Trigger snapshot head dimensions mismatch")
-            expected_trigger_aux = np.concatenate(
-                [
-                    workload_snapshot.reshape(
-                        len(rollout.transitions), self.policy.num_cache_heads, -1
-                    ),
-                    candidate_summary_snapshot,
-                ],
-                axis=-1,
+                raise RuntimeError("rollout Trigger workload head dimensions mismatch")
+            expected_trigger_aux = workload_snapshot.reshape(
+                len(rollout.transitions), self.policy.num_cache_heads, -1
             ).astype(np.float32, copy=False)
             if trigger_aux_snapshot.shape != expected_trigger_aux.shape or not np.array_equal(
                 trigger_aux_snapshot, expected_trigger_aux
             ):
                 raise RuntimeError(
-                    "V3 rollout Trigger auxiliary drifted from its stored components"
+                    "rollout Trigger auxiliary drifted from stored workload"
                 )
             if not np.all(np.isfinite(trigger_aux_snapshot)):
                 raise FloatingPointError("stored V3 Trigger auxiliary is non-finite")
-            if float(rollout.pre_trigger_and_execution_candidate_logit_max_diff) > 1.0e-7:
-                raise RuntimeError(
-                    "rollout pre-trigger/execution candidate logits exceeded tolerance"
-                )
             cache_trigger_aux = torch.as_tensor(
                 trigger_aux_snapshot.copy(),
                 dtype=torch.float32,
@@ -7265,7 +7334,10 @@ class PPOV2Trainer:
         actor_gradient_clipping_parameter_groups: dict[str, tuple[Any, ...]] | None = None
         kl_early_stop_triggered = False
         ppo_update_epochs_executed = 0
-        cache_optimizer_steps_at_update_start = int(self.cache_optimizer_steps)
+        cache_optimizer_steps_at_update_start = int(
+            self.cache_trigger_optimizer_steps
+            + self.cache_candidate_optimizer_steps
+        )
         uav_operation_optimizer_steps_at_update_start = int(
             self.uav_operation_optimizer_steps
         )
@@ -7346,7 +7418,8 @@ class PPOV2Trainer:
                 if any(
                     optimizer is None
                     for optimizer in (
-                        self.cache_optimizer,
+                        self.cache_trigger_optimizer,
+                        self.cache_candidate_optimizer,
                         self.uav_operation_optimizer,
                         self.uav_candidate_optimizer,
                     )
@@ -7567,6 +7640,8 @@ class PPOV2Trainer:
                 branch_policy_loss = None
                 cache_branch_policy_loss = None
                 uav_branch_policy_loss = None
+                cache_trigger_actor_loss = None
+                cache_candidate_actor_loss = None
                 if branch_diagnostics_enabled:
                     if (
                         evaluation.cache_log_prob is None
@@ -7711,11 +7786,48 @@ class PPOV2Trainer:
                             candidate_teacher,
                             candidate_valid,
                         )
+                        safe_trigger_log_probabilities = torch.where(
+                            trigger_valid_actions,
+                            trigger_log_probabilities,
+                            torch.zeros_like(trigger_log_probabilities),
+                        )
+                        trigger_entropy_component = -torch.sum(
+                            torch.where(
+                                trigger_valid_actions,
+                                torch.exp(safe_trigger_log_probabilities)
+                                * safe_trigger_log_probabilities,
+                                torch.zeros_like(safe_trigger_log_probabilities),
+                            ),
+                            dim=(-1, -2),
+                        ).mean()
+                        candidate_log_probabilities = torch.log(
+                            candidate_student_probabilities.clamp_min(1.0e-12)
+                        )
+                        candidate_entropy_component = -torch.sum(
+                            torch.where(
+                                candidate_valid,
+                                candidate_student_probabilities
+                                * candidate_log_probabilities,
+                                torch.zeros_like(candidate_log_probabilities),
+                            ),
+                            dim=(-1, -2),
+                        ).mean()
+                        cache_trigger_actor_loss = (
+                            trigger_policy_loss
+                            - hyper.entropy_coefficient * trigger_entropy_component
+                        )
+                        cache_candidate_actor_loss = (
+                            candidate_policy_loss
+                            - hyper.entropy_coefficient * candidate_entropy_component
+                        )
                         if bool(torch.any(candidate_valid.any(dim=-1)).item()):
                             cache_candidate_policy_loss_values.append(
                                 float(candidate_policy_loss.detach().cpu())
                             )
-                        cache_branch_policy_loss = 0.5 * (
+                        # Trigger and Candidate keep their full-scale teacher
+                        # objectives and are backpropagated through separate
+                        # parameter graphs below.
+                        cache_branch_policy_loss = (
                             trigger_policy_loss + candidate_policy_loss
                         )
                         branch_metric_tensors += (
@@ -7866,7 +7978,7 @@ class PPOV2Trainer:
                                 if cache_active_this_minibatch:
                                     branch_policy_loss = (
                                         branch_policy_loss
-                                        + 0.5 * cache_branch_policy_loss
+                                        + cache_branch_policy_loss
                                     )
                                 if (
                                     uav_operation_active_this_minibatch
@@ -7876,7 +7988,7 @@ class PPOV2Trainer:
                                         branch_policy_loss + uav_branch_policy_loss
                                     )
                             else:
-                                branch_policy_loss = 0.5 * (
+                                branch_policy_loss = (
                                     cache_branch_policy_loss + uav_branch_policy_loss
                                 )
                         else:
@@ -7900,7 +8012,7 @@ class PPOV2Trainer:
                                     uav_active=uav_active_this_minibatch,
                                 )
                             else:
-                                branch_policy_loss = 0.5 * (
+                                branch_policy_loss = (
                                     cache_branch_policy_loss + uav_branch_policy_loss
                                 )
                         branch_metric_tensors += (
@@ -8028,16 +8140,47 @@ class PPOV2Trainer:
                     # Clear every active optimizer before the actor backward.
                     self.critic_optimizer.zero_grad(set_to_none=True)
                     if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
-                        assert self.cache_optimizer is not None
+                        assert self.cache_trigger_optimizer is not None
+                        assert self.cache_candidate_optimizer is not None
                         assert self.uav_operation_optimizer is not None
                         assert self.uav_candidate_optimizer is not None
-                        self.cache_optimizer.zero_grad(set_to_none=True)
+                        self.cache_trigger_optimizer.zero_grad(set_to_none=True)
+                        self.cache_candidate_optimizer.zero_grad(set_to_none=True)
                         self.uav_operation_optimizer.zero_grad(set_to_none=True)
                         self.uav_candidate_optimizer.zero_grad(set_to_none=True)
                     else:
                         assert self.actor_optimizer is not None
                         self.actor_optimizer.zero_grad(set_to_none=True)
-                    actor_loss.backward()
+                    if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                        backward_losses: list[Any] = []
+                        if cache_active_this_minibatch:
+                            if (
+                                cache_trigger_actor_loss is None
+                                or cache_candidate_actor_loss is None
+                            ):
+                                raise RuntimeError(
+                                    "separate Cache actor losses are unavailable"
+                                )
+                            backward_losses.extend(
+                                [cache_trigger_actor_loss, cache_candidate_actor_loss]
+                            )
+                        if (
+                            uav_operation_active_this_minibatch
+                            or uav_candidate_active_this_minibatch
+                        ):
+                            if uav_branch_policy_loss is None:
+                                raise RuntimeError("UAV actor loss is unavailable")
+                            backward_losses.append(
+                                uav_branch_policy_loss
+                                - hyper.entropy_coefficient
+                                * evaluation.uav_entropy.mean()
+                            )
+                        for loss_index, component_loss in enumerate(backward_losses):
+                            component_loss.backward(
+                                retain_graph=loss_index < len(backward_losses) - 1
+                            )
+                    else:
+                        actor_loss.backward()
                     if branch_specific_kl_gate_enabled:
                         if branch_gradient_parameter_groups is None:
                             raise RuntimeError(
@@ -8053,7 +8196,8 @@ class PPOV2Trainer:
                         if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
                             assert branch_gradient_parameter_groups is not None
                             active_by_branch = {
-                                "cache": cache_active_this_minibatch,
+                                "cache_trigger": cache_active_this_minibatch,
+                                "cache_candidate": cache_active_this_minibatch,
                                 "uav_operation": uav_operation_active_this_minibatch,
                                 "uav_candidate": uav_candidate_active_this_minibatch,
                             }
@@ -8105,14 +8249,21 @@ class PPOV2Trainer:
                                 "Joint Cache/UAV branch gradient groups are unavailable"
                             )
                         if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
-                            cache_head_gradient_norm_value = _gradient_group_norm(
-                                branch_gradient_parameter_groups["cache"]
+                            cache_trigger_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["cache_trigger"]
+                            )
+                            cache_candidate_gradient_norm_value = _gradient_group_norm(
+                                branch_gradient_parameter_groups["cache_candidate"]
+                            )
+                            cache_head_gradient_norm_value = math.hypot(
+                                cache_trigger_gradient_norm_value,
+                                cache_candidate_gradient_norm_value,
                             )
                             uav_head_gradient_norm_value = _gradient_group_norm(
                                 branch_gradient_parameter_groups["uav_operation"]
                             )
                             shared_actor_gradient_norm_value = 0.0
-                            cache_encoder_gradient_norm_value = cache_head_gradient_norm_value
+                            cache_encoder_gradient_norm_value = cache_trigger_gradient_norm_value
                             uav_encoder_gradient_norm_value = uav_head_gradient_norm_value
                             uav_candidate_encoder_gradient_norm_value = _gradient_group_norm(
                                 branch_gradient_parameter_groups["uav_candidate"]
@@ -8215,7 +8366,8 @@ class PPOV2Trainer:
                             assert branch_gradient_parameter_groups is not None
                             proposed_gradient_norms: dict[str, float] = {}
                             proposed_active = {
-                                "cache": cache_active_this_minibatch,
+                                "cache_trigger": cache_active_this_minibatch,
+                                "cache_candidate": cache_active_this_minibatch,
                                 "uav_operation": uav_operation_active_this_minibatch,
                                 "uav_candidate": uav_candidate_active_this_minibatch,
                             }
@@ -8234,7 +8386,10 @@ class PPOV2Trainer:
                                     else 0.0
                                 )
                                 proposed_gradient_norms[branch_name] = norm_before_clip
-                            cache_norm = proposed_gradient_norms["cache"]
+                            cache_norm = math.hypot(
+                                proposed_gradient_norms["cache_trigger"],
+                                proposed_gradient_norms["cache_candidate"],
+                            )
                             operation_norm = proposed_gradient_norms["uav_operation"]
                             candidate_norm = proposed_gradient_norms["uav_candidate"]
                             cache_actor_grad_norm_preclip_epoch_values.append(
@@ -8277,12 +8432,15 @@ class PPOV2Trainer:
                                 "PPO v5 actor gradient norm 非 finite。"
                             )
                         if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
-                            assert self.cache_optimizer is not None
+                            assert self.cache_trigger_optimizer is not None
+                            assert self.cache_candidate_optimizer is not None
                             assert self.uav_operation_optimizer is not None
                             assert self.uav_candidate_optimizer is not None
                             if cache_active_this_minibatch:
-                                self.cache_optimizer.step()
-                                self.cache_optimizer_steps += 1
+                                self.cache_trigger_optimizer.step()
+                                self.cache_candidate_optimizer.step()
+                                self.cache_trigger_optimizer_steps += 1
+                                self.cache_candidate_optimizer_steps += 1
                             if uav_operation_active_this_minibatch:
                                 self.uav_operation_optimizer.step()
                                 self.uav_operation_optimizer_steps += 1
@@ -8290,7 +8448,8 @@ class PPOV2Trainer:
                                 self.uav_candidate_optimizer.step()
                                 self.uav_candidate_optimizer_steps += 1
                             self.actor_optimizer_steps = (
-                                self.cache_optimizer_steps
+                                self.cache_trigger_optimizer_steps
+                                + self.cache_candidate_optimizer_steps
                                 + self.uav_operation_optimizer_steps
                                 + self.uav_candidate_optimizer_steps
                             )
@@ -8446,10 +8605,12 @@ class PPOV2Trainer:
                                 candidate_probabilities_after_step.detach().clone()
                             )
                     if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
-                        assert self.cache_optimizer is not None
+                        assert self.cache_trigger_optimizer is not None
+                        assert self.cache_candidate_optimizer is not None
                         assert self.uav_operation_optimizer is not None
                         assert self.uav_candidate_optimizer is not None
-                        self.cache_optimizer.zero_grad(set_to_none=True)
+                        self.cache_trigger_optimizer.zero_grad(set_to_none=True)
+                        self.cache_candidate_optimizer.zero_grad(set_to_none=True)
                         self.uav_operation_optimizer.zero_grad(set_to_none=True)
                         self.uav_candidate_optimizer.zero_grad(set_to_none=True)
                     else:
@@ -8550,7 +8711,36 @@ class PPOV2Trainer:
                 if branchwise_policy_enabled and bool(cache_active_this_minibatch):
                     cache_minibatches_executed += 1
                 cache_approx_kl_after_step: float | None = None
+                cache_trigger_kl_after_step: float | None = None
+                cache_candidate_kl_after_step: float | None = None
                 cache_stop_triggered_after_step = False
+                if (
+                    branch_kl_instrumentation_enabled
+                    and self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS
+                ):
+                    if (
+                        cache_operation_masks is None
+                        or cache_old_operation_log_probs_all is None
+                        or cache_old_candidate_log_probs_all is None
+                        or cache_full_candidate_features_t is None
+                        or cache_full_candidate_valid_mask_t is None
+                        or cache_candidate_kl_masks_t is None
+                        or cache_trigger_aux is None
+                    ):
+                        raise RuntimeError("Cache component KL tensors are incomplete")
+                    (
+                        cache_trigger_kl_after_step,
+                        cache_candidate_kl_after_step,
+                    ) = self._evaluate_cache_component_kls(
+                        cache_contexts=cache_contexts,
+                        cache_trigger_aux=cache_trigger_aux,
+                        operation_masks=cache_operation_masks,
+                        candidate_features=cache_full_candidate_features_t,
+                        candidate_valid_mask=cache_full_candidate_valid_mask_t,
+                        frozen_candidate_kl_mask=cache_candidate_kl_masks_t,
+                        old_operation_log_probs=cache_old_operation_log_probs_all,
+                        old_candidate_log_probs=cache_old_candidate_log_probs_all,
+                    )
                 if cache_minibatch_kl_control_enabled:
                     if cache_active_this_minibatch:
                         if (
@@ -8640,6 +8830,8 @@ class PPOV2Trainer:
                             "cache_approx_kl": float(
                                 update_epoch_cache_approx_kls[-1]
                             ),
+                            "CACHE_TRIGGER_KL": cache_trigger_kl_after_step,
+                            "CACHE_CANDIDATE_KL": cache_candidate_kl_after_step,
                             "uav_approx_kl": float(
                                 update_epoch_uav_approx_kls[-1]
                             ),
@@ -10270,7 +10462,9 @@ class PPOV2Trainer:
             cache_minibatches_suppressed=int(cache_suppressed_minibatches),
             uav_minibatches_executed=int(uav_minibatches_executed),
             cache_optimizer_steps_this_update=int(
-                self.cache_optimizer_steps - cache_optimizer_steps_at_update_start
+                self.cache_trigger_optimizer_steps
+                + self.cache_candidate_optimizer_steps
+                - cache_optimizer_steps_at_update_start
             ),
             uav_operation_optimizer_steps_this_update=int(
                 self.uav_operation_optimizer_steps
@@ -10919,7 +11113,8 @@ class PPOV2Trainer:
                 if any(
                     optimizer is None
                     for optimizer in (
-                        self.cache_optimizer,
+                        self.cache_trigger_optimizer,
+                        self.cache_candidate_optimizer,
                         self.uav_operation_optimizer,
                         self.uav_candidate_optimizer,
                     )
@@ -10927,10 +11122,12 @@ class PPOV2Trainer:
                     raise RuntimeError("proposed branch optimizers are not initialized")
                 payload.update(
                     {
-                        "cache_optimizer_state_dict": self.cache_optimizer.state_dict(),
+                        "cache_trigger_optimizer_state_dict": self.cache_trigger_optimizer.state_dict(),
+                        "cache_candidate_optimizer_state_dict": self.cache_candidate_optimizer.state_dict(),
                         "uav_operation_optimizer_state_dict": self.uav_operation_optimizer.state_dict(),
                         "uav_candidate_optimizer_state_dict": self.uav_candidate_optimizer.state_dict(),
-                        "cache_optimizer_steps": int(self.cache_optimizer_steps),
+                        "cache_trigger_optimizer_steps": int(self.cache_trigger_optimizer_steps),
+                        "cache_candidate_optimizer_steps": int(self.cache_candidate_optimizer_steps),
                         "uav_operation_optimizer_steps": int(self.uav_operation_optimizer_steps),
                         "uav_candidate_optimizer_steps": int(self.uav_candidate_optimizer_steps),
                         "actor_optimizer_steps": int(self.actor_optimizer_steps),
@@ -11251,14 +11448,16 @@ class PPOV2Trainer:
                 raise RuntimeError("separate critic optimizer is not initialized")
             if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
                 optimizers = {
-                    "cache_optimizer": self.cache_optimizer,
+                    "cache_trigger_optimizer": self.cache_trigger_optimizer,
+                    "cache_candidate_optimizer": self.cache_candidate_optimizer,
                     "uav_operation_optimizer": self.uav_operation_optimizer,
                     "uav_candidate_optimizer": self.uav_candidate_optimizer,
                 }
                 if any(optimizer is None for optimizer in optimizers.values()):
                     raise RuntimeError("proposed branch optimizers are not initialized")
                 required = {
-                    "cache_optimizer_state_dict",
+                    "cache_trigger_optimizer_state_dict",
+                    "cache_candidate_optimizer_state_dict",
                     "uav_operation_optimizer_state_dict",
                     "uav_candidate_optimizer_state_dict",
                     "critic_optimizer_state_dict",
@@ -11268,7 +11467,12 @@ class PPOV2Trainer:
                 for name, optimizer in optimizers.items():
                     optimizer.load_state_dict(payload[name + "_state_dict"])
                 self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
-                self.cache_optimizer_steps = int(payload.get("cache_optimizer_steps", -1))
+                self.cache_trigger_optimizer_steps = int(
+                    payload.get("cache_trigger_optimizer_steps", -1)
+                )
+                self.cache_candidate_optimizer_steps = int(
+                    payload.get("cache_candidate_optimizer_steps", -1)
+                )
                 self.uav_operation_optimizer_steps = int(
                     payload.get("uav_operation_optimizer_steps", -1)
                 )
@@ -11276,13 +11480,15 @@ class PPOV2Trainer:
                     payload.get("uav_candidate_optimizer_steps", -1)
                 )
                 if min(
-                    self.cache_optimizer_steps,
+                    self.cache_trigger_optimizer_steps,
+                    self.cache_candidate_optimizer_steps,
                     self.uav_operation_optimizer_steps,
                     self.uav_candidate_optimizer_steps,
                 ) < 0:
                     raise ValueError("proposed optimizer steps must be non-negative")
                 self.actor_optimizer_steps = (
-                    self.cache_optimizer_steps
+                    self.cache_trigger_optimizer_steps
+                    + self.cache_candidate_optimizer_steps
                     + self.uav_operation_optimizer_steps
                     + self.uav_candidate_optimizer_steps
                 )

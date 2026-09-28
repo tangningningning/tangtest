@@ -1753,7 +1753,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
     """
 
     architecture_id = "adaptive_joint_cache_uav_ppo"
-    architecture_version = 5
+    architecture_version = 6
     trigger_order = ("KEEP", "UPDATE")
     true_binary_trigger = True
 
@@ -1794,14 +1794,18 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         if self.trigger_service_count <= 0:
             raise ValueError("proposed Trigger requires at least one service")
         self.trigger_workload_dim = self.trigger_service_count * 3
-        self.trigger_candidate_summary_dim = 1 + 2 * int(cache_feature_dim)
-        self.trigger_aux_dim = (
-            self.trigger_workload_dim + self.trigger_candidate_summary_dim
-        )
+        self.trigger_aux_dim = self.trigger_workload_dim
+        original_cache_encoder = self.cache_encoder
+        self.cache_trigger_encoder = deepcopy(original_cache_encoder)
+        self.cache_candidate_encoder = deepcopy(original_cache_encoder)
+        del self.cache_encoder
         self.cache_trigger_head = nn.ModuleList(
             nn.Linear(self.hidden_dim + self.trigger_aux_dim, len(self.trigger_order))
             for _ in range(self.num_cache_heads)
         )
+
+    def _default_actor_encoder(self) -> Any:
+        return self.cache_trigger_encoder
 
     def _trigger_logits(
         self,
@@ -1824,7 +1828,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             raise ValueError("Cache Trigger auxiliary input contains NaN/Inf")
         if auxiliary.requires_grad:
             raise RuntimeError("Cache Trigger auxiliary input must be detached")
-        hidden = self.cache_encoder(obs)
+        hidden = self.cache_trigger_encoder(obs)
         trigger_input = torch.cat([hidden, auxiliary], dim=-1)
         logits = torch.stack(
             [head(trigger_input) for head in self.cache_trigger_head], dim=1
@@ -1842,7 +1846,8 @@ class AdaptiveJointCacheUAVPPOActorCritic(
 
     def actor_parameters(self) -> tuple[Any, ...]:
         modules = (
-            self.cache_encoder,
+            self.cache_trigger_encoder,
+            self.cache_candidate_encoder,
             self.uav_encoder,
             self.uav_candidate_encoder,
             self.cache_trigger_head,
@@ -1861,11 +1866,18 @@ class AdaptiveJointCacheUAVPPOActorCritic(
 
     def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
         groups = {
-            "cache": tuple(
+            "cache_trigger": tuple(
                 parameter
                 for module in (
-                    self.cache_encoder,
+                    self.cache_trigger_encoder,
                     self.cache_trigger_head,
+                )
+                for parameter in module.parameters()
+            ),
+            "cache_candidate": tuple(
+                parameter
+                for module in (
+                    self.cache_candidate_encoder,
                     self.cache_candidate_scorer,
                 )
                 for parameter in module.parameters()
@@ -1945,6 +1957,11 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             probabilities=raw_probabilities.detach(),
         )
 
+    def _candidate_encoder_for_scorer(self, scorer: Any) -> Any:
+        if scorer is self.cache_candidate_scorer:
+            return self.cache_candidate_encoder
+        return super()._candidate_encoder_for_scorer(scorer)
+
     def sample_cache_update_candidate(
         self,
         observation: Any,
@@ -1966,7 +1983,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         observation: Any,
         candidate_features: Any,
     ) -> Any:
-        """Score candidates once with the unchanged production scorer path."""
+        """Score candidates after UPDATE with the candidate-only encoder."""
 
         scores, single = self._candidate_scores(
             observation,
@@ -1983,7 +2000,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         candidate_logits: Any,
         deterministic: bool = False,
     ) -> CandidatePolicySample:
-        """Sample from the exact candidate logits already used by Trigger."""
+        """Sample from an already computed conditional candidate logit vector."""
 
         scores = torch.as_tensor(candidate_logits, dtype=torch.float32)
         if scores.ndim != 1 or int(scores.numel()) == 0:

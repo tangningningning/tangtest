@@ -260,7 +260,7 @@ def _actual_optimizers(trainer: Any) -> tuple[Any, Any]:
     critic_optimizer = getattr(trainer, "critic_optimizer", None)
     shared_optimizer = getattr(trainer, "optimizer", None)
     if actor_optimizer is None:
-        actor_optimizer = getattr(trainer, "cache_optimizer", None)
+        actor_optimizer = getattr(trainer, "cache_trigger_optimizer", None)
     if actor_optimizer is None:
         actor_optimizer = shared_optimizer
     if critic_optimizer is None:
