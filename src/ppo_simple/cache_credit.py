@@ -1099,6 +1099,7 @@ def evaluate_cache_full_information_values(
     keep_branch_count = 0
     exact_candidate_count = 0
     surrogate_candidate_count = 0
+    confirmation_added_exact_count = 0
     full_exact_audit_count = 0
     full_exact_environment_baseline = 0
     surrogate_inference_runtime_seconds = 0.0
@@ -1287,8 +1288,50 @@ def evaluate_cache_full_information_values(
                     hybrid_q[np.asarray(exact_indices, dtype=np.int64)] = exact_by_index[
                         np.asarray(exact_indices, dtype=np.int64)
                     ]
+                # Final exact-confirmation: the Hybrid winner must itself be
+                # exact-evaluated before it may become best_candidate_index /
+                # q_best_update. Surrogate values still drive screening and
+                # ranking, but a surrogate-only winner is re-evaluated exactly
+                # and the mixed value vector is re-argmaxed until the winner is
+                # exact. This guarantees a semantically valid winner without
+                # promising the global exact optimum (a candidate that is never
+                # exact-evaluated may still hide a higher true value).
+                confirmed_exact_mask = np.zeros(universe_count, dtype=bool)
+                confirmed_exact_mask[np.asarray(exact_indices, dtype=np.int64)] = True
+                confirmation_added = 0
+                while True:
+                    universe_best_index = int(np.argmax(hybrid_q))
+                    if confirmed_exact_mask[universe_best_index]:
+                        break
+                    winner_candidate = universe_candidates[universe_best_index]
+                    winner_identity = _cache_branch_identity(
+                        transition,
+                        node_index,
+                        state,
+                        winner_candidate,
+                    )
+                    winner_q = branch_cache.get(winner_identity)
+                    if winner_q is None:
+                        winner_branch = _execute_cache_branch(
+                            trainer,
+                            transition,
+                            step,
+                            next_step,
+                            node_index,
+                            state,
+                            winner_candidate,
+                        )
+                        winner_q = float(_branch_q_values(trainer, [winner_branch])[0])
+                        branch_cache[winner_identity] = winner_q
+                        environment_executions += 1
+                    else:
+                        deduplicated_branches += 1
+                    hybrid_q[universe_best_index] = winner_q
+                    exact_by_index[universe_best_index] = winner_q
+                    confirmed_exact_mask[universe_best_index] = True
+                    confirmation_added += 1
+                confirmation_added_exact_count += confirmation_added
                 hybrid_delta = hybrid_q - keep_value
-                universe_best_index = int(np.argmax(hybrid_q))
                 required_indices = [universe_best_index]
                 if production_selected_index is not None:
                     required_indices.append(int(production_selected_index))
@@ -1591,6 +1634,7 @@ def evaluate_cache_full_information_values(
         "runtime_seconds": float(time.perf_counter() - started_at),
         "full_exact_environment_baseline": int(full_exact_environment_baseline),
         "exact_candidate_count": int(exact_candidate_count),
+        "confirmation_added_exact_count": int(confirmation_added_exact_count),
         "surrogate_candidate_count": int(surrogate_candidate_count),
         "full_exact_audit_count": int(full_exact_audit_count),
         "surrogate_inference_runtime_seconds": float(surrogate_inference_runtime_seconds),

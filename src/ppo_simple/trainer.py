@@ -97,7 +97,9 @@ REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
 # Candidate state-head teacher normalization changes the actor objective;
 # proposed-joint checkpoints with global Candidate MAD are incompatible.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 24
+# Final Hybrid exact-confirmation also changes the Candidate winner objective,
+# so proposed-joint checkpoints from before the repair are incompatible.
+JOINT_PROPOSED_CHECKPOINT_VERSION = 25
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
