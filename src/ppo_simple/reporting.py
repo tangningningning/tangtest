@@ -323,6 +323,13 @@ def build_run_manifest(
     return {
         "experiment_type": "main_training",
         "architecture_version": int(getattr(trainer.policy, "architecture_version", 1)),
+        **(
+            {
+                "checkpoint_version": int(trainer._expected_checkpoint_version()),
+            }
+            if getattr(trainer, "_requires_critic_bootstrap_teacher_warmup", lambda: False)()
+            else {}
+        ),
         "initial_actor_sha256": training_provenance.get("ACTOR_INITIAL_STATE_SHA256"),
         "initial_critic_sha256": training_provenance.get("CRITIC_INITIAL_STATE_SHA256"),
         "initial_uav_candidate_encoder_sha256": training_provenance.get(
@@ -342,6 +349,11 @@ def build_run_manifest(
         "seed": int(seed),
         "device": str(trainer.device),
         "policy_schema": policy_schema,
+        **(
+            trainer.critic_bootstrap_teacher_metadata()
+            if hasattr(trainer, "critic_bootstrap_teacher_metadata")
+            else {}
+        ),
         "configuration_control_mode": str(context.configuration_control_mode),
         "advantage_normalization_mode": str(hyper.advantage_normalization_mode),
         "operation_advantage_normalization_mode": str(
@@ -516,6 +528,26 @@ def validate_run_manifest_for_resume(
         )
         raise ValueError(f"PPO resume run_manifest mismatch: {details}")
 
+    if current.get("policy_schema") == "adaptive_joint_cache_uav_ppo":
+        lifecycle_identity_fields = (
+            "checkpoint_version",
+            "critic_bootstrap_teacher_warmup_required",
+            "critic_warmup_seed_namespace",
+        )
+        lifecycle_mismatches = {
+            field: (existing.get(field), current.get(field))
+            for field in lifecycle_identity_fields
+            if existing.get(field) != current.get(field)
+        }
+        if lifecycle_mismatches:
+            details = ", ".join(
+                f"{field}: existing={old!r}, current={new!r}"
+                for field, (old, new) in lifecycle_mismatches.items()
+            )
+            raise ValueError(
+                f"PPO resume critic warmup manifest mismatch: {details}"
+            )
+
     existing_protocol = _manifest_protocol_identity(existing)
     current_protocol = _manifest_protocol_identity(current)
     protocol_mismatches = {
@@ -612,6 +644,8 @@ def update_run_manifest_teacher_state(path: Path, trainer: Any) -> dict[str, Any
     payload = _read_json(manifest_path)
     if hasattr(trainer, "cache_credit_metadata"):
         payload.update(trainer.cache_credit_metadata())
+    if hasattr(trainer, "critic_bootstrap_teacher_metadata"):
+        payload.update(trainer.critic_bootstrap_teacher_metadata())
     payload.update(
         {
             "cache_teacher_scale_calibration": dict(
@@ -718,6 +752,7 @@ def update_run_summary(
     target_epochs: int,
     status: str,
     protocol_metadata: dict[str, Any] | None = None,
+    lifecycle_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the current compact summary from already-written metrics."""
 
@@ -851,5 +886,7 @@ def update_run_summary(
         "nan_inf_detected": bool(episode_nan_inf),
     }
     summary.update(region_values)
+    if lifecycle_metadata is not None:
+        summary.update(dict(lifecycle_metadata))
     _write_json(path, summary)
     return summary

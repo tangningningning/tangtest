@@ -518,7 +518,11 @@ def _cache_branch_identity(
     return int(transition.origin_index), final_cache.tobytes(), final_uav
 
 
-def _branch_q_values(trainer: Any, branches: list[dict[str, Any]]) -> np.ndarray:
+def _branch_q_components(
+    trainer: Any, branches: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Return Exact-Q branch reward, next critic value, and Q components."""
+
     observations = [branch["next_observation"] for branch in branches]
     if any(value is None for value in observations):
         if any(value is not None for value in observations):
@@ -533,9 +537,32 @@ def _branch_q_values(trainer: Any, branches: list[dict[str, Any]]) -> np.ndarray
         next_values = value_tensor.detach().cpu().numpy().reshape(-1).astype(np.float64)
     rewards = np.asarray([branch["reward"] for branch in branches], dtype=np.float64)
     q_values = rewards + float(trainer.hyperparameters.gamma) * next_values
-    if not np.all(np.isfinite(q_values)):
-        raise FloatingPointError("Exact Cache Q values are non-finite")
-    return q_values
+    if not (
+        np.all(np.isfinite(rewards))
+        and np.all(np.isfinite(next_values))
+        and np.all(np.isfinite(q_values))
+    ):
+        raise FloatingPointError("Exact Cache Q components are non-finite")
+    reconstruction_error = np.abs(
+        q_values
+        - (rewards + float(trainer.hyperparameters.gamma) * next_values)
+    )
+    if not np.all(np.isfinite(reconstruction_error)):
+        raise FloatingPointError("Exact Cache Q reconstruction error is non-finite")
+    return {
+        "branch_reward": rewards,
+        "branch_next_critic_value": next_values,
+        "branch_q": q_values,
+        "max_reconstruction_error": float(
+            np.max(reconstruction_error) if len(reconstruction_error) else 0.0
+        ),
+    }
+
+
+def _branch_q_values(trainer: Any, branches: list[dict[str, Any]]) -> np.ndarray:
+    return np.asarray(
+        _branch_q_components(trainer, branches)["branch_q"], dtype=np.float64
+    )
 
 
 def _rank_correlation(predicted: np.ndarray, exact: np.ndarray) -> float:
@@ -1005,6 +1032,8 @@ def evaluate_cache_full_information_values(
     candidate_temperature: float | None = None,
     force_full_exact: bool = False,
     train_surrogate: bool = True,
+    include_q_component_diagnostics: bool = False,
+    include_full_candidate_q_components: bool = False,
 ) -> dict[str, Any]:
     """Evaluate fixed-downstream Cache values and detached full-information teachers.
 
@@ -1014,6 +1043,13 @@ def evaluate_cache_full_information_values(
     """
 
     trigger_scale = None if trigger_temperature is None else float(trigger_temperature)
+    readiness_check = getattr(trainer, "_require_critic_bootstrap_teacher_ready", None)
+    if readiness_check is not None:
+        readiness_check("Cache full-information teacher/surrogate evaluation")
+    if include_full_candidate_q_components and not force_full_exact:
+        raise ValueError(
+            "full candidate Q components require explicit force_full_exact=True"
+        )
     candidate_scale = 1.0
     if trigger_scale is not None and (
         not math.isfinite(trigger_scale) or trigger_scale <= 0.0
@@ -1114,6 +1150,11 @@ def evaluate_cache_full_information_values(
     exact_delta_labels: list[float] = []
     exact_group_labels: list[int] = []
     screening_rows: list[dict[str, Any]] = []
+    q_component_diagnostics: list[list[dict[str, Any]]] = [
+        [] for _ in range(sample_count)
+    ]
+    full_candidate_q_components: list[dict[str, Any]] = []
+    max_q_component_reconstruction_error = 0.0
     feasible_universe_counts: list[int] = []
     policy_best_recalled: list[float] = []
     surrogate_ready = bool(
@@ -1133,6 +1174,9 @@ def evaluate_cache_full_information_values(
             raise RuntimeError("full-information Cache evaluation lacks next aligned step")
         branch_cache: dict[
             tuple[int, bytes, tuple[tuple[str, float, float], ...]], float
+        ] = {}
+        branch_component_cache: dict[
+            tuple[int, bytes, tuple[tuple[str, float, float], ...]], dict[str, float]
         ] = {}
         full_exact_branch_keys: set[
             tuple[int, bytes, tuple[tuple[str, float, float], ...]]
@@ -1270,7 +1314,22 @@ def evaluate_cache_full_information_values(
                         state,
                         candidate,
                     )
-                    q_value = float(_branch_q_values(trainer, [branch])[0])
+                    if include_q_component_diagnostics or include_full_candidate_q_components:
+                        branch_components = _branch_q_components(trainer, [branch])
+                        q_value = float(branch_components["branch_q"][0])
+                        branch_component_cache[identity] = {
+                            "reward": float(branch_components["branch_reward"][0]),
+                            "next_v": float(
+                                branch_components["branch_next_critic_value"][0]
+                            ),
+                            "q": q_value,
+                        }
+                        max_q_component_reconstruction_error = max(
+                            max_q_component_reconstruction_error,
+                            float(branch_components["max_reconstruction_error"]),
+                        )
+                    else:
+                        q_value = float(_branch_q_values(trainer, [branch])[0])
                     branch_cache[identity] = q_value
                     environment_executions += 1
                 else:
@@ -1321,7 +1380,28 @@ def evaluate_cache_full_information_values(
                             state,
                             winner_candidate,
                         )
-                        winner_q = float(_branch_q_values(trainer, [winner_branch])[0])
+                        if include_q_component_diagnostics or include_full_candidate_q_components:
+                            winner_components = _branch_q_components(
+                                trainer, [winner_branch]
+                            )
+                            winner_q = float(winner_components["branch_q"][0])
+                            branch_component_cache[winner_identity] = {
+                                "reward": float(winner_components["branch_reward"][0]),
+                                "next_v": float(
+                                    winner_components[
+                                        "branch_next_critic_value"
+                                    ][0]
+                                ),
+                                "q": winner_q,
+                            }
+                            max_q_component_reconstruction_error = max(
+                                max_q_component_reconstruction_error,
+                                float(winner_components["max_reconstruction_error"]),
+                            )
+                        else:
+                            winner_q = float(
+                                _branch_q_values(trainer, [winner_branch])[0]
+                            )
                         branch_cache[winner_identity] = winner_q
                         environment_executions += 1
                     else:
@@ -1357,6 +1437,34 @@ def evaluate_cache_full_information_values(
                     ],
                     dtype=np.int64,
                 )
+                if include_full_candidate_q_components:
+                    full_candidate_q_components.append(
+                        {
+                            "transition_index": int(selected_indices[sample_index]),
+                            "origin_index": int(transition.origin_index),
+                            "head_index": int(node_index),
+                            "candidates": [
+                                {
+                                    "universe_index": int(candidate_index),
+                                    "target_node_cache": np.asarray(
+                                        universe_candidates[int(candidate_index)].target_node_cache,
+                                        dtype=np.int8,
+                                    ).astype(int).tolist(),
+                                    **dict(
+                                        branch_component_cache[
+                                            _cache_branch_identity(
+                                                transition,
+                                                node_index,
+                                                state,
+                                                universe_candidates[int(candidate_index)],
+                                            )
+                                        ]
+                                    ),
+                                }
+                                for candidate_index in range(universe_count)
+                            ],
+                        }
+                    )
                 count = len(policy_indices)
                 if count > candidate_capacity:
                     raise RuntimeError("post-Hybrid policy Candidate set exceeds capacity")
@@ -1412,6 +1520,72 @@ def evaluate_cache_full_information_values(
                             "random_audit_index": random_audit_index,
                         }
                     )
+                if include_q_component_diagnostics:
+                    keep_identity = _cache_branch_identity(
+                        transition, node_index, state, None
+                    )
+                    keep_components = branch_component_cache.get(keep_identity)
+                    if keep_components is None:
+                        raise RuntimeError(
+                            "Cache KEEP Exact-Q component diagnostics are missing"
+                        )
+                    winner_components = branch_component_cache.get(
+                        _cache_branch_identity(
+                            transition,
+                            node_index,
+                            state,
+                            universe_candidates[universe_best_index],
+                        )
+                    )
+                    winner_policy_index = int(
+                        np.flatnonzero(policy_indices == universe_best_index)[0]
+                    )
+                    if winner_components is None:
+                        raise RuntimeError(
+                            "Cache confirmed-winner Exact-Q components are missing"
+                        )
+                    q_component_diagnostics[sample_index].append(
+                        {
+                            "head_index": int(node_index),
+                            "head_id": str(
+                                trainer.context.action_spec.cache_node_ids[node_index]
+                            ),
+                            "keep": dict(keep_components),
+                            "final_exact_confirmed_winner": {
+                                **dict(winner_components),
+                                "policy_candidate_index": winner_policy_index,
+                                "universe_candidate_index": int(universe_best_index),
+                                "target_node_cache": np.asarray(
+                                    universe_candidates[universe_best_index].target_node_cache,
+                                    dtype=np.int8,
+                                ).astype(int).tolist(),
+                                "proposal_source": str(
+                                    universe_candidates[universe_best_index].proposal_source
+                                ),
+                            },
+                            "critic_provenance_reference": "critic_parameter_digest_before_teacher",
+                        }
+                    )
+            elif include_q_component_diagnostics:
+                keep_identity = _cache_branch_identity(
+                    transition, node_index, state, None
+                )
+                keep_components = branch_component_cache.get(keep_identity)
+                if keep_components is None:
+                    raise RuntimeError(
+                        "Cache KEEP Exact-Q component diagnostics are missing"
+                    )
+                q_component_diagnostics[sample_index].append(
+                    {
+                        "head_index": int(node_index),
+                        "head_id": str(
+                            trainer.context.action_spec.cache_node_ids[node_index]
+                        ),
+                        "keep": dict(keep_components),
+                        "final_exact_confirmed_winner": None,
+                        "critic_provenance_reference": "critic_parameter_digest_before_teacher",
+                    }
+                )
         full_exact_environment_baseline += len(full_exact_branch_keys)
 
     q_best = np.full((sample_count, node_count), np.nan, dtype=np.float64)
@@ -1664,6 +1838,19 @@ def evaluate_cache_full_information_values(
         "downstream_mode": "FIXED_DOWNSTREAM",
         "trigger_temperature": trigger_scale,
         "candidate_temperature": candidate_scale,
+        "q_component_diagnostics": (
+            q_component_diagnostics if include_q_component_diagnostics else None
+        ),
+        "full_candidate_q_components": (
+            full_candidate_q_components
+            if include_full_candidate_q_components
+            else None
+        ),
+        "max_q_component_reconstruction_error": (
+            float(max_q_component_reconstruction_error)
+            if include_q_component_diagnostics or include_full_candidate_q_components
+            else None
+        ),
     }
 
 

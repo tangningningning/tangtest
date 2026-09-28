@@ -23,6 +23,27 @@ EPISODE_SEED_STREAMS = (
 )
 
 
+def derive_namespaced_seed(episode_seed: int, namespace: str, stream_name: str) -> int:
+    """Derive a deterministic seed outside the formal episode stream namespace.
+
+    This is for auxiliary training-only work such as critic warmup.  It leaves
+    ``EPISODE_SEED_STREAMS`` and all existing formal episode seed values intact.
+    """
+
+    if isinstance(episode_seed, bool) or not isinstance(episode_seed, int):
+        raise TypeError("episode_seed must be an integer")
+    if episode_seed < 0 or episode_seed > (1 << 64) - 1:
+        raise ValueError("episode_seed must be in the unsigned 64-bit range")
+    namespace_value = str(namespace).strip()
+    stream_value = str(stream_name).strip()
+    if not namespace_value or not stream_value:
+        raise ValueError("seed namespace and stream name must be non-empty")
+    payload = (
+        f"{SEED_PROTOCOL_VERSION}|{episode_seed}|{namespace_value}|{stream_value}"
+    ).encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
 def _derive(episode_seed: int, stream_name: str) -> int:
     if isinstance(episode_seed, bool) or not isinstance(episode_seed, int):
         raise TypeError("episode_seed must be an integer")

@@ -27,6 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - CLI help/import-only environme
 from common import project_config
 from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
 from scenario import task_scenario
+from scenario.realization import derive_namespaced_seed
 
 from . import interface
 from .interface import _copy_uav_positions
@@ -99,7 +100,9 @@ NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
 # proposed-joint checkpoints with global Candidate MAD are incompatible.
 # Final Hybrid exact-confirmation also changes the Candidate winner objective,
 # so proposed-joint checkpoints from before the repair are incompatible.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 25
+JOINT_PROPOSED_CHECKPOINT_VERSION = 26
+CRITIC_BOOTSTRAP_WARMUP_NAMESPACE = "ppo_critic_bootstrap_warmup"
+CRITIC_BOOTSTRAP_TEACHER_SOURCE = "LIVE_PRE_CURRENT_ROLLOUT_CRITIC"
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
@@ -1060,6 +1063,20 @@ class UpdateResult:
     matching_cf_kkt_stationarity_residual_max: float = math.nan
     matching_cf_kkt_complementary_slackness_residual_mean: float = math.nan
     matching_cf_kkt_complementary_slackness_residual_max: float = math.nan
+    critic_bootstrap_teacher_warmup_complete: bool | None = None
+    actor_update_executed: bool = False
+    critic_update_executed: bool = False
+    critic_optimizer_steps_before_update: int = 0
+    critic_optimizer_steps_before_teacher: int | None = None
+    critic_optimizer_steps_after_update: int = 0
+    popart_mean_before_teacher: float | None = None
+    popart_std_before_teacher: float | None = None
+    critic_parameter_digest_before_teacher: str | None = None
+    teacher_source: str | None = None
+    teacher_generation_executed: bool = False
+    cache_q_component_diagnostics: list[list[dict[str, Any]]] | None = None
+    uav_q_component_diagnostics: list[list[dict[str, Any]]] | None = None
+    max_q_component_reconstruction_error: float = math.nan
 
 
 @dataclass(frozen=True)
@@ -1418,6 +1435,30 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         json.dump(record, stream, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         stream.write("\n")
+
+
+def _run_with_isolated_rng(seed: int, callback: Callable[[], Any]) -> Any:
+    """Run auxiliary work on a deterministic RNG stream and restore training RNGs."""
+
+    if torch is None:
+        raise RuntimeError("isolated PPO RNG execution requires PyTorch")
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        random.seed(int(seed))
+        np.random.seed(int(seed) % (1 << 32))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+        return callback()
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def _binary_action_bitmask(action: Any) -> int:
@@ -3327,6 +3368,12 @@ def _append_critic_diagnostics(
         == len(update.raw_returns)
     ):
         raise AssertionError("critic diagnostics length mismatch")
+    for name, values in (
+        ("Cache", update.cache_q_component_diagnostics),
+        ("UAV", update.uav_q_component_diagnostics),
+    ):
+        if values is not None and len(values) != len(transitions):
+            raise AssertionError(f"{name} Q-component diagnostics length mismatch")
     for transition_index, (transition, raw_advantage, raw_return) in enumerate(zip(
         transitions,
         update.raw_advantages,
@@ -3371,6 +3418,37 @@ def _append_critic_diagnostics(
             "critic_return_scale": float(update.critic_return_scale),
             "normalized_value_residual": normalized_residual,
         }
+        if update.teacher_generation_executed:
+            record.update(
+                {
+                    "critic_bootstrap_teacher_warmup_complete": bool(
+                        update.critic_bootstrap_teacher_warmup_complete
+                    ),
+                    "critic_optimizer_steps_before_teacher": int(
+                        update.critic_optimizer_steps_before_teacher or 0
+                    ),
+                    "critic_optimizer_steps_after_update": int(
+                        update.critic_optimizer_steps_after_update
+                    ),
+                    "popart_mean_before_teacher": update.popart_mean_before_teacher,
+                    "popart_std_before_teacher": update.popart_std_before_teacher,
+                    "critic_parameter_digest_before_teacher": (
+                        update.critic_parameter_digest_before_teacher
+                    ),
+                    "teacher_source": update.teacher_source,
+                    "max_q_component_reconstruction_error": float(
+                        update.max_q_component_reconstruction_error
+                    ),
+                }
+            )
+            if update.cache_q_component_diagnostics is not None:
+                record["cache_q_components"] = update.cache_q_component_diagnostics[
+                    transition_index
+                ]
+            if update.uav_q_component_diagnostics is not None:
+                record["uav_q_components"] = update.uav_q_component_diagnostics[
+                    transition_index
+                ]
         if transition.uav_operation_actions is not None:
             if cache_count is None:
                 raise AssertionError(
@@ -4280,6 +4358,12 @@ class PPOV2Trainer:
         self.optimizer_steps = 0
         self.actor_optimizer_steps = 0
         self.critic_optimizer_steps = 0
+        self.critic_bootstrap_teacher_warmup_complete = False
+        self.critic_warmup_rollout_slots = 0
+        self.critic_warmup_optimizer_steps = 0
+        self.critic_warmup_seed: int | None = None
+        self.critic_warmup_update_rng_seed: int | None = None
+        self.critic_optimizer_steps_before_first_formal_teacher: int | None = None
         self.cache_trigger_optimizer = None
         self.cache_candidate_optimizer = None
         self.uav_operation_optimizer = None
@@ -4504,6 +4588,7 @@ class PPOV2Trainer:
     ) -> dict[str, float | int | str]:
         """Fit only the independent ensemble on labels from exact branches."""
 
+        self._require_critic_bootstrap_teacher_ready("Cache surrogate training")
         if self.cache_surrogate_ensemble is None or self.cache_surrogate_optimizer is None:
             raise RuntimeError("Cache surrogate optimizer is not initialized")
         contexts = np.asarray(conditional_contexts, dtype=np.float32)
@@ -4726,6 +4811,7 @@ class PPOV2Trainer:
     def _update_cache_surrogate_gate(self, cache_credit: dict[str, Any]) -> None:
         """Update readiness from shadow/audit evidence and enforce fallback."""
 
+        self._require_critic_bootstrap_teacher_ready("Cache surrogate quality-gate update")
         if not cache_credit:
             return
         gate_metrics = cache_credit.get("surrogate_gate_metrics")
@@ -4805,6 +4891,476 @@ class PPOV2Trainer:
             self.hyperparameters.critic_value_scale_epsilon,
             self.hyperparameters.critic_value_scale_warmup_samples,
         )
+
+    def _requires_critic_bootstrap_teacher_warmup(self) -> bool:
+        return isinstance(self.policy, AdaptiveJointCacheUAVPPOActorCritic)
+
+    def _critic_bootstrap_teacher_readiness(self) -> dict[str, Any]:
+        required = self._requires_critic_bootstrap_teacher_warmup()
+        warmup_complete: bool | None = (
+            bool(self.critic_bootstrap_teacher_warmup_complete)
+            if required
+            else None
+        )
+        steps = int(self.critic_optimizer_steps)
+        ready = bool(not required or (warmup_complete and steps > 0))
+        return {
+            "required": required,
+            "warmup_complete": warmup_complete,
+            "critic_optimizer_steps": steps,
+            "ready": ready,
+        }
+
+    def _require_critic_bootstrap_teacher_ready(self, branch: str) -> dict[str, Any]:
+        readiness = self._critic_bootstrap_teacher_readiness()
+        if not readiness["ready"]:
+            raise RuntimeError(
+                f"{branch} requires a completed pre-epoch critic warmup; "
+                "critic-bootstrap teacher generation is disabled until "
+                "critic_bootstrap_teacher_warmup_complete=True and "
+                "critic_optimizer_steps>0."
+            )
+        return readiness
+
+    def critic_bootstrap_teacher_metadata(self) -> dict[str, Any]:
+        required = self._requires_critic_bootstrap_teacher_warmup()
+        if not required:
+            return {}
+        return {
+            "critic_bootstrap_teacher_warmup_required": bool(required),
+            "critic_bootstrap_teacher_warmup_complete": (
+                bool(self.critic_bootstrap_teacher_warmup_complete)
+                if required
+                else None
+            ),
+            "critic_warmup_rollout_slots": (
+                int(self.critic_warmup_rollout_slots) if required else None
+            ),
+            "critic_warmup_optimizer_steps": (
+                int(self.critic_warmup_optimizer_steps) if required else None
+            ),
+            "critic_warmup_seed": (
+                None if self.critic_warmup_seed is None else int(self.critic_warmup_seed)
+            ) if required else None,
+            "critic_warmup_seed_namespace": (
+                CRITIC_BOOTSTRAP_WARMUP_NAMESPACE if required else None
+            ),
+            "critic_warmup_update_rng_seed": (
+                None
+                if self.critic_warmup_update_rng_seed is None
+                else int(self.critic_warmup_update_rng_seed)
+            ) if required else None,
+            "critic_optimizer_steps_before_first_formal_teacher": (
+                None
+                if self.critic_optimizer_steps_before_first_formal_teacher is None
+                else int(self.critic_optimizer_steps_before_first_formal_teacher)
+            ),
+        }
+
+    def _validate_critic_warmup_lifecycle(
+        self,
+        completed_episodes: int,
+        *,
+        actor_optimizer_steps: int | None = None,
+    ) -> None:
+        if not self._requires_critic_bootstrap_teacher_warmup():
+            return
+        planned_steps = int(
+            self.hyperparameters.update_epochs * self.hyperparameters.num_minibatches
+        )
+        if self.critic_bootstrap_teacher_warmup_complete:
+            if self.critic_optimizer_steps <= 0:
+                raise ValueError(
+                    "invalid proposed checkpoint lifecycle: warmup is complete "
+                    "but critic_optimizer_steps is zero"
+                )
+            if self.critic_warmup_optimizer_steps != planned_steps:
+                raise ValueError(
+                    "invalid proposed checkpoint lifecycle: warmup optimizer-step "
+                    f"count={self.critic_warmup_optimizer_steps}, expected={planned_steps}"
+                )
+            if self.critic_optimizer_steps < self.critic_warmup_optimizer_steps:
+                raise ValueError(
+                    "invalid proposed checkpoint lifecycle: total critic steps are "
+                    "less than the recorded warmup steps"
+                )
+            if (
+                self.critic_optimizer_steps_before_first_formal_teacher is not None
+                and (
+                    self.critic_optimizer_steps_before_first_formal_teacher
+                    < self.critic_warmup_optimizer_steps
+                    or self.critic_optimizer_steps_before_first_formal_teacher
+                    > self.critic_optimizer_steps
+                )
+            ):
+                raise ValueError(
+                    "invalid proposed checkpoint lifecycle: first formal teacher "
+                    "critic-step provenance is out of range"
+                )
+            if (
+                self.critic_warmup_rollout_slots <= 0
+                or self.critic_warmup_seed is None
+                or self.critic_warmup_update_rng_seed is None
+            ):
+                raise ValueError(
+                    "invalid proposed checkpoint lifecycle: completed warmup lacks "
+                    "TRAIN rollout or seed provenance"
+                )
+            if (
+                self.context.data_protocol
+                == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
+                and self.critic_warmup_rollout_slots != self.context.episode_slots
+            ):
+                raise ValueError(
+                    "invalid proposed checkpoint lifecycle: full-episode warmup "
+                    "slot count does not match the TRAIN protocol"
+                )
+            return
+        if (
+            int(completed_episodes) != 0
+            or self.critic_optimizer_steps != 0
+            or self.critic_warmup_optimizer_steps != 0
+            or self.critic_warmup_rollout_slots != 0
+            or self.critic_return_statistics.count != 0
+        ):
+            raise ValueError(
+                "invalid proposed checkpoint lifecycle: warmup_complete=False is "
+                "only valid before all formal epochs with zero critic/warmup steps"
+            )
+        if actor_optimizer_steps is not None and int(actor_optimizer_steps) != 0:
+            raise ValueError(
+                "invalid proposed checkpoint lifecycle: actor optimization started "
+                "before critic warmup completed"
+            )
+
+    def _critic_parameter_digest(self) -> str:
+        critic_parameters = tuple(self.policy.critic_parameters())
+        critic_ids = {id(parameter) for parameter in critic_parameters}
+        named_parameters = sorted(
+            (name, parameter)
+            for name, parameter in self.policy.named_parameters()
+            if id(parameter) in critic_ids
+        )
+        if len(named_parameters) != len(critic_parameters):
+            raise RuntimeError("critic digest could not identify every critic parameter")
+        values: list[tuple[str, Any]] = list(named_parameters)
+        for name, buffer in sorted(self.policy.named_buffers()):
+            if name in {"popart_mean", "popart_std"}:
+                values.append((name, buffer))
+        digest = hashlib.sha256()
+        for name, tensor in sorted(values, key=lambda item: item[0]):
+            value = tensor.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(json.dumps(list(value.shape), separators=(",", ":")).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _parameter_delta_norm(
+        before: tuple[Any, ...], after: tuple[Any, ...]
+    ) -> float:
+        if len(before) != len(after):
+            raise RuntimeError("parameter group changed shape during critic warmup")
+        squared = 0.0
+        for old, new in zip(before, after, strict=True):
+            if old.shape != new.shape:
+                raise RuntimeError("parameter shape changed during critic warmup")
+            squared += float(torch.sum((new.detach() - old) ** 2).cpu())
+        value = float(math.sqrt(squared))
+        if not math.isfinite(value):
+            raise FloatingPointError("parameter delta norm is non-finite")
+        return value
+
+    def _critic_minibatch_update(
+        self,
+        observations: Any,
+        returns: Any,
+        critic_targets: Any,
+        critic_return_scale: float,
+        *,
+        popart_critic: bool,
+        actor_parameters: list[Any],
+    ) -> tuple[Any, Any, float]:
+        """Apply the one shared proposed-policy critic minibatch objective."""
+
+        if self.critic_optimizer is None:
+            raise RuntimeError("separate critic optimizer is not initialized")
+        if not math.isfinite(float(critic_return_scale)) or float(critic_return_scale) <= 0.0:
+            raise FloatingPointError("critic return scale must be positive and finite")
+        critic_parameters = list(self.policy.critic_parameters())
+        if not critic_parameters:
+            raise RuntimeError("critic parameter group is empty")
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        if popart_critic:
+            critic_normalized_values = self.policy.critic_normalized_value(observations)
+            critic_values = (
+                self.policy.popart_mean + self.policy.popart_std * critic_normalized_values
+            )
+            critic_value_residual = critic_values.detach() - returns
+            raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
+            normalized_value_residual = critic_normalized_values - critic_targets
+        else:
+            critic_values = self.policy.critic_value(observations)
+            critic_value_residual = critic_values - returns
+            raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
+            normalized_value_residual = critic_value_residual / float(critic_return_scale)
+        value_loss = 0.5 * torch.mean(normalized_value_residual**2)
+        critic_loss = value_loss
+        if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
+            torch.isfinite(value_loss).item()
+        ) or not bool(torch.isfinite(critic_loss).item()):
+            raise FloatingPointError("PPO critic loss is non-finite")
+        critic_loss.backward()
+        if any(parameter.grad is not None for parameter in actor_parameters):
+            raise RuntimeError("critic backward touched actor parameters")
+        if any(
+            parameter.grad is not None
+            and not bool(torch.all(torch.isfinite(parameter.grad)).item())
+            for parameter in critic_parameters
+        ):
+            raise FloatingPointError("PPO critic gradient is non-finite")
+        if not any(parameter.grad is not None for parameter in critic_parameters):
+            raise RuntimeError("critic loss produced no critic gradients")
+        critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
+            critic_parameters, self.hyperparameters.max_grad_norm
+        )
+        critic_gradient_norm_value = float(critic_gradient_norm.detach().cpu())
+        if not math.isfinite(critic_gradient_norm_value):
+            raise FloatingPointError("PPO critic gradient norm is non-finite")
+        self.critic_optimizer.step()
+        self.critic_optimizer_steps += 1
+        return raw_value_loss, value_loss, critic_gradient_norm_value
+
+    def warmup_critic(
+        self,
+        rollout: SimpleRollout,
+        *,
+        rng_seed: int | None = None,
+    ) -> dict[str, Any]:
+        """Run the proposed-joint pre-epoch critic-only warmup on a TRAIN rollout."""
+
+        if not self._requires_critic_bootstrap_teacher_warmup():
+            raise RuntimeError("critic warmup is only supported by the proposed joint policy")
+        if self.critic_warmup_seed is None:
+            base_seed = int(
+                project_config.get_config_value(self.context.cfg, "experiment.seed")
+            )
+            self.critic_warmup_seed = derive_namespaced_seed(
+                base_seed,
+                CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+                "episode_realization",
+            )
+        if rng_seed is None:
+            rng_seed = derive_namespaced_seed(
+                self.critic_warmup_seed,
+                CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+                "critic_optimizer",
+            )
+        self.critic_warmup_update_rng_seed = int(rng_seed)
+        return _run_with_isolated_rng(
+            int(rng_seed), lambda: self._warmup_critic_impl(rollout)
+        )
+
+    def _warmup_critic_impl(self, rollout: SimpleRollout) -> dict[str, Any]:
+
+        if not self._requires_critic_bootstrap_teacher_warmup():
+            raise RuntimeError("critic warmup is only supported by the proposed joint policy")
+        if self.critic_bootstrap_teacher_warmup_complete:
+            raise RuntimeError("critic bootstrap teacher warmup has already completed")
+        if self.critic_optimizer_steps != 0 or self.critic_warmup_optimizer_steps != 0:
+            raise RuntimeError(
+                "critic warmup requires a fresh proposed-joint critic lifecycle"
+            )
+        if self.actor_optimizer_steps != 0 or self.optimizer_steps != 0:
+            raise RuntimeError(
+                "critic warmup requires actor and aggregate optimizer steps to be zero"
+            )
+        self._validate_critic_warmup_lifecycle(0, actor_optimizer_steps=0)
+        sample_count = int(rollout.observations.shape[0])
+        hyper = self.hyperparameters
+        if sample_count < hyper.num_minibatches or sample_count % hyper.num_minibatches:
+            raise ValueError("critic warmup rollout length must divide into configured minibatches")
+        if len(rollout.transitions) != sample_count or not rollout.transitions:
+            raise ValueError("critic warmup rollout transitions/observations are inconsistent")
+        if any(
+            int(transition.origin_index) < self.context.train_origin_start
+            or int(transition.origin_index) > self.context.train_origin_end
+            for transition in rollout.transitions
+        ):
+            raise ValueError("critic warmup rollout contains an origin outside TRAIN data")
+        if self.context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+            if sample_count != self.context.episode_slots:
+                raise ValueError("critic warmup requires one complete TRAIN realization")
+            if not bool(rollout.dones[-1]) or bool(np.any(rollout.dones[:-1])):
+                raise ValueError("critic warmup TRAIN realization must terminate only at its end")
+
+        planned_steps = int(hyper.update_epochs * hyper.num_minibatches)
+        critic_parameters = tuple(self.policy.critic_parameters())
+        actor_parameters = tuple(self.policy.actor_parameters())
+        critic_before = tuple(parameter.detach().clone() for parameter in critic_parameters)
+        actor_before = tuple(parameter.detach().clone() for parameter in actor_parameters)
+        branch_groups = self.proposed_actor_parameter_groups or {}
+        branch_before = {
+            name: tuple(parameter.detach().clone() for parameter in parameters)
+            for name, parameters in branch_groups.items()
+        }
+        actor_steps_before = {
+            "cache_trigger": int(self.cache_trigger_optimizer_steps),
+            "cache_candidate": int(self.cache_candidate_optimizer_steps),
+            "uav_operation": int(self.uav_operation_optimizer_steps),
+            "uav_candidate": int(self.uav_candidate_optimizer_steps),
+        }
+        bootstrap_value = 0.0
+        if rollout.bootstrap_observation is not None:
+            with torch.no_grad():
+                bootstrap_tensor = self.policy.critic_value(rollout.bootstrap_observation)
+            bootstrap_value = float(bootstrap_tensor.detach().cpu())
+        advantages, returns = compute_gae(
+            rollout.rewards,
+            rollout.old_values,
+            rollout.dones,
+            bootstrap_value,
+            hyper.gamma,
+            hyper.gae_lambda,
+        )
+        if not np.all(np.isfinite(returns)) or not np.all(np.isfinite(advantages)):
+            raise FloatingPointError("critic warmup returns or advantages are non-finite")
+
+        popart_critic = self._uses_popart_critic()
+        popart_before = self.policy.popart_statistics() if popart_critic else None
+        popart_preservation_error = 0.0
+        reference_observations = np.asarray(rollout.observations, dtype=np.float32)[
+            : min(sample_count, 8)
+        ]
+        if popart_critic:
+            expected_mean, expected_std = self.critic_return_statistics.active_statistics(
+                hyper.critic_value_scale_epsilon,
+                hyper.critic_value_scale_warmup_samples,
+            )
+            active_mean, active_std = self.policy.popart_statistics()
+            if not math.isclose(active_mean, expected_mean, rel_tol=1.0e-6, abs_tol=1.0e-6) or not math.isclose(
+                active_std, expected_std, rel_tol=1.0e-6, abs_tol=1.0e-6
+            ):
+                raise RuntimeError("V6 PopArt policy statistics are out of sync with Welford state")
+            with torch.no_grad():
+                raw_values_before = self.policy.critic_value(reference_observations).detach().clone()
+            self.critic_return_statistics.update(returns)
+            critic_target_mean, critic_return_scale = self.critic_return_statistics.active_statistics(
+                hyper.critic_value_scale_epsilon,
+                hyper.critic_value_scale_warmup_samples,
+            )
+            self.policy.update_popart_statistics(critic_target_mean, critic_return_scale)
+            with torch.no_grad():
+                raw_values_after_statistics = self.policy.critic_value(reference_observations)
+            popart_preservation_error = float(
+                torch.max(torch.abs(raw_values_after_statistics - raw_values_before)).cpu()
+            )
+            if not math.isfinite(popart_preservation_error):
+                raise FloatingPointError("PopArt raw-value preservation error is non-finite")
+        else:
+            critic_target_mean = 0.0
+            critic_return_scale = self._critic_return_scale()
+        if not math.isfinite(critic_return_scale) or critic_return_scale <= 0.0:
+            raise FloatingPointError("critic warmup return scale is non-finite")
+
+        observations_t = torch.as_tensor(
+            rollout.observations, dtype=torch.float32, device=self.device
+        )
+        returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+        critic_targets_t = (
+            (returns_t - float(critic_target_mean)) / float(critic_return_scale)
+            if popart_critic
+            else returns_t
+        )
+        if any(
+            optimizer is None
+            for optimizer in (
+                self.cache_trigger_optimizer,
+                self.cache_candidate_optimizer,
+                self.uav_operation_optimizer,
+                self.uav_candidate_optimizer,
+            )
+        ):
+            raise RuntimeError("proposed actor optimizers are not initialized")
+        self.cache_trigger_optimizer.zero_grad(set_to_none=True)
+        self.cache_candidate_optimizer.zero_grad(set_to_none=True)
+        self.uav_operation_optimizer.zero_grad(set_to_none=True)
+        self.uav_candidate_optimizer.zero_grad(set_to_none=True)
+        minibatch_size = sample_count // hyper.num_minibatches
+        executed_steps = 0
+        for _update_epoch in range(hyper.update_epochs):
+            permutation = torch.randperm(sample_count, device=self.device)
+            for start in range(0, sample_count, minibatch_size):
+                indices = permutation[start : start + minibatch_size]
+                self._critic_minibatch_update(
+                    observations_t[indices],
+                    returns_t[indices],
+                    critic_targets_t[indices],
+                    critic_return_scale,
+                    popart_critic=popart_critic,
+                    actor_parameters=list(actor_parameters),
+                )
+                executed_steps += 1
+        if hyper.critic_value_scale_mode == CRITIC_VALUE_SCALE_RUNNING_RETURN_STD:
+            self.critic_return_statistics.update(returns)
+        if executed_steps != planned_steps:
+            raise RuntimeError(
+                f"critic warmup steps mismatch: planned={planned_steps}, executed={executed_steps}"
+            )
+        self.critic_warmup_optimizer_steps = int(executed_steps)
+        self.critic_warmup_rollout_slots = sample_count
+        critic_delta = self._parameter_delta_norm(
+            critic_before, tuple(self.policy.critic_parameters())
+        )
+        actor_delta = self._parameter_delta_norm(
+            actor_before, tuple(self.policy.actor_parameters())
+        )
+        branch_deltas = {
+            name: self._parameter_delta_norm(
+                before, tuple(branch_groups[name])
+            )
+            for name, before in branch_before.items()
+        }
+        if actor_delta != 0.0 or any(value != 0.0 for value in branch_deltas.values()):
+            raise RuntimeError("critic warmup changed actor parameters")
+        if not math.isfinite(critic_delta) or critic_delta <= 0.0:
+            raise FloatingPointError("critic warmup did not produce a finite nonzero critic delta")
+        actor_steps_after = {
+            "cache_trigger": int(self.cache_trigger_optimizer_steps),
+            "cache_candidate": int(self.cache_candidate_optimizer_steps),
+            "uav_operation": int(self.uav_operation_optimizer_steps),
+            "uav_candidate": int(self.uav_candidate_optimizer_steps),
+        }
+        if actor_steps_after != actor_steps_before:
+            raise RuntimeError("critic warmup changed actor optimizer step counters")
+        if self.critic_optimizer_steps != executed_steps:
+            raise RuntimeError("critic warmup critic_optimizer_steps do not match executed steps")
+        self.critic_bootstrap_teacher_warmup_complete = True
+        self._validate_critic_warmup_lifecycle(0, actor_optimizer_steps=0)
+        return {
+            "update_phase": "CRITIC_WARMUP",
+            "warmup_complete": True,
+            "planned_critic_optimizer_steps": planned_steps,
+            "executed_critic_optimizer_steps": executed_steps,
+            "critic_optimizer_steps_before": 0,
+            "critic_optimizer_steps_after": int(self.critic_optimizer_steps),
+            "rollout_slots": sample_count,
+            "critic_parameter_delta_norm": critic_delta,
+            "actor_parameter_delta_norm": actor_delta,
+            "actor_branch_parameter_delta_norms": branch_deltas,
+            "actor_optimizer_steps": actor_steps_after,
+            "cache_full_information_teacher_calls": 0,
+            "uav_exact_teacher_calls": 0,
+            "cache_surrogate_updates": 0,
+            "popart_mean_before": None if popart_before is None else float(popart_before[0]),
+            "popart_std_before": None if popart_before is None else float(popart_before[1]),
+            "popart_raw_value_preservation_error": popart_preservation_error,
+            "warmup_seed": self.critic_warmup_seed,
+        }
 
     def _expected_checkpoint_version(self) -> int:
         if self.policy.architecture_id in JOINT_CACHE_UAV_POLICY_SCHEMAS:
@@ -5175,6 +5731,7 @@ class PPOV2Trainer:
 
         if not self._uses_exact_uav_operation_credit():
             return {}
+        self._require_critic_bootstrap_teacher_ready("UAV exact operation/candidate teacher")
         all_transitions = tuple(rollout.transitions)
         if target_transition_indices is None:
             transitions = all_transitions
@@ -5264,6 +5821,10 @@ class PPOV2Trainer:
         candidate_move_distances = np.full(
             (sample_count, head_count, candidate_capacity), np.nan, dtype=np.float64
         )
+        q_component_diagnostics: list[list[dict[str, Any]]] = [
+            [] for _ in range(sample_count)
+        ]
+        max_q_component_reconstruction_error = 0.0
         candidate_weighted_mean_residual = np.zeros(
             (sample_count, head_count), dtype=np.float64
         )
@@ -5705,8 +6266,22 @@ class PPOV2Trainer:
                 )
                 q_values = np.asarray(branch_rewards, dtype=np.float64)
                 q_values += float(self.hyperparameters.gamma) * next_values
-                if not np.all(np.isfinite(q_values)):
-                    raise FloatingPointError("proposed counterfactual Q is non-finite")
+                reconstructed_q = branch_rewards + float(
+                    self.hyperparameters.gamma
+                ) * next_values
+                component_error = np.abs(q_values - reconstructed_q)
+                if not (
+                    np.all(np.isfinite(branch_rewards))
+                    and np.all(np.isfinite(next_values))
+                    and np.all(np.isfinite(q_values))
+                    and np.all(np.isfinite(component_error))
+                ):
+                    raise FloatingPointError("proposed counterfactual Q components are non-finite")
+                max_q_component_reconstruction_error = max(
+                    max_q_component_reconstruction_error,
+                    float(np.max(component_error) if len(component_error) else 0.0),
+                )
+                branch_index_by_move: dict[int, int] = {}
                 q_stay_value = 0.0
                 move_values = np.zeros(move_count, dtype=np.float64)
                 for branch_index, (operation, candidate_index) in enumerate(branch_labels):
@@ -5714,6 +6289,7 @@ class PPOV2Trainer:
                         q_stay_value = float(q_values[branch_index])
                     else:
                         assert candidate_index is not None
+                        branch_index_by_move[int(candidate_index)] = int(branch_index)
                         move_values[candidate_index] = float(q_values[branch_index])
                 q_stay[plan.transition_index, head_index] = q_stay_value
                 if bool(head_result["stay_full_branch_feasible"]) and not math.isfinite(
@@ -5756,6 +6332,145 @@ class PPOV2Trainer:
                 baseline[plan.transition_index, head_index] = (
                     float(p_stay) * q_stay[plan.transition_index, head_index]
                     + float(p_move) * q_move[plan.transition_index, head_index]
+                )
+                stay_branch_index = next(
+                    (
+                        branch_index
+                        for branch_index, label in enumerate(branch_labels)
+                        if label == ("STAY", None)
+                    ),
+                    None,
+                )
+
+                def _branch_components(branch_index: int | None) -> dict[str, float] | None:
+                    if branch_index is None:
+                        return None
+                    return {
+                        "reward": float(branch_rewards[branch_index]),
+                        "next_v": float(next_values[branch_index]),
+                        "q": float(q_values[branch_index]),
+                    }
+
+                move_component_indices = [
+                    branch_index_by_move[int(candidate_index)]
+                    for candidate_index in np.flatnonzero(move_full_branch_feasible_mask)
+                    if int(candidate_index) in branch_index_by_move
+                ]
+                move_expectation_components: dict[str, float] | None = None
+                teacher_best_move: dict[str, Any] | None = None
+                selected_move: dict[str, Any] | None = None
+                if move_component_indices:
+                    feasible_move_indices = np.flatnonzero(move_full_branch_feasible_mask)
+                    best_move_index = int(
+                        feasible_move_indices[
+                            int(np.argmax(move_values[feasible_move_indices]))
+                        ]
+                    )
+                    best_branch_index = branch_index_by_move.get(best_move_index)
+                    if best_branch_index is None:
+                        raise RuntimeError("UAV teacher-best MOVE lacks its Exact-Q branch")
+                    teacher_best_move = {
+                        "candidate_index": best_move_index,
+                        "target_position": np.asarray(
+                            move_candidates[best_move_index].target_position,
+                            dtype=np.float64,
+                        ).tolist(),
+                        "proposal_source": str(
+                            move_candidates[best_move_index].proposal_source
+                        ),
+                        **_branch_components(best_branch_index),
+                    }
+                    expectation_reward = float(
+                        np.dot(candidate_probabilities, np.asarray([
+                            branch_rewards[branch_index_by_move[index]]
+                            if index in branch_index_by_move
+                            else 0.0
+                            for index in range(move_count)
+                        ], dtype=np.float64))
+                    )
+                    expectation_next_v = float(
+                        np.dot(candidate_probabilities, np.asarray([
+                            next_values[branch_index_by_move[index]]
+                            if index in branch_index_by_move
+                            else 0.0
+                            for index in range(move_count)
+                        ], dtype=np.float64))
+                    )
+                    expectation_q = float(q_move[plan.transition_index, head_index])
+                    move_expectation_components = {
+                        "reward": expectation_reward,
+                        "next_v": expectation_next_v,
+                        "q": expectation_q,
+                    }
+                    expectation_error = abs(
+                        expectation_q
+                        - (
+                            expectation_reward
+                            + float(self.hyperparameters.gamma) * expectation_next_v
+                        )
+                    )
+                    if not math.isfinite(expectation_error):
+                        raise FloatingPointError(
+                            "UAV teacher MOVE expectation reconstruction is non-finite"
+                        )
+                    max_q_component_reconstruction_error = max(
+                        max_q_component_reconstruction_error, expectation_error
+                    )
+                    selected_candidate_index = int(
+                        np.asarray(transition.uav_selected_indices, dtype=np.int64)[
+                            head_index
+                        ]
+                    )
+                    selected_branch_index = branch_index_by_move.get(
+                        selected_candidate_index
+                    )
+                    if selected_branch_index is not None:
+                        selected_move = {
+                            "candidate_index": selected_candidate_index,
+                            "target_position": np.asarray(
+                                move_candidates[selected_candidate_index].target_position,
+                                dtype=np.float64,
+                            ).tolist(),
+                            "proposal_source": str(
+                                move_candidates[selected_candidate_index].proposal_source
+                            ),
+                            **_branch_components(selected_branch_index),
+                        }
+                stay_components = _branch_components(stay_branch_index)
+                for named_components in (
+                    stay_components,
+                    move_expectation_components,
+                    teacher_best_move,
+                    selected_move,
+                ):
+                    if named_components is None:
+                        continue
+                    identity_error = abs(
+                        float(named_components["q"])
+                        - (
+                            float(named_components["reward"])
+                            + float(self.hyperparameters.gamma)
+                            * float(named_components["next_v"])
+                        )
+                    )
+                    if not math.isfinite(identity_error):
+                        raise FloatingPointError(
+                            "UAV Q component reconstruction is non-finite"
+                        )
+                    max_q_component_reconstruction_error = max(
+                        max_q_component_reconstruction_error, identity_error
+                    )
+                q_component_diagnostics[plan.transition_index].append(
+                    {
+                        "head_index": int(head_index),
+                        "uav_id": str(uav_id),
+                        "terminal": bool(plan.done),
+                        "stay": stay_components,
+                        "teacher_move_expectation": move_expectation_components,
+                        "teacher_best_move": teacher_best_move,
+                        "selected_move": selected_move,
+                        "critic_provenance_reference": "critic_parameter_digest_before_teacher",
+                    }
                 )
         counterfactual_environment_executions = aggregate_counts[
             "counterfactual_environment_executions"
@@ -6017,6 +6732,10 @@ class PPOV2Trainer:
             "advantage_centering": False,
             "advantage_sign_flip_count": sign_flip_count,
             "ratio_granularity": "OPERATION_ONLY",
+            "q_component_diagnostics": q_component_diagnostics,
+            "max_q_component_reconstruction_error": float(
+                max_q_component_reconstruction_error
+            ),
         }
 
     @staticmethod
@@ -6497,6 +7216,22 @@ class PPOV2Trainer:
 
     def update(self, rollout: SimpleRollout) -> UpdateResult:
         hyper = self.hyperparameters
+        actor_optimizer_steps_before_update = int(self.actor_optimizer_steps)
+        critic_optimizer_steps_before_update = int(self.critic_optimizer_steps)
+        proposed_teacher_required = self._requires_critic_bootstrap_teacher_warmup()
+        teacher_readiness: dict[str, Any] | None = None
+        critic_optimizer_steps_before_teacher: int | None = None
+        popart_mean_before_teacher: float | None = None
+        popart_std_before_teacher: float | None = None
+        critic_parameter_digest_before_teacher: str | None = None
+        teacher_generation_executed = False
+        cache_q_component_diagnostics: list[list[dict[str, Any]]] | None = None
+        uav_q_component_diagnostics: list[list[dict[str, Any]]] | None = None
+        max_q_component_reconstruction_error = 0.0
+        if proposed_teacher_required:
+            teacher_readiness = self._require_critic_bootstrap_teacher_ready(
+                "formal proposed-joint PPO update"
+            )
         bootstrap_value = 0.0
         if rollout.bootstrap_observation is not None:
             with torch.no_grad():
@@ -6758,7 +7493,32 @@ class PPOV2Trainer:
         if exact_uav_credit_enabled:
             if not branch_diagnostics_enabled:
                 raise RuntimeError("proposed operation credit requires joint branch diagnostics")
+            if proposed_teacher_required:
+                # Capture the critic that the formal Q teachers actually read.
+                # PopArt has already consumed this rollout's return statistics,
+                # but no critic optimizer step for this rollout has run yet.
+                critic_optimizer_steps_before_teacher = int(self.critic_optimizer_steps)
+                popart_mean_before_teacher, popart_std_before_teacher = (
+                    self.policy.popart_statistics()
+                )
+                critic_parameter_digest_before_teacher = self._critic_parameter_digest()
+                if self.critic_optimizer_steps_before_first_formal_teacher is None:
+                    self.critic_optimizer_steps_before_first_formal_teacher = int(
+                        self.critic_optimizer_steps
+                    )
             uav_operation_credit = self._compute_exact_uav_operation_credit(rollout)
+            teacher_generation_executed = True
+            uav_q_component_diagnostics = uav_operation_credit.get(
+                "q_component_diagnostics"
+            )
+            max_q_component_reconstruction_error = max(
+                max_q_component_reconstruction_error,
+                float(
+                    uav_operation_credit.get(
+                        "max_q_component_reconstruction_error", 0.0
+                    )
+                ),
+            )
             (
                 uav_operation_diagnostics,
                 uav_operation_diagnostic_arrays,
@@ -6814,6 +7574,19 @@ class PPOV2Trainer:
             cache_credit = evaluate_cache_full_information_values(
                 self,
                 rollout,
+                include_q_component_diagnostics=True,
+            )
+            teacher_generation_executed = True
+            cache_q_component_diagnostics = cache_credit.get(
+                "q_component_diagnostics"
+            )
+            max_q_component_reconstruction_error = max(
+                max_q_component_reconstruction_error,
+                float(
+                    cache_credit.get(
+                        "max_q_component_reconstruction_error", 0.0
+                    )
+                ),
             )
             self._update_cache_surrogate_gate(cache_credit)
         cache_trigger_teacher_probabilities_t = None
@@ -8625,51 +9398,84 @@ class PPOV2Trainer:
                     # Rebuild the critic graph after the actor step.  No graph
                     # is retained and the actor group is cleared before critic
                     # backward to enforce the reverse disjointness invariant.
-                    if popart_critic:
-                        critic_normalized_values = self.policy.critic_normalized_value(
-                            observations[indices]
-                        )
-                        critic_values = (
-                            self.policy.popart_mean
-                            + self.policy.popart_std * critic_normalized_values
-                        )
-                        critic_value_residual = critic_values.detach() - returns_t[indices]
-                        raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
-                        normalized_value_residual = (
-                            critic_normalized_values - critic_targets_t[indices]
+                    if self.policy.architecture_id in PROPOSED_POLICY_SCHEMAS:
+                        raw_value_loss, value_loss, critic_gradient_norm_value = (
+                            self._critic_minibatch_update(
+                                observations[indices],
+                                returns_t[indices],
+                                critic_targets_t[indices],
+                                critic_return_scale,
+                                popart_critic=popart_critic,
+                                actor_parameters=actor_parameters,
+                            )
                         )
                     else:
-                        critic_values = self.policy.critic_value(observations[indices])
-                        critic_value_residual = critic_values - returns_t[indices]
-                        raw_value_loss = 0.5 * torch.mean(critic_value_residual**2)
-                        normalized_value_residual = critic_value_residual / critic_return_scale
-                    value_loss = 0.5 * torch.mean(normalized_value_residual**2)
-                    # V5 backpropagates the configured scaled loss.  V6
-                    # backpropagates normalized-space loss.  In both cases
-                    # raw value loss remains a diagnostic-only metric.
+                        if popart_critic:
+                            critic_normalized_values = self.policy.critic_normalized_value(
+                                observations[indices]
+                            )
+                            critic_values = (
+                                self.policy.popart_mean
+                                + self.policy.popart_std * critic_normalized_values
+                            )
+                            critic_value_residual = (
+                                critic_values.detach() - returns_t[indices]
+                            )
+                            raw_value_loss = 0.5 * torch.mean(
+                                critic_value_residual**2
+                            )
+                            normalized_value_residual = (
+                                critic_normalized_values - critic_targets_t[indices]
+                            )
+                        else:
+                            critic_values = self.policy.critic_value(observations[indices])
+                            critic_value_residual = critic_values - returns_t[indices]
+                            raw_value_loss = 0.5 * torch.mean(
+                                critic_value_residual**2
+                            )
+                            normalized_value_residual = (
+                                critic_value_residual / critic_return_scale
+                            )
+                        value_loss = 0.5 * torch.mean(normalized_value_residual**2)
+                        critic_loss = value_loss
+                        if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
+                            torch.isfinite(value_loss).item()
+                        ) or not bool(torch.isfinite(critic_loss).item()):
+                            raise FloatingPointError("PPO v5 critic loss 非 finite。")
+                        critic_loss.backward()
+                        if any(
+                            parameter.grad is not None
+                            for parameter in actor_parameters
+                        ):
+                            raise RuntimeError(
+                                "PPO v5 critic backward touched actor parameters."
+                            )
+                        for parameter in critic_parameters:
+                            if parameter.grad is not None and not bool(
+                                torch.all(torch.isfinite(parameter.grad)).item()
+                            ):
+                                gradient_finite = False
+                        if not gradient_finite:
+                            raise FloatingPointError(
+                                "PPO v5 critic gradient 非 finite。"
+                            )
+                        critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
+                            critic_parameters, hyper.max_grad_norm
+                        )
+                        critic_gradient_norm_value = float(
+                            critic_gradient_norm.detach().cpu()
+                        )
+                        if not np.isfinite(critic_gradient_norm_value):
+                            raise FloatingPointError(
+                                "PPO v5 critic gradient norm 非 finite。"
+                            )
+                        self.critic_optimizer.step()
+                        self.critic_optimizer_steps += 1
                     critic_loss = value_loss
                     if not bool(torch.isfinite(raw_value_loss).item()) or not bool(
                         torch.isfinite(value_loss).item()
                     ) or not bool(torch.isfinite(critic_loss).item()):
                         raise FloatingPointError("PPO v5 critic loss 非 finite。")
-                    critic_loss.backward()
-                    if any(parameter.grad is not None for parameter in actor_parameters):
-                        raise RuntimeError("PPO v5 critic backward touched actor parameters.")
-                    for parameter in critic_parameters:
-                        if parameter.grad is not None and not bool(
-                            torch.all(torch.isfinite(parameter.grad)).item()
-                        ):
-                            gradient_finite = False
-                    if not gradient_finite:
-                        raise FloatingPointError("PPO v5 critic gradient 非 finite。")
-                    critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
-                        critic_parameters, hyper.max_grad_norm
-                    )
-                    critic_gradient_norm_value = float(critic_gradient_norm.detach().cpu())
-                    if not np.isfinite(critic_gradient_norm_value):
-                        raise FloatingPointError("PPO v5 critic gradient norm 非 finite。")
-                    self.critic_optimizer.step()
-                    self.critic_optimizer_steps += 1
                     total_loss = actor_loss.detach() + critic_loss.detach()
                     if not bool(torch.isfinite(total_loss).item()):
                         raise FloatingPointError("PPO v5 monitor total loss 非 finite。")
@@ -10963,6 +11769,40 @@ class PPOV2Trainer:
             ),
             cache_proposal_diagnostics=cache_proposal_diagnostics,
             uav_proposal_diagnostics=uav_proposal_diagnostics,
+            critic_bootstrap_teacher_warmup_complete=(
+                None
+                if not proposed_teacher_required
+                else bool(teacher_readiness["warmup_complete"])
+            ),
+            actor_update_executed=(
+                int(self.actor_optimizer_steps) > actor_optimizer_steps_before_update
+            ),
+            critic_update_executed=(
+                int(self.critic_optimizer_steps) > critic_optimizer_steps_before_update
+            ),
+            critic_optimizer_steps_before_update=critic_optimizer_steps_before_update,
+            critic_optimizer_steps_before_teacher=(
+                critic_optimizer_steps_before_teacher
+            ),
+            critic_optimizer_steps_after_update=int(self.critic_optimizer_steps),
+            popart_mean_before_teacher=popart_mean_before_teacher,
+            popart_std_before_teacher=popart_std_before_teacher,
+            critic_parameter_digest_before_teacher=(
+                critic_parameter_digest_before_teacher
+            ),
+            teacher_source=(
+                CRITIC_BOOTSTRAP_TEACHER_SOURCE
+                if teacher_generation_executed
+                else None
+            ),
+            teacher_generation_executed=bool(teacher_generation_executed),
+            cache_q_component_diagnostics=cache_q_component_diagnostics,
+            uav_q_component_diagnostics=uav_q_component_diagnostics,
+            max_q_component_reconstruction_error=(
+                float(max_q_component_reconstruction_error)
+                if teacher_generation_executed
+                else math.nan
+            ),
         )
 
     def checkpoint_payload(
@@ -10981,6 +11821,10 @@ class PPOV2Trainer:
         completed_training_episodes = int(completed_episodes)
         if completed_training_episodes < 0:
             raise ValueError("completed_training_episodes must be non-negative")
+        self._validate_critic_warmup_lifecycle(
+            completed_training_episodes,
+            actor_optimizer_steps=self.actor_optimizer_steps,
+        )
         resolved_pool_index = (
             completed_training_episodes
             if next_pool_index is None
@@ -11054,6 +11898,12 @@ class PPOV2Trainer:
                 "torch": torch.get_rng_state(),
             },
         }
+        if self._requires_critic_bootstrap_teacher_warmup():
+            payload["rng_state"]["torch_cuda"] = (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            )
         if self.cache_surrogate_ensemble is not None:
             payload.update(
                 {
@@ -11111,6 +11961,8 @@ class PPOV2Trainer:
             )
         if episode_seed_start is not None:
             payload["episode_seed_start"] = int(episode_seed_start)
+        if self._requires_critic_bootstrap_teacher_warmup():
+            payload.update(self.critic_bootstrap_teacher_metadata())
         if self._uses_separate_optimization():
             if self.critic_optimizer is None:
                 raise RuntimeError("separate critic optimizer is not initialized")
@@ -11269,8 +12121,89 @@ class PPOV2Trainer:
                 f"expected={expected_scale_mode}."
             )
         expected_version = self._expected_checkpoint_version()
+        if (
+            self._requires_critic_bootstrap_teacher_warmup()
+            and int(payload.get("checkpoint_version", -1)) == 25
+        ):
+            raise ValueError(
+                "proposed-joint checkpoint v25 is incompatible with the critic warmup lifecycle; "
+                "version 25 checkpoints are not migrated"
+            )
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
+        if self._requires_critic_bootstrap_teacher_warmup():
+            required_lifecycle_fields = {
+                "critic_bootstrap_teacher_warmup_complete",
+                "critic_warmup_rollout_slots",
+                "critic_warmup_optimizer_steps",
+                "critic_warmup_seed",
+                "critic_warmup_seed_namespace",
+                "critic_warmup_update_rng_seed",
+                "critic_optimizer_steps_before_first_formal_teacher",
+            }
+            missing_lifecycle_fields = required_lifecycle_fields - set(payload)
+            if missing_lifecycle_fields:
+                raise ValueError(
+                    "proposed v26 checkpoint is missing critic warmup lifecycle state: "
+                    + ", ".join(sorted(missing_lifecycle_fields))
+                )
+            warmup_flag = payload["critic_bootstrap_teacher_warmup_complete"]
+            if not isinstance(warmup_flag, bool):
+                raise ValueError(
+                    "checkpoint critic_bootstrap_teacher_warmup_complete must be boolean"
+                )
+            if payload["critic_warmup_seed_namespace"] != CRITIC_BOOTSTRAP_WARMUP_NAMESPACE:
+                raise ValueError("checkpoint critic warmup seed namespace mismatch")
+            for field in ("critic_warmup_rollout_slots", "critic_warmup_optimizer_steps"):
+                value = payload[field]
+                if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                    raise ValueError(f"checkpoint {field} must be an integer")
+            for field in ("critic_warmup_seed", "critic_warmup_update_rng_seed"):
+                value = payload[field]
+                if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, np.integer))
+                ):
+                    raise ValueError(f"checkpoint {field} must be an integer or null")
+            first_teacher_value = payload[
+                "critic_optimizer_steps_before_first_formal_teacher"
+            ]
+            if first_teacher_value is not None and (
+                isinstance(first_teacher_value, bool)
+                or not isinstance(first_teacher_value, (int, np.integer))
+            ):
+                raise ValueError(
+                    "checkpoint critic_optimizer_steps_before_first_formal_teacher "
+                    "must be an integer or null"
+                )
+            self.critic_bootstrap_teacher_warmup_complete = warmup_flag
+            self.critic_warmup_rollout_slots = int(
+                payload["critic_warmup_rollout_slots"]
+            )
+            self.critic_warmup_optimizer_steps = int(
+                payload["critic_warmup_optimizer_steps"]
+            )
+            raw_warmup_seed = payload["critic_warmup_seed"]
+            self.critic_warmup_seed = (
+                None if raw_warmup_seed is None else int(raw_warmup_seed)
+            )
+            raw_update_rng_seed = payload["critic_warmup_update_rng_seed"]
+            self.critic_warmup_update_rng_seed = (
+                None if raw_update_rng_seed is None else int(raw_update_rng_seed)
+            )
+            raw_first_teacher_steps = payload[
+                "critic_optimizer_steps_before_first_formal_teacher"
+            ]
+            self.critic_optimizer_steps_before_first_formal_teacher = (
+                None
+                if raw_first_teacher_steps is None
+                else int(raw_first_teacher_steps)
+            )
+            if min(
+                self.critic_warmup_rollout_slots,
+                self.critic_warmup_optimizer_steps,
+            ) < 0:
+                raise ValueError("checkpoint critic warmup counters must be non-negative")
         for field, expected in self.cache_credit_metadata().items():
             if field == "CACHE_TRIGGER_TEACHER_TEMPERATURE":
                 continue
@@ -11554,6 +12487,12 @@ class PPOV2Trainer:
             np.random.set_state(rng_state["numpy"])
         if "torch" in rng_state:
             torch.set_rng_state(rng_state["torch"])
+        if rng_state.get("torch_cuda") is not None:
+            if not torch.cuda.is_available():
+                raise ValueError(
+                    "checkpoint contains CUDA RNG state but CUDA is unavailable"
+                )
+            torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
         if "cache_surrogate" in rng_state:
             self.cache_surrogate_rng.bit_generator.state = rng_state[
                 "cache_surrogate"
@@ -11570,6 +12509,10 @@ class PPOV2Trainer:
             raise ValueError(
                 "PPO checkpoint completed_training_episodes is invalid or inconsistent."
             )
+        self._validate_critic_warmup_lifecycle(
+            completed_training_episodes,
+            actor_optimizer_steps=self.actor_optimizer_steps,
+        )
         raw_next_pool_index = payload.get("next_pool_index", completed_training_episodes)
         next_pool_index = int(raw_next_pool_index)
         if next_pool_index < 0:
@@ -11779,6 +12722,38 @@ def run_training(
         lr_experiment_value=lr_experiment_value,
         exact_q_parallel_workers=exact_q_parallel_workers,
     )
+    critic_warmup_required = trainer._requires_critic_bootstrap_teacher_warmup()
+    effective_episode_seed_start = episode_seed_start
+    warmup_realization_seed: int | None = None
+    warmup_generation_rng_seed: int | None = None
+    warmup_collection_seed: int | None = None
+    warmup_optimizer_seed: int | None = None
+    if critic_warmup_required and not resume:
+        warmup_seed_root = int(
+            episode_seed_start if episode_seed_start is not None else seed
+        )
+        warmup_realization_seed = derive_namespaced_seed(
+            warmup_seed_root,
+            CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+            "episode_realization",
+        )
+        warmup_generation_rng_seed = derive_namespaced_seed(
+            warmup_realization_seed,
+            CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+            "episode_generation",
+        )
+        warmup_collection_seed = derive_namespaced_seed(
+            warmup_realization_seed,
+            CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+            "rollout_collection",
+        )
+        warmup_optimizer_seed = derive_namespaced_seed(
+            warmup_realization_seed,
+            CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+            "critic_optimizer",
+        )
+        trainer.critic_warmup_seed = warmup_realization_seed
+        trainer.critic_warmup_update_rng_seed = warmup_optimizer_seed
     architecture_version = int(getattr(trainer.policy, "architecture_version", 1))
     ensure_run_artifact_directories(run_path, architecture_version)
     config_hash = _config_hash(config_path)
@@ -11828,6 +12803,8 @@ def run_training(
         )
         if completed_episodes > target_epochs:
             raise ValueError("checkpoint completed epochs exceed target epochs")
+        if cursor.episode_seed_start is not None and effective_episode_seed_start is None:
+            effective_episode_seed_start = int(cursor.episode_seed_start)
         if seed_based_pool:
             if (
                 cursor.episode_seed_start is not None
@@ -11904,6 +12881,206 @@ def run_training(
                         context.initial_cache, dtype=np.int8
                     ).copy()
                     current_uav_positions = _copy_uav_positions(context.initial_uav)
+        if critic_warmup_required:
+            warmup_seed_root = int(
+                effective_episode_seed_start
+                if effective_episode_seed_start is not None
+                else seed
+            )
+            expected_warmup_realization_seed = derive_namespaced_seed(
+                warmup_seed_root,
+                CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+                "episode_realization",
+            )
+            expected_warmup_collection_seed = derive_namespaced_seed(
+                expected_warmup_realization_seed,
+                CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+                "rollout_collection",
+            )
+            expected_warmup_generation_rng_seed = derive_namespaced_seed(
+                expected_warmup_realization_seed,
+                CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+                "episode_generation",
+            )
+            expected_warmup_optimizer_seed = derive_namespaced_seed(
+                expected_warmup_realization_seed,
+                CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+                "critic_optimizer",
+            )
+            if (
+                trainer.critic_warmup_seed is not None
+                and int(trainer.critic_warmup_seed)
+                != expected_warmup_realization_seed
+            ):
+                raise ValueError("checkpoint critic warmup realization seed mismatch")
+            if (
+                trainer.critic_warmup_update_rng_seed is not None
+                and int(trainer.critic_warmup_update_rng_seed)
+                != expected_warmup_optimizer_seed
+            ):
+                raise ValueError("checkpoint critic warmup optimizer seed mismatch")
+            trainer.critic_warmup_seed = expected_warmup_realization_seed
+            trainer.critic_warmup_update_rng_seed = expected_warmup_optimizer_seed
+            warmup_realization_seed = expected_warmup_realization_seed
+            warmup_generation_rng_seed = expected_warmup_generation_rng_seed
+            warmup_collection_seed = expected_warmup_collection_seed
+            warmup_optimizer_seed = expected_warmup_optimizer_seed
+            update_run_manifest_teacher_state(
+                run_path / RUN_MANIFEST_FILENAME,
+                trainer,
+            )
+    elif critic_warmup_required:
+        trainer.save_checkpoint(
+            run_path,
+            completed_episodes,
+            current_train_origin,
+            current_cache_state,
+            current_uav_positions,
+            config_hash,
+            int(rollout_steps),
+            best_epoch=best_epoch,
+            best_epoch_return=best_epoch_return,
+            next_pool_index=next_pool_index,
+            episode_seed_start=effective_episode_seed_start,
+        )
+
+    if critic_warmup_required and not trainer.critic_bootstrap_teacher_warmup_complete:
+        if (
+            warmup_realization_seed is None
+            or warmup_generation_rng_seed is None
+            or warmup_collection_seed is None
+            or warmup_optimizer_seed is None
+        ):
+            raise RuntimeError("proposed critic warmup seed namespace was not initialized")
+        if completed_episodes != 0:
+            raise RuntimeError(
+                "proposed critic warmup cannot start after a formal epoch has completed"
+            )
+        warmup_context = context
+        warmup_realization_directory: str | None = None
+        if full_episode_protocol:
+            assert context.data_protocol == project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
+            warmup_generator = episode_generator or _load_single_episode_generator(
+                base_context.root
+            )
+            warmup_realization_path = (
+                run_path
+                / "critic_bootstrap_warmup"
+                / f"episode_{warmup_realization_seed}"
+            )
+            warmup_artifacts, _warmup_realization_action = _run_with_isolated_rng(
+                int(warmup_generation_rng_seed),
+                lambda: _ensure_episode_realization(
+                    base_context,
+                    config_path,
+                    warmup_realization_path,
+                    warmup_realization_seed,
+                    generate_missing=True,
+                    generation_device=episode_generation_device,
+                    generator_module=warmup_generator,
+                ),
+            )
+            warmup_context = load_environment_context(
+                config_path,
+                realization_dir=warmup_artifacts.directory,
+            )
+            _assert_realization_context_compatible(context, warmup_context)
+            warmup_realization_directory = str(warmup_artifacts.directory)
+        saved_context = trainer.context
+        try:
+            trainer.context = warmup_context
+            warmup_rollout = _run_with_isolated_rng(
+                int(warmup_collection_seed),
+                lambda: trainer.collect_chunk(
+                    warmup_context.train_origin_start,
+                    np.asarray(warmup_context.initial_cache, dtype=np.int8).copy(),
+                    _copy_uav_positions(warmup_context.initial_uav),
+                    int(rollout_steps),
+                ),
+            )
+            warmup_metrics = trainer.warmup_critic(
+                warmup_rollout,
+                rng_seed=int(warmup_optimizer_seed),
+            )
+        finally:
+            trainer.context = saved_context
+        warmup_checkpoint = trainer.save_checkpoint(
+            run_path,
+            completed_episodes,
+            current_train_origin,
+            current_cache_state,
+            current_uav_positions,
+            config_hash,
+            int(rollout_steps),
+            best_epoch=best_epoch,
+            best_epoch_return=best_epoch_return,
+            next_pool_index=next_pool_index,
+            episode_seed_start=effective_episode_seed_start,
+        )
+        update_run_manifest_teacher_state(
+            run_path / RUN_MANIFEST_FILENAME,
+            trainer,
+        )
+        _append_jsonl(
+            update_metrics_path,
+            {
+                "record_type": "update",
+                "update_phase": "CRITIC_WARMUP",
+                "seed": seed,
+                "episode": None,
+                "epoch": None,
+                "training_episode_index": None,
+                "completed_epochs": 0,
+                "formal_epoch_count": 0,
+                "origin_start": int(warmup_context.train_origin_start),
+                "origin_end": int(warmup_context.train_origin_end),
+                "num_transitions": int(len(warmup_rollout.transitions)),
+                "actor_update_executed": False,
+                "critic_update_executed": True,
+                "teacher_generation_executed": False,
+                "critic_bootstrap_teacher_warmup_complete": True,
+                "critic_optimizer_steps_before": int(
+                    warmup_metrics["critic_optimizer_steps_before"]
+                ),
+                "critic_optimizer_steps_after": int(
+                    warmup_metrics["critic_optimizer_steps_after"]
+                ),
+                "critic_warmup_rollout_slots": int(
+                    warmup_metrics["rollout_slots"]
+                ),
+                "critic_warmup_optimizer_steps_planned": int(
+                    warmup_metrics["planned_critic_optimizer_steps"]
+                ),
+                "critic_warmup_optimizer_steps_executed": int(
+                    warmup_metrics["executed_critic_optimizer_steps"]
+                ),
+                "cache_trigger_actor_optimizer_steps": 0,
+                "cache_candidate_actor_optimizer_steps": 0,
+                "uav_operation_actor_optimizer_steps": 0,
+                "uav_candidate_actor_optimizer_steps": 0,
+                "cache_full_information_teacher_calls": 0,
+                "uav_exact_teacher_calls": 0,
+                "cache_surrogate_updates": 0,
+                "critic_parameter_delta_norm": float(
+                    warmup_metrics["critic_parameter_delta_norm"]
+                ),
+                "actor_parameter_delta_norm": float(
+                    warmup_metrics["actor_parameter_delta_norm"]
+                ),
+                "actor_branch_parameter_delta_norms": dict(
+                    warmup_metrics["actor_branch_parameter_delta_norms"]
+                ),
+                "popart_mean_before": warmup_metrics["popart_mean_before"],
+                "popart_std_before": warmup_metrics["popart_std_before"],
+                "popart_raw_value_preservation_error": float(
+                    warmup_metrics["popart_raw_value_preservation_error"]
+                ),
+                "critic_warmup_seed": int(warmup_realization_seed),
+                "critic_warmup_seed_namespace": CRITIC_BOOTSTRAP_WARMUP_NAMESPACE,
+                "critic_warmup_realization_directory": warmup_realization_directory,
+                "checkpoint": warmup_checkpoint.relative_to(run_path).as_posix(),
+            },
+        )
 
     origins_per_epoch = context.train_origin_end - context.train_origin_start + 1
     update_run_summary(
@@ -11914,6 +13091,7 @@ def run_training(
         target_epochs=target_epochs,
         status="completed" if completed_episodes >= target_epochs else "running",
         protocol_metadata=protocol_metadata,
+        lifecycle_metadata=trainer.critic_bootstrap_teacher_metadata(),
     )
     git_sha_display = manifest.get("git_commit_sha") or "null"
     if len(git_sha_display) > 12:
@@ -12160,10 +13338,6 @@ def run_training(
         update_started_at = time.perf_counter()
         update = trainer.update(rollout)
         update_runtime_seconds = float(time.perf_counter() - update_started_at)
-        update_run_manifest_teacher_state(
-            run_path / RUN_MANIFEST_FILENAME,
-            trainer,
-        )
         if update.uav_operation_diagnostic_arrays is not None:
             episode_uav_operation_diagnostic_arrays.append(
                 update.uav_operation_diagnostic_arrays
@@ -12185,9 +13359,13 @@ def run_training(
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
             next_pool_index=next_pool_index,
-            episode_seed_start=episode_seed_start,
+            episode_seed_start=effective_episode_seed_start,
         )
         checkpoint_relative_path = checkpoint_path.relative_to(run_path).as_posix()
+        update_run_manifest_teacher_state(
+            run_path / RUN_MANIFEST_FILENAME,
+            trainer,
+        )
         cache_count = len(context.action_spec.cache_node_ids)
         transition_count = len(rollout.transitions)
         cache_requests = int(rollout.actions[:, :cache_count].sum())
@@ -12445,6 +13623,7 @@ def run_training(
             update_metrics_path,
             {
                 "record_type": "update",
+                "update_phase": "FORMAL_PPO",
                 "seed": seed,
                 "episode": episode_number,
                 "epoch": episode_number,
@@ -12474,6 +13653,37 @@ def run_training(
                     trainer.hyperparameters.advantage_normalization_mode
                 ),
                 "optimizer_steps": int(update.optimizer_steps),
+                "actor_update_executed": bool(update.actor_update_executed),
+                "critic_update_executed": bool(update.critic_update_executed),
+                "teacher_generation_executed": bool(
+                    update.teacher_generation_executed
+                ),
+                "critic_bootstrap_teacher_warmup_complete": (
+                    update.critic_bootstrap_teacher_warmup_complete
+                ),
+                "critic_optimizer_steps_before": int(
+                    update.critic_optimizer_steps_before_update
+                ),
+                "critic_optimizer_steps_before_teacher": (
+                    update.critic_optimizer_steps_before_teacher
+                ),
+                "critic_optimizer_steps_after": int(
+                    update.critic_optimizer_steps_after_update
+                ),
+                "critic_optimizer_steps_after_update": int(
+                    update.critic_optimizer_steps_after_update
+                ),
+                "popart_mean_before_teacher": update.popart_mean_before_teacher,
+                "popart_std_before_teacher": update.popart_std_before_teacher,
+                "critic_parameter_digest_before_teacher": (
+                    update.critic_parameter_digest_before_teacher
+                ),
+                "teacher_source": update.teacher_source,
+                "max_q_component_reconstruction_error": (
+                    None
+                    if not np.isfinite(update.max_q_component_reconstruction_error)
+                    else float(update.max_q_component_reconstruction_error)
+                ),
                 "actor_optimizer_steps": int(update.actor_optimizer_steps),
                 "critic_optimizer_steps": int(update.critic_optimizer_steps),
                 "policy_loss": float(update.policy_loss),
@@ -12691,7 +13901,7 @@ def run_training(
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
                     next_pool_index=next_pool_index,
-                    episode_seed_start=episode_seed_start,
+                    episode_seed_start=effective_episode_seed_start,
                 )
                 checkpoint_path = trainer.save_checkpoint(
                     run_path,
@@ -12704,7 +13914,7 @@ def run_training(
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
                     next_pool_index=next_pool_index,
-                    episode_seed_start=episode_seed_start,
+                    episode_seed_start=effective_episode_seed_start,
                 )
             if (
                 context.policy_schema in PROPOSED_POLICY_SCHEMAS
@@ -12722,7 +13932,7 @@ def run_training(
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
                     next_pool_index=next_pool_index,
-                    episode_seed_start=episode_seed_start,
+                    episode_seed_start=effective_episode_seed_start,
                 )
             _append_jsonl(
                 episode_metrics_path,
@@ -12870,6 +14080,7 @@ def run_training(
                     else "running"
                 ),
                 protocol_metadata=protocol_metadata,
+                lifecycle_metadata=trainer.critic_bootstrap_teacher_metadata(),
             )
             should_update_plot = (
                 completed_episodes % PLOT_UPDATE_INTERVAL_EPOCHS == 0
