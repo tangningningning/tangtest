@@ -1245,7 +1245,7 @@ def evaluate_cache_full_information_values(
                         float(exact_by_index[int(candidate_index)] - keep_value)
                     )
                     exact_group_labels.append(
-                        int(sample_index * node_count + node_index)
+                        int(int(transition.origin_index) * node_count + node_index)
                     )
                 if full_exact_row:
                     exact_delta = exact_by_index - keep_value

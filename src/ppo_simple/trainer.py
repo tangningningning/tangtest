@@ -97,7 +97,7 @@ REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
 # Full-information Cache Trigger/Candidate teachers change the actor objective;
 # proposed-joint checkpoints from earlier Cache objectives cannot be resumed.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 21
+JOINT_PROPOSED_CHECKPOINT_VERSION = 22
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
@@ -108,6 +108,7 @@ CACHE_SURROGATE_HIDDEN_DIM = 64
 CACHE_SURROGATE_LEARNING_RATE = 1.0e-3
 CACHE_SURROGATE_AUDIT_INTERVAL = 20
 CACHE_SURROGATE_AUDIT_WINDOW = 3
+CACHE_SURROGATE_MAX_RANK_PAIRS_PER_GROUP = 512
 KL_GATE_MODE_JOINT = "joint"
 KL_GATE_MODE_BRANCH_SPECIFIC = "branch_specific"
 CACHE_KL_CONTROL_EPOCH = "epoch"
@@ -4517,8 +4518,36 @@ class PPOV2Trainer:
             [member(context_tensor, feature_tensor).squeeze(-1) for member in self.cache_surrogate_ensemble],
             dim=0,
         )
-        mse_loss = torch.mean((predictions - target_tensor.unsqueeze(0)) ** 2)
+        if ranking_group_ids is None:
+            raise ValueError("group-equal Cache surrogate training requires state-head group ids")
+        group_values = np.asarray(ranking_group_ids).reshape(-1)
+        if group_values.shape != (len(targets),):
+            raise ValueError("Cache surrogate state-head group ids are not aligned")
+        ordered_group_ids = tuple(dict.fromkeys(group_values.tolist()))
+        if not ordered_group_ids:
+            raise ValueError("Cache surrogate training requires at least one state-head group")
+        group_members = [
+            np.flatnonzero(group_values == group_id) for group_id in ordered_group_ids
+        ]
+        if any(not len(members) for members in group_members):
+            raise AssertionError("Cache surrogate group membership is empty")
+
+        squared_errors = (predictions - target_tensor.unsqueeze(0)) ** 2
+        group_index_tensors = [
+            torch.as_tensor(members, dtype=torch.long, device=self.device)
+            for members in group_members
+        ]
+        # Each ensemble member first averages over candidates inside a state/head;
+        # member and group dimensions are then averaged without candidate-count bias.
+        mse_loss = torch.stack(
+            [
+                torch.mean(squared_errors[:, member_indices])
+                for member_indices in group_index_tensors
+            ]
+        ).mean()
         pairwise_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        pair_counts: list[int] = []
+        hard_negative_count = 0
         objective = self.cache_surrogate_objective
         effective_ranking_weight = (
             self.cache_surrogate_ranking_weight
@@ -4526,31 +4555,113 @@ class PPOV2Trainer:
             else float(ranking_weight)
         )
         if objective == "MSE_PLUS_RANKING":
-            if ranking_group_ids is None:
-                raise ValueError("pairwise Cache ranking requires state-head group ids")
-            group_values = np.asarray(ranking_group_ids).reshape(-1)
-            if group_values.shape != (len(targets),):
-                raise ValueError("Cache surrogate ranking group ids are not aligned")
-            pair_left: list[int] = []
-            pair_right: list[int] = []
-            pair_sign: list[float] = []
-            for group_id in dict.fromkeys(group_values.tolist()):
-                members = np.flatnonzero(group_values == group_id)
-                for offset, left in enumerate(members[:-1]):
-                    right = members[offset + 1 :]
-                    delta = targets[int(left)] - targets[right]
-                    ordered = np.flatnonzero(np.abs(delta) > 1.0e-8)
-                    pair_left.extend([int(left)] * len(ordered))
-                    pair_right.extend(int(value) for value in right[ordered])
-                    pair_sign.extend(np.sign(delta[ordered]).astype(float).tolist())
-            if pair_left:
-                left_tensor = torch.as_tensor(pair_left, dtype=torch.long, device=self.device)
-                right_tensor = torch.as_tensor(pair_right, dtype=torch.long, device=self.device)
-                sign_tensor = torch.as_tensor(pair_sign, dtype=torch.float32, device=self.device)
+            mean_predictions = (
+                predictions.detach().mean(dim=0).cpu().numpy().astype(np.float64)
+            )
+            service_count = (int(features.shape[1]) - 21) // 6
+            if 21 + 6 * service_count != int(features.shape[1]):
+                raise ValueError("Cache target feature width cannot resolve service count")
+            delta_start = 4 + 2 * service_count
+            group_ranking_losses: list[Any] = []
+            for members in group_members:
+                local_targets = targets[members].astype(np.float64)
+                local_predictions = mean_predictions[members]
+                count = len(members)
+                exact_order = np.argsort(-local_targets, kind="mergesort")
+                predicted_order = np.argsort(-local_predictions, kind="mergesort")
+                q_range = float(np.max(local_targets) - np.min(local_targets))
+                near_tolerance = max(1.0e-3, 0.01 * q_range)
+                near_best = set(
+                    int(value)
+                    for value in np.flatnonzero(
+                        local_targets >= float(np.max(local_targets)) - near_tolerance
+                    )
+                )
+                exact_ranks = np.empty(count, dtype=np.int64)
+                exact_ranks[exact_order] = np.arange(count, dtype=np.int64)
+                predicted_top = predicted_order[: min(16, count)]
+                hard_negative_threshold = max(3, int(math.ceil(0.25 * count)))
+                hard_negatives = [
+                    int(value)
+                    for value in predicted_top
+                    if int(value) not in near_best
+                    and int(exact_ranks[int(value)]) >= hard_negative_threshold
+                ]
+                hard_negative_count += len(hard_negatives)
+
+                local_pairs: list[tuple[int, int]] = []
+                seen_pairs: set[tuple[int, int]] = set()
+
+                def add_pair(left: int, right: int) -> None:
+                    if len(local_pairs) >= CACHE_SURROGATE_MAX_RANK_PAIRS_PER_GROUP:
+                        return
+                    if left == right or abs(float(local_targets[left] - local_targets[right])) <= 1.0e-8:
+                        return
+                    pair = (min(int(left), int(right)), max(int(left), int(right)))
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        local_pairs.append(pair)
+
+                best = int(exact_order[0])
+                # Global-best comparisons are the primary signal.
+                for other in exact_order[1:]:
+                    add_pair(best, int(other))
+                # Prediction-high/exact-low candidates receive explicit hard-negative pressure.
+                for hard_negative in hard_negatives:
+                    add_pair(best, hard_negative)
+                    for near_index in sorted(near_best):
+                        add_pair(near_index, hard_negative)
+                # Retain representatives across reconfiguration Hamming shells.
+                local_deltas = features[
+                    members, delta_start : delta_start + service_count
+                ]
+                shell_ids = np.count_nonzero(np.abs(local_deltas) > 0.5, axis=1)
+                shell_representatives = [
+                    int(max(np.flatnonzero(shell_ids == shell), key=lambda i: local_targets[int(i)]))
+                    for shell in sorted(set(int(value) for value in shell_ids))
+                ]
+                for offset, left in enumerate(shell_representatives[:-1]):
+                    for right in shell_representatives[offset + 1 :]:
+                        add_pair(left, right)
+                # Add top-3/near-best comparisons, then close-rank pairs, until the cap.
+                priority_high = list(dict.fromkeys([int(v) for v in exact_order[:3]] + sorted(near_best)))
+                for high in priority_high:
+                    for lower in exact_order[3:]:
+                        add_pair(high, int(lower))
+                for left, right in zip(exact_order[:-1], exact_order[1:]):
+                    add_pair(int(left), int(right))
+
+                pair_counts.append(len(local_pairs))
+                if not local_pairs:
+                    group_ranking_losses.append(
+                        torch.zeros((), dtype=torch.float32, device=self.device)
+                    )
+                    continue
+                left_tensor = torch.as_tensor(
+                    [int(members[left]) for left, _ in local_pairs],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                right_tensor = torch.as_tensor(
+                    [int(members[right]) for _, right in local_pairs],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                signs = np.asarray(
+                    [
+                        np.sign(local_targets[left] - local_targets[right])
+                        for left, right in local_pairs
+                    ],
+                    dtype=np.float32,
+                )
+                sign_tensor = torch.as_tensor(signs, dtype=torch.float32, device=self.device)
                 pair_differences = predictions[:, left_tensor] - predictions[:, right_tensor]
-                pairwise_loss = torch.nn.functional.softplus(
-                    -pair_differences * sign_tensor.unsqueeze(0)
-                ).mean()
+                group_ranking_losses.append(
+                    torch.nn.functional.softplus(
+                        -pair_differences * sign_tensor.unsqueeze(0)
+                    ).mean()
+                )
+            pairwise_loss = torch.stack(group_ranking_losses).mean()
         loss = mse_loss + effective_ranking_weight * pairwise_loss
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("Cache surrogate regression loss is non-finite")
@@ -4573,6 +4684,20 @@ class PPOV2Trainer:
             "pairwise_ranking_loss": float(pairwise_loss.detach().cpu()),
             "objective": objective,
             "ranking_weight": effective_ranking_weight,
+            "group_count": int(len(group_members)),
+            "max_rank_pairs_per_group": int(CACHE_SURROGATE_MAX_RANK_PAIRS_PER_GROUP),
+            "rank_pair_count": int(sum(pair_counts)),
+            "rank_pairs_per_group_mean": (
+                float(np.mean(pair_counts)) if pair_counts else 0.0
+            ),
+            "rank_pairs_per_group_p50": (
+                float(np.percentile(pair_counts, 50.0)) if pair_counts else 0.0
+            ),
+            "rank_pairs_per_group_p90": (
+                float(np.percentile(pair_counts, 90.0)) if pair_counts else 0.0
+            ),
+            "rank_pairs_per_group_max": int(max(pair_counts)) if pair_counts else 0,
+            "hard_negative_count": int(hard_negative_count),
             "mae": mae,
             "rmse": rmse,
         }
