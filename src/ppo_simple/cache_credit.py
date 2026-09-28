@@ -843,6 +843,111 @@ def _robust_mad_scale(values: np.ndarray, epsilon: float, maximum: float) -> flo
     return float(np.clip(estimate, lower, upper))
 
 
+def state_head_candidate_teacher(
+    values: np.ndarray,
+    mask: np.ndarray,
+    epsilon: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Build one locally normalized Candidate teacher and its diagnostics."""
+
+    q_values = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(mask, dtype=bool)
+    lower = float(epsilon)
+    if q_values.shape != valid.shape or not math.isfinite(lower) or lower <= 0.0:
+        raise ValueError("Candidate teacher Q/mask/epsilon is invalid")
+    probabilities = np.zeros_like(q_values, dtype=np.float64)
+    legal_q = q_values[valid]
+    if not len(legal_q):
+        return probabilities, {
+            "candidate_count": 0,
+            "q_min": None,
+            "q_max": None,
+            "q_range": None,
+            "median": None,
+            "mad": None,
+            "resolved_scale": None,
+            "fallback_type": "NO_LEGAL_CANDIDATE",
+            "teacher_entropy": None,
+            "teacher_top1_probability": None,
+            "teacher_top1_top2_probability_gap": None,
+            "teacher_argmax": None,
+            "normalized_top1_top2_q_gap": None,
+        }
+    if not np.all(np.isfinite(legal_q)):
+        raise FloatingPointError("Candidate teacher received non-finite legal Q values")
+
+    center = float(np.median(legal_q))
+    absolute_deviation = np.abs(legal_q - center)
+    mad = float(np.median(absolute_deviation))
+    robust_scale = 1.4826 * mad
+    standard_deviation = float(np.std(legal_q))
+    value_range = float(np.max(legal_q) - np.min(legal_q))
+    equivalent = value_range <= lower
+    if equivalent:
+        scale = lower
+        fallback_type = "EQUAL_Q_EPSILON"
+        normalized = np.zeros_like(legal_q)
+    else:
+        scale_candidates = (
+            (robust_scale, "MAD_1P4826"),
+            (standard_deviation, "STD_FALLBACK"),
+            (value_range, "RANGE_FALLBACK"),
+            (lower, "EPSILON_FALLBACK"),
+        )
+        scale, fallback_type = next(
+            (float(candidate), label)
+            for candidate, label in scale_candidates
+            if math.isfinite(float(candidate)) and float(candidate) > 0.0
+        )
+        normalized = (legal_q - center) / scale
+    if not math.isfinite(scale) or scale <= 0.0 or not np.all(np.isfinite(normalized)):
+        raise FloatingPointError("Candidate state-head normalization is non-finite")
+
+    legal_probabilities = _stable_masked_softmax(
+        normalized,
+        np.ones(len(normalized), dtype=bool),
+        1.0,
+    )
+    probabilities[valid] = legal_probabilities
+    if not np.all(np.isfinite(probabilities)):
+        raise FloatingPointError("Candidate state-head teacher is non-finite")
+    ordered_probabilities = np.sort(legal_probabilities)[::-1]
+    ordered_q = np.sort(legal_q)[::-1]
+    entropy = float(
+        -np.sum(
+            legal_probabilities
+            * np.log(np.maximum(legal_probabilities, 1.0e-300))
+        )
+    )
+    top_gap = (
+        float(ordered_probabilities[0] - ordered_probabilities[1])
+        if len(ordered_probabilities) > 1
+        else 1.0
+    )
+    normalized_q_gap = (
+        float((ordered_q[0] - ordered_q[1]) / scale)
+        if len(ordered_q) > 1
+        else 0.0
+    )
+    legal_indices = np.flatnonzero(valid)
+    teacher_argmax = int(legal_indices[int(np.argmax(legal_probabilities))])
+    return probabilities, {
+        "candidate_count": int(len(legal_q)),
+        "q_min": float(np.min(legal_q)),
+        "q_max": float(np.max(legal_q)),
+        "q_range": value_range,
+        "median": center,
+        "mad": mad,
+        "resolved_scale": float(scale),
+        "fallback_type": fallback_type,
+        "teacher_entropy": entropy,
+        "teacher_top1_probability": float(ordered_probabilities[0]),
+        "teacher_top1_top2_probability_gap": top_gap,
+        "teacher_argmax": teacher_argmax,
+        "normalized_top1_top2_q_gap": normalized_q_gap,
+    }
+
+
 def _cache_teacher_probability_stats(
     probabilities: np.ndarray,
     valid_mask: np.ndarray,
@@ -909,12 +1014,17 @@ def evaluate_cache_full_information_values(
     """
 
     trigger_scale = None if trigger_temperature is None else float(trigger_temperature)
-    candidate_scale = None if candidate_temperature is None else float(candidate_temperature)
-    if any(
-        value is not None and (not math.isfinite(value) or value <= 0.0)
-        for value in (trigger_scale, candidate_scale)
+    candidate_scale = 1.0
+    if trigger_scale is not None and (
+        not math.isfinite(trigger_scale) or trigger_scale <= 0.0
     ):
-        raise ValueError("Cache teacher temperatures must be positive and finite")
+        raise ValueError("Cache Trigger teacher temperature must be positive and finite")
+    if candidate_temperature is not None and not math.isclose(
+        float(candidate_temperature), 1.0, rel_tol=0.0, abs_tol=0.0
+    ):
+        raise ValueError(
+            "state-head Candidate teacher compatibility temperature must equal 1.0"
+        )
     transitions = tuple(rollout.transitions)
     if not transitions:
         raise ValueError("full-information Cache evaluation requires transitions")
@@ -1284,7 +1394,6 @@ def evaluate_cache_full_information_values(
                 q_best[sample_index, head_index] - q_keep[sample_index, head_index]
             )
     trigger_deltas = delta_best[np.isfinite(delta_best)]
-    candidate_centered_values: list[float] = []
     candidate_ranges: list[float] = []
     candidate_stds: list[float] = []
     for sample_index in range(sample_count):
@@ -1293,8 +1402,6 @@ def evaluate_cache_full_information_values(
             if not np.any(legal):
                 continue
             row = candidate_q[sample_index, head_index, legal]
-            center = float(np.median(row))
-            candidate_centered_values.extend((row - center).tolist())
             candidate_ranges.append(float(np.max(row) - np.min(row)))
             candidate_stds.append(float(np.std(row)))
 
@@ -1329,12 +1436,7 @@ def evaluate_cache_full_information_values(
         return resolved
 
     trigger_scale = resolve_scale("trigger_temperature", trigger_scale, trigger_deltas)
-    candidate_scale = resolve_scale(
-        "candidate_temperature",
-        candidate_scale,
-        np.asarray(candidate_centered_values, dtype=np.float64),
-    )
-    if trigger_temperature is None or candidate_temperature is None:
+    if trigger_temperature is None:
         calibration.update(
             {
                 "method": "CLIPPED_RUNNING_MAD",
@@ -1346,8 +1448,9 @@ def evaluate_cache_full_information_values(
         )
         trainer.cache_teacher_scale_calibration = calibration
         trainer.cache_trigger_teacher_temperature = float(trigger_scale)
-        trainer.cache_candidate_teacher_temperature = float(candidate_scale)
+    trainer.cache_candidate_teacher_temperature = 1.0
 
+    candidate_group_diagnostics: list[dict[str, Any]] = []
     for sample_index in range(sample_count):
         for head_index in node_indices:
             legal = candidate_valid[sample_index, head_index]
@@ -1361,11 +1464,27 @@ def evaluate_cache_full_information_values(
                 np.asarray([True, True], dtype=bool),
                 trigger_scale,
             )
-            candidate_teacher[sample_index, head_index] = _stable_masked_softmax(
+            candidate_row, candidate_diagnostics = state_head_candidate_teacher(
                 candidate_q[sample_index, head_index],
                 legal,
-                candidate_scale,
+                scale_epsilon,
             )
+            candidate_teacher[sample_index, head_index] = candidate_row
+            candidate_diagnostics.update(
+                {
+                    "sample_index": int(sample_index),
+                    "transition_index": int(selected_indices[sample_index]),
+                    "origin_index": int(
+                        selected_transitions[sample_index].origin_index
+                    ),
+                    "head_index": int(head_index),
+                    "head_id": str(
+                        trainer.context.action_spec.cache_node_ids[head_index]
+                    ),
+                    "role": str(trainer.context.cache_nodes["node_roles"][head_index]),
+                }
+            )
+            candidate_group_diagnostics.append(candidate_diagnostics)
     if not np.all(np.isfinite(q_keep[:, node_indices])):
         raise FloatingPointError("full-exact Cache KEEP values are non-finite")
     if not np.all(np.isfinite(candidate_q[candidate_valid])):
@@ -1489,6 +1608,10 @@ def evaluate_cache_full_information_values(
         "candidate_q_std_mean": float(np.mean(candidate_stds)) if candidate_stds else 0.0,
         "trigger_teacher_statistics": trigger_scale_stats,
         "candidate_teacher_statistics": candidate_scale_stats,
+        "candidate_teacher_group_diagnostics": candidate_group_diagnostics,
+        "candidate_teacher_scale_mode": "STATE_HEAD_ROBUST_NORMALIZATION",
+        "candidate_teacher_center": "MEDIAN",
+        "candidate_teacher_scale": "MAD_1P4826_WITH_STD_RANGE_EPS_FALLBACK",
         "value_evaluator": (
             "HYBRID_EXACT_SURROGATE"
             if surrogate_candidate_count > 0

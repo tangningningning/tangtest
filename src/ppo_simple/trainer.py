@@ -95,9 +95,9 @@ POPART_CHECKPOINT_VERSION = 6
 CACHE_ONLY_CHECKPOINT_VERSION = 7
 REPLICA_AWARE_CACHE_ONLY_CHECKPOINT_VERSION = 8
 NO_PREDICTION_CACHE_ONLY_CHECKPOINT_VERSION = 9
-# Trigger-first execution, split Cache encoders/optimizers, and the rollout
-# snapshot schema make every earlier proposed-joint checkpoint incompatible.
-JOINT_PROPOSED_CHECKPOINT_VERSION = 23
+# Candidate state-head teacher normalization changes the actor objective;
+# proposed-joint checkpoints with global Candidate MAD are incompatible.
+JOINT_PROPOSED_CHECKPOINT_VERSION = 24
 CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
@@ -3995,13 +3995,7 @@ class PPOV2Trainer:
                 DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE,
             )
         )
-        self.cache_candidate_teacher_temperature = float(
-            project_config.get_config_value(
-                context.cfg,
-                "algorithm.ppo.cache_candidate_teacher_temperature",
-                DEFAULT_EXACT_Q_LISTWISE_TEMPERATURE,
-            )
-        )
+        self.cache_candidate_teacher_temperature = 1.0
         self.uav_exact_q_listwise_temperature = float(
             project_config.get_config_value(
                 context.cfg,
@@ -4443,8 +4437,17 @@ class PPOV2Trainer:
             "CACHE_VALUE_EVALUATOR": "HYBRID_EXACT_SURROGATE",
             "CACHE_DOWNSTREAM_MODE": CACHE_DOWNSTREAM_MODE,
             "CACHE_COUNTERFACTUAL_MODE": CACHE_COUNTERFACTUAL_MODE,
+            "CACHE_TRIGGER_TEACHER_SCALE_MODE": "CLIPPED_RUNNING_MAD",
+            "CACHE_TRIGGER_TEACHER_SCALE_SOURCE": "TRAIN_ROLLOUT_ONLY",
+            "CACHE_CANDIDATE_TEACHER_SCALE_MODE": "STATE_HEAD_ROBUST_NORMALIZATION",
+            "CACHE_CANDIDATE_TEACHER_CENTER": "MEDIAN",
+            "CACHE_CANDIDATE_TEACHER_SCALE": "MAD_1P4826_WITH_STD_RANGE_EPS_FALLBACK",
+            "STATE_HEAD_NORMALIZATION_IMPLEMENTED": "YES",
+            "CANDIDATE_GLOBAL_RUNNING_MAD_ACTIVE": "NO",
+            "CACHE_TRIGGER_GLOBAL_RUNNING_MAD_ACTIVE": "YES",
             "CACHE_TEACHER_SCALE_MODE": "CLIPPED_RUNNING_MAD",
             "CACHE_TEACHER_SCALE_SOURCE": "TRAIN_ROLLOUT_ONLY",
+            "CACHE_TEACHER_SCALE_SCOPE": "TRIGGER_ONLY",
             "CACHE_TEACHER_SCALE_EPSILON": float(self.cache_teacher_scale_epsilon),
             "CACHE_TEACHER_SCALE_MAX": float(self.cache_teacher_scale_max),
             "CACHE_TRIGGER_TEACHER_TEMPERATURE": float(
@@ -11267,10 +11270,7 @@ class PPOV2Trainer:
         if int(payload.get("checkpoint_version", -1)) != expected_version:
             raise ValueError("PPO v2 checkpoint version 不匹配。")
         for field, expected in self.cache_credit_metadata().items():
-            if field in {
-                "CACHE_TRIGGER_TEACHER_TEMPERATURE",
-                "CACHE_CANDIDATE_TEACHER_TEMPERATURE",
-            }:
+            if field == "CACHE_TRIGGER_TEACHER_TEMPERATURE":
                 continue
             if payload.get(field) != expected:
                 raise ValueError(
@@ -11433,6 +11433,12 @@ class PPOV2Trainer:
                 value = float(payload[field])
                 if not math.isfinite(value) or value <= 0.0:
                     raise ValueError(f"checkpoint {field} must be positive and finite")
+                if field == "cache_candidate_teacher_temperature" and not math.isclose(
+                    value, 1.0, rel_tol=0.0, abs_tol=0.0
+                ):
+                    raise ValueError(
+                        "checkpoint Candidate teacher temperature must equal 1.0"
+                    )
                 setattr(self, field, value)
             if self.cache_teacher_scale_calibration and (
                 self.cache_teacher_scale_calibration.get("method")
