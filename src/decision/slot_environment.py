@@ -708,6 +708,88 @@ def build_policy_target_configuration(
     )
 
 
+def execute_configured_slot(
+    previous_cache_state: np.ndarray,
+    previous_uav_positions: dict[str, Any],
+    final_cache_state: np.ndarray,
+    final_uav_positions: dict[str, Any],
+    scenario_slice: dict[str, Any],
+    actual_tasks: list[task_allocation.Task],
+    actual_vehicle_positions: dict[str, np.ndarray],
+    local_cache_state: dict[str, set[int]],
+    service_catalog: dict[str, Any],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    flight_boundary: tuple[float, float, float, float],
+    *,
+    slot_id: int | None = None,
+    time_s: float | None = None,
+    performance_profile: dict[str, Any] | None = None,
+    matching_kkt_cache: task_allocation.KKTResourceAllocationCache | None = None,
+    node_evaluation_cache: task_allocation.NodeEvaluationCache | None = None,
+) -> SlotExecutionResult:
+    """执行控制器已确定的最终 Cache/UAV 配置及真实 Matching/KKT。"""
+
+    previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
+    final_cache = np.asarray(final_cache_state, dtype=np.int8).copy()
+    previous_uav = _position_tuples(previous_uav_positions)
+    final_uav = _position_tuples(final_uav_positions)
+    if previous_cache.shape != final_cache.shape:
+        raise ValueError("最终 Cache 配置 shape 必须与当前 Cache 一致。")
+    cache_updates = np.any(final_cache != previous_cache, axis=1).astype(np.int8)
+    tolerance = float(
+        project_config.get_config_value(
+            project_cfg, "algorithm.uav.position_tolerance_m", 1.0e-6
+        )
+    )
+    uav_moves = {
+        uav_id: int(
+            np.linalg.norm(
+                np.asarray(final_uav[uav_id], dtype=np.float64)
+                - np.asarray(previous_uav[uav_id], dtype=np.float64)
+            )
+            > tolerance
+        )
+        for uav_id in previous_uav
+    }
+    configuration = build_policy_target_configuration(
+        previous_cache,
+        previous_uav,
+        final_cache,
+        final_uav,
+        cache_updates,
+        uav_moves,
+        service_catalog,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+        flight_boundary,
+    )
+    if not bool(np.any(cache_updates)) and configuration.cache_cost != 0.0:
+        raise AssertionError("Cache 配置未变化时不得产生 reconfiguration cost。")
+    return execute_slot(
+        previous_cache,
+        previous_uav,
+        cache_updates,
+        uav_moves,
+        scenario_slice,
+        actual_tasks,
+        actual_vehicle_positions,
+        local_cache_state,
+        service_catalog,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+        flight_boundary,
+        slot_id=slot_id,
+        time_s=time_s,
+        performance_profile=performance_profile,
+        configuration_override=configuration,
+        matching_kkt_cache=matching_kkt_cache,
+        node_evaluation_cache=node_evaluation_cache,
+    )
+
 def _validated_configuration_override(
     configuration: JointConfigurationResult,
     previous_cache: np.ndarray,

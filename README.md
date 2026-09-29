@@ -1,12 +1,12 @@
 # adaptive_cache_mec
 
-## 当前算法
+## 正式算法
 
-正式策略为 `adaptive_joint_cache_uav_ppo`，由 PPO 联合控制 Cache 与 UAV 配置。
+正式训练配置为 `configs/proposed/system_config.toml`。当前策略采用双时间尺度 PPO：Macro 在 Cache 决策边界联合选择 Cache 配置与持续时长；每个 slot 的 Micro 策略按固定 UAV ID 顺序选择 UAV0 位置，再在 UAV0 条件下选择 UAV1 位置。Cache candidate 0 表示保持当前配置，UAV candidate 0 表示保持当前位置。
 
-## 正式配置
+训练按完整 episode 收集两份独立 rollout。episode 结束后先更新 Micro PPO，再对 Macro frames 做 full-batch SMDP PPO。正式训练不调用 Exact-Q teacher，也不要求 MC warmup；Transfer-Exchange Matching、KKT、预测 artifact 和现有物理模型保持原样。
 
-唯一正式配置为 `configs/proposed/system_config.toml`。
+长期数学定义与代码映射见 [`adaptive_dual_timescale_formula_updates.md`](adaptive_dual_timescale_formula_updates.md)。
 
 ## 数据生成
 
@@ -22,33 +22,36 @@ python scripts/generation/generate_episode_pool.py --help
 
 ## 训练
 
-训练统一使用 `ppo-train`，并通过正式配置和已有 episode pool 提供输入：
+训练使用 `ppo-train` 和已有 episode pool。每个 PPO episode 对应一个完整 realization：
 
 ```powershell
 ppo-train --config configs/proposed/system_config.toml `
-  --epochs <epochs> --run-dir runs/<new-run> `
+  --epochs <episodes> --run-dir runs/<new-run> `
   --episode-pool environment_data/<episode-pool>
 ```
 
+可用 `--resume` 从该 run 的最新 checkpoint 继续。缺失 realization 默认会报错；需要按 seed 补生成时，必须显式指定 `--episode-seed-start` 和 `--generate-missing-episodes`。
+
 ## 评价
 
-冻结 checkpoint 的正式评价统一使用 `ppo-eval`：
+冻结 checkpoint 的正式评价默认使用 deterministic action selection，并执行真实 Matching/KKT：
 
 ```powershell
 ppo-eval --config configs/proposed/system_config.toml `
-  --checkpoint runs/<training-run>/checkpoints/<checkpoint>.pt `
+  --checkpoint runs/<training-run>/checkpoints/latest_checkpoint.pt `
   --run-dir runs/<evaluation-run> `
-  --episode-pool environment_data/<episode-pool>
+  --episode-pool environment_data/<episode-pool> `
+  --seed-start <first-seed> --episodes <count>
 ```
 
 ## 主流程
 
 ```text
-固定 SUMO 网络
-→ episode realization 与车辆、任务、流行度预测产物
-→ proposed_joint PPO rollout
-→ Cache Trigger → Cache Candidate
-→ UAV Operation → UAV Candidate
-→ Matching → KKT → reward
-→ Critic / PPO update → checkpoint → 正式 evaluation
+固定 SUMO 网络与 prediction artifacts
+→ Macro Cache candidate + duration SMDP PPO
+→ 在 Cache frame 内保持 Cache 配置
+→ 每 slot 条件式、group-balanced masked UAV PPO
+→ Transfer-Exchange Matching → KKT → 真实 G(t)
+→ 独立 Micro/Macro rollout 与 episode-end PPO updates
+→ checkpoint → frozen-policy evaluation
 ```

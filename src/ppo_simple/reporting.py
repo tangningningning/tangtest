@@ -2895,3 +2895,119 @@ def _branch_kl_update_metric_fields(
             }
         )
     return fields
+
+
+def append_dual_timescale_record(path: Path, record: dict[str, Any]) -> None:
+    """追加新主线的 episode/update JSONL 记录。"""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a", encoding="utf-8", newline="\n") as stream:
+        json.dump(record, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        stream.write("\n")
+
+
+def write_dual_timescale_run_manifest(
+    path: Path,
+    *,
+    config_path: str | Path,
+    config_raw_sha256: str,
+    config_semantic_sha256: str,
+    seed: int,
+    trainer: Any,
+    context: Any,
+    target_episodes: int,
+    episode_pool: str | Path | None = None,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """记录双时间尺度 checkpoint、动作和 PPO 配置合同。"""
+
+    manifest = {
+        "experiment_type": "macro_cache_smdp_micro_uav_ppo",
+        "config_path": str(Path(config_path).resolve()),
+        "config_raw_sha256": str(config_raw_sha256),
+        "config_semantic_sha256": str(config_semantic_sha256),
+        "seed": int(seed),
+        "target_episodes": int(target_episodes),
+        "episode_pool": None if episode_pool is None else str(Path(episode_pool).resolve()),
+        "policy_schema": trainer.policy.architecture_id,
+        "checkpoint_version": int(trainer.checkpoint_version),
+        "architecture_version": int(trainer.policy.architecture_version),
+        "observation_dim": int(context.observation_spec.observation_dim),
+        "macro_cache_candidate_feature_dim": int(trainer.policy.macro_cache_feature_dim),
+        "micro_uav_candidate_feature_dim": int(trainer.policy.micro_uav_feature_dim),
+        "prediction_horizon": int(trainer.policy.prediction_horizon),
+        "macro_duration_candidates": list(trainer.policy.duration_candidates),
+        "macro_cache_action": "(Cache configuration C_k, duration L_k)",
+        "cache_candidate_zero": "current actual Cache configuration (KEEP)",
+        "uav_candidate_zero": "current UAV position (STAY)",
+        "uav_joint_policy": "UAV0 then UAV1 conditional on selected UAV0 position",
+        "mask_rollout_contract": "behavior masks and candidate descriptors are saved per action",
+        "macro_full_batch": True,
+        "micro_macro_buffers_separate": True,
+        "exact_q_training_enabled": False,
+        "critic_mc_warmup_required": False,
+        "prediction_model_frozen": True,
+        "matching": "Transfer-Exchange (unchanged)",
+        "kkt": "existing continuous resource allocation (unchanged)",
+        "physical_system_model_changed": False,
+        "configuration_control_mode": context.configuration_control_mode,
+        "episode_slots": int(context.episode_slots),
+        "origin_start": int(context.train_origin_start),
+        "origin_end": int(context.train_origin_end),
+        "terminal_origin": int(context.terminal_origin),
+        "training_counters": dict(trainer.training_counters),
+        "resume": bool(resume),
+    }
+    _write_json(Path(path), manifest)
+    return manifest
+
+
+def append_dual_timescale_slot_metrics(
+    path: Path,
+    *,
+    episode: int,
+    transitions: Iterable[Any],
+) -> int:
+    """记录新主线的实际系统 slot 结果，不输出旧 Trigger/Operation 指标。"""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with destination.open("a", encoding="utf-8", newline="\n") as stream:
+        for transition in transitions:
+            expected_reward = (
+                float(transition.actual_task_utility)
+                - float(transition.cache_cost)
+                - float(transition.movement_cost)
+            )
+            if not math.isclose(
+                float(transition.reward), expected_reward, rel_tol=1e-12, abs_tol=1e-9
+            ):
+                raise ValueError("slot utility 与任务效用、Cache cost、移动 cost 不一致。")
+            record = {
+                "record_type": "slot",
+                "episode": int(episode),
+                "origin": int(transition.origin_index),
+                "slot": int(transition.slot),
+                "G": float(transition.reward),
+                "task_utility": float(transition.actual_task_utility),
+                "delay": float(transition.total_task_delay_s),
+                "energy": float(transition.total_vehicle_energy_j),
+                "cache_cost": float(transition.cache_cost),
+                "movement_cost": float(transition.movement_cost),
+                "actual_cache_update_count": int(transition.actual_cache_update_count),
+                "uav0_stay": bool(int(transition.actions[0]) == 0),
+                "uav1_stay": bool(int(transition.actions[1]) == 0),
+                "uav0_move": bool(int(transition.actions[0]) != 0),
+                "uav1_move": bool(int(transition.actions[1]) != 0),
+                "matching_calls": 1,
+                "kkt_calls": int(
+                    transition.matching_summary.get("KKT_SOLVER_CALL_COUNT", 0)
+                ),
+                "slot_runtime_seconds": float(transition.slot_runtime_seconds),
+            }
+            json.dump(record, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            count += 1
+    return count

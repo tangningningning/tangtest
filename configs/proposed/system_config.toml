@@ -473,9 +473,8 @@ target_candidate_capacity = 64
 target_intermediate_fractions = [0.25, 0.5, 0.75]
 
 [algorithm.uav]
-# 在 Trigger 固定条件下生成并优化 UAV 目标位置；本模块只负责 WHERE，
-# STAY/MOVE 仍由策略学习并决定 WHEN。
-# Trigger z_u^q(t) 由未来 PPO 外部给定；这里不实现 trigger policy。
+# 为每个 slot 的 Micro PPO 生成可行 MOVE 候选及其描述特征；当前 UAV 位置由策略作为
+# candidate 0 / STAY 加入。这里提供候选，不独立决定 STAY/MOVE 或重配置时机。
 enabled = true
 method = "demand_aware_target_position"
 # 以下均为算法超参数，不是物理系统参数，不加入 FORMAL_SYSTEM_PARAMETER_KEYS。
@@ -494,9 +493,9 @@ position_tolerance_m = 1.0e-6
 objective_tolerance = 1.0e-9
 
 [algorithm.configuration]
-# Trigger-conditioned Cache + UAV 外层 block-coordinate configuration optimizer。
-# 本模块只交替调用已有 Cache/UAV solver，不实现 Matching/KKT/PPO。
-enabled = true
+# 正式双时间尺度 PPO 直接传入最终 Cache/UAV 配置，因此默认关闭旧外层坐标优化路径。
+# 坐标优化 helper 与物理候选生成代码保留给显式诊断；正式 slot 执行只调用 Matching/KKT。
+enabled = false
 method = "cache_uav_coordinate"
 max_outer_rounds = 10
 objective_tolerance = 1.0e-9
@@ -522,18 +521,27 @@ max_updates = 100
 objective_tolerance = 1.0e-9
 
 [algorithm.ppo]
-# 正式 PPO 训练路径，处理 Cache/UAV 请求。
+# When：每个 Macro frame 边界决策一次；frame 内每个 slot 决策 UAV 位置。
+# What：Macro 联合选 Cache 配置与 duration；Micro 顺序选择 UAV0/UAV1 统一位置候选。
+# Where：动作与 mask 在 src/ppo_simple/{policy,rollout,trainer}.py；真实执行在 slot_environment.py。
+# Cache candidate 0=当前配置 KEEP；UAV candidate 0=当前位置 STAY。
+# Exact-Q 仅保留 diagnostic 能力，正式训练关闭；不改变当前物理系统模型。
 enabled = true
-method = "ppo_simple_v2"
-# 当前配置固定使用正式的联合 Cache/UAV 重配置模式和策略结构。
-configuration_control_mode = "adaptive_joint_cache_uav_reconfiguration"
-# 正式联合主线中，Cache Trigger 与 Candidate 共用完整信息 best-update/
-# candidate-specific value teacher；UAV Operation 与 Candidate 使用各自独立的
-# Exact-Q teacher、优化器和 KL 分支。
-policy_schema = "adaptive_joint_cache_uav_ppo"
-kl_gate_mode = "branch_specific"
+method = "ppo_dual_timescale_v1"
+configuration_control_mode = "macro_cache_smdp_micro_uav_candidate"
+policy_schema = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
+macro_cache_enabled = true
+# 当前车辆预测 horizon H=5；默认候选为 sorted(unique([1, ceil(H/2), H]))。
+# candidate 0 始终是当前实际 Cache 配置，即 KEEP。
+macro_duration_candidates = [1, 3, 5]
+macro_full_batch = true
+exact_q_training_enabled = false
+critic_mc_warmup_required = false
+uav_unified_candidate_policy = true
+uav_autoregressive = true
+uav_group_balance = true
 hidden_sizes = [128, 128]
-# PPO 算法参数，不属于物理系统模型。
+# PPO 算法参数，不属于系统物理模型。
 gamma = 1.0
 gae_lambda = 0.95
 clip_epsilon = 0.2
@@ -543,46 +551,11 @@ critic_learning_rate = 1.0e-3
 value_loss_coefficient = 0.01
 entropy_coefficient = 0.0
 max_grad_norm = 0.5
-# PPO 完整 episode 更新：一个优化阶段划分为十个 minibatch。
-# 该结构参考经典 PPO2 实现。
-# 不是系统物理参数，也不声称为当前任务最优值。
-# 后续实验如需要再进行有限敏感性分析。
+# 每个完整 episode 收集完毕后先更新 Micro，再用全部 Macro frames full-batch 更新。
 update_epochs = 4
 target_kl = 0.10
-cache_kl_control = "minibatch_early_stop"
 num_minibatches = 10
-# 300 个 transition / 10 个 minibatch = 每个 minibatch 30 个样本。
 minibatch_size = 30
-advantage_normalization_mode = "centered_std"
-operation_advantage_normalization_mode = "fixed_reference_scale"
-operation_advantage_reference_scale = 0.02
-# UAV Exact-Q 候选置信度参考尺度，是置信度加权的算法设计参数；
-# 不改变 teacher 标准化方式或候选策略温度。
-uav_candidate_q_reference_scale = 0.02
-# UAV Operation head 使用完整信息 Exact-Q teacher KL；
-# 条件 Candidate head 继续使用 Exact-Q listwise teacher。
-uav_operation_advantage_source = "FULL_INFORMATION_EXACT_Q_TEACHER"
-uav_candidate_advantage_source = "EXACT_Q_LISTWISE"
-candidate_advantage_normalization = "EXACT_Q_LISTWISE"
-# 正式 Cache credit 共用固定下游的完整精确价值评估器。
-cache_teacher_scale_mode = "training_rollout_mad"
-cache_teacher_scale_epsilon = 1.0e-3
-cache_teacher_scale_max = 1.0e3
-cache_learning_rate = 5.0e-4
-uav_operation_learning_rate = 5.0e-4
-uav_candidate_learning_rate = 5.0e-4
-cache_trigger_credit_source = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
-cache_candidate_credit_source = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
-cache_value_evaluator = "HYBRID_EXACT_SURROGATE"
-cache_downstream_mode = "FIXED_DOWNSTREAM"
-cache_counterfactual_mode = "FULL_EXACT_CORRECTNESS_GATE"
-cache_trigger_policy = "TRUE_BINARY_KEEP_UPDATE"
-cache_update_candidate_policy = "UNIFIED_CONDITIONAL_UPDATE_CANDIDATES"
-uav_exact_q_listwise_temperature = 0.5
-exact_q_listwise_temperature = 0.5
-critic_value_scale_mode = "popart_normalized"
-critic_value_scale_epsilon = 1.0e-8
-critic_value_scale_warmup_samples = 64
 
 [algorithm.ppo.data_protocol]
 # 独立的完整 Episode 协议。每个训练 realization 的 0..299 均用于训练；

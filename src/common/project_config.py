@@ -757,253 +757,89 @@ def validate_config(
         raise ValueError("algorithm.matching.max_updates 必须 >= 1。")
     if float(get_config_value(config, "algorithm.matching.objective_tolerance")) < 0.0:
         raise ValueError("algorithm.matching.objective_tolerance 不能为负。")
-    ppo_method = str(get_config_value(config, "algorithm.ppo.method", "ppo_simple_v2"))
-    if ppo_method != "ppo_simple_v2":
-        raise ValueError("algorithm.ppo.method 当前只支持 ppo_simple_v2。")
+    ppo_method = str(get_config_value(config, "algorithm.ppo.method", ""))
+    if ppo_method != "ppo_dual_timescale_v1":
+        raise ValueError("algorithm.ppo.method 当前只支持 ppo_dual_timescale_v1。")
     configuration_control_mode = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.configuration_control_mode",
-            "adaptive_joint_cache_uav_reconfiguration",
-        )
+        get_config_value(config, "algorithm.ppo.configuration_control_mode", "")
     )
-    proposed_control_mode = "adaptive_joint_cache_uav_reconfiguration"
-    if configuration_control_mode != proposed_control_mode:
+    if configuration_control_mode != "macro_cache_smdp_micro_uav_candidate":
         raise ValueError(
-            "当前正式训练只支持 configuration_control_mode="
-            f"{proposed_control_mode}。"
+            "configuration_control_mode 必须为 macro_cache_smdp_micro_uav_candidate。"
         )
-    policy_schema = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.policy_schema",
-            "adaptive_joint_cache_uav_ppo",
-        )
-    )
-    proposed_schema = "adaptive_joint_cache_uav_ppo"
-    if policy_schema != proposed_schema:
-        raise ValueError(
-            "当前训练器仅支持正式 proposed_joint 策略："
-            f"{proposed_schema}"
-        )
-    candidate_advantage_source = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.uav_candidate_advantage_source",
-            "EXACT_Q_LISTWISE",
-        )
-    )
-    candidate_advantage_normalization = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.candidate_advantage_normalization",
-            "EXACT_Q_LISTWISE",
-        )
-    )
-    exact_q_listwise_temperature = float(
-        get_config_value(config, "algorithm.ppo.exact_q_listwise_temperature", 1.0)
-    )
-    cache_teacher_scale_mode = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.cache_teacher_scale_mode",
-            "training_rollout_mad",
-        )
-    )
-    cache_teacher_scale_epsilon = float(
-        get_config_value(
-            config,
-            "algorithm.ppo.cache_teacher_scale_epsilon",
-            1.0e-3,
-        )
-    )
-    cache_teacher_scale_max = float(
-        get_config_value(
-            config,
-            "algorithm.ppo.cache_teacher_scale_max",
-            1.0e3,
-        )
-    )
-    if cache_teacher_scale_mode != "training_rollout_mad":
-        raise ValueError(
-            "algorithm.ppo.cache_teacher_scale_mode only supports training_rollout_mad."
-        )
-    if (
-        not math.isfinite(cache_teacher_scale_epsilon)
-        or cache_teacher_scale_epsilon <= 0.0
-        or not math.isfinite(cache_teacher_scale_max)
-        or cache_teacher_scale_max < cache_teacher_scale_epsilon
+    policy_schema = str(get_config_value(config, "algorithm.ppo.policy_schema", ""))
+    if policy_schema != "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo":
+        raise ValueError("当前正式配置要求双时间尺度 Macro/Micro policy schema。")
+    required_flags = {
+        "macro_cache_enabled": True,
+        "macro_full_batch": True,
+        "exact_q_training_enabled": False,
+        "critic_mc_warmup_required": False,
+        "uav_unified_candidate_policy": True,
+        "uav_autoregressive": True,
+        "uav_group_balance": True,
+    }
+    for key, expected in required_flags.items():
+        actual = get_config_value(config, f"algorithm.ppo.{key}", None)
+        if actual is not expected:
+            raise ValueError(f"algorithm.ppo.{key} 必须为 {expected!r}。")
+    prediction_horizon = int(get_config_value(config, "prediction.vehicle.horizon"))
+    raw_durations = get_config_value(config, "algorithm.ppo.macro_duration_candidates")
+    if raw_durations is None:
+        raw_durations = sorted({1, int(math.ceil(prediction_horizon / 2.0)), prediction_horizon})
+    if not isinstance(raw_durations, list) or not raw_durations:
+        raise ValueError("macro_duration_candidates 必须为非空整数数组。")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or int(value) <= 0
+        for value in raw_durations
     ):
-        raise ValueError("Cache teacher scale bounds must be positive and finite.")
-    uav_exact_q_temperature = float(
-        get_config_value(
-            config,
-            "algorithm.ppo.uav_exact_q_listwise_temperature",
-            exact_q_listwise_temperature,
-        )
-    )
-    for field, value in {
-        "exact_q_listwise_temperature": exact_q_listwise_temperature,
-        "uav_exact_q_listwise_temperature": uav_exact_q_temperature,
-    }.items():
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(f"algorithm.ppo.{field} 必须是正的有限数。")
-    if candidate_advantage_source != "EXACT_Q_LISTWISE":
-        raise ValueError(
-            "正式策略要求 algorithm.ppo.uav_candidate_advantage_source=EXACT_Q_LISTWISE。"
-        )
-    if candidate_advantage_normalization != "EXACT_Q_LISTWISE":
-        raise ValueError(
-            "正式策略要求 algorithm.ppo.candidate_advantage_normalization=EXACT_Q_LISTWISE。"
-        )
-    kl_gate_mode = str(
-        get_config_value(config, "algorithm.ppo.kl_gate_mode", "branch_specific")
-    )
-    if kl_gate_mode != "branch_specific":
-        raise ValueError(
-            "正式策略要求 algorithm.ppo.kl_gate_mode=branch_specific。"
-        )
-    cache_kl_control = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.cache_kl_control",
-            "minibatch_early_stop",
-        )
-    )
-    if cache_kl_control != "minibatch_early_stop":
-        raise ValueError(
-            "正式策略要求 algorithm.ppo.cache_kl_control=minibatch_early_stop。"
-        )
+        raise ValueError("macro_duration_candidates 必须全部为正整数。")
+    if raw_durations != sorted(set(raw_durations)):
+        raise ValueError("macro_duration_candidates 必须严格升序且不得重复。")
+    if int(raw_durations[-1]) > prediction_horizon:
+        raise ValueError("Macro duration 不得超过当前预测 horizon。")
+
     target_kl = get_config_value(config, "algorithm.ppo.target_kl", None)
     if target_kl is None or not math.isfinite(float(target_kl)) or float(target_kl) <= 0.0:
-        raise ValueError(
-            "minibatch_early_stop 需要正的有限 target_kl。"
-        )
+        raise ValueError("algorithm.ppo.target_kl 必须为正的有限数。")
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
         raise ValueError("algorithm.ppo.hidden_sizes 必须是非空列表。")
-    if any(int(value) <= 0 for value in ppo_hidden_sizes):
+    if any(isinstance(value, bool) or int(value) != value or int(value) <= 0 for value in ppo_hidden_sizes):
         raise ValueError("algorithm.ppo.hidden_sizes 必须全部为正整数。")
     ppo_gamma = float(get_config_value(config, "algorithm.ppo.gamma"))
     ppo_gae_lambda = float(get_config_value(config, "algorithm.ppo.gae_lambda"))
-    if not 0.0 <= ppo_gamma <= 1.0:
-        raise ValueError("algorithm.ppo.gamma 必须位于 [0,1]。")
-    if not 0.0 <= ppo_gae_lambda <= 1.0:
-        raise ValueError("algorithm.ppo.gae_lambda 必须位于 [0,1]。")
+    if not 0.0 <= ppo_gamma <= 1.0 or not 0.0 <= ppo_gae_lambda <= 1.0:
+        raise ValueError("gamma 和 gae_lambda 必须位于 [0,1]。")
     ppo_clip_epsilon = float(get_config_value(config, "algorithm.ppo.clip_epsilon"))
     ppo_learning_rate = float(get_config_value(config, "algorithm.ppo.learning_rate"))
     ppo_actor_learning_rate = float(
-        get_config_value(
-            config,
-            "algorithm.ppo.actor_learning_rate",
-            ppo_learning_rate,
-        )
+        get_config_value(config, "algorithm.ppo.actor_learning_rate", ppo_learning_rate)
     )
     ppo_critic_learning_rate = float(
-        get_config_value(
-            config,
-            "algorithm.ppo.critic_learning_rate",
-            ppo_learning_rate,
-        )
+        get_config_value(config, "algorithm.ppo.critic_learning_rate", ppo_learning_rate)
     )
     ppo_value_coef = float(get_config_value(config, "algorithm.ppo.value_loss_coefficient"))
     ppo_entropy_coef = float(get_config_value(config, "algorithm.ppo.entropy_coefficient"))
     ppo_max_grad_norm = float(get_config_value(config, "algorithm.ppo.max_grad_norm"))
     ppo_update_epochs = int(get_config_value(config, "algorithm.ppo.update_epochs"))
     ppo_num_minibatches = int(get_config_value(config, "algorithm.ppo.num_minibatches"))
-    advantage_normalization_mode = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.advantage_normalization_mode",
-            "centered_std",
-        )
-    )
-    if advantage_normalization_mode not in {"centered_std", "std_only"}:
-        raise ValueError(
-            "algorithm.ppo.advantage_normalization_mode 只支持 centered_std/std_only。"
-        )
-    operation_advantage_normalization_mode = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.operation_advantage_normalization_mode",
-            "std_only",
-        )
-    )
-    if operation_advantage_normalization_mode not in {
-        "std_only",
-        "fixed_reference_scale",
-    }:
-        raise ValueError(
-            "algorithm.ppo.operation_advantage_normalization_mode 只支持 "
-            "std_only/fixed_reference_scale。"
-        )
-    operation_advantage_reference_scale = float(
-        get_config_value(
-            config,
-            "algorithm.ppo.operation_advantage_reference_scale",
-            0.02,
-        )
-    )
-    if (
-        not math.isfinite(operation_advantage_reference_scale)
-        or operation_advantage_reference_scale <= 0.0
-    ):
-        raise ValueError(
-            "algorithm.ppo.operation_advantage_reference_scale 必须是正的有限数。"
-        )
-    critic_value_scale_mode = str(
-        get_config_value(config, "algorithm.ppo.critic_value_scale_mode", "none")
-    )
-    if critic_value_scale_mode not in {
-        "none",
-        "running_return_std",
-        "popart_normalized",
-    }:
-        raise ValueError(
-            "algorithm.ppo.critic_value_scale_mode 只支持 "
-            "none/running_return_std/popart_normalized。"
-        )
-    critic_value_scale_epsilon = float(
-        get_config_value(config, "algorithm.ppo.critic_value_scale_epsilon", 1.0e-8)
-    )
-    critic_value_scale_warmup_samples = get_config_value(
-        config, "algorithm.ppo.critic_value_scale_warmup_samples", 64
-    )
-    if (
-        not math.isfinite(critic_value_scale_epsilon)
-        or critic_value_scale_epsilon <= 0.0
-    ):
-        raise ValueError(
-            "algorithm.ppo.critic_value_scale_epsilon 必须是正的有限数。"
-        )
-    if (
-        isinstance(critic_value_scale_warmup_samples, bool)
-        or not isinstance(critic_value_scale_warmup_samples, int)
-        or critic_value_scale_warmup_samples < 0
-    ):
-        raise ValueError(
-            "algorithm.ppo.critic_value_scale_warmup_samples 必须是非负整数。"
-        )
     if not 0.0 < ppo_clip_epsilon < 1.0:
         raise ValueError("algorithm.ppo.clip_epsilon 必须位于 (0,1)。")
-    if ppo_learning_rate <= 0.0:
-        raise ValueError("algorithm.ppo.learning_rate 必须大于 0。")
-    for dotted_key, learning_rate in (
-        ("algorithm.ppo.actor_learning_rate", ppo_actor_learning_rate),
-        ("algorithm.ppo.critic_learning_rate", ppo_critic_learning_rate),
-    ):
-        if not math.isfinite(learning_rate) or learning_rate <= 0.0:
-            raise ValueError(f"{dotted_key} 必须是正的有限数。")
-    if ppo_value_coef < 0.0:
-        raise ValueError("algorithm.ppo.value_loss_coefficient 不能为负。")
-    if ppo_entropy_coef < 0.0:
-        raise ValueError("algorithm.ppo.entropy_coefficient 不能为负。")
-    if ppo_max_grad_norm <= 0.0:
-        raise ValueError("algorithm.ppo.max_grad_norm 必须大于 0。")
-    if ppo_update_epochs < 1:
-        raise ValueError("algorithm.ppo.update_epochs 必须 >= 1。")
-    if ppo_num_minibatches < 1:
-        raise ValueError("algorithm.ppo.num_minibatches 必须 >= 1。")
+    for key, value in {
+        "learning_rate": ppo_learning_rate,
+        "actor_learning_rate": ppo_actor_learning_rate,
+        "critic_learning_rate": ppo_critic_learning_rate,
+        "max_grad_norm": ppo_max_grad_norm,
+    }.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"algorithm.ppo.{key} 必须为正的有限数。")
+    if ppo_value_coef < 0.0 or ppo_entropy_coef < 0.0:
+        raise ValueError("value_loss_coefficient 和 entropy_coefficient 不能为负。")
+    if ppo_update_epochs < 1 or ppo_num_minibatches < 1:
+        raise ValueError("update_epochs 和 num_minibatches 必须为正整数。")
+    if int(get_config_value(config, "algorithm.ppo.minibatch_size")) <= 0:
+        raise ValueError("algorithm.ppo.minibatch_size 必须为正整数。")
     prediction_batch_parallel_workers = get_config_value(
         config,
         "algorithm.configuration.prediction_batch_parallel_workers",

@@ -1,111 +1,72 @@
-"""实现 proposed_joint 使用的 Cache/UAV 策略网络。"""
+"""双时间尺度 Cache/UAV PPO 策略及其 masked categorical 分布。"""
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
-import math
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
 try:
     import torch
     import torch.nn as nn
-except ModuleNotFoundError:  # pragma: no cover - import-only environments
+except ModuleNotFoundError:  # pragma: no cover - 无 PyTorch 环境仅允许查看配置
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
-class PolicySample:
-    action: np.ndarray
-    log_prob: Any
-    entropy: Any
-    value: Any
-    action_mask: np.ndarray
-    action_probabilities: np.ndarray | None = None
-    deterministic_action: np.ndarray | None = None
+class CategoricalSample:
+    """一次合法 categorical 抽样。"""
 
-
-@dataclass(frozen=True)
-class PolicyEvaluation:
-    log_prob: Any
-    entropy: Any
-    value: Any
-    logits: Any
-    # 分支指标复用 rollout 已保存的动作和 log-probability，不改变 PPO 目标。
-    cache_log_prob: Any | None = None
-    uav_log_prob: Any | None = None
-    # 按 UAV 保存 Operation 与 Candidate 的 log-probability，以分别计算两类信赖域。
-    uav_operation_log_probs: Any | None = None
-    uav_candidate_log_probs: Any | None = None
-    # 保存完整条件 UAV 候选 log-probability，使 Exact-Q 期望包含全部合法 MOVE 目标。
-    uav_candidate_log_probs_all: Any | None = None
-    # 保存每个 UAV head 的完整 STAY/MOVE 分布，供完整 rollout 的 Operation KL gate 使用。
-    uav_operation_log_probs_all: Any | None = None
-    cache_entropy: Any | None = None
-    uav_entropy: Any | None = None
-    # 保存每个 Cache 节点的操作分布，以及操作发生变化时的候选分布。
-    cache_node_log_probs: Any | None = None
-    # 保存每个 head 的完整掩码分类分布，调用方可脱离计算图后用于分布对比。
-    cache_operation_log_probs_all: Any | None = None
-    cache_candidate_log_probs_all: Any | None = None
-
-
-@dataclass(frozen=True)
-class CandidatePolicySample:
     selected_index: int
     log_prob: Any
     entropy: Any
-    logits: Any
+    probabilities: np.ndarray
+    masked_logits: Any
 
 
 @dataclass(frozen=True)
-class OperationPolicySample:
-    selected_index: int
+class MacroActionSample:
+    """Cache candidate 与 duration 组成的单个 Macro 联合动作。"""
+
+    cache_index: int
+    duration_index: int
+    requested_duration: int
     log_prob: Any
     entropy: Any
-    logits: Any
-    # 原始操作 logits 的可选指标，不会额外采样动作。
-    raw_logits: Any | None = None
-    probabilities: Any | None = None
+    value: Any
+    cache_mask: np.ndarray
+    duration_mask: np.ndarray
+
+
+@dataclass(frozen=True)
+class JointMicroEvaluation:
+    """两个 UAV 条件式联合动作的 PPO 评估结果。"""
+
+    log_prob: Any
+    entropy: Any
+    value: Any
+    uav0_log_prob: Any
+    uav1_log_prob: Any
 
 
 def _require_torch() -> None:
     if torch is None or nn is None:
-        raise ImportError("proposed_joint 策略需要 PyTorch。")
+        raise ImportError("双时间尺度 PPO 需要 PyTorch。")
 
 
-def _validate_binary_actions(actions: Any, action_dim: int) -> Any:
-    values = torch.as_tensor(actions, dtype=torch.long)
-    if values.ndim == 1:
-        values = values.unsqueeze(0)
-    if values.ndim != 2 or tuple(values.shape[1:]) != (int(action_dim),):
-        raise ValueError(
-            f"actions shape={tuple(values.shape)}，期望 [B,{int(action_dim)}]。"
-        )
-    if not bool(torch.all((values == 0) | (values == 1)).item()):
-        raise ValueError("proposed_joint 动作必须是二元请求向量。")
-    return values
+def _masked_categorical(logits: Any, mask: Any) -> Any:
+    """在构造分布前应用 rollout 中的合法动作 mask。"""
 
-
-def _normalize_masks(action_masks: Any, batch_size: int, action_dim: int, device: Any) -> Any:
-    if action_masks is None:
-        return torch.ones(
-            (int(batch_size), int(action_dim), 2),
-            dtype=torch.bool,
-            device=device,
-        )
-    masks = torch.as_tensor(action_masks, dtype=torch.bool, device=device)
-    if masks.ndim == 2:
-        masks = masks.unsqueeze(0)
-    expected = (int(batch_size), int(action_dim), 2)
-    if tuple(masks.shape) != expected:
-        raise ValueError(f"action_masks shape={tuple(masks.shape)}，期望 {expected}。")
-    if not bool(torch.all(torch.any(masks, dim=-1)).item()):
-        raise ValueError("action mask 不能同时屏蔽 binary request 的 0/1。")
-    return masks
+    valid = torch.as_tensor(mask, dtype=torch.bool, device=logits.device)
+    if tuple(valid.shape) != tuple(logits.shape) or not bool(torch.any(valid).item()):
+        raise ValueError("categorical mask 必须与 logits 对齐且至少允许一个动作。")
+    if not bool(torch.all(torch.isfinite(logits[valid])).item()):
+        raise FloatingPointError("categorical logits 包含 NaN/Inf。")
+    return torch.distributions.Categorical(
+        logits=logits.masked_fill(~valid, -float("inf"))
+    )
 
 
 def _group_balance_candidate_logits(
@@ -113,1976 +74,552 @@ def _group_balance_candidate_logits(
     candidate_features: Any,
     candidate_masks: Any,
     operation_slice: slice,
-    active_heads: Any | None = None,
 ) -> Any:
-    """返回掩码 logits，并按操作组均衡相同分数的概率。"""
+    """复用现有 PPO 的候选组均衡规则并屏蔽非法候选。"""
 
     scores = torch.as_tensor(raw_scores)
-    features = torch.as_tensor(
-        candidate_features,
-        dtype=torch.float32,
-        device=scores.device,
-    )
-    if scores.ndim < 1 or features.ndim != scores.ndim + 1:
-        raise ValueError("raw_scores/candidate_features 维度不匹配。")
-    if tuple(features.shape[:-1]) != tuple(scores.shape):
-        raise ValueError("candidate_features 必须与 raw_scores 对齐。")
-    candidate_count = int(scores.shape[-1])
+    features = torch.as_tensor(candidate_features, dtype=torch.float32, device=scores.device)
+    masks = torch.as_tensor(candidate_masks, dtype=torch.bool, device=scores.device)
+    if features.ndim != scores.ndim + 1 or tuple(features.shape[:-1]) != tuple(scores.shape):
+        raise ValueError("candidate features 与 logits 维度不匹配。")
+    if tuple(masks.shape) != tuple(scores.shape) or not bool(
+        torch.all(torch.any(masks, dim=-1)).item()
+    ):
+        raise ValueError("每个 UAV candidate head 至少要有一个合法动作。")
     start = 0 if operation_slice.start is None else int(operation_slice.start)
     stop = int(features.shape[-1]) if operation_slice.stop is None else int(operation_slice.stop)
-    if start < 0 or stop <= start or stop > int(features.shape[-1]):
-        raise ValueError("operation_slice 超出 candidate feature 范围。")
-    masks = (
-        torch.ones_like(scores, dtype=torch.bool)
-        if candidate_masks is None
-        else torch.as_tensor(candidate_masks, dtype=torch.bool, device=scores.device)
-    )
-    if tuple(masks.shape) != tuple(scores.shape):
-        raise ValueError("candidate_masks 必须与 raw_scores 对齐。")
-    if not bool(torch.all(torch.any(masks, dim=-1)).item()):
-        raise ValueError("每个 conditional head 至少需要一个 valid candidate。")
-    if not bool(torch.all(torch.isfinite(scores)).item()):
-        raise ValueError("candidate scores 包含 NaN/Inf。")
-    if active_heads is None:
-        active = torch.ones(scores.shape[:-1], dtype=torch.bool, device=scores.device)
-    else:
-        active = torch.as_tensor(active_heads, dtype=torch.bool, device=scores.device)
-        if tuple(active.shape) != tuple(scores.shape[:-1]):
-            raise ValueError("active_heads 必须与 candidate head 维度对齐。")
-
-    flat_scores = scores.reshape(-1, candidate_count)
-    flat_features = features.reshape(-1, candidate_count, int(features.shape[-1]))
-    flat_masks = masks.reshape(-1, candidate_count)
-    flat_active = active.reshape(-1)
-    operation_values = flat_features[..., start:stop]
-    if not bool(torch.all(torch.isfinite(operation_values)).item()):
-        raise ValueError("candidate operation feature 包含 NaN/Inf。")
-    group_ids = torch.argmax(operation_values, dim=-1)
-    flat_balanced = flat_scores.clone()
-    for row_index in range(int(flat_scores.shape[0])):
-        if not bool(flat_active[row_index].item()):
-            continue
-        valid_operations = operation_values[row_index][flat_masks[row_index]]
-        if valid_operations.ndim != 2 or not int(valid_operations.shape[0]):
-            raise ValueError("active head 没有 valid operation candidate。")
-        if not bool(torch.all((valid_operations == 0.0) | (valid_operations == 1.0)).item()):
-            raise ValueError("active candidate operation 必须是 one-hot。")
-        if not bool(torch.all(valid_operations.sum(dim=-1) == 1.0).item()):
-            raise ValueError("active candidate 必须属于唯一 operation group。")
-        row_groups = group_ids[row_index]
-        group_counts = torch.zeros(
-            (stop - start,), dtype=torch.long, device=scores.device
-        )
-        group_counts.scatter_add_(
+    groups = features[..., start:stop]
+    valid_groups = groups[masks]
+    if stop <= start or not bool(torch.all((valid_groups == 0.0) | (valid_groups == 1.0)).item()):
+        raise ValueError("合法候选组标记必须是 one-hot。")
+    if not bool(torch.all(valid_groups.sum(dim=-1) == 1.0).item()):
+        raise ValueError("每个合法 UAV 候选必须属于一个动作组。")
+    group_ids = groups.argmax(dim=-1)
+    flat_scores = scores.reshape(-1, scores.shape[-1])
+    flat_masks = masks.reshape_as(flat_scores)
+    flat_groups = group_ids.reshape_as(flat_scores)
+    balanced = flat_scores.clone()
+    for row in range(int(flat_scores.shape[0])):
+        counts = torch.zeros(stop - start, dtype=torch.long, device=scores.device)
+        counts.scatter_add_(
             0,
-            row_groups[flat_masks[row_index]],
-            torch.ones_like(row_groups[flat_masks[row_index]], dtype=torch.long),
+            flat_groups[row][flat_masks[row]],
+            torch.ones_like(flat_groups[row][flat_masks[row]], dtype=torch.long),
         )
-        valid_counts = group_counts.gather(0, row_groups)
-        if bool(torch.any(valid_counts[flat_masks[row_index]] < 1).item()):
-            raise ValueError("valid candidate 的 group_count 必须至少为1。")
-        flat_balanced[row_index] = flat_scores[row_index] - torch.log(
-            valid_counts.to(dtype=flat_scores.dtype)
-        )
-    return flat_balanced.reshape(scores.shape).masked_fill(~masks, -float("inf"))
+        balanced[row] -= torch.log(counts[flat_groups[row]].clamp_min(1).to(scores.dtype))
+    return balanced.reshape(scores.shape).masked_fill(~masks, -float("inf"))
 
 
-class _ActorCriticBase(nn.Module if nn is not None else object):
-    """建立共享状态编码器，并保留正式策略的基础采样接口。"""
+def _mlp(input_dim: int, hidden_sizes: tuple[int, ...], output_dim: int) -> Any:
+    layers: list[Any] = []
+    width = int(input_dim)
+    for hidden in hidden_sizes:
+        layers.extend((nn.Linear(width, int(hidden)), nn.Tanh()))
+        width = int(hidden)
+    layers.append(nn.Linear(width, int(output_dim)))
+    return nn.Sequential(*layers)
 
-    architecture_id = "internal_actor_critic_base"
-    architecture_version = 1
+
+class DualTimescaleActorCritic(nn.Module if nn is not None else object):
+    """Macro Cache SMDP 与 Micro UAV PPO 的独立 Actor/Critic。"""
+
+    architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
+    architecture_version = 7
 
     def __init__(
         self,
         observation_dim: int,
-        action_dim: int,
+        macro_cache_feature_dim: int,
+        micro_uav_feature_dim: int,
+        duration_candidates: tuple[int, ...],
+        prediction_horizon: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
     ) -> None:
         _require_torch()
         super().__init__()
-        if int(observation_dim) <= 0 or int(action_dim) <= 0:
-            raise ValueError("observation_dim/action_dim 必须大于0。")
-        if not hidden_sizes or any(int(size) <= 0 for size in hidden_sizes):
-            raise ValueError("hidden_sizes 必须是正整数列表。")
         self.observation_dim = int(observation_dim)
-        self.action_dim = int(action_dim)
-        layers: list[Any] = []
-        last_dim = self.observation_dim
-        for hidden_size in hidden_sizes:
-            layers.extend([nn.Linear(last_dim, int(hidden_size)), nn.Tanh()])
-            last_dim = int(hidden_size)
-        self.encoder = nn.Sequential(*layers)
-        self.hidden_dim = int(last_dim)
-        self.actor_head = nn.Linear(last_dim, self.action_dim)
-        self.critic_head = nn.Linear(last_dim, 1)
+        self.macro_cache_feature_dim = int(macro_cache_feature_dim)
+        self.micro_uav_feature_dim = int(micro_uav_feature_dim)
+        self.duration_candidates = tuple(int(value) for value in duration_candidates)
+        self.prediction_horizon = int(prediction_horizon)
+        sizes = tuple(int(value) for value in hidden_sizes)
+        if min(self.observation_dim, self.macro_cache_feature_dim, self.micro_uav_feature_dim) <= 0:
+            raise ValueError("策略 observation/candidate feature dimensions 必须为正数。")
+        if not sizes or any(value <= 0 for value in sizes):
+            raise ValueError("hidden_sizes 必须是正整数序列。")
+        if (
+            self.prediction_horizon <= 0
+            or not self.duration_candidates
+            or any(value <= 0 for value in self.duration_candidates)
+            or tuple(sorted(set(self.duration_candidates))) != self.duration_candidates
+            or self.duration_candidates[-1] > self.prediction_horizon
+        ):
+            raise ValueError("Macro duration candidates 与 prediction horizon 不匹配。")
+        hidden = sizes[-1]
 
-    def _observations(self, observations: Any) -> tuple[Any, bool]:
-        device = next(self.parameters()).device
-        obs = torch.as_tensor(observations, dtype=torch.float32, device=device)
-        single = obs.ndim == 1
-        if single:
-            obs = obs.unsqueeze(0)
-        expected = (self.observation_dim,)
-        if obs.ndim != 2 or tuple(obs.shape[1:]) != expected:
-            raise ValueError(
-                f"observations shape={tuple(obs.shape)}，期望 [B,{self.observation_dim}]。"
+        self.macro_actor_encoder = _mlp(self.observation_dim, sizes[:-1], hidden)
+        if len(sizes) == 1:
+            self.macro_actor_encoder = nn.Sequential(
+                nn.Linear(self.observation_dim, hidden), nn.Tanh()
             )
-        if not bool(torch.all(torch.isfinite(obs)).item()):
-            raise ValueError("observations 包含 NaN/Inf。")
-        return obs, single
+        self.macro_cache_candidate_encoder = nn.Sequential(
+            nn.Linear(self.macro_cache_feature_dim, hidden), nn.Tanh()
+        )
+        self.macro_cache_scorer = nn.Sequential(
+            nn.Linear(hidden * 2, hidden), nn.Tanh(), nn.Linear(hidden, 1)
+        )
+        self.macro_duration_scorer = nn.Sequential(
+            nn.Linear(hidden * 2 + 1, hidden), nn.Tanh(), nn.Linear(hidden, 1)
+        )
+        self.macro_critic = _mlp(self.observation_dim, sizes, 1)
 
-    def _default_actor_encoder(self) -> Any:
-        """返回共享策略编码器的状态表示。"""
+        self.micro_actor_encoder = nn.Sequential(
+            nn.Linear(self.observation_dim, hidden), nn.Tanh()
+        )
+        self.micro_uav_candidate_scorer = nn.Sequential(
+            nn.Linear(hidden + self.micro_uav_feature_dim + 2, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+        self.micro_critic = _mlp(self.observation_dim, sizes, 1)
 
-        return self.encoder
-
-    def forward(self, observations: Any) -> tuple[Any, Any]:
-        obs, single = self._observations(observations)
-        hidden = self._default_actor_encoder()(obs)
-        logits = self.actor_head(hidden)
-        values = self._critic_values(obs, hidden)
+    @staticmethod
+    def _observation_batch(observations: Any, device: Any) -> tuple[Any, bool]:
+        values = torch.as_tensor(observations, dtype=torch.float32, device=device)
+        single = values.ndim == 1
         if single:
-            return logits.squeeze(0), values.squeeze(0)
-        return logits, values
+            values = values.unsqueeze(0)
+        if values.ndim != 2 or not bool(torch.all(torch.isfinite(values)).item()):
+            raise ValueError("observations 必须是有限的 [B,D] 张量。")
+        return values, single
 
-    def _critic_values(self, observations: Any, actor_hidden: Any) -> Any:
-        del observations
-        return self.critic_head(actor_hidden).squeeze(-1)
+    @staticmethod
+    def _candidate_batch(
+        features: Any,
+        masks: Any,
+        batch_size: int,
+        feature_dim: int,
+        device: Any,
+    ) -> tuple[Any, Any]:
+        feature_values = torch.as_tensor(features, dtype=torch.float32, device=device)
+        mask_values = torch.as_tensor(masks, dtype=torch.bool, device=device)
+        if feature_values.ndim == 2:
+            feature_values = feature_values.unsqueeze(0)
+        if mask_values.ndim == 1:
+            mask_values = mask_values.unsqueeze(0)
+        if (
+            feature_values.ndim != 3
+            or int(feature_values.shape[0]) != int(batch_size)
+            or int(feature_values.shape[-1]) != int(feature_dim)
+            or tuple(mask_values.shape) != tuple(feature_values.shape[:2])
+        ):
+            raise ValueError("candidate features/masks shape 不匹配。")
+        if not bool(torch.all(torch.isfinite(feature_values)).item()):
+            raise ValueError("candidate features 包含 NaN/Inf。")
+        if not bool(torch.all(torch.any(mask_values, dim=-1)).item()):
+            raise ValueError("每个候选集合必须保留至少一个合法动作。")
+        return feature_values, mask_values
 
-    def _masked_distribution(self, logits: Any, masks: Any) -> Any:
-        binary_logits = torch.stack([torch.zeros_like(logits), logits], dim=-1)
-        return torch.distributions.Categorical(logits=binary_logits.masked_fill(~masks, -float("inf")))
+    def macro_value(self, observations: Any) -> Any:
+        obs, single = self._observation_batch(observations, next(self.parameters()).device)
+        values = self.macro_critic(obs).squeeze(-1)
+        return values.squeeze(0) if single else values
 
-    def sample(
+    def micro_value(self, observations: Any) -> Any:
+        obs, single = self._observation_batch(observations, next(self.parameters()).device)
+        values = self.micro_critic(obs).squeeze(-1)
+        return values.squeeze(0) if single else values
+
+    def _macro_logits(
+        self,
+        observations: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+        duration_masks: Any,
+        cache_actions: Any | None = None,
+        duration_actions: Any | None = None,
+    ) -> tuple[Any, Any, Any, Any, Any, Any]:
+        device = next(self.parameters()).device
+        obs, single = self._observation_batch(observations, device)
+        if int(obs.shape[-1]) != self.observation_dim:
+            raise ValueError("Macro observation dimension mismatch。")
+        features, masks = self._candidate_batch(
+            cache_candidate_features,
+            cache_candidate_masks,
+            int(obs.shape[0]),
+            self.macro_cache_feature_dim,
+            device,
+        )
+        duration_mask = torch.as_tensor(duration_masks, dtype=torch.bool, device=device)
+        if duration_mask.ndim == 1:
+            duration_mask = duration_mask.unsqueeze(0)
+        expected_duration_shape = (int(obs.shape[0]), len(self.duration_candidates))
+        if tuple(duration_mask.shape) != expected_duration_shape:
+            raise ValueError("duration_masks shape mismatch。")
+        if not bool(torch.all(torch.any(duration_mask, dim=-1)).item()):
+            raise ValueError("duration mask 至少要允许一个时长。")
+
+        hidden = self.macro_actor_encoder(obs)
+        candidate_hidden = self.macro_cache_candidate_encoder(features)
+        expanded_hidden = hidden.unsqueeze(1).expand(-1, int(features.shape[1]), -1)
+        cache_logits = self.macro_cache_scorer(
+            torch.cat((expanded_hidden, candidate_hidden), dim=-1)
+        ).squeeze(-1)
+        cache_dist = _masked_categorical(cache_logits, masks)
+
+        if cache_actions is None:
+            raise ValueError("Macro duration probability requires selected Cache candidates。")
+        cache_action = torch.as_tensor(cache_actions, dtype=torch.long, device=device).reshape(-1)
+        if tuple(cache_action.shape) != (int(obs.shape[0]),):
+            raise ValueError("cache_actions shape mismatch。")
+        if bool(torch.any(cache_action < 0).item()) or bool(
+            torch.any(cache_action >= int(features.shape[1])).item()
+        ):
+            raise ValueError("Macro cache action index 越界。")
+        if not bool(torch.all(masks.gather(1, cache_action[:, None]).squeeze(1)).item()):
+            raise ValueError("Macro cache action 被 rollout mask 屏蔽。")
+        selected_candidate = candidate_hidden[
+            torch.arange(int(obs.shape[0]), device=device), cache_action
+        ]
+        duration_values = torch.as_tensor(
+            self.duration_candidates, dtype=torch.float32, device=device
+        ) / float(self.prediction_horizon)
+        duration_values = duration_values.reshape(1, -1, 1).expand(
+            int(obs.shape[0]), -1, -1
+        )
+        duration_hidden = torch.cat(
+            (
+                hidden.unsqueeze(1).expand(-1, len(self.duration_candidates), -1),
+                selected_candidate.unsqueeze(1).expand(-1, len(self.duration_candidates), -1),
+                duration_values,
+            ),
+            dim=-1,
+        )
+        duration_logits = self.macro_duration_scorer(duration_hidden).squeeze(-1)
+        duration_dist = _masked_categorical(duration_logits, duration_mask)
+        if duration_actions is not None:
+            duration_action = torch.as_tensor(
+                duration_actions, dtype=torch.long, device=device
+            ).reshape(-1)
+            if tuple(duration_action.shape) != (int(obs.shape[0]),):
+                raise ValueError("duration_actions shape mismatch。")
+            if bool(torch.any(duration_action < 0).item()) or bool(
+                torch.any(duration_action >= len(self.duration_candidates)).item()
+            ):
+                raise ValueError("Macro duration action index 越界。")
+            if not bool(
+                torch.all(
+                    duration_mask.gather(1, duration_action[:, None]).squeeze(1)
+                ).item()
+            ):
+                raise ValueError("Macro duration action 被 rollout mask 屏蔽。")
+        values = self.macro_critic(obs).squeeze(-1)
+        return cache_dist.logits, duration_dist.logits, values, masks, duration_mask, cache_action
+
+    def sample_macro(
         self,
         observation: Any,
-        action_mask: Callable[[int, np.ndarray], Any] | Any = None,
+        cache_candidate_features: Any,
+        cache_candidate_mask: Any,
+        *,
         deterministic: bool = False,
-        record_diagnostics: bool = False,
-    ) -> PolicySample:
-        logits, value = self.forward(observation)
-        if logits.ndim != 1 or tuple(logits.shape) != (self.action_dim,):
-            raise ValueError("sample 需要单个 observation。")
-        actions: list[int] = []
-        masks: list[np.ndarray] = []
-        log_probs: list[Any] = []
-        entropies: list[Any] = []
-        action_probabilities: list[float] | None = [] if record_diagnostics else None
-        deterministic_actions: list[int] | None = [] if record_diagnostics else None
-        for action_index in range(self.action_dim):
-            raw_mask = (
-                np.ones(2, dtype=bool)
-                if action_mask is None
-                else action_mask(action_index, np.asarray(actions, dtype=np.int8))
+    ) -> MacroActionSample:
+        features = np.asarray(cache_candidate_features, dtype=np.float32)
+        cache_mask = np.asarray(cache_candidate_mask, dtype=bool).reshape(-1)
+        if features.ndim != 2 or len(features) != len(cache_mask) or not len(cache_mask):
+            raise ValueError("Macro cache candidates/mask must be non-empty and aligned。")
+        if not bool(cache_mask[0]):
+            raise ValueError("Macro cache candidate 0 (KEEP) 必须合法。")
+        device = next(self.parameters()).device
+        durations_mask = np.ones(len(self.duration_candidates), dtype=bool)
+        with torch.no_grad():
+            obs, _ = self._observation_batch(observation, device)
+            padded_features = torch.as_tensor(features, dtype=torch.float32, device=device).unsqueeze(0)
+            cache_mask_t = torch.as_tensor(cache_mask, dtype=torch.bool, device=device).unsqueeze(0)
+            hidden = self.macro_actor_encoder(obs)
+            embedded = self.macro_cache_candidate_encoder(padded_features)
+            logits = self.macro_cache_scorer(
+                torch.cat((hidden.unsqueeze(1).expand(-1, len(features), -1), embedded), dim=-1)
+            ).squeeze(-1).squeeze(0)
+            cache_dist = _masked_categorical(
+                logits, torch.as_tensor(cache_mask, dtype=torch.bool, device=device)
             )
-            mask = np.asarray(raw_mask, dtype=bool).reshape(-1)
-            if mask.shape != (2,) or not bool(np.any(mask)):
-                raise ValueError(f"action_mask[{action_index}] 必须是 [2] 且至少允许一个值。")
-            mask_tensor = torch.as_tensor(mask, dtype=torch.bool, device=logits.device).reshape(1, 2)
-            distribution = self._masked_distribution(logits[action_index].reshape(1), mask_tensor)
-            deterministic_index = int(torch.argmax(distribution.logits, dim=-1).item())
-            value_index = (
-                deterministic_index
+            cache_index = (
+                int(torch.argmax(cache_dist.logits).item())
+                if deterministic
+                else int(cache_dist.sample().item())
+            )
+            selected_embed = embedded[0, cache_index]
+            duration_values = torch.as_tensor(
+                self.duration_candidates, dtype=torch.float32, device=device
+            ) / float(self.prediction_horizon)
+            duration_input = torch.cat(
+                (
+                    hidden.expand(len(self.duration_candidates), -1),
+                    selected_embed.expand(len(self.duration_candidates), -1),
+                    duration_values.reshape(-1, 1),
+                ),
+                dim=-1,
+            )
+            duration_logits = self.macro_duration_scorer(duration_input).squeeze(-1)
+            duration_dist = _masked_categorical(
+                duration_logits,
+                torch.as_tensor(durations_mask, dtype=torch.bool, device=device),
+            )
+            duration_index = (
+                int(torch.argmax(duration_dist.logits).item())
+                if deterministic
+                else int(duration_dist.sample().item())
+            )
+            cache_tensor = torch.as_tensor(cache_index, dtype=torch.long, device=device)
+            duration_tensor = torch.as_tensor(duration_index, dtype=torch.long, device=device)
+            return MacroActionSample(
+                cache_index=cache_index,
+                duration_index=duration_index,
+                requested_duration=self.duration_candidates[duration_index],
+                log_prob=cache_dist.log_prob(cache_tensor) + duration_dist.log_prob(duration_tensor),
+                entropy=cache_dist.entropy() + duration_dist.entropy(),
+                value=self.macro_critic(obs).squeeze(),
+                cache_mask=cache_mask.copy(),
+                duration_mask=durations_mask,
+            )
+
+    def evaluate_macro(
+        self,
+        observations: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+        cache_actions: Any,
+        duration_masks: Any,
+        duration_actions: Any,
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        cache_logits, duration_logits, values, masks, d_masks, cache_actions_t = self._macro_logits(
+            observations,
+            cache_candidate_features,
+            cache_candidate_masks,
+            duration_masks,
+            cache_actions,
+            duration_actions,
+        )
+        device = cache_logits.device
+        duration_actions_t = torch.as_tensor(duration_actions, dtype=torch.long, device=device).reshape(-1)
+        cache_dist = _masked_categorical(cache_logits, masks)
+        duration_dist = _masked_categorical(duration_logits, d_masks)
+        cache_log_prob = cache_dist.log_prob(cache_actions_t)
+        duration_log_prob = duration_dist.log_prob(duration_actions_t)
+        return (
+            cache_log_prob + duration_log_prob,
+            cache_dist.entropy() + duration_dist.entropy(),
+            values,
+            cache_log_prob,
+            duration_log_prob,
+        )
+
+    def _micro_candidate_logits(
+        self,
+        observation: Any,
+        candidate_features: Any,
+        candidate_mask: Any,
+        uav0_position_condition: Any,
+    ) -> Any:
+        device = next(self.parameters()).device
+        obs, _ = self._observation_batch(observation, device)
+        if int(obs.shape[0]) != 1 or int(obs.shape[-1]) != self.observation_dim:
+            raise ValueError("Micro candidate sampling requires one state。")
+        features = torch.as_tensor(candidate_features, dtype=torch.float32, device=device)
+        mask = torch.as_tensor(candidate_mask, dtype=torch.bool, device=device).reshape(-1)
+        condition = torch.as_tensor(
+            uav0_position_condition, dtype=torch.float32, device=device
+        ).reshape(2)
+        if (
+            features.ndim != 2
+            or int(features.shape[-1]) != self.micro_uav_feature_dim
+            or len(features) != len(mask)
+            or not len(mask)
+        ):
+            raise ValueError("Micro candidate features/mask shape mismatch。")
+        if not bool(torch.all(torch.isfinite(features)).item()) or not bool(
+            torch.all(torch.isfinite(condition)).item()
+        ):
+            raise ValueError("Micro candidate inputs must be finite。")
+        hidden = self.micro_actor_encoder(obs).expand(len(features), -1)
+        inputs = torch.cat(
+            (hidden, features, condition.expand(len(features), -1)), dim=-1
+        )
+        scores = self.micro_uav_candidate_scorer(inputs).squeeze(-1)
+        return _group_balance_candidate_logits(
+            scores,
+            features,
+            mask,
+            slice(self.micro_uav_feature_dim - 2, self.micro_uav_feature_dim),
+        )
+
+    def sample_micro_head(
+        self,
+        observation: Any,
+        candidate_features: Any,
+        candidate_mask: Any,
+        *,
+        uav_index: int,
+        uav0_position_condition: Any,
+        deterministic: bool = False,
+    ) -> CategoricalSample:
+        if int(uav_index) not in (0, 1):
+            raise ValueError("当前 Micro 策略要求固定 UAV0、UAV1 顺序。")
+        with torch.no_grad():
+            logits = self._micro_candidate_logits(
+                observation,
+                candidate_features,
+                candidate_mask,
+                uav0_position_condition,
+            )
+            mask = torch.as_tensor(candidate_mask, dtype=torch.bool, device=logits.device)
+            distribution = _masked_categorical(logits, mask)
+            selected = (
+                int(torch.argmax(distribution.logits).item())
                 if deterministic
                 else int(distribution.sample().item())
             )
-            actions.append(value_index)
-            masks.append(mask.copy())
-            if action_probabilities is not None and deterministic_actions is not None:
-                action_probabilities.append(
-                    float(distribution.probs[0, 1].detach().cpu().item())
-                )
-                deterministic_actions.append(deterministic_index)
-            action_tensor = torch.as_tensor([value_index], dtype=torch.long, device=logits.device)
-            log_probs.append(distribution.log_prob(action_tensor).squeeze(0))
-            entropies.append(distribution.entropy().squeeze(0))
-        return PolicySample(
-            action=np.asarray(actions, dtype=np.int8),
-            log_prob=torch.stack(log_probs).sum(),
-            entropy=torch.stack(entropies).sum(),
-            value=value,
-            action_mask=np.stack(masks, axis=0),
-            action_probabilities=(
-                None
-                if action_probabilities is None
-                else np.asarray(action_probabilities, dtype=np.float64)
-            ),
-            deterministic_action=(
-                None
-                if deterministic_actions is None
-                else np.asarray(deterministic_actions, dtype=np.int8)
-            ),
-        )
+            selected_t = torch.as_tensor(selected, dtype=torch.long, device=logits.device)
+            return CategoricalSample(
+                selected_index=selected,
+                log_prob=distribution.log_prob(selected_t),
+                entropy=distribution.entropy(),
+                probabilities=distribution.probs.detach().cpu().numpy().copy(),
+                masked_logits=distribution.logits,
+            )
 
-    def evaluate(
+    def evaluate_micro_joint(
         self,
         observations: Any,
+        candidate_features: Any,
+        candidate_masks: Any,
         actions: Any,
-        action_masks: Any = None,
-    ) -> PolicyEvaluation:
-        obs, _ = self._observations(observations)
-        hidden = self._default_actor_encoder()(obs)
-        logits = self.actor_head(hidden)
-        values = self._critic_values(obs, hidden)
-        action_values = _validate_binary_actions(actions, self.action_dim).to(logits.device)
-        masks = _normalize_masks(action_masks, int(obs.shape[0]), self.action_dim, logits.device)
-        distribution = self._masked_distribution(logits, masks)
-        valid = masks.gather(-1, action_values.unsqueeze(-1)).squeeze(-1)
-        if not bool(torch.all(valid).item()):
-            raise ValueError("actions 包含被 action mask 屏蔽的 request。")
-        return PolicyEvaluation(
-            log_prob=distribution.log_prob(action_values).sum(dim=-1),
-            entropy=torch.where(
-                masks.sum(dim=-1) == 1,
-                torch.zeros_like(distribution.entropy()),
-                distribution.entropy(),
-            ).sum(dim=-1),
+        uav0_position_conditions: Any,
+    ) -> JointMicroEvaluation:
+        device = next(self.parameters()).device
+        obs, _ = self._observation_batch(observations, device)
+        features = torch.as_tensor(candidate_features, dtype=torch.float32, device=device)
+        masks = torch.as_tensor(candidate_masks, dtype=torch.bool, device=device)
+        action_values = torch.as_tensor(actions, dtype=torch.long, device=device)
+        conditions = torch.as_tensor(
+            uav0_position_conditions, dtype=torch.float32, device=device
+        )
+        if features.ndim != 4 or tuple(features.shape[:2]) != (int(obs.shape[0]), 2):
+            raise ValueError("Micro rollout features must be [B,2,C,F]。")
+        if int(features.shape[-1]) != self.micro_uav_feature_dim:
+            raise ValueError("Micro candidate feature dimension mismatch。")
+        if tuple(masks.shape) != tuple(features.shape[:3]):
+            raise ValueError("Micro rollout masks must match candidate features。")
+        if tuple(action_values.shape) != (int(obs.shape[0]), 2):
+            raise ValueError("Micro rollout actions must be [B,2]。")
+        if tuple(conditions.shape) != (int(obs.shape[0]), 2):
+            raise ValueError("UAV0 conditional positions must be [B,2]。")
+        if not bool(torch.all(torch.isfinite(features)).item()) or not bool(
+            torch.all(torch.isfinite(conditions)).item()
+        ):
+            raise ValueError("Micro rollout candidate data contains NaN/Inf。")
+        hidden = self.micro_actor_encoder(obs)
+        head_log_probs: list[Any] = []
+        head_entropies: list[Any] = []
+        for head in range(2):
+            head_features = features[:, head]
+            head_masks = masks[:, head]
+            condition = (
+                torch.zeros_like(conditions)
+                if head == 0
+                else conditions
+            )
+            expanded_hidden = hidden.unsqueeze(1).expand(-1, int(features.shape[2]), -1)
+            logits = self.micro_uav_candidate_scorer(
+                torch.cat(
+                    (
+                        expanded_hidden,
+                        head_features,
+                        condition.unsqueeze(1).expand(-1, int(features.shape[2]), -1),
+                    ),
+                    dim=-1,
+                )
+            ).squeeze(-1)
+            balanced = _group_balance_candidate_logits(
+                logits,
+                head_features,
+                head_masks,
+                slice(self.micro_uav_feature_dim - 2, self.micro_uav_feature_dim),
+            )
+            dist = _masked_categorical(balanced, head_masks)
+            action = action_values[:, head]
+            valid = head_masks.gather(1, action[:, None]).squeeze(1)
+            if not bool(torch.all(valid).item()):
+                raise ValueError("PPO action 被 rollout 当时保存的 mask 屏蔽。")
+            head_log_probs.append(dist.log_prob(action))
+            head_entropies.append(dist.entropy())
+        values = self.micro_critic(obs).squeeze(-1)
+        log0, log1 = head_log_probs
+        entropies = head_entropies[0] + head_entropies[1]
+        return JointMicroEvaluation(
+            log_prob=log0 + log1,
+            entropy=entropies,
             value=values,
-            logits=logits,
+            uav0_log_prob=log0,
+            uav1_log_prob=log1,
         )
 
-
-class _PrimitiveActorCriticBase(_ActorCriticBase):
-    """构建共享状态编码器以及 Trigger 和条件候选 head。"""
-
-    architecture_id = "internal_primitive_base"
-    architecture_version = 1
-
-    def __init__(
-        self,
-        observation_dim: int,
-        action_dim: int,
-        cache_feature_dim: int,
-        uav_feature_dim: int,
-        hidden_sizes: tuple[int, ...] = (128, 128),
-    ) -> None:
-        super().__init__(observation_dim, action_dim, hidden_sizes)
-        if int(cache_feature_dim) <= 0 or int(uav_feature_dim) <= 0:
-            raise ValueError("primitive candidate feature dimensions 必须大于0。")
-        self.cache_feature_dim = int(cache_feature_dim)
-        self.uav_feature_dim = int(uav_feature_dim)
-        candidate_hidden = max(32, self.hidden_dim // 2)
-        self.cache_candidate_scorer = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.cache_feature_dim, candidate_hidden),
-            nn.Tanh(),
-            nn.Linear(candidate_hidden, 1),
-        )
-        self.uav_candidate_scorer = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.uav_feature_dim, candidate_hidden),
-            nn.Tanh(),
-            nn.Linear(candidate_hidden, 1),
-        )
-
-    def _candidate_encoder_for_scorer(self, scorer: Any) -> Any:
-        del scorer
-        return self._default_actor_encoder()
-
-    def _candidate_scores(
-        self,
-        observations: Any,
-        candidate_features: Any,
-        feature_dim: int,
-        scorer: Any,
-    ) -> tuple[Any, bool]:
-        obs, single = self._observations(observations)
-        features = torch.as_tensor(candidate_features, dtype=torch.float32, device=obs.device)
-        if features.ndim == 2:
-            features = features.unsqueeze(0)
-        expected = (int(obs.shape[0]), int(feature_dim))
-        if features.ndim != 3 or int(features.shape[0]) != expected[0] or int(
-            features.shape[2]
-        ) != expected[1]:
-            raise ValueError(
-                "candidate_features shape 必须为 "
-                f"[B,C,{int(feature_dim)}]，实际 {tuple(features.shape)}。"
-            )
-        if not bool(torch.all(torch.isfinite(features)).item()):
-            raise ValueError("candidate_features 包含 NaN/Inf。")
-        hidden = self._candidate_encoder_for_scorer(scorer)(obs)
-        expanded_hidden = hidden.unsqueeze(1).expand(-1, int(features.shape[1]), -1)
-        scores = scorer(torch.cat([expanded_hidden, features], dim=-1)).squeeze(-1)
-        return scores, single
-
-    def _candidate_operation_slice(self, candidate_kind: str) -> slice | None:
-        del candidate_kind
-        return None
-
-    def _sample_candidate(
-        self,
-        observation: Any,
-        candidate_features: Any,
-        feature_dim: int,
-        scorer: Any,
-        deterministic: bool,
-        operation_slice: slice | None = None,
-    ) -> CandidatePolicySample:
-        scores, single = self._candidate_scores(
-            observation,
-            candidate_features,
-            feature_dim,
-            scorer,
-        )
-        if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
-            raise ValueError("conditional candidate sampling 需要单个 context。")
-        distribution_logits = scores.squeeze(0)
-        if operation_slice is not None:
-            distribution_logits = _group_balance_candidate_logits(
-                distribution_logits,
-                candidate_features,
-                None,
-                operation_slice,
-            )
-        distribution = torch.distributions.Categorical(logits=distribution_logits)
-        selected = (
-            int(torch.argmax(distribution.logits).item())
-            if deterministic
-            else int(distribution.sample().item())
-        )
-        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=scores.device)
-        return CandidatePolicySample(
-            selected_index=selected,
-            log_prob=distribution.log_prob(selected_tensor),
-            entropy=distribution.entropy(),
-            logits=distribution_logits,
-        )
-
-    def _sample_candidate_grouped_deterministic(
-        self,
-        observation: Any,
-        candidate_features: Any,
-        feature_dim: int,
-        scorer: Any,
-        operation_slice: slice | None,
-    ) -> CandidatePolicySample:
-        """先按组内最高分选择候选组，再在组内选择最高分候选。"""
-
-        if operation_slice is None:
-            raise ValueError(
-                "grouped deterministic decoding requires operation groups"
-            )
-        scores, single = self._candidate_scores(
-            observation,
-            candidate_features,
-            feature_dim,
-            scorer,
-        )
-        if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
-            raise ValueError("conditional candidate sampling 需要单个 context。")
-        candidate_features_t = torch.as_tensor(
-            candidate_features,
-            dtype=torch.float32,
-            device=scores.device,
-        )
-        distribution_logits = _group_balance_candidate_logits(
-            scores.squeeze(0),
-            candidate_features_t,
-            None,
-            operation_slice,
-        )
-        distribution = torch.distributions.Categorical(logits=distribution_logits)
-        start = 0 if operation_slice.start is None else int(operation_slice.start)
-        stop = (
-            int(candidate_features_t.shape[-1])
-            if operation_slice.stop is None
-            else int(operation_slice.stop)
-        )
-        operation_values = candidate_features_t[:, start:stop]
-        if operation_values.ndim != 2 or int(operation_values.shape[0]) != int(
-            distribution.probs.shape[-1]
-        ):
-            raise ValueError("candidate operation features shape mismatch")
-        operation_indices = torch.argmax(operation_values, dim=-1)
-        group_count = stop - start
-        group_probabilities = torch.stack(
-            [
-                distribution.probs[operation_indices == group_index].sum()
-                for group_index in range(group_count)
-            ]
-        )
-        selected_group = int(torch.argmax(group_probabilities).item())
-        group_candidates = torch.nonzero(
-            operation_indices == selected_group,
-            as_tuple=False,
-        ).reshape(-1)
-        if int(group_candidates.numel()) == 0:
-            raise ValueError("grouped deterministic decoding selected an empty group")
-        selected = int(
-            group_candidates[
-                int(torch.argmax(distribution.probs[group_candidates]).item())
-            ].item()
-        )
-        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=scores.device)
-        return CandidatePolicySample(
-            selected_index=selected,
-            log_prob=distribution.log_prob(selected_tensor),
-            entropy=distribution.entropy(),
-            logits=distribution_logits,
-        )
-
-    def sample_cache_candidate(
-        self,
-        observation: Any,
-        candidate_features: Any,
-        deterministic: bool = False,
-    ) -> CandidatePolicySample:
-        return self._sample_candidate(
-            observation,
-            candidate_features,
-            self.cache_feature_dim,
-            self.cache_candidate_scorer,
-            deterministic,
-            self._candidate_operation_slice("cache"),
-        )
-
-    def sample_uav_candidate(
-        self,
-        observation: Any,
-        candidate_features: Any,
-        deterministic: bool = False,
-    ) -> CandidatePolicySample:
-        return self._sample_candidate(
-            observation,
-            candidate_features,
-            self.uav_feature_dim,
-            self.uav_candidate_scorer,
-            deterministic,
-            self._candidate_operation_slice("uav"),
-        )
-
-    def sample_cache_candidate_grouped_deterministic(
-        self,
-        observation: Any,
-        candidate_features: Any,
-    ) -> CandidatePolicySample:
-        return self._sample_candidate_grouped_deterministic(
-            observation,
-            candidate_features,
-            self.cache_feature_dim,
-            self.cache_candidate_scorer,
-            self._candidate_operation_slice("cache"),
-        )
-
-    def sample_uav_candidate_grouped_deterministic(
-        self,
-        observation: Any,
-        candidate_features: Any,
-    ) -> CandidatePolicySample:
-        return self._sample_candidate_grouped_deterministic(
-            observation,
-            candidate_features,
-            self.uav_feature_dim,
-            self.uav_candidate_scorer,
-            self._candidate_operation_slice("uav"),
-        )
-
-    def _evaluate_conditional_heads(
-        self,
-        contexts: Any,
-        candidate_features: Any,
-        candidate_masks: Any,
-        selected_indices: Any,
-        active_heads: Any,
-        feature_dim: int,
-        scorer: Any,
-        operation_slice: slice | None = None,
-    ) -> tuple[Any, Any]:
-        contexts_t = torch.as_tensor(contexts, dtype=torch.float32)
-        features_t = torch.as_tensor(candidate_features, dtype=torch.float32)
-        masks_t = torch.as_tensor(candidate_masks, dtype=torch.bool)
-        selected_t = torch.as_tensor(selected_indices, dtype=torch.long)
-        active_t = torch.as_tensor(active_heads, dtype=torch.bool)
-        if contexts_t.ndim != 3:
-            raise ValueError("conditional contexts 必须为 [B,H,observation_dim]。")
-        batch_size, head_count, observation_dim = [int(value) for value in contexts_t.shape]
-        if observation_dim != self.observation_dim:
-            raise ValueError("conditional context observation_dim 不匹配。")
-        if tuple(features_t.shape[:2]) != (batch_size, head_count) or int(
-            features_t.shape[-1]
-        ) != int(feature_dim):
-            raise ValueError("conditional candidate feature shape 不匹配。")
-        candidate_count = int(features_t.shape[2])
-        if tuple(masks_t.shape) != (batch_size, head_count, candidate_count):
-            raise ValueError("conditional candidate mask shape 不匹配。")
-        if tuple(selected_t.shape) != (batch_size, head_count) or tuple(active_t.shape) != (
-            batch_size,
-            head_count,
-        ):
-            raise ValueError("conditional selected/active shape 不匹配。")
-        flat_scores, _ = self._candidate_scores(
-            contexts_t.reshape(batch_size * head_count, observation_dim),
-            features_t.reshape(batch_size * head_count, candidate_count, feature_dim),
-            feature_dim,
-            scorer,
-        )
-        scores = flat_scores.reshape(batch_size, head_count, candidate_count)
-        if not bool(torch.all(torch.any(masks_t, dim=-1)).item()):
-            raise ValueError("每个 conditional head 至少需要一个 padded valid candidate。")
-        if bool(torch.any(selected_t < 0).item()) or bool(
-            torch.any(selected_t >= candidate_count).item()
-        ):
-            raise ValueError("conditional selected index 越界。")
-        selected_valid = masks_t.gather(-1, selected_t.unsqueeze(-1)).squeeze(-1)
-        if not bool(torch.all(selected_valid).item()):
-            raise ValueError("conditional selected index 被 candidate mask 屏蔽。")
-        distribution_logits = scores.masked_fill(~masks_t.to(scores.device), -float("inf"))
-        if operation_slice is not None:
-            distribution_logits = _group_balance_candidate_logits(
-                scores,
-                features_t,
-                masks_t,
-                operation_slice,
-                active_heads=active_t,
-            )
-        distribution = torch.distributions.Categorical(logits=distribution_logits)
-        active_float = active_t.to(torch.float32)
-        log_prob = (distribution.log_prob(selected_t) * active_float).sum(dim=-1)
-        entropy = (distribution.entropy() * active_float).sum(dim=-1)
-        return log_prob, entropy
-
-    def evaluate_primitive(
-        self,
-        observations: Any,
-        actions: Any,
-        action_masks: Any,
-        cache_contexts: Any,
-        cache_candidate_features: Any,
-        cache_candidate_masks: Any,
-        cache_selected_indices: Any,
-        uav_contexts: Any,
-        uav_candidate_features: Any,
-        uav_candidate_masks: Any,
-        uav_selected_indices: Any,
-        num_cache_heads: int,
-    ) -> PolicyEvaluation:
-        trigger = super().evaluate(observations, actions, action_masks)
-        action_values = _validate_binary_actions(actions, self.action_dim).to(
-            trigger.log_prob.device
-        )
-        cache_active = action_values[:, : int(num_cache_heads)].to(torch.bool)
-        uav_active = action_values[:, int(num_cache_heads) :].to(torch.bool)
-        cache_log_prob, cache_entropy = self._evaluate_conditional_heads(
-            cache_contexts,
-            cache_candidate_features,
-            cache_candidate_masks,
-            cache_selected_indices,
-            cache_active,
-            self.cache_feature_dim,
-            self.cache_candidate_scorer,
-            self._candidate_operation_slice("cache"),
-        )
-        uav_log_prob, uav_entropy = self._evaluate_conditional_heads(
-            uav_contexts,
-            uav_candidate_features,
-            uav_candidate_masks,
-            uav_selected_indices,
-            uav_active,
-            self.uav_feature_dim,
-            self.uav_candidate_scorer,
-            self._candidate_operation_slice("uav"),
-        )
-        return PolicyEvaluation(
-            log_prob=trigger.log_prob + cache_log_prob + uav_log_prob,
-            entropy=trigger.entropy + cache_entropy + uav_entropy,
-            value=trigger.value,
-            logits=trigger.logits,
-            cache_log_prob=cache_log_prob,
-            uav_log_prob=uav_log_prob,
-            cache_entropy=cache_entropy,
-            uav_entropy=uav_entropy,
-        )
-
-
-class _SeparateCriticActorCriticBase(
-    _PrimitiveActorCriticBase
-):
-    """为 Critic 建立独立的状态表示。"""
-
-    architecture_id = "internal_separate_critic_base"
-    architecture_version = 1
-
-    def __init__(
-        self,
-        observation_dim: int,
-        action_dim: int,
-        cache_feature_dim: int,
-        uav_feature_dim: int,
-        hidden_sizes: tuple[int, ...] = (128, 128),
-    ) -> None:
-        super().__init__(
-            observation_dim,
-            action_dim,
-            cache_feature_dim,
-            uav_feature_dim,
-            hidden_sizes,
-        )
-        critic_layers: list[Any] = []
-        last_dim = self.observation_dim
-        for hidden_size in hidden_sizes:
-            critic_layers.extend([nn.Linear(last_dim, int(hidden_size)), nn.Tanh()])
-            last_dim = int(hidden_size)
-        self.critic_encoder = nn.Sequential(*critic_layers)
-        self.critic_head = nn.Linear(last_dim, 1)
-
-    def _critic_values(self, observations: Any, actor_hidden: Any) -> Any:
-        del actor_hidden
-        return self.critic_head(self.critic_encoder(observations)).squeeze(-1)
-
-
-class _SeparateOptimizationActorCriticBase(
-    _SeparateCriticActorCriticBase
-):
-    """提供互不重叠的 Actor 与 Critic 参数组。"""
-
-    architecture_id = "internal_separate_optimization_base"
-    architecture_version = 1
-
-    def actor_parameters(self) -> tuple[Any, ...]:
-        """返回由 Actor 优化器更新的参数。"""
-
+    def macro_actor_parameters(self) -> tuple[Any, ...]:
         modules = (
-            self.encoder,
-            self.actor_head,
-            self.cache_candidate_scorer,
-            self.uav_candidate_scorer,
+            self.macro_actor_encoder,
+            self.macro_cache_candidate_encoder,
+            self.macro_cache_scorer,
+            self.macro_duration_scorer,
         )
-        parameters = tuple(
-            parameter
-            for module in modules
-            for parameter in module.parameters()
+        return tuple(parameter for module in modules for parameter in module.parameters())
+
+    def macro_critic_parameters(self) -> tuple[Any, ...]:
+        return tuple(self.macro_critic.parameters())
+
+    def micro_actor_parameters(self) -> tuple[Any, ...]:
+        modules = (self.micro_actor_encoder, self.micro_uav_candidate_scorer)
+        return tuple(parameter for module in modules for parameter in module.parameters())
+
+    def micro_critic_parameters(self) -> tuple[Any, ...]:
+        return tuple(self.micro_critic.parameters())
+
+    def macro_parameters(self) -> tuple[Any, ...]:
+        return (*self.macro_actor_parameters(), *self.macro_critic_parameters())
+
+    def micro_parameters(self) -> tuple[Any, ...]:
+        return (*self.micro_actor_parameters(), *self.micro_critic_parameters())
+
+    def macro_state_dict(self) -> dict[str, Any]:
+        prefixes = (
+            "macro_actor_encoder.",
+            "macro_cache_candidate_encoder.",
+            "macro_cache_scorer.",
+            "macro_duration_scorer.",
+            "macro_critic.",
         )
-        if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("Actor 参数组中存在重复参数。")
-        return parameters
-
-    def critic_parameters(self) -> tuple[Any, ...]:
-        """返回由 Critic 优化器更新的参数。"""
-
-        modules = (self.critic_encoder, self.critic_head)
-        parameters = tuple(
-            parameter
-            for module in modules
-            for parameter in module.parameters()
-        )
-        if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("Critic 参数组中存在重复参数。")
-        return parameters
-
-    def critic_value(self, observations: Any) -> Any:
-        """计算独立 Critic 的值，避免构建 Actor 计算图。"""
-
-        obs, single = self._observations(observations)
-        values = self.critic_head(self.critic_encoder(obs)).squeeze(-1)
-        return values.squeeze(0) if single else values
-
-
-class _PopArtCriticActorCriticBase(
-    _SeparateOptimizationActorCriticBase
-):
-    """通过 PopArt 缓冲区保存 Critic 的归一化统计量。"""
-
-    architecture_id = "internal_popart_critic_base"
-    architecture_version = 1
-
-    def __init__(
-        self,
-        observation_dim: int,
-        action_dim: int,
-        cache_feature_dim: int,
-        uav_feature_dim: int,
-        hidden_sizes: tuple[int, ...] = (128, 128),
-    ) -> None:
-        super().__init__(
-            observation_dim,
-            action_dim,
-            cache_feature_dim,
-            uav_feature_dim,
-            hidden_sizes,
-        )
-        self.register_buffer("popart_mean", torch.zeros((), dtype=torch.float32))
-        self.register_buffer("popart_std", torch.ones((), dtype=torch.float32))
-
-    @staticmethod
-    def _validate_popart_statistics(mean: Any, std: Any) -> tuple[float, float]:
-        mean_f = float(mean)
-        std_f = float(std)
-        if not math.isfinite(mean_f) or not math.isfinite(std_f) or std_f <= 0.0:
-            raise ValueError("PopArt mean/std must be finite and std must be positive.")
-        return mean_f, std_f
-
-    def popart_statistics(self) -> tuple[float, float]:
-        """返回当前原始价值的均值和标准差。"""
-
-        return (
-            float(self.popart_mean.detach().cpu().item()),
-            float(self.popart_std.detach().cpu().item()),
-        )
-
-    def critic_normalized_value(self, observations: Any) -> Any:
-        """返回 Critic 内部的归一化价值 z(s)。"""
-
-        obs, single = self._observations(observations)
-        values = self.critic_head(self.critic_encoder(obs)).squeeze(-1)
-        return values.squeeze(0) if single else values
-
-    def critic_value(self, observations: Any) -> Any:
-        """返回供 rollout、GAE 和 PPO 使用的原始价值 V(s)。"""
-
-        normalized_values = self.critic_normalized_value(observations)
-        return self.popart_mean + self.popart_std * normalized_values
-
-    def _critic_values(self, observations: Any, actor_hidden: Any) -> Any:
-        del actor_hidden
-        return self.critic_value(observations)
-
-    def update_popart_statistics(self, mean: Any, std: Any) -> None:
-        """只变换 Critic 输出层，同时保持原始价值不变。"""
-
-        mean_new, std_new = self._validate_popart_statistics(mean, std)
-        mean_old, std_old = self.popart_statistics()
-        with torch.no_grad():
-            self.critic_head.weight.mul_(std_old / std_new)
-            self.critic_head.bias.mul_(std_old).add_(mean_old - mean_new).div_(std_new)
-            self.popart_mean.fill_(mean_new)
-            self.popart_std.fill_(std_new)
-
-
-class _CacheOperationActorCriticBase(
-    _PopArtCriticActorCriticBase
-):
-    """为联合策略保留 Cache 操作和候选评分模块。"""
-
-    architecture_id = "internal_cache_operation_base"
-    architecture_version = 1
-    operation_order = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
-
-    def __init__(
-        self,
-        observation_dim: int,
-        action_dim: int,
-        cache_feature_dim: int,
-        uav_feature_dim: int,
-        num_cache_heads: int,
-        hidden_sizes: tuple[int, ...] = (128, 128),
-    ) -> None:
-        super().__init__(
-            observation_dim,
-            action_dim,
-            cache_feature_dim,
-            uav_feature_dim,
-            hidden_sizes,
-        )
-        if int(num_cache_heads) <= 0:
-            raise ValueError("Cache num_cache_heads must be positive")
-        self.num_cache_heads = int(num_cache_heads)
-        self.cache_operation_head = nn.Linear(
-            self.hidden_dim,
-            self.num_cache_heads * len(self.operation_order),
-        )
-
-    def actor_parameters(self) -> tuple[Any, ...]:
-        """返回 Cache 操作策略使用的参数。"""
-
-        modules = (
-            self.encoder,
-            self.cache_candidate_scorer,
-            self.cache_operation_head,
-        )
-        parameters = tuple(
-            parameter
-            for module in modules
-            for parameter in module.parameters()
-        )
-        if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("Cache actor parameter group contains duplicate parameters.")
-        return parameters
-
-    def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
-        obs, single = self._observations(observations)
-        hidden = self.encoder(obs)
-        logits = self.cache_operation_head(hidden).reshape(
-            int(obs.shape[0]),
-            self.num_cache_heads,
-            len(self.operation_order),
-        )
-        return (logits.squeeze(0) if single else logits), single
-
-    def sample_cache_operation(
-        self,
-        observation: Any,
-        head_index: int,
-        operation_mask: Any,
-        deterministic: bool = False,
-    ) -> OperationPolicySample:
-        """根据动态可行性掩码为一个节点采样操作。"""
-
-        logits, single = self._operation_logits(observation)
-        if not single or tuple(logits.shape) != (
-            self.num_cache_heads,
-            len(self.operation_order),
-        ):
-            raise ValueError("Cache operation sampling requires one observation")
-        index = int(head_index)
-        if index < 0 or index >= self.num_cache_heads:
-            raise IndexError("Cache cache operation head index out of range")
-        mask = torch.as_tensor(
-            np.asarray(operation_mask, dtype=bool).reshape(-1),
-            dtype=torch.bool,
-            device=logits.device,
-        )
-        if tuple(mask.shape) != (len(self.operation_order),) or not bool(
-            torch.any(mask).item()
-        ):
-            raise ValueError("Cache operation mask must allow at least one operation")
-        raw_logits = logits[index]
-        raw_distribution = torch.distributions.Categorical(logits=raw_logits)
-        masked_logits = raw_logits.masked_fill(~mask, -float("inf"))
-        distribution = torch.distributions.Categorical(logits=masked_logits)
-        selected = (
-            int(torch.argmax(distribution.logits).item())
-            if deterministic
-            else int(distribution.sample().item())
-        )
-        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=logits.device)
-        return OperationPolicySample(
-            selected_index=selected,
-            log_prob=distribution.log_prob(selected_tensor),
-            entropy=distribution.entropy(),
-            logits=masked_logits,
-            raw_logits=raw_logits,
-            probabilities=raw_distribution.probs,
-        )
-
-    def sample_cache_candidate(
-        self,
-        observation: Any,
-        candidate_features: Any,
-        candidate_mask: Any | None = None,
-        deterministic: bool = False,
-    ) -> CandidatePolicySample:
-        """仅在指定操作组内根据原始评分采样。"""
-
-        scores, single = self._candidate_scores(
-            observation,
-            candidate_features,
-            self.cache_feature_dim,
-            self.cache_candidate_scorer,
-        )
-        if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
-            raise ValueError("Cache candidate sampling requires one context")
-        raw_scores = scores.squeeze(0)
-        if candidate_mask is None:
-            mask = torch.ones_like(raw_scores, dtype=torch.bool)
-        else:
-            mask = torch.as_tensor(
-                np.asarray(candidate_mask, dtype=bool).reshape(-1),
-                dtype=torch.bool,
-                device=raw_scores.device,
-            )
-        if tuple(mask.shape) != tuple(raw_scores.shape) or not bool(
-            torch.any(mask).item()
-        ):
-            raise ValueError("Cache candidate mask must allow at least one candidate")
-        distribution_logits = raw_scores.masked_fill(~mask, -float("inf"))
-        distribution = torch.distributions.Categorical(logits=distribution_logits)
-        selected = (
-            int(torch.argmax(distribution.logits).item())
-            if deterministic
-            else int(distribution.sample().item())
-        )
-        selected_tensor = torch.as_tensor(
-            selected,
-            dtype=torch.long,
-            device=raw_scores.device,
-        )
-        return CandidatePolicySample(
-            selected_index=selected,
-            log_prob=distribution.log_prob(selected_tensor),
-            entropy=distribution.entropy(),
-            logits=distribution_logits,
-        )
-
-    def evaluate_cache_operation_primitive(
-        self,
-        observations: Any,
-        operation_contexts: Any,
-        operation_masks: Any,
-        operation_actions: Any,
-        candidate_features: Any,
-        candidate_masks: Any,
-        candidate_selected_indices: Any,
-    ) -> PolicyEvaluation:
-        """计算 Cache 操作与候选组成的联合分布。"""
-
-        observations_t, _ = self._observations(observations)
-        operation_contexts_t = torch.as_tensor(
-            operation_contexts,
-            dtype=torch.float32,
-            device=observations_t.device,
-        )
-        operation_masks_t = torch.as_tensor(
-            operation_masks,
-            dtype=torch.bool,
-            device=observations_t.device,
-        )
-        operation_actions_t = torch.as_tensor(
-            operation_actions,
-            dtype=torch.long,
-            device=observations_t.device,
-        )
-        candidate_features_t = torch.as_tensor(
-            candidate_features,
-            dtype=torch.float32,
-            device=observations_t.device,
-        )
-        candidate_masks_t = torch.as_tensor(
-            candidate_masks,
-            dtype=torch.bool,
-            device=observations_t.device,
-        )
-        candidate_selected_t = torch.as_tensor(
-            candidate_selected_indices,
-            dtype=torch.long,
-            device=observations_t.device,
-        )
-        if operation_contexts_t.ndim != 3:
-            raise ValueError("Cache operation_contexts must be [B,H,observation_dim]")
-        batch_size, head_count, observation_dim = [
-            int(value) for value in operation_contexts_t.shape
-        ]
-        if batch_size != int(observations_t.shape[0]):
-            raise ValueError("Cache operation_contexts batch dimension mismatch")
-        if head_count != self.num_cache_heads or observation_dim != self.observation_dim:
-            raise ValueError("Cache operation_contexts shape mismatch")
-        expected_operation_shape = (
-            batch_size,
-            self.num_cache_heads,
-            len(self.operation_order),
-        )
-        if tuple(operation_masks_t.shape) != expected_operation_shape:
-            raise ValueError("Cache operation_masks shape mismatch")
-        if tuple(operation_actions_t.shape) != (
-            batch_size,
-            self.num_cache_heads,
-        ):
-            raise ValueError("Cache operation_actions shape mismatch")
-        if bool(torch.any(operation_actions_t < 0).item()) or bool(
-            torch.any(operation_actions_t >= len(self.operation_order)).item()
-        ):
-            raise ValueError("Cache operation action index out of range")
-        if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
-            raise ValueError("Cache operation mask cannot block every operation")
-
-        all_operation_logits, _ = self._operation_logits(
-            operation_contexts_t.reshape(batch_size * head_count, observation_dim)
-        )
-        all_operation_logits = all_operation_logits.reshape(
-            batch_size,
-            head_count,
-            self.num_cache_heads,
-            len(self.operation_order),
-        )
-        head_indices = torch.arange(
-            self.num_cache_heads,
-            dtype=torch.long,
-            device=all_operation_logits.device,
-        )
-        operation_logits = all_operation_logits[:, head_indices, head_indices, :]
-        if tuple(operation_logits.shape) != expected_operation_shape:
-            raise AssertionError("Cache operation head diagonal shape mismatch")
-        operation_logits = operation_logits.masked_fill(
-            ~operation_masks_t,
-            -float("inf"),
-        )
-        operation_distribution = torch.distributions.Categorical(logits=operation_logits)
-        operation_valid = operation_masks_t.gather(
-            -1,
-            operation_actions_t.unsqueeze(-1),
-        ).squeeze(-1)
-        if not bool(torch.all(operation_valid).item()):
-            raise ValueError("Cache operation action is blocked by its operation mask")
-        operation_node_log_prob = operation_distribution.log_prob(operation_actions_t)
-        operation_log_prob = operation_node_log_prob.sum(dim=-1)
-        operation_entropy = torch.where(
-            operation_masks_t.sum(dim=-1) == 1,
-            torch.zeros_like(operation_distribution.entropy()),
-            operation_distribution.entropy(),
-        ).sum(dim=-1)
-
-        if candidate_features_t.ndim != 4:
-            raise ValueError("Cache candidate_features must be [B,H,C,F]")
-        if tuple(candidate_features_t.shape[:2]) != (
-            batch_size,
-            self.num_cache_heads,
-        ) or int(candidate_features_t.shape[-1]) != self.cache_feature_dim:
-            raise ValueError("Cache candidate_features shape mismatch")
-        candidate_count = int(candidate_features_t.shape[2])
-        if candidate_count <= 0:
-            raise ValueError("Cache candidate tensor must have positive width")
-        expected_candidate_shape = (
-            batch_size,
-            self.num_cache_heads,
-            candidate_count,
-        )
-        if tuple(candidate_masks_t.shape) != expected_candidate_shape:
-            raise ValueError("Cache candidate_masks shape mismatch")
-        if tuple(candidate_selected_t.shape) != (
-            batch_size,
-            self.num_cache_heads,
-        ):
-            raise ValueError("Cache candidate_selected_indices shape mismatch")
-        if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
-            raise ValueError("Cache candidate mask must have a placeholder or active candidate")
-        if bool(torch.any(candidate_selected_t < 0).item()) or bool(
-            torch.any(candidate_selected_t >= candidate_count).item()
-        ):
-            raise ValueError("Cache candidate selected index out of range")
-        candidate_valid = candidate_masks_t.gather(
-            -1,
-            candidate_selected_t.unsqueeze(-1),
-        ).squeeze(-1)
-        if not bool(torch.all(candidate_valid).item()):
-            raise ValueError("Cache candidate selected index is masked")
-        candidate_contexts = operation_contexts_t.reshape(
-            batch_size * head_count,
-            observation_dim,
-        )
-        flat_features = candidate_features_t.reshape(
-            batch_size * head_count,
-            candidate_count,
-            self.cache_feature_dim,
-        )
-        raw_scores, _ = self._candidate_scores(
-            candidate_contexts,
-            flat_features,
-            self.cache_feature_dim,
-            self.cache_candidate_scorer,
-        )
-        raw_scores = raw_scores.reshape(
-            batch_size,
-            self.num_cache_heads,
-            candidate_count,
-        )
-        candidate_logits = raw_scores.masked_fill(~candidate_masks_t, -float("inf"))
-        candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
-        candidate_active = operation_actions_t != 0
-        candidate_node_log_prob = (
-            candidate_distribution.log_prob(candidate_selected_t)
-            * candidate_active.to(torch.float32)
-        )
-        candidate_log_prob = candidate_node_log_prob.sum(dim=-1)
-        candidate_entropy = (
-            candidate_distribution.entropy()
-            * candidate_active.to(torch.float32)
-        ).sum(dim=-1)
-        return PolicyEvaluation(
-            log_prob=operation_log_prob + candidate_log_prob,
-            entropy=operation_entropy + candidate_entropy,
-            value=self.critic_value(observations_t),
-            logits=operation_logits,
-            cache_log_prob=operation_log_prob + candidate_log_prob,
-            cache_entropy=operation_entropy + candidate_entropy,
-            cache_node_log_probs=operation_node_log_prob + candidate_node_log_prob,
-            cache_operation_log_probs_all=operation_distribution.logits,
-            cache_candidate_log_probs_all=candidate_distribution.logits,
-        )
-
-class _JointCacheUavOperationActorCriticBase(
-    _CacheOperationActorCriticBase
-):
-    """定义包含显式 UAV 操作的联合 Cache/UAV 策略基础结构。"""
-
-    architecture_id = "internal_joint_cache_uav_operation_base"
-    architecture_version = 1
-    uav_operation_order = ("STAY", "MOVE")
-
-    def __init__(
-        self,
-        observation_dim: int,
-        action_dim: int,
-        cache_feature_dim: int,
-        uav_feature_dim: int,
-        num_cache_heads: int,
-        hidden_sizes: tuple[int, ...] = (128, 128),
-        num_uav_heads: int | None = None,
-    ) -> None:
-        super().__init__(
-            observation_dim,
-            action_dim,
-            cache_feature_dim,
-            uav_feature_dim,
-            num_cache_heads,
-            hidden_sizes,
-            # Cache 操作基类不使用联合策略的 UAV head 数量。
-        )
-        if num_uav_heads is None:
-            if int(uav_feature_dim) <= 16:
-                raise ValueError("uav_feature_dim must include at least one UAV head")
-            # 目标位置特征包含服务向量，因此显式传入 UAV head 数量以确定特征宽度。
-            self.num_uav_heads = int(uav_feature_dim) - 16
-        else:
-            self.num_uav_heads = int(num_uav_heads)
-            if self.num_uav_heads <= 0:
-                raise ValueError("num_uav_heads must be positive")
-        self.uav_operation_head = nn.Linear(
-            self.hidden_dim,
-            self.num_uav_heads * len(self.uav_operation_order),
-        )
-
-    def actor_parameters(self) -> tuple[Any, ...]:
-        """返回联合 Actor 使用的五个模块。"""
-
-        modules = (
-            self.encoder,
-            self.cache_operation_head,
-            self.cache_candidate_scorer,
-            self.uav_operation_head,
-            self.uav_candidate_scorer,
-        )
-        parameters = tuple(
-            parameter
-            for module in modules
-            for parameter in module.parameters()
-        )
-        if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("actor parameter group contains duplicate parameters.")
-        return parameters
-
-    def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
-        """返回与四个 Actor 优化器对应的互斥参数组。"""
-
-        groups = {
-            "cache": tuple(
-                parameter
-                for module in (
-                    self.cache_operation_head,
-                    self.cache_candidate_scorer,
-                )
-                for parameter in module.parameters()
-            ),
-            "uav": tuple(
-                parameter
-                for module in (
-                    self.uav_operation_head,
-                    self.uav_candidate_scorer,
-                )
-                for parameter in module.parameters()
-            ),
-            "shared": tuple(self.encoder.parameters()),
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in self.state_dict().items()
+            if key.startswith(prefixes)
         }
-        group_ids = [
-            id(parameter)
-            for parameters in groups.values()
-            for parameter in parameters
-        ]
-        if len(set(group_ids)) != len(group_ids):
-            raise RuntimeError("actor gradient groups overlap.")
-        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
-        if set(group_ids) != actor_ids:
-            raise RuntimeError("actor gradient groups do not cover the actor.")
-        return groups
 
-    def _uav_operation_logits(self, observations: Any) -> tuple[Any, bool]:
-        obs, single = self._observations(observations)
-        hidden = self.encoder(obs)
-        logits = self.uav_operation_head(hidden).reshape(
-            int(obs.shape[0]),
-            self.num_uav_heads,
-            len(self.uav_operation_order),
+    def micro_state_dict(self) -> dict[str, Any]:
+        prefixes = (
+            "micro_actor_encoder.",
+            "micro_uav_candidate_scorer.",
+            "micro_critic.",
         )
-        return (logits.squeeze(0) if single else logits), single
-
-    def sample_uav_operation(
-        self,
-        observation: Any,
-        head_index: int,
-        operation_mask: Any,
-        deterministic: bool = False,
-    ) -> OperationPolicySample:
-        """为一个 UAV 采样显式的 STAY/MOVE 操作。"""
-
-        logits, single = self._uav_operation_logits(observation)
-        if not single or tuple(logits.shape) != (
-            self.num_uav_heads,
-            len(self.uav_operation_order),
-        ):
-            raise ValueError("UAV operation sampling requires one observation")
-        index = int(head_index)
-        if index < 0 or index >= self.num_uav_heads:
-            raise IndexError("UAV operation head index out of range")
-        raw_operation_logits = logits[index]
-        raw_operation_probabilities = torch.softmax(raw_operation_logits, dim=-1)
-        mask = torch.as_tensor(
-            np.asarray(operation_mask, dtype=bool).reshape(-1),
-            dtype=torch.bool,
-            device=logits.device,
-        )
-        if tuple(mask.shape) != (len(self.uav_operation_order),) or not bool(
-            torch.any(mask).item()
-        ):
-            raise ValueError("UAV operation mask must allow at least one operation")
-        masked_logits = logits[index].masked_fill(~mask, -float("inf"))
-        distribution = torch.distributions.Categorical(logits=masked_logits)
-        selected = (
-            int(torch.argmax(distribution.logits).item())
-            if deterministic
-            else int(distribution.sample().item())
-        )
-        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=logits.device)
-        return OperationPolicySample(
-            selected_index=selected,
-            log_prob=distribution.log_prob(selected_tensor),
-            entropy=distribution.entropy(),
-            logits=masked_logits,
-            raw_logits=raw_operation_logits.detach(),
-            probabilities=raw_operation_probabilities.detach(),
-        )
-
-    def evaluate_joint_cache_uav_operation(
-        self,
-        observations: Any,
-        cache_operation_contexts: Any,
-        cache_operation_masks: Any,
-        cache_operation_actions: Any,
-        cache_candidate_features: Any,
-        cache_candidate_masks: Any,
-        cache_candidate_selected_indices: Any,
-        uav_operation_contexts: Any,
-        uav_operation_masks: Any,
-        uav_operation_actions: Any,
-        uav_candidate_features: Any,
-        uav_candidate_masks: Any,
-        uav_candidate_selected_indices: Any,
-        cache_trigger_aux: Any,
-    ) -> PolicyEvaluation:
-        """重新计算不包含 Cache Trigger 概率项的联合 log-probability。"""
-
-        cache_evaluation = self.evaluate_cache_operation_primitive(
-            observations,
-            cache_operation_contexts,
-            cache_operation_masks,
-            cache_operation_actions,
-            cache_candidate_features,
-            cache_candidate_masks,
-            cache_candidate_selected_indices,
-            cache_trigger_aux,
-        )
-        observations_t, _ = self._observations(observations)
-        operation_contexts_t = torch.as_tensor(
-            uav_operation_contexts,
-            dtype=torch.float32,
-            device=observations_t.device,
-        )
-        operation_masks_t = torch.as_tensor(
-            uav_operation_masks,
-            dtype=torch.bool,
-            device=observations_t.device,
-        )
-        operation_actions_t = torch.as_tensor(
-            uav_operation_actions,
-            dtype=torch.long,
-            device=observations_t.device,
-        )
-        candidate_features_t = torch.as_tensor(
-            uav_candidate_features,
-            dtype=torch.float32,
-            device=observations_t.device,
-        )
-        candidate_masks_t = torch.as_tensor(
-            uav_candidate_masks,
-            dtype=torch.bool,
-            device=observations_t.device,
-        )
-        candidate_selected_t = torch.as_tensor(
-            uav_candidate_selected_indices,
-            dtype=torch.long,
-            device=observations_t.device,
-        )
-        if operation_contexts_t.ndim != 3:
-            raise ValueError("UAV operation_contexts must be [B,U,observation_dim]")
-        batch_size, head_count, observation_dim = [
-            int(value) for value in operation_contexts_t.shape
-        ]
-        if batch_size != int(observations_t.shape[0]):
-            raise ValueError("UAV operation_contexts batch dimension mismatch")
-        if head_count != self.num_uav_heads or observation_dim != self.observation_dim:
-            raise ValueError("UAV operation_contexts shape mismatch")
-        expected_operation_shape = (
-            batch_size,
-            self.num_uav_heads,
-            len(self.uav_operation_order),
-        )
-        if tuple(operation_masks_t.shape) != expected_operation_shape:
-            raise ValueError("UAV operation_masks shape mismatch")
-        if tuple(operation_actions_t.shape) != (batch_size, self.num_uav_heads):
-            raise ValueError("UAV operation_actions shape mismatch")
-        if bool(torch.any(operation_actions_t < 0).item()) or bool(
-            torch.any(operation_actions_t >= len(self.uav_operation_order)).item()
-        ):
-            raise ValueError("UAV operation action index out of range")
-        if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
-            raise ValueError("UAV operation mask cannot block every operation")
-        all_operation_logits, _ = self._uav_operation_logits(
-            operation_contexts_t.reshape(batch_size * head_count, observation_dim)
-        )
-        all_operation_logits = all_operation_logits.reshape(
-            batch_size,
-            head_count,
-            self.num_uav_heads,
-            len(self.uav_operation_order),
-        )
-        head_indices = torch.arange(
-            self.num_uav_heads,
-            dtype=torch.long,
-            device=all_operation_logits.device,
-        )
-        operation_logits = all_operation_logits[:, head_indices, head_indices, :]
-        operation_logits = operation_logits.masked_fill(~operation_masks_t, -float("inf"))
-        operation_distribution = torch.distributions.Categorical(logits=operation_logits)
-        operation_valid = operation_masks_t.gather(
-            -1,
-            operation_actions_t.unsqueeze(-1),
-        ).squeeze(-1)
-        if not bool(torch.all(operation_valid).item()):
-            raise ValueError("UAV operation action is blocked by its operation mask")
-        uav_operation_log_probs = operation_distribution.log_prob(operation_actions_t)
-        operation_log_prob = uav_operation_log_probs.sum(dim=-1)
-        operation_entropy = torch.where(
-            operation_masks_t.sum(dim=-1) == 1,
-            torch.zeros_like(operation_distribution.entropy()),
-            operation_distribution.entropy(),
-        ).sum(dim=-1)
-
-        if candidate_features_t.ndim != 4:
-            raise ValueError("UAV candidate_features must be [B,U,C,F]")
-        if tuple(candidate_features_t.shape[:2]) != (
-            batch_size,
-            self.num_uav_heads,
-        ) or int(candidate_features_t.shape[-1]) != self.uav_feature_dim:
-            raise ValueError("UAV candidate_features shape mismatch")
-        candidate_count = int(candidate_features_t.shape[2])
-        if candidate_count <= 0:
-            raise ValueError("UAV candidate tensor must have positive width")
-        expected_candidate_shape = (batch_size, self.num_uav_heads, candidate_count)
-        if tuple(candidate_masks_t.shape) != expected_candidate_shape:
-            raise ValueError("UAV candidate_masks shape mismatch")
-        if tuple(candidate_selected_t.shape) != (batch_size, self.num_uav_heads):
-            raise ValueError("UAV candidate_selected_indices shape mismatch")
-        if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
-            raise ValueError("UAV candidate mask must have a placeholder or candidate")
-        if bool(torch.any(candidate_selected_t < 0).item()) or bool(
-            torch.any(candidate_selected_t >= candidate_count).item()
-        ):
-            raise ValueError("UAV candidate selected index out of range")
-        candidate_valid = candidate_masks_t.gather(
-            -1,
-            candidate_selected_t.unsqueeze(-1),
-        ).squeeze(-1)
-        if not bool(torch.all(candidate_valid).item()):
-            raise ValueError("UAV candidate selected index is masked")
-        candidate_active = operation_actions_t == 1
-        # MOVE 张量只包含合法目标位置；STAY 由高层 Operation head 单独表示。
-        candidate_contexts = operation_contexts_t.reshape(
-            batch_size * head_count,
-            observation_dim,
-        )
-        flat_features = candidate_features_t.reshape(
-            batch_size * head_count,
-            candidate_count,
-            self.uav_feature_dim,
-        )
-        raw_scores, _ = self._candidate_scores(
-            candidate_contexts,
-            flat_features,
-            self.uav_feature_dim,
-            self.uav_candidate_scorer,
-        )
-        raw_scores = raw_scores.reshape(
-            batch_size,
-            self.num_uav_heads,
-            candidate_count,
-        )
-        candidate_logits = raw_scores.masked_fill(~candidate_masks_t, -float("inf"))
-        candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
-        uav_candidate_log_probs = (
-            candidate_distribution.log_prob(candidate_selected_t)
-            * candidate_active.to(torch.float32)
-        )
-        candidate_log_prob = uav_candidate_log_probs.sum(dim=-1)
-        candidate_entropy = (
-            candidate_distribution.entropy()
-            * candidate_active.to(torch.float32)
-        ).sum(dim=-1)
-        return PolicyEvaluation(
-            log_prob=cache_evaluation.log_prob + operation_log_prob + candidate_log_prob,
-            entropy=cache_evaluation.entropy + operation_entropy + candidate_entropy,
-            value=cache_evaluation.value,
-            logits=cache_evaluation.logits,
-            cache_log_prob=cache_evaluation.log_prob,
-            uav_log_prob=operation_log_prob + candidate_log_prob,
-            uav_operation_log_probs=uav_operation_log_probs,
-            uav_operation_log_probs_all=operation_distribution.logits,
-            uav_candidate_log_probs=uav_candidate_log_probs,
-            uav_candidate_log_probs_all=candidate_distribution.logits,
-            cache_entropy=cache_evaluation.entropy,
-            uav_entropy=operation_entropy + candidate_entropy,
-            cache_node_log_probs=cache_evaluation.cache_node_log_probs,
-            cache_operation_log_probs_all=cache_evaluation.cache_operation_log_probs_all,
-            cache_candidate_log_probs_all=cache_evaluation.cache_candidate_log_probs_all,
-        )
-
-
-class _DecoupledCacheUavEncoderActorCriticBase(
-    _JointCacheUavOperationActorCriticBase
-):
-    """建立彼此独立的 Cache、UAV Operation 和 UAV Candidate 编码器。
-
-    初始化顺序保持不变，并通过复制已有编码器初始化新分支，确保正式策略的
-    参数键和随机初始化顺序与当前 checkpoint 一致。
-    """
-
-    architecture_id = (
-        "internal_decoupled_cache_uav_encoder_base"
-    )
-    architecture_version = 2
-
-    def __init__(
-        self,
-        observation_dim: int,
-        action_dim: int,
-        cache_feature_dim: int,
-        uav_feature_dim: int,
-        num_cache_heads: int,
-        hidden_sizes: tuple[int, ...] = (128, 128),
-        num_uav_heads: int | None = None,
-    ) -> None:
-        super().__init__(
-            observation_dim,
-            action_dim,
-            cache_feature_dim,
-            uav_feature_dim,
-            num_cache_heads,
-            hidden_sizes,
-            num_uav_heads=num_uav_heads,
-        )
-        original_encoder = self.encoder
-        self.cache_encoder = deepcopy(original_encoder)
-        self.uav_encoder = deepcopy(original_encoder)
-        self.uav_candidate_encoder = deepcopy(original_encoder)
-        del self.encoder
-
-    def _default_actor_encoder(self) -> Any:
-        return self.cache_encoder
-
-    def _candidate_encoder_for_scorer(self, scorer: Any) -> Any:
-        if scorer is self.cache_candidate_scorer:
-            return self.cache_encoder
-        if scorer is self.uav_candidate_scorer:
-            return self.uav_candidate_encoder
-        raise ValueError("candidate scorer has no registered branch encoder")
-
-    def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
-        obs, single = self._observations(observations)
-        hidden = self.cache_encoder(obs)
-        logits = self.cache_operation_head(hidden).reshape(
-            int(obs.shape[0]),
-            self.num_cache_heads,
-            len(self.operation_order),
-        )
-        return (logits.squeeze(0) if single else logits), single
-
-    def _uav_operation_logits(self, observations: Any) -> tuple[Any, bool]:
-        obs, single = self._observations(observations)
-        hidden = self.uav_encoder(obs)
-        logits = self.uav_operation_head(hidden).reshape(
-            int(obs.shape[0]),
-            self.num_uav_heads,
-            len(self.uav_operation_order),
-        )
-        return (logits.squeeze(0) if single else logits), single
-
-    def actor_parameters(self) -> tuple[Any, ...]:
-        modules = (
-            self.cache_encoder,
-            self.uav_encoder,
-            self.uav_candidate_encoder,
-            self.cache_operation_head,
-            self.cache_candidate_scorer,
-            self.uav_operation_head,
-            self.uav_candidate_scorer,
-        )
-        parameters = tuple(
-            parameter
-            for module in modules
-            for parameter in module.parameters()
-        )
-        if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("actor parameter group contains duplicates.")
-        return parameters
-
-    def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
-        groups = {
-            "cache": tuple(
-                parameter
-                for module in (
-                    self.cache_operation_head,
-                    self.cache_candidate_scorer,
-                )
-                for parameter in module.parameters()
-            ),
-            "uav": tuple(
-                parameter
-                for module in (
-                    self.uav_operation_head,
-                    self.uav_candidate_scorer,
-                )
-                for parameter in module.parameters()
-            ),
-            "cache_encoder": tuple(self.cache_encoder.parameters()),
-            "uav_encoder": tuple(self.uav_encoder.parameters()),
-            "uav_candidate_encoder": tuple(
-                self.uav_candidate_encoder.parameters()
-            ),
-            "shared": (),
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in self.state_dict().items()
+            if key.startswith(prefixes)
         }
-        group_ids = [
-            id(parameter)
-            for parameters in groups.values()
-            for parameter in parameters
-        ]
-        if len(set(group_ids)) != len(group_ids):
-            raise RuntimeError("actor gradient groups overlap.")
-        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
-        if set(group_ids) != actor_ids:
-            raise RuntimeError("actor gradient groups do not cover the actor.")
-        return groups
 
-
-class AdaptiveJointCacheUAVPPOActorCritic(
-    _DecoupledCacheUavEncoderActorCriticBase
-):
-    """使用二分类 Cache Trigger 与 Cache/UAV 条件候选头的正式联合策略。"""
-
-    architecture_id = "adaptive_joint_cache_uav_ppo"
-    architecture_version = 6
-    trigger_order = ("KEEP", "UPDATE")
-    true_binary_trigger = True
-
-    def _candidate_operation_slice(self, candidate_kind: str) -> slice | None:
-        # proposed_joint 候选是完整目标配置，因此不需要按操作类型平衡 logits。
-        del candidate_kind
-        return None
-
-    def __init__(
+    def load_separated_state_dicts(
         self,
-        observation_dim: int,
-        action_dim: int,
-        cache_feature_dim: int,
-        uav_feature_dim: int,
-        num_cache_heads: int,
-        hidden_sizes: tuple[int, ...] = (128, 128),
-        num_uav_heads: int | None = None,
+        macro_state: dict[str, Any],
+        micro_state: dict[str, Any],
     ) -> None:
-        # 初始化共享网络后，移除四分类 Cache 操作头，只保留二分类 Trigger。
-        _DecoupledCacheUavEncoderActorCriticBase.__init__(
-            self,
-            observation_dim,
-            action_dim,
-            cache_feature_dim,
-            uav_feature_dim,
-            num_cache_heads,
-            hidden_sizes,
-            num_uav_heads=num_uav_heads,
-        )
-        del self.cache_operation_head
-        if (int(cache_feature_dim) - 21) % 6 != 0:
-            raise ValueError(
-                "proposed target cache feature dimension cannot determine service count"
-            )
-        self.trigger_service_count = (int(cache_feature_dim) - 21) // 6
-        if self.trigger_service_count <= 0:
-            raise ValueError("proposed Trigger requires at least one service")
-        self.trigger_workload_dim = self.trigger_service_count * 3
-        self.trigger_aux_dim = self.trigger_workload_dim
-        original_cache_encoder = self.cache_encoder
-        self.cache_trigger_encoder = deepcopy(original_cache_encoder)
-        self.cache_candidate_encoder = deepcopy(original_cache_encoder)
-        del self.cache_encoder
-        self.cache_trigger_head = nn.ModuleList(
-            nn.Linear(self.hidden_dim + self.trigger_aux_dim, len(self.trigger_order))
-            for _ in range(self.num_cache_heads)
-        )
-
-    def _default_actor_encoder(self) -> Any:
-        return self.cache_trigger_encoder
-
-    def _trigger_logits(
-        self,
-        observations: Any,
-        trigger_aux: Any,
-    ) -> tuple[Any, bool]:
-        obs, single = self._observations(observations)
-        auxiliary = torch.as_tensor(
-            trigger_aux,
-            dtype=torch.float32,
-            device=obs.device,
-        )
-        if auxiliary.ndim == 1 and single:
-            auxiliary = auxiliary.unsqueeze(0)
-        if tuple(auxiliary.shape) != (int(obs.shape[0]), self.trigger_aux_dim):
-            raise ValueError(
-                "Cache Trigger auxiliary input must be [B,trigger_aux_dim]"
-            )
-        if not bool(torch.all(torch.isfinite(auxiliary)).item()):
-            raise ValueError("Cache Trigger auxiliary input contains NaN/Inf")
-        if auxiliary.requires_grad:
-            raise RuntimeError("Cache Trigger auxiliary input must be detached")
-        hidden = self.cache_trigger_encoder(obs)
-        trigger_input = torch.cat([hidden, auxiliary], dim=-1)
-        logits = torch.stack(
-            [head(trigger_input) for head in self.cache_trigger_head], dim=1
-        )
-        return (logits.squeeze(0) if single else logits), single
-
-    def _operation_logits(
-        self,
-        observations: Any,
-        trigger_aux: Any,
-    ) -> tuple[Any, bool]:
-        """返回二分类 Cache Trigger 的 logits。"""
-
-        return self._trigger_logits(observations, trigger_aux)
-
-    def actor_parameters(self) -> tuple[Any, ...]:
-        modules = (
-            self.cache_trigger_encoder,
-            self.cache_candidate_encoder,
-            self.uav_encoder,
-            self.uav_candidate_encoder,
-            self.cache_trigger_head,
-            self.cache_candidate_scorer,
-            self.uav_operation_head,
-            self.uav_candidate_scorer,
-        )
-        parameters = tuple(
-            parameter
-            for module in modules
-            for parameter in module.parameters()
-        )
-        if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("proposed actor parameter group contains duplicates.")
-        return parameters
-
-    def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
-        groups = {
-            "cache_trigger": tuple(
-                parameter
-                for module in (
-                    self.cache_trigger_encoder,
-                    self.cache_trigger_head,
-                )
-                for parameter in module.parameters()
-            ),
-            "cache_candidate": tuple(
-                parameter
-                for module in (
-                    self.cache_candidate_encoder,
-                    self.cache_candidate_scorer,
-                )
-                for parameter in module.parameters()
-            ),
-            "uav_operation": tuple(
-                parameter
-                for module in (
-                    self.uav_encoder,
-                    self.uav_operation_head,
-                )
-                for parameter in module.parameters()
-            ),
-            "uav_candidate": tuple(
-                parameter
-                for module in (
-                    self.uav_candidate_encoder,
-                    self.uav_candidate_scorer,
-                )
-                for parameter in module.parameters()
-            ),
-        }
-        group_ids = [
-            id(parameter)
-            for parameters in groups.values()
-            for parameter in parameters
-        ]
-        if len(set(group_ids)) != len(group_ids):
-            raise RuntimeError("proposed actor gradient groups overlap.")
-        actor_ids = {id(parameter) for parameter in self.actor_parameters()}
-        if set(group_ids) != actor_ids:
-            raise RuntimeError("proposed actor gradient groups do not cover the actor.")
-        return groups
-
-    def sample_cache_trigger(
-        self,
-        observation: Any,
-        head_index: int,
-        trigger_mask: Any,
-        trigger_aux: Any,
-        deterministic: bool = False,
-    ) -> OperationPolicySample:
-        logits, single = self._trigger_logits(observation, trigger_aux)
-        if not single or tuple(logits.shape) != (
-            self.num_cache_heads,
-            len(self.trigger_order),
-        ):
-            raise ValueError("Cache trigger sampling requires one observation")
-        index = int(head_index)
-        if index < 0 or index >= self.num_cache_heads:
-            raise IndexError("Cache trigger head index out of range")
-        raw_logits = logits[index]
-        raw_probabilities = torch.softmax(raw_logits, dim=-1)
-        mask = torch.as_tensor(
-            np.asarray(trigger_mask, dtype=bool).reshape(-1),
-            dtype=torch.bool,
-            device=raw_logits.device,
-        )
-        if tuple(mask.shape) != (len(self.trigger_order),) or not bool(
-            torch.any(mask).item()
-        ):
-            raise ValueError("Cache trigger mask must allow at least one value")
-        distribution = torch.distributions.Categorical(
-            logits=raw_logits.masked_fill(~mask, -float("inf"))
-        )
-        selected = (
-            int(torch.argmax(distribution.logits).item())
-            if deterministic
-            else int(distribution.sample().item())
-        )
-        selected_tensor = torch.as_tensor(selected, dtype=torch.long, device=raw_logits.device)
-        return OperationPolicySample(
-            selected_index=selected,
-            log_prob=distribution.log_prob(selected_tensor),
-            entropy=distribution.entropy(),
-            logits=distribution.logits,
-            raw_logits=raw_logits.detach(),
-            probabilities=raw_probabilities.detach(),
-        )
-
-    def _candidate_encoder_for_scorer(self, scorer: Any) -> Any:
-        if scorer is self.cache_candidate_scorer:
-            return self.cache_candidate_encoder
-        return super()._candidate_encoder_for_scorer(scorer)
-
-    def sample_cache_update_candidate(
-        self,
-        observation: Any,
-        candidate_features: Any,
-        deterministic: bool = False,
-    ) -> CandidatePolicySample:
-        """从统一的合法目标配置集合中采样。"""
-
-        scores = self.score_cache_update_candidates(
-            observation,
-            candidate_features,
-        )
-        return self.sample_cache_update_candidate_from_logits(
-            scores, deterministic=deterministic
-        )
-
-    def score_cache_update_candidates(
-        self,
-        observation: Any,
-        candidate_features: Any,
-    ) -> Any:
-        """在 UPDATE 后使用候选专用编码器为候选打分。"""
-
-        scores, single = self._candidate_scores(
-            observation,
-            candidate_features,
-            self.cache_feature_dim,
-            self.cache_candidate_scorer,
-        )
-        if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
-            raise ValueError("candidate scoring requires one context")
-        return scores.squeeze(0)
-
-    @staticmethod
-    def sample_cache_update_candidate_from_logits(
-        candidate_logits: Any,
-        deterministic: bool = False,
-    ) -> CandidatePolicySample:
-        """从已计算的条件候选 logits 向量中采样。"""
-
-        scores = torch.as_tensor(candidate_logits, dtype=torch.float32)
-        if scores.ndim != 1 or int(scores.numel()) == 0:
-            raise ValueError("candidate logits must be a non-empty vector")
-        if not bool(torch.all(torch.isfinite(scores)).item()):
-            raise ValueError("candidate logits contain NaN/Inf")
-        distribution = torch.distributions.Categorical(logits=scores)
-        selected = (
-            int(torch.argmax(distribution.logits).item())
-            if deterministic
-            else int(distribution.sample().item())
-        )
-        selected_tensor = torch.as_tensor(
-            selected,
-            dtype=torch.long,
-            device=scores.device,
-        )
-        return CandidatePolicySample(
-            selected_index=selected,
-            log_prob=distribution.log_prob(selected_tensor),
-            entropy=distribution.entropy(),
-            logits=distribution.logits,
-        )
-
-    def evaluate_cache_operation_primitive(
-        self,
-        observations: Any,
-        operation_contexts: Any,
-        operation_masks: Any,
-        operation_actions: Any,
-        candidate_features: Any,
-        candidate_masks: Any,
-        candidate_selected_indices: Any,
-        trigger_aux: Any,
-    ) -> PolicyEvaluation:
-        """计算二元 Trigger 与统一条件候选的联合分布。"""
-
-        observations_t, _ = self._observations(observations)
-        contexts_t = torch.as_tensor(
-            operation_contexts,
-            dtype=torch.float32,
-            device=observations_t.device,
-        )
-        masks_t = torch.as_tensor(
-            operation_masks,
-            dtype=torch.bool,
-            device=observations_t.device,
-        )
-        actions_t = torch.as_tensor(
-            operation_actions,
-            dtype=torch.long,
-            device=observations_t.device,
-        )
-        features_t = torch.as_tensor(
-            candidate_features,
-            dtype=torch.float32,
-            device=observations_t.device,
-        )
-        candidate_masks_t = torch.as_tensor(
-            candidate_masks,
-            dtype=torch.bool,
-            device=observations_t.device,
-        )
-        selected_t = torch.as_tensor(
-            candidate_selected_indices,
-            dtype=torch.long,
-            device=observations_t.device,
-        )
-        trigger_aux_t = torch.as_tensor(
-            trigger_aux,
-            dtype=torch.float32,
-            device=observations_t.device,
-        )
-        if contexts_t.ndim != 3:
-            raise ValueError("operation_contexts must be [B,H,observation_dim]")
-        batch_size, head_count, observation_dim = [int(value) for value in contexts_t.shape]
-        if batch_size != int(observations_t.shape[0]) or head_count != self.num_cache_heads:
-            raise ValueError("operation_contexts shape mismatch")
-        if observation_dim != self.observation_dim:
-            raise ValueError("operation_contexts observation dimension mismatch")
-        expected_operation_shape = (batch_size, head_count, 2)
-        if tuple(masks_t.shape) != expected_operation_shape or tuple(actions_t.shape) != (
-            batch_size,
-            head_count,
-        ):
-            raise ValueError("trigger tensor shape mismatch")
-        if bool(torch.any(actions_t < 0).item()) or bool(torch.any(actions_t >= 2).item()):
-            raise ValueError("trigger action index out of range")
-        if not bool(torch.all(torch.any(masks_t, dim=-1)).item()):
-            raise ValueError("trigger mask cannot block every trigger")
-        if tuple(trigger_aux_t.shape) != (
-            batch_size,
-            head_count,
-            self.trigger_aux_dim,
-        ):
-            raise ValueError("Cache Trigger auxiliary tensor shape mismatch")
-        if trigger_aux_t.requires_grad:
-            raise RuntimeError("PPO Cache Trigger auxiliary must be detached")
-        flat_contexts = contexts_t.reshape(batch_size * head_count, observation_dim)
-        flat_aux = trigger_aux_t.reshape(
-            batch_size * head_count, self.trigger_aux_dim
-        )
-        all_logits, _ = self._trigger_logits(flat_contexts, flat_aux)
-        trigger_logits = all_logits.reshape(
-            batch_size,
-            head_count,
-            self.num_cache_heads,
-            2,
-        )
-        head_indices = torch.arange(head_count, dtype=torch.long, device=all_logits.device)
-        trigger_logits = trigger_logits[:, head_indices, head_indices, :]
-        trigger_logits = trigger_logits.masked_fill(~masks_t, -float("inf"))
-        trigger_distribution = torch.distributions.Categorical(logits=trigger_logits)
-        selected_valid = masks_t.gather(-1, actions_t.unsqueeze(-1)).squeeze(-1)
-        if not bool(torch.all(selected_valid).item()):
-            raise ValueError("trigger action is blocked by its mask")
-        trigger_node_log_probs = trigger_distribution.log_prob(actions_t)
-        trigger_log_prob = trigger_node_log_probs.sum(dim=-1)
-        trigger_entropy = torch.where(
-            masks_t.sum(dim=-1) == 1,
-            torch.zeros_like(trigger_distribution.entropy()),
-            trigger_distribution.entropy(),
-        ).sum(dim=-1)
-
-        if features_t.ndim != 4 or tuple(features_t.shape[:2]) != (batch_size, head_count):
-            raise ValueError("candidate feature shape mismatch")
-        candidate_count = int(features_t.shape[2])
-        if candidate_count <= 0 or int(features_t.shape[3]) != self.cache_feature_dim:
-            raise ValueError("candidate feature width mismatch")
-        expected_candidate_shape = (batch_size, head_count, candidate_count)
-        if tuple(candidate_masks_t.shape) != expected_candidate_shape or tuple(selected_t.shape) != (
-            batch_size,
-            head_count,
-        ):
-            raise ValueError("candidate tensor shape mismatch")
-        if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
-            raise ValueError("candidate mask must allow a padded candidate")
-        if bool(torch.any(selected_t < 0).item()) or bool(torch.any(selected_t >= candidate_count).item()):
-            raise ValueError("candidate selected index out of range")
-        candidate_valid = candidate_masks_t.gather(-1, selected_t.unsqueeze(-1)).squeeze(-1)
-        if not bool(torch.all(candidate_valid).item()):
-            raise ValueError("candidate selected index is masked")
-        flat_features = features_t.reshape(
-            batch_size * head_count,
-            candidate_count,
-            self.cache_feature_dim,
-        )
-        raw_scores, _ = self._candidate_scores(
-            flat_contexts,
-            flat_features,
-            self.cache_feature_dim,
-            self.cache_candidate_scorer,
-        )
-        candidate_logits = raw_scores.reshape(
-            batch_size,
-            head_count,
-            candidate_count,
-        ).masked_fill(~candidate_masks_t, -float("inf"))
-        candidate_distribution = torch.distributions.Categorical(logits=candidate_logits)
-        candidate_active = actions_t == 1
-        candidate_node_log_probs = candidate_distribution.log_prob(selected_t) * candidate_active.to(torch.float32)
-        candidate_log_prob = candidate_node_log_probs.sum(dim=-1)
-        candidate_entropy = (
-            candidate_distribution.entropy() * candidate_active.to(torch.float32)
-        ).sum(dim=-1)
-        return PolicyEvaluation(
-            log_prob=trigger_log_prob + candidate_log_prob,
-            entropy=trigger_entropy + candidate_entropy,
-            value=self.critic_value(observations_t),
-            logits=trigger_logits,
-            cache_log_prob=trigger_log_prob + candidate_log_prob,
-            cache_entropy=trigger_entropy + candidate_entropy,
-            cache_node_log_probs=trigger_node_log_probs + candidate_node_log_probs,
-            cache_operation_log_probs_all=trigger_distribution.logits,
-            cache_candidate_log_probs_all=candidate_distribution.logits,
-        )
+        combined = {**macro_state, **micro_state}
+        self.load_state_dict(combined, strict=True)

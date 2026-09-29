@@ -20,8 +20,8 @@ from scenario.realization import (
 )
 
 
-PROPOSED_POLICY_SCHEMA = "adaptive_joint_cache_uav_ppo"
-PROPOSED_CONTROL_MODE = "adaptive_joint_cache_uav_reconfiguration"
+PROPOSED_POLICY_SCHEMA = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
+PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ class EnvironmentContext:
     cache_nodes: dict[str, Any]
     local_cache: dict[str, set[int]]
     flight_boundary: tuple[float, float, float, float]
-    action_spec: TriggerActionSpec
+    action_spec: ConfigurationActionSpec
     observation_spec: ConfigurationObservationSpec
     initial_cache: np.ndarray
     initial_uav: dict[str, np.ndarray]
@@ -94,16 +94,10 @@ def _assert_realization_context_compatible(
             f"candidate_dim={candidate_observation.observation_dim}"
         )
     if (
-        reference.action_spec.action_dim != candidate.action_spec.action_dim
-        or len(reference.action_spec.cache_node_ids)
-        != len(candidate.action_spec.cache_node_ids)
+        reference.action_spec.cache_node_ids != candidate.action_spec.cache_node_ids
         or reference.action_spec.uav_ids != candidate.action_spec.uav_ids
     ):
-        raise ValueError(
-            "PPO episode realization changes the action tensor contract: "
-            f"reference_dim={reference.action_spec.action_dim}, "
-            f"candidate_dim={candidate.action_spec.action_dim}"
-        )
+        raise ValueError("PPO realization changes Cache/UAV candidate ordering.")
     if np.asarray(reference.initial_cache).shape != np.asarray(candidate.initial_cache).shape:
         raise ValueError("PPO episode realization changes the initial cache tensor shape")
     if set(reference.initial_uav) != set(candidate.initial_uav):
@@ -143,7 +137,7 @@ def load_environment_context(
     local_cache = task_scenario.load_tv_local_cache(
         realization.tv_local_cache
     )
-    action_spec = TriggerActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
+    action_spec = ConfigurationActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
     policy_schema = str(
         project_config.get_config_value(
             cfg,
@@ -153,9 +147,23 @@ def load_environment_context(
     )
     if policy_schema != PROPOSED_POLICY_SCHEMA:
         raise ValueError(
-            "当前训练器仅支持正式 proposed_joint 策略："
+            "当前训练器仅支持正式双时间尺度策略："
             f"{PROPOSED_POLICY_SCHEMA}"
         )
+    macro_duration_candidates_from_project(cfg)
+    ppo_config = cfg["algorithm"]["ppo"]
+    required_flags = {
+        "macro_cache_enabled": True,
+        "macro_full_batch": True,
+        "exact_q_training_enabled": False,
+        "critic_mc_warmup_required": False,
+        "uav_unified_candidate_policy": True,
+        "uav_autoregressive": True,
+        "uav_group_balance": True,
+    }
+    for key, expected in required_flags.items():
+        if ppo_config.get(key) is not expected:
+            raise ValueError(f"algorithm.ppo.{key} 必须为 {expected!r}。")
     prediction_horizon = int(
         project_config.get_config_value(cfg, "prediction.vehicle.horizon")
     )
@@ -290,82 +298,58 @@ def aligned_train_steps(
     )
 
 
-def _validate_binary_vector(value: Any, expected_length: int, name: str) -> np.ndarray:
-    vector = np.asarray(value, dtype=np.int8).reshape(-1)
-    if vector.shape != (expected_length,):
-        raise ValueError(f"{name} shape={vector.shape}，期望 {(expected_length,)}。")
-    if not np.all(np.isin(vector, [0, 1])):
-        raise ValueError(f"{name} 必须是 0/1 向量。")
-    return vector
-
-
 @dataclass(frozen=True)
-class TriggerActionSpec:
-    """Trigger action 的唯一权威顺序。"""
+class ConfigurationActionSpec:
+    """提供动态 Cache 节点和 UAV 的固定顺序。"""
 
     cache_node_ids: tuple[str, ...]
     uav_ids: tuple[str, ...]
-    labels: tuple[str, ...]
-    action_dim: int
 
     @classmethod
     def from_cache_nodes_and_project(
         cls,
         cache_nodes: dict[str, Any],
         project_cfg: dict[str, Any],
-    ) -> "TriggerActionSpec":
+    ) -> "ConfigurationActionSpec":
         cache_node_ids = tuple(str(value) for value in cache_nodes["node_ids"])
         uav_ids = tuple(
             str(item["id"])
             for item in project_config.get_config_value(project_cfg, "nodes.uav.instances", [])
         )
         if not cache_node_ids:
-            raise ValueError("TriggerActionSpec 需要至少一个 dynamic cache node。")
+            raise ValueError("正式控制至少需要一个动态 Cache 节点。")
         if not uav_ids:
-            raise ValueError("TriggerActionSpec 需要至少一个 UAV。")
-        labels = tuple(
-            [f"z_{node_id}^ca" for node_id in cache_node_ids]
-            + [f"z_{uav_id}^q" for uav_id in uav_ids]
-        )
-        return cls(
-            cache_node_ids=cache_node_ids,
-            uav_ids=uav_ids,
-            labels=labels,
-            action_dim=len(labels),
-        )
+            raise ValueError("正式控制至少需要一个 UAV。")
+        return cls(cache_node_ids=cache_node_ids, uav_ids=uav_ids)
 
-    def action_vector_to_triggers(self, action_vector: Any) -> tuple[np.ndarray, dict[str, int]]:
-        vector = _validate_binary_vector(action_vector, self.action_dim, "action_vector")
-        cache_count = len(self.cache_node_ids)
-        cache_triggers = vector[:cache_count].astype(np.int8).copy()
-        uav_triggers = {
-            uav_id: int(vector[cache_count + index])
-            for index, uav_id in enumerate(self.uav_ids)
-        }
-        return cache_triggers, uav_triggers
 
-    def triggers_to_action_vector(
-        self,
-        cache_triggers: Any,
-        uav_triggers: dict[str, int],
-    ) -> np.ndarray:
-        cache_vector = _validate_binary_vector(
-            cache_triggers,
-            len(self.cache_node_ids),
-            "cache_triggers",
-        )
-        if set(uav_triggers) != set(self.uav_ids):
-            raise ValueError(
-                f"uav_triggers IDs={sorted(uav_triggers)} 与 spec={list(self.uav_ids)} 不一致。"
-            )
-        uav_vector = np.asarray(
-            [int(uav_triggers[uav_id]) for uav_id in self.uav_ids],
-            dtype=np.int8,
-        )
-        if not np.all(np.isin(uav_vector, [0, 1])):
-            raise ValueError("uav_triggers 必须全部为 0/1。")
-        return np.concatenate([cache_vector, uav_vector]).astype(np.int8)
+def macro_duration_candidates_from_project(project_cfg: dict[str, Any]) -> tuple[int, ...]:
+    """校验 Macro 时长候选并限制在真实预测 horizon 内。"""
 
+    horizon = int(project_config.get_config_value(project_cfg, "prediction.vehicle.horizon"))
+    if horizon <= 0:
+        raise ValueError("Macro prediction horizon 必须为正整数。")
+    raw = project_config.get_config_value(
+        project_cfg, "algorithm.ppo.macro_duration_candidates"
+    )
+    if raw is None:
+        raw = sorted({1, int(math.ceil(horizon / 2.0)), horizon})
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("macro_duration_candidates 必须为非空整数数组。")
+    values: list[int] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int) or int(item) <= 0:
+            raise ValueError("macro_duration_candidates 中的 duration 必须为正整数。")
+        values.append(int(item))
+    if len(set(values)) != len(values):
+        raise ValueError("macro_duration_candidates 不允许重复。")
+    if values != sorted(values):
+        raise ValueError("macro_duration_candidates 必须严格升序。")
+    if values[-1] > horizon:
+        raise ValueError(
+            "默认 prediction-driven Macro duration 不能超过车辆预测 horizon。"
+        )
+    return tuple(values)
 
 @dataclass(frozen=True)
 class ConfigurationObservationSpec:
@@ -773,7 +757,7 @@ def build_step_observation(
     *,
     time_to_go_override: float | None = None,
 ) -> np.ndarray:
-    """Build the single authoritative observation for trigger and primitive heads."""
+    """构造 Macro Cache 与 Micro UAV 共用的正式 slot observation。"""
 
     time_to_go = (
         float(time_to_go_override)
