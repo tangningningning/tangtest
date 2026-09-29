@@ -93,11 +93,22 @@ def _assert_realization_context_compatible(
             f"reference_dim={reference_observation.observation_dim}, "
             f"candidate_dim={candidate_observation.observation_dim}"
         )
+    reference_cache_roles = tuple(
+        str(value).upper() for value in reference.cache_nodes["node_roles"]
+    )
+    candidate_cache_roles = tuple(
+        str(value).upper() for value in candidate.cache_nodes["node_roles"]
+    )
+    # Service-vehicle IDs may differ across full_episode_randomized realizations.
+    # Each episode builds and saves observations/candidate descriptors in its own
+    # action order, so the cross-episode tensor contract is the role ordering.
     if (
-        reference.action_spec.cache_node_ids != candidate.action_spec.cache_node_ids
+        len(reference.action_spec.cache_node_ids)
+        != len(candidate.action_spec.cache_node_ids)
+        or reference_cache_roles != candidate_cache_roles
         or reference.action_spec.uav_ids != candidate.action_spec.uav_ids
     ):
-        raise ValueError("PPO realization changes Cache/UAV candidate ordering.")
+        raise ValueError("PPO realization changes Cache node role ordering or UAV ID ordering.")
     if np.asarray(reference.initial_cache).shape != np.asarray(candidate.initial_cache).shape:
         raise ValueError("PPO episode realization changes the initial cache tensor shape")
     if set(reference.initial_uav) != set(candidate.initial_uav):

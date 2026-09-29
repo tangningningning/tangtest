@@ -405,6 +405,10 @@ class PPOTrainer:
             {
                 "micro_adv_mean": float(adv_mean),
                 "micro_adv_std": float(adv_std),
+                "micro_normalized_adv_mean": float(np.mean(normalized)),
+                "micro_normalized_adv_std": float(np.std(normalized)),
+                "micro_value_prediction_mean": float(np.mean(values)),
+                "micro_value_target_mean": float(np.mean(returns)),
                 "micro_value_rmse": float(np.sqrt(np.mean((returns - values) ** 2))),
                 "micro_explained_variance": _explained_variance(returns, values),
                 "micro_early_stop": bool(stopped),
@@ -499,6 +503,10 @@ class PPOTrainer:
             {
                 "macro_adv_mean": float(adv_mean),
                 "macro_adv_std": float(adv_std),
+                "macro_normalized_adv_mean": float(np.mean(normalized)),
+                "macro_normalized_adv_std": float(np.std(normalized)),
+                "macro_value_prediction_mean": float(np.mean(values)),
+                "macro_value_target_mean": float(np.mean(returns)),
                 "macro_value_rmse": float(np.sqrt(np.mean((returns - values) ** 2))),
                 "macro_explained_variance": _explained_variance(returns, values),
                 "macro_early_stop": bool(stopped),

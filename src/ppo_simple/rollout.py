@@ -463,6 +463,12 @@ def collect_dual_timescale_episode(
     frame_cache_changed = False
     frame_reward = 0.0
     elapsed_in_frame = 0
+    keep_probabilities: list[float] = []
+    update_group_probabilities: list[float] = []
+    cache_entropies: list[float] = []
+    duration_entropies: list[float] = []
+    update_candidate_entropies: list[float] = []
+    update_candidate_selection_counts: dict[bytes, int] = {}
     start_time = time.perf_counter()
 
     for slot_index, step in enumerate(aligned_steps):
@@ -492,8 +498,39 @@ def collect_dual_timescale_episode(
             frame_old_log_prob = float(selected.log_prob.detach().cpu())
             frame_old_entropy = float(selected.entropy.detach().cpu())
             frame_old_value = float(selected.value.detach().cpu())
+            cache_probabilities = np.asarray(selected.cache_probabilities, dtype=np.float64)
+            if cache_probabilities.shape != frame_candidate_masks.shape or not np.all(
+                np.isfinite(cache_probabilities)
+            ) or not np.isclose(float(cache_probabilities.sum()), 1.0, rtol=1e-6, atol=1e-7):
+                raise AssertionError("Macro Cache sampling probabilities are invalid or misaligned.")
+            keep_probability = float(cache_probabilities[0])
+            update_group_probability = float(cache_probabilities[1:].sum())
+            keep_probabilities.append(keep_probability)
+            update_group_probabilities.append(update_group_probability)
+            cache_entropies.append(float(selected.cache_entropy.detach().cpu()))
+            duration_entropies.append(float(selected.duration_entropy.detach().cpu()))
+            update_candidate_probabilities = cache_probabilities[1:]
+            if update_group_probability > 0.0:
+                conditional_update_probabilities = (
+                    update_candidate_probabilities / update_group_probability
+                )
+                positive_update_probabilities = conditional_update_probabilities[
+                    conditional_update_probabilities > 0.0
+                ]
+                update_candidate_entropies.append(
+                    float(-np.sum(positive_update_probabilities * np.log(positive_update_probabilities)))
+                )
+            else:
+                update_candidate_entropies.append(0.0)
             frame_cache = _candidates[frame_cache_index].copy()
             frame_cache_changed = bool(np.any(frame_cache != cache))
+            if frame_cache_index > 0:
+                candidate_signature = np.ascontiguousarray(
+                    frame_cache, dtype=np.int8
+                ).tobytes()
+                update_candidate_selection_counts[candidate_signature] = (
+                    update_candidate_selection_counts.get(candidate_signature, 0) + 1
+                )
             frame_reward = 0.0
             elapsed_in_frame = 0
 
@@ -739,11 +776,67 @@ def collect_dual_timescale_episode(
     )
     matching_summaries = [item.matching_summary for item in micro_buffer.transitions]
     episode_return = float(sum(item.reward for item in micro_buffer.transitions))
+    keep_count = int(sum(item.cache_action == 0 for item in macro_buffer.transitions))
+    update_count = int(macro_count - keep_count)
+    requested_duration_counts = {
+        str(value): int(durations.count(value)) for value in policy.duration_candidates
+    }
+    actual_duration_counts = {
+        str(value): int(actual_durations.count(value))
+        for value in policy.duration_candidates
+    }
+    update_candidate_unique_selected = len(update_candidate_selection_counts)
+    update_candidate_top1_count = max(update_candidate_selection_counts.values(), default=0)
+    update_candidate_top1_fraction = (
+        float(update_candidate_top1_count / update_count) if update_count else 0.0
+    )
+    update_candidate_pattern = (
+        "SINGLE_CANDIDATE_DOMINANCE"
+        if update_candidate_top1_fraction >= 0.8
+        else "NORMAL"
+    )
+    selected_update_duration_counts = {
+        int(value) for value, count in requested_duration_counts.items() if count > 0
+    }
+    if keep_count == 0:
+        cache_action_pattern = "ALL_UPDATE"
+    elif update_count == 0:
+        cache_action_pattern = "ALL_KEEP"
+    else:
+        cache_action_pattern = "NORMAL"
+    cache_duration_pattern = (
+        f"ALL_{next(iter(selected_update_duration_counts))}"
+        if len(selected_update_duration_counts) == 1
+        else "NORMAL"
+    )
+    uav_action_patterns = []
+    for head_index in range(2):
+        stay_count = int(stay_counts[head_index])
+        move_count = int(micro_count - stay_count)
+        uav_action_patterns.append(
+            "NORMAL" if stay_count and move_count else "ALL_STAY" if stay_count else "ALL_MOVE"
+        )
+    update_candidate_valid_entropies = [
+        entropy
+        for entropy, update_probability in zip(
+            update_candidate_entropies, update_group_probabilities, strict=True
+        )
+        if update_probability > 0.0
+    ]
+    update_candidate_selection_entropy = 0.0
+    if update_count:
+        for selected_count in update_candidate_selection_counts.values():
+            selection_probability = selected_count / update_count
+            update_candidate_selection_entropy -= selection_probability * float(
+                np.log(selection_probability)
+            )
     summary = {
         "episode_return": episode_return,
         "macro_return": float(sum(item.frame_reward for item in macro_buffer.transitions)),
         "macro_frame_count": macro_count,
         "macro_entropy": float(np.mean([item.old_macro_entropy for item in macro_buffer.transitions])),
+        "macro_cache_entropy": float(np.mean(cache_entropies)) if cache_entropies else 0.0,
+        "macro_duration_entropy": float(np.mean(duration_entropies)) if duration_entropies else 0.0,
         "macro_duration_distribution": duration_distribution,
         "requested_duration_mean": float(np.mean(durations)),
         "actual_duration_mean": float(
@@ -751,11 +844,28 @@ def collect_dual_timescale_episode(
         ),
         "duration_distribution": duration_distribution,
         "actual_duration_distribution": actual_duration_distribution,
-        "keep_rate": (
-            float(np.mean([item.cache_action == 0 for item in macro_buffer.transitions]))
-            if macro_count
+        "requested_duration_counts": requested_duration_counts,
+        "actual_duration_counts": actual_duration_counts,
+        "keep_count": keep_count,
+        "update_count": update_count,
+        "update_selected_candidate_count": update_count,
+        "keep_rate": float(keep_count / macro_count) if macro_count else 0.0,
+        "update_rate": float(update_count / macro_count) if macro_count else 0.0,
+        "mean_keep_probability": float(np.mean(keep_probabilities)) if keep_probabilities else 0.0,
+        "mean_update_group_probability": (
+            float(np.mean(update_group_probabilities)) if update_group_probabilities else 0.0
+        ),
+        "update_candidate_unique_selected": update_candidate_unique_selected,
+        "update_candidate_entropy": (
+            float(np.mean(update_candidate_valid_entropies))
+            if update_candidate_valid_entropies
             else 0.0
         ),
+        "update_candidate_selection_entropy": float(update_candidate_selection_entropy),
+        "update_candidate_top1_fraction": update_candidate_top1_fraction,
+        "update_candidate_pattern": update_candidate_pattern,
+        "cache_action_pattern": cache_action_pattern,
+        "cache_duration_pattern": cache_duration_pattern,
         "actual_cache_update_rate": (
             float(np.mean([item.actual_cache_update for item in macro_buffer.transitions]))
             if macro_count
@@ -765,6 +875,10 @@ def collect_dual_timescale_episode(
         "uav1_stay_rate": float(stay_counts[1] / max(micro_count, 1)),
         "uav0_move_rate": float(1.0 - stay_counts[0] / max(micro_count, 1)),
         "uav1_move_rate": float(1.0 - stay_counts[1] / max(micro_count, 1)),
+        "uav0_action_pattern": uav_action_patterns[0],
+        "uav1_action_pattern": uav_action_patterns[1],
+        "uav0_entropy": float(np.mean([item.old_uav_entropies[0] for item in micro_buffer.transitions])),
+        "uav1_entropy": float(np.mean([item.old_uav_entropies[1] for item in micro_buffer.transitions])),
         "micro_candidate_entropy": float(np.mean([item.old_joint_entropy for item in micro_buffer.transitions])),
         "uav_candidate_usage_by_index": [
             [int(sum(int(item.actions[head]) == candidate_index for item in micro_buffer.transitions)) for candidate_index in range(max_uav_candidates)]
@@ -778,6 +892,12 @@ def collect_dual_timescale_episode(
         "valid_candidate_count_mean": float(
             np.mean([np.mean(item.valid_candidate_count) for item in micro_buffer.transitions])
         ),
+        "uav0_mean_valid_candidates": float(
+            np.mean([item.valid_candidate_count[0] for item in micro_buffer.transitions])
+        ),
+        "uav1_mean_valid_candidates": float(
+            np.mean([item.valid_candidate_count[1] for item in micro_buffer.transitions])
+        ),
         "total_task_delay_s": float(
             sum(item.total_task_delay_s for item in micro_buffer.transitions)
         ),
@@ -787,6 +907,17 @@ def collect_dual_timescale_episode(
         "total_cache_cost": float(sum(item.cache_cost for item in micro_buffer.transitions)),
         "total_movement_cost": float(
             sum(item.movement_cost for item in micro_buffer.transitions)
+        ),
+        "total_task_utility": float(
+            sum(item.actual_task_utility for item in micro_buffer.transitions)
+        ),
+        "mean_task_delay_s": float(
+            sum(item.total_task_delay_s for item in micro_buffer.transitions)
+            / max(sum(item.task_count for item in micro_buffer.transitions), 1)
+        ),
+        "mean_vehicle_energy_j": float(
+            sum(item.total_vehicle_energy_j for item in micro_buffer.transitions)
+            / max(sum(item.task_count for item in micro_buffer.transitions), 1)
         ),
         "matching_call_count": int(len(micro_buffer)),
         "kkt_call_count": int(
@@ -798,6 +929,8 @@ def collect_dual_timescale_episode(
         ),
         "episode_runtime_seconds": float(time.perf_counter() - start_time),
         "total_tasks": int(sum(item.task_count for item in micro_buffer.transitions)),
+        "exact_q_branch_requests": 0,
+        "exact_q_environment_executions": 0,
     }
     return EpisodeCollection(micro_buffer, macro_buffer, summary)
 

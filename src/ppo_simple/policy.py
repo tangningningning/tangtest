@@ -38,6 +38,9 @@ class MacroActionSample:
     value: Any
     cache_mask: np.ndarray
     duration_mask: np.ndarray
+    cache_probabilities: np.ndarray
+    cache_entropy: Any
+    duration_entropy: Any
 
 
 @dataclass(frozen=True)
@@ -85,15 +88,15 @@ def _group_balance_candidate_logits(
     if tuple(masks.shape) != tuple(scores.shape) or not bool(
         torch.all(torch.any(masks, dim=-1)).item()
     ):
-        raise ValueError("每个 UAV candidate head 至少要有一个合法动作。")
+        raise ValueError("每个 candidate head 至少要有一个合法动作。")
     start = 0 if operation_slice.start is None else int(operation_slice.start)
     stop = int(features.shape[-1]) if operation_slice.stop is None else int(operation_slice.stop)
     groups = features[..., start:stop]
     valid_groups = groups[masks]
     if stop <= start or not bool(torch.all((valid_groups == 0.0) | (valid_groups == 1.0)).item()):
-        raise ValueError("合法候选组标记必须是 one-hot。")
+        raise ValueError("合法 candidate group 标记必须是 one-hot。")
     if not bool(torch.all(valid_groups.sum(dim=-1) == 1.0).item()):
-        raise ValueError("每个合法 UAV 候选必须属于一个动作组。")
+        raise ValueError("每个合法 candidate 必须属于一个动作组。")
     group_ids = groups.argmax(dim=-1)
     flat_scores = scores.reshape(-1, scores.shape[-1])
     flat_masks = masks.reshape_as(flat_scores)
@@ -230,6 +233,20 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         values = self.micro_critic(obs).squeeze(-1)
         return values.squeeze(0) if single else values
 
+    @staticmethod
+    def _balance_macro_cache_group_mass(raw_scores: Any, candidate_masks: Any) -> Any:
+        scores = torch.as_tensor(raw_scores)
+        candidate_indices = torch.arange(int(scores.shape[-1]), device=scores.device)
+        group_features = torch.stack(
+            (candidate_indices == 0, candidate_indices > 0), dim=-1
+        ).to(dtype=torch.float32)
+        group_features = group_features.reshape(
+            *([1] * (scores.ndim - 1)), int(scores.shape[-1]), 2
+        ).expand(*scores.shape, 2)
+        return _group_balance_candidate_logits(
+            scores, group_features, candidate_masks, slice(0, 2)
+        )
+
     def _macro_logits(
         self,
         observations: Any,
@@ -265,6 +282,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         cache_logits = self.macro_cache_scorer(
             torch.cat((expanded_hidden, candidate_hidden), dim=-1)
         ).squeeze(-1)
+        cache_logits = self._balance_macro_cache_group_mass(cache_logits, masks)
         cache_dist = _masked_categorical(cache_logits, masks)
 
         if cache_actions is None:
@@ -328,8 +346,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         cache_mask = np.asarray(cache_candidate_mask, dtype=bool).reshape(-1)
         if features.ndim != 2 or len(features) != len(cache_mask) or not len(cache_mask):
             raise ValueError("Macro cache candidates/mask must be non-empty and aligned。")
-        if not bool(cache_mask[0]):
-            raise ValueError("Macro cache candidate 0 (KEEP) 必须合法。")
         device = next(self.parameters()).device
         durations_mask = np.ones(len(self.duration_candidates), dtype=bool)
         with torch.no_grad():
@@ -341,6 +357,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             logits = self.macro_cache_scorer(
                 torch.cat((hidden.unsqueeze(1).expand(-1, len(features), -1), embedded), dim=-1)
             ).squeeze(-1).squeeze(0)
+            logits = self._balance_macro_cache_group_mass(logits, cache_mask_t.squeeze(0))
             cache_dist = _masked_categorical(
                 logits, torch.as_tensor(cache_mask, dtype=torch.bool, device=device)
             )
@@ -373,15 +390,20 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             )
             cache_tensor = torch.as_tensor(cache_index, dtype=torch.long, device=device)
             duration_tensor = torch.as_tensor(duration_index, dtype=torch.long, device=device)
+            cache_entropy = cache_dist.entropy()
+            duration_entropy = duration_dist.entropy()
             return MacroActionSample(
                 cache_index=cache_index,
                 duration_index=duration_index,
                 requested_duration=self.duration_candidates[duration_index],
                 log_prob=cache_dist.log_prob(cache_tensor) + duration_dist.log_prob(duration_tensor),
-                entropy=cache_dist.entropy() + duration_dist.entropy(),
+                entropy=cache_entropy + duration_entropy,
                 value=self.macro_critic(obs).squeeze(),
                 cache_mask=cache_mask.copy(),
                 duration_mask=durations_mask,
+                cache_probabilities=cache_dist.probs.detach().cpu().numpy().copy(),
+                cache_entropy=cache_entropy,
+                duration_entropy=duration_entropy,
             )
 
     def evaluate_macro(

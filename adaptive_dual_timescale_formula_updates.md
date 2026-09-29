@@ -156,10 +156,26 @@ Macro actor/critic 与 Micro actor/critic 分离，不共享 Critic、optimizer 
 
 ## 8. 代码映射与状态
 
+### Cache unified candidate group-mass balancing
+
+Cache sampling and evaluate apply the existing `_group_balance_candidate_logits` helper to the single Cache candidate categorical. Candidate index `0` is the KEEP group and indices `> 0` are the UPDATE group; the transform uses valid-candidate counts, so equal raw logits within each group do not give UPDATE extra probability mass solely because it has more candidates. This remains one unified categorical action with one selected candidate, log probability, and PPO ratio; it does not add a separate Trigger policy.
+
+For the current mask, let `C_valid` be the set of valid candidates, `g(i)` the operation group of candidate `i`, and `N_g = |{j in C_valid : g(j) = g}|`. The logits used by the categorical are:
+
+```text
+z_tilde_i = z_i - log(N_g(i)),  i in C_valid
+z_tilde_i = -infinity,          i not in C_valid
+
+π_C(i | S) = exp(z_tilde_i) / Σ_{j in C_valid} exp(z_tilde_j)
+```
+
+This removes prior probability bias caused solely by different candidate counts between operation groups. It does not change candidate feasibility, the physical system model, or reward.
+
 | 数学/实现合同 | 正式代码位置 | 状态 |
 |---|---|---|
 | Macro duration candidates 校验与预测 horizon 约束 | `src/common/project_config.py::validate_for_formal_experiment`; `src/ppo_simple/interface.py::macro_duration_candidates_from_project` | IMPLEMENTED / VERIFIED：正式 TOML parse 与校验通过 |
 | Cache candidate 0=KEEP 与 proposal 复用 | `src/ppo_simple/rollout.py::_cache_candidates` | IMPLEMENTED / VERIFIED：候选 0 运行时断言及源码检查 |
+| unified Cache KEEP/UPDATE candidate group-mass balancing | `src/ppo_simple/policy.py::_balance_macro_cache_group_mass`; `_group_balance_candidate_logits` | IMPLEMENTED / VERIFIED：1+15、1+351、masked support、单组边界、sample/evaluate 与 UAV 回归 synthetic checks 通过 |
 | duration tail clip、Cache persistence、Macro reward | `src/ppo_simple/rollout.py::actual_duration_for_frame`; `collect_dual_timescale_episode` | IMPLEMENTED / VERIFIED：尾帧合成检查及源码检查 |
 | Cache update mask 与 boundary cost | `src/ppo_simple/rollout.py::cache_update_mask`; `src/decision/slot_environment.py::execute_configured_slot` | IMPLEMENTED / VERIFIED：相同/变化配置的成本合成检查 |
 | duration-aware SMDP GAE | `src/ppo_simple/rollout.py::compute_macro_smdp_gae` | IMPLEMENTED / VERIFIED：手算数组与函数结果一致 |
