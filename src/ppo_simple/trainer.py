@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import errno
 import hashlib
 import importlib.util
 import json
@@ -25,7 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - CLI help/import-only environme
     torch = None  # type: ignore[assignment]
 
 from common import project_config
-from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
+from decision import cache_configuration, uav_configuration
 from scenario import task_scenario
 from scenario.realization import derive_namespaced_seed
 
@@ -50,7 +49,6 @@ from .reporting import (
 )
 from .policy import (
     AdaptiveJointCacheUAVPPOActorCritic,
-    _PopArtCriticActorCriticBase,
     _SeparateOptimizationActorCriticBase,
 )
 from .cache_credit import (
@@ -65,11 +63,9 @@ from .exact_q_parallel import (
     initialize_worker as initialize_exact_q_worker,
     new_timing_profile as new_exact_q_timing_profile,
 )
-from .primitive_control import PrimitiveTensorSpec, _intermediate_observation
+from .primitive_control import PrimitiveTensorSpec
 from .rollout import (
     SimpleRollout,
-    _check_request_contract,
-    _check_reward,
     collect_rollout,
     compute_gae,
 )
@@ -93,7 +89,6 @@ CACHE_TRIGGER_CREDIT_SOURCE = "FULL_INFORMATION_BEST_UPDATE_VALUE_TEACHER"
 CACHE_CANDIDATE_CREDIT_SOURCE = "CANDIDATE_SPECIFIC_VALUE_LISTWISE_TEACHER"
 CACHE_COUNTERFACTUAL_MODE = "FULL_EXACT_CORRECTNESS_GATE"
 CACHE_DOWNSTREAM_MODE = "FIXED_DOWNSTREAM"
-CACHE_SURROGATE_TYPE = "DELTA_Q_ENSEMBLE"
 CACHE_SURROGATE_ENSEMBLE_SIZE = 3
 CACHE_SURROGATE_HIDDEN_DIM = 64
 CACHE_SURROGATE_LEARNING_RATE = 1.0e-3
@@ -145,14 +140,6 @@ class EpisodeFilesystemPermissionError(RuntimeError):
     """当前训练进程无法读取规范 episode artifact。"""
 
 
-def _is_filesystem_permission_error(error: OSError) -> bool:
-    return isinstance(error, PermissionError) or getattr(error, "errno", None) in {
-        errno.EACCES,
-        errno.EPERM,
-        errno.EROFS,
-    }
-
-
 def _require_torch() -> None:
     if torch is None:
         raise ImportError("proposed_joint 训练需要 PyTorch。")
@@ -171,47 +158,6 @@ def _gradient_group_norm(parameters: Any) -> float:
     if squared_norm is None:
         return 0.0
     return float(torch.sqrt(squared_norm).detach().cpu())
-
-
-def _gradient_clip_coefficient(preclip_norm: float, max_norm: float) -> float:
-    """返回 clip_grad_norm_ 对应的梯度裁剪系数，供诊断使用。"""
-
-    norm = float(preclip_norm)
-    limit = float(max_norm)
-    if not math.isfinite(norm) or not math.isfinite(limit) or limit <= 0.0:
-        raise ValueError("gradient clipping norms must be finite and positive")
-    if norm <= 0.0:
-        return 1.0
-    return float(min(1.0, limit / norm))
-
-
-def _clip_disjoint_actor_gradient_groups(
-    cache_parameters: Any,
-    uav_parameters: Any,
-    max_norm: float,
-) -> dict[str, float]:
-    """在一个优化器步骤中分别裁剪 Cache 与 UAV Actor 梯度。"""
-
-    cache_parameters_tuple = tuple(cache_parameters)
-    uav_parameters_tuple = tuple(uav_parameters)
-    cache_ids = {id(parameter) for parameter in cache_parameters_tuple}
-    uav_ids = {id(parameter) for parameter in uav_parameters_tuple}
-    if cache_ids & uav_ids:
-        raise RuntimeError("Cache/UAV actor clipping groups overlap")
-    cache_preclip_norm = _gradient_group_norm(cache_parameters_tuple)
-    uav_preclip_norm = _gradient_group_norm(uav_parameters_tuple)
-    cache_clip_coefficient = _gradient_clip_coefficient(cache_preclip_norm, max_norm)
-    uav_clip_coefficient = _gradient_clip_coefficient(uav_preclip_norm, max_norm)
-    if cache_parameters_tuple and cache_clip_coefficient < 1.0:
-        torch.nn.utils.clip_grad_norm_(cache_parameters_tuple, max_norm)
-    if uav_parameters_tuple and uav_clip_coefficient < 1.0:
-        torch.nn.utils.clip_grad_norm_(uav_parameters_tuple, max_norm)
-    return {
-        "cache_preclip_norm": float(cache_preclip_norm),
-        "cache_clip_coefficient": float(cache_clip_coefficient),
-        "uav_preclip_norm": float(uav_preclip_norm),
-        "uav_clip_coefficient": float(uav_clip_coefficient),
-    }
 
 
 def _module_parameter_delta_norm(before_parameters: dict[str, Any], module: Any) -> float:
@@ -526,31 +472,6 @@ def _branch_actor_policy_loss(
     if bool(uav_active):
         loss = loss + 0.5 * uav_branch_policy_loss
     return loss
-
-
-def _clear_inactive_branch_gradients(
-    branch_gradient_parameter_groups: dict[str, tuple[Any, ...]],
-    *,
-    cache_active: bool,
-    uav_active: bool,
-) -> None:
-    """将已停止 Actor 分支的梯度设为 None，避免 Adam 使用过期梯度。"""
-
-    if not bool(cache_active):
-        for parameter in (
-            branch_gradient_parameter_groups.get("cache", ())
-            + branch_gradient_parameter_groups.get("cache_encoder", ())
-        ):
-            parameter.grad = None
-    if not bool(uav_active):
-        for parameter in (
-            branch_gradient_parameter_groups.get("uav", ())
-            + branch_gradient_parameter_groups.get("uav_encoder", ())
-        ):
-            parameter.grad = None
-    if not bool(cache_active) and not bool(uav_active):
-        for parameter in branch_gradient_parameter_groups.get("shared", ()):
-            parameter.grad = None
 
 
 @dataclass(frozen=True)
@@ -1837,33 +1758,6 @@ def _uav_candidate_old_new_drift_metrics(
         argmax_flip_values,
         best_policy_prob_change_values,
     )
-
-
-def _cache_per_head_ppo_loss(
-    ratios: Any,
-    advantages: Any,
-    clip_epsilon: float,
-) -> Any:
-    """计算各 Cache head 平均后的 global-GAE PPO surrogate。"""
-
-    if torch is None:  # pragma: no cover - guarded by the trainer constructor
-        raise RuntimeError("Cache per-head PPO loss requires torch")
-    ratio_t = torch.as_tensor(ratios)
-    advantage_t = torch.as_tensor(advantages, device=ratio_t.device)
-    if ratio_t.ndim != 2 or advantage_t.ndim != 1:
-        raise ValueError("Cache per-head PPO tensors must be [B,H] and [B]")
-    if int(ratio_t.shape[0]) != int(advantage_t.shape[0]):
-        raise ValueError("Cache per-head ratio/advantage batch shape mismatch")
-    if not math.isfinite(float(clip_epsilon)) or float(clip_epsilon) <= 0.0:
-        raise ValueError("Cache per-head clip_epsilon must be positive and finite")
-    head_advantages = advantage_t.unsqueeze(-1).expand_as(ratio_t)
-    unclipped = ratio_t * head_advantages
-    clipped = torch.clamp(
-        ratio_t,
-        1.0 - float(clip_epsilon),
-        1.0 + float(clip_epsilon),
-    ) * head_advantages
-    return -torch.minimum(unclipped, clipped).mean()
 
 
 def _cache_per_head_old_new_kl(
