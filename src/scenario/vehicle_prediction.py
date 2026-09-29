@@ -837,12 +837,3 @@ def write_predictions_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
-
-
-
-
-
-
-# ============================================================================
-# CLI
-# ============================================================================

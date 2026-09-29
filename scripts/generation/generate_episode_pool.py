@@ -26,19 +26,14 @@ if str(SCRIPTS_ROOT) not in sys.path:
 
 from generation import generate_episode_realization as realization_generator
 from common import project_config
-from ppo_simple.trainer import (
+from scenario.realization import (
+    GENERATOR_EXTRA_ARTIFACT_FILENAMES,
     REALIZATION_ARTIFACT_FILENAMES,
     _realization_artifacts_from_directory,
 )
 
 
-# The trainer contract covers the nine files below.  The single-episode
-# generator also produces these SUMO provenance files, so an existing episode
-# is not considered complete unless those files are present as well.
-ADDITIONAL_GENERATOR_ARTIFACTS = (
-    "sumo_demand.rou.xml",
-    "sumo_demand.meta.json",
-)
+# 单条 episode 生成器还会写入来源记录文件，完整性校验也会检查这些文件。
 DEVELOPMENT_SEEDS = frozenset({1001, 1002})
 
 
@@ -47,7 +42,7 @@ def _required_artifact_names() -> tuple[str, ...]:
         dict.fromkeys(
             (
                 *REALIZATION_ARTIFACT_FILENAMES.values(),
-                *ADDITIONAL_GENERATOR_ARTIFACTS,
+                *GENERATOR_EXTRA_ARTIFACT_FILENAMES,
             )
         )
     )
@@ -73,8 +68,7 @@ def _validate_complete_realization(
             "incomplete episode realization; remove it before retrying: "
             f"directory={directory}, missing={missing}"
         )
-    # Use the same path contract as the trainer, then run the existing
-    # generator's lightweight 300-slot content validation before skipping.
+    # 使用统一路径合同，并在跳过已有 episode 前执行轻量内容校验。
     _realization_artifacts_from_directory(directory)
     get = project_config.get_config_value
     realization_generator.validate_written_outputs(

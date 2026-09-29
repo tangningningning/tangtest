@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -19,24 +18,19 @@ except ModuleNotFoundError:  # pragma: no cover - import-only environments
 
 from common import project_config
 
-from .evaluation_metrics import (
-    aggregate_episode_task_metrics,
-    episode_metric_statistics,
-    execution_ratio_statistics,
-)
-from .interface import _copy_uav_positions
-from .reporting import resolve_checkpoint_reference
-from .rollout import collect_rollout
-from .trainer import (
-    PPOTrainer,
+from .interface import (
+    PROPOSED_CONTROL_MODE,
+    PROPOSED_POLICY_SCHEMA,
     _assert_realization_context_compatible,
+    _copy_uav_positions,
     aligned_train_steps,
     load_environment_context,
 )
+from .reporting import resolve_checkpoint_reference
+from .rollout import EXECUTION_CLASSES, _finite_nonnegative, collect_rollout
+from .trainer import PPOTrainer
 
 
-PROPOSED_POLICY_SCHEMA = "adaptive_joint_cache_uav_ppo"
-PROPOSED_CONTROL_MODE = "adaptive_joint_cache_uav_reconfiguration"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 FULL_EPISODE_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
 FULL_EPISODE_SLOTS = 300
@@ -62,6 +56,159 @@ EPISODE_METRIC_NAMES = (
 )
 
 
+def slot_task_metrics_dict(transition: Any) -> dict[str, Any]:
+    """将一个 rollout transition 的任务指标转换为 JSON 可写形式。"""
+
+    task_count = int(transition.task_count)
+    if task_count < 0:
+        raise ValueError("transition.task_count must be non-negative")
+    counts = {
+        name: int(transition.execution_target_counts.get(name, 0))
+        for name in EXECUTION_CLASSES
+    }
+    if any(value < 0 for value in counts.values()):
+        raise ValueError("transition execution target counts must be non-negative")
+    if sum(counts.values()) != task_count:
+        raise AssertionError("transition execution target counts do not sum to task_count")
+    total_delay = _finite_nonnegative(
+        transition.total_task_delay_s,
+        "transition.total_task_delay_s",
+        "slot",
+    )
+    total_energy = _finite_nonnegative(
+        transition.total_vehicle_energy_j,
+        "transition.total_vehicle_energy_j",
+        "slot",
+    )
+    return {
+        "task_count": task_count,
+        "mean_task_delay_s": (
+            None if task_count == 0 else float(total_delay / float(task_count))
+        ),
+        "mean_vehicle_energy_j": (
+            None if task_count == 0 else float(total_energy / float(task_count))
+        ),
+        "execution_counts": counts,
+    }
+
+def aggregate_episode_task_metrics(transitions: Iterable[Any]) -> dict[str, Any]:
+    """按任务数加权汇总整个 episode 的 slot 指标。"""
+
+    total_tasks = 0
+    total_delay = 0.0
+    total_energy = 0.0
+    execution_counts = {name: 0 for name in EXECUTION_CLASSES}
+    for transition in transitions:
+        slot_metrics = slot_task_metrics_dict(transition)
+        task_count = int(slot_metrics["task_count"])
+        total_tasks += task_count
+        total_delay += _finite_nonnegative(
+            transition.total_task_delay_s,
+            "transition.total_task_delay_s",
+            "episode",
+        )
+        total_energy += _finite_nonnegative(
+            transition.total_vehicle_energy_j,
+            "transition.total_vehicle_energy_j",
+            "episode",
+        )
+        for name in EXECUTION_CLASSES:
+            execution_counts[name] += int(slot_metrics["execution_counts"][name])
+    if sum(execution_counts.values()) != total_tasks:
+        raise AssertionError("episode execution counts do not sum to total_tasks")
+    execution_ratios = {
+        name: (
+            0.0
+            if total_tasks == 0
+            else float(execution_counts[name]) / float(total_tasks)
+        )
+        for name in EXECUTION_CLASSES
+    }
+    return {
+        "total_tasks": int(total_tasks),
+        "mean_task_delay_s": (
+            None if total_tasks == 0 else float(total_delay / float(total_tasks))
+        ),
+        "mean_vehicle_energy_j": (
+            None if total_tasks == 0 else float(total_energy / float(total_tasks))
+        ),
+        "execution_counts": execution_counts,
+        "execution_ratios": execution_ratios,
+    }
+
+def episode_metric_statistics(
+    summaries: Iterable[Mapping[str, Any]],
+    metric_names: Iterable[str],
+) -> dict[str, dict[str, float]]:
+    """计算 episode 级样本统计量与 Student-t 95% 置信区间。"""
+
+    summary_list = list(summaries)
+    values_by_metric: dict[str, list[float]] = {}
+    for metric_name in metric_names:
+        values: list[float] = []
+        for summary in summary_list:
+            value = summary.get(metric_name)
+            if value is None:
+                raise ValueError(
+                    f"episode metric {metric_name} is null; cannot pool statistics"
+                )
+            numeric = float(value)
+            if not np.isfinite(numeric):
+                raise ValueError(f"episode metric {metric_name} is non-finite")
+            values.append(numeric)
+        values_by_metric[str(metric_name)] = values
+
+    result: dict[str, dict[str, float]] = {}
+    for metric_name, values in values_by_metric.items():
+        count = len(values)
+        if count < 2:
+            raise ValueError("episode-level Student-t statistics require at least 2 episodes")
+        array = np.asarray(values, dtype=np.float64)
+        mean = float(np.mean(array))
+        std = float(np.std(array, ddof=1))
+        se = float(std / np.sqrt(float(count)))
+        try:
+            from scipy.stats import t as student_t
+        except ModuleNotFoundError as exc:  # pragma: no cover - env dependency
+            raise ImportError(
+                "pool statistics require scipy for the Student-t critical value"
+            ) from exc
+        critical = float(student_t.ppf(0.975, count - 1))
+        result[metric_name] = {
+            "mean": mean,
+            "std": std,
+            "median": float(np.median(array)),
+            "min": float(np.min(array)),
+            "max": float(np.max(array)),
+            "se": se,
+            "ci95_low": float(mean - critical * se),
+            "ci95_high": float(mean + critical * se),
+        }
+    return result
+
+def execution_ratio_statistics(
+    summaries: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, float]]:
+    """计算各执行类别 episode 比率的均值与样本标准差。"""
+
+    summary_list = list(summaries)
+    count = len(summary_list)
+    if count < 2:
+        raise ValueError("execution ratio statistics require at least 2 episodes")
+    result: dict[str, dict[str, float]] = {}
+    for name in EXECUTION_CLASSES:
+        values = np.asarray(
+            [float(summary["execution_ratios"][name]) for summary in summary_list],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"execution ratios for {name} contain non-finite values")
+        result[name] = {
+            "mean_execution_ratio": float(np.mean(values)),
+            "std_execution_ratio": float(np.std(values, ddof=1)),
+        }
+    return result
+
 def _require_torch() -> None:
     if torch is None:
         raise ImportError("proposed joint evaluation requires PyTorch.")
@@ -72,14 +219,6 @@ def _resolve_path(project_root: Path, value: str | Path) -> Path:
     if not path.is_absolute():
         path = project_root / path
     return path.resolve(strict=False)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _ensure_fresh_output(path: Path) -> None:
@@ -94,16 +233,6 @@ def _ensure_fresh_output(path: Path) -> None:
 
 
 def _validate_proposed_context(context: Any) -> dict[str, Any]:
-    if str(context.policy_schema) != PROPOSED_POLICY_SCHEMA:
-        raise ValueError(
-            "proposed joint evaluator requires policy_schema="
-            f"{PROPOSED_POLICY_SCHEMA}, got {context.policy_schema}"
-        )
-    if str(context.configuration_control_mode) != PROPOSED_CONTROL_MODE:
-        raise ValueError(
-            "proposed joint evaluator requires configuration_control_mode="
-            f"{PROPOSED_CONTROL_MODE}, got {context.configuration_control_mode}"
-        )
     protocol = project_config.get_ppo_data_protocol(context.cfg)
     expected = {
         "protocol": FULL_EPISODE_PROTOCOL,
@@ -133,11 +262,6 @@ def _load_checkpoint_metadata(checkpoint: Path) -> dict[str, Any]:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError("proposed checkpoint payload must be a mapping")
-    if payload.get("policy_schema") != PROPOSED_POLICY_SCHEMA:
-        raise ValueError(
-            "proposed checkpoint policy_schema mismatch: "
-            f"{payload.get('policy_schema')!r} != {PROPOSED_POLICY_SCHEMA!r}"
-        )
     return payload
 
 
@@ -154,7 +278,7 @@ def _seed_policy_sampling(seed: int) -> None:
 def _load_proposed_trainer(
     context: Any,
     checkpoint: Path,
-    config_hash: str,
+    config_raw_sha256: str,
     checkpoint_metadata: dict[str, Any],
     device: str,
 ) -> PPOTrainer:
@@ -164,15 +288,7 @@ def _load_proposed_trainer(
             "Trainer policy factory did not construct the configured proposed schema: "
             f"{trainer.policy.architecture_id!r} != {context.policy_schema!r}"
         )
-    if checkpoint_metadata.get("configuration_control_mode") != (
-        context.configuration_control_mode
-    ):
-        raise ValueError(
-            "proposed checkpoint configuration_control_mode mismatch: "
-            f"{checkpoint_metadata.get('configuration_control_mode')!r} != "
-            f"{context.configuration_control_mode!r}"
-        )
-    trainer.load_checkpoint(checkpoint, config_hash)
+    trainer.load_checkpoint(checkpoint, config_raw_sha256)
     if trainer.policy.architecture_id != PROPOSED_POLICY_SCHEMA:
         raise TypeError("proposed checkpoint restored an unexpected policy schema")
     trainer.policy.eval()
@@ -363,8 +479,11 @@ def evaluate_pool(
     _ensure_fresh_output(output_path)
 
     checkpoint_metadata = _load_checkpoint_metadata(checkpoint)
-    config_hash = _sha256(config_file)
+    config_raw_sha256 = project_config.raw_config_sha256(config_file)
     reference_context = load_environment_context(str(config_file))
+    config_semantic_sha256 = project_config.semantic_config_hash(
+        reference_context.cfg
+    )
     protocol = _validate_proposed_context(reference_context)
     environment_means: list[dict[str, Any]] = []
     repeat_summaries: list[dict[str, Any]] = []
@@ -389,7 +508,7 @@ def evaluate_pool(
         trainer = _load_proposed_trainer(
             context,
             checkpoint,
-            config_hash,
+            config_raw_sha256,
             checkpoint_metadata,
             device,
         )
@@ -481,7 +600,9 @@ def evaluate_pool(
     aggregate = {
         "experiment_type": "proposed_joint_episode_pool_evaluation",
         "config_path": str(config_file),
-        "config_sha256": config_hash,
+        "config_sha256": config_raw_sha256,
+        "config_raw_sha256": config_raw_sha256,
+        "config_semantic_sha256": config_semantic_sha256,
         "checkpoint_path": str(checkpoint),
         "checkpoint_policy_schema": checkpoint_metadata.get("policy_schema"),
         "policy_schema": PROPOSED_POLICY_SCHEMA,

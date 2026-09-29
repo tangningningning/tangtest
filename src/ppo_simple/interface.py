@@ -6,12 +6,288 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from common import project_config
-from decision import cache_configuration, task_allocation
+from decision import cache_configuration, task_allocation, uav_configuration
+from scenario import task_scenario
+from scenario.realization import (
+    RealizationArtifacts,
+    _realization_artifacts_from_directory,
+    configured_realization_artifacts,
+)
+
+
+PROPOSED_POLICY_SCHEMA = "adaptive_joint_cache_uav_ppo"
+PROPOSED_CONTROL_MODE = "adaptive_joint_cache_uav_reconfiguration"
+
+
+@dataclass(frozen=True)
+class EnvironmentContext:
+    cfg: dict[str, Any]
+    root: Path
+    cache_cfg: cache_configuration.CacheOptimizationConfig
+    scenarios: dict[str, Any]
+    service_catalog: dict[str, Any]
+    cache_nodes: dict[str, Any]
+    local_cache: dict[str, set[int]]
+    flight_boundary: tuple[float, float, float, float]
+    action_spec: TriggerActionSpec
+    observation_spec: ConfigurationObservationSpec
+    initial_cache: np.ndarray
+    initial_uav: dict[str, np.ndarray]
+    train_origin_start: int
+    train_origin_end: int
+    data_protocol: str
+    episode_slots: int
+    terminal_origin: int
+    configured_rollout_steps: int | None
+    minibatch_size: int
+    configuration_control_mode: str
+    policy_schema: str
+    realization: "RealizationArtifacts | None" = None
+    observation_time_to_go: Callable[[int], float] | None = None
+
+def _assert_realization_context_compatible(
+    reference: EnvironmentContext,
+    candidate: EnvironmentContext,
+) -> None:
+    """确认新 realization 满足当前 PPO 张量与协议约定。"""
+
+    scalar_fields = (
+        "data_protocol",
+        "episode_slots",
+        "train_origin_start",
+        "train_origin_end",
+        "terminal_origin",
+        "configured_rollout_steps",
+        "minibatch_size",
+        "configuration_control_mode",
+        "policy_schema",
+    )
+    for field in scalar_fields:
+        if getattr(reference, field) != getattr(candidate, field):
+            raise ValueError(
+                "PPO episode realization changes the fixed training contract: "
+                f"field={field}, reference={getattr(reference, field)!r}, "
+                f"candidate={getattr(candidate, field)!r}"
+            )
+    reference_observation = reference.observation_spec
+    candidate_observation = candidate.observation_spec
+    if (
+        reference_observation.observation_dim
+        != candidate_observation.observation_dim
+        or len(reference_observation.vehicle_ids)
+        != len(candidate_observation.vehicle_ids)
+        or reference_observation.service_ids != candidate_observation.service_ids
+        or reference_observation.uav_ids != candidate_observation.uav_ids
+        or reference_observation.prediction_horizon
+        != candidate_observation.prediction_horizon
+        or (reference_observation.horizon_mask_slice is None)
+        != (candidate_observation.horizon_mask_slice is None)
+    ):
+        raise ValueError(
+            "PPO episode realization changes the observation tensor contract: "
+            f"reference_dim={reference_observation.observation_dim}, "
+            f"candidate_dim={candidate_observation.observation_dim}"
+        )
+    if (
+        reference.action_spec.action_dim != candidate.action_spec.action_dim
+        or len(reference.action_spec.cache_node_ids)
+        != len(candidate.action_spec.cache_node_ids)
+        or reference.action_spec.uav_ids != candidate.action_spec.uav_ids
+    ):
+        raise ValueError(
+            "PPO episode realization changes the action tensor contract: "
+            f"reference_dim={reference.action_spec.action_dim}, "
+            f"candidate_dim={candidate.action_spec.action_dim}"
+        )
+    if np.asarray(reference.initial_cache).shape != np.asarray(candidate.initial_cache).shape:
+        raise ValueError("PPO episode realization changes the initial cache tensor shape")
+    if set(reference.initial_uav) != set(candidate.initial_uav):
+        raise ValueError("PPO episode realization changes the initial UAV ID set")
+
+def load_environment_context(
+    config_path: str = "configs/proposed/system_config.toml",
+    realization_dir: str | Path | None = None,
+) -> EnvironmentContext:
+    cfg = project_config.load_config(config_path)
+    project_config.validate_for_formal_experiment(cfg)
+    data_protocol = project_config.get_ppo_data_protocol(cfg)
+    root = Path(cfg["_meta"]["project_root"])
+    realization = (
+        configured_realization_artifacts(cfg, root)
+        if realization_dir is None
+        else _realization_artifacts_from_directory(
+            Path(realization_dir)
+            if Path(realization_dir).is_absolute()
+            else root / Path(realization_dir)
+        )
+    )
+    cache_cfg = cache_configuration.cache_config_from_project(cfg)
+    scenarios = cache_configuration.load_prediction_scenarios(
+        realization.prediction_scenarios
+    )
+    service_catalog = cache_configuration.load_service_catalog(
+        project_config.resolve_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
+    )
+    train_start = int(data_protocol["train_origin_start"])
+    train_end = int(data_protocol["train_origin_end"])
+    origin_count = int(scenarios["origin_slots"].shape[0])
+    if train_start < 0 or train_end < train_start or train_end >= origin_count:
+        raise ValueError("训练起点范围超出 prediction_scenarios。")
+    first_origin = cache_configuration.scenario_at_origin(scenarios, train_start)
+    cache_nodes = cache_configuration.build_cache_nodes(first_origin, cache_cfg)
+    local_cache = task_scenario.load_tv_local_cache(
+        realization.tv_local_cache
+    )
+    action_spec = TriggerActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
+    policy_schema = str(
+        project_config.get_config_value(
+            cfg,
+            "algorithm.ppo.policy_schema",
+            PROPOSED_POLICY_SCHEMA,
+        )
+    )
+    if policy_schema != PROPOSED_POLICY_SCHEMA:
+        raise ValueError(
+            "当前训练器仅支持正式 proposed_joint 策略："
+            f"{PROPOSED_POLICY_SCHEMA}"
+        )
+    prediction_horizon = int(
+        project_config.get_config_value(cfg, "prediction.vehicle.horizon")
+    )
+    observation_spec = ConfigurationObservationSpec.from_cache_nodes(
+        cache_nodes,
+        service_catalog["service_ids"].tolist(),
+        action_spec.uav_ids,
+        [str(value) for value in first_origin["vehicle_ids"].tolist()],
+        include_time_to_go=True,
+        prediction_horizon=prediction_horizon,
+        include_prediction_horizon_mask=True,
+    )
+    initial_cache = cache_configuration.popularity_aware_initial_cache(
+        service_catalog,
+        cache_nodes,
+        cache_cfg,
+    )
+    initial_uav = uav_configuration.initial_uav_positions_from_project(cfg)
+    configuration_control_mode = str(
+        project_config.get_config_value(
+            cfg,
+            "algorithm.ppo.configuration_control_mode",
+            PROPOSED_CONTROL_MODE,
+        )
+    )
+    if configuration_control_mode != PROPOSED_CONTROL_MODE:
+        raise ValueError(
+            "当前训练器仅支持正式 proposed_joint 控制模式："
+            f"{PROPOSED_CONTROL_MODE}"
+        )
+    return EnvironmentContext(
+        cfg=cfg,
+        root=root,
+        cache_cfg=cache_cfg,
+        scenarios=scenarios,
+        service_catalog=service_catalog,
+        cache_nodes=cache_nodes,
+        local_cache=local_cache,
+        flight_boundary=uav_configuration.boundary_from_project(cfg),
+        action_spec=action_spec,
+        observation_spec=observation_spec,
+        initial_cache=initial_cache,
+        initial_uav=initial_uav,
+        train_origin_start=train_start,
+        train_origin_end=train_end,
+        data_protocol=str(data_protocol["protocol"]),
+        episode_slots=int(data_protocol["episode_slots"]),
+        terminal_origin=int(data_protocol["terminal_origin"]),
+        configured_rollout_steps=(
+            None
+            if data_protocol["rollout_steps"] is None
+            else int(data_protocol["rollout_steps"])
+        ),
+        minibatch_size=int(data_protocol["minibatch_size"]),
+        configuration_control_mode=configuration_control_mode,
+        policy_schema=policy_schema,
+        realization=realization,
+    )
+
+def aligned_train_steps(
+    context: EnvironmentContext,
+    origin_start: int | None = None,
+    max_steps: int | None = None,
+    *,
+    include_bootstrap_step: bool = False,
+) -> list[Any]:
+    start = context.train_origin_start if origin_start is None else int(origin_start)
+    if start < context.train_origin_start or start > context.train_origin_end:
+        raise ValueError("origin_start 必须位于 formal train origins 内。")
+    available_steps = context.train_origin_end - start + 1
+    step_count = available_steps
+    if max_steps is not None:
+        if int(max_steps) <= 0:
+            raise ValueError("max_steps 必须大于0。")
+        step_count = min(available_steps, int(max_steps))
+    if include_bootstrap_step and start + step_count > context.train_origin_end:
+        raise ValueError("train terminal 后不允许读取 test origin 作为 bootstrap step。")
+    return prepare_aligned_rollout_steps(
+        context.root,
+        context.scenarios,
+        start,
+        step_count,
+        (
+            context.realization.vehicle_predictions
+            if context.realization is not None
+            else project_config.resolve_path(
+                context.root,
+                project_config.get_config_value(
+                    context.cfg,
+                    "paths.vehicle_predictions",
+                ),
+            )
+        ),
+        (
+            context.realization.popularity_predictions
+            if context.realization is not None
+            else project_config.resolve_path(
+                context.root,
+                project_config.get_config_value(
+                    context.cfg,
+                    "paths.popularity_predictions",
+                ),
+            )
+        ),
+        (
+            context.realization.tasks
+            if context.realization is not None
+            else project_config.resolve_path(
+                context.root,
+                project_config.get_config_value(context.cfg, "paths.tasks"),
+            )
+        ),
+        (
+            context.realization.trajectory
+            if context.realization is not None
+            else project_config.resolve_path(
+                context.root,
+                project_config.get_config_value(context.cfg, "paths.trajectory"),
+            )
+        ),
+        include_bootstrap_step=bool(include_bootstrap_step),
+        prediction_horizon=int(context.observation_spec.prediction_horizon),
+        prediction_dt_s=float(
+            project_config.get_config_value(context.cfg, "simulation.dt_s")
+        ),
+        prediction_terminal_origin=int(context.train_origin_end),
+        expected_vehicle_ids=context.observation_spec.vehicle_ids,
+        expected_service_ids=context.observation_spec.service_ids,
+        include_prediction_horizon_mask=(
+            context.observation_spec.horizon_mask_slice is not None
+        ),
+    )
 
 
 def _validate_binary_vector(value: Any, expected_length: int, name: str) -> np.ndarray:

@@ -3,10 +3,110 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from common import project_config
 
 
 SEED_PROTOCOL_VERSION = "adaptive_cache_mec_episode_seed_v1"
 SUMO_MAX_SEED = 2_147_483_646
+
+REALIZATION_ARTIFACT_FILENAMES = {
+    "trajectory": "trajectory.csv",
+    "vehicle_roles": "vehicle_roles.json",
+    "tasks": "tasks.csv",
+    "popularity": "popularity.csv",
+    "popularity_history": "popularity_history.csv",
+    "vehicle_predictions": "vehicle_predictions.csv",
+    "popularity_predictions": "popularity_predictions.csv",
+    "prediction_scenarios": "prediction_scenarios.npz",
+    "tv_local_cache": "tv_local_cache.json",
+}
+# 单条 episode 生成器还会输出以下来源记录文件；完整性校验会同时检查这些文件。
+GENERATOR_EXTRA_ARTIFACT_FILENAMES = (
+    "sumo_demand.rou.xml",
+    "sumo_demand.meta.json",
+)
+
+
+@dataclass(frozen=True)
+class RealizationArtifacts:
+    """一条完整 episode realization 所需文件的路径合同。"""
+
+    directory: Path
+    trajectory: Path
+    vehicle_roles: Path
+    tasks: Path
+    popularity: Path
+    popularity_history: Path
+    vehicle_predictions: Path
+    popularity_predictions: Path
+    prediction_scenarios: Path
+    tv_local_cache: Path
+
+
+def configured_realization_artifacts(
+    cfg: dict[str, Any], root: Path
+) -> RealizationArtifacts:
+    """根据配置路径构建 episode artifact 映射。"""
+
+    paths = {
+        field: project_config.resolve_path(
+            root, project_config.get_config_value(cfg, f"paths.{field}")
+        )
+        for field in REALIZATION_ARTIFACT_FILENAMES
+    }
+    return RealizationArtifacts(
+        directory=paths["trajectory"].parent,
+        trajectory=paths["trajectory"],
+        vehicle_roles=paths["vehicle_roles"],
+        tasks=paths["tasks"],
+        popularity=paths["popularity"],
+        popularity_history=paths["popularity_history"],
+        vehicle_predictions=paths["vehicle_predictions"],
+        popularity_predictions=paths["popularity_predictions"],
+        prediction_scenarios=paths["prediction_scenarios"],
+        tv_local_cache=paths["tv_local_cache"],
+    )
+
+
+def _realization_artifacts_from_directory(directory: Path) -> RealizationArtifacts:
+    """校验 realization 目录并返回规范 artifact 路径映射。"""
+
+    realization_dir = Path(directory).expanduser().resolve(strict=False)
+    if not realization_dir.is_dir():
+        raise FileNotFoundError(
+            f"PPO episode realization directory does not exist: {realization_dir}"
+        )
+    paths = {
+        field: realization_dir / filename
+        for field, filename in REALIZATION_ARTIFACT_FILENAMES.items()
+    }
+    missing = [
+        filename
+        for field, filename in REALIZATION_ARTIFACT_FILENAMES.items()
+        if not paths[field].is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "PPO episode realization is missing required artifacts: "
+            f"directory={realization_dir}, missing={missing}"
+        )
+    return RealizationArtifacts(
+        directory=realization_dir,
+        trajectory=paths["trajectory"],
+        vehicle_roles=paths["vehicle_roles"],
+        tasks=paths["tasks"],
+        popularity=paths["popularity"],
+        popularity_history=paths["popularity_history"],
+        vehicle_predictions=paths["vehicle_predictions"],
+        popularity_predictions=paths["popularity_predictions"],
+        prediction_scenarios=paths["prediction_scenarios"],
+        tv_local_cache=paths["tv_local_cache"],
+    )
+
 
 EPISODE_SEED_STREAMS = (
     "traffic_seed",

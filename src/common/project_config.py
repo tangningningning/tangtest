@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -37,6 +38,47 @@ def resolve_path(project_root: Path, value: str | Path) -> Path:
     return path.resolve(strict=False)
 
 
+def parse_toml_file(path: str | Path) -> dict[str, Any]:
+    """解析 TOML 文件，不注入运行时元数据或执行配置校验。"""
+
+    config_path = Path(path).expanduser()
+    with config_path.open("rb") as stream:
+        config = tomllib.load(stream)
+    if not isinstance(config, dict):
+        raise ValueError(f"TOML 配置根对象必须是 table：{config_path}")
+    return config
+
+
+def semantic_config_hash(config: dict[str, Any]) -> str:
+    """对解析后的配置值计算稳定哈希，并忽略运行时注入的元数据。"""
+
+    if not isinstance(config, dict):
+        raise TypeError("语义配置哈希要求输入解析后的配置字典。")
+    semantic_config = {
+        key: value for key, value in config.items() if key != "_meta"
+    }
+    canonical = json.dumps(
+        semantic_config,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def semantic_config_hash_from_file(path: str | Path) -> str:
+    """解析 TOML 快照后计算其语义哈希。"""
+
+    return semantic_config_hash(parse_toml_file(path))
+
+
+def raw_config_sha256(path: str | Path) -> str:
+    """计算 TOML 文件原始字节哈希，仅用于来源记录。"""
+
+    return hashlib.sha256(Path(path).expanduser().read_bytes()).hexdigest()
+
+
 def load_config(
     path: str | Path = "configs/proposed/system_config.toml",
     *,
@@ -44,10 +86,7 @@ def load_config(
 ) -> dict[str, Any]:
     project_root = find_project_root()
     config_path = resolve_path(project_root, path)
-    with config_path.open("rb") as stream:
-        config = tomllib.load(stream)
-    if not isinstance(config, dict):
-        raise ValueError("configs/proposed/system_config.toml 根对象必须是 table。")
+    config = parse_toml_file(config_path)
     config["_meta"] = {
         "config_path": str(config_path),
         "project_root": str(project_root),

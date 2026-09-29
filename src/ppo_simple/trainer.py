@@ -26,15 +26,23 @@ except ModuleNotFoundError:  # pragma: no cover - CLI help/import-only environme
 from common import project_config
 from decision import cache_configuration, uav_configuration
 from scenario import task_scenario
-from scenario.realization import derive_namespaced_seed
+from scenario.realization import (
+    GENERATOR_EXTRA_ARTIFACT_FILENAMES,
+    REALIZATION_ARTIFACT_FILENAMES,
+    RealizationArtifacts,
+    _realization_artifacts_from_directory,
+    derive_namespaced_seed,
+)
 
 from . import interface
-from .interface import _copy_uav_positions
-from .plotting import (
-    SLOT_METRICS_FILENAME,
-    TRAINING_EPOCH_RETURN_PLOT_FILENAME,
-    append_training_slot_metrics,
-    update_training_epoch_return_plot,
+from .interface import (
+    EnvironmentContext,
+    PROPOSED_CONTROL_MODE,
+    PROPOSED_POLICY_SCHEMA,
+    _assert_realization_context_compatible,
+    _copy_uav_positions,
+    aligned_train_steps,
+    load_environment_context,
 )
 from .reporting import (
     RUN_MANIFEST_FILENAME,
@@ -44,6 +52,15 @@ from .reporting import (
     ensure_fresh_run_dir_is_clean,
     ensure_run_artifact_directories,
     update_run_summary,
+    SLOT_METRICS_FILENAME,
+    TRAINING_EPOCH_RETURN_PLOT_FILENAME,
+    append_training_slot_metrics,
+    update_training_epoch_return_plot,
+    _gradient_group_norm,
+    _module_parameter_delta_norm,
+    _matching_termination_metrics,
+    _matching_metrics_from_counts,
+    _kkt_metrics_from_diagnostics,
     update_run_manifest_teacher_state,
     write_run_manifest,
 )
@@ -52,10 +69,10 @@ from .policy import (
     _SeparateOptimizationActorCriticBase,
 )
 from .cache_credit import (
+    CacheCounterfactualDeltaQSurrogate,
     CACHE_SURROGATE_K_CANDIDATES,
     evaluate_cache_full_information_values,
 )
-from .cache_surrogate import CacheCounterfactualDeltaQSurrogate
 from .exact_q_parallel import (
     ExactQHeadPlan,
     ExactQTransitionPlan,
@@ -76,8 +93,6 @@ from .uav_credit import (
 
 
 CHECKPOINT_METHOD = "ppo_simple_v2"
-PROPOSED_POLICY_SCHEMA = "adaptive_joint_cache_uav_ppo"
-PROPOSED_CONTROL_MODE = "adaptive_joint_cache_uav_reconfiguration"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 CHECKPOINT_INTERVAL_EPOCHS = 10
@@ -115,27 +130,6 @@ CRITIC_VALUE_SCALE_RUNNING_RETURN_STD = "running_return_std"
 CRITIC_VALUE_SCALE_POPART_NORMALIZED = "popart_normalized"
 DEFAULT_CRITIC_VALUE_SCALE_EPSILON = 1.0e-8
 DEFAULT_CRITIC_VALUE_SCALE_WARMUP_SAMPLES = 64
-REALIZATION_ARTIFACT_FILENAMES = {
-    "trajectory": "trajectory.csv",
-    "vehicle_roles": "vehicle_roles.json",
-    "tasks": "tasks.csv",
-    "popularity": "popularity.csv",
-    "popularity_history": "popularity_history.csv",
-    "vehicle_predictions": "vehicle_predictions.csv",
-    "popularity_predictions": "popularity_predictions.csv",
-    "prediction_scenarios": "prediction_scenarios.npz",
-    "tv_local_cache": "tv_local_cache.json",
-}
-# 现有单条 episode 生成器还会同时输出这些文件；
-# 它们不属于 trainer 读取的九个 artifact。将这些文件纳入完成校验，
-# 可以避免懒生成流程把不完整输出误判为
-# 可复用数据。
-GENERATOR_EXTRA_ARTIFACT_FILENAMES = (
-    "sumo_demand.rou.xml",
-    "sumo_demand.meta.json",
-)
-
-
 class EpisodeFilesystemPermissionError(RuntimeError):
     """当前训练进程无法读取规范 episode artifact。"""
 
@@ -145,164 +139,14 @@ def _require_torch() -> None:
         raise ImportError("proposed_joint 训练需要 PyTorch。")
 
 
-def _gradient_group_norm(parameters: Any) -> float:
-    """返回单个诊断参数组裁剪前的 L2 范数。"""
-
-    squared_norm = None
-    for parameter in parameters:
-        gradient = parameter.grad
-        if gradient is None:
-            continue
-        component = torch.sum(gradient.detach() ** 2)
-        squared_norm = component if squared_norm is None else squared_norm + component
-    if squared_norm is None:
-        return 0.0
-    return float(torch.sqrt(squared_norm).detach().cpu())
 
 
-def _module_parameter_delta_norm(before_parameters: dict[str, Any], module: Any) -> float:
-    """返回具名参数变化量的范数，仅用于诊断。"""
-
-    delta_squared = 0.0
-    current_names = set()
-    for name, parameter in module.named_parameters():
-        key = str(name)
-        current_names.add(key)
-        if key not in before_parameters:
-            raise RuntimeError(f"diagnostic module parameter disappeared: {key}")
-        delta_squared += float(
-            torch.sum((parameter.detach() - before_parameters[key]) ** 2).cpu()
-        )
-    if current_names != set(before_parameters):
-        raise RuntimeError("diagnostic module parameter names changed during PPO update")
-    return float(np.sqrt(delta_squared))
 
 
-def _matching_termination_metrics(
-    summaries: Any,
-) -> dict[str, Any]:
-    """汇总 Matching 停止原因，不改变 Matching 决策。"""
-
-    natural_stable_count = 0
-    max_updates_hit_count = 0
-    update_counts: list[int] = []
-    for summary in summaries:
-        if not summary or not isinstance(summary, dict):
-            continue
-        stop_reason = str(summary.get("stop_reason", ""))
-        if stop_reason == "converged_by_no_improvement":
-            natural_stable_count += 1
-        elif stop_reason == "stopped_by_max_updates":
-            max_updates_hit_count += 1
-        if "updates" not in summary:
-            continue
-        update_count = int(summary["updates"])
-        if update_count < 0:
-            raise ValueError("Matching update count must be non-negative")
-        update_counts.append(update_count)
-    return _matching_metrics_from_counts(
-        natural_stable_count,
-        max_updates_hit_count,
-        update_counts,
-    )
 
 
-def _matching_metrics_from_counts(
-    natural_stable_count: int,
-    max_updates_hit_count: int,
-    update_counts: Any,
-) -> dict[str, Any]:
-    """从 Exact-Q worker 汇总数据中构建相同的 Matching 指标。"""
-
-    counts_list = [int(value) for value in update_counts]
-    if any(value < 0 for value in counts_list):
-        raise ValueError("Matching update count must be non-negative")
-    if not counts_list:
-        return {
-            "natural_stable_count": int(natural_stable_count),
-            "max_updates_hit_count": int(max_updates_hit_count),
-            "max_updates_hit_rate": 0.0,
-            "update_count_mean": 0.0,
-            "update_count_p95": 0.0,
-            "update_count_max": 0,
-        }
-    counts = np.asarray(counts_list, dtype=np.float64)
-    return {
-        "natural_stable_count": int(natural_stable_count),
-        "max_updates_hit_count": int(max_updates_hit_count),
-        "max_updates_hit_rate": float(max_updates_hit_count / len(counts_list)),
-        "update_count_mean": float(np.mean(counts)),
-        "update_count_p95": float(np.percentile(counts, 95.0)),
-        "update_count_max": int(np.max(counts)),
-    }
 
 
-def _kkt_metrics_from_diagnostics(records: Any) -> dict[str, Any]:
-    """从 Matching 汇总数据中聚合只读 KKT 求解诊断。"""
-
-    normalized: list[dict[str, Any]] = []
-    for record in records or ():
-        if not isinstance(record, dict):
-            continue
-        normalized.append(record)
-
-    solve_count = len(normalized)
-    converged_count = sum(
-        bool(record.get("converged_by_tolerance", False))
-        for record in normalized
-    )
-    max_iter_hit_count = sum(
-        bool(record.get("hit_max_bisection_iterations", False))
-        for record in normalized
-    )
-    finite_count = sum(bool(record.get("finite", False)) for record in normalized)
-
-    def finite_values(field: str) -> np.ndarray:
-        values = []
-        for record in normalized:
-            try:
-                value = float(record.get(field, math.nan))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value):
-                values.append(value)
-        return np.asarray(values, dtype=np.float64)
-
-    iterations = finite_values("iterations")
-    resource_residuals = finite_values("resource_sum_residual")
-    stationarity_residuals = finite_values("stationarity_residual")
-    complementary_residuals = finite_values("complementary_slackness_residual")
-
-    def mean(values: np.ndarray) -> float:
-        return 0.0 if values.size == 0 else float(np.mean(values))
-
-    def maximum(values: np.ndarray) -> float:
-        return math.nan if values.size == 0 else float(np.max(values))
-
-    return {
-        "solve_count": int(solve_count),
-        "converged_count": int(converged_count),
-        "converged_rate": (
-            float(converged_count / solve_count) if solve_count else 0.0
-        ),
-        "max_iter_hit_count": int(max_iter_hit_count),
-        "max_iter_hit_rate": (
-            float(max_iter_hit_count / solve_count) if solve_count else 0.0
-        ),
-        "finite_count": int(finite_count),
-        "finite_rate": float(finite_count / solve_count) if solve_count else 0.0,
-        "iteration_mean": mean(iterations),
-        "iteration_p95": (
-            0.0 if iterations.size == 0 else float(np.percentile(iterations, 95.0))
-        ),
-        "iteration_max": int(np.max(iterations)) if iterations.size else 0,
-        "resource_residual_mean": mean(resource_residuals),
-        "resource_residual_max": maximum(resource_residuals),
-        "stationarity_residual_mean": mean(stationarity_residuals),
-        "stationarity_residual_max": maximum(stationarity_residuals),
-        "complementary_slackness_residual_mean": mean(complementary_residuals),
-        "complementary_slackness_residual_max": maximum(complementary_residuals),
-    }
 
 
 def _branch_specific_kl_gate_transition(
@@ -472,50 +316,6 @@ def _branch_actor_policy_loss(
     if bool(uav_active):
         loss = loss + 0.5 * uav_branch_policy_loss
     return loss
-
-
-@dataclass(frozen=True)
-class EnvironmentContext:
-    cfg: dict[str, Any]
-    root: Path
-    cache_cfg: cache_configuration.CacheOptimizationConfig
-    scenarios: dict[str, Any]
-    service_catalog: dict[str, Any]
-    cache_nodes: dict[str, Any]
-    local_cache: dict[str, set[int]]
-    flight_boundary: tuple[float, float, float, float]
-    action_spec: interface.TriggerActionSpec
-    observation_spec: interface.ConfigurationObservationSpec
-    initial_cache: np.ndarray
-    initial_uav: dict[str, np.ndarray]
-    train_origin_start: int
-    train_origin_end: int
-    data_protocol: str
-    episode_slots: int
-    terminal_origin: int
-    configured_rollout_steps: int | None
-    minibatch_size: int
-    configuration_control_mode: str
-    policy_schema: str
-    realization: "RealizationArtifacts | None" = None
-    observation_time_to_go: Callable[[int], float] | None = None
-
-
-@dataclass(frozen=True)
-class RealizationArtifacts:
-    """一条完整随机化 episode realization 所需的文件路径。"""
-
-    directory: Path
-    trajectory: Path
-    vehicle_roles: Path
-    tasks: Path
-    popularity: Path
-    popularity_history: Path
-    vehicle_predictions: Path
-    popularity_predictions: Path
-    prediction_scenarios: Path
-    tv_local_cache: Path
-
 
 @dataclass(frozen=True)
 class PPOHyperparameters:
@@ -943,64 +743,10 @@ class TrainingCursor:
     episode_seed_start: int | None = None
 
 
-def _project_path(root: Path, value: Any) -> Path:
-    return cache_configuration.resolve_path(root, value)
 
 
-def _configured_realization_artifacts(
-    cfg: dict[str, Any], root: Path
-) -> RealizationArtifacts:
-    get = project_config.get_config_value
-    paths = {
-        field: _project_path(root, get(cfg, f"paths.{field}"))
-        for field in REALIZATION_ARTIFACT_FILENAMES
-    }
-    return RealizationArtifacts(
-        directory=paths["trajectory"].parent,
-        trajectory=paths["trajectory"],
-        vehicle_roles=paths["vehicle_roles"],
-        tasks=paths["tasks"],
-        popularity=paths["popularity"],
-        popularity_history=paths["popularity_history"],
-        vehicle_predictions=paths["vehicle_predictions"],
-        popularity_predictions=paths["popularity_predictions"],
-        prediction_scenarios=paths["prediction_scenarios"],
-        tv_local_cache=paths["tv_local_cache"],
-    )
 
 
-def _realization_artifacts_from_directory(directory: Path) -> RealizationArtifacts:
-    realization_dir = Path(directory).expanduser().resolve(strict=False)
-    if not realization_dir.is_dir():
-        raise FileNotFoundError(
-            f"PPO episode realization directory does not exist: {realization_dir}"
-        )
-    paths = {
-        field: realization_dir / filename
-        for field, filename in REALIZATION_ARTIFACT_FILENAMES.items()
-    }
-    missing = [
-        filename
-        for field, filename in REALIZATION_ARTIFACT_FILENAMES.items()
-        if not paths[field].is_file()
-    ]
-    if missing:
-        raise FileNotFoundError(
-            "PPO episode realization is missing required artifacts: "
-            f"directory={realization_dir}, missing={missing}"
-        )
-    return RealizationArtifacts(
-        directory=realization_dir,
-        trajectory=paths["trajectory"],
-        vehicle_roles=paths["vehicle_roles"],
-        tasks=paths["tasks"],
-        popularity=paths["popularity"],
-        popularity_history=paths["popularity_history"],
-        vehicle_predictions=paths["vehicle_predictions"],
-        popularity_predictions=paths["popularity_predictions"],
-        prediction_scenarios=paths["prediction_scenarios"],
-        tv_local_cache=paths["tv_local_cache"],
-    )
 
 
 def _load_episode_pool(
@@ -1226,64 +972,6 @@ def _ensure_episode_realization(
     return artifacts, "GENERATE"
 
 
-def _assert_realization_context_compatible(
-    reference: EnvironmentContext,
-    candidate: EnvironmentContext,
-) -> None:
-    """确认新 realization 满足当前 PPO 张量与协议约定。"""
-
-    scalar_fields = (
-        "data_protocol",
-        "episode_slots",
-        "train_origin_start",
-        "train_origin_end",
-        "terminal_origin",
-        "configured_rollout_steps",
-        "minibatch_size",
-        "configuration_control_mode",
-        "policy_schema",
-    )
-    for field in scalar_fields:
-        if getattr(reference, field) != getattr(candidate, field):
-            raise ValueError(
-                "PPO episode realization changes the fixed training contract: "
-                f"field={field}, reference={getattr(reference, field)!r}, "
-                f"candidate={getattr(candidate, field)!r}"
-            )
-    reference_observation = reference.observation_spec
-    candidate_observation = candidate.observation_spec
-    if (
-        reference_observation.observation_dim
-        != candidate_observation.observation_dim
-        or len(reference_observation.vehicle_ids)
-        != len(candidate_observation.vehicle_ids)
-        or reference_observation.service_ids != candidate_observation.service_ids
-        or reference_observation.uav_ids != candidate_observation.uav_ids
-        or reference_observation.prediction_horizon
-        != candidate_observation.prediction_horizon
-        or (reference_observation.horizon_mask_slice is None)
-        != (candidate_observation.horizon_mask_slice is None)
-    ):
-        raise ValueError(
-            "PPO episode realization changes the observation tensor contract: "
-            f"reference_dim={reference_observation.observation_dim}, "
-            f"candidate_dim={candidate_observation.observation_dim}"
-        )
-    if (
-        reference.action_spec.action_dim != candidate.action_spec.action_dim
-        or len(reference.action_spec.cache_node_ids)
-        != len(candidate.action_spec.cache_node_ids)
-        or reference.action_spec.uav_ids != candidate.action_spec.uav_ids
-    ):
-        raise ValueError(
-            "PPO episode realization changes the action tensor contract: "
-            f"reference_dim={reference.action_spec.action_dim}, "
-            f"candidate_dim={candidate.action_spec.action_dim}"
-        )
-    if np.asarray(reference.initial_cache).shape != np.asarray(candidate.initial_cache).shape:
-        raise ValueError("PPO episode realization changes the initial cache tensor shape")
-    if set(reference.initial_uav) != set(candidate.initial_uav):
-        raise ValueError("PPO episode realization changes the initial UAV ID set")
 
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -3347,111 +3035,6 @@ def _append_critic_diagnostics(
         )
 
 
-def load_environment_context(
-    config_path: str = "configs/proposed/system_config.toml",
-    realization_dir: str | Path | None = None,
-) -> EnvironmentContext:
-    cfg = project_config.load_config(config_path)
-    project_config.validate_for_formal_experiment(cfg)
-    data_protocol = project_config.get_ppo_data_protocol(cfg)
-    root = Path(cfg["_meta"]["project_root"])
-    realization = (
-        _configured_realization_artifacts(cfg, root)
-        if realization_dir is None
-        else _realization_artifacts_from_directory(
-            Path(realization_dir)
-            if Path(realization_dir).is_absolute()
-            else root / Path(realization_dir)
-        )
-    )
-    cache_cfg = cache_configuration.cache_config_from_project(cfg)
-    scenarios = cache_configuration.load_prediction_scenarios(
-        realization.prediction_scenarios
-    )
-    service_catalog = cache_configuration.load_service_catalog(
-        _project_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
-    )
-    train_start = int(data_protocol["train_origin_start"])
-    train_end = int(data_protocol["train_origin_end"])
-    origin_count = int(scenarios["origin_slots"].shape[0])
-    if train_start < 0 or train_end < train_start or train_end >= origin_count:
-        raise ValueError("训练起点范围超出 prediction_scenarios。")
-    first_origin = cache_configuration.scenario_at_origin(scenarios, train_start)
-    cache_nodes = cache_configuration.build_cache_nodes(first_origin, cache_cfg)
-    local_cache = task_scenario.load_tv_local_cache(
-        realization.tv_local_cache
-    )
-    action_spec = interface.TriggerActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
-    policy_schema = str(
-        project_config.get_config_value(
-            cfg,
-            "algorithm.ppo.policy_schema",
-            PROPOSED_POLICY_SCHEMA,
-        )
-    )
-    if policy_schema != PROPOSED_POLICY_SCHEMA:
-        raise ValueError(
-            "当前训练器仅支持正式 proposed_joint 策略："
-            f"{PROPOSED_POLICY_SCHEMA}"
-        )
-    prediction_horizon = int(
-        project_config.get_config_value(cfg, "prediction.vehicle.horizon")
-    )
-    observation_spec = interface.ConfigurationObservationSpec.from_cache_nodes(
-        cache_nodes,
-        service_catalog["service_ids"].tolist(),
-        action_spec.uav_ids,
-        [str(value) for value in first_origin["vehicle_ids"].tolist()],
-        include_time_to_go=True,
-        prediction_horizon=prediction_horizon,
-        include_prediction_horizon_mask=True,
-    )
-    initial_cache = cache_configuration.popularity_aware_initial_cache(
-        service_catalog,
-        cache_nodes,
-        cache_cfg,
-    )
-    initial_uav = uav_configuration.initial_uav_positions_from_project(cfg)
-    configuration_control_mode = str(
-        project_config.get_config_value(
-            cfg,
-            "algorithm.ppo.configuration_control_mode",
-            PROPOSED_CONTROL_MODE,
-        )
-    )
-    if configuration_control_mode != PROPOSED_CONTROL_MODE:
-        raise ValueError(
-            "当前训练器仅支持正式 proposed_joint 控制模式："
-            f"{PROPOSED_CONTROL_MODE}"
-        )
-    return EnvironmentContext(
-        cfg=cfg,
-        root=root,
-        cache_cfg=cache_cfg,
-        scenarios=scenarios,
-        service_catalog=service_catalog,
-        cache_nodes=cache_nodes,
-        local_cache=local_cache,
-        flight_boundary=uav_configuration.boundary_from_project(cfg),
-        action_spec=action_spec,
-        observation_spec=observation_spec,
-        initial_cache=initial_cache,
-        initial_uav=initial_uav,
-        train_origin_start=train_start,
-        train_origin_end=train_end,
-        data_protocol=str(data_protocol["protocol"]),
-        episode_slots=int(data_protocol["episode_slots"]),
-        terminal_origin=int(data_protocol["terminal_origin"]),
-        configured_rollout_steps=(
-            None
-            if data_protocol["rollout_steps"] is None
-            else int(data_protocol["rollout_steps"])
-        ),
-        minibatch_size=int(data_protocol["minibatch_size"]),
-        configuration_control_mode=configuration_control_mode,
-        policy_schema=policy_schema,
-        realization=realization,
-    )
 
 
 def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOHyperparameters:
@@ -3620,79 +3203,6 @@ def hyperparameters_from_project(cfg: dict[str, Any]) -> PPOHyperparameters:
     return values
 
 
-def aligned_train_steps(
-    context: EnvironmentContext,
-    origin_start: int | None = None,
-    max_steps: int | None = None,
-    *,
-    include_bootstrap_step: bool = False,
-) -> list[Any]:
-    start = context.train_origin_start if origin_start is None else int(origin_start)
-    if start < context.train_origin_start or start > context.train_origin_end:
-        raise ValueError("origin_start 必须位于 formal train origins 内。")
-    available_steps = context.train_origin_end - start + 1
-    step_count = available_steps
-    if max_steps is not None:
-        if int(max_steps) <= 0:
-            raise ValueError("max_steps 必须大于0。")
-        step_count = min(available_steps, int(max_steps))
-    if include_bootstrap_step and start + step_count > context.train_origin_end:
-        raise ValueError("train terminal 后不允许读取 test origin 作为 bootstrap step。")
-    return interface.prepare_aligned_rollout_steps(
-        context.root,
-        context.scenarios,
-        start,
-        step_count,
-        (
-            context.realization.vehicle_predictions
-            if context.realization is not None
-            else _project_path(
-                context.root,
-                project_config.get_config_value(
-                    context.cfg,
-                    "paths.vehicle_predictions",
-                ),
-            )
-        ),
-        (
-            context.realization.popularity_predictions
-            if context.realization is not None
-            else _project_path(
-                context.root,
-                project_config.get_config_value(
-                    context.cfg,
-                    "paths.popularity_predictions",
-                ),
-            )
-        ),
-        (
-            context.realization.tasks
-            if context.realization is not None
-            else _project_path(
-                context.root,
-                project_config.get_config_value(context.cfg, "paths.tasks"),
-            )
-        ),
-        (
-            context.realization.trajectory
-            if context.realization is not None
-            else _project_path(
-                context.root,
-                project_config.get_config_value(context.cfg, "paths.trajectory"),
-            )
-        ),
-        include_bootstrap_step=bool(include_bootstrap_step),
-        prediction_horizon=int(context.observation_spec.prediction_horizon),
-        prediction_dt_s=float(
-            project_config.get_config_value(context.cfg, "simulation.dt_s")
-        ),
-        prediction_terminal_origin=int(context.train_origin_end),
-        expected_vehicle_ids=context.observation_spec.vehicle_ids,
-        expected_service_ids=context.observation_spec.service_ids,
-        include_prediction_horizon_mask=(
-            context.observation_spec.horizon_mask_slice is not None
-        ),
-    )
 
 
 _LEARNING_RATE_METADATA_FIELDS = (
@@ -11005,7 +10515,7 @@ class PPOTrainer:
         current_train_origin: int,
         current_cache_state: np.ndarray,
         current_uav_positions: dict[str, Any],
-        config_hash: str,
+        config_raw_sha256: str,
         rollout_steps: int,
         best_epoch: int = 0,
         best_epoch_return: float | None = None,
@@ -11082,7 +10592,11 @@ class PPOTrainer:
             "rollout_steps": int(rollout_steps),
             "num_minibatches": int(self.hyperparameters.num_minibatches),
             "minibatch_size": int(self.context.minibatch_size),
-            "config_sha256": str(config_hash),
+            "config_raw_sha256": str(config_raw_sha256),
+            "config_semantic_sha256": project_config.semantic_config_hash(
+                self.context.cfg
+            ),
+            "config_sha256": str(config_raw_sha256),
             "observation_dim": int(self.context.observation_spec.observation_dim),
             "action_dim": int(self.context.action_spec.action_dim),
             "policy_state_dict": self.policy.state_dict(),
@@ -11197,7 +10711,7 @@ class PPOTrainer:
         current_train_origin: int,
         current_cache_state: np.ndarray,
         current_uav_positions: dict[str, Any],
-        config_hash: str,
+        config_raw_sha256: str,
         rollout_steps: int,
         *,
         filename: str = CHECKPOINT_FILENAME,
@@ -11215,7 +10729,7 @@ class PPOTrainer:
                 current_train_origin,
                 current_cache_state,
                 current_uav_positions,
-                config_hash,
+                config_raw_sha256,
                 rollout_steps,
                 best_epoch,
                 best_epoch_return,
@@ -11229,7 +10743,7 @@ class PPOTrainer:
     def load_checkpoint(
         self,
         checkpoint: Path,
-        config_hash: str,
+        config_raw_sha256: str,
     ) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
         _validate_learning_rate_metadata(
@@ -11421,9 +10935,17 @@ class PPOTrainer:
             )
         if payload.get("configuration_control_mode") != self.context.configuration_control_mode:
             raise ValueError("PPO checkpoint configuration_control_mode mismatch.")
-        config_hash_matches = payload.get("config_sha256") == config_hash
-        if payload.get("method") != CHECKPOINT_METHOD or not config_hash_matches:
-            raise ValueError("checkpoint 方法标识或配置哈希不匹配。")
+        current_semantic_sha256 = project_config.semantic_config_hash(
+            self.context.cfg
+        )
+        config_compatible = _checkpoint_config_compatible(
+            payload,
+            Path(checkpoint),
+            config_raw_sha256,
+            current_semantic_sha256,
+        )
+        if payload.get("method") != CHECKPOINT_METHOD or not config_compatible:
+            raise ValueError("checkpoint 方法标识或配置语义不匹配。")
         if int(payload.get("action_dim")) != int(self.context.action_spec.action_dim):
             raise ValueError("checkpoint action_dim 与当前策略不匹配。")
         self.policy.load_state_dict(payload["policy_state_dict"], strict=True)
@@ -11658,9 +11180,50 @@ class PPOTrainer:
         )
 
 
-def _config_hash(config_path: str) -> str:
-    path = Path(config_path)
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _checkpoint_config_compatible(
+    payload: dict[str, Any],
+    checkpoint: Path,
+    current_raw_sha256: str,
+    current_semantic_sha256: str,
+) -> bool:
+    """按语义哈希、正式快照和旧 raw 哈希的顺序核对配置。"""
+
+    stored_semantic_sha256 = payload.get("config_semantic_sha256")
+    if stored_semantic_sha256 is not None:
+        return (
+            isinstance(stored_semantic_sha256, str)
+            and bool(stored_semantic_sha256)
+            and stored_semantic_sha256 == current_semantic_sha256
+        )
+
+    checkpoint_path = Path(checkpoint)
+    run_dir = (
+        checkpoint_path.parent.parent
+        if checkpoint_path.parent.name == "checkpoints"
+        else checkpoint_path.parent
+    )
+    snapshot_names = (
+        "run_config.toml",
+        "config_snapshot.toml",
+        "system_config.toml",
+        "config.toml",
+    )
+    for snapshot_name in snapshot_names:
+        snapshot_path = run_dir / snapshot_name
+        if not snapshot_path.is_file():
+            continue
+        try:
+            snapshot_semantic_sha256 = project_config.semantic_config_hash_from_file(
+                snapshot_path
+            )
+        except (OSError, TypeError, ValueError):
+            continue
+        return snapshot_semantic_sha256 == current_semantic_sha256
+
+    stored_raw_sha256 = payload.get("config_raw_sha256")
+    if stored_raw_sha256 is None:
+        stored_raw_sha256 = payload.get("config_sha256")
+    return stored_raw_sha256 == current_raw_sha256
 
 
 def _run_protocol_metadata(
@@ -11839,7 +11402,7 @@ def run_training(
         trainer.critic_warmup_seed = warmup_realization_seed
         trainer.critic_warmup_update_rng_seed = warmup_optimizer_seed
     ensure_run_artifact_directories(run_path)
-    config_hash = _config_hash(config_path)
+    config_raw_sha256 = project_config.raw_config_sha256(config_path)
     completed_episodes = 0
     next_pool_index = 0
     current_train_origin = context.train_origin_start
@@ -11854,7 +11417,8 @@ def run_training(
     manifest = write_run_manifest(
         run_path / RUN_MANIFEST_FILENAME,
         config_path=config_path,
-        config_sha256=config_hash,
+        config_raw_sha256=config_raw_sha256,
+        config_semantic_sha256=project_config.semantic_config_hash(context.cfg),
         seed=seed,
         trainer=trainer,
         context=context,
@@ -11869,7 +11433,7 @@ def run_training(
             raise FileNotFoundError(f"resume checkpoint 不存在：{checkpoint}")
         cursor = trainer.load_checkpoint(
             checkpoint,
-            config_hash,
+            config_raw_sha256,
         )
         completed_episodes = cursor.completed_episodes
         current_train_origin = cursor.current_train_origin
@@ -12017,7 +11581,7 @@ def run_training(
             current_train_origin,
             current_cache_state,
             current_uav_positions,
-            config_hash,
+            config_raw_sha256,
             int(rollout_steps),
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
@@ -12089,7 +11653,7 @@ def run_training(
             current_train_origin,
             current_cache_state,
             current_uav_positions,
-            config_hash,
+            config_raw_sha256,
             int(rollout_steps),
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
@@ -12179,7 +11743,7 @@ def run_training(
         f"Policy Schema: {manifest['policy_schema']}\n"
         f"Advantage Mode: {manifest['advantage_normalization_mode']}\n"
         f"Critic Scale Mode: {manifest['critic_value_scale_mode']}\n"
-        f"Config SHA256: {str(config_hash)[:12]}\n"
+        f"Raw config SHA256: {str(config_raw_sha256)[:12]}\n"
         f"Git Commit: {git_sha_display}"
     )
     if resume:
@@ -12432,7 +11996,7 @@ def run_training(
             next_train_origin,
             rollout.next_cache_state,
             rollout.next_uav_positions,
-            config_hash,
+            config_raw_sha256,
             int(rollout_steps),
             best_epoch=best_epoch,
             best_epoch_return=best_epoch_return,
@@ -12969,7 +12533,7 @@ def run_training(
                     next_train_origin,
                     rollout.next_cache_state,
                     rollout.next_uav_positions,
-                    config_hash,
+                    config_raw_sha256,
                     int(rollout_steps),
                     filename=BEST_TRAIN_RETURN_CHECKPOINT_FILENAME,
                     best_epoch=best_epoch,
@@ -12983,7 +12547,7 @@ def run_training(
                     next_train_origin,
                     rollout.next_cache_state,
                     rollout.next_uav_positions,
-                    config_hash,
+                    config_raw_sha256,
                     int(rollout_steps),
                     best_epoch=best_epoch,
                     best_epoch_return=best_epoch_return,
@@ -12997,7 +12561,7 @@ def run_training(
                     next_train_origin,
                     rollout.next_cache_state,
                     rollout.next_uav_positions,
-                    config_hash,
+                    config_raw_sha256,
                     int(rollout_steps),
                     filename=f"epoch_{completed_episodes:03d}_checkpoint.pt",
                     best_epoch=best_epoch,

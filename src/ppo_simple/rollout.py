@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from decision import slot_environment
 
 from . import interface
-from .evaluation_metrics import task_metrics_from_result
+
 from .interface import _copy_uav_positions
 from .policy import AdaptiveJointCacheUAVPPOActorCritic, PolicySample
 from .primitive_control import (
@@ -19,6 +19,98 @@ from .primitive_control import (
     sample_and_apply_joint_cache_uav_operation_configuration,
 )
 
+
+EXECUTION_CLASSES = ("LOCAL", "SV", "RSU", "UAV", "CLOUD")
+
+@dataclass(frozen=True)
+class SlotTaskMetrics:
+    """单个 SlotExecutionResult 已产生的任务性能指标。"""
+
+    task_count: int
+    total_task_delay_s: float
+    total_vehicle_energy_j: float
+    execution_target_counts: dict[str, int]
+
+def _require_mapping(value: Any, field_name: str) -> Mapping[Any, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be a mapping")
+    return value
+
+def _finite_nonnegative(value: Any, field_name: str, key: Any) -> float:
+    numeric = float(value)
+    if not np.isfinite(numeric) or numeric < 0.0:
+        raise ValueError(
+            f"{field_name}[{key!r}] must be finite and non-negative, got {value!r}"
+        )
+    return numeric
+
+def _execution_class(target: Any, cache_nodes: Mapping[str, Any]) -> str:
+    target_id = str(target)
+    if target_id == "LOCAL" or target_id.startswith("LOCAL:"):
+        return "LOCAL"
+    if target_id == "CLOUD":
+        return "CLOUD"
+
+    node_ids = [str(value) for value in cache_nodes["node_ids"]]
+    if target_id not in node_ids:
+        raise ValueError(f"unknown matching execution target: {target_id}")
+    node_index = node_ids.index(target_id)
+    role = str(cache_nodes["node_roles"][node_index]).upper()
+    if role not in {"SV", "RSU", "UAV"}:
+        raise ValueError(f"unknown cache node execution role: {role}")
+    return role
+
+def task_metrics_from_result(
+    result: Any,
+    cache_nodes: Mapping[str, Any],
+) -> SlotTaskMetrics:
+    """从已完成的 SlotExecutionResult 提取任务指标，不重新计算性能公式。"""
+
+    delay = _require_mapping(result.per_task_delay_s, "per_task_delay_s")
+    energy = _require_mapping(
+        result.per_task_vehicle_energy_j,
+        "per_task_vehicle_energy_j",
+    )
+    utility = _require_mapping(result.per_task_utility, "per_task_utility")
+    matching = _require_mapping(result.matching, "matching")
+    key_sets = {
+        "per_task_delay_s": set(delay),
+        "per_task_vehicle_energy_j": set(energy),
+        "per_task_utility": set(utility),
+        "matching": set(matching),
+    }
+    expected_keys = next(iter(key_sets.values()))
+    if any(keys != expected_keys for keys in key_sets.values()):
+        raise ValueError(
+            "per_task_delay_s, per_task_vehicle_energy_j, per_task_utility, "
+            "and matching must have exactly the same keys"
+        )
+
+    total_delay = 0.0
+    total_energy = 0.0
+    execution_counts = {name: 0 for name in EXECUTION_CLASSES}
+    for task_id in delay:
+        total_delay += _finite_nonnegative(
+            delay[task_id],
+            "per_task_delay_s",
+            task_id,
+        )
+        total_energy += _finite_nonnegative(
+            energy[task_id],
+            "per_task_vehicle_energy_j",
+            task_id,
+        )
+        execution_counts[_execution_class(matching[task_id], cache_nodes)] += 1
+
+    task_count = len(expected_keys)
+    if sum(execution_counts.values()) != task_count:
+        raise AssertionError("execution target counts do not sum to task_count")
+    return SlotTaskMetrics(
+        task_count=task_count,
+        total_task_delay_s=float(total_delay),
+        total_vehicle_energy_j=float(total_energy),
+        execution_target_counts=execution_counts,
+    )
 
 def _snapshot_trigger_feature(value: Any) -> np.ndarray:
     """将 Trigger 特征复制为有限且脱离计算图的 float32 rollout 数据。"""
