@@ -127,7 +127,7 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
     task_count = int(sum(item.task_count for item in micro))
     total_delay = float(sum(item.total_task_delay_s for item in micro))
     total_energy = float(sum(item.total_vehicle_energy_j for item in micro))
-    return {
+    record = {
         "episode_seed": int(episode_seed),
         "repeat_index": int(repeat_index),
         "total_return": float(sum(item.reward for item in micro)),
@@ -166,6 +166,10 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "kkt_call_count": int(collection.summary["kkt_call_count"]),
         "episode_runtime_seconds": float(collection.summary["episode_runtime_seconds"]),
     }
+    deterministic_actions = collection.summary.get("deterministic_action_selection")
+    if deterministic_actions is not None:
+        record["deterministic_action_selection"] = deterministic_actions
+    return record
 
 
 def _metric_statistics(

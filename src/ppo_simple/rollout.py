@@ -469,6 +469,8 @@ def collect_dual_timescale_episode(
     duration_entropies: list[float] = []
     update_candidate_entropies: list[float] = []
     update_candidate_selection_counts: dict[bytes, int] = {}
+    deterministic_cache_selections: list[dict[str, Any]] = []
+    deterministic_uav_selections: list[dict[str, Any]] = []
     start_time = time.perf_counter()
 
     for slot_index, step in enumerate(aligned_steps):
@@ -524,6 +526,19 @@ def collect_dual_timescale_episode(
                 update_candidate_entropies.append(0.0)
             frame_cache = _candidates[frame_cache_index].copy()
             frame_cache_changed = bool(np.any(frame_cache != cache))
+            if deterministic:
+                selected_cache_id = hashlib.sha256(
+                    np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
+                ).hexdigest()[:16]
+                deterministic_cache_selections.append(
+                    {
+                        "decision_slot": int(step.slot),
+                        "selected_group": str(selected.cache_selected_group),
+                        "selected_candidate_index": frame_cache_index,
+                        "selected_candidate_id": selected_cache_id,
+                        "selected_duration": frame_requested_duration,
+                    }
+                )
             if frame_cache_index > 0:
                 candidate_signature = np.ascontiguousarray(
                     frame_cache, dtype=np.int8
@@ -586,6 +601,21 @@ def collect_dual_timescale_episode(
             )
             selected_index = int(sample.selected_index)
             selected_candidate = candidates[selected_index]
+            if deterministic:
+                deterministic_uav_selections.append(
+                    {
+                        "slot": int(step.slot),
+                        "uav_index": int(uav_index),
+                        "selected_group": str(sample.selected_group),
+                        "selected_candidate_index": selected_index,
+                        "selected_candidate_source": str(
+                            selected_candidate.proposal_source
+                        ),
+                        "selected_candidate_position": [
+                            float(value) for value in selected_candidate.target_position
+                        ],
+                    }
+                )
             uav_configuration.apply_uav_candidate(
                 current_trial,
                 previous_positions,
@@ -932,6 +962,11 @@ def collect_dual_timescale_episode(
         "exact_q_branch_requests": 0,
         "exact_q_environment_executions": 0,
     }
+    if deterministic:
+        summary["deterministic_action_selection"] = {
+            "cache": deterministic_cache_selections,
+            "uav": deterministic_uav_selections,
+        }
     return EpisodeCollection(micro_buffer, macro_buffer, summary)
 
 

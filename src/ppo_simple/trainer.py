@@ -57,7 +57,7 @@ from .rollout import (
 CHECKPOINT_METHOD = "ppo_dual_timescale_v1"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
-CHECKPOINT_VERSION = 27
+CHECKPOINT_VERSION = 29
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 
 
@@ -172,6 +172,17 @@ def _normalize_advantages(values: np.ndarray) -> tuple[np.ndarray, float, float]
     return (array - mean) / (std + 1.0e-8), mean, std
 
 
+def _gradient_norm(parameters: Any) -> float:
+    norms = [
+        torch.linalg.vector_norm(parameter.grad.detach(), ord=2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not norms:
+        return 0.0
+    return float(torch.linalg.vector_norm(torch.stack(norms), ord=2).detach().cpu())
+
+
 def _explained_variance(targets: np.ndarray, predictions: np.ndarray) -> float | None:
     target = np.asarray(targets, dtype=np.float64).reshape(-1)
     prediction = np.asarray(predictions, dtype=np.float64).reshape(-1)
@@ -179,6 +190,16 @@ def _explained_variance(targets: np.ndarray, predictions: np.ndarray) -> float |
     if variance <= 1.0e-12:
         return None
     return float(1.0 - np.var(target - prediction) / variance)
+
+
+def _pearson_correlation(targets: np.ndarray, predictions: np.ndarray) -> float | None:
+    target = np.asarray(targets, dtype=np.float64).reshape(-1)
+    prediction = np.asarray(predictions, dtype=np.float64).reshape(-1)
+    if target.shape != prediction.shape or len(target) < 2:
+        return None
+    if float(np.std(target)) <= 1.0e-12 or float(np.std(prediction)) <= 1.0e-12:
+        return None
+    return float(np.corrcoef(target, prediction)[0, 1])
 
 
 def _macro_batch(buffer: MacroRolloutBuffer) -> dict[str, np.ndarray]:
@@ -270,25 +291,44 @@ class PPOTrainer:
             if critic_learning_rate_override is not None
             else self.config.get("critic_learning_rate", self.config["learning_rate"])
         )
+        macro_critic_lr = float(
+            critic_learning_rate_override
+            if critic_learning_rate_override is not None
+            else self.config.get("macro_critic_learning_rate", critic_lr)
+        )
+        micro_critic_lr = float(
+            critic_learning_rate_override
+            if critic_learning_rate_override is not None
+            else self.config.get("micro_critic_learning_rate", critic_lr)
+        )
         self.macro_optimizer = torch.optim.Adam(
             [
                 {"params": self.policy.macro_actor_parameters(), "lr": actor_lr},
-                {"params": self.policy.macro_critic_parameters(), "lr": critic_lr},
+                {"params": self.policy.macro_critic_parameters(), "lr": macro_critic_lr},
             ],
             eps=1.0e-5,
         )
         self.micro_optimizer = torch.optim.Adam(
             [
                 {"params": self.policy.micro_actor_parameters(), "lr": actor_lr},
-                {"params": self.policy.micro_critic_parameters(), "lr": critic_lr},
+                {"params": self.policy.micro_critic_parameters(), "lr": micro_critic_lr},
             ],
             eps=1.0e-5,
         )
-        self.learning_rates = {"actor": actor_lr, "critic": critic_lr}
+        self.learning_rates = {
+            "actor": actor_lr,
+            "critic": critic_lr,
+            "macro_critic": macro_critic_lr,
+            "micro_critic": micro_critic_lr,
+        }
         self.training_counters = {
             "completed_episodes": 0,
             "micro_optimizer_steps": 0,
             "macro_optimizer_steps": 0,
+            "micro_actor_optimizer_steps": 0,
+            "micro_critic_optimizer_steps": 0,
+            "macro_actor_optimizer_steps": 0,
+            "macro_critic_optimizer_steps": 0,
             "micro_update_count": 0,
             "macro_update_count": 0,
             "environment_executions": 0,
@@ -377,11 +417,24 @@ class PPOTrainer:
                 loss = actor_loss + value_coefficient * value_loss - entropy_coefficient * entropy
                 self.micro_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    self.policy.micro_parameters(), max_grad_norm
+                micro_actor_parameters = self.policy.micro_actor_parameters()
+                micro_critic_parameters = self.policy.micro_critic_parameters()
+                micro_actor_before_clip = float(
+                    torch.nn.utils.clip_grad_norm_(micro_actor_parameters, max_grad_norm)
+                    .detach()
+                    .cpu()
                 )
+                micro_actor_after_clip = _gradient_norm(micro_actor_parameters)
+                micro_critic_before_clip = float(
+                    torch.nn.utils.clip_grad_norm_(micro_critic_parameters, max_grad_norm)
+                    .detach()
+                    .cpu()
+                )
+                micro_critic_after_clip = _gradient_norm(micro_critic_parameters)
                 self.micro_optimizer.step()
                 self.training_counters["micro_optimizer_steps"] += 1
+                self.training_counters["micro_actor_optimizer_steps"] += 1
+                self.training_counters["micro_critic_optimizer_steps"] += 1
                 with torch.no_grad():
                     approx_kl = torch.mean((ratio - 1.0) - log_ratio)
                     clip_fraction = torch.mean((torch.abs(ratio - 1.0) > clip).float())
@@ -392,6 +445,10 @@ class PPOTrainer:
                         "entropy": float(entropy.detach().cpu()),
                         "approx_kl": float(approx_kl.detach().cpu()),
                         "clip_fraction": float(clip_fraction.detach().cpu()),
+                        "actor_grad_norm_before_clip": micro_actor_before_clip,
+                        "actor_grad_norm_after_clip": micro_actor_after_clip,
+                        "critic_grad_norm_before_clip": micro_critic_before_clip,
+                        "critic_grad_norm_after_clip": micro_critic_after_clip,
                     }
                 )
                 if target_kl > 0.0 and records[-1]["approx_kl"] > 1.5 * target_kl:
@@ -401,16 +458,38 @@ class PPOTrainer:
                 break
         self.training_counters["micro_update_count"] += 1
         result = self._aggregate_update_metrics("micro", records)
+        with torch.no_grad():
+            predictions = (
+                self.policy.micro_value(
+                    torch.as_tensor(
+                        batch["observations"], dtype=torch.float32, device=self.device
+                    )
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
         result.update(
             {
+                "micro_actor_optimizer_steps_this_update": len(records),
+                "micro_critic_optimizer_steps_this_update": len(records),
                 "micro_adv_mean": float(adv_mean),
                 "micro_adv_std": float(adv_std),
                 "micro_normalized_adv_mean": float(np.mean(normalized)),
                 "micro_normalized_adv_std": float(np.std(normalized)),
-                "micro_value_prediction_mean": float(np.mean(values)),
+                "micro_value_prediction_mean": float(np.mean(predictions)),
+                "micro_value_prediction_std": float(np.std(predictions)),
                 "micro_value_target_mean": float(np.mean(returns)),
-                "micro_value_rmse": float(np.sqrt(np.mean((returns - values) ** 2))),
-                "micro_explained_variance": _explained_variance(returns, values),
+                "micro_value_target_std": float(np.std(returns)),
+                "micro_value_target_prediction_corr": _pearson_correlation(
+                    returns, predictions
+                ),
+                "micro_value_rmse": float(
+                    np.sqrt(np.mean((returns - predictions) ** 2))
+                ),
+                "micro_explained_variance": _explained_variance(
+                    returns, predictions
+                ),
                 "micro_early_stop": bool(stopped),
             }
         )
@@ -476,12 +555,22 @@ class PPOTrainer:
             ).mean()
             value_loss = torch.mean((value - tensors["returns"]) ** 2)
             entropy_mean = entropy.mean()
-            loss = actor_loss + value_coefficient * value_loss - entropy_coefficient * entropy_mean
+            loss = actor_loss - entropy_coefficient * entropy_mean
             self.macro_optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.macro_parameters(), max_grad_norm)
+            macro_actor_parameters = self.policy.macro_actor_parameters()
+            macro_critic_parameters = self.policy.macro_critic_parameters()
+            if any(parameter.grad is not None for parameter in macro_critic_parameters):
+                raise RuntimeError("Macro actor PPO update produced Macro Critic gradients.")
+            macro_actor_before_clip = float(
+                torch.nn.utils.clip_grad_norm_(macro_actor_parameters, max_grad_norm)
+                .detach()
+                .cpu()
+            )
+            macro_actor_after_clip = _gradient_norm(macro_actor_parameters)
             self.macro_optimizer.step()
             self.training_counters["macro_optimizer_steps"] += 1
+            self.training_counters["macro_actor_optimizer_steps"] += 1
             with torch.no_grad():
                 approx_kl = torch.mean((ratio - 1.0) - log_ratio)
                 clip_fraction = torch.mean((torch.abs(ratio - 1.0) > clip).float())
@@ -492,6 +581,10 @@ class PPOTrainer:
                     "entropy": float(entropy_mean.detach().cpu()),
                     "approx_kl": float(approx_kl.detach().cpu()),
                     "clip_fraction": float(clip_fraction.detach().cpu()),
+                    "actor_grad_norm_before_clip": macro_actor_before_clip,
+                    "actor_grad_norm_after_clip": macro_actor_after_clip,
+                    "critic_grad_norm_before_clip": 0.0,
+                    "critic_grad_norm_after_clip": 0.0,
                 }
             )
             if target_kl > 0.0 and records[-1]["approx_kl"] > 1.5 * target_kl:
@@ -499,20 +592,150 @@ class PPOTrainer:
                 break
         self.training_counters["macro_update_count"] += 1
         result = self._aggregate_update_metrics("macro", records)
+        critic_steps = int(self.config.get("macro_critic_steps_per_update", 50))
+        critic_fit = self._update_macro_critic_only(
+            batch["observations"],
+            returns,
+            steps=critic_steps,
+            value_loss_coefficient=value_coefficient,
+            max_grad_norm=max_grad_norm,
+        )
+        with torch.no_grad():
+            predictions = (
+                self.policy.macro_value(
+                    torch.as_tensor(
+                        batch["observations"], dtype=torch.float32, device=self.device
+                    )
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
         result.update(
             {
+                "macro_actor_optimizer_steps_this_update": len(records),
+                "macro_critic_optimizer_steps_this_update": critic_fit["optimizer_steps"],
                 "macro_adv_mean": float(adv_mean),
                 "macro_adv_std": float(adv_std),
                 "macro_normalized_adv_mean": float(np.mean(normalized)),
                 "macro_normalized_adv_std": float(np.std(normalized)),
-                "macro_value_prediction_mean": float(np.mean(values)),
+                "macro_value_prediction_mean": float(np.mean(predictions)),
+                "macro_value_prediction_std": float(np.std(predictions)),
                 "macro_value_target_mean": float(np.mean(returns)),
-                "macro_value_rmse": float(np.sqrt(np.mean((returns - values) ** 2))),
-                "macro_explained_variance": _explained_variance(returns, values),
+                "macro_value_target_std": float(np.std(returns)),
+                "macro_value_target_prediction_corr": _pearson_correlation(
+                    returns, predictions
+                ),
+                "macro_value_rmse": float(
+                    np.sqrt(np.mean((returns - predictions) ** 2))
+                ),
+                "macro_explained_variance": _explained_variance(
+                    returns, predictions
+                ),
+                "macro_critic_fit_snapshots": critic_fit["snapshots"],
+                "macro_critic_grad_norm_before_clip": critic_fit[
+                    "grad_norm_before_clip_mean"
+                ],
+                "macro_critic_grad_norm_after_clip": critic_fit[
+                    "grad_norm_after_clip_mean"
+                ],
+                "macro_value_loss": critic_fit["final"]["rmse"] ** 2,
                 "macro_early_stop": bool(stopped),
             }
         )
         return result
+
+    def _update_macro_critic_only(
+        self,
+        observations: np.ndarray,
+        value_targets: np.ndarray,
+        *,
+        steps: int,
+        value_loss_coefficient: float,
+        max_grad_norm: float,
+    ) -> dict[str, Any]:
+        """Update only the Macro Critic on one frozen full-episode target batch."""
+
+        if int(steps) <= 0:
+            raise ValueError("macro_critic_steps_per_update 必须为正整数。")
+        observation_tensor = torch.as_tensor(
+            observations, dtype=torch.float32, device=self.device
+        ).detach()
+        target_tensor = torch.as_tensor(
+            value_targets, dtype=torch.float32, device=self.device
+        ).reshape(-1).detach().clone()
+        frozen_targets = target_tensor.clone()
+        actor_parameters = self.policy.macro_actor_parameters()
+        critic_parameters = self.policy.macro_critic_parameters()
+        snapshots: dict[str, dict[str, float | None]] = {
+            "0": self._macro_critic_fit_metrics(observation_tensor, target_tensor)
+        }
+        snapshot_steps = {10, 25, 50}
+        gradient_before: list[float] = []
+        gradient_after: list[float] = []
+        optimizer_steps = 0
+        for step in range(1, int(steps) + 1):
+            self.macro_optimizer.zero_grad(set_to_none=True)
+            predictions = self.policy.macro_value(observation_tensor)
+            value_loss = torch.mean((predictions - target_tensor) ** 2)
+            (float(value_loss_coefficient) * value_loss).backward()
+            if any(parameter.grad is not None for parameter in actor_parameters):
+                raise RuntimeError("Macro Critic-only update produced Macro Actor gradients.")
+            grad_before = float(
+                torch.nn.utils.clip_grad_norm_(critic_parameters, max_grad_norm)
+                .detach()
+                .cpu()
+            )
+            grad_after = _gradient_norm(critic_parameters)
+            gradient_before.append(grad_before)
+            gradient_after.append(grad_after)
+            self.macro_optimizer.step()
+            optimizer_steps += 1
+            self.training_counters["macro_optimizer_steps"] += 1
+            self.training_counters["macro_critic_optimizer_steps"] += 1
+            if not torch.equal(target_tensor, frozen_targets):
+                raise RuntimeError("Macro value targets changed during critic-only updates.")
+            if step in snapshot_steps:
+                snapshots[str(step)] = self._macro_critic_fit_metrics(
+                    observation_tensor, target_tensor
+                )
+        if optimizer_steps != int(steps):
+            raise RuntimeError("Macro Critic optimizer step count did not match its budget.")
+        final = snapshots.get(str(int(steps)))
+        if final is None:
+            final = self._macro_critic_fit_metrics(observation_tensor, target_tensor)
+            snapshots[str(int(steps))] = final
+        return {
+            "optimizer_steps": optimizer_steps,
+            "snapshots": snapshots,
+            "final": final,
+            "grad_norm_before_clip_mean": float(np.mean(gradient_before)),
+            "grad_norm_after_clip_mean": float(np.mean(gradient_after)),
+        }
+
+    def _macro_critic_fit_metrics(
+        self, observations: Any, value_targets: Any
+    ) -> dict[str, float | None]:
+        with torch.no_grad():
+            predictions = (
+                self.policy.macro_value(observations)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+        targets = value_targets.detach().cpu().numpy().astype(np.float64)
+        target_std = float(np.std(targets))
+        prediction_std = float(np.std(predictions))
+        rmse = float(np.sqrt(np.mean((targets - predictions) ** 2)))
+        return {
+            "explained_variance": _explained_variance(targets, predictions),
+            "rmse": rmse,
+            "prediction_std": prediction_std,
+            "target_std": target_std,
+            "std_ratio": prediction_std / target_std if target_std > 1.0e-12 else None,
+            "correlation": _pearson_correlation(targets, predictions),
+        }
 
     @staticmethod
     def _aggregate_update_metrics(
@@ -522,7 +745,17 @@ class PPOTrainer:
             raise ValueError(f"{prefix} PPO 没有完成任何 optimizer step。")
         return {
             f"{prefix}_{name}": float(np.mean([record[name] for record in records]))
-            for name in ("actor_loss", "value_loss", "entropy", "approx_kl", "clip_fraction")
+            for name in (
+                "actor_loss",
+                "value_loss",
+                "entropy",
+                "approx_kl",
+                "clip_fraction",
+                "actor_grad_norm_before_clip",
+                "actor_grad_norm_after_clip",
+                "critic_grad_norm_before_clip",
+                "critic_grad_norm_after_clip",
+            )
         }
 
     def _tensor_batch(
@@ -650,9 +883,18 @@ class PPOTrainer:
         self.macro_optimizer.load_state_dict(payload["macro_optimizer_state_dict"])
         self.micro_optimizer.load_state_dict(payload["micro_optimizer_state_dict"])
         counters = payload.get("training_counters")
-        if not isinstance(counters, dict) or set(counters) != set(self.training_counters):
+        legacy_counter_keys = set(self.training_counters) - {
+            "micro_actor_optimizer_steps",
+            "micro_critic_optimizer_steps",
+            "macro_actor_optimizer_steps",
+            "macro_critic_optimizer_steps",
+        }
+        counter_keys = set(counters) if isinstance(counters, dict) else set()
+        if counter_keys not in (legacy_counter_keys, set(self.training_counters)):
             raise ValueError("checkpoint training counter schema mismatch。")
-        self.training_counters = {key: int(value) for key, value in counters.items()}
+        restored_counters = dict(self.training_counters)
+        restored_counters.update({key: int(value) for key, value in counters.items()})
+        self.training_counters = restored_counters
         if restore_rng:
             if "python_rng_state" not in payload or "numpy_rng_state" not in payload:
                 raise ValueError("checkpoint 缺少可恢复的 RNG 状态。")
@@ -802,10 +1044,21 @@ def run_training(
             ),
             **collection.summary,
         }
+        optimizer_steps_this_episode = {
+            key: int(update_metrics[key])
+            for key in (
+                "macro_actor_optimizer_steps_this_update",
+                "macro_critic_optimizer_steps_this_update",
+                "micro_actor_optimizer_steps_this_update",
+                "micro_critic_optimizer_steps_this_update",
+            )
+        }
+        episode_record.update(optimizer_steps_this_episode)
         update_record = {
             "record_type": "update",
             "episode": completed,
             **update_metrics,
+            **optimizer_steps_this_episode,
             **trainer.training_counters,
         }
         append_dual_timescale_record(episode_metrics_path, episode_record)

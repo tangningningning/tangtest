@@ -24,6 +24,7 @@ class CategoricalSample:
     entropy: Any
     probabilities: np.ndarray
     masked_logits: Any
+    selected_group: str
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class MacroActionSample:
     cache_probabilities: np.ndarray
     cache_entropy: Any
     duration_entropy: Any
+    cache_selected_group: str
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,44 @@ def _masked_categorical(logits: Any, mask: Any) -> Any:
     return torch.distributions.Categorical(
         logits=logits.masked_fill(~valid, -float("inf"))
     )
+
+
+def _group_aware_deterministic_candidate(
+    raw_scores: Any,
+    probabilities: Any,
+    candidate_mask: Any,
+    group_ids: Any,
+) -> tuple[int, int]:
+    """Select a group by probability mass, then its raw-score candidate."""
+
+    scores = torch.as_tensor(raw_scores).reshape(-1)
+    probs = torch.as_tensor(probabilities, dtype=scores.dtype, device=scores.device).reshape(-1)
+    mask = torch.as_tensor(candidate_mask, dtype=torch.bool, device=scores.device).reshape(-1)
+    groups = torch.as_tensor(group_ids, dtype=torch.long, device=scores.device).reshape(-1)
+    if not (scores.shape == probs.shape == mask.shape == groups.shape) or not len(scores):
+        raise ValueError("group-aware candidate tensors must be non-empty and aligned")
+    if not bool(torch.any(mask).item()) or bool(torch.any(groups[mask] > 1).item()) or bool(
+        torch.any(groups[mask] < 0).item()
+    ):
+        raise ValueError("group-aware candidate mask/group ids are invalid")
+    if not bool(torch.all(torch.isfinite(scores[mask])).item()) or not bool(
+        torch.all(torch.isfinite(probs[mask])).item()
+    ):
+        raise FloatingPointError("group-aware scores/probabilities must be finite")
+
+    group_mass = torch.zeros(2, dtype=probs.dtype, device=probs.device)
+    group_mass.scatter_add_(0, groups[mask], probs[mask])
+    selected_group = int(torch.argmax(group_mass).item())
+    if selected_group == 0:
+        if not bool(mask[0].item()) or int(groups[0].item()) != 0:
+            raise ValueError("the KEEP/STAY group must contain legal candidate zero")
+        return 0, selected_group
+
+    selected_mask = mask & (groups == selected_group)
+    if not bool(torch.any(selected_mask).item()):
+        raise ValueError("selected action group has no legal candidates")
+    selected_index = int(scores.masked_fill(~selected_mask, -float("inf")).argmax().item())
+    return selected_index, selected_group
 
 
 def _group_balance_candidate_logits(
@@ -113,11 +153,18 @@ def _group_balance_candidate_logits(
     return balanced.reshape(scores.shape).masked_fill(~masks, -float("inf"))
 
 
-def _mlp(input_dim: int, hidden_sizes: tuple[int, ...], output_dim: int) -> Any:
+def _mlp(
+    input_dim: int,
+    hidden_sizes: tuple[int, ...],
+    output_dim: int,
+    *,
+    activation: Any = None,
+) -> Any:
     layers: list[Any] = []
     width = int(input_dim)
+    activation_factory = nn.Tanh if activation is None else activation
     for hidden in hidden_sizes:
-        layers.extend((nn.Linear(width, int(hidden)), nn.Tanh()))
+        layers.extend((nn.Linear(width, int(hidden)), activation_factory()))
         width = int(hidden)
     layers.append(nn.Linear(width, int(output_dim)))
     return nn.Sequential(*layers)
@@ -127,7 +174,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP 与 Micro UAV PPO 的独立 Actor/Critic。"""
 
     architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
-    architecture_version = 7
+    architecture_version = 9
 
     def __init__(
         self,
@@ -174,7 +221,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         self.macro_duration_scorer = nn.Sequential(
             nn.Linear(hidden * 2 + 1, hidden), nn.Tanh(), nn.Linear(hidden, 1)
         )
-        self.macro_critic = _mlp(self.observation_dim, sizes, 1)
+        self.macro_critic = _mlp(
+            self.observation_dim, sizes, 1, activation=nn.SiLU
+        )
 
         self.micro_actor_encoder = nn.Sequential(
             nn.Linear(self.observation_dim, hidden), nn.Tanh()
@@ -184,7 +233,15 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             nn.Tanh(),
             nn.Linear(hidden, 1),
         )
-        self.micro_critic = _mlp(self.observation_dim, sizes, 1)
+        self.micro_critic = _mlp(
+            self.observation_dim, sizes, 1, activation=nn.SiLU
+        )
+
+    def _macro_critic_inputs(self, observations: Any) -> Any:
+        return 2.0 * observations - 1.0
+
+    def _micro_critic_inputs(self, observations: Any) -> Any:
+        return 2.0 * observations - 1.0
 
     @staticmethod
     def _observation_batch(observations: Any, device: Any) -> tuple[Any, bool]:
@@ -225,12 +282,12 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
 
     def macro_value(self, observations: Any) -> Any:
         obs, single = self._observation_batch(observations, next(self.parameters()).device)
-        values = self.macro_critic(obs).squeeze(-1)
+        values = self.macro_critic(self._macro_critic_inputs(obs)).squeeze(-1)
         return values.squeeze(0) if single else values
 
     def micro_value(self, observations: Any) -> Any:
         obs, single = self._observation_batch(observations, next(self.parameters()).device)
-        values = self.micro_critic(obs).squeeze(-1)
+        values = self.micro_critic(self._micro_critic_inputs(obs)).squeeze(-1)
         return values.squeeze(0) if single else values
 
     @staticmethod
@@ -331,7 +388,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 ).item()
             ):
                 raise ValueError("Macro duration action 被 rollout mask 屏蔽。")
-        values = self.macro_critic(obs).squeeze(-1)
+        values = self.macro_critic(self._macro_critic_inputs(obs)).squeeze(-1)
         return cache_dist.logits, duration_dist.logits, values, masks, duration_mask, cache_action
 
     def sample_macro(
@@ -354,18 +411,26 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             cache_mask_t = torch.as_tensor(cache_mask, dtype=torch.bool, device=device).unsqueeze(0)
             hidden = self.macro_actor_encoder(obs)
             embedded = self.macro_cache_candidate_encoder(padded_features)
-            logits = self.macro_cache_scorer(
+            raw_cache_logits = self.macro_cache_scorer(
                 torch.cat((hidden.unsqueeze(1).expand(-1, len(features), -1), embedded), dim=-1)
             ).squeeze(-1).squeeze(0)
-            logits = self._balance_macro_cache_group_mass(logits, cache_mask_t.squeeze(0))
+            logits = self._balance_macro_cache_group_mass(
+                raw_cache_logits, cache_mask_t.squeeze(0)
+            )
             cache_dist = _masked_categorical(
                 logits, torch.as_tensor(cache_mask, dtype=torch.bool, device=device)
             )
-            cache_index = (
-                int(torch.argmax(cache_dist.logits).item())
-                if deterministic
-                else int(cache_dist.sample().item())
-            )
+            cache_group_ids = torch.arange(len(features), device=device).gt(0).long()
+            if deterministic:
+                cache_index, cache_group = _group_aware_deterministic_candidate(
+                    raw_cache_logits,
+                    cache_dist.probs,
+                    cache_mask_t.squeeze(0),
+                    cache_group_ids,
+                )
+            else:
+                cache_index = int(cache_dist.sample().item())
+                cache_group = int(cache_group_ids[cache_index].item())
             selected_embed = embedded[0, cache_index]
             duration_values = torch.as_tensor(
                 self.duration_candidates, dtype=torch.float32, device=device
@@ -398,12 +463,13 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 requested_duration=self.duration_candidates[duration_index],
                 log_prob=cache_dist.log_prob(cache_tensor) + duration_dist.log_prob(duration_tensor),
                 entropy=cache_entropy + duration_entropy,
-                value=self.macro_critic(obs).squeeze(),
+                value=self.macro_critic(self._macro_critic_inputs(obs)).squeeze(),
                 cache_mask=cache_mask.copy(),
                 duration_mask=durations_mask,
                 cache_probabilities=cache_dist.probs.detach().cpu().numpy().copy(),
                 cache_entropy=cache_entropy,
                 duration_entropy=duration_entropy,
+                cache_selected_group="KEEP" if cache_group == 0 else "UPDATE",
             )
 
     def evaluate_macro(
@@ -437,7 +503,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             duration_log_prob,
         )
 
-    def _micro_candidate_logits(
+    def _micro_candidate_raw_logits(
         self,
         observation: Any,
         candidate_features: Any,
@@ -468,7 +534,25 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         inputs = torch.cat(
             (hidden, features, condition.expand(len(features), -1)), dim=-1
         )
-        scores = self.micro_uav_candidate_scorer(inputs).squeeze(-1)
+        return self.micro_uav_candidate_scorer(inputs).squeeze(-1)
+
+    def _micro_candidate_logits(
+        self,
+        observation: Any,
+        candidate_features: Any,
+        candidate_mask: Any,
+        uav0_position_condition: Any,
+    ) -> Any:
+        scores = self._micro_candidate_raw_logits(
+            observation,
+            candidate_features,
+            candidate_mask,
+            uav0_position_condition,
+        )
+        features = torch.as_tensor(
+            candidate_features, dtype=torch.float32, device=scores.device
+        )
+        mask = torch.as_tensor(candidate_mask, dtype=torch.bool, device=scores.device).reshape(-1)
         return _group_balance_candidate_logits(
             scores,
             features,
@@ -489,19 +573,31 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         if int(uav_index) not in (0, 1):
             raise ValueError("当前 Micro 策略要求固定 UAV0、UAV1 顺序。")
         with torch.no_grad():
-            logits = self._micro_candidate_logits(
+            raw_logits = self._micro_candidate_raw_logits(
                 observation,
                 candidate_features,
                 candidate_mask,
                 uav0_position_condition,
             )
-            mask = torch.as_tensor(candidate_mask, dtype=torch.bool, device=logits.device)
-            distribution = _masked_categorical(logits, mask)
-            selected = (
-                int(torch.argmax(distribution.logits).item())
-                if deterministic
-                else int(distribution.sample().item())
+            features = torch.as_tensor(
+                candidate_features, dtype=torch.float32, device=raw_logits.device
             )
+            mask = torch.as_tensor(candidate_mask, dtype=torch.bool, device=raw_logits.device)
+            logits = _group_balance_candidate_logits(
+                raw_logits,
+                features,
+                mask,
+                slice(self.micro_uav_feature_dim - 2, self.micro_uav_feature_dim),
+            )
+            distribution = _masked_categorical(logits, mask)
+            group_ids = features[:, -2:].argmax(dim=-1)
+            if deterministic:
+                selected, selected_group = _group_aware_deterministic_candidate(
+                    raw_logits, distribution.probs, mask, group_ids
+                )
+            else:
+                selected = int(distribution.sample().item())
+                selected_group = int(group_ids[selected].item())
             selected_t = torch.as_tensor(selected, dtype=torch.long, device=logits.device)
             return CategoricalSample(
                 selected_index=selected,
@@ -509,6 +605,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 entropy=distribution.entropy(),
                 probabilities=distribution.probs.detach().cpu().numpy().copy(),
                 masked_logits=distribution.logits,
+                selected_group="STAY" if selected_group == 0 else "MOVE",
             )
 
     def evaluate_micro_joint(
@@ -576,7 +673,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 raise ValueError("PPO action 被 rollout 当时保存的 mask 屏蔽。")
             head_log_probs.append(dist.log_prob(action))
             head_entropies.append(dist.entropy())
-        values = self.micro_critic(obs).squeeze(-1)
+        values = self.micro_critic(self._micro_critic_inputs(obs)).squeeze(-1)
         log0, log1 = head_log_probs
         entropies = head_entropies[0] + head_entropies[1]
         return JointMicroEvaluation(
