@@ -1,10 +1,4 @@
-"""Proposed joint frozen-policy evaluator.
-
-The evaluator uses the same PPOV2Trainer policy factory and checkpoint
-loader as training.  It only samples actions and executes the real rollout
-environment; it does not compute PPO credit, GAE, counterfactual TD values, or
-perform optimizer updates.
-"""
+"""使用冻结策略运行 proposed_joint 正式评价。"""
 
 from __future__ import annotations
 
@@ -34,7 +28,7 @@ from .interface import _copy_uav_positions
 from .reporting import resolve_checkpoint_reference
 from .rollout import collect_rollout
 from .trainer import (
-    PPOV2Trainer,
+    PPOTrainer,
     _assert_realization_context_compatible,
     aligned_train_steps,
     load_environment_context,
@@ -163,8 +157,8 @@ def _load_proposed_trainer(
     config_hash: str,
     checkpoint_metadata: dict[str, Any],
     device: str,
-) -> PPOV2Trainer:
-    trainer = PPOV2Trainer(context, device=device)
+) -> PPOTrainer:
+    trainer = PPOTrainer(context, device=device)
     if trainer.policy.architecture_id != context.policy_schema:
         raise TypeError(
             "Trainer policy factory did not construct the configured proposed schema: "
@@ -187,7 +181,7 @@ def _load_proposed_trainer(
 
 def _rollout_summary(
     context: Any,
-    trainer: PPOV2Trainer,
+    trainer: PPOTrainer,
     rollout: Any,
     *,
     episode_seed: int,

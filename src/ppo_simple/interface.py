@@ -1,10 +1,4 @@
-"""Minimal environment interface used by the standalone PPO v2 path.
-
-This module contains only the state/action contract and the artifact-alignment
-helpers needed to connect PPO v2 to the existing environment. Cache/UAV
-configuration, task matching, KKT allocation, and reward calculation remain
-owned by the existing decision modules.
-"""
+"""定义正式环境的状态、动作和 artifact 对齐接口。"""
 
 from __future__ import annotations
 

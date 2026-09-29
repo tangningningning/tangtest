@@ -1331,7 +1331,7 @@ def operation_generation_sanity() -> dict[str, bool]:
     return checks
 
 
-def run_slot20_validation(config_path: str = "configs/system_config.toml") -> dict[str, Any]:
+def run_slot20_validation(config_path: str = "configs/proposed/system_config.toml") -> dict[str, Any]:
     cfg = project_config.load_config(config_path)
     project_config.validate_config(cfg)
     project_config.validate_for_formal_experiment(cfg)
@@ -1672,7 +1672,7 @@ def _summary(result: TransferExchangeMatchingResult) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Actual-State Transfer-Exchange Matching validation.")
-    parser.add_argument("--config", default="configs/system_config.toml")
+    parser.add_argument("--config", default="configs/proposed/system_config.toml")
     parser.add_argument(
         "--cloud-resource-sharing-audit",
         action="store_true",
@@ -3636,7 +3636,7 @@ def _find_edge_case(
     return None
 
 
-def run_minimal_validation(config_path: str = "configs/system_config.toml") -> dict[str, Any]:
+def run_minimal_validation(config_path: str = "configs/proposed/system_config.toml") -> dict[str, Any]:
     """Run KKT/Cloud formula diagnostics; Cloud-only cases bypass candidate gating."""
 
     cfg = project_config.load_config(config_path)
@@ -3829,7 +3829,7 @@ def _summary_dict(result: KKTMatchingEvaluation | None) -> dict[str, Any] | None
 
 def build_kkt_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Given matching -> KKT resource allocation validation.")
-    parser.add_argument("--config", default="configs/system_config.toml")
+    parser.add_argument("--config", default="configs/proposed/system_config.toml")
     return parser
 
 

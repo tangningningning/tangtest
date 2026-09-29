@@ -1,9 +1,7 @@
-"""Full-information Cache value evaluation with exact-oracle hybrid screening.
+"""根据完整信息计算 Cache 价值，并使用 Exact-oracle Hybrid 筛选候选。
 
-KEEP is always evaluated exactly. A policy-independent delta-Q ensemble may
-screen legal UPDATE candidates only after passing the existing rolling exact
-quality gate; selected candidates are evaluated by the production exact branch
-executor and override predictions.
+KEEP 始终精确评估。只有滚动 Exact 质量门通过后，策略无关的 delta-Q
+集成模型才筛选合法 UPDATE 候选；最终选中项由正式精确分支执行器复核。
 """
 
 from __future__ import annotations
@@ -19,7 +17,6 @@ from decision import cache_configuration, slot_environment, uav_configuration
 
 from .primitive_control import (
     _all_cache_target_configurations_with_features,
-    _cache_candidate_feature,
     _intermediate_observation,
     _target_cache_proposals_with_features,
 )
@@ -71,28 +68,26 @@ def _stored_node_cache_trigger_aux(
     transition: Any,
     node_index: int,
     node_count: int,
-) -> np.ndarray | None:
-    """Return the V3 auxiliary row frozen on this rollout transition."""
+) -> np.ndarray:
+    """读取 rollout 中冻结的 Cache Trigger 辅助状态。"""
 
-    if not bool(getattr(policy, "true_binary_trigger", False)):
-        return None
     auxiliary_dim = getattr(policy, "trigger_aux_dim", None)
     if auxiliary_dim is None:
-        raise RuntimeError("V3 Cache Trigger policy does not expose trigger_aux_dim")
+        raise RuntimeError("正式 Cache Trigger 策略未提供 trigger_aux_dim。")
     stored_auxiliary = getattr(transition, "cache_trigger_aux", None)
     if stored_auxiliary is None:
         raise RuntimeError(
-            "V3 Cache Trigger credit requires stored rollout cache_trigger_aux"
+            "Cache Trigger 信用计算缺少 rollout 保存的 cache_trigger_aux。"
         )
     auxiliary = np.asarray(stored_auxiliary, dtype=np.float32)
     expected_shape = (int(node_count), int(auxiliary_dim))
     if tuple(auxiliary.shape) != expected_shape:
         raise RuntimeError(
-            "stored V3 Cache Trigger auxiliary has shape "
+            "Cache Trigger 辅助状态形状为 "
             f"{tuple(auxiliary.shape)}, expected {expected_shape}"
         )
     if not np.all(np.isfinite(auxiliary)):
-        raise FloatingPointError("stored V3 Cache Trigger auxiliary is non-finite")
+        raise FloatingPointError("保存的 Cache Trigger 辅助状态不是有限值。")
     return auxiliary[int(node_index)].copy()
 
 
@@ -103,15 +98,9 @@ def _masked_operation_probabilities(
     operation_mask: np.ndarray,
     trigger_aux: np.ndarray | None = None,
 ) -> np.ndarray:
-    if bool(getattr(policy, "true_binary_trigger", False)):
-        if trigger_aux is None:
-            raise RuntimeError(
-                "V3 Cache Trigger operation logits require stored trigger_aux"
-            )
-        logits, single = policy._operation_logits(conditional_context, trigger_aux)
-    else:
-        # Legacy non-binary policies retain their one-argument operation API.
-        logits, single = policy._operation_logits(conditional_context)
+    if trigger_aux is None:
+        raise RuntimeError("Cache Trigger logits 缺少保存的辅助状态。")
+    logits, single = policy._operation_logits(conditional_context, trigger_aux)
     if not single:
         raise RuntimeError("Cache operation distribution requires one context")
     raw_logits = logits[int(node_index)]
@@ -170,137 +159,53 @@ def _node_policy_state(
         step,
         context,
     )
-    if bool(getattr(trainer.policy, "true_binary_trigger", False)):
-        # The proposed mainline enumerates complete target configurations.  No
-        # primitive operation label reaches the policy, replay, or candidate
-        # tensor; proposal_source is diagnostics-only provenance.
-        action_map = _production_action_map(transition)
-        sequential_triggers = np.zeros(
-            len(context.action_spec.cache_node_ids), dtype=np.int8
-        )
-        for index in range(node_index):
-            if str(action_map[index].get("conditional_action", "")).upper() != "KEEP":
-                sequential_triggers[index] = 1
-        sequential_triggers[node_index] = 1
-        update_candidates, unified_features = _target_cache_proposals_with_features(
-            working_cache,
-            previous_cache,
-            sequential_triggers,
-            node_index,
-            np.asarray(conditional_context, dtype=np.float32),
-            step,
-            context,
-            proposal_cache_nodes,
-            surrogate_predictor=(
-                trainer._predict_cache_surrogate
-                if getattr(trainer, "cache_surrogate_ensemble", None) is not None
-                else None
-            ),
-            surrogate_ready=bool(
-                getattr(trainer, "cache_surrogate_screening_ready", False)
-                and getattr(trainer, "cache_surrogate_screening_active", False)
-            ),
-        )
-        if update_candidates:
-            candidate_probabilities = _candidate_probabilities(
-                trainer.policy,
-                np.asarray(conditional_context, dtype=np.float32),
-                unified_features,
-            )
-            candidate_features = [
-                np.asarray(feature, dtype=np.float32)
-                for feature in unified_features
-            ]
-            candidate_operations = np.asarray(
-                np.zeros(len(update_candidates), dtype=np.int64),
-                dtype=np.int64,
-            )
-        else:
-            candidate_probabilities = np.zeros(0, dtype=np.float64)
-            candidate_features = []
-            candidate_operations = np.zeros(0, dtype=np.int64)
-        operation_mask = np.asarray([True, bool(update_candidates)], dtype=bool)
-        operation_probabilities = _masked_operation_probabilities(
+    # 正式主线枚举完整目标配置。候选张量不包含操作标签，proposal_source 只记录来源。
+    action_map = _production_action_map(transition)
+    sequential_triggers = np.zeros(
+        len(context.action_spec.cache_node_ids), dtype=np.int8
+    )
+    for index in range(node_index):
+        if str(action_map[index].get("conditional_action", "")).upper() != "KEEP":
+            sequential_triggers[index] = 1
+    sequential_triggers[node_index] = 1
+    update_candidates, unified_features = _target_cache_proposals_with_features(
+        working_cache,
+        previous_cache,
+        sequential_triggers,
+        node_index,
+        np.asarray(conditional_context, dtype=np.float32),
+        step,
+        context,
+        proposal_cache_nodes,
+        surrogate_predictor=(
+            trainer._predict_cache_surrogate
+            if getattr(trainer, "cache_surrogate_ensemble", None) is not None
+            else None
+        ),
+        surrogate_ready=bool(
+            getattr(trainer, "cache_surrogate_screening_ready", False)
+            and getattr(trainer, "cache_surrogate_screening_active", False)
+        ),
+    )
+    if update_candidates:
+        candidate_probabilities = _candidate_probabilities(
             trainer.policy,
             np.asarray(conditional_context, dtype=np.float32),
-            node_index,
-            operation_mask,
-            trigger_aux=trigger_aux,
+            unified_features,
         )
-        p_keep = float(operation_probabilities[0])
-        p_update = float(operation_probabilities[1])
-        if candidate_probabilities.size:
-            candidate_probabilities = candidate_probabilities / float(
-                candidate_probabilities.sum()
-            )
-        return {
-            "working_cache": working_cache,
-            "previous_cache": previous_cache,
-            "conditional_context": np.asarray(conditional_context, dtype=np.float32),
-            "operation_mask": operation_mask,
-            "operation_probabilities": operation_probabilities,
-            "p_keep": p_keep,
-            "p_update": p_update,
-            "candidates": update_candidates,
-            "candidate_features": candidate_features,
-            "candidate_operations": candidate_operations,
-            "candidate_probabilities": np.asarray(candidate_probabilities, dtype=np.float64),
-            "grouped_candidates": {
-                name: [] for name in OPERATION_ORDER[1:]
-            },
-            "grouped_features": {
-                name: np.zeros((0, int(feature_dim)), dtype=np.float32)
-                for name in OPERATION_ORDER[1:]
-            },
-        }
-    all_candidates = cache_configuration.enumerate_cache_primitive_actions(
-        working_cache,
-        node_index,
-        context.service_catalog,
-        context.cache_nodes,
-    )
-    operation_mask = np.zeros(len(OPERATION_ORDER), dtype=bool)
-    operation_mask[0] = True
-    grouped_candidates: dict[str, list[Any]] = {
-        name: [] for name in OPERATION_ORDER[1:]
-    }
-    for candidate in all_candidates:
-        operation_index = OPERATION_ORDER.index(str(candidate.operation_type))
-        operation_mask[operation_index] = True
-        if operation_index != 0:
-            grouped_candidates[str(candidate.operation_type)].append(candidate)
-
-    action_map = _production_action_map(transition)
-    sequential_triggers = np.zeros(len(context.action_spec.cache_node_ids), dtype=np.int8)
-    for index in range(node_index):
-        if str(action_map[index].get("operation_type")) != "NO_CHANGE":
-            sequential_triggers[index] = 1
-    # Candidate features are evaluated in the UPDATE conditional state.
-    sequential_triggers[node_index] = 1
-
-    grouped_features: dict[str, np.ndarray] = {}
-    for operation_name in OPERATION_ORDER[1:]:
-        candidates = grouped_candidates[operation_name]
-        if not candidates:
-            grouped_features[operation_name] = np.zeros(
-                (0, int(feature_dim)), dtype=np.float32
-            )
-            continue
-        grouped_features[operation_name] = np.stack(
-            [
-                _cache_candidate_feature(
-                    candidate,
-                    working_cache,
-                    previous_cache,
-                    sequential_triggers,
-                    step.predicted_service_popularity,
-                    context,
-                    include_replica_awareness=True,
-                )
-                for candidate in candidates
-            ]
-        ).astype(np.float32)
-
+        candidate_features = [
+            np.asarray(feature, dtype=np.float32)
+            for feature in unified_features
+        ]
+        candidate_operations = np.asarray(
+            np.zeros(len(update_candidates), dtype=np.int64),
+            dtype=np.int64,
+        )
+    else:
+        candidate_probabilities = np.zeros(0, dtype=np.float64)
+        candidate_features = []
+        candidate_operations = np.zeros(0, dtype=np.int64)
+    operation_mask = np.asarray([True, bool(update_candidates)], dtype=bool)
     operation_probabilities = _masked_operation_probabilities(
         trainer.policy,
         np.asarray(conditional_context, dtype=np.float32),
@@ -309,41 +214,11 @@ def _node_policy_state(
         trigger_aux=trigger_aux,
     )
     p_keep = float(operation_probabilities[0])
-    p_update = float(operation_probabilities[1:].sum())
-    candidates: list[Any] = []
-    candidate_features: list[np.ndarray] = []
-    candidate_operations: list[int] = []
-    candidate_probabilities: list[float] = []
-    for operation_name in OPERATION_ORDER[1:]:
-        group_candidates = grouped_candidates[operation_name]
-        if not group_candidates:
-            continue
-        group_index = OPERATION_ORDER.index(operation_name)
-        conditional_probabilities = _candidate_probabilities(
-            trainer.policy,
-            np.asarray(conditional_context, dtype=np.float32),
-            grouped_features[operation_name],
+    p_update = float(operation_probabilities[1])
+    if candidate_probabilities.size:
+        candidate_probabilities = candidate_probabilities / float(
+            candidate_probabilities.sum()
         )
-        group_probability = float(operation_probabilities[group_index])
-        for candidate, feature, probability in zip(
-            group_candidates,
-            grouped_features[operation_name],
-            conditional_probabilities,
-            strict=True,
-        ):
-            candidates.append(candidate)
-            candidate_features.append(np.asarray(feature, dtype=np.float32))
-            candidate_operations.append(int(group_index))
-            candidate_probabilities.append(
-                (group_probability / p_update) * float(probability)
-                if p_update > 0.0
-                else 0.0
-            )
-    candidate_probabilities_array = np.asarray(candidate_probabilities, dtype=np.float64)
-    if candidate_probabilities_array.size:
-        if p_update <= 0.0:
-            raise RuntimeError("UPDATE probability is zero despite legal candidates")
-        candidate_probabilities_array /= float(candidate_probabilities_array.sum())
     return {
         "working_cache": working_cache,
         "previous_cache": previous_cache,
@@ -352,12 +227,17 @@ def _node_policy_state(
         "operation_probabilities": operation_probabilities,
         "p_keep": p_keep,
         "p_update": p_update,
-        "candidates": candidates,
+        "candidates": update_candidates,
         "candidate_features": candidate_features,
-        "candidate_operations": np.asarray(candidate_operations, dtype=np.int64),
-        "candidate_probabilities": candidate_probabilities_array,
-        "grouped_candidates": grouped_candidates,
-        "grouped_features": grouped_features,
+        "candidate_operations": candidate_operations,
+        "candidate_probabilities": np.asarray(candidate_probabilities, dtype=np.float64),
+        "grouped_candidates": {
+            name: [] for name in OPERATION_ORDER[1:]
+        },
+        "grouped_features": {
+            name: np.zeros((0, int(feature_dim)), dtype=np.float32)
+            for name in OPERATION_ORDER[1:]
+        },
     }
 
 
@@ -487,14 +367,7 @@ def _cache_branch_identity(
     state: dict[str, Any],
     candidate: Any | None,
 ) -> tuple[int, bytes, tuple[tuple[str, float, float], ...]]:
-    """Return the complete physical identity of one Cache branch.
-
-    The transition origin identifies the fixed task, vehicle, and prediction
-    inputs.  The remaining identity is the complete post-configuration Cache
-    state plus all UAV positions.  Operation labels and candidate indices are
-    intentionally absent: two logical candidates are reusable only when this
-    complete physical state is identical.
-    """
+    """返回一个 Cache 分支的完整物理状态标识。transition origin 用于标识固定任务、车辆与预测输入；其余部分包含完整的配置后 Cache 状态和全部 UAV 位置。不使用 Operation 标签或候选索引；只有完整物理状态相同的逻辑候选才可复用。"""
 
     final_cache = np.asarray(transition.next_cache_state, dtype=np.int8).copy()
     if candidate is None:
@@ -521,7 +394,7 @@ def _cache_branch_identity(
 def _branch_q_components(
     trainer: Any, branches: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Return Exact-Q branch reward, next critic value, and Q components."""
+    """返回 Exact-Q 分支奖励、下一状态 Critic 价值及各项 Q 组成。"""
 
     observations = [branch["next_observation"] for branch in branches]
     if any(value is None for value in observations):
@@ -566,7 +439,7 @@ def _branch_q_values(trainer: Any, branches: list[dict[str, Any]]) -> np.ndarray
 
 
 def _rank_correlation(predicted: np.ndarray, exact: np.ndarray) -> float:
-    """Return a dependency-free Spearman-style rank correlation."""
+    """计算不依赖第三方库的 Spearman 风格秩相关系数。"""
 
     predicted_a = np.asarray(predicted, dtype=np.float64).reshape(-1)
     exact_a = np.asarray(exact, dtype=np.float64).reshape(-1)
@@ -609,7 +482,7 @@ def _hybrid_exact_indices(
     production_selected_index: int | None = None,
     random_audit_index: int | None = None,
 ) -> list[int]:
-    """Choose the Exact-Q subset from the complete feasible universe."""
+    """从完整可行候选集合中选择 Exact-Q 子集。"""
 
     predicted = np.asarray(predicted_delta, dtype=np.float64).reshape(-1)
     sigma = np.asarray(predicted_sigma, dtype=np.float64).reshape(-1)
@@ -635,7 +508,7 @@ def _hybrid_exact_indices(
 
 
 def _screening_gate_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate full-Exact rows for K selection and safety gating."""
+    """汇总 full-Exact 行，用于选择 K 和执行安全 gate。"""
 
     recall_values: dict[int, list[float]] = {
         k: [] for k in CACHE_SURROGATE_K_CANDIDATES
@@ -797,7 +670,7 @@ def _selected_cache_candidate_index(
     node_index: int,
     candidates: list[Any],
 ) -> int | None:
-    """Resolve the production target candidate without trusting padding."""
+    """解析正式 target 候选，不将 padding 当作有效数据。"""
 
     if not candidates:
         return None
@@ -852,7 +725,7 @@ def _stable_masked_softmax(
 
 
 def _robust_mad_scale(values: np.ndarray, epsilon: float, maximum: float) -> float:
-    """Estimate a bounded scale from training values without outlier leverage."""
+    """根据训练数据估计有界尺度，降低异常值的影响。"""
 
     array = np.asarray(values, dtype=np.float64).reshape(-1)
     array = array[np.isfinite(array)]
@@ -875,7 +748,7 @@ def state_head_candidate_teacher(
     mask: np.ndarray,
     epsilon: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Build one locally normalized Candidate teacher and its diagnostics."""
+    """构造一个局部归一化的 Candidate teacher 及其诊断指标。"""
 
     q_values = np.asarray(values, dtype=np.float64)
     valid = np.asarray(mask, dtype=bool)
@@ -1035,12 +908,7 @@ def evaluate_cache_full_information_values(
     include_q_component_diagnostics: bool = False,
     include_full_candidate_q_components: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate fixed-downstream Cache values and detached full-information teachers.
-
-    FULL_EXACT is the oracle. After the surrogate passes its rolling exact-audit
-    gate, the same evaluator uses HYBRID_EXACT_SURROGATE candidate completion.
-    KEEP stays exact and every selected exact branch overrides its prediction.
-    """
+    """计算固定后续决策下的 Cache 价值和 detached full-information teacher。FULL_EXACT 是 oracle。Surrogate 通过滚动 exact-audit gate 后，同一 evaluator 使用 HYBRID_EXACT_SURROGATE 补全候选。KEEP 始终精确评估，选中的精确分支会覆盖其预测值。"""
 
     trigger_scale = None if trigger_temperature is None else float(trigger_temperature)
     readiness_check = getattr(trainer, "_require_critic_bootstrap_teacher_ready", None)
@@ -1347,14 +1215,14 @@ def evaluate_cache_full_information_values(
                     hybrid_q[np.asarray(exact_indices, dtype=np.int64)] = exact_by_index[
                         np.asarray(exact_indices, dtype=np.int64)
                     ]
-                # Final exact-confirmation: the Hybrid winner must itself be
-                # exact-evaluated before it may become best_candidate_index /
-                # q_best_update. Surrogate values still drive screening and
-                # ranking, but a surrogate-only winner is re-evaluated exactly
-                # and the mixed value vector is re-argmaxed until the winner is
-                # exact. This guarantees a semantically valid winner without
-                # promising the global exact optimum (a candidate that is never
-                # exact-evaluated may still hide a higher true value).
+                # 最终精确确认：Hybrid 获胜候选必须经过精确评估，
+                # 才能成为 best_candidate_index 或
+                # q_best_update。Surrogate 值仍用于筛选和
+                # 排序；若获胜候选只有 surrogate 结果，则会重新精确评估，
+                # 并在混合价值向量上重新取最大值，直到获胜候选
+                # 已精确评估。这样可确保获胜候选语义有效，但不保证
+                # 它一定是全局精确最优项；从未经过精确评估的候选中
+                # 仍可能存在更高的真实价值。
                 confirmed_exact_mask = np.zeros(universe_count, dtype=bool)
                 confirmed_exact_mask[np.asarray(exact_indices, dtype=np.int64)] = True
                 confirmation_added = 0
@@ -1855,7 +1723,7 @@ def evaluate_cache_full_information_values(
 
 
 def _audit_value_stats(values: list[float]) -> dict[str, float | None]:
-    """Return compact finite distribution statistics for teacher values."""
+    """返回 teacher 价值对应的紧凑有限分布统计量。"""
 
     if not values:
         return {

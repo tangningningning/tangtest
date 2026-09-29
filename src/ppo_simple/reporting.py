@@ -1,4 +1,4 @@
-"""Run provenance and compact summary reporting for PPO experiments."""
+"""记录正式 PPO run 的来源信息、清单和汇总指标。"""
 
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ from common import project_config
 
 from .plotting import (
     TRAINING_EPOCH_RETURN_PLOT_FILENAME,
-    TRAINING_SLOT_REWARD_PLOT_FILENAME,
-    _load_slot_contract,
     _read_slot_metrics,
 )
 
@@ -29,83 +27,47 @@ FRESH_RUN_ARTIFACTS = (
     "update_metrics.jsonl",
     "critic_diagnostics.jsonl",
     "slot_metrics.jsonl",
-    "latest_checkpoint.pt",
-    "best_train_return_checkpoint.pt",
     f"{CHECKPOINTS_DIRECTORY}/latest_checkpoint.pt",
     f"{CHECKPOINTS_DIRECTORY}/best_train_return_checkpoint.pt",
     f"plots/{TRAINING_EPOCH_RETURN_PLOT_FILENAME}",
-    f"plots/{TRAINING_SLOT_REWARD_PLOT_FILENAME}",
 )
 
 
-def checkpoint_path_for_write(
-    run_dir: Path, filename: str, architecture_version: int
-) -> Path:
-    """Return the canonical output path for this policy architecture."""
+def checkpoint_path_for_write(run_dir: Path, filename: str) -> Path:
+    """返回正式 checkpoint 的保存路径。"""
 
-    run_path = Path(run_dir)
-    if int(architecture_version) >= 3:
-        return run_path / CHECKPOINTS_DIRECTORY / filename
-    return run_path / filename
+    return Path(run_dir) / CHECKPOINTS_DIRECTORY / filename
 
 
-def checkpoint_path_for_resume(
-    run_dir: Path, filename: str, architecture_version: int
-) -> Path:
-    """Prefer the canonical checkpoint and allow a legacy root-level read."""
+def checkpoint_path_for_resume(run_dir: Path, filename: str) -> Path:
+    """返回正式 checkpoint 的恢复路径。"""
 
-    run_path = Path(run_dir)
-    canonical = run_path / CHECKPOINTS_DIRECTORY / filename
-    legacy = run_path / filename
-    if canonical.is_file():
-        return canonical
-    if legacy.is_file():
-        return legacy
-    return checkpoint_path_for_write(run_path, filename, architecture_version)
+    return Path(run_dir) / CHECKPOINTS_DIRECTORY / filename
 
 
 def resolve_checkpoint_reference(checkpoint: Path) -> Path:
-    """Resolve a V3 checkpoint path, falling back to a legacy root-level file."""
+    """解析 checkpoint 文件、正式 checkpoint 目录或 run 目录。"""
 
     path = Path(checkpoint).expanduser()
     if path.is_dir():
         if path.name == CHECKPOINTS_DIRECTORY:
-            return checkpoint_path_for_resume(path.parent, "latest_checkpoint.pt", 3)
-        return checkpoint_path_for_resume(path, "latest_checkpoint.pt", 3)
+            return checkpoint_path_for_resume(path.parent, "latest_checkpoint.pt")
+        return checkpoint_path_for_resume(path, "latest_checkpoint.pt")
     if path.parent.name == CHECKPOINTS_DIRECTORY:
-        run_path = path.parent.parent
-    else:
-        run_path = path.parent
-    canonical = run_path / CHECKPOINTS_DIRECTORY / path.name
-    legacy = run_path / path.name
-    if canonical.is_file():
-        return canonical
-    if legacy.is_file():
-        return legacy
-    return canonical
+        return path
+    return path.parent / CHECKPOINTS_DIRECTORY / path.name
 
 
-def checkpoint_run_directory(checkpoint: Path) -> Path:
-    """Return the run root for either a canonical or legacy checkpoint path."""
+def ensure_run_artifact_directories(run_dir: Path) -> None:
+    """创建正式 checkpoint 和 plot 目录。"""
 
-    path = Path(checkpoint)
-    if path.parent.name == CHECKPOINTS_DIRECTORY:
-        return path.parent.parent
-    return path.parent
-
-
-def ensure_run_artifact_directories(run_dir: Path, architecture_version: int) -> None:
-    """Create V3+ checkpoint and plot directories without moving legacy files."""
-
-    if int(architecture_version) < 3:
-        return
     run_path = Path(run_dir)
     (run_path / CHECKPOINTS_DIRECTORY).mkdir(parents=True, exist_ok=True)
     (run_path / PLOTS_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
 
 def ensure_fresh_run_dir_is_clean(run_dir: Path) -> None:
-    """Reject fresh runs that would mix with an existing experiment."""
+    """如果新 run 会与现有实验混合，则拒绝启动。"""
 
     run_path = Path(run_dir)
     if not run_path.exists():
@@ -256,15 +218,8 @@ def _optimizer_learning_rate(optimizer: Any, label: str) -> float:
 
 
 def _actual_optimizers(trainer: Any) -> tuple[Any, Any]:
-    actor_optimizer = getattr(trainer, "actor_optimizer", None)
+    actor_optimizer = getattr(trainer, "cache_trigger_optimizer", None)
     critic_optimizer = getattr(trainer, "critic_optimizer", None)
-    shared_optimizer = getattr(trainer, "optimizer", None)
-    if actor_optimizer is None:
-        actor_optimizer = getattr(trainer, "cache_trigger_optimizer", None)
-    if actor_optimizer is None:
-        actor_optimizer = shared_optimizer
-    if critic_optimizer is None:
-        critic_optimizer = shared_optimizer
     return actor_optimizer, critic_optimizer
 
 
@@ -278,58 +233,29 @@ def build_run_manifest(
     target_epochs: int,
     rollout_steps: int,
 ) -> dict[str, Any]:
-    """Build a manifest from the live trainer, policy, optimizers, and config."""
+    """从当前 trainer、策略、优化器和配置生成正式 run manifest。"""
 
-    get = project_config.get_config_value
     hyper = trainer.hyperparameters
     actor_optimizer, critic_optimizer = _actual_optimizers(trainer)
     protocol = project_config.get_ppo_data_protocol(context.cfg)
     train_origin_start = int(context.train_origin_start)
     train_origin_end = int(context.train_origin_end)
-    test_origin_start = protocol["test_origin_start"]
-    test_origin_end = protocol["test_origin_end"]
     policy_schema = str(getattr(trainer.policy, "architecture_id", context.policy_schema))
-    is_proposed_joint = policy_schema == "adaptive_joint_cache_uav_ppo"
+    if policy_schema != "adaptive_joint_cache_uav_ppo":
+        raise ValueError("run manifest 仅支持正式 proposed_joint 策略。")
     git_sha, git_dirty = _git_identity(Path(context.root))
     resolved_config_path = Path(
         context.cfg.get("_meta", {}).get("config_path", config_path)
     ).resolve()
     learning_rate_metadata = trainer.learning_rate_metadata()
     training_provenance = context.cfg.get("training_provenance", {})
-    q_cache_manifest_fields: dict[str, Any] = {}
-    if getattr(trainer, "q_cache_optimizer", None) is not None:
-        q_cache_manifest_fields = {
-            "cache_credit_granularity": "FULL_NODE_ACTION",
-            "q_cache_learning_rate": _optimizer_learning_rate(
-                trainer.q_cache_optimizer, "q_cache"
-            ),
-            "q_cache_target_source": "current_PopArt_normalized_raw_GAE_return",
-            "q_cache_conditioning": (
-                "full_state_plus_target_cache_node_plus_full_cache_and_uav_action_encoding"
-            ),
-            "q_cache_action_encoding": (
-                "per_node_operation_one_hot_plus_candidate_one_hot_plus_production_primitive_feature"
-            ),
-            "q_cache_optimizer_steps_per_rollout": int(
-                hyper.update_epochs * hyper.num_minibatches
-            ),
-            "cache_counterfactual_advantage_source": (
-                "detached_Q_selected_minus_legal_action_policy_expectation"
-            ),
-        }
     cache_credit_manifest_fields: dict[str, Any] = {}
     if hasattr(trainer, "cache_credit_metadata"):
         cache_credit_manifest_fields = dict(trainer.cache_credit_metadata())
     return {
         "experiment_type": "main_training",
         "architecture_version": int(getattr(trainer.policy, "architecture_version", 1)),
-        **(
-            {
-                "checkpoint_version": int(trainer._expected_checkpoint_version()),
-            }
-            if getattr(trainer, "_requires_critic_bootstrap_teacher_warmup", lambda: False)()
-            else {}
-        ),
+        "checkpoint_version": int(trainer._expected_checkpoint_version()),
         "initial_actor_sha256": training_provenance.get("ACTOR_INITIAL_STATE_SHA256"),
         "initial_critic_sha256": training_provenance.get("CRITIC_INITIAL_STATE_SHA256"),
         "initial_uav_candidate_encoder_sha256": training_provenance.get(
@@ -337,11 +263,10 @@ def build_run_manifest(
         ),
         "uav_candidate_encoder_initialization": (
             "deterministic deepcopy of the seeded base UAV encoder before optimization"
-            if is_proposed_joint else None
         ),
-        "checkpoint_interval_epochs": 10 if is_proposed_joint else None,
+        "checkpoint_interval_epochs": 10,
         "best_train_return_checkpoint_role": "TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION",
-        "final_checkpoint_selection_metric": "validation_mean_episode_return" if is_proposed_joint else None,
+        "final_checkpoint_selection_metric": "validation_mean_episode_return",
         "git_commit_sha": git_sha,
         "git_dirty": git_dirty,
         "config_path": str(resolved_config_path),
@@ -362,26 +287,11 @@ def build_run_manifest(
         "operation_advantage_reference_scale": float(
             hyper.operation_advantage_reference_scale
         ),
-        "uav_operation_advantage_source": (
-            "FULL_INFORMATION_EXACT_Q_TEACHER" if is_proposed_joint else "GLOBAL_GAE"
-        ),
-        "UAV_OPERATION_TEACHER": (
-            "FULL_INFORMATION_EXACT_Q_TEACHER" if is_proposed_joint else "GLOBAL_GAE"
-        ),
-        "uav_candidate_advantage_source": (
-            "EXACT_Q_LISTWISE"
-            if is_proposed_joint
-            else "GLOBAL_GAE"
-        ),
-        "UAV_CANDIDATE_TEACHER": (
-            "EXACT_Q_LISTWISE" if is_proposed_joint else "GLOBAL_GAE"
-        ),
-        "UAV_TEACHER_UNCHANGED": "YES" if is_proposed_joint else "N/A",
-        "candidate_advantage_normalization": (
-            "EXACT_Q_LISTWISE"
-            if is_proposed_joint
-            else "LEGACY_GLOBAL_GAE"
-        ),
+        "uav_operation_advantage_source": "FULL_INFORMATION_EXACT_Q_TEACHER",
+        "UAV_OPERATION_TEACHER": "FULL_INFORMATION_EXACT_Q_TEACHER",
+        "uav_candidate_advantage_source": "EXACT_Q_LISTWISE",
+        "UAV_CANDIDATE_TEACHER": "EXACT_Q_LISTWISE",
+        "candidate_advantage_normalization": "EXACT_Q_LISTWISE",
         "critic_value_scale_mode": str(hyper.critic_value_scale_mode),
         "critic_value_scale_epsilon": float(hyper.critic_value_scale_epsilon),
         "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),
@@ -394,20 +304,15 @@ def build_run_manifest(
         "terminal_origin": int(context.terminal_origin),
         "train_origin_start": train_origin_start,
         "train_origin_end": train_origin_end,
-        "test_origin_start": (
-            None if test_origin_start is None else int(test_origin_start)
-        ),
-        "test_origin_end": None if test_origin_end is None else int(test_origin_end),
         "target_epochs": int(target_epochs),
         "rollout_steps": int(rollout_steps),
-        "origins_per_epoch": int(context.episode_slots),
         "gamma": float(hyper.gamma),
         "gae_lambda": float(hyper.gae_lambda),
         "clip_epsilon": float(hyper.clip_epsilon),
         "update_epochs": int(hyper.update_epochs),
         "target_kl": hyper.target_kl,
         "cache_kl_control": str(
-            getattr(trainer, "cache_kl_control", "epoch")
+            getattr(trainer, "cache_kl_control", "minibatch_early_stop")
         ),
         "num_minibatches": int(hyper.num_minibatches),
         "minibatch_size": int(context.minibatch_size),
@@ -420,67 +325,33 @@ def build_run_manifest(
         "max_grad_norm": float(hyper.max_grad_norm),
         "entropy_coefficient": float(hyper.entropy_coefficient),
         **learning_rate_metadata,
-        **q_cache_manifest_fields,
         **cache_credit_manifest_fields,
     }
 
 
 def _manifest_protocol_identity(manifest: dict[str, Any]) -> dict[str, Any]:
-    """Normalize protocol metadata while accepting old legacy manifests."""
+    """校验并规范化正式完整 episode manifest 的协议字段。"""
 
-    protocol = str(
-        manifest.get(
-            "data_protocol",
-            project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
-        )
-    )
-    if protocol not in {
-        project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
-        project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
-    }:
-        raise ValueError(f"unknown PPO run_manifest data_protocol: {protocol}")
-    origin_start = int(
-        manifest.get("origin_start", manifest.get("train_origin_start", 0))
-    )
-    raw_origin_end = manifest.get(
-        "origin_end", manifest.get("train_origin_end")
-    )
-    raw_episode_slots = manifest.get(
-        "episode_slots", manifest.get("origins_per_epoch")
-    )
-    if raw_origin_end is None and raw_episode_slots is not None:
-        raw_origin_end = origin_start + int(raw_episode_slots) - 1
-    if raw_origin_end is None:
-        raise ValueError("PPO run_manifest is missing origin_end/episode_slots")
-    origin_end = int(raw_origin_end)
-    episode_slots = int(
-        raw_episode_slots
-        if raw_episode_slots is not None
-        else origin_end - origin_start + 1
-    )
+    protocol = str(manifest["data_protocol"])
+    if protocol != project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+        raise ValueError(f"run manifest 使用了不支持的数据协议：{protocol}")
+    origin_start = int(manifest["origin_start"])
+    origin_end = int(manifest["origin_end"])
+    episode_slots = int(manifest["episode_slots"])
     if episode_slots <= 0 or origin_end - origin_start + 1 != episode_slots:
-        raise ValueError("PPO run_manifest has inconsistent episode slot bounds")
-    terminal_origin = int(manifest.get("terminal_origin", origin_end))
+        raise ValueError("run manifest 中的 episode slot 范围不一致。")
+    terminal_origin = int(manifest["terminal_origin"])
     if terminal_origin != origin_end:
-        raise ValueError("PPO run_manifest terminal_origin must equal origin_end")
-
-    raw_rollout_steps = manifest.get("rollout_steps")
-    rollout_steps = None if raw_rollout_steps is None else int(raw_rollout_steps)
-    raw_num_minibatches = manifest.get("num_minibatches")
-    num_minibatches = (
-        None if raw_num_minibatches is None else int(raw_num_minibatches)
-    )
-    raw_minibatch_size = manifest.get("minibatch_size")
-    if raw_minibatch_size is None and num_minibatches is not None:
-        minibatch_size = (
-            episode_slots // num_minibatches
-            if num_minibatches > 0 and episode_slots % num_minibatches == 0
-            else None
-        )
-    else:
-        minibatch_size = (
-            None if raw_minibatch_size is None else int(raw_minibatch_size)
-        )
+        raise ValueError("run manifest 的 terminal_origin 必须等于 origin_end。")
+    rollout_steps = int(manifest["rollout_steps"])
+    num_minibatches = int(manifest["num_minibatches"])
+    minibatch_size = int(manifest["minibatch_size"])
+    if rollout_steps != episode_slots:
+        raise ValueError("完整 episode 的 rollout_steps 必须等于 episode_slots。")
+    if num_minibatches <= 0 or episode_slots % num_minibatches != 0:
+        raise ValueError("完整 episode 的 num_minibatches 必须整除 episode_slots。")
+    if minibatch_size != episode_slots // num_minibatches:
+        raise ValueError("run manifest 的 minibatch_size 与 episode 范围不一致。")
     return {
         "data_protocol": protocol,
         "episode_slots": episode_slots,
@@ -496,7 +367,7 @@ def _manifest_protocol_identity(manifest: dict[str, Any]) -> dict[str, Any]:
 def validate_run_manifest_for_resume(
     existing: dict[str, Any], current: dict[str, Any]
 ) -> None:
-    """Reject a resume when immutable experiment identity differs."""
+    """拒绝恢复身份字段或完整 episode 协议不一致的 run。"""
 
     required_match_fields = (
         "config_sha256",
@@ -513,8 +384,6 @@ def validate_run_manifest_for_resume(
         "effective_critic_learning_rate",
         "actor_learning_rate_overridden",
         "critic_learning_rate_overridden",
-        "lr_experiment_axis",
-        "lr_experiment_value",
     )
     mismatches = {
         field: (existing.get(field), current.get(field))
@@ -528,25 +397,24 @@ def validate_run_manifest_for_resume(
         )
         raise ValueError(f"PPO resume run_manifest mismatch: {details}")
 
-    if current.get("policy_schema") == "adaptive_joint_cache_uav_ppo":
-        lifecycle_identity_fields = (
-            "checkpoint_version",
-            "critic_bootstrap_teacher_warmup_required",
-            "critic_warmup_seed_namespace",
+    lifecycle_identity_fields = (
+        "checkpoint_version",
+        "critic_bootstrap_teacher_warmup_required",
+        "critic_warmup_seed_namespace",
+    )
+    lifecycle_mismatches = {
+        field: (existing.get(field), current.get(field))
+        for field in lifecycle_identity_fields
+        if existing.get(field) != current.get(field)
+    }
+    if lifecycle_mismatches:
+        details = ", ".join(
+            f"{field}: existing={old!r}, current={new!r}"
+            for field, (old, new) in lifecycle_mismatches.items()
         )
-        lifecycle_mismatches = {
-            field: (existing.get(field), current.get(field))
-            for field in lifecycle_identity_fields
-            if existing.get(field) != current.get(field)
-        }
-        if lifecycle_mismatches:
-            details = ", ".join(
-                f"{field}: existing={old!r}, current={new!r}"
-                for field, (old, new) in lifecycle_mismatches.items()
-            )
-            raise ValueError(
-                f"PPO resume critic warmup manifest mismatch: {details}"
-            )
+        raise ValueError(
+            f"PPO resume critic warmup manifest mismatch: {details}"
+        )
 
     existing_protocol = _manifest_protocol_identity(existing)
     current_protocol = _manifest_protocol_identity(current)
@@ -605,7 +473,7 @@ def write_run_manifest(
     rollout_steps: int,
     resume: bool,
 ) -> dict[str, Any]:
-    """Create a fresh manifest or validate/update one for a resume."""
+    """创建正式 manifest，或校验并更新正在恢复的 run。"""
 
     current = build_run_manifest(
         config_path=config_path,
@@ -636,7 +504,7 @@ def write_run_manifest(
 
 
 def update_run_manifest_teacher_state(path: Path, trainer: Any) -> dict[str, Any]:
-    """Persist calibrated training-only Cache teacher and screening state."""
+    """持久化仅由训练数据校准的 Cache teacher 与筛选状态。"""
 
     manifest_path = Path(path)
     if not manifest_path.exists():
@@ -751,27 +619,18 @@ def update_run_summary(
     completed_epochs: int,
     target_epochs: int,
     status: str,
-    protocol_metadata: dict[str, Any] | None = None,
+    protocol_metadata: dict[str, Any],
     lifecycle_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Write the current compact summary from already-written metrics."""
+    """根据已写入的指标生成当前 run 汇总。"""
 
     if status not in {"running", "completed"}:
         raise ValueError(f"invalid run summary status: {status}")
     episodes, episode_nan_inf = _episode_records(episode_metrics_path)
-    if protocol_metadata is None:
-        episode_slots, origin_start = _load_slot_contract(slot_metrics_path.parent)
-        protocol_metadata = {
-            "data_protocol": project_config.PPO_DATA_PROTOCOL_LEGACY_SPLIT,
-            "episode_slots": episode_slots,
-            "origin_start": origin_start,
-            "origin_end": origin_start + episode_slots - 1,
-            "terminal_origin": origin_start + episode_slots - 1,
-        }
     episode_slots = int(protocol_metadata["episode_slots"])
     origin_start = int(protocol_metadata["origin_start"])
     origin_end = int(protocol_metadata["origin_end"])
-    terminal_origin = int(protocol_metadata.get("terminal_origin", origin_end))
+    terminal_origin = int(protocol_metadata["terminal_origin"])
     if origin_end - origin_start + 1 != episode_slots:
         raise ValueError("run summary protocol has inconsistent episode slot bounds")
     if terminal_origin != origin_end:

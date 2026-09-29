@@ -1,4 +1,4 @@
-"""PPO v2 trigger policy and adaptive primitive Cache/UAV policy schema."""
+"""实现 proposed_joint 使用的 Cache/UAV 策略网络。"""
 
 from __future__ import annotations
 
@@ -34,35 +34,21 @@ class PolicyEvaluation:
     entropy: Any
     value: Any
     logits: Any
-    # Optional branch-level diagnostics.  These are populated only by policy
-    # schemas whose rollout already carries the corresponding primitive
-    # actions and old log-probabilities; they do not affect the PPO objective.
+    # 分支指标复用 rollout 已保存的动作和 log-probability，不改变 PPO 目标。
     cache_log_prob: Any | None = None
     uav_log_prob: Any | None = None
-    # Per-UAV operation/candidate log-probabilities.  The aggregate branch
-    # values above remain the compatibility surface for the existing PPO
-    # paths; the proposed joint policy uses these tensors to keep the
-    # operation trust region independent from the candidate trust region.
+    # 按 UAV 保存 Operation 与 Candidate 的 log-probability，以分别计算两类信赖域。
     uav_operation_log_probs: Any | None = None
     uav_candidate_log_probs: Any | None = None
-    # Full conditional UAV candidate log-probabilities.  This is populated by
-    # the proposed evaluator so the exact conditional PPO expectation can
-    # enumerate every legal MOVE candidate, including states whose sampled
-    # operation was STAY.
+    # 保存完整条件 UAV 候选 log-probability，使 Exact-Q 期望包含全部合法 MOVE 目标。
     uav_candidate_log_probs_all: Any | None = None
-    # Full masked STAY/MOVE log-probabilities for every UAV head.  The
-    # proposed operation KL gate compares this categorical distribution on the
-    # complete rollout; it must not depend on the sampled operation only.
+    # 保存每个 UAV head 的完整 STAY/MOVE 分布，供完整 rollout 的 Operation KL gate 使用。
     uav_operation_log_probs_all: Any | None = None
     cache_entropy: Any | None = None
     uav_entropy: Any | None = None
-    # Exact per-Cache-node primitive log-probabilities.  These include the
-    # masked operation categorical and, when the operation is not NO_CHANGE,
-    # the selected candidate categorical.
+    # 保存每个 Cache 节点的操作分布，以及操作发生变化时的候选分布。
     cache_node_log_probs: Any | None = None
-    # Full masked per-head categorical log-probabilities.  These are detached
-    # by callers when used for diagnostics; exposing them here avoids a second
-    # policy implementation for Cache old-vs-new distribution checks.
+    # 保存每个 head 的完整掩码分类分布，调用方可脱离计算图后用于分布对比。
     cache_operation_log_probs_all: Any | None = None
     cache_candidate_log_probs_all: Any | None = None
 
@@ -81,15 +67,14 @@ class OperationPolicySample:
     log_prob: Any
     entropy: Any
     logits: Any
-    # Optional raw (pre-mask) diagnostics. These are derived from the
-    # already-computed operation logits and never sample an additional action.
+    # 原始操作 logits 的可选指标，不会额外采样动作。
     raw_logits: Any | None = None
     probabilities: Any | None = None
 
 
 def _require_torch() -> None:
     if torch is None or nn is None:
-        raise ImportError("PPO v2 requires PyTorch.")
+        raise ImportError("proposed_joint 策略需要 PyTorch。")
 
 
 def _validate_binary_actions(actions: Any, action_dim: int) -> Any:
@@ -101,7 +86,7 @@ def _validate_binary_actions(actions: Any, action_dim: int) -> Any:
             f"actions shape={tuple(values.shape)}，期望 [B,{int(action_dim)}]。"
         )
     if not bool(torch.all((values == 0) | (values == 1)).item()):
-        raise ValueError("PPO v2 action 必须是 binary request vector。")
+        raise ValueError("proposed_joint 动作必须是二元请求向量。")
     return values
 
 
@@ -130,7 +115,7 @@ def _group_balance_candidate_logits(
     operation_slice: slice,
     active_heads: Any | None = None,
 ) -> Any:
-    """Return masked logits with equal-score probability balanced by operation group."""
+    """返回掩码 logits，并按操作组均衡相同分数的概率。"""
 
     scores = torch.as_tensor(raw_scores)
     features = torch.as_tensor(
@@ -202,10 +187,10 @@ def _group_balance_candidate_logits(
     return flat_balanced.reshape(scores.shape).masked_fill(~masks, -float("inf"))
 
 
-class BernoulliActorCritic(nn.Module if nn is not None else object):
-    """Dimension-driven MLP actor-critic with independent binary requests."""
+class _ActorCriticBase(nn.Module if nn is not None else object):
+    """建立共享状态编码器，并保留正式策略的基础采样接口。"""
 
-    architecture_id = "ppo_simple_v2_mlp_independent_bernoulli"
+    architecture_id = "internal_actor_critic_base"
     architecture_version = 1
 
     def __init__(
@@ -248,7 +233,7 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
         return obs, single
 
     def _default_actor_encoder(self) -> Any:
-        """Return the representation used by the legacy single-head path."""
+        """返回共享策略编码器的状态表示。"""
 
         return self.encoder
 
@@ -358,10 +343,10 @@ class BernoulliActorCritic(nn.Module if nn is not None else object):
         )
 
 
-class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
-    """Shared-state PPO policy with trigger and conditional primitive heads."""
+class _PrimitiveActorCriticBase(_ActorCriticBase):
+    """构建共享状态编码器以及 Trigger 和条件候选 head。"""
 
-    architecture_id = "adaptive_primitive_v1"
+    architecture_id = "internal_primitive_base"
     architecture_version = 1
 
     def __init__(
@@ -470,12 +455,7 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         scorer: Any,
         operation_slice: slice | None,
     ) -> CandidatePolicySample:
-        """Select a candidate by group-MAP followed by within-group MAP.
-
-        This is an evaluation-only decoder.  It reuses the exact balanced
-        candidate distribution used by the normal conditional head and does
-        not change the existing sampling or PPO evaluation methods.
-        """
+        """先按组内最高分选择候选组，再在组内选择最高分候选。"""
 
         if operation_slice is None:
             raise ValueError(
@@ -713,45 +693,12 @@ class AdaptivePrimitiveActorCritic(BernoulliActorCritic):
         )
 
 
-# The formal V6 network deliberately inherits through the following schema
-# generations.  This chain fixes its module hierarchy and state_dict keys; the
-# intermediate classes are implementation bases, not active experiment choices.
-class AdaptivePrimitiveV2ActorCritic(AdaptivePrimitiveActorCritic):
-    """Scheme B policy with the v2 finite-horizon observation schema."""
-
-    architecture_id = "adaptive_primitive_v2"
-
-
-class AdaptivePrimitiveGroupedV2ActorCritic(AdaptivePrimitiveV2ActorCritic):
-    """v2 policy with operation-group-balanced conditional candidate logits."""
-
-    architecture_id = "adaptive_primitive_v2_grouped"
-    architecture_version = 1
-
-    def _candidate_operation_slice(self, candidate_kind: str) -> slice:
-        if candidate_kind == "cache":
-            return slice(4, 8)
-        if candidate_kind == "uav":
-            uav_count = int(self.uav_feature_dim) - 16
-            if uav_count <= 0:
-                raise ValueError("UAV candidate feature dimension 缺少 UAV identity one-hot。")
-            return slice(1 + uav_count, 3 + uav_count)
-        raise ValueError(f"unknown candidate kind={candidate_kind}")
-
-
-class AdaptivePrimitiveHorizonGroupedV3ActorCritic(AdaptivePrimitiveGroupedV2ActorCritic):
-    """Grouped primitive policy using the explicit full prediction-horizon state."""
-
-    architecture_id = "adaptive_primitive_v3_horizon_grouped"
-    architecture_version = 1
-
-
-class AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic(
-    AdaptivePrimitiveHorizonGroupedV3ActorCritic
+class _SeparateCriticActorCriticBase(
+    _PrimitiveActorCriticBase
 ):
-    """V3 horizon/grouped policy with an independent critic representation."""
+    """为 Critic 建立独立的状态表示。"""
 
-    architecture_id = "adaptive_primitive_v4_horizon_grouped_separate_critic"
+    architecture_id = "internal_separate_critic_base"
     architecture_version = 1
 
     def __init__(
@@ -782,16 +729,16 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic(
         return self.critic_head(self.critic_encoder(observations)).squeeze(-1)
 
 
-class AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic(
-    AdaptivePrimitiveHorizonGroupedSeparateCriticV4ActorCritic
+class _SeparateOptimizationActorCriticBase(
+    _SeparateCriticActorCriticBase
 ):
-    """V4 network with explicit disjoint actor/critic parameter groups for V5."""
+    """提供互不重叠的 Actor 与 Critic 参数组。"""
 
-    architecture_id = "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization"
+    architecture_id = "internal_separate_optimization_base"
     architecture_version = 1
 
     def actor_parameters(self) -> tuple[Any, ...]:
-        """Return only parameters updated by the actor optimizer."""
+        """返回由 Actor 优化器更新的参数。"""
 
         modules = (
             self.encoder,
@@ -805,11 +752,11 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic(
             for parameter in module.parameters()
         )
         if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("V5 actor parameter group contains duplicate parameters.")
+            raise RuntimeError("Actor 参数组中存在重复参数。")
         return parameters
 
     def critic_parameters(self) -> tuple[Any, ...]:
-        """Return only parameters updated by the critic optimizer."""
+        """返回由 Critic 优化器更新的参数。"""
 
         modules = (self.critic_encoder, self.critic_head)
         parameters = tuple(
@@ -818,23 +765,23 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic(
             for parameter in module.parameters()
         )
         if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("V5 critic parameter group contains duplicate parameters.")
+            raise RuntimeError("Critic 参数组中存在重复参数。")
         return parameters
 
     def critic_value(self, observations: Any) -> Any:
-        """Evaluate the independent critic without building an actor graph."""
+        """计算独立 Critic 的值，避免构建 Actor 计算图。"""
 
         obs, single = self._observations(observations)
         values = self.critic_head(self.critic_encoder(obs)).squeeze(-1)
         return values.squeeze(0) if single else values
 
 
-class AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic(
-    AdaptivePrimitiveHorizonGroupedSeparateCriticOptimizationV5ActorCritic
+class _PopArtCriticActorCriticBase(
+    _SeparateOptimizationActorCriticBase
 ):
-    """V5 policy whose independent critic predicts a PopArt-normalized value."""
+    """通过 PopArt 缓冲区保存 Critic 的归一化统计量。"""
 
-    architecture_id = "adaptive_primitive_v6_horizon_grouped_separate_critic_popart"
+    architecture_id = "internal_popart_critic_base"
     architecture_version = 1
 
     def __init__(
@@ -864,7 +811,7 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic(
         return mean_f, std_f
 
     def popart_statistics(self) -> tuple[float, float]:
-        """Return the active raw-value mean and standard deviation."""
+        """返回当前原始价值的均值和标准差。"""
 
         return (
             float(self.popart_mean.detach().cpu().item()),
@@ -872,14 +819,14 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic(
         )
 
     def critic_normalized_value(self, observations: Any) -> Any:
-        """Return the critic's internal normalized value z(s)."""
+        """返回 Critic 内部的归一化价值 z(s)。"""
 
         obs, single = self._observations(observations)
         values = self.critic_head(self.critic_encoder(obs)).squeeze(-1)
         return values.squeeze(0) if single else values
 
     def critic_value(self, observations: Any) -> Any:
-        """Return the raw value V(s) exposed to rollout, GAE, and PPO."""
+        """返回供 rollout、GAE 和 PPO 使用的原始价值 V(s)。"""
 
         normalized_values = self.critic_normalized_value(observations)
         return self.popart_mean + self.popart_std * normalized_values
@@ -889,7 +836,7 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic(
         return self.critic_value(observations)
 
     def update_popart_statistics(self, mean: Any, std: Any) -> None:
-        """Transform only the critic output head while preserving raw values."""
+        """只变换 Critic 输出层，同时保持原始价值不变。"""
 
         mean_new, std_new = self._validate_popart_statistics(mean, std)
         mean_old, std_old = self.popart_statistics()
@@ -900,19 +847,12 @@ class AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic(
             self.popart_std.fill_(std_new)
 
 
-class AdaptiveCacheOnlyActorCritic(
-    AdaptivePrimitiveHorizonGroupedSeparateCriticPopArtV6ActorCritic
+class _CacheOperationActorCriticBase(
+    _PopArtCriticActorCriticBase
 ):
-    """Cache-only hierarchical policy on top of the frozen V6 backbone.
+    """为联合策略保留 Cache 操作和候选评分模块。"""
 
-    The inherited V6 binary trigger head and UAV scorer remain in the module
-    hierarchy for checkpoint compatibility, but Cache-only training does not use
-    either of them.  Cache operation logits are produced by a new per-node
-    four-way head, while candidate logits are the raw cache scorer scores
-    restricted to the operation selected by that head.
-    """
-
-    architecture_id = "adaptive_cache_only_popart"
+    architecture_id = "internal_cache_operation_base"
     architecture_version = 1
     operation_order = ("NO_CHANGE", "ADD", "DELETE", "SWAP")
 
@@ -933,7 +873,7 @@ class AdaptiveCacheOnlyActorCritic(
             hidden_sizes,
         )
         if int(num_cache_heads) <= 0:
-            raise ValueError("Cache-only num_cache_heads must be positive")
+            raise ValueError("Cache num_cache_heads must be positive")
         self.num_cache_heads = int(num_cache_heads)
         self.cache_operation_head = nn.Linear(
             self.hidden_dim,
@@ -941,7 +881,7 @@ class AdaptiveCacheOnlyActorCritic(
         )
 
     def actor_parameters(self) -> tuple[Any, ...]:
-        """Return only parameters used by the Cache-only Cache policy."""
+        """返回 Cache 操作策略使用的参数。"""
 
         modules = (
             self.encoder,
@@ -954,7 +894,7 @@ class AdaptiveCacheOnlyActorCritic(
             for parameter in module.parameters()
         )
         if len({id(parameter) for parameter in parameters}) != len(parameters):
-            raise RuntimeError("Cache-only actor parameter group contains duplicate parameters.")
+            raise RuntimeError("Cache actor parameter group contains duplicate parameters.")
         return parameters
 
     def _operation_logits(self, observations: Any) -> tuple[Any, bool]:
@@ -974,17 +914,17 @@ class AdaptiveCacheOnlyActorCritic(
         operation_mask: Any,
         deterministic: bool = False,
     ) -> OperationPolicySample:
-        """Sample one node's operation using its dynamic feasibility mask."""
+        """根据动态可行性掩码为一个节点采样操作。"""
 
         logits, single = self._operation_logits(observation)
         if not single or tuple(logits.shape) != (
             self.num_cache_heads,
             len(self.operation_order),
         ):
-            raise ValueError("Cache-only operation sampling requires one observation")
+            raise ValueError("Cache operation sampling requires one observation")
         index = int(head_index)
         if index < 0 or index >= self.num_cache_heads:
-            raise IndexError("Cache-only cache operation head index out of range")
+            raise IndexError("Cache cache operation head index out of range")
         mask = torch.as_tensor(
             np.asarray(operation_mask, dtype=bool).reshape(-1),
             dtype=torch.bool,
@@ -993,7 +933,7 @@ class AdaptiveCacheOnlyActorCritic(
         if tuple(mask.shape) != (len(self.operation_order),) or not bool(
             torch.any(mask).item()
         ):
-            raise ValueError("Cache-only operation mask must allow at least one operation")
+            raise ValueError("Cache operation mask must allow at least one operation")
         raw_logits = logits[index]
         raw_distribution = torch.distributions.Categorical(logits=raw_logits)
         masked_logits = raw_logits.masked_fill(~mask, -float("inf"))
@@ -1020,7 +960,7 @@ class AdaptiveCacheOnlyActorCritic(
         candidate_mask: Any | None = None,
         deterministic: bool = False,
     ) -> CandidatePolicySample:
-        """Sample only within one operation group using raw scorer scores."""
+        """仅在指定操作组内根据原始评分采样。"""
 
         scores, single = self._candidate_scores(
             observation,
@@ -1029,7 +969,7 @@ class AdaptiveCacheOnlyActorCritic(
             self.cache_candidate_scorer,
         )
         if not single or scores.ndim != 2 or int(scores.shape[0]) != 1:
-            raise ValueError("Cache-only candidate sampling requires one context")
+            raise ValueError("Cache candidate sampling requires one context")
         raw_scores = scores.squeeze(0)
         if candidate_mask is None:
             mask = torch.ones_like(raw_scores, dtype=torch.bool)
@@ -1042,7 +982,7 @@ class AdaptiveCacheOnlyActorCritic(
         if tuple(mask.shape) != tuple(raw_scores.shape) or not bool(
             torch.any(mask).item()
         ):
-            raise ValueError("Cache-only candidate mask must allow at least one candidate")
+            raise ValueError("Cache candidate mask must allow at least one candidate")
         distribution_logits = raw_scores.masked_fill(~mask, -float("inf"))
         distribution = torch.distributions.Categorical(logits=distribution_logits)
         selected = (
@@ -1072,7 +1012,7 @@ class AdaptiveCacheOnlyActorCritic(
         candidate_masks: Any,
         candidate_selected_indices: Any,
     ) -> PolicyEvaluation:
-        """Evaluate the Cache-only joint operation-plus-candidate distribution."""
+        """计算 Cache 操作与候选组成的联合分布。"""
 
         observations_t, _ = self._observations(observations)
         operation_contexts_t = torch.as_tensor(
@@ -1106,32 +1046,32 @@ class AdaptiveCacheOnlyActorCritic(
             device=observations_t.device,
         )
         if operation_contexts_t.ndim != 3:
-            raise ValueError("Cache-only operation_contexts must be [B,H,observation_dim]")
+            raise ValueError("Cache operation_contexts must be [B,H,observation_dim]")
         batch_size, head_count, observation_dim = [
             int(value) for value in operation_contexts_t.shape
         ]
         if batch_size != int(observations_t.shape[0]):
-            raise ValueError("Cache-only operation_contexts batch dimension mismatch")
+            raise ValueError("Cache operation_contexts batch dimension mismatch")
         if head_count != self.num_cache_heads or observation_dim != self.observation_dim:
-            raise ValueError("Cache-only operation_contexts shape mismatch")
+            raise ValueError("Cache operation_contexts shape mismatch")
         expected_operation_shape = (
             batch_size,
             self.num_cache_heads,
             len(self.operation_order),
         )
         if tuple(operation_masks_t.shape) != expected_operation_shape:
-            raise ValueError("Cache-only operation_masks shape mismatch")
+            raise ValueError("Cache operation_masks shape mismatch")
         if tuple(operation_actions_t.shape) != (
             batch_size,
             self.num_cache_heads,
         ):
-            raise ValueError("Cache-only operation_actions shape mismatch")
+            raise ValueError("Cache operation_actions shape mismatch")
         if bool(torch.any(operation_actions_t < 0).item()) or bool(
             torch.any(operation_actions_t >= len(self.operation_order)).item()
         ):
-            raise ValueError("Cache-only operation action index out of range")
+            raise ValueError("Cache operation action index out of range")
         if not bool(torch.all(torch.any(operation_masks_t, dim=-1)).item()):
-            raise ValueError("Cache-only operation mask cannot block every operation")
+            raise ValueError("Cache operation mask cannot block every operation")
 
         all_operation_logits, _ = self._operation_logits(
             operation_contexts_t.reshape(batch_size * head_count, observation_dim)
@@ -1149,7 +1089,7 @@ class AdaptiveCacheOnlyActorCritic(
         )
         operation_logits = all_operation_logits[:, head_indices, head_indices, :]
         if tuple(operation_logits.shape) != expected_operation_shape:
-            raise AssertionError("Cache-only operation head diagonal shape mismatch")
+            raise AssertionError("Cache operation head diagonal shape mismatch")
         operation_logits = operation_logits.masked_fill(
             ~operation_masks_t,
             -float("inf"),
@@ -1160,7 +1100,7 @@ class AdaptiveCacheOnlyActorCritic(
             operation_actions_t.unsqueeze(-1),
         ).squeeze(-1)
         if not bool(torch.all(operation_valid).item()):
-            raise ValueError("Cache-only operation action is blocked by its operation mask")
+            raise ValueError("Cache operation action is blocked by its operation mask")
         operation_node_log_prob = operation_distribution.log_prob(operation_actions_t)
         operation_log_prob = operation_node_log_prob.sum(dim=-1)
         operation_entropy = torch.where(
@@ -1170,39 +1110,39 @@ class AdaptiveCacheOnlyActorCritic(
         ).sum(dim=-1)
 
         if candidate_features_t.ndim != 4:
-            raise ValueError("Cache-only candidate_features must be [B,H,C,F]")
+            raise ValueError("Cache candidate_features must be [B,H,C,F]")
         if tuple(candidate_features_t.shape[:2]) != (
             batch_size,
             self.num_cache_heads,
         ) or int(candidate_features_t.shape[-1]) != self.cache_feature_dim:
-            raise ValueError("Cache-only candidate_features shape mismatch")
+            raise ValueError("Cache candidate_features shape mismatch")
         candidate_count = int(candidate_features_t.shape[2])
         if candidate_count <= 0:
-            raise ValueError("Cache-only candidate tensor must have positive width")
+            raise ValueError("Cache candidate tensor must have positive width")
         expected_candidate_shape = (
             batch_size,
             self.num_cache_heads,
             candidate_count,
         )
         if tuple(candidate_masks_t.shape) != expected_candidate_shape:
-            raise ValueError("Cache-only candidate_masks shape mismatch")
+            raise ValueError("Cache candidate_masks shape mismatch")
         if tuple(candidate_selected_t.shape) != (
             batch_size,
             self.num_cache_heads,
         ):
-            raise ValueError("Cache-only candidate_selected_indices shape mismatch")
+            raise ValueError("Cache candidate_selected_indices shape mismatch")
         if not bool(torch.all(torch.any(candidate_masks_t, dim=-1)).item()):
-            raise ValueError("Cache-only candidate mask must have a placeholder or active candidate")
+            raise ValueError("Cache candidate mask must have a placeholder or active candidate")
         if bool(torch.any(candidate_selected_t < 0).item()) or bool(
             torch.any(candidate_selected_t >= candidate_count).item()
         ):
-            raise ValueError("Cache-only candidate selected index out of range")
+            raise ValueError("Cache candidate selected index out of range")
         candidate_valid = candidate_masks_t.gather(
             -1,
             candidate_selected_t.unsqueeze(-1),
         ).squeeze(-1)
         if not bool(torch.all(candidate_valid).item()):
-            raise ValueError("Cache-only candidate selected index is masked")
+            raise ValueError("Cache candidate selected index is masked")
         candidate_contexts = operation_contexts_t.reshape(
             batch_size * head_count,
             observation_dim,
@@ -1247,24 +1187,13 @@ class AdaptiveCacheOnlyActorCritic(
             cache_candidate_log_probs_all=candidate_distribution.logits,
         )
 
-class AdaptiveReplicaAwareCacheOnlyActorCritic(
-    AdaptiveCacheOnlyActorCritic
+class _JointCacheUavOperationActorCriticBase(
+    _CacheOperationActorCriticBase
 ):
-    """Cache-only Cache operation hierarchy with six replica-aware candidate features."""
+    """定义包含显式 UAV 操作的联合 Cache/UAV 策略基础结构。"""
 
-    architecture_id = "adaptive_replica_aware_cache_only_popart"
+    architecture_id = "internal_joint_cache_uav_operation_base"
     architecture_version = 1
-    replica_aware_candidate_features = True
-
-
-class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
-    AdaptiveReplicaAwareCacheOnlyActorCritic
-):
-    """Neutral joint Cache/UAV policy base with explicit UAV operations."""
-
-    architecture_id = "adaptive_joint_cache_replica_aware_uav_operation_joint_base"
-    architecture_version = 1
-    replica_aware_candidate_features = True
     uav_operation_order = ("STAY", "MOVE")
 
     def __init__(
@@ -1284,14 +1213,12 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
             uav_feature_dim,
             num_cache_heads,
             hidden_sizes,
-            # The Cache-only parent does not consume this joint-head count.
+            # Cache 操作基类不使用联合策略的 UAV head 数量。
         )
         if num_uav_heads is None:
             if int(uav_feature_dim) <= 16:
                 raise ValueError("uav_feature_dim must include at least one UAV head")
-            # Historical primitive tensors encoded the UAV-head count as the
-            # residual width.  New target-position features also carry service
-            # vectors, so the explicit count is required for the proposed path.
+            # 目标位置特征包含服务向量，因此显式传入 UAV head 数量以确定特征宽度。
             self.num_uav_heads = int(uav_feature_dim) - 16
         else:
             self.num_uav_heads = int(num_uav_heads)
@@ -1303,7 +1230,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         )
 
     def actor_parameters(self) -> tuple[Any, ...]:
-        """Return exactly the five modules used by the joint actor."""
+        """返回联合 Actor 使用的五个模块。"""
 
         modules = (
             self.encoder,
@@ -1322,12 +1249,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         return parameters
 
     def actor_gradient_parameter_groups(self) -> dict[str, tuple[Any, ...]]:
-        """Return disjoint actor groups for post-backward diagnostics only.
-
-        The actor still has one optimizer and one joint PPO loss.  The shared
-        encoder is intentionally kept separate from the branch-only modules so
-        its gradient is not attributed to either branch.
-        """
+        """返回与四个 Actor 优化器对应的互斥参数组。"""
 
         groups = {
             "cache": tuple(
@@ -1377,7 +1299,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         operation_mask: Any,
         deterministic: bool = False,
     ) -> OperationPolicySample:
-        """Sample one UAV's explicit STAY/MOVE operation."""
+        """为一个 UAV 采样显式的 STAY/MOVE 操作。"""
 
         logits, single = self._uav_operation_logits(observation)
         if not single or tuple(logits.shape) != (
@@ -1433,7 +1355,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         uav_candidate_selected_indices: Any,
         cache_trigger_aux: Any,
     ) -> PolicyEvaluation:
-        """Recompute the full joint log-probability without the old trigger head."""
+        """重新计算不包含旧 Trigger head 的联合 log-probability。"""
 
         cache_evaluation = self.evaluate_cache_operation_primitive(
             observations,
@@ -1559,8 +1481,7 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         if not bool(torch.all(candidate_valid).item()):
             raise ValueError("UAV candidate selected index is masked")
         candidate_active = operation_actions_t == 1
-        # The proposed MOVE tensor contains only legal target positions; STAY
-        # is represented exclusively by the high-level operation head.
+        # MOVE 张量只包含合法目标位置；STAY 由高层 Operation head 单独表示。
         candidate_contexts = operation_contexts_t.reshape(
             batch_size * head_count,
             observation_dim,
@@ -1611,20 +1532,17 @@ class AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic(
         )
 
 
-class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationJointActorCritic
+class _DecoupledCacheUavEncoderActorCriticBase(
+    _JointCacheUavOperationActorCriticBase
 ):
-    """Neutral decoupled-encoder joint Cache/UAV policy base.
+    """建立彼此独立的 Cache、UAV Operation 和 UAV Candidate 编码器。
 
-    The joint base constructor creates the shared encoder and all existing
-    heads in the historical initialization order.  The encoder is then cloned
-    into independent Cache, UAV operation, and UAV candidate representations
-    without consuming additional random numbers; the critic and all
-    head/scorer initialization therefore remain unchanged.
+    初始化顺序保持不变，并通过复制已有编码器初始化新分支，确保正式策略的
+    参数键和随机初始化顺序与当前 checkpoint 一致。
     """
 
     architecture_id = (
-        "adaptive_joint_cache_replica_aware_uav_operation_decoupled_encoder"
+        "internal_decoupled_cache_uav_encoder_base"
     )
     architecture_version = 2
 
@@ -1741,16 +1659,9 @@ class AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic(
 
 
 class AdaptiveJointCacheUAVPPOActorCritic(
-    AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic
+    _DecoupledCacheUavEncoderActorCriticBase
 ):
-    """Proposed joint policy with an explicit binary Cache trigger.
-
-    The production mainline uses a real two-logit ``KEEP/UPDATE`` head while
-    retaining the existing decoupled Cache/UAV encoders, critic, candidate
-    scorers, and STAY/MOVE trigger path.  UPDATE/MOVE candidates are complete
-    target configurations/positions; proposal provenance is metadata only and
-    never a second high-level operation probability.
-    """
+    """使用二分类 Cache Trigger 与 Cache/UAV 条件候选头的正式联合策略。"""
 
     architecture_id = "adaptive_joint_cache_uav_ppo"
     architecture_version = 6
@@ -1758,8 +1669,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
     true_binary_trigger = True
 
     def _candidate_operation_slice(self, candidate_kind: str) -> slice | None:
-        # Proposed candidates are complete target configurations/positions;
-        # there is no ADD/DELETE/SWAP or polar-operation group to rebalance.
+        # proposed_joint 候选是完整目标配置，因此不需要按操作类型平衡 logits。
         del candidate_kind
         return None
 
@@ -1773,9 +1683,8 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         hidden_sizes: tuple[int, ...] = (128, 128),
         num_uav_heads: int | None = None,
     ) -> None:
-        # Bypass the four-way historical operation head so the proposed
-        # state_dict contains only the binary Cache trigger.
-        AdaptiveJointCacheReplicaAwareUAVOperationDecoupledEncoderActorCritic.__init__(
+        # 初始化共享网络后，移除四分类 Cache 操作头，只保留二分类 Trigger。
+        _DecoupledCacheUavEncoderActorCriticBase.__init__(
             self,
             observation_dim,
             action_dim,
@@ -1840,7 +1749,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         observations: Any,
         trigger_aux: Any,
     ) -> tuple[Any, bool]:
-        """Compatibility alias exposing the binary trigger logits only."""
+        """返回二分类 Cache Trigger 的 logits。"""
 
         return self._trigger_logits(observations, trigger_aux)
 
@@ -1968,7 +1877,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         candidate_features: Any,
         deterministic: bool = False,
     ) -> CandidatePolicySample:
-        """Sample from the one unified legal target-configuration set."""
+        """从统一的合法目标配置集合中采样。"""
 
         scores = self.score_cache_update_candidates(
             observation,
@@ -1983,7 +1892,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         observation: Any,
         candidate_features: Any,
     ) -> Any:
-        """Score candidates after UPDATE with the candidate-only encoder."""
+        """在 UPDATE 后使用候选专用编码器为候选打分。"""
 
         scores, single = self._candidate_scores(
             observation,
@@ -2000,7 +1909,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         candidate_logits: Any,
         deterministic: bool = False,
     ) -> CandidatePolicySample:
-        """Sample from an already computed conditional candidate logit vector."""
+        """从已计算的条件候选 logits 向量中采样。"""
 
         scores = torch.as_tensor(candidate_logits, dtype=torch.float32)
         if scores.ndim != 1 or int(scores.numel()) == 0:
@@ -2036,7 +1945,7 @@ class AdaptiveJointCacheUAVPPOActorCritic(
         candidate_selected_indices: Any,
         trigger_aux: Any,
     ) -> PolicyEvaluation:
-        """Evaluate binary triggers plus unified conditional candidates."""
+        """计算二元 Trigger 与统一条件候选的联合分布。"""
 
         observations_t, _ = self._observations(observations)
         contexts_t = torch.as_tensor(
@@ -2177,16 +2086,3 @@ class AdaptiveJointCacheUAVPPOActorCritic(
             cache_operation_log_probs_all=trigger_distribution.logits,
             cache_candidate_log_probs_all=candidate_distribution.logits,
         )
-
-
-class AdaptiveNoPredictionCacheOnlyActorCritic(
-    AdaptiveReplicaAwareCacheOnlyActorCritic
-):
-    """Replica-aware Cache-only hierarchy with future vehicle/popularity inputs masked at rollout time."""
-
-    architecture_id = (
-        "adaptive_replica_aware_cache_only_no_prediction_popart"
-    )
-    architecture_version = 1
-    replica_aware_candidate_features = True
-    no_prediction_ablation = True

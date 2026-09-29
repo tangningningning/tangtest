@@ -1,4 +1,4 @@
-"""Minimal training metrics logging and plotting for PPO runs."""
+"""读取训练指标并绘制正式 PPO 训练曲线。"""
 
 from __future__ import annotations
 
@@ -10,12 +10,9 @@ from typing import Any, Iterable
 import numpy as np
 
 
-SLOTS_PER_EPOCH = 240
 SLOT_METRICS_FILENAME = "slot_metrics.jsonl"
 EPISODE_METRICS_FILENAME = "episode_metrics.jsonl"
 TRAINING_EPOCH_RETURN_PLOT_FILENAME = "training_epoch_return.png"
-# Kept only as a legacy artifact name for fresh-run contamination checks.
-TRAINING_SLOT_REWARD_PLOT_FILENAME = "training_slot_reward.png"
 SLOT_DETAIL_FIELDS = (
     "q",
     "cache_cost",
@@ -28,11 +25,11 @@ SLOT_DETAIL_FIELDS = (
 
 
 def _load_slot_contract(run_dir: Path) -> tuple[int, int]:
-    """Read active episode slots/origin start, with the legacy 240 fallback."""
+    """从正式 run manifest 读取 episode slot 范围。"""
 
     manifest_path = Path(run_dir) / "run_manifest.json"
     if not manifest_path.exists():
-        return SLOTS_PER_EPOCH, 0
+        raise FileNotFoundError(f"缺少正式 run manifest：{manifest_path}")
     try:
         with manifest_path.open("r", encoding="utf-8") as stream:
             manifest = json.load(stream)
@@ -40,23 +37,15 @@ def _load_slot_contract(run_dir: Path) -> tuple[int, int]:
         raise ValueError(f"unable to read plotting protocol manifest: {manifest_path}") from exc
     if not isinstance(manifest, dict):
         raise ValueError(f"plotting protocol manifest must be an object: {manifest_path}")
-    raw_slots = manifest.get(
-        "episode_slots",
-        manifest.get("origins_per_epoch", SLOTS_PER_EPOCH),
-    )
-    raw_start = manifest.get(
-        "origin_start",
-        manifest.get("train_origin_start", 0),
-    )
-    raw_end = manifest.get("origin_end", manifest.get("train_origin_end"))
+    raw_slots = manifest.get("episode_slots")
+    raw_start = manifest.get("origin_start")
+    raw_end = manifest.get("origin_end")
+    if raw_slots is None or raw_start is None or raw_end is None:
+        raise ValueError(f"正式 run manifest 缺少 episode slot 范围：{manifest_path}")
     try:
         episode_slots = int(raw_slots)
         origin_start = int(raw_start)
-        origin_end = (
-            origin_start + episode_slots - 1
-            if raw_end is None
-            else int(raw_end)
-        )
+        origin_end = int(raw_end)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"plotting protocol manifest has invalid slot bounds: {manifest_path}") from exc
     if episode_slots <= 0 or origin_end - origin_start + 1 != episode_slots:
@@ -222,12 +211,7 @@ def append_training_slot_metrics(
     uav_trigger_counts: Iterable[int] | None = None,
     uav_movement_counts: Iterable[int] | None = None,
 ) -> int:
-    """Append or safely complete one epoch of raw transition rewards.
-
-    Existing records are validated against the current episode before missing
-    origins are appended.  A complete epoch is therefore idempotent, while a
-    partial epoch is safely filled without creating duplicate keys.
-    """
+    """追加一个 epoch 的原始 transition reward，或安全补全已有记录。先依据当前 episode 校验已有记录，再追加缺失 origin。完整 epoch 可重复执行而不会产生变化；部分 epoch 会安全补全且不会创建重复键。"""
 
     path = Path(path)
     active_slots, active_origin_start = _resolve_slot_contract(
@@ -401,7 +385,7 @@ def _finite_episode_return(value: Any) -> float:
 
 
 def _read_episode_returns(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Read one finite raw return for every contiguous completed Epoch."""
+    """为每个连续完成的 Epoch 读取一个有限的原始回报。"""
 
     records: dict[int, float] = {}
     if not path.exists():
@@ -475,7 +459,7 @@ def _full_window_moving_average(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def update_training_epoch_return_plot(run_dir: Path) -> Path:
-    """Render the only supported PPO training plot from Epoch returns."""
+    """根据 Epoch 回报生成当前唯一支持的 PPO 训练图。"""
 
     import matplotlib
 

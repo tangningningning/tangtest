@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Generate one complete randomized full-episode realization.
+"""生成一个完整的随机化 episode realization。
 
-The entrypoint is intentionally a thin orchestration layer.  It derives named
-episode streams, runs SUMO for a temporary realization, reuses the frozen
-service catalog/GRU/calibration residual bank, and writes every realization
-artifact below the caller-provided output directory.  It never trains a model
-or writes the shared ``data/generated`` artifacts.
+入口负责派生 episode 随机流、运行 SUMO、复用冻结的服务目录、GRU 和校准残差，
+并将 realization 文件写入调用方指定的输出目录。它不会训练模型或改写共享产物。
 """
 
 from __future__ import annotations
@@ -38,10 +35,10 @@ from scenario import task_scenario as task
 from scenario.realization import EPISODE_SEED_STREAMS, derive_episode_seeds
 
 
-FORMAL_RUN = PROJECT_ROOT / "runs" / "ppo_v6_popart_actor1e4_fresh_20260910"
 EXPECTED_SLOTS = 300
 EPISODE_MANIFEST_FILENAME = "episode_manifest.json"
 EPISODE_MANIFEST_SCHEMA_VERSION = "episode_manifest_v1"
+RUN_MANIFEST_FILENAME = "run_manifest.json"
 
 
 def resolve_project_path(value: str | Path) -> Path:
@@ -59,21 +56,51 @@ def is_within(path: Path, parent: Path) -> bool:
     return True
 
 
+def protected_output_directories() -> dict[str, set[Path]]:
+    """查找已有正式训练目录和 episode 池，避免生成器覆盖它们。"""
+
+    run_root = PROJECT_ROOT / "runs"
+    run_directories = {
+        manifest.parent.resolve(strict=False)
+        for manifest in run_root.rglob(RUN_MANIFEST_FILENAME)
+        if manifest.is_file()
+    } if run_root.is_dir() else set()
+    pool_root = PROJECT_ROOT / "environment_data"
+    episode_directories = {
+        manifest.parent.resolve(strict=False)
+        for manifest in pool_root.rglob(EPISODE_MANIFEST_FILENAME)
+        if manifest.is_file() and manifest.parent.name.startswith("episode_")
+    } if pool_root.is_dir() else set()
+    pool_directories = {directory.parent for directory in episode_directories}
+    return {
+        "正式 run": run_directories,
+        "正式 episode 池": pool_directories,
+    }
+
+
+def paths_overlap(left: Path, right: Path) -> bool:
+    """判断两个路径是否相同或存在祖先/后代关系。"""
+
+    return is_within(left, right) or is_within(right, left)
+
+
 def prepare_output_dir(value: str | Path) -> Path:
     output_dir = resolve_project_path(value)
-    forbidden = (
-        PROJECT_ROOT / "data" / "generated",
-        FORMAL_RUN,
-    )
-    if output_dir == PROJECT_ROOT or any(
-        is_within(output_dir, path.resolve(strict=False)) for path in forbidden
-    ):
-        raise ValueError(
-            "output-dir must not be the repository root, data/generated, "
-            "or the formal V6 run directory"
-        )
+    protected = {
+        "仓库根目录": {PROJECT_ROOT.resolve(strict=False)},
+        "data/generated": {(PROJECT_ROOT / "data" / "generated").resolve(strict=False)},
+        **protected_output_directories(),
+    }
+    for label, paths in protected.items():
+        if any(
+            output_dir == path
+            if label == "仓库根目录"
+            else paths_overlap(output_dir, path)
+            for path in paths
+        ):
+            raise ValueError(f"output-dir 不能覆盖或包含受保护目录：{label}")
     if output_dir.exists() and not output_dir.is_dir():
-        raise ValueError(f"output-dir is not a directory: {output_dir}")
+        raise ValueError(f"output-dir 不是目录：{output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -125,7 +152,7 @@ def _git_identity() -> tuple[str, bool]:
 
 
 def _generation_config_payload(config: dict[str, Any]) -> dict[str, Any]:
-    """Return only fields that can change generated episode artifacts."""
+    """仅返回会影响生成 episode artifact 的配置字段。"""
 
     get = project_config_module.get_config_value
     return {
@@ -314,7 +341,7 @@ def validate_episode_provenance(
     *,
     check_source_identity: bool = True,
 ) -> dict[str, Any]:
-    """Fail closed when an existing realization is not provenance verified."""
+    """现有 realization 未通过来源核验时，禁止继续使用。"""
 
     manifest_path = Path(directory) / EPISODE_MANIFEST_FILENAME
     prefix = "REALIZATION_PROVENANCE_MISMATCH"
@@ -570,10 +597,7 @@ def run_episode(
         raise ValueError("frozen GRU service count does not match config")
 
     protected_data = PROJECT_ROOT / "data" / "generated"
-    protected_before = {
-        "data/generated": snapshot_tree(protected_data),
-        "formal V6 run": snapshot_tree(FORMAL_RUN),
-    }
+    protected_before = snapshot_tree(protected_data)
 
     total_start = time.perf_counter()
 
@@ -750,8 +774,7 @@ def run_episode(
         horizon_steps=horizon_steps,
     )
     manifest_path = write_episode_manifest(config, int(episode_seed), output_dir)
-    assert_snapshot_unchanged("data/generated", protected_data, protected_before["data/generated"])
-    assert_snapshot_unchanged("formal V6 run", FORMAL_RUN, protected_before["formal V6 run"])
+    assert_snapshot_unchanged("data/generated", protected_data, protected_before)
     total_runtime = time.perf_counter() - total_start
 
     print("单 Episode realization 生成完成：")

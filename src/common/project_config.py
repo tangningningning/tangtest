@@ -27,9 +27,9 @@ except ModuleNotFoundError:  # pragma: no cover - only for Python < 3.11
 def find_project_root() -> Path:
     candidates = (Path(__file__).resolve().parents[2], Path.cwd().resolve())
     for candidate in candidates:
-        if (candidate / "configs" / "system_config.toml").is_file() and (candidate / "data").is_dir():
+        if (candidate / "configs" / "proposed" / "system_config.toml").is_file() and (candidate / "data").is_dir():
             return candidate
-    raise FileNotFoundError("无法找到包含 configs/system_config.toml 的项目根目录。")
+    raise FileNotFoundError("无法找到包含 configs/proposed/system_config.toml 的项目根目录。")
 
 
 def resolve_path(project_root: Path, value: str | Path) -> Path:
@@ -40,7 +40,7 @@ def resolve_path(project_root: Path, value: str | Path) -> Path:
 
 
 def load_config(
-    path: str | Path = "configs/system_config.toml",
+    path: str | Path = "configs/proposed/system_config.toml",
     *,
     require_artifacts: bool = True,
 ) -> dict[str, Any]:
@@ -49,7 +49,7 @@ def load_config(
     with config_path.open("rb") as stream:
         config = tomllib.load(stream)
     if not isinstance(config, dict):
-        raise ValueError("configs/system_config.toml 根对象必须是 table。")
+        raise ValueError("configs/proposed/system_config.toml 根对象必须是 table。")
     config["_meta"] = {
         "config_path": str(config_path),
         "project_root": str(project_root),
@@ -67,29 +67,19 @@ def get_config_value(config: dict[str, Any], dotted_key: str, default: Any = Non
     return current
 
 
-PPO_DATA_PROTOCOL_LEGACY_SPLIT = "legacy_split"
 PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED = "full_episode_randomized"
 
 
 def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
-    """Return the validated PPO episode/data protocol from a project config.
-
-    The historical split remains the default when ``protocol`` is absent.  A
-    full-episode protocol is explicit so an old 240-origin run cannot be
-    silently reinterpreted as a 300-origin run.
-    """
+    """读取并校验正式的完整 episode 数据协议。"""
 
     raw_protocol = get_config_value(config, "algorithm.ppo.data_protocol")
     if not isinstance(raw_protocol, dict):
         raise ValueError("缺少 algorithm.ppo.data_protocol 配置表。")
-    protocol = str(raw_protocol.get("protocol", PPO_DATA_PROTOCOL_LEGACY_SPLIT))
-    if protocol not in {
-        PPO_DATA_PROTOCOL_LEGACY_SPLIT,
-        PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
-    }:
+    protocol = str(raw_protocol.get("protocol", ""))
+    if protocol != PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
         raise ValueError(
-            "algorithm.ppo.data_protocol.protocol 只支持 "
-            "legacy_split/full_episode_randomized。"
+            "algorithm.ppo.data_protocol.protocol 必须为 full_episode_randomized。"
         )
 
     dt_s = float(get_config_value(config, "simulation.dt_s"))
@@ -140,65 +130,45 @@ def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("algorithm.ppo.num_minibatches 必须是正整数。")
     num_minibatches = int(num_minibatches_value)
 
-    if protocol == PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
-        configured_episode_slots = read_int("episode_slots")
-        configured_train_end = read_int("train_origin_end")
-        configured_rollout_steps = read_int("rollout_steps")
-        configured_terminal = read_int("terminal_origin")
-        assert (
-            configured_episode_slots is not None
-            and configured_train_end is not None
-            and configured_rollout_steps is not None
-            and configured_terminal is not None
+    configured_episode_slots = read_int("episode_slots")
+    configured_train_end = read_int("train_origin_end")
+    configured_rollout_steps = read_int("rollout_steps")
+    configured_terminal = read_int("terminal_origin")
+    assert (
+        configured_episode_slots is not None
+        and configured_train_end is not None
+        and configured_rollout_steps is not None
+        and configured_terminal is not None
+    )
+    if configured_episode_slots != physical_episode_slots:
+        raise ValueError(
+            "full_episode_randomized episode_slots 必须等于 "
+            "simulation.episode_time_s / simulation.dt_s："
+            f"configured={configured_episode_slots}, "
+            f"expected={physical_episode_slots}。"
         )
-        if configured_episode_slots != physical_episode_slots:
-            raise ValueError(
-                "full_episode_randomized episode_slots 必须等于 "
-                "simulation.episode_time_s / simulation.dt_s："
-                f"configured={configured_episode_slots}, "
-                f"expected={physical_episode_slots}。"
-            )
-        if configured_train_end != configured_episode_slots - 1:
-            raise ValueError(
-                "full_episode_randomized train_origin_end 必须等于 episode_slots-1。"
-            )
-        if configured_rollout_steps != configured_episode_slots:
-            raise ValueError(
-                "full_episode_randomized rollout_steps 必须等于 episode_slots。"
-            )
-        if configured_terminal != configured_episode_slots - 1:
-            raise ValueError(
-                "full_episode_randomized terminal_origin 必须等于 episode_slots-1。"
-            )
-        if "test_origin_start" in raw_protocol or "test_origin_end" in raw_protocol:
-            raise ValueError(
-                "full_episode_randomized 不允许设置同一 realization 内的 test split。"
-            )
-        train_end = configured_train_end
-        episode_slots = configured_episode_slots
-        configured_rollout = configured_rollout_steps
-        terminal_origin = configured_terminal
-        test_start = None
-        test_end = None
-    else:
-        train_end = read_int("train_origin_end")
-        test_start = read_int("test_origin_start")
-        test_end = read_int("test_origin_end")
-        assert train_end is not None and test_start is not None and test_end is not None
-        if train_end < train_start:
-            raise ValueError("PPO train origin 区间必须非空且按升序排列。")
-        if test_start != train_end + 1:
-            raise ValueError("PPO train/test origin 区间必须连续、无重叠且无空洞。")
-        if test_end < test_start:
-            raise ValueError("PPO test origin 区间必须非空且按升序排列。")
-        if test_end != physical_episode_slots - 1:
-            raise ValueError(
-                "PPO train/test origin 区间必须完整覆盖正式 episode："
-                f"test_origin_end={test_end}, expected={physical_episode_slots - 1}。"
-            )
-        episode_slots = train_end - train_start + 1
-        configured_rollout = read_int("rollout_steps", required=False)
-        terminal_origin = train_end
+    if configured_train_end != configured_episode_slots - 1:
+        raise ValueError(
+            "full_episode_randomized train_origin_end 必须等于 episode_slots-1。"
+        )
+    if configured_rollout_steps != configured_episode_slots:
+        raise ValueError(
+            "full_episode_randomized rollout_steps 必须等于 episode_slots。"
+        )
+    if configured_terminal != configured_episode_slots - 1:
+        raise ValueError(
+            "full_episode_randomized terminal_origin 必须等于 episode_slots-1。"
+        )
+    if "test_origin_start" in raw_protocol or "test_origin_end" in raw_protocol:
+        raise ValueError(
+            "full_episode_randomized 不允许设置同一 realization 内的 test split。"
+        )
+    train_end = configured_train_end
+    episode_slots = configured_episode_slots
+    configured_rollout = configured_rollout_steps
+    terminal_origin = configured_terminal
+    test_start = None
+    test_end = None
 
     train_origin_count = train_end - train_start + 1
     if train_origin_count <= 0 or train_origin_count % num_minibatches != 0:
@@ -675,7 +645,7 @@ def validate_config(
 
     uav_count = int(get_config_value(config, "nodes.uav.count"))
     if uav_count < 1:
-        raise ValueError("nodes.uav.count 必须至少为1，请检查 configs/system_config.toml。")
+        raise ValueError("nodes.uav.count 必须至少为1，请检查 configs/proposed/system_config.toml。")
     if require_artifacts:
         uav_instances = get_config_value(config, "nodes.uav.instances", [])
         if len(uav_instances) != uav_count:
@@ -719,7 +689,7 @@ def validate_config(
             configured_tv,
         ):
             raise ValueError(
-                "vehicle_roles.json 车辆数量必须与 configs/system_config.toml 的正式 baseline 一致。"
+                "vehicle_roles.json 车辆数量必须与 configs/proposed/system_config.toml 的正式 baseline 一致。"
             )
         if len(research) != len(set(research)) or len(sv) != len(set(sv)) or len(tv) != len(set(tv)):
             raise ValueError("vehicle_roles.json 研究车辆角色列表不能包含重复 ID。")
@@ -817,58 +787,43 @@ def validate_config(
         get_config_value(
             config,
             "algorithm.ppo.configuration_control_mode",
-            "legacy_exact",
+            "adaptive_joint_cache_uav_reconfiguration",
         )
     )
-    if configuration_control_mode not in {
-        "legacy_exact",
-        "policy_primitive",
-        "policy_primitive_cache_operation",
-        "policy_primitive_joint_cache_uav_operation",
-        "adaptive_joint_cache_uav_reconfiguration",
-    }:
+    proposed_control_mode = "adaptive_joint_cache_uav_reconfiguration"
+    if configuration_control_mode != proposed_control_mode:
         raise ValueError(
-            "algorithm.ppo.configuration_control_mode 只支持 "
-            "legacy_exact/policy_primitive/policy_primitive_cache_operation/"
-            "policy_primitive_joint_cache_uav_operation/"
-            "adaptive_joint_cache_uav_reconfiguration。"
+            "当前正式训练只支持 configuration_control_mode="
+            f"{proposed_control_mode}。"
         )
     policy_schema = str(
-        get_config_value(config, "algorithm.ppo.policy_schema", "adaptive_primitive_v1")
+        get_config_value(
+            config,
+            "algorithm.ppo.policy_schema",
+            "adaptive_joint_cache_uav_ppo",
+        )
     )
     proposed_schema = "adaptive_joint_cache_uav_ppo"
-    supported_policy_schemas = {
-        "adaptive_primitive_v1",
-        "adaptive_primitive_v2",
-        "adaptive_primitive_v2_grouped",
-        "adaptive_primitive_v3_horizon_grouped",
-        "adaptive_primitive_v4_horizon_grouped_separate_critic",
-        "adaptive_primitive_v5_horizon_grouped_separate_critic_optimization",
-        "adaptive_primitive_v6_horizon_grouped_separate_critic_popart",
-        "adaptive_cache_only_popart",
-        "adaptive_replica_aware_cache_only_popart",
-        "adaptive_replica_aware_cache_only_no_prediction_popart",
-        proposed_schema,
-    }
-    if policy_schema not in supported_policy_schemas:
+    if policy_schema != proposed_schema:
         raise ValueError(
-            "algorithm.ppo.policy_schema is not a supported semantic policy schema."
+            "当前训练器仅支持正式 proposed_joint 策略："
+            f"{proposed_schema}"
         )
     candidate_advantage_source = str(
         get_config_value(
             config,
             "algorithm.ppo.uav_candidate_advantage_source",
-            "GLOBAL_GAE",
+            "EXACT_Q_LISTWISE",
         )
     )
     candidate_advantage_normalization = str(
         get_config_value(
             config,
             "algorithm.ppo.candidate_advantage_normalization",
-            "LEGACY_GLOBAL_GAE",
+            "EXACT_Q_LISTWISE",
         )
     )
-    legacy_exact_q_temperature = float(
+    exact_q_listwise_temperature = float(
         get_config_value(config, "algorithm.ppo.exact_q_listwise_temperature", 1.0)
     )
     cache_teacher_scale_mode = str(
@@ -907,99 +862,45 @@ def validate_config(
         get_config_value(
             config,
             "algorithm.ppo.uav_exact_q_listwise_temperature",
-            legacy_exact_q_temperature,
+            exact_q_listwise_temperature,
         )
     )
     for field, value in {
-        "exact_q_listwise_temperature": legacy_exact_q_temperature,
+        "exact_q_listwise_temperature": exact_q_listwise_temperature,
         "uav_exact_q_listwise_temperature": uav_exact_q_temperature,
     }.items():
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"algorithm.ppo.{field} 必须是正的有限数。")
-    if policy_schema == proposed_schema:
-        if candidate_advantage_source != "EXACT_Q_LISTWISE":
-            raise ValueError(
-                "proposed_joint requires algorithm.ppo.uav_candidate_advantage_source="
-                "EXACT_Q_LISTWISE."
-            )
-        if candidate_advantage_normalization != "EXACT_Q_LISTWISE":
-            raise ValueError(
-                "proposed_joint requires algorithm.ppo.candidate_advantage_normalization=EXACT_Q_LISTWISE."
-            )
-    if configuration_control_mode in {
-        "policy_primitive",
-        "policy_primitive_cache_operation",
-        "policy_primitive_joint_cache_uav_operation",
-    } and policy_schema not in supported_policy_schemas:
-        raise ValueError("policy_primitive requires a supported policy schema")
-    if (
-        configuration_control_mode == "policy_primitive_cache_operation"
-        and policy_schema
-        not in {
-            "adaptive_cache_only_popart",
-            "adaptive_replica_aware_cache_only_popart",
-            "adaptive_replica_aware_cache_only_no_prediction_popart",
-        }
-    ):
+    if candidate_advantage_source != "EXACT_Q_LISTWISE":
         raise ValueError(
-            "policy_primitive_cache_operation requires "
-            "adaptive_cache_only_popart/"
-            "adaptive_replica_aware_cache_only_popart/"
-            "adaptive_replica_aware_cache_only_no_prediction_popart."
+            "正式策略要求 algorithm.ppo.uav_candidate_advantage_source=EXACT_Q_LISTWISE。"
         )
-    if (
-        configuration_control_mode
-        in {
-            "policy_primitive_joint_cache_uav_operation",
-            "adaptive_joint_cache_uav_reconfiguration",
-        }
-        and policy_schema != proposed_schema
-    ):
+    if candidate_advantage_normalization != "EXACT_Q_LISTWISE":
         raise ValueError(
-            "the proposed joint reconfiguration control mode requires "
-            "adaptive_joint_cache_uav_ppo."
+            "正式策略要求 algorithm.ppo.candidate_advantage_normalization=EXACT_Q_LISTWISE。"
         )
     kl_gate_mode = str(
-        get_config_value(config, "algorithm.ppo.kl_gate_mode", "joint")
+        get_config_value(config, "algorithm.ppo.kl_gate_mode", "branch_specific")
     )
-    if kl_gate_mode not in {"joint", "branch_specific"}:
+    if kl_gate_mode != "branch_specific":
         raise ValueError(
-            "algorithm.ppo.kl_gate_mode 只支持 joint/branch_specific。"
-        )
-    if (
-        kl_gate_mode == "branch_specific"
-        and policy_schema != proposed_schema
-    ):
-        raise ValueError(
-            "algorithm.ppo.kl_gate_mode=branch_specific requires the proposed joint policy schema."
-        )
-    if (
-        policy_schema == proposed_schema
-        and kl_gate_mode != "branch_specific"
-    ):
-        raise ValueError(
-            "the proposed joint policy schema requires algorithm.ppo.kl_gate_mode=branch_specific."
+            "正式策略要求 algorithm.ppo.kl_gate_mode=branch_specific。"
         )
     cache_kl_control = str(
-        get_config_value(config, "algorithm.ppo.cache_kl_control", "epoch")
+        get_config_value(
+            config,
+            "algorithm.ppo.cache_kl_control",
+            "minibatch_early_stop",
+        )
     )
-    if cache_kl_control not in {"epoch", "minibatch_early_stop"}:
+    if cache_kl_control != "minibatch_early_stop":
         raise ValueError(
-            "algorithm.ppo.cache_kl_control 只支持 epoch/minibatch_early_stop。"
+            "正式策略要求 algorithm.ppo.cache_kl_control=minibatch_early_stop。"
         )
-    if cache_kl_control == "minibatch_early_stop" and policy_schema != proposed_schema:
+    target_kl = get_config_value(config, "algorithm.ppo.target_kl", None)
+    if target_kl is None or not math.isfinite(float(target_kl)) or float(target_kl) <= 0.0:
         raise ValueError(
-            "algorithm.ppo.cache_kl_control=minibatch_early_stop requires the proposed joint policy schema."
-        )
-    if cache_kl_control == "minibatch_early_stop":
-        target_kl = get_config_value(config, "algorithm.ppo.target_kl", None)
-        if target_kl is None or not math.isfinite(float(target_kl)) or float(target_kl) <= 0.0:
-            raise ValueError(
-                "algorithm.ppo.cache_kl_control=minibatch_early_stop requires a positive finite target_kl."
-            )
-    if policy_schema == proposed_schema and cache_kl_control != "minibatch_early_stop":
-        raise ValueError(
-            "the proposed joint policy schema requires minibatch_early_stop Cache KL control."
+            "minibatch_early_stop 需要正的有限 target_kl。"
         )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
@@ -1158,8 +1059,8 @@ def validate_config(
         if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
             raise ValueError(f"simulation.{label} 必须是 dt_s 的整数倍。")
 
-    # The historical split remains the default; the new full-episode mode has
-    # no same-realization test interval and validates its own terminal contract.
+    # 当前 PPO 使用完整 episode 随机化协议，
+    # 并在协议校验中验证 episode 终止位置。
     get_ppo_data_protocol(config)
     research_count = int(get_config_value(config, "simulation.num_research_vehicles"))
     service_count = int(get_config_value(config, "simulation.num_service_vehicles"))
@@ -1335,7 +1236,7 @@ def validate_config(
 
 def main() -> int:
     config = load_config()
-    print("configs/system_config.toml 解析与校验通过")
+    print("configs/proposed/system_config.toml 解析与校验通过")
     print(f"config_hash={config_hash(config)}")
     print(
         "vehicle_counts="
