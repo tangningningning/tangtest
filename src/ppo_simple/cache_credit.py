@@ -1817,3 +1817,143 @@ def _audit_value_stats(values: list[float]) -> dict[str, float | None]:
         "p95": float(np.percentile(array, 95.0)),
         "max": float(np.max(array)),
     }
+
+def _cache_per_head_old_new_kl(
+    old_operation_log_probs: Any,
+    new_operation_log_probs: Any,
+    old_candidate_log_probs: Any,
+    new_candidate_log_probs: Any,
+    operation_masks: Any,
+    candidate_masks: Any,
+) -> Any:
+    """返回每个 Cache head 从旧策略到新策略的 KL。每个 head 的动作集合包含 KEEP 和所有合法 UPDATE 候选；UPDATE 概率由 Trigger 概率与条件候选概率相乘得到，与 Stage2A 损失使用的原子动作 logp 一致。mask 固定使用 rollout 数据，padding 候选的贡献为零。"""
+
+    if torch is None:  # pragma: no cover - Trainer 构造时已检查依赖
+        raise RuntimeError("Cache per-head KL requires torch")
+    old_operation = torch.as_tensor(old_operation_log_probs)
+    new_operation = torch.as_tensor(
+        new_operation_log_probs,
+        dtype=old_operation.dtype,
+        device=old_operation.device,
+    )
+    old_candidate = torch.as_tensor(
+        old_candidate_log_probs,
+        dtype=old_operation.dtype,
+        device=old_operation.device,
+    )
+    new_candidate = torch.as_tensor(
+        new_candidate_log_probs,
+        dtype=old_operation.dtype,
+        device=old_operation.device,
+    )
+    operation_mask = torch.as_tensor(
+        operation_masks,
+        dtype=torch.bool,
+        device=old_operation.device,
+    )
+    candidate_mask = torch.as_tensor(
+        candidate_masks,
+        dtype=torch.bool,
+        device=old_operation.device,
+    )
+    if old_operation.ndim != 3 or int(old_operation.shape[-1]) != 2:
+        raise ValueError("Cache operation log-probabilities must be [B,H,2]")
+    if tuple(new_operation.shape) != tuple(old_operation.shape):
+        raise ValueError("Cache old/new operation log-probability shape mismatch")
+    if old_candidate.ndim != 3 or tuple(new_candidate.shape) != tuple(old_candidate.shape):
+        raise ValueError("Cache old/new candidate log-probability shape mismatch")
+    if tuple(operation_mask.shape) != tuple(old_operation.shape):
+        raise ValueError("Cache operation mask shape mismatch")
+    if tuple(candidate_mask.shape) != tuple(old_candidate.shape):
+        raise ValueError("Cache candidate mask shape mismatch")
+    if not bool(torch.all(torch.any(operation_mask, dim=-1)).item()):
+        raise ValueError("Cache operation mask blocks every action")
+    if not bool(torch.all(torch.any(candidate_mask, dim=-1)).item()):
+        raise ValueError("Cache candidate mask blocks every candidate")
+    for values, mask, label in (
+        (old_operation, operation_mask, "old operation"),
+        (new_operation, operation_mask, "new operation"),
+        (old_candidate, candidate_mask, "old candidate"),
+        (new_candidate, candidate_mask, "new candidate"),
+    ):
+        if not bool(torch.all(torch.isfinite(values[mask])).item()):
+            raise FloatingPointError(f"Cache {label} log-probabilities are non-finite")
+
+    safe_old_operation = torch.where(
+        operation_mask, old_operation, torch.zeros_like(old_operation)
+    )
+    safe_new_operation = torch.where(
+        operation_mask, new_operation, torch.zeros_like(new_operation)
+    )
+    safe_old_candidate = torch.where(
+        candidate_mask, old_candidate, torch.zeros_like(old_candidate)
+    )
+    safe_new_candidate = torch.where(
+        candidate_mask, new_candidate, torch.zeros_like(new_candidate)
+    )
+    old_operation_probabilities = torch.where(
+        operation_mask,
+        torch.exp(safe_old_operation),
+        torch.zeros_like(safe_old_operation),
+    )
+    old_candidate_probabilities = torch.where(
+        candidate_mask,
+        torch.exp(safe_old_candidate),
+        torch.zeros_like(safe_old_candidate),
+    )
+    old_keep = old_operation_probabilities[..., 0]
+    old_update = old_operation_probabilities[..., 1]
+    keep_kl = old_keep * (
+        safe_old_operation[..., 0] - safe_new_operation[..., 0]
+    )
+    update_log_delta = (
+        safe_old_operation[..., 1].unsqueeze(-1)
+        + safe_old_candidate
+        - safe_new_operation[..., 1].unsqueeze(-1)
+        - safe_new_candidate
+    )
+    update_kl = (
+        old_update.unsqueeze(-1)
+        * old_candidate_probabilities
+        * update_log_delta
+    ).sum(dim=-1)
+    return torch.clamp(keep_kl + update_kl, min=0.0)
+
+def _candidate_probability_log_distribution(
+    probabilities: Any,
+    candidate_valid_mask: Any,
+) -> tuple[Any, Any]:
+    """返回归一化候选 log probability 和安全的 KL mask。没有合法 UPDATE 候选的状态仍有定义良好的 Cache 动作分布，此时 KEEP 是唯一动作。Candidate 策略在这些行上返回全零概率，因此 KL 计算中只为 UPDATE 条件分布加入带 mask 的单位质量哨兵值。"""
+
+    if torch is None:  # pragma: no cover - Trainer 构造时已检查依赖
+        raise RuntimeError("candidate distributions require torch")
+    probability_t = torch.as_tensor(probabilities)
+    valid_t = torch.as_tensor(
+        candidate_valid_mask,
+        dtype=torch.bool,
+        device=probability_t.device,
+    )
+    if probability_t.ndim != 3 or tuple(valid_t.shape) != tuple(probability_t.shape):
+        raise ValueError("Cache candidate probability/mask shape mismatch")
+    if int(probability_t.shape[-1]) < 1:
+        raise ValueError("Cache candidate distributions require a padded candidate")
+    active = valid_t.any(dim=-1)
+    fallback = torch.zeros_like(valid_t)
+    fallback[..., 0] = ~active
+    kl_mask = valid_t | fallback
+    safe_probabilities = torch.where(
+        valid_t, probability_t, torch.zeros_like(probability_t)
+    )
+    fallback_probabilities = torch.zeros_like(probability_t)
+    fallback_probabilities[..., 0] = 1.0
+    safe_probabilities = torch.where(
+        active.unsqueeze(-1), safe_probabilities, fallback_probabilities
+    )
+    if not bool(torch.all(torch.isfinite(safe_probabilities[kl_mask])).item()):
+        raise FloatingPointError("Cache candidate probabilities are non-finite")
+    log_probabilities = torch.where(
+        kl_mask,
+        torch.log(safe_probabilities.clamp_min(1.0e-12)),
+        torch.zeros_like(safe_probabilities),
+    )
+    return log_probabilities, kl_mask

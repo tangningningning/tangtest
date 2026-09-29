@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Trigger-conditioned UAV configuration optimization.
+"""在 Trigger 固定条件下优化 UAV 配置。
 
 本模块只解决冻结框架中的 WHERE：
 
@@ -55,7 +55,7 @@ class UavSearchConfig:
     movement_energy_coefficient_j_per_m: float
     movement_fixed_cost: float
     lambda_movement: float
-    movement_cost_weight: float = 1.0
+    movement_cost_weight: float
 
     @property
     def max_move_distance_m(self) -> float:
@@ -76,28 +76,16 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         refine_rounds=int(get(config, "algorithm.uav.refine_rounds")),
         refine_num_angles=int(get(config, "algorithm.uav.refine_num_angles")),
         refine_radius_shrink=float(get(config, "algorithm.uav.refine_radius_shrink")),
-        exploration_num_angles=int(
-            get(config, "algorithm.uav.exploration_num_angles", 8)
-        ),
+        exploration_num_angles=int(get(config, "algorithm.uav.exploration_num_angles")),
         exploration_radius_fractions=tuple(
             float(value)
-            for value in get(
-                config,
-                "algorithm.uav.exploration_radius_fractions",
-                [0.5, 1.0],
-            )
+            for value in get(config, "algorithm.uav.exploration_radius_fractions")
         ),
         demand_anchor_scales=tuple(
             float(value)
-            for value in get(
-                config,
-                "algorithm.uav.demand_anchor_scales",
-                [0.5, 1.0],
-            )
+            for value in get(config, "algorithm.uav.demand_anchor_scales")
         ),
-        target_candidate_capacity=int(
-            get(config, "algorithm.uav.target_candidate_capacity", 24)
-        ),
+        target_candidate_capacity=int(get(config, "algorithm.uav.target_candidate_capacity")),
         max_coordinate_rounds=int(get(config, "algorithm.uav.max_coordinate_rounds")),
         position_tolerance_m=float(get(config, "algorithm.uav.position_tolerance_m")),
         objective_tolerance=float(get(config, "algorithm.uav.objective_tolerance")),
@@ -109,9 +97,7 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         ),
         movement_fixed_cost=float(get(config, "nodes.uav.movement.movement_fixed_cost")),
         lambda_movement=float(get(config, "objective.lambda_movement")),
-        movement_cost_weight=float(
-            get(config, "objective.uav_movement_cost_weight", 1.0)
-        ),
+        movement_cost_weight=float(get(config, "objective.uav_movement_cost_weight")),
     )
 
 

@@ -6,12 +6,23 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable
 
 import numpy as np
 
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - 仅在调用 Exact-Q tensor helper 时需要
+    torch = None  # type: ignore[assignment]
+
 
 DEFAULT_Q_EQUALITY_TOLERANCE = 1.0e-12
+
+
+def _require_torch() -> None:
+    if torch is None:
+        raise RuntimeError("UAV Exact-Q helper 需要 PyTorch。")
 
 
 def _as_finite_array(value: Any, *, name: str, dtype: Any) -> np.ndarray:
@@ -596,3 +607,687 @@ def merge_uav_operation_diagnostic_arrays(
         arrays,
         q_equality_tolerance=q_equality_tolerance,
     )
+
+def _exact_q_policy_quality_metrics(
+    probabilities_before: Any,
+    probabilities_after: Any,
+    q_values: Any,
+    valid_mask: Any,
+) -> dict[str, float]:
+    """在同一批冻结的 Exact-Q 候选数据上比较两个策略。"""
+
+    before = np.asarray(probabilities_before, dtype=np.float64)
+    after = np.asarray(probabilities_after, dtype=np.float64)
+    q = np.asarray(q_values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if before.shape != after.shape or before.shape != q.shape or before.shape != valid.shape:
+        raise ValueError("exact-Q policy quality tensor shapes do not match")
+    if before.ndim < 1 or not np.all(np.isfinite(q[valid])):
+        raise ValueError("exact-Q policy quality tensors are invalid")
+    top1_before: list[float] = []
+    top1_after: list[float] = []
+    regret_before: list[float] = []
+    regret_after: list[float] = []
+    expected_before: list[float] = []
+    expected_after: list[float] = []
+    policy_kls: list[float] = []
+    for prefix in np.ndindex(q.shape[:-1]):
+        legal = np.flatnonzero(valid[prefix])
+        if legal.size == 0:
+            continue
+        p_before = before[prefix][legal]
+        p_after = after[prefix][legal]
+        q_row = q[prefix][legal]
+        if (
+            not np.all(np.isfinite(p_before))
+            or not np.all(np.isfinite(p_after))
+            or np.any(p_before < 0.0)
+            or np.any(p_after < 0.0)
+            or not np.all(np.isfinite(q_row))
+        ):
+            raise FloatingPointError("exact-Q policy quality contains NaN/Inf")
+        before_sum = float(p_before.sum())
+        after_sum = float(p_after.sum())
+        if before_sum <= 0.0 or after_sum <= 0.0:
+            raise FloatingPointError("exact-Q candidate policy probability mass is empty")
+        p_before = p_before / before_sum
+        p_after = p_after / after_sum
+        best_q = float(np.max(q_row))
+        best_mask = np.isclose(q_row, best_q, rtol=1.0e-10, atol=1.0e-10)
+        selected_before = int(np.argmax(p_before))
+        selected_after = int(np.argmax(p_after))
+        selected_q_before = float(q_row[selected_before])
+        selected_q_after = float(q_row[selected_after])
+        top1_before.append(float(bool(best_mask[selected_before])))
+        top1_after.append(float(bool(best_mask[selected_after])))
+        regret_before.append(max(0.0, best_q - selected_q_before))
+        regret_after.append(max(0.0, best_q - selected_q_after))
+        expected_before.append(float(np.dot(p_before, q_row)))
+        expected_after.append(float(np.dot(p_after, q_row)))
+        positive = p_before > 0.0
+        kl = float(
+            np.sum(
+                p_before[positive]
+                * (
+                    np.log(p_before[positive])
+                    - np.log(np.maximum(p_after[positive], 1.0e-300))
+                )
+            )
+        )
+        policy_kls.append(max(0.0, kl))
+    if not top1_before:
+        return {
+            "count": 0.0,
+            "top1_before": math.nan,
+            "top1_after": math.nan,
+            "mean_regret_before": math.nan,
+            "mean_regret_after": math.nan,
+            "expected_q_before": math.nan,
+            "expected_q_after": math.nan,
+            "expected_q_delta": math.nan,
+            "policy_kl_old_new": math.nan,
+        }
+    expected_q_before = float(np.mean(expected_before))
+    expected_q_after = float(np.mean(expected_after))
+    result = {
+        "count": float(len(top1_before)),
+        "top1_before": float(np.mean(top1_before)),
+        "top1_after": float(np.mean(top1_after)),
+        "mean_regret_before": float(np.mean(regret_before)),
+        "mean_regret_after": float(np.mean(regret_after)),
+        "expected_q_before": expected_q_before,
+        "expected_q_after": expected_q_after,
+        "expected_q_delta": expected_q_after - expected_q_before,
+        "policy_kl_old_new": float(np.mean(policy_kls)),
+    }
+    if not all(math.isfinite(value) for value in result.values()):
+        raise FloatingPointError("exact-Q policy quality is non-finite")
+    return result
+
+def _uav_candidate_policy_metrics(
+    probabilities: Any,
+    teacher_probabilities: Any,
+    q_values: Any,
+    valid_mask: Any,
+    logits: Any,
+) -> dict[str, float]:
+    """汇总冻结更新批次中的合法 UAV 候选分布。"""
+
+    policy = np.asarray(probabilities, dtype=np.float64)
+    teacher = np.asarray(teacher_probabilities, dtype=np.float64)
+    q = np.asarray(q_values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    raw_logits = np.asarray(logits, dtype=np.float64)
+    if not (
+        policy.shape == teacher.shape == q.shape == valid.shape == raw_logits.shape
+    ) or policy.ndim < 1:
+        raise ValueError("UAV candidate diagnostic tensor shapes do not match")
+
+    policy_entropies: list[float] = []
+    teacher_entropies: list[float] = []
+    best_policy_probabilities: list[float] = []
+    best_policy_ranks: list[float] = []
+    best_top1: list[float] = []
+    best_top3: list[float] = []
+    logit_stds: list[float] = []
+    logit_ranges: list[float] = []
+    for prefix in np.ndindex(q.shape[:-1]):
+        legal = np.flatnonzero(valid[prefix])
+        if legal.size == 0:
+            continue
+        p = policy[prefix][legal]
+        t = teacher[prefix][legal]
+        q_row = q[prefix][legal]
+        logits_row = raw_logits[prefix][legal]
+        if (
+            not np.all(np.isfinite(p))
+            or not np.all(np.isfinite(t))
+            or not np.all(np.isfinite(q_row))
+            or not np.all(np.isfinite(logits_row))
+            or np.any(p < 0.0)
+            or np.any(t < 0.0)
+        ):
+            raise FloatingPointError("UAV candidate diagnostic contains NaN/Inf")
+        p_sum = float(np.sum(p))
+        t_sum = float(np.sum(t))
+        if p_sum <= 0.0 or t_sum <= 0.0:
+            raise FloatingPointError("UAV candidate diagnostic has empty legal mass")
+        p = p / p_sum
+        t = t / t_sum
+        policy_entropies.append(
+            float(-np.sum(np.where(p > 0.0, p * np.log(np.maximum(p, 1.0e-12)), 0.0)))
+        )
+        teacher_entropies.append(
+            float(-np.sum(np.where(t > 0.0, t * np.log(np.maximum(t, 1.0e-12)), 0.0)))
+        )
+        best_q = float(np.max(q_row))
+        best_mask = np.isclose(q_row, best_q, rtol=1.0e-10, atol=1.0e-10)
+        descending = np.argsort(-p, kind="stable")
+        best_positions = np.flatnonzero(best_mask)
+        best_policy_probabilities.append(float(np.sum(p[best_mask])))
+        best_policy_ranks.append(
+            float(1 + min(int(np.flatnonzero(descending == position)[0]) for position in best_positions))
+        )
+        best_top1.append(float(bool(np.any(best_mask[descending[:1]]))))
+        best_top3.append(float(bool(np.any(best_mask[descending[: min(3, len(descending))]]))))
+        logit_stds.append(float(np.std(logits_row)))
+        logit_ranges.append(float(np.max(logits_row) - np.min(logits_row)))
+
+    if not policy_entropies:
+        return {
+            "policy_entropy_mean": math.nan,
+            "teacher_entropy_mean": math.nan,
+            "best_policy_prob_mean": math.nan,
+            "best_policy_prob_median": math.nan,
+            "best_policy_rank_mean": math.nan,
+            "best_policy_top1_rate": math.nan,
+            "best_policy_top3_rate": math.nan,
+            "logit_std_mean": math.nan,
+            "logit_range_mean": math.nan,
+        }
+    result = {
+        "policy_entropy_mean": float(np.mean(policy_entropies)),
+        "teacher_entropy_mean": float(np.mean(teacher_entropies)),
+        "best_policy_prob_mean": float(np.mean(best_policy_probabilities)),
+        "best_policy_prob_median": float(np.median(best_policy_probabilities)),
+        "best_policy_rank_mean": float(np.mean(best_policy_ranks)),
+        "best_policy_top1_rate": float(np.mean(best_top1)),
+        "best_policy_top3_rate": float(np.mean(best_top3)),
+        "logit_std_mean": float(np.mean(logit_stds)),
+        "logit_range_mean": float(np.mean(logit_ranges)),
+    }
+    if not all(math.isfinite(value) for value in result.values()):
+        raise FloatingPointError("UAV candidate diagnostic is non-finite")
+    return result
+
+def _uav_candidate_old_new_drift_summary(
+    kl_values: Any,
+    argmax_flip_values: Any,
+    best_policy_prob_change_values: Any,
+) -> dict[str, Any]:
+    """汇总更新前后的合法候选分布。每个条目对应一个合法候选 head；保留数组供调用方计算更新级分位数，使其统计合法 head，而不是已经聚合的 epoch 均值。"""
+
+    kl = np.asarray(kl_values, dtype=np.float64).reshape(-1)
+    flips = np.asarray(argmax_flip_values, dtype=np.float64).reshape(-1)
+    best_changes = np.asarray(
+        best_policy_prob_change_values, dtype=np.float64
+    ).reshape(-1)
+    if not (kl.shape == flips.shape == best_changes.shape):
+        raise ValueError("UAV candidate drift value shapes do not match")
+    if kl.size == 0:
+        return {
+            "kl_values": kl,
+            "argmax_flip_values": flips,
+            "best_policy_prob_change_values": best_changes,
+            "kl_mean": math.nan,
+            "kl_p50": math.nan,
+            "kl_p90": math.nan,
+            "kl_max": math.nan,
+            "argmax_flip_rate": math.nan,
+            "best_policy_prob_change_mean": math.nan,
+            "best_policy_prob_change_p10": math.nan,
+        }
+    if not (
+        np.all(np.isfinite(kl))
+        and np.all(np.isfinite(flips))
+        and np.all(np.isfinite(best_changes))
+    ):
+        raise FloatingPointError("UAV candidate old-vs-new drift is non-finite")
+    return {
+        "kl_values": kl,
+        "argmax_flip_values": flips,
+        "best_policy_prob_change_values": best_changes,
+        "kl_mean": float(np.mean(kl)),
+        "kl_p50": float(np.percentile(kl, 50.0)),
+        "kl_p90": float(np.percentile(kl, 90.0)),
+        "kl_max": float(np.max(kl)),
+        "argmax_flip_rate": float(np.mean(flips)),
+        "best_policy_prob_change_mean": float(np.mean(best_changes)),
+        "best_policy_prob_change_p10": float(
+            np.percentile(best_changes, 10.0)
+        ),
+    }
+
+def _uav_candidate_old_new_drift_metrics(
+    old_probabilities: Any,
+    new_probabilities: Any,
+    teacher_probabilities: Any,
+    q_values: Any,
+    valid_mask: Any,
+) -> dict[str, Any]:
+    """测量固定合法 Exact-Q 候选 head 上的策略变化。旧、新分布只在冻结的合法 mask 内重新归一化。最优候选概率变化按冻结的最高 Q 候选集合计算，因此并列候选作为集合处理，不依赖任意选出的单个索引。"""
+
+    old = np.asarray(old_probabilities, dtype=np.float64)
+    new = np.asarray(new_probabilities, dtype=np.float64)
+    teacher = np.asarray(teacher_probabilities, dtype=np.float64)
+    q = np.asarray(q_values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if not (old.shape == new.shape == teacher.shape == q.shape == valid.shape):
+        raise ValueError("UAV candidate old-vs-new tensor shapes do not match")
+    if old.ndim < 1:
+        raise ValueError("UAV candidate old-vs-new tensors must have a candidate axis")
+
+    kl_values: list[float] = []
+    argmax_flip_values: list[float] = []
+    best_policy_prob_change_values: list[float] = []
+    for prefix in np.ndindex(q.shape[:-1]):
+        legal = np.flatnonzero(valid[prefix])
+        if legal.size == 0:
+            continue
+        old_row = old[prefix][legal]
+        new_row = new[prefix][legal]
+        teacher_row = teacher[prefix][legal]
+        q_row = q[prefix][legal]
+        if not (
+            np.all(np.isfinite(old_row))
+            and np.all(np.isfinite(new_row))
+            and np.all(np.isfinite(teacher_row))
+            and np.all(np.isfinite(q_row))
+            and np.all(old_row >= 0.0)
+            and np.all(new_row >= 0.0)
+            and np.all(teacher_row >= 0.0)
+        ):
+            raise FloatingPointError(
+                "UAV candidate old-vs-new drift contains NaN/Inf or negative mass"
+            )
+        old_sum = float(np.sum(old_row))
+        new_sum = float(np.sum(new_row))
+        teacher_sum = float(np.sum(teacher_row))
+        if old_sum <= 0.0 or new_sum <= 0.0 or teacher_sum <= 0.0:
+            raise FloatingPointError(
+                "UAV candidate old-vs-new drift has empty legal probability mass"
+            )
+        old_row = old_row / old_sum
+        new_row = new_row / new_sum
+        teacher_row = teacher_row / teacher_sum
+        positive = old_row > 0.0
+        kl = float(
+            np.sum(
+                old_row[positive]
+                * (
+                    np.log(np.maximum(old_row[positive], 1.0e-300))
+                    - np.log(np.maximum(new_row[positive], 1.0e-300))
+                )
+            )
+        )
+        kl_values.append(max(0.0, kl))
+        argmax_flip_values.append(
+            float(int(np.argmax(old_row)) != int(np.argmax(new_row)))
+        )
+        best_q = float(np.max(q_row))
+        best_mask = np.isclose(q_row, best_q, rtol=1.0e-10, atol=1.0e-10)
+        # teacher 是损失函数使用的 detached Exact-Q target；
+        # 将它保留在校验路径中，防止诊断无提示地改用
+        # 其他 target 张量。
+        if not np.isclose(float(np.sum(teacher_row)), 1.0, atol=1.0e-8):
+            raise FloatingPointError("UAV candidate teacher mass is not normalized")
+        best_policy_prob_change_values.append(
+            float(np.sum(new_row[best_mask]) - np.sum(old_row[best_mask]))
+        )
+    return _uav_candidate_old_new_drift_summary(
+        kl_values,
+        argmax_flip_values,
+        best_policy_prob_change_values,
+    )
+
+def _proposal_source_diagnostics(
+    q_values: Any,
+    valid_mask: Any,
+    sources: Any,
+    distances: Any,
+) -> dict[str, Any]:
+    """汇总固定 proposal 集合，不额外评估新分支。"""
+
+    q = np.asarray(q_values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    source_array = np.asarray(sources, dtype=object)
+    distance_array = np.asarray(distances, dtype=np.float64)
+    if q.shape != valid.shape or q.shape != source_array.shape or q.shape != distance_array.shape:
+        raise ValueError("proposal diagnostic tensor shapes do not match")
+    counts = valid.sum(axis=-1).reshape(-1)
+    active_counts = counts[counts > 0]
+    source_counts: dict[str, int] = {}
+    best_distances: list[float] = []
+    for prefix in np.ndindex(q.shape[:-1]):
+        legal = np.flatnonzero(valid[prefix])
+        if legal.size == 0:
+            continue
+        best_index = int(legal[int(np.argmax(q[prefix][legal]))])
+        source = str(source_array[prefix + (best_index,)])
+        if not source:
+            raise ValueError("proposal diagnostic is missing a candidate source")
+        source_counts[source] = source_counts.get(source, 0) + 1
+        distance = float(distance_array[prefix + (best_index,)])
+        if not math.isfinite(distance):
+            raise FloatingPointError("proposal diagnostic distance is non-finite")
+        best_distances.append(distance)
+    total = int(sum(source_counts.values()))
+    fractions = {
+        source: float(count) / float(total)
+        for source, count in sorted(source_counts.items())
+    }
+    return {
+        "candidate_count_mean": (
+            0.0 if active_counts.size == 0 else float(np.mean(active_counts))
+        ),
+        "candidate_count_max": (
+            0 if active_counts.size == 0 else int(np.max(active_counts))
+        ),
+        "best_q_source_counts": {
+            source: int(count) for source, count in sorted(source_counts.items())
+        },
+        "best_q_source_fractions": fractions,
+        "best_q_distance_mean": (
+            math.nan if not best_distances else float(np.mean(best_distances))
+        ),
+        "best_q_distance_median": (
+            math.nan if not best_distances else float(np.median(best_distances))
+        ),
+        "best_q_distance_max": (
+            math.nan if not best_distances else float(np.max(best_distances))
+        ),
+    }
+
+def _exact_q_listwise_teacher(
+    q_values: Any,
+    candidate_valid_mask: Any,
+    temperature: float,
+) -> Any:
+    """根据各状态的 Exact-Q 构造已分离梯度的合法候选 teacher。温度 softmax 前会按 state/head 分别标准化 Q 值；相同 Q 值的合法集合得到均匀 teacher，padding 候选的质量始终为零。"""
+
+    _require_torch()
+    q_tensor = torch.as_tensor(q_values, dtype=torch.float32)
+    valid = torch.as_tensor(
+        candidate_valid_mask, dtype=torch.bool, device=q_tensor.device
+    )
+    if q_tensor.shape != valid.shape or q_tensor.ndim < 1:
+        raise ValueError("exact-Q teacher tensor shape mismatch")
+    scale = float(temperature)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("exact-Q teacher temperature must be positive and finite")
+    if not bool(torch.all(torch.isfinite(q_tensor[valid])).item()):
+        raise FloatingPointError("exact-Q teacher received non-finite legal Q values")
+    legal_count = valid.sum(dim=-1, keepdim=True)
+    active_heads = legal_count > 0
+    safe_valid = valid | ~active_heads
+    safe_q = torch.where(valid, q_tensor, torch.zeros_like(q_tensor))
+    count = legal_count.clamp_min(1).to(torch.float32)
+    mean = safe_q.sum(dim=-1, keepdim=True) / count
+    centered = torch.where(valid, safe_q - mean, torch.zeros_like(safe_q))
+    variance = (centered.square().sum(dim=-1, keepdim=True) / count).clamp_min(0.0)
+    std = torch.sqrt(variance)
+    standardized = torch.where(
+        valid & (std > 1.0e-8),
+        centered / std.clamp_min(1.0e-8),
+        torch.zeros_like(centered),
+    )
+    logits = standardized / scale
+    logits = logits.masked_fill(~safe_valid, -float("inf"))
+    teacher = torch.softmax(logits, dim=-1)
+    return torch.where(valid & active_heads, teacher, torch.zeros_like(teacher)).detach()
+
+def _exact_q_listwise_confidence(
+    q_values: Any,
+    candidate_valid_mask: Any,
+    reference_scale: float,
+) -> Any:
+    """根据合法候选 Q 值的离散程度返回各 head 的 detached confidence。总体标准差使用与 _exact_q_listwise_teacher 相同的合法 mask 和逐 head 居中方式；此辅助函数不会改动标准化 teacher logits。"""
+
+    _require_torch()
+    q_tensor = torch.as_tensor(q_values, dtype=torch.float32)
+    valid = torch.as_tensor(
+        candidate_valid_mask, dtype=torch.bool, device=q_tensor.device
+    )
+    if q_tensor.shape != valid.shape or q_tensor.ndim < 1:
+        raise ValueError("exact-Q confidence tensor shape mismatch")
+    scale = float(reference_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("exact-Q confidence reference scale must be positive and finite")
+    if not bool(torch.all(torch.isfinite(q_tensor[valid])).item()):
+        raise FloatingPointError("exact-Q confidence received non-finite legal Q values")
+    legal_count = valid.sum(dim=-1, keepdim=True)
+    active_heads = legal_count > 0
+    safe_q = torch.where(valid, q_tensor, torch.zeros_like(q_tensor))
+    count = legal_count.clamp_min(1).to(torch.float32)
+    mean = safe_q.sum(dim=-1, keepdim=True) / count
+    centered = torch.where(valid, safe_q - mean, torch.zeros_like(safe_q))
+    variance = (centered.square().sum(dim=-1, keepdim=True) / count).clamp_min(0.0)
+    q_std = torch.sqrt(variance).squeeze(-1)
+    confidence = torch.clamp(q_std / scale, min=0.0, max=1.0)
+    return torch.where(
+        active_heads.squeeze(-1), confidence, torch.zeros_like(confidence)
+    ).detach()
+
+def _masked_operation_probabilities(probabilities: Any, masks: Any) -> Any:
+    """在合法动作范围内归一化二元 Operation 分布。"""
+
+    _require_torch()
+    values = torch.as_tensor(probabilities, dtype=torch.float32)
+    legal = torch.as_tensor(masks, dtype=torch.bool, device=values.device)
+    if values.shape != legal.shape or values.ndim < 1 or int(values.shape[-1]) != 2:
+        raise ValueError("operation probability/mask shape mismatch")
+    if not bool(torch.all(torch.isfinite(values)).item()):
+        raise FloatingPointError("operation probabilities are non-finite")
+    masked = torch.where(legal, values, torch.zeros_like(values))
+    normalizer = masked.sum(dim=-1, keepdim=True)
+    if bool(torch.any(normalizer <= 0.0).item()):
+        raise ValueError("operation mask blocks every operation")
+    normalized = masked / normalizer
+    if not bool(torch.all(torch.isfinite(normalized)).item()):
+        raise FloatingPointError("masked operation probabilities are non-finite")
+    if not torch.allclose(
+        normalized.sum(dim=-1),
+        torch.ones_like(normalized.sum(dim=-1)),
+        rtol=0.0,
+        atol=1.0e-6,
+    ):
+        raise FloatingPointError("masked operation probabilities do not sum to one")
+    return normalized
+
+def _exact_q_operation_teacher(
+    q_stay: Any,
+    candidate_q_values: Any,
+    rollout_candidate_probabilities: Any,
+    candidate_valid_mask: Any,
+    operation_valid_mask: Any,
+    rollout_operation_masks: Any,
+    temperature: float,
+    reference_scale: float,
+) -> tuple[Any, Any, Any, Any, Any]:
+    """根据冻结 rollout 价值构造二元 Operation teacher。Candidate teacher 和 Operation teacher 使用的 MOVE 价值来自同一个合法候选 Exact-Q listwise 分布。rollout 候选概率仅用于诊断对比。候选集合未激活时没有 MOVE 价值，只保留经过 mask 的 STAY teacher，不赋予硬最大值或构造虚假 Operation target。"""
+
+    _require_torch()
+    q_values = torch.as_tensor(candidate_q_values, dtype=torch.float32)
+    valid = torch.as_tensor(
+        candidate_valid_mask, dtype=torch.bool, device=q_values.device
+    )
+    rollout_probabilities = torch.as_tensor(
+        rollout_candidate_probabilities,
+        dtype=torch.float32,
+        device=q_values.device,
+    )
+    stay_q = torch.as_tensor(q_stay, dtype=torch.float32, device=q_values.device)
+    teacher_masks = torch.as_tensor(
+        operation_valid_mask,
+        dtype=torch.bool,
+        device=q_values.device,
+    )
+    rollout_masks = torch.as_tensor(
+        rollout_operation_masks,
+        dtype=torch.bool,
+        device=q_values.device,
+    )
+    if (
+        q_values.shape != valid.shape
+        or rollout_probabilities.shape != q_values.shape
+        or q_values.ndim < 1
+    ):
+        raise ValueError("operation teacher candidate Q shape mismatch")
+    if stay_q.shape != q_values.shape[:-1]:
+        raise ValueError("operation teacher STAY Q shape mismatch")
+    if teacher_masks.shape != stay_q.shape + (2,):
+        raise ValueError("operation teacher validity mask shape mismatch")
+    if rollout_masks.shape != teacher_masks.shape:
+        raise ValueError("operation teacher rollout mask shape mismatch")
+    scale = float(reference_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("operation teacher reference scale must be positive and finite")
+    if not bool(torch.all(torch.isfinite(stay_q)).item()):
+        raise FloatingPointError("operation teacher STAY Q is non-finite")
+    if not bool(torch.all(torch.isfinite(rollout_probabilities)).item()):
+        raise FloatingPointError(
+            "operation teacher rollout candidate probabilities are non-finite"
+        )
+    if bool(torch.any(rollout_probabilities < 0.0).item()):
+        raise ValueError(
+            "operation teacher rollout candidate probabilities are negative"
+        )
+    candidate_teacher = _exact_q_listwise_teacher(
+        q_values,
+        valid,
+        temperature,
+    ).to(q_values.device)
+    q_move_listwise_teacher = torch.sum(candidate_teacher * q_values, dim=-1)
+    rollout_probabilities = torch.where(
+        valid,
+        rollout_probabilities,
+        torch.zeros_like(rollout_probabilities),
+    )
+    rollout_probability_mass = rollout_probabilities.sum(dim=-1, keepdim=True)
+    active_candidates = valid.any(dim=-1, keepdim=True)
+    if bool(
+        torch.any(
+            active_candidates
+            & ~torch.isclose(
+                rollout_probability_mass,
+                torch.ones_like(rollout_probability_mass),
+                rtol=0.0,
+                atol=1.0e-5,
+            )
+        ).item()
+    ):
+        raise ValueError(
+            "operation teacher rollout candidate probabilities are not normalized"
+        )
+    if bool(
+        torch.any(
+            (~active_candidates)
+            & (rollout_probability_mass != 0.0)
+        ).item()
+    ):
+        raise ValueError(
+            "inactive operation teacher candidate heads have non-zero probability mass"
+        )
+    q_move_operation = torch.sum(rollout_probabilities * q_values, dim=-1)
+    move_legal = teacher_masks[..., 1]
+    if bool(torch.any(teacher_masks & ~rollout_masks).item()):
+        raise ValueError(
+            "Exact-Q teacher-valid operation is not rollout-legal"
+        )
+    if bool(torch.any(~teacher_masks.any(dim=-1)).item()):
+        raise ValueError("Exact-Q operation teacher has no valid operation")
+    stay_legal = teacher_masks[..., 0]
+    both_legal = stay_legal & move_legal
+    delta = q_move_listwise_teacher - stay_q
+    move_probability = torch.where(
+        both_legal,
+        torch.sigmoid(delta / scale),
+        torch.where(move_legal, torch.ones_like(delta), torch.zeros_like(delta)),
+    )
+    raw_teacher = torch.stack(
+        (1.0 - move_probability, move_probability),
+        dim=-1,
+    )
+    teacher = _masked_operation_probabilities(raw_teacher, teacher_masks)
+    if not bool(torch.all(torch.isfinite(teacher)).item()):
+        raise FloatingPointError("operation teacher is non-finite")
+    return (
+        teacher.detach(),
+        q_move_operation.detach(),
+        q_move_listwise_teacher.detach(),
+        move_probability.detach(),
+        move_legal,
+    )
+
+def _operation_teacher_kl(
+    operation_log_probs_all: Any,
+    teacher_probabilities: Any,
+    operation_masks: Any,
+) -> Any:
+    """返回完整 state/head 上 Exact-Q Operation teacher 到策略的 KL。"""
+
+    _require_torch()
+    log_probs = torch.as_tensor(operation_log_probs_all, dtype=torch.float32)
+    teacher = torch.as_tensor(
+        teacher_probabilities, dtype=torch.float32, device=log_probs.device
+    )
+    masks = torch.as_tensor(
+        operation_masks, dtype=torch.bool, device=log_probs.device
+    )
+    if log_probs.shape != teacher.shape or teacher.shape != masks.shape:
+        raise ValueError("operation teacher KL shape mismatch")
+    safe_teacher = torch.where(masks, teacher, torch.zeros_like(teacher))
+    safe_log_probs = torch.where(
+        masks, log_probs, torch.zeros_like(log_probs)
+    )
+    kl = torch.sum(
+        safe_teacher
+        * (torch.log(safe_teacher.clamp_min(1.0e-12)) - safe_log_probs),
+        dim=-1,
+    )
+    value = kl.mean()
+    if not bool(torch.isfinite(value).item()):
+        raise FloatingPointError("operation teacher KL is non-finite")
+    return value
+
+def _exact_q_listwise_candidate_loss(
+    candidate_log_probs: Any,
+    q_values: Any,
+    candidate_valid_mask: Any,
+    temperature: float,
+    confidence_reference_scale: float | None = None,
+) -> tuple[Any, Any]:
+    """返回可选 confidence 加权 KL 和 detached teacher。"""
+
+    _require_torch()
+    log_probs = torch.as_tensor(candidate_log_probs, dtype=torch.float32)
+    valid = torch.as_tensor(
+        candidate_valid_mask, dtype=torch.bool, device=log_probs.device
+    )
+    q_tensor = torch.as_tensor(q_values, dtype=torch.float32, device=log_probs.device)
+    if log_probs.shape != valid.shape or q_tensor.shape != valid.shape:
+        raise ValueError("exact-Q listwise candidate tensor shape mismatch")
+    teacher = _exact_q_listwise_teacher(q_tensor, valid, temperature).to(
+        log_probs.device
+    )
+    active_heads = valid.any(dim=-1)
+    if not bool(torch.any(active_heads).item()):
+        return log_probs.sum() * 0.0, teacher
+    safe_log_probs = torch.where(
+        valid, log_probs, torch.zeros_like(log_probs)
+    )
+    safe_teacher = torch.where(
+        valid, teacher, torch.zeros_like(teacher)
+    )
+    kl = torch.sum(
+        safe_teacher
+        * (
+            torch.log(safe_teacher.clamp_min(1.0e-12))
+            - safe_log_probs
+        ),
+        dim=-1,
+    )
+    if confidence_reference_scale is not None:
+        confidence = _exact_q_listwise_confidence(
+            q_tensor,
+            valid,
+            confidence_reference_scale,
+        ).to(log_probs.device)
+        if tuple(confidence.shape) != tuple(active_heads.shape):
+            raise ValueError("exact-Q confidence head shape mismatch")
+        if not bool(torch.all(torch.isfinite(confidence)).item()):
+            raise FloatingPointError("exact-Q confidence is non-finite")
+        if bool(torch.any(confidence < 0.0).item()):
+            raise ValueError("exact-Q confidence is negative")
+        kl = kl * confidence.detach()
+    return kl[active_heads].mean(), teacher

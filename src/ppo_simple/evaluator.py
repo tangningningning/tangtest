@@ -32,12 +32,6 @@ from .trainer import PPOTrainer
 
 
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
-FULL_EPISODE_PROTOCOL = project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED
-FULL_EPISODE_SLOTS = 300
-FULL_EPISODE_ORIGIN_START = 0
-FULL_EPISODE_ORIGIN_END = 299
-FULL_EPISODE_TERMINAL_ORIGIN = 299
-FULL_EPISODE_ROLLOUT_STEPS = 300
 DEFAULT_ENVIRONMENT_COUNT = 20
 DEFAULT_POLICY_REPEATS = 5
 
@@ -232,29 +226,6 @@ def _ensure_fresh_output(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _validate_proposed_context(context: Any) -> dict[str, Any]:
-    protocol = project_config.get_ppo_data_protocol(context.cfg)
-    expected = {
-        "protocol": FULL_EPISODE_PROTOCOL,
-        "physical_episode_slots": FULL_EPISODE_SLOTS,
-        "episode_slots": FULL_EPISODE_SLOTS,
-        "train_origin_start": FULL_EPISODE_ORIGIN_START,
-        "train_origin_end": FULL_EPISODE_ORIGIN_END,
-        "terminal_origin": FULL_EPISODE_TERMINAL_ORIGIN,
-        "rollout_steps": FULL_EPISODE_ROLLOUT_STEPS,
-        "test_origin_start": None,
-        "test_origin_end": None,
-    }
-    for key, expected_value in expected.items():
-        actual = protocol.get(key)
-        if actual != expected_value:
-            raise ValueError(
-                "proposed joint evaluator protocol mismatch for "
-                f"{key}: {actual!r} != {expected_value!r}"
-            )
-    return protocol
-
-
 def _load_checkpoint_metadata(checkpoint: Path) -> dict[str, Any]:
     _require_torch()
     if not checkpoint.is_file():
@@ -279,10 +250,15 @@ def _load_proposed_trainer(
     context: Any,
     checkpoint: Path,
     config_raw_sha256: str,
+    config_semantic_sha256: str,
     checkpoint_metadata: dict[str, Any],
     device: str,
 ) -> PPOTrainer:
-    trainer = PPOTrainer(context, device=device)
+    trainer = PPOTrainer(
+        context,
+        device=device,
+        config_semantic_sha256=config_semantic_sha256,
+    )
     if trainer.policy.architecture_id != context.policy_schema:
         raise TypeError(
             "Trainer policy factory did not construct the configured proposed schema: "
@@ -305,20 +281,31 @@ def _rollout_summary(
     policy_action_mode: str,
     policy_sampling_seed: int | None,
     checkpoint: Path,
+    protocol: dict[str, Any],
 ) -> dict[str, Any]:
-    if len(rollout.transitions) != FULL_EPISODE_SLOTS:
+    episode_slots = int(protocol["episode_slots"])
+    rollout_steps = int(protocol["rollout_steps"])
+    train_origin_start = int(protocol["train_origin_start"])
+    train_origin_end = int(protocol["train_origin_end"])
+    terminal_origin = int(protocol["terminal_origin"])
+    if len(rollout.transitions) != rollout_steps:
         raise ValueError(
             "proposed evaluation rollout must contain exactly "
-            f"{FULL_EPISODE_SLOTS} transitions"
+            f"{rollout_steps} transitions"
         )
-    if not bool(rollout.dones[-1]) or bool(np.any(rollout.dones[:-1])):
-        raise ValueError("proposed evaluation must terminate only at origin 299")
+    terminal_index = terminal_origin - train_origin_start
+    done_indices = np.flatnonzero(np.asarray(rollout.dones, dtype=bool))
+    if not np.array_equal(done_indices, np.asarray([terminal_index], dtype=np.int64)):
+        raise ValueError(
+            "proposed evaluation must terminate only at configured "
+            f"terminal_origin {terminal_origin}"
+        )
 
     task_metrics = aggregate_episode_task_metrics(rollout.transitions)
     cache_head_count = len(context.action_spec.cache_node_ids)
     uav_head_count = len(context.action_spec.uav_ids)
-    total_cache_heads = FULL_EPISODE_SLOTS * cache_head_count
-    total_uav_heads = FULL_EPISODE_SLOTS * uav_head_count
+    total_cache_heads = episode_slots * cache_head_count
+    total_uav_heads = episode_slots * uav_head_count
     if total_cache_heads <= 0 or total_uav_heads <= 0:
         raise ValueError("proposed evaluation requires Cache and UAV action heads")
 
@@ -329,7 +316,7 @@ def _rollout_summary(
     if "STAY" not in operation_order or "MOVE" not in operation_order:
         raise ValueError("proposed policy does not expose the STAY/MOVE operation order")
     uav_operation_array = np.asarray(uav_operation_actions, dtype=np.int64)
-    expected_shape = (FULL_EPISODE_SLOTS, uav_head_count)
+    expected_shape = (rollout_steps, uav_head_count)
     if uav_operation_array.shape != expected_shape:
         raise ValueError(
             "proposed UAV operation action shape mismatch: "
@@ -355,12 +342,12 @@ def _rollout_summary(
         "policy_action_mode": str(policy_action_mode),
         "policy_schema": str(context.policy_schema),
         "configuration_control_mode": str(context.configuration_control_mode),
-        "data_protocol": str(context.data_protocol),
-        "episode_slots": int(context.episode_slots),
-        "origin_start": int(context.train_origin_start),
-        "origin_end": int(context.train_origin_end),
-        "terminal_origin": int(context.terminal_origin),
-        "rollout_steps": int(context.configured_rollout_steps or 0),
+        "data_protocol": str(protocol["protocol"]),
+        "episode_slots": episode_slots,
+        "origin_start": train_origin_start,
+        "origin_end": train_origin_end,
+        "terminal_origin": terminal_origin,
+        "rollout_steps": rollout_steps,
         "checkpoint_path": str(checkpoint),
         "checkpoint_policy_schema": str(trainer.policy.architecture_id),
         "num_transitions": len(rollout.transitions),
@@ -484,7 +471,7 @@ def evaluate_pool(
     config_semantic_sha256 = project_config.semantic_config_hash(
         reference_context.cfg
     )
-    protocol = _validate_proposed_context(reference_context)
+    protocol = project_config.get_ppo_data_protocol(reference_context.cfg)
     environment_means: list[dict[str, Any]] = []
     repeat_summaries: list[dict[str, Any]] = []
 
@@ -499,16 +486,18 @@ def evaluate_pool(
             str(config_file),
             realization_dir=realization_dir,
         )
-        _validate_proposed_context(context)
         _assert_realization_context_compatible(reference_context, context)
         steps = aligned_train_steps(context)
-        if len(steps) != FULL_EPISODE_SLOTS:
-            raise ValueError("proposed evaluation aligned steps are not a full 300-slot episode")
+        if len(steps) != int(protocol["episode_slots"]):
+            raise ValueError(
+                "proposed evaluation aligned steps do not match the configured episode_slots"
+            )
 
         trainer = _load_proposed_trainer(
             context,
             checkpoint,
             config_raw_sha256,
+            config_semantic_sha256,
             checkpoint_metadata,
             device,
         )
@@ -539,7 +528,7 @@ def evaluate_pool(
                     steps,
                     initial_cache=np.asarray(context.initial_cache, dtype=np.int8).copy(),
                     initial_uav=_copy_uav_positions(context.initial_uav),
-                    terminal_origin_index=FULL_EPISODE_TERMINAL_ORIGIN,
+                    terminal_origin_index=int(protocol["terminal_origin"]),
                     deterministic=policy_action_mode == "deterministic",
                 )
             summary = _rollout_summary(
@@ -551,6 +540,7 @@ def evaluate_pool(
                 policy_action_mode=policy_action_mode,
                 policy_sampling_seed=repeat_seed,
                 checkpoint=checkpoint,
+                protocol=protocol,
             )
             environment_repeat_summaries.append(summary)
             repeat_summaries.append(summary)
@@ -637,7 +627,7 @@ def evaluate_pool(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate a frozen proposed joint PPO policy on an episode pool"
+        description="在 episode pool 上评估冻结的 proposed joint PPO 策略"
     )
     parser.add_argument("--config", default=PROPOSED_CONFIG_PATH)
     parser.add_argument("--checkpoint", required=True)
@@ -656,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--policy-sampling-seed",
         type=int,
         default=None,
-        help="optional base seed; repeat seeds are derived from it",
+        help="可选的基础 seed；各次重复评估的 seed 将由此派生",
     )
     return parser
 

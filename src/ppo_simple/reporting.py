@@ -1399,3 +1399,1499 @@ def update_run_summary(
         summary.update(dict(lifecycle_metadata))
     _write_json(path, summary)
     return summary
+
+def _cache_operation_epoch_metrics(
+    transitions: Any,
+    initial_cache: np.ndarray,
+    cache_nodes: dict[str, Any],
+    service_sizes_mb: np.ndarray,
+) -> dict[str, Any]:
+    """汇总 KEEP/UPDATE 行为，不影响 rollout 或 PPO 更新。"""
+
+    operation_names = ("KEEP", "UPDATE")
+    roles = ("SV", "RSU", "UAV")
+    node_roles = [str(value).upper() for value in cache_nodes["node_roles"]]
+    node_count = len(node_roles)
+    capacities = np.asarray(cache_nodes["capacities_mb"], dtype=np.float64).reshape(-1)
+    sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
+    operation_counts = {
+        role: {operation: 0 for operation in operation_names} for role in roles
+    }
+    role_samples = {role: 0 for role in roles}
+    previous_cache = np.asarray(initial_cache, dtype=np.int8).copy()
+    rsu_service_count: list[float] = []
+    rsu_capacity_utilization: list[float] = []
+    rsu_nonempty: list[bool] = []
+    rsu_requested_updates = 0
+    rsu_actual_changes = 0
+    rsu_samples = 0
+
+    for transition in transitions:
+        next_cache = np.asarray(transition.next_cache_state, dtype=np.int8)
+        if next_cache.shape != previous_cache.shape:
+            raise ValueError("cache behavior diagnostics encountered a state shape change")
+        actions = {
+            int(item["head_index"]): item
+            for item in transition.cache_conditional_actions
+            if "head_index" in item
+        }
+        for node_index, role in enumerate(node_roles):
+            role_samples[role] = role_samples.get(role, 0) + 1
+            action = actions.get(node_index)
+            if action is not None and role in operation_counts:
+                conditional_action = str(action.get("conditional_action", "")).upper()
+                raw_operation = str(action.get("operation_type", "")).upper()
+                if conditional_action == "KEEP" or raw_operation == "NO_CHANGE":
+                    operation = "KEEP"
+                elif conditional_action == "TARGET_CONFIGURATION" or raw_operation in {
+                    "ADD",
+                    "DELETE",
+                    "SWAP",
+                }:
+                    operation = "UPDATE"
+                else:
+                    operation = ""
+                if operation in operation_counts[role]:
+                    operation_counts[role][operation] += 1
+            if role != "RSU":
+                continue
+            row = next_cache[node_index]
+            used_mb = float(np.dot(row.astype(np.float64), sizes))
+            capacity = float(capacities[node_index])
+            if not math.isfinite(used_mb) or not math.isfinite(capacity) or capacity <= 0.0:
+                raise FloatingPointError("RSU cache behavior diagnostic is non-finite")
+            rsu_service_count.append(float(row.sum()))
+            rsu_capacity_utilization.append(used_mb / capacity)
+            rsu_nonempty.append(bool(row.sum() > 0))
+            rsu_requested_updates += int(
+                np.asarray(transition.action, dtype=np.int8)[node_index] == 1
+            )
+            rsu_actual_changes += int(
+                np.any(row != previous_cache[node_index])
+            )
+            rsu_samples += 1
+        previous_cache = next_cache.copy()
+
+    def _rate(count: int, denominator: int) -> float:
+        return 0.0 if denominator <= 0 else float(count) / float(denominator)
+
+    operation_rates = {
+        role: {
+            operation: _rate(count, role_samples[role])
+            for operation, count in counts.items()
+        }
+        for role, counts in operation_counts.items()
+    }
+    return {
+        "cache_operation_counts": operation_counts,
+        "cache_operation_rates": operation_rates,
+        "RSU_mean_cached_service_count": (
+            0.0 if not rsu_service_count else float(np.mean(rsu_service_count))
+        ),
+        "RSU_nonempty_fraction": (
+            0.0 if not rsu_nonempty else float(np.mean(rsu_nonempty))
+        ),
+        "RSU_cache_capacity_utilization": (
+            0.0
+            if not rsu_capacity_utilization
+            else float(np.mean(rsu_capacity_utilization))
+        ),
+        "RSU_requested_update_rate": _rate(rsu_requested_updates, rsu_samples),
+        "RSU_actual_change_rate": _rate(rsu_actual_changes, rsu_samples),
+        "RSU_operation_sample_count": int(rsu_samples),
+    }
+
+def _uav_episode_diagnostics(
+    *,
+    available: bool,
+    move_probabilities: list[float],
+    stay_probabilities: list[float],
+    logit_margins: list[float],
+    move_feasible: list[bool],
+    move_selected: list[bool],
+    actual_movement: list[bool],
+    move_advantages: list[float],
+    stay_advantages: list[float],
+    global_advantages: list[float],
+    global_return_targets: list[float],
+    rewards: list[float],
+    q_values: list[float],
+    movement_costs: list[float],
+    delays: list[float],
+    energies: list[float],
+    old_log_probs: list[float],
+    new_log_probs: list[float],
+    ratios: list[float],
+    clipped: list[bool],
+    feasible_action_counts: list[int],
+    move_candidate_counts: list[int],
+) -> dict[str, Any]:
+    """不再调用策略，汇总已采样的 UAV 诊断。按经核验的 actual_movement 标记对 MOVE/STAY 条件字段分组，并单独保留所选操作标签，供后续审计动作与物理结果是否一致；不会把动作索引当作移动结果。"""
+
+    empty = {
+        "uav_move_probability_mean": None,
+        "uav_move_probability_median": None,
+        "uav_move_probability_p10": None,
+        "uav_move_probability_p90": None,
+        "uav_move_probability_gt_0_5_rate": None,
+        "uav_stay_probability_mean": None,
+        "uav_head_entropy": None,
+        "uav_binary_entropy_mean": None,
+        "uav_stay_move_logit_margin_mean": None,
+        "uav_stay_move_logit_margin_median": None,
+        "uav_move_feasible_count": None,
+        "uav_move_feasible_rate": None,
+        "uav_move_selected_count": None,
+        "uav_move_selected_rate": None,
+        "uav_move_given_selected": None,
+        "uav_action_advantage_logging_available": False,
+        "mean_advantage_for_uav_move": None,
+        "median_advantage_for_uav_move": None,
+        "mean_advantage_for_uav_stay": None,
+        "median_advantage_for_uav_stay": None,
+        "uav_action_conditional_logging_available": False,
+        "uav_move_count": None,
+        "uav_stay_count": None,
+        "uav_move_adv_mean": None,
+        "uav_stay_adv_mean": None,
+        "uav_move_adv_median": None,
+        "uav_stay_adv_median": None,
+        "uav_move_adv_positive_fraction": None,
+        "uav_stay_adv_positive_fraction": None,
+        "uav_move_reward_mean": None,
+        "uav_stay_reward_mean": None,
+        "uav_move_q_total_mean": None,
+        "uav_stay_q_total_mean": None,
+        "uav_move_movement_cost_mean": None,
+        "uav_stay_movement_cost_mean": None,
+        "uav_move_delay_mean": None,
+        "uav_stay_delay_mean": None,
+        "uav_move_energy_mean": None,
+        "uav_stay_energy_mean": None,
+        "uav_move_return_target_mean": None,
+        "uav_stay_return_target_mean": None,
+        "uav_move_old_log_prob_mean": None,
+        "uav_stay_old_log_prob_mean": None,
+        "uav_move_new_log_prob_mean": None,
+        "uav_stay_new_log_prob_mean": None,
+        "uav_move_ratio_mean": None,
+        "uav_stay_ratio_mean": None,
+        "uav_move_clip_fraction": None,
+        "uav_stay_clip_fraction": None,
+        "uav_selected_move_count": None,
+        "uav_selected_stay_count": None,
+        "uav_selected_move_actual_move_count": None,
+        "uav_selected_move_actual_stay_count": None,
+        "uav_selected_stay_actual_move_count": None,
+        "uav_selected_stay_actual_stay_count": None,
+        "uav_feasible_action_count_mean": None,
+        "uav_feasible_action_count_min": None,
+        "uav_feasible_action_count_max": None,
+        "uav_move_candidate_count_mean": None,
+        "uav_move_candidate_count_min": None,
+        "uav_move_candidate_count_max": None,
+        "uav_action_mask_summary": None,
+    }
+    if not available:
+        return empty
+
+    move = np.asarray(move_probabilities, dtype=np.float64)
+    stay = np.asarray(stay_probabilities, dtype=np.float64)
+    margins = np.asarray(logit_margins, dtype=np.float64)
+    feasible = np.asarray(move_feasible, dtype=bool)
+    selected = np.asarray(move_selected, dtype=bool)
+    actual = np.asarray(actual_movement, dtype=bool)
+    expected_length = len(move)
+    if expected_length <= 0 or not all(
+        array.ndim == 1 and len(array) == expected_length
+        for array in (stay, margins, feasible, selected, actual)
+    ):
+        raise AssertionError("UAV diagnostic arrays must be aligned and non-empty")
+    if not (
+        np.all(np.isfinite(move))
+        and np.all(np.isfinite(stay))
+        and np.all(np.isfinite(margins))
+    ):
+        raise FloatingPointError("UAV diagnostic arrays contain NaN/Inf")
+    if not (
+        np.all((move >= 0.0) & (move <= 1.0))
+        and np.all((stay >= 0.0) & (stay <= 1.0))
+        and np.allclose(move + stay, 1.0, rtol=0.0, atol=1.0e-6)
+    ):
+        raise AssertionError("UAV diagnostic probabilities are invalid")
+
+    def _aligned_float_array(values: list[float], field: str) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim != 1 or len(array) != expected_length:
+            raise AssertionError(f"{field} must align with UAV diagnostic samples")
+        if not np.all(np.isfinite(array)):
+            raise FloatingPointError(f"{field} contains NaN/Inf")
+        return array
+
+    advantages = _aligned_float_array(global_advantages, "global_advantages")
+    return_targets = _aligned_float_array(
+        global_return_targets, "global_return_targets"
+    )
+    rewards_a = _aligned_float_array(rewards, "rewards")
+    q_values_a = _aligned_float_array(q_values, "q_values")
+    movement_costs_a = _aligned_float_array(movement_costs, "movement_costs")
+    delays_a = _aligned_float_array(delays, "delays")
+    energies_a = _aligned_float_array(energies, "energies")
+    old_log_probs_a = _aligned_float_array(old_log_probs, "old_log_probs")
+    new_log_probs_a = _aligned_float_array(new_log_probs, "new_log_probs")
+    ratios_a = _aligned_float_array(ratios, "ratios")
+    if np.any(ratios_a < 0.0):
+        raise AssertionError("UAV branch ratios must be non-negative")
+    clipped_a = np.asarray(clipped, dtype=bool)
+    if clipped_a.ndim != 1 or len(clipped_a) != expected_length:
+        raise AssertionError("clipped must align with UAV diagnostic samples")
+    feasible_counts_a = np.asarray(feasible_action_counts, dtype=np.float64)
+    candidate_counts_a = np.asarray(move_candidate_counts, dtype=np.float64)
+    if not (
+        feasible_counts_a.ndim == candidate_counts_a.ndim == 1
+        and len(feasible_counts_a) == len(candidate_counts_a) == expected_length
+        and np.all(np.isfinite(feasible_counts_a))
+        and np.all(np.isfinite(candidate_counts_a))
+        and np.all(feasible_counts_a >= 0.0)
+        and np.all(candidate_counts_a >= 0.0)
+        and np.all(feasible_counts_a == np.floor(feasible_counts_a))
+        and np.all(candidate_counts_a == np.floor(candidate_counts_a))
+    ):
+        raise AssertionError("UAV action mask counts are invalid")
+
+    def _percentile(values: np.ndarray, percentile: float) -> float:
+        return float(np.percentile(values, percentile))
+
+    def _advantage_summary(values: list[float]) -> tuple[float | None, float | None]:
+        if not values:
+            return None, None
+        values_a = np.asarray(values, dtype=np.float64)
+        if not np.all(np.isfinite(values_a)):
+            raise FloatingPointError("UAV action advantages contain NaN/Inf")
+        return float(np.mean(values_a)), float(np.median(values_a))
+
+    def _group_stats(mask: np.ndarray) -> dict[str, Any]:
+        if mask.ndim != 1 or len(mask) != expected_length:
+            raise AssertionError("UAV action-conditional mask is not aligned")
+        if not bool(np.any(mask)):
+            return {
+                "count": 0,
+                "adv_mean": None,
+                "adv_median": None,
+                "adv_positive_fraction": None,
+                "reward_mean": None,
+                "q_total_mean": None,
+                "movement_cost_mean": None,
+                "delay_mean": None,
+                "energy_mean": None,
+                "return_target_mean": None,
+                "old_log_prob_mean": None,
+                "new_log_prob_mean": None,
+                "ratio_mean": None,
+                "clip_fraction": None,
+            }
+
+        def _mean(values: np.ndarray) -> float:
+            result = float(np.mean(values[mask]))
+            if not np.isfinite(result):
+                raise FloatingPointError("UAV action-conditional mean is non-finite")
+            return result
+
+        def _median(values: np.ndarray) -> float:
+            result = float(np.median(values[mask]))
+            if not np.isfinite(result):
+                raise FloatingPointError("UAV action-conditional median is non-finite")
+            return result
+
+        return {
+            "count": int(np.sum(mask)),
+            "adv_mean": _mean(advantages),
+            "adv_median": _median(advantages),
+            "adv_positive_fraction": float(np.mean(advantages[mask] > 0.0)),
+            "reward_mean": _mean(rewards_a),
+            "q_total_mean": _mean(q_values_a),
+            "movement_cost_mean": _mean(movement_costs_a),
+            "delay_mean": _mean(delays_a),
+            "energy_mean": _mean(energies_a),
+            "return_target_mean": _mean(return_targets),
+            "old_log_prob_mean": _mean(old_log_probs_a),
+            "new_log_prob_mean": _mean(new_log_probs_a),
+            "ratio_mean": _mean(ratios_a),
+            "clip_fraction": float(np.mean(clipped_a[mask])),
+        }
+
+    move_advantage_mean, move_advantage_median = _advantage_summary(move_advantages)
+    stay_advantage_mean, stay_advantage_median = _advantage_summary(stay_advantages)
+    actual_move_stats = _group_stats(actual)
+    actual_stay_stats = _group_stats(~actual)
+    probability_entropy = -(
+        np.where(move > 0.0, move * np.log(np.maximum(move, 1.0e-12)), 0.0)
+        + np.where(stay > 0.0, stay * np.log(np.maximum(stay, 1.0e-12)), 0.0)
+    )
+    selected_count = int(np.sum(selected))
+    return {
+        "uav_move_probability_mean": float(np.mean(move)),
+        "uav_move_probability_median": float(np.median(move)),
+        "uav_move_probability_p10": _percentile(move, 10.0),
+        "uav_move_probability_p90": _percentile(move, 90.0),
+        "uav_move_probability_gt_0_5_rate": float(np.mean(move > 0.5)),
+        "uav_stay_probability_mean": float(np.mean(stay)),
+        "uav_head_entropy": float(np.mean(probability_entropy)),
+        "uav_binary_entropy_mean": float(np.mean(probability_entropy)),
+        "uav_stay_move_logit_margin_mean": float(np.mean(margins)),
+        "uav_stay_move_logit_margin_median": float(np.median(margins)),
+        "uav_move_feasible_count": int(np.sum(feasible)),
+        "uav_move_feasible_rate": float(np.mean(feasible)),
+        "uav_move_selected_count": selected_count,
+        "uav_move_selected_rate": float(np.mean(selected)),
+        "uav_move_given_selected": (
+            None
+            if selected_count == 0
+            else float(np.sum(actual & selected)) / float(selected_count)
+        ),
+        "uav_action_advantage_logging_available": True,
+        "mean_advantage_for_uav_move": move_advantage_mean,
+        "median_advantage_for_uav_move": move_advantage_median,
+        "mean_advantage_for_uav_stay": stay_advantage_mean,
+        "median_advantage_for_uav_stay": stay_advantage_median,
+        "uav_action_conditional_logging_available": True,
+        "uav_move_count": actual_move_stats["count"],
+        "uav_stay_count": actual_stay_stats["count"],
+        "uav_move_adv_mean": actual_move_stats["adv_mean"],
+        "uav_stay_adv_mean": actual_stay_stats["adv_mean"],
+        "uav_move_adv_median": actual_move_stats["adv_median"],
+        "uav_stay_adv_median": actual_stay_stats["adv_median"],
+        "uav_move_adv_positive_fraction": actual_move_stats[
+            "adv_positive_fraction"
+        ],
+        "uav_stay_adv_positive_fraction": actual_stay_stats[
+            "adv_positive_fraction"
+        ],
+        "uav_move_reward_mean": actual_move_stats["reward_mean"],
+        "uav_stay_reward_mean": actual_stay_stats["reward_mean"],
+        "uav_move_q_total_mean": actual_move_stats["q_total_mean"],
+        "uav_stay_q_total_mean": actual_stay_stats["q_total_mean"],
+        "uav_move_movement_cost_mean": actual_move_stats["movement_cost_mean"],
+        "uav_stay_movement_cost_mean": actual_stay_stats["movement_cost_mean"],
+        "uav_move_delay_mean": actual_move_stats["delay_mean"],
+        "uav_stay_delay_mean": actual_stay_stats["delay_mean"],
+        "uav_move_energy_mean": actual_move_stats["energy_mean"],
+        "uav_stay_energy_mean": actual_stay_stats["energy_mean"],
+        "uav_move_return_target_mean": actual_move_stats["return_target_mean"],
+        "uav_stay_return_target_mean": actual_stay_stats["return_target_mean"],
+        "uav_move_old_log_prob_mean": actual_move_stats["old_log_prob_mean"],
+        "uav_stay_old_log_prob_mean": actual_stay_stats["old_log_prob_mean"],
+        "uav_move_new_log_prob_mean": actual_move_stats["new_log_prob_mean"],
+        "uav_stay_new_log_prob_mean": actual_stay_stats["new_log_prob_mean"],
+        "uav_move_ratio_mean": actual_move_stats["ratio_mean"],
+        "uav_stay_ratio_mean": actual_stay_stats["ratio_mean"],
+        "uav_move_clip_fraction": actual_move_stats["clip_fraction"],
+        "uav_stay_clip_fraction": actual_stay_stats["clip_fraction"],
+        "uav_selected_move_count": selected_count,
+        "uav_selected_stay_count": int(expected_length - selected_count),
+        "uav_selected_move_actual_move_count": int(np.sum(selected & actual)),
+        "uav_selected_move_actual_stay_count": int(np.sum(selected & ~actual)),
+        "uav_selected_stay_actual_move_count": int(np.sum(~selected & actual)),
+        "uav_selected_stay_actual_stay_count": int(np.sum(~selected & ~actual)),
+        "uav_feasible_action_count_mean": float(np.mean(feasible_counts_a)),
+        "uav_feasible_action_count_min": int(np.min(feasible_counts_a)),
+        "uav_feasible_action_count_max": int(np.max(feasible_counts_a)),
+        "uav_move_candidate_count_mean": float(np.mean(candidate_counts_a)),
+        "uav_move_candidate_count_min": int(np.min(candidate_counts_a)),
+        "uav_move_candidate_count_max": int(np.max(candidate_counts_a)),
+        "uav_action_mask_summary": {
+            "operation_width": 2,
+            "feasible_operation_count_mean": float(np.mean(feasible_counts_a)),
+            "feasible_operation_count_min": int(np.min(feasible_counts_a)),
+            "feasible_operation_count_max": int(np.max(feasible_counts_a)),
+            "move_candidate_count_mean": float(np.mean(candidate_counts_a)),
+            "move_candidate_count_min": int(np.min(candidate_counts_a)),
+            "move_candidate_count_max": int(np.max(candidate_counts_a)),
+        },
+    }
+
+def _binary_action_bitmask(action: Any) -> int:
+    """将二元动作向量编码为紧凑且确定的整数。"""
+
+    values = np.asarray(action, dtype=np.int8).reshape(-1)
+    if not np.all((values == 0) | (values == 1)):
+        raise ValueError("binary action bitmask requires only 0/1 values")
+    bitmask = 0
+    for index, value in enumerate(values.tolist()):
+        if int(value):
+            bitmask |= 1 << int(index)
+    return int(bitmask)
+
+def _branch_update_metric_fields(update: Any) -> dict[str, Any]:
+    """返回有限的分支诊断指标。"""
+
+    values = {
+        "cache_approx_kl": float(update.cache_approx_kl),
+        "uav_approx_kl": float(update.uav_approx_kl),
+        "cache_clip_fraction": float(update.cache_clip_fraction),
+        "CACHE_PER_HEAD_OLD_NEW_KL_MEAN": float(
+            update.cache_per_head_old_new_kl_mean
+        ),
+        "CACHE_PER_HEAD_OLD_NEW_KL_P50": float(
+            update.cache_per_head_old_new_kl_p50
+        ),
+        "CACHE_PER_HEAD_OLD_NEW_KL_P90": float(
+            update.cache_per_head_old_new_kl_p90
+        ),
+        "CACHE_PER_HEAD_OLD_NEW_KL_MAX": float(
+            update.cache_per_head_old_new_kl_max
+        ),
+        "CACHE_PER_HEAD_RATIO_MEAN": float(update.cache_per_head_ratio_mean),
+        "CACHE_PER_HEAD_RATIO_P90": float(update.cache_per_head_ratio_p90),
+        "CACHE_PER_HEAD_RATIO_MAX": float(update.cache_per_head_ratio_max),
+        "CACHE_PER_HEAD_CLIP_FRACTION": float(update.cache_per_head_clip_fraction),
+        "uav_clip_fraction": float(update.uav_clip_fraction),
+        "cache_entropy": float(update.cache_entropy),
+        "uav_entropy": float(update.uav_entropy),
+        "cache_head_gradient_norm": float(update.cache_head_gradient_norm),
+        "uav_head_gradient_norm": float(update.uav_head_gradient_norm),
+            "shared_actor_gradient_norm": float(update.shared_actor_gradient_norm),
+        }
+    fields = values if all(math.isfinite(value) for value in values.values()) else {}
+    fields.update(
+        {
+        }
+    )
+    policy_losses = {
+        "cache_policy_loss": float(update.cache_policy_loss),
+        "cache_trigger_policy_loss": float(update.cache_trigger_policy_loss),
+        "cache_candidate_listwise_loss": float(
+            update.cache_candidate_policy_loss
+        ),
+        "uav_policy_loss": float(update.uav_policy_loss),
+        "uav_operation_policy_loss": float(update.uav_operation_policy_loss),
+        "uav_candidate_listwise_loss": float(update.uav_candidate_policy_loss),
+        "actor_policy_loss": float(update.actor_policy_loss),
+    }
+    if all(math.isfinite(value) for value in policy_losses.values()):
+        fields.update(policy_losses)
+    candidate_metrics = {
+        "candidate_loss": float(update.uav_candidate_policy_loss),
+        "mean_abs_candidate_advantage": float(
+            update.uav_candidate_advantage_mean_abs
+        ),
+        "candidate_adv_weighted_mean_residual": float(
+            update.uav_candidate_advantage_weighted_mean_residual
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_metrics.values()):
+        fields.update(candidate_metrics)
+        fields["candidate_advantage_normalization"] = str(
+            update.uav_candidate_advantage_normalization
+        )
+        fields["candidate_advantage_source"] = str(
+            update.uav_candidate_advantage_source
+        )
+    candidate_policy_metrics = {
+        "UAV_CANDIDATE_POLICY_ENTROPY_MEAN": float(
+            update.uav_candidate_policy_entropy_mean
+        ),
+        "UAV_CANDIDATE_TEACHER_ENTROPY_MEAN": float(
+            update.uav_candidate_teacher_entropy_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_MEAN": float(
+            update.uav_candidate_best_policy_prob_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_MEDIAN": float(
+            update.uav_candidate_best_policy_prob_median
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_RANK_MEAN": float(
+            update.uav_candidate_best_policy_rank_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_TOP1_RATE": float(
+            update.uav_candidate_best_policy_top1_rate
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_TOP3_RATE": float(
+            update.uav_candidate_best_policy_top3_rate
+        ),
+        "UAV_CANDIDATE_LOGIT_STD_MEAN": float(update.uav_candidate_logit_std_mean),
+        "UAV_CANDIDATE_LOGIT_RANGE_MEAN": float(
+            update.uav_candidate_logit_range_mean
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_policy_metrics.values()):
+        fields.update(candidate_policy_metrics)
+    candidate_confidence_metrics = {
+        "UAV_CANDIDATE_CONFIDENCE_MEAN": float(
+            update.uav_candidate_confidence_mean
+        ),
+        "UAV_CANDIDATE_CONFIDENCE_P10": float(update.uav_candidate_confidence_p10),
+        "UAV_CANDIDATE_CONFIDENCE_P50": float(update.uav_candidate_confidence_p50),
+        "UAV_CANDIDATE_CONFIDENCE_P90": float(update.uav_candidate_confidence_p90),
+        "UAV_CANDIDATE_CONFIDENCE_SATURATION_RATE": float(
+            update.uav_candidate_confidence_saturation_rate
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_confidence_metrics.values()):
+        fields.update(candidate_confidence_metrics)
+    fields.update(
+        {
+            "CACHE_ACTOR_GRAD_NORM_PRECLIP": [
+                float(value)
+                for value in update.cache_actor_grad_norm_preclip_by_update_epoch
+            ],
+            "CACHE_ACTOR_GRAD_CLIP_COEFFICIENT": [
+                float(value)
+                for value in update.cache_actor_grad_clip_coefficient_by_update_epoch
+            ],
+            "UAV_ACTOR_GRAD_NORM_PRECLIP": [
+                float(value)
+                for value in update.uav_actor_grad_norm_preclip_by_update_epoch
+            ],
+            "UAV_ACTOR_GRAD_CLIP_COEFFICIENT": [
+                float(value)
+                for value in update.uav_actor_grad_clip_coefficient_by_update_epoch
+            ],
+            "COMBINED_ACTOR_GRAD_NORM_POSTCLIP": [
+                float(value)
+                for value in update.combined_actor_grad_norm_postclip_by_update_epoch
+            ],
+            "UAV_CANDIDATE_SCORER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_scorer_gradient_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_SCORER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_scorer_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_gradient_norm_by_update_epoch
+            ],
+            "UAV_OPERATION_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_gradient_norm_by_update_epoch
+            ],
+            "UAV_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_OPERATION_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_encoder_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_encoder_gradient_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_encoder_parameter_delta_norm_by_update_epoch
+            ],
+            "UAV_CANDIDATE_OLD_NEW_KL_MEAN_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_old_new_kl_mean_by_update_epoch
+            ],
+            "UAV_CANDIDATE_OLD_NEW_KL_P90_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_old_new_kl_p90_by_update_epoch
+            ],
+            "UAV_CANDIDATE_OLD_NEW_KL_MAX_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_old_new_kl_max_by_update_epoch
+            ],
+            "UAV_CANDIDATE_ARGMAX_FLIP_RATE_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_argmax_flip_rate_by_update_epoch
+            ],
+            "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_MEAN_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_best_policy_prob_change_mean_by_update_epoch
+            ],
+            "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_P10_BY_UPDATE_EPOCH": [
+                float(value)
+                for value in update.uav_candidate_best_policy_prob_change_p10_by_update_epoch
+            ],
+        }
+    )
+    combined_postclip = np.asarray(
+        update.combined_actor_grad_norm_postclip_by_update_epoch,
+        dtype=np.float64,
+    )
+    if combined_postclip.size:
+        fields.update(
+            {
+                "COMBINED_POSTCLIP_NORM_MEAN": float(np.mean(combined_postclip)),
+                "COMBINED_POSTCLIP_NORM_MAX": float(np.max(combined_postclip)),
+                "COMBINED_POSTCLIP_GT_0P5_FRACTION": float(
+                    np.mean(combined_postclip > 0.5)
+                ),
+            }
+        )
+    candidate_drift_metrics = {
+        "UAV_CANDIDATE_OLD_NEW_KL_MEAN": float(
+            update.uav_candidate_old_new_kl_mean
+        ),
+        "UAV_CANDIDATE_OLD_NEW_KL_P50": float(update.uav_candidate_old_new_kl_p50),
+        "UAV_CANDIDATE_OLD_NEW_KL_P90": float(update.uav_candidate_old_new_kl_p90),
+        "UAV_CANDIDATE_OLD_NEW_KL_MAX": float(update.uav_candidate_old_new_kl_max),
+        "UAV_CANDIDATE_ARGMAX_FLIP_RATE": float(
+            update.uav_candidate_argmax_flip_rate
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_MEAN": float(
+            update.uav_candidate_best_policy_prob_change_mean
+        ),
+        "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_P10": float(
+            update.uav_candidate_best_policy_prob_change_p10
+        ),
+    }
+    if all(math.isfinite(value) for value in candidate_drift_metrics.values()):
+        fields.update(candidate_drift_metrics)
+    candidate_gate_metrics = {
+        "UAV_CANDIDATE_TARGET_KL": float(update.uav_candidate_target_kl),
+    }
+    if all(math.isfinite(value) for value in candidate_gate_metrics.values()):
+        fields.update(candidate_gate_metrics)
+    candidate_effective_kl_metrics = {
+        "UAV_CANDIDATE_EFFECTIVE_KL_AT_GATE": float(
+            update.uav_candidate_effective_kl_at_gate
+        ),
+        "UAV_CANDIDATE_EFFECTIVE_KL_IMMEDIATELY_AFTER_GATE": float(
+            update.uav_candidate_effective_kl_immediately_after_gate
+        ),
+        "UAV_CANDIDATE_EFFECTIVE_KL_AFTER_GATE": float(
+            update.uav_candidate_effective_kl_after_gate
+        ),
+        "UAV_CANDIDATE_POST_GATE_DRIFT_FROM_GATE": float(
+            update.uav_candidate_post_gate_drift_from_gate
+        ),
+    }
+    fields.update(
+        {
+            key: value
+            for key, value in candidate_effective_kl_metrics.items()
+            if math.isfinite(value)
+        }
+    )
+    fields.update(
+        {
+            "UAV_CANDIDATE_KL_GATE_STATISTIC": str(
+                update.uav_candidate_kl_gate_statistic
+            ),
+            "UAV_CANDIDATE_KL_GATE_TRIGGER_SOURCE": str(
+                update.uav_candidate_kl_gate_trigger_source
+            ),
+            "UAV_CANDIDATE_KL_STOP_EPOCH": update.uav_candidate_kl_stop_epoch,
+            "UAV_CANDIDATE_ACTIVE_PER_UPDATE_EPOCH": [
+                bool(value) for value in update.uav_candidate_active_per_update_epoch
+            ],
+            "UAV_CANDIDATE_SUPPRESSED_UPDATE_EPOCHS": int(
+                update.uav_candidate_suppressed_update_epochs
+            ),
+        }
+    )
+    scorer_deltas = {
+        "cache_target_scorer_parameter_delta_norm": float(
+            update.cache_target_scorer_parameter_delta_norm
+        ),
+        "uav_target_scorer_parameter_delta_norm": float(
+            update.uav_target_scorer_parameter_delta_norm
+        ),
+    }
+    if all(math.isfinite(value) for value in scorer_deltas.values()):
+        fields.update(scorer_deltas)
+    exact_q_quality = {
+        "uav_top1_exact_q_accuracy_before": float(
+            update.uav_top1_exact_q_accuracy_before
+        ),
+        "uav_top1_exact_q_accuracy_after": float(
+            update.uav_top1_exact_q_accuracy_after
+        ),
+        "uav_mean_exact_q_regret_before": float(
+            update.uav_mean_exact_q_regret_before
+        ),
+        "uav_mean_exact_q_regret_after": float(
+            update.uav_mean_exact_q_regret_after
+        ),
+        "uav_expected_exact_q_before": float(update.uav_expected_exact_q_before),
+        "uav_expected_exact_q_after": float(update.uav_expected_exact_q_after),
+        "uav_expected_exact_q_delta": float(update.uav_expected_exact_q_delta),
+        "uav_target_policy_kl_old_new": float(update.uav_target_policy_kl_old_new),
+    }
+    if all(math.isfinite(value) for value in exact_q_quality.values()):
+        fields.update(exact_q_quality)
+    if update.cache_proposal_diagnostics is not None:
+        fields["cache_proposal_diagnostics"] = dict(update.cache_proposal_diagnostics)
+    if update.uav_proposal_diagnostics is not None:
+        fields["uav_proposal_diagnostics"] = dict(update.uav_proposal_diagnostics)
+    fields.update(
+        {
+            "CACHE_TRIGGER_CREDIT_SOURCE": str(update.cache_trigger_credit_source),
+            "CACHE_CANDIDATE_CREDIT_SOURCE": str(update.cache_candidate_credit_source),
+            "CACHE_VALUE_EVALUATOR": str(update.cache_value_evaluator),
+            "CACHE_DOWNSTREAM_MODE": str(update.cache_downstream_mode),
+            "CACHE_TRIGGER_TEACHER_TEMPERATURE": float(
+                update.cache_trigger_teacher_temperature
+            ),
+            "CACHE_CANDIDATE_TEACHER_TEMPERATURE": float(
+                update.cache_candidate_teacher_temperature
+            ),
+            "CACHE_TRIGGER_VALID_HEAD_COUNT": int(
+                update.cache_trigger_valid_head_count
+            ),
+            "CACHE_CANDIDATE_VALID_HEAD_COUNT": int(
+                update.cache_candidate_valid_head_count
+            ),
+            "CACHE_Q_KEEP_MEAN": float(update.cache_q_keep_mean),
+            "CACHE_Q_BEST_UPDATE_MEAN": float(update.cache_q_best_update_mean),
+            "CACHE_DELTA_BEST_MEAN": float(update.cache_delta_best_mean),
+            "CACHE_LOGICAL_UPDATE_CANDIDATE_COUNT": int(
+                update.cache_logical_candidate_count
+            ),
+            "CACHE_FULL_EXACT_KEEP_BRANCH_COUNT": int(update.cache_keep_exact_count),
+            "CACHE_FULL_EXACT_UPDATE_BRANCH_COUNT": int(
+                update.cache_full_exact_update_branch_count
+            ),
+            "CACHE_DEDUPLICATED_BRANCH_COUNT": int(
+                update.cache_deduplicated_branch_count
+            ),
+            "CACHE_COUNTERFACTUAL_ENV_EXECUTIONS": int(
+                update.cache_credit_counterfactual_env_executions
+            ),
+            "CACHE_TEACHER_EVALUATION_RUNTIME_SECONDS": float(
+                update.cache_credit_runtime_seconds
+            ),
+            "CACHE_EXACT_CANDIDATE_COUNT": int(
+                update.cache_exact_candidate_count
+            ),
+            "CACHE_SURROGATE_CANDIDATE_COUNT": int(
+                update.cache_surrogate_candidate_count
+            ),
+            "CACHE_COUNTERFACTUAL_EXECUTIONS_SAVED": int(
+                update.cache_counterfactual_executions_saved
+            ),
+            "CACHE_COUNTERFACTUAL_EXECUTION_REDUCTION_RATIO": float(
+                update.cache_counterfactual_execution_reduction_fraction
+            ),
+            "CACHE_SURROGATE_SCREENING_ACTIVE": bool(
+                update.cache_surrogate_screening_active
+            ),
+            "CACHE_SURROGATE_SCREENING_READY": bool(
+                update.cache_surrogate_screening_ready
+            ),
+            "CACHE_SURROGATE_SELECTED_K": update.cache_surrogate_selected_k,
+            "CACHE_SURROGATE_DELTA_Q_MAE": float(
+                update.cache_surrogate_delta_q_mae
+            ),
+            "CACHE_SURROGATE_DELTA_Q_RMSE": float(
+                update.cache_surrogate_delta_q_rmse
+            ),
+            "CACHE_SURROGATE_GATE_METRICS": update.cache_surrogate_gate_metrics,
+            "CACHE_TEACHER_SCALE_CALIBRATION": update.cache_teacher_scale_calibration,
+            "CACHE_TRIGGER_DELTA_Q_STATISTICS": (
+                update.cache_trigger_delta_best_statistics
+            ),
+            "CACHE_TRIGGER_TEACHER_STATISTICS": update.cache_trigger_teacher_statistics,
+            "CACHE_CANDIDATE_TEACHER_STATISTICS": update.cache_candidate_teacher_statistics,
+        }
+    )
+    if math.isfinite(float(update.uav_operation_credit_runtime_seconds)):
+        fields["uav_operation_credit_runtime_seconds"] = float(
+            update.uav_operation_credit_runtime_seconds
+        )
+        fields["uav_operation_counterfactual_env_executions"] = int(
+            update.uav_operation_counterfactual_env_executions
+        )
+        fields.update(
+            {
+                "UAV_EXACT_Q_BRANCH_REQUEST_COUNT": int(
+                    update.uav_exact_q_branch_request_count
+                ),
+                "UAV_EXACT_Q_UNIQUE_BRANCH_COUNT": int(
+                    update.uav_exact_q_unique_branch_count
+                ),
+                "UAV_EXACT_Q_DUPLICATE_BRANCH_COUNT": int(
+                    update.uav_exact_q_duplicate_branch_count
+                ),
+                "UAV_EXACT_Q_CACHE_HIT_COUNT": int(
+                    update.uav_exact_q_cache_hit_count
+                ),
+                "EXECUTE_SLOT_CALL_COUNT": int(
+                    update.uav_exact_q_execute_slot_call_count
+                ),
+                "MATCHING_CALL_COUNT": int(update.uav_exact_q_matching_call_count),
+                # 该值来自 Matching/KKT 资源缓存的实际请求次数。
+                "KKT_CALL_COUNT": int(update.uav_exact_q_kkt_call_count),
+                "KKT_CACHE_REQUEST_COUNT": int(
+                    update.uav_exact_q_kkt_cache_request_count
+                ),
+                "KKT_CACHE_HIT_COUNT": int(update.uav_exact_q_kkt_cache_hit_count),
+                "KKT_CACHE_MISS_COUNT": int(update.uav_exact_q_kkt_cache_miss_count),
+                "KKT_SOLVER_CALL_COUNT": int(
+                    update.uav_exact_q_kkt_solver_call_count
+                ),
+                "NODE_EVAL_CACHE_REQUEST_COUNT": int(
+                    update.uav_exact_q_node_eval_cache_request_count
+                ),
+                "NODE_EVAL_CACHE_HIT_COUNT": int(
+                    update.uav_exact_q_node_eval_cache_hit_count
+                ),
+                "NODE_EVAL_CACHE_MISS_COUNT": int(
+                    update.uav_exact_q_node_eval_cache_miss_count
+                ),
+                "NODE_EVAL_CACHE_HIT_RATE": float(
+                    update.uav_exact_q_node_eval_cache_hit_count
+                    / update.uav_exact_q_node_eval_cache_request_count
+                    if update.uav_exact_q_node_eval_cache_request_count > 0
+                    else 0.0
+                ),
+                "NODE_EVAL_FULL_EXECUTION_COUNT": int(
+                    update.uav_exact_q_node_eval_full_execution_count
+                ),
+                "IDEAL_UTILITY_REQUEST_COUNT": int(
+                    update.uav_exact_q_ideal_utility_request_count
+                ),
+                "IDEAL_UTILITY_CACHE_HIT_COUNT": int(
+                    update.uav_exact_q_ideal_utility_cache_hit_count
+                ),
+                "IDEAL_UTILITY_CACHE_MISS_COUNT": int(
+                    update.uav_exact_q_ideal_utility_cache_miss_count
+                ),
+                "IDEAL_UTILITY_CACHE_HIT_RATE": float(
+                    update.uav_exact_q_ideal_utility_cache_hit_count
+                    / update.uav_exact_q_ideal_utility_request_count
+                    if update.uav_exact_q_ideal_utility_request_count > 0
+                    else 0.0
+                ),
+                "IMPACT_SCOPE_REQUEST_COUNT": int(
+                    update.uav_exact_q_impact_scope_request_count
+                ),
+                "IMPACT_SCOPE_COMPUTE_COUNT": int(
+                    update.uav_exact_q_impact_scope_compute_count
+                ),
+                "IMPACT_SCOPE_REUSE_COUNT": int(
+                    update.uav_exact_q_impact_scope_reuse_count
+                ),
+                "IMPACT_SCOPE_REUSE_RATE": float(
+                    update.uav_exact_q_impact_scope_reuse_count
+                    / update.uav_exact_q_impact_scope_request_count
+                    if update.uav_exact_q_impact_scope_request_count > 0
+                    else 0.0
+                ),
+            }
+        )
+        if update.uav_operation_timing is not None:
+            timing_fields = {
+                "EXACT_Q_MATCHING_RUNTIME": "matching_runtime",
+                "MATCHING_PROFILE_TOTAL_RUNTIME": "matching_runtime",
+                "MATCHING_FEASIBLE_TARGET_RUNTIME": "matching_feasible_target_runtime",
+                "MATCHING_CANDIDATE_GENERATION_RUNTIME": "matching_candidate_generation_runtime",
+                "MATCHING_CANDIDATE_BUILD_RUNTIME": "matching_candidate_generation_runtime",
+                "MATCHING_IMPACT_SCOPE_RUNTIME": "matching_impact_scope_runtime",
+                "MATCHING_UPPER_BOUND_RUNTIME": "matching_upper_bound_runtime",
+                "MATCHING_IDEAL_UTILITY_RUNTIME": "matching_ideal_utility_runtime",
+                "MATCHING_CHANNEL_RATE_RUNTIME": "matching_channel_rate_runtime",
+                "MATCHING_EXACT_EVAL_ORCHESTRATION_RUNTIME": "matching_exact_eval_orchestration_runtime",
+                "MATCHING_EXACT_EVAL_CONTROL_RUNTIME": "matching_exact_eval_orchestration_runtime",
+                "MATCHING_REPLAY_TIEBREAK_RUNTIME": "matching_replay_tiebreak_runtime",
+                "MATCHING_OTHER_RUNTIME": "matching_other_runtime",
+                "EXACT_Q_NODE_CACHE_LOOKUP_RUNTIME": "node_cache_lookup_runtime",
+                # Node 求解未命中耗时不包含单独记录的
+                # KKT allocation 耗时，以保证两类统计互不重叠。
+                "EXACT_Q_NODE_EVAL_RUNTIME": "node_eval_miss_runtime",
+                "EXACT_Q_NODE_EVAL_MISS_RUNTIME": "node_eval_miss_runtime",
+                "EXACT_Q_KKT_RUNTIME": "kkt_runtime",
+                "KKT_COEFFICIENT_BUILD_RUNTIME": "kkt_coefficient_build_runtime",
+                "KKT_SOLVER_CORE_RUNTIME": "kkt_solver_core_runtime",
+                "KKT_RESULT_ASSEMBLY_RUNTIME": "kkt_result_assembly_runtime",
+                "REWARD_DELAY_AGGREGATION_RUNTIME": "reward_delay_aggregation_runtime",
+                "REWARD_ENERGY_AGGREGATION_RUNTIME": "reward_energy_aggregation_runtime",
+                "REWARD_COST_AGGREGATION_RUNTIME": "reward_cost_aggregation_runtime",
+                "REWARD_FINAL_COMBINATION_RUNTIME": "reward_final_combination_runtime",
+                "EXACT_Q_BRANCH_STATE_BUILD_RUNTIME": "branch_state_build_runtime",
+                "EXACT_Q_REWARD_ASSEMBLY_RUNTIME": "reward_assembly_runtime",
+                "EXACT_Q_CRITIC_RUNTIME": "critic_runtime",
+                "EXACT_Q_OTHER_RUNTIME": "other_runtime",
+                "PARALLEL_WORKER_STARTUP_RUNTIME": "parallel_worker_startup_runtime",
+                "WORK_ITEM_SERIALIZATION_RUNTIME": "work_item_serialization_runtime",
+                "RESULT_MERGE_RUNTIME": "result_merge_runtime",
+                "EXACT_Q_PARALLEL_WORKERS": "parallel_worker_count",
+            }
+            total_runtime = float(update.uav_operation_credit_runtime_seconds)
+            if math.isfinite(total_runtime) and total_runtime > 0.0:
+                for metric_name, timing_key in timing_fields.items():
+                    value = float(update.uav_operation_timing.get(timing_key, 0.0))
+                    if not math.isfinite(value):
+                        continue
+                    fields[metric_name] = value
+                    fields[f"{metric_name}_FRACTION"] = value / total_runtime
+                exact_eval_subhotspot_fields = {
+                    "EXACT_EVAL_KKT_CONVERSION_RUNTIME": "exact_eval_kkt_conversion_runtime",
+                    "EXACT_EVAL_STATE_COPY_RUNTIME": "exact_eval_state_copy_runtime",
+                    "EXACT_EVAL_AFFECTED_NODE_PREP_RUNTIME": "exact_eval_affected_node_prep_runtime",
+                    "EXACT_EVAL_NODE_CALL_ORCHESTRATION_RUNTIME": "exact_eval_node_call_orchestration_runtime",
+                    "EXACT_EVAL_RESULT_MERGE_RUNTIME": "exact_eval_result_merge_runtime",
+                    "EXACT_EVAL_NON_EDGE_PREP_RUNTIME": "exact_eval_non_edge_prep_runtime",
+                    "EXACT_EVAL_TARGET_COUNT_BUILD_RUNTIME": "exact_eval_target_count_build_runtime",
+                    "EXACT_EVAL_UTILITY_SUM_RUNTIME": "exact_eval_utility_sum_runtime",
+                    "EXACT_EVAL_OTHER_RUNTIME": "exact_eval_other_runtime",
+                }
+                exact_eval_control_runtime = float(
+                    update.uav_operation_timing.get(
+                        "matching_exact_eval_orchestration_runtime", 0.0
+                    )
+                )
+                classified_subhotspot_runtime = 0.0
+                for metric_name, timing_key in exact_eval_subhotspot_fields.items():
+                    value = float(update.uav_operation_timing.get(timing_key, 0.0))
+                    if not math.isfinite(value):
+                        continue
+                    fields[metric_name] = value
+                    if exact_eval_control_runtime > 0.0:
+                        fields[f"{metric_name}_FRACTION"] = (
+                            value / exact_eval_control_runtime
+                        )
+                    classified_subhotspot_runtime += value
+                fields["EXACT_EVAL_RECORD_BOOKKEEPING_RUNTIME"] = float(
+                    update.uav_operation_timing.get(
+                        "exact_eval_record_bookkeeping_runtime", 0.0
+                    )
+                )
+                fields["EXACT_EVAL_SUBHOTSPOT_CLASSIFIED_RUNTIME"] = (
+                    classified_subhotspot_runtime
+                )
+                fields["EXACT_EVAL_UNCLASSIFIED_RUNTIME"] = (
+                    exact_eval_control_runtime - classified_subhotspot_runtime
+                )
+                fields["CURRENT_KKT_CONVERSION_CALL_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "current_kkt_conversion_call_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CANDIDATE_KKT_CONVERSION_CALL_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "candidate_kkt_conversion_call_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["EXACT_EVAL_STATE_COPY_CALL_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "exact_eval_state_copy_call_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CURRENT_KKT_CONTEXT_REQUEST_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "current_kkt_context_request_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CURRENT_KKT_CONTEXT_REUSE_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "current_kkt_context_reuse_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CANDIDATE_KKT_CONTEXT_REQUEST_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "candidate_kkt_context_request_count", 0.0
+                            )
+                        )
+                    )
+                )
+                fields["CANDIDATE_KKT_CONTEXT_REUSE_COUNT"] = int(
+                    round(
+                        float(
+                            update.uav_operation_timing.get(
+                                "candidate_kkt_context_reuse_count", 0.0
+                            )
+                        )
+                    )
+                )
+    routing_metrics = {
+        "UAV_OPERATION_FULL_ROLLOUT_KL": float(
+            update.uav_operation_full_rollout_kl
+        ),
+        "uav_operation_head_parameter_delta_norm": float(
+            update.uav_operation_head_parameter_delta_norm
+        ),
+        "uav_operation_encoder_parameter_delta_norm": float(
+            update.uav_encoder_parameter_delta_norm
+        ),
+        "uav_candidate_encoder_parameter_delta_norm": float(
+            update.uav_candidate_encoder_parameter_delta_norm
+        ),
+    }
+    if all(math.isfinite(value) for value in routing_metrics.values()):
+        fields.update(routing_metrics)
+    fields.update(
+        {
+            "UAV_OPERATION_STEPS_EXECUTED": int(update.uav_operation_steps_executed),
+            "UAV_OPERATION_STEPS_SUPPRESSED": int(update.uav_operation_steps_suppressed),
+            "UAV_CANDIDATE_FULL_STEPS": int(update.uav_candidate_full_steps),
+            "UAV_CANDIDATE_ONLY_STEPS_AFTER_OPERATION_STOP": int(
+                update.uav_candidate_only_steps_after_operation_stop
+            ),
+            "UAV_CANDIDATE_OPTIMIZER_STEP_COUNT": int(
+                update.uav_candidate_optimizer_step_count
+            ),
+            "UAV_CANDIDATE_SCORER_OPTIMIZER_STEP_COUNT": int(
+                update.uav_candidate_optimizer_step_count
+            ),
+            "UAV_OPERATION_ENCODER_OPTIMIZER_STEP_COUNT": int(
+                update.uav_operation_encoder_optimizer_step_count
+            ),
+            "UAV_CANDIDATE_ENCODER_OPTIMIZER_STEP_COUNT": int(
+                update.uav_candidate_encoder_optimizer_step_count
+            ),
+            "UAV_CANDIDATE_SCORER_ENCODER_STEP_GAP": int(
+                update.uav_candidate_scorer_encoder_step_gap
+            ),
+        }
+    )
+    if update.uav_operation_teacher_diagnostics is not None:
+        fields.update(dict(update.uav_operation_teacher_diagnostics))
+    if update.uav_operation_diagnostics is not None:
+        fields.update(dict(update.uav_operation_diagnostics))
+    encoder_gradient_norms = {
+        "cache_encoder_gradient_norm": float(update.cache_encoder_gradient_norm),
+        "uav_operation_encoder_gradient_norm": float(update.uav_encoder_gradient_norm),
+        "uav_candidate_encoder_gradient_norm": float(
+            update.uav_candidate_encoder_gradient_norm
+        ),
+    }
+    if all(math.isfinite(value) for value in encoder_gradient_norms.values()):
+        fields.update(encoder_gradient_norms)
+    fields.update(
+        {
+            "MATCHING_NATURAL_STABLE_COUNT": int(
+                update.matching_natural_stable_count
+            ),
+            "MATCHING_MAX_UPDATES_HIT_COUNT": int(
+                update.matching_max_updates_hit_count
+            ),
+            "MATCHING_MAX_UPDATES_HIT_RATE": float(
+                update.matching_max_updates_hit_rate
+            ),
+            "MATCHING_UPDATE_COUNT_MEAN": float(update.matching_update_count_mean),
+            "MATCHING_UPDATE_COUNT_P95": float(update.matching_update_count_p95),
+            "MATCHING_UPDATE_COUNT_MAX": int(update.matching_update_count_max),
+            "MATCHING_CF_NATURAL_STABLE_COUNT": int(
+                update.matching_cf_natural_stable_count
+            ),
+            "MATCHING_CF_MAX_UPDATES_HIT_COUNT": int(
+                update.matching_cf_max_updates_hit_count
+            ),
+            "MATCHING_CF_MAX_UPDATES_HIT_RATE": float(
+                update.matching_cf_max_updates_hit_rate
+            ),
+            "MATCHING_CF_UPDATE_COUNT_MEAN": float(
+                update.matching_cf_update_count_mean
+            ),
+            "MATCHING_CF_UPDATE_COUNT_P95": float(
+                update.matching_cf_update_count_p95
+            ),
+            "MATCHING_CF_UPDATE_COUNT_MAX": int(
+                update.matching_cf_update_count_max
+            ),
+            "KKT_SOLVE_COUNT": int(update.kkt_solve_count),
+            "KKT_CONVERGED_COUNT": int(update.kkt_converged_count),
+            "KKT_CONVERGED_RATE": float(update.kkt_converged_rate),
+            "KKT_MAX_ITER_HIT_COUNT": int(update.kkt_max_iter_hit_count),
+            "KKT_MAX_ITER_HIT_RATE": float(update.kkt_max_iter_hit_rate),
+            "KKT_FINITE_COUNT": int(update.kkt_finite_count),
+            "KKT_FINITE_RATE": float(update.kkt_finite_rate),
+            "KKT_ITERATION_MEAN": float(update.kkt_iteration_mean),
+            "KKT_ITERATION_P95": float(update.kkt_iteration_p95),
+            "KKT_ITERATION_MAX": int(update.kkt_iteration_max),
+            "KKT_RESOURCE_RESIDUAL_MEAN": float(
+                update.kkt_resource_residual_mean
+            ),
+            "KKT_RESOURCE_RESIDUAL_MAX": float(update.kkt_resource_residual_max),
+            "KKT_STATIONARITY_RESIDUAL_MEAN": float(
+                update.kkt_stationarity_residual_mean
+            ),
+            "KKT_STATIONARITY_RESIDUAL_MAX": float(
+                update.kkt_stationarity_residual_max
+            ),
+            "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": float(
+                update.kkt_complementary_slackness_residual_mean
+            ),
+            "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": float(
+                update.kkt_complementary_slackness_residual_max
+            ),
+            "KKT_CF_SOLVE_COUNT": int(update.matching_cf_kkt_solve_count),
+            "KKT_CF_CONVERGED_COUNT": int(
+                update.matching_cf_kkt_converged_count
+            ),
+            "KKT_CF_CONVERGED_RATE": float(
+                update.matching_cf_kkt_converged_rate
+            ),
+            "KKT_CF_MAX_ITER_HIT_COUNT": int(
+                update.matching_cf_kkt_max_iter_hit_count
+            ),
+            "KKT_CF_MAX_ITER_HIT_RATE": float(
+                update.matching_cf_kkt_max_iter_hit_rate
+            ),
+            "KKT_CF_FINITE_COUNT": int(update.matching_cf_kkt_finite_count),
+            "KKT_CF_FINITE_RATE": float(update.matching_cf_kkt_finite_rate),
+            "KKT_CF_ITERATION_MEAN": float(
+                update.matching_cf_kkt_iteration_mean
+            ),
+            "KKT_CF_ITERATION_P95": float(update.matching_cf_kkt_iteration_p95),
+            "KKT_CF_ITERATION_MAX": int(update.matching_cf_kkt_iteration_max),
+            "KKT_CF_RESOURCE_RESIDUAL_MEAN": float(
+                update.matching_cf_kkt_resource_residual_mean
+            ),
+            "KKT_CF_RESOURCE_RESIDUAL_MAX": float(
+                update.matching_cf_kkt_resource_residual_max
+            ),
+            "KKT_CF_STATIONARITY_RESIDUAL_MEAN": float(
+                update.matching_cf_kkt_stationarity_residual_mean
+            ),
+            "KKT_CF_STATIONARITY_RESIDUAL_MAX": float(
+                update.matching_cf_kkt_stationarity_residual_max
+            ),
+            "KKT_CF_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": float(
+                update.matching_cf_kkt_complementary_slackness_residual_mean
+            ),
+            "KKT_CF_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": float(
+                update.matching_cf_kkt_complementary_slackness_residual_max
+            ),
+        }
+    )
+    return fields
+
+def _critic_episode_metrics(
+    old_values: list[float],
+    raw_targets: list[float],
+) -> tuple[float | None, float, float]:
+    """将采集阶段的 Critic 价值与正式 GAE target 进行汇总比较。"""
+
+    values = np.asarray(old_values, dtype=np.float64)
+    targets = np.asarray(raw_targets, dtype=np.float64)
+    if values.shape != targets.shape or values.ndim != 1 or not len(values):
+        raise ValueError("critic episode metric arrays must be aligned and non-empty")
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(targets)):
+        raise FloatingPointError("critic episode metrics contain NaN/Inf")
+    target_variance = float(np.var(targets))
+    value_std = float(np.std(values))
+    target_std = float(np.std(targets))
+    if not all(np.isfinite(value) for value in (target_variance, value_std, target_std)):
+        raise FloatingPointError("critic episode metric summary is non-finite")
+    explained_variance: float | None
+    if target_variance <= 1.0e-12:
+        explained_variance = None
+    else:
+        explained_variance = float(
+            1.0 - float(np.var(targets - values)) / target_variance
+        )
+        if not np.isfinite(explained_variance):
+            raise FloatingPointError("critic explained variance is non-finite")
+    return explained_variance, value_std, target_std
+
+def _append_critic_diagnostics(
+    path: Path,
+    *,
+    seed: int,
+    epoch: int,
+    chunk_origin_start: int,
+    optimizer_steps: int,
+    rollout: Any,
+    update: Any,
+    cache_count: int | None = None,
+) -> None:
+    """追加 PPO 更新中已计算的 Critic 原始目标值。"""
+
+    transitions = rollout.transitions
+    if not (
+        len(transitions)
+        == len(update.raw_advantages)
+        == len(update.ppo_advantages)
+        == len(update.raw_returns)
+    ):
+        raise AssertionError("critic diagnostics length mismatch")
+    for name, values in (
+        ("Cache", update.cache_q_component_diagnostics),
+        ("UAV", update.uav_q_component_diagnostics),
+    ):
+        if values is not None and len(values) != len(transitions):
+            raise AssertionError(f"{name} Q-component diagnostics length mismatch")
+    for transition_index, (transition, raw_advantage, raw_return) in enumerate(zip(
+        transitions,
+        update.raw_advantages,
+        update.raw_returns,
+        strict=True,
+    )):
+        old_value = float(transition.old_value)
+        target = float(raw_return)
+        residual = old_value - target
+        normalized_residual = residual / float(update.critic_return_scale)
+        global_advantage = float(update.ppo_advantages[transition_index])
+        values = (
+            old_value,
+            float(raw_advantage),
+            global_advantage,
+            target,
+            update.bootstrap_value,
+            residual,
+        )
+        if not all(np.isfinite(value) for value in values):
+            raise FloatingPointError("critic diagnostics contain non-finite values")
+        record: dict[str, Any] = {
+            "record_type": "critic_transition",
+            "seed": int(seed),
+            "episode": int(epoch),
+            "epoch": int(epoch),
+            "chunk_origin_start": int(chunk_origin_start),
+            "optimizer_steps": int(optimizer_steps),
+            "origin": int(transition.origin_index),
+            "slot": int(transition.slot),
+            "done": bool(transition.done),
+            "old_value": old_value,
+            "raw_advantage": float(raw_advantage),
+            "global_advantage": global_advantage,
+            "advantage_source": "actual_PPO_advantage",
+            "raw_return": target,
+            "global_return_target": target,
+            "value_target": target,
+            "bootstrap_value": float(update.bootstrap_value),
+            "value_residual": residual,
+            "abs_value_residual": abs(residual),
+            "critic_return_scale": float(update.critic_return_scale),
+            "normalized_value_residual": normalized_residual,
+        }
+        if update.teacher_generation_executed:
+            record.update(
+                {
+                    "critic_bootstrap_teacher_warmup_complete": bool(
+                        update.critic_bootstrap_teacher_warmup_complete
+                    ),
+                    "critic_optimizer_steps_before_teacher": int(
+                        update.critic_optimizer_steps_before_teacher or 0
+                    ),
+                    "critic_optimizer_steps_after_update": int(
+                        update.critic_optimizer_steps_after_update
+                    ),
+                    "popart_mean_before_teacher": update.popart_mean_before_teacher,
+                    "popart_std_before_teacher": update.popart_std_before_teacher,
+                    "critic_parameter_digest_before_teacher": (
+                        update.critic_parameter_digest_before_teacher
+                    ),
+                    "teacher_source": update.teacher_source,
+                    "max_q_component_reconstruction_error": float(
+                        update.max_q_component_reconstruction_error
+                    ),
+                }
+            )
+            if update.cache_q_component_diagnostics is not None:
+                record["cache_q_components"] = update.cache_q_component_diagnostics[
+                    transition_index
+                ]
+            if update.uav_q_component_diagnostics is not None:
+                record["uav_q_components"] = update.uav_q_component_diagnostics[
+                    transition_index
+                ]
+        if transition.uav_operation_actions is not None:
+            if cache_count is None:
+                raise AssertionError(
+                    "cache_count is required for joint UAV action diagnostics"
+                )
+            if (
+                transition.uav_operation_masks is None
+                or transition.uav_candidate_counts is None
+                or update.uav_branch_old_log_probs is None
+                or update.uav_branch_new_log_probs is None
+                or update.uav_branch_ratios is None
+                or update.uav_branch_clipped is None
+            ):
+                raise AssertionError(
+                    "joint UAV action diagnostics are incomplete"
+                )
+            operation_actions = np.asarray(
+                transition.uav_operation_actions, dtype=np.int64
+            ).reshape(-1)
+            operation_masks = np.asarray(
+                transition.uav_operation_masks, dtype=bool
+            )
+            candidate_counts = np.asarray(
+                transition.uav_candidate_counts, dtype=np.int64
+            ).reshape(-1)
+            actual_flags = np.asarray(
+                [
+                    bool(action.get("actual_moved", False))
+                    for action in transition.uav_conditional_actions
+                ],
+                dtype=bool,
+            ).reshape(-1)
+            uav_count = len(operation_actions)
+            if not (
+                operation_masks.shape == (uav_count, 2)
+                and len(candidate_counts) == uav_count
+                and len(actual_flags) == uav_count
+                and np.all(operation_actions >= 0)
+                and np.all(operation_actions < 2)
+                and np.all(candidate_counts >= 0)
+                and np.all(np.isfinite(operation_masks))
+            ):
+                raise AssertionError("joint UAV action diagnostic shapes are invalid")
+            if int(np.sum(actual_flags)) != int(transition.actual_uav_movement_count):
+                raise AssertionError(
+                    "UAV actual movement flags disagree with rollout movement count"
+                )
+            branch_old = float(update.uav_branch_old_log_probs[transition_index])
+            branch_new = float(update.uav_branch_new_log_probs[transition_index])
+            branch_ratio = float(update.uav_branch_ratios[transition_index])
+            branch_clipped = bool(update.uav_branch_clipped[transition_index])
+            branch_values = (branch_old, branch_new, branch_ratio)
+            if not all(np.isfinite(value) for value in branch_values):
+                raise FloatingPointError(
+                    "joint UAV branch action diagnostics are non-finite"
+                )
+            cache_action = np.asarray(
+                transition.action[: int(cache_count)], dtype=np.int8
+            ).reshape(-1)
+            if len(cache_action) != int(cache_count) or not np.all(
+                (cache_action == 0) | (cache_action == 1)
+            ):
+                raise AssertionError("selected Cache action is not binary")
+            record.update(
+                {
+                    "selected_cache_action": [int(value) for value in cache_action],
+                    "selected_uav_action": [
+                        "MOVE" if int(value) == 1 else "STAY"
+                        for value in operation_actions
+                    ],
+                    "actual_uav_move": [int(value) for value in actual_flags],
+                    "old_uav_log_prob": branch_old,
+                    "new_uav_log_prob": branch_new,
+                    "uav_ratio": branch_ratio,
+                    "uav_clipped": branch_clipped,
+                    "uav_log_prob_scope": "joint_uav_branch_per_transition",
+                    "feasible_uav_action_count": [
+                        int(value) for value in operation_masks.sum(axis=1)
+                    ],
+                    "uav_action_mask": [
+                        [int(value) for value in row]
+                        for row in operation_masks
+                    ],
+                    "uav_move_candidate_count": [
+                        int(value) for value in candidate_counts
+                    ],
+                    "reward": float(transition.reward),
+                    "q_total": float(transition.actual_task_utility),
+                    "movement_cost": float(transition.movement_cost),
+                    "delay": float(transition.total_task_delay_s),
+                    "energy": float(transition.total_vehicle_energy_j),
+                }
+            )
+        _append_jsonl(
+            path,
+            record,
+        )
+
+def _branch_kl_update_metric_fields(
+    update: Any, minibatch_early_stop_mode: str
+) -> dict[str, Any]:
+    """返回写入 update JSONL 的分支级 minibatch/epoch KL 诊断。"""
+
+    if not update.kl_epoch_diagnostics:
+        return {}
+    epoch_fields = (
+        "cache_without_uav_kl_trigger_count",
+        "uav_only_kl_trigger_count",
+        "both_kl_trigger_count",
+        "neither_kl_trigger_count",
+    )
+    fields: dict[str, Any] = {
+        "kl_minibatch_diagnostics": [
+            dict(record) for record in update.kl_minibatch_diagnostics
+        ],
+        "kl_epoch_diagnostics": [
+            dict(record) for record in update.kl_epoch_diagnostics
+        ],
+        **{
+            field: int(
+                sum(int(record[field]) for record in update.kl_epoch_diagnostics)
+            )
+            for field in epoch_fields
+        },
+        "cache_trigger_suppressed_uav_update": bool(
+            any(
+                record["cache_trigger_suppressed_uav_update"]
+                for record in update.kl_epoch_diagnostics
+            )
+        ),
+        "uav_trigger_suppressed_cache_update": bool(
+            any(
+                record["uav_trigger_suppressed_cache_update"]
+                for record in update.kl_epoch_diagnostics
+            )
+        ),
+        "CACHE_OPTIMIZER_STEPS_THIS_UPDATE": int(
+            update.cache_optimizer_steps_this_update
+        ),
+        "UAV_OPERATION_OPTIMIZER_STEPS_THIS_UPDATE": int(
+            update.uav_operation_optimizer_steps_this_update
+        ),
+        "UAV_CANDIDATE_OPTIMIZER_STEPS_THIS_UPDATE": int(
+            update.uav_candidate_optimizer_steps_this_update
+        ),
+        "CACHE_MINIBATCHES_SUPPRESSED": int(update.cache_minibatches_suppressed),
+        "UAV_OPERATION_MINIBATCHES_SUPPRESSED": int(
+            update.uav_operation_minibatches_suppressed
+        ),
+        "UAV_CANDIDATE_MINIBATCHES_SUPPRESSED": int(
+            update.uav_candidate_minibatches_suppressed
+        ),
+        "UAV_OPERATION_STOP_MINIBATCH": update.uav_operation_stop_minibatch,
+        "UAV_CANDIDATE_STOP_MINIBATCH": update.uav_candidate_stop_minibatch,
+        "CACHE_KL_MINIBATCH_EARLY_STOP_ACTIVE": bool(
+            update.cache_kl_control == minibatch_early_stop_mode
+        ),
+        "uav_candidate_active_per_update_epoch": [
+            bool(value) for value in update.uav_candidate_active_per_update_epoch
+        ],
+        "UAV_CANDIDATE_ONLY_STEPS_AFTER_OPERATION_STOP": int(
+            update.uav_candidate_only_steps_after_operation_stop
+        ),
+    }
+    if update.cache_active_per_update_epoch or update.uav_active_per_update_epoch:
+        fields.update(
+            {
+                "kl_gate_mode": str(update.kl_gate_mode),
+                "cache_active_per_update_epoch": [
+                    bool(value) for value in update.cache_active_per_update_epoch
+                ],
+                "uav_active_per_update_epoch": [
+                    bool(value) for value in update.uav_active_per_update_epoch
+                ],
+                "cache_stop_epoch": update.cache_stop_epoch,
+                "uav_stop_epoch": update.uav_stop_epoch,
+                "cache_suppressed_update_epochs": int(
+                    update.cache_suppressed_update_epochs
+                ),
+                "uav_suppressed_update_epochs": int(
+                    update.uav_suppressed_update_epochs
+                ),
+                "joint_kl_diagnostic": bool(update.joint_kl_diagnostic),
+                "cache_independent_stop": bool(update.cache_independent_stop),
+                "uav_independent_stop": bool(update.uav_independent_stop),
+                "both_inactive_stop": bool(update.both_inactive_stop),
+                "joint_kl_control_enabled": False,
+            }
+        )
+    return fields

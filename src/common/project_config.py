@@ -260,10 +260,13 @@ def _node_positions_path(config: dict[str, Any]) -> Path:
 
 
 def _normalise_node_position(node_id: str, value: Any) -> list[float]:
-    """兼容旧数组格式，并读取新 JSON 中的 position 字段。"""
+    """读取正式 node_positions.json 中对象格式的 position 字段。"""
 
-    if isinstance(value, dict):
-        value = value.get("position")
+    if not isinstance(value, dict) or "position" not in value:
+        raise ValueError(
+            f"node_positions.json 的 {node_id} 必须是包含 position 字段的对象。"
+        )
+    value = value["position"]
     if not isinstance(value, list) or len(value) != 3:
         raise ValueError(
             f"node_positions.json 的 {node_id} 位置必须是 [x, y, z]。"
@@ -280,7 +283,7 @@ def _normalise_node_position(node_id: str, value: Any) -> list[float]:
 
 
 def load_node_positions(config: dict[str, Any]) -> dict[str, Any]:
-    """读取并校验由 scenario.node_placement 生成的节点位置文件。"""
+    """读取并校验正式 node_positions.json 节点位置文件。"""
 
     positions_path = _node_positions_path(config)
     with positions_path.open("r", encoding="utf-8") as stream:
@@ -289,10 +292,6 @@ def load_node_positions(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("node_positions.json 根对象必须是 object。")
 
     raw_boundary = payload.get("network_boundary")
-    if not isinstance(raw_boundary, dict):
-        network_metadata = payload.get("network")
-        if isinstance(network_metadata, dict):
-            raw_boundary = network_metadata.get("boundary")
     if not isinstance(raw_boundary, dict):
         raise ValueError("node_positions.json 缺少 network_boundary。")
     required_boundary_keys = ("min_x", "max_x", "min_y", "max_y")
@@ -685,7 +684,12 @@ def validate_config(
         raise ValueError("algorithm.uav.coarse_num_angles 必须 >= 4。")
     if int(get_config_value(config, "algorithm.uav.refine_num_angles")) < 4:
         raise ValueError("algorithm.uav.refine_num_angles 必须 >= 4。")
-    if int(get_config_value(config, "algorithm.uav.exploration_num_angles", 8)) < 4:
+    exploration_num_angles = get_config_value(
+        config, "algorithm.uav.exploration_num_angles"
+    )
+    if exploration_num_angles is None:
+        raise ValueError("缺少必需配置：algorithm.uav.exploration_num_angles。")
+    if int(exploration_num_angles) < 4:
         raise ValueError("algorithm.uav.exploration_num_angles 必须 >= 4。")
     if int(get_config_value(config, "algorithm.uav.refine_rounds")) < 0:
         raise ValueError("algorithm.uav.refine_rounds 不能为负。")
@@ -705,8 +709,10 @@ def validate_config(
         if number <= 0.0 or number > 1.0:
             raise ValueError("algorithm.uav.coarse_radius_fractions 必须位于 (0,1]。")
     exploration_fractions = get_config_value(
-        config, "algorithm.uav.exploration_radius_fractions", [0.5, 1.0]
+        config, "algorithm.uav.exploration_radius_fractions"
     )
+    if exploration_fractions is None:
+        raise ValueError("缺少必需配置：algorithm.uav.exploration_radius_fractions。")
     if not isinstance(exploration_fractions, list) or not exploration_fractions:
         raise ValueError(
             "algorithm.uav.exploration_radius_fractions 必须是非空列表。"
@@ -716,13 +722,20 @@ def validate_config(
             "algorithm.uav.exploration_radius_fractions 必须位于 (0,1]。"
         )
     demand_anchor_scales = get_config_value(
-        config, "algorithm.uav.demand_anchor_scales", [0.5, 1.0]
+        config, "algorithm.uav.demand_anchor_scales"
     )
+    if demand_anchor_scales is None:
+        raise ValueError("缺少必需配置：algorithm.uav.demand_anchor_scales。")
     if not isinstance(demand_anchor_scales, list) or not demand_anchor_scales:
         raise ValueError("algorithm.uav.demand_anchor_scales 必须是非空列表。")
     if any(float(value) <= 0.0 or float(value) > 1.0 for value in demand_anchor_scales):
         raise ValueError("algorithm.uav.demand_anchor_scales 必须位于 (0,1]。")
-    if int(get_config_value(config, "algorithm.uav.target_candidate_capacity", 24)) < 1:
+    target_candidate_capacity = get_config_value(
+        config, "algorithm.uav.target_candidate_capacity"
+    )
+    if target_candidate_capacity is None:
+        raise ValueError("缺少必需配置：algorithm.uav.target_candidate_capacity。")
+    if int(target_candidate_capacity) < 1:
         raise ValueError("algorithm.uav.target_candidate_capacity 必须 >= 1。")
     if get_config_value(config, "algorithm.configuration.method", "cache_uav_coordinate") != (
         "cache_uav_coordinate"
@@ -1112,9 +1125,12 @@ def validate_config(
             "objective.omega_delay 和 objective.omega_energy "
             "必须位于 [0,1] 且总和等于 1。"
         )
-    uav_movement_cost_weight = float(
-        get_config_value(config, "objective.uav_movement_cost_weight", 1.0)
+    raw_uav_movement_cost_weight = get_config_value(
+        config, "objective.uav_movement_cost_weight"
     )
+    if raw_uav_movement_cost_weight is None:
+        raise ValueError("缺少必需配置：objective.uav_movement_cost_weight。")
+    uav_movement_cost_weight = float(raw_uav_movement_cost_weight)
     if not math.isfinite(uav_movement_cost_weight) or uav_movement_cost_weight < 0.0:
         raise ValueError("objective.uav_movement_cost_weight 必须是非负有限数。")
     cache_cost_weight = float(

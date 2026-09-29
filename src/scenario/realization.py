@@ -1,4 +1,4 @@
-"""Small deterministic seed helper for repeated simulation episodes."""
+"""为重复仿真 episode 提供稳定的种子派生和 realization 路径管理。"""
 
 from __future__ import annotations
 
@@ -124,10 +124,10 @@ EPISODE_SEED_STREAMS = (
 
 
 def derive_namespaced_seed(episode_seed: int, namespace: str, stream_name: str) -> int:
-    """Derive a deterministic seed outside the formal episode stream namespace.
+    """在正式 episode seed stream 命名空间之外派生确定性种子。
 
-    This is for auxiliary training-only work such as critic warmup.  It leaves
-    ``EPISODE_SEED_STREAMS`` and all existing formal episode seed values intact.
+    用于 critic warmup 等辅助训练，不会改变 ``EPISODE_SEED_STREAMS``
+    或任何现有正式 episode seed 的取值。
     """
 
     if isinstance(episode_seed, bool) or not isinstance(episode_seed, int):
@@ -161,7 +161,7 @@ def _derive(episode_seed: int, stream_name: str) -> int:
 
 
 def derive_episode_seeds(episode_seed: int) -> dict[str, int]:
-    """Derive stable, named and independent seeds for one simulation episode."""
+    """为单条仿真 episode 派生稳定、具名且相互独立的种子。"""
 
     seeds = {
         name: _derive(episode_seed, name) for name in EPISODE_SEED_STREAMS
