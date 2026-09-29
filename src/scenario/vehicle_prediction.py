@@ -22,6 +22,7 @@ import csv
 import math
 import os
 import shutil
+import sys  # 用于将 SUMO 官方工具目录加入 Python 模块搜索路径。
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
