@@ -15,9 +15,7 @@ Local 在 Matching 层用 ``LOCAL:<vehicle_id>`` 表示任务车辆自身本地�
 
 from __future__ import annotations
 
-import argparse
 import csv
-import json
 import math
 import time
 from dataclasses import dataclass, field
@@ -32,8 +30,7 @@ except ModuleNotFoundError:  # pragma: no cover - server fallback without Numba
     numba = None  # type: ignore[assignment]
 
 from common import project_config, system_model
-from decision import cache_configuration, uav_configuration
-from scenario import task_scenario
+from decision import cache_configuration
 
 LOCAL_PREFIX = "LOCAL:"
 
@@ -238,8 +235,8 @@ def build_feasible_targets(
 
     正式实际/预测调用必须提供 vehicle_positions、service_node_positions 和
     cache_config；若某个缓存边缘节点缺少当前位置、角色、正带宽/CPU 或正信道
-    速率，则该节点不进入 M_edge，Cloud 作为后备节点保留。旧的纯集合 sanity
-    调用可以省略物理上下文，此时只检查 cache node 的结构存在性。
+    速率，则该节点不进入 M_edge，Cloud 作为后备节点保留。省略物理上下文时，
+    此函数只检查 cache node 的结构存在性。
     """
 
     edge_cache = np.asarray(edge_cache_state, dtype=np.int8)
@@ -1302,421 +1299,14 @@ def optimize_task_matching(
     )
 
 
-def operation_generation_sanity() -> dict[str, bool]:
-    """极小操作语义检查，不跑KKT，不伪造物理参数。"""
-
-    feasible = {
-        "12": ["LOCAL:12", "EDGE_A"],
-        "30": ["LOCAL:30", "EDGE_A"],
-        "40": ["LOCAL:40", CLOUD],
-    }
-    checks = {
-        "edge_edge_swap": "EDGE_B" in feasible["12"] if False else True,
-        "local_v_not_for_j": "LOCAL:12" not in feasible["30"],
-        "local_local_swap_infeasible": ("LOCAL:30" not in feasible["12"] and "LOCAL:12" not in feasible["30"]),
-        "identical_target_skipped": True,
-        "no_edge_cache_uses_cloud": feasible["40"] == ["LOCAL:40", CLOUD],
-        "edge_cache_suppresses_cloud": (
-            "EDGE_A" in feasible["12"]
-            and "EDGE_A" in feasible["30"]
-            and CLOUD not in feasible["12"]
-            and CLOUD not in feasible["30"]
-        ),
-        "local_candidate_coexists_without_cloud": (
-            "LOCAL:12" in feasible["12"]
-            and "EDGE_A" in feasible["12"]
-            and CLOUD not in feasible["12"]
-        ),
-    }
-    return checks
 
 
-def run_slot20_validation(config_path: str = "configs/proposed/system_config.toml") -> dict[str, Any]:
-    cfg = project_config.load_config(config_path)
-    project_config.validate_config(cfg)
-    project_config.validate_for_formal_experiment(cfg)
-    root = Path(cfg["_meta"]["project_root"])
-    cache_cfg = cache_configuration.cache_config_from_project(cfg)
-    slot = 20
-    warmup_time_s = float(project_config.get_config_value(cfg, "simulation.warmup_time_s"))
-    dt_s = float(project_config.get_config_value(cfg, "simulation.dt_s"))
-    time_s = warmup_time_s + slot * dt_s
-    scenarios = cache_configuration.load_prediction_scenarios(
-        cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.prediction_scenarios"))
-    )
-    origin = cache_configuration.scenario_at_origin(scenarios, slot)
-    if int(origin["origin_slot"]) != slot:
-        raise AssertionError(
-            f"prediction origin_slot={origin['origin_slot']} 与 slot={slot} 不一致。"
-        )
-    catalog = cache_configuration.load_service_catalog(
-        cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
-    )
-    cache_nodes = cache_configuration.build_cache_nodes(origin, cache_cfg)
-    edge_cache_state = cache_configuration.deterministic_initial_cache(origin, catalog, cache_nodes, cache_cfg)
-    tasks = load_actual_tasks(root / "data/generated/tasks.csv", slot)
-    roles = cache_configuration.load_json(root / "data/generated/vehicle_roles.json")
-    sv_ids = {str(value) for value in roles["service_vehicles"]}
-    tv_ids = {task.vehicle_id for task in tasks}
-    actual_positions = load_vehicle_positions(
-        root / "data/generated/trajectory.csv",
-        time_s,
-        tv_ids | sv_ids,
-    )
-    uav_positions = uav_configuration.initial_uav_positions_from_project(cfg)
-    service_positions = build_service_node_positions(cache_nodes, actual_positions, uav_positions)
-    local_cache = task_scenario.load_tv_local_cache(
-        cache_configuration.resolve_path(root, project_config.get_config_value(cfg, "paths.tv_local_cache"))
-    )
-    full_result = optimize_task_matching(
-        tasks,
-        actual_positions,
-        service_positions,
-        local_cache,
-        edge_cache_state,
-        cfg,
-        cache_nodes,
-        cache_cfg,
-        evaluation_mode="full",
-    )
-    incremental_result = optimize_task_matching(
-        tasks,
-        actual_positions,
-        service_positions,
-        local_cache,
-        edge_cache_state,
-        cfg,
-        cache_nodes,
-        cache_cfg,
-        evaluation_mode="incremental",
-    )
-    result = incremental_result
-    initial_targets = build_feasible_targets(
-        tasks,
-        local_cache,
-        edge_cache_state,
-        cache_nodes,
-        vehicle_positions=actual_positions,
-        service_node_positions=service_positions,
-        cache_config=cache_cfg,
-    )
-    initial_matching = {
-        task.task_id: initial_targets[task.task_id][0]
-        for task in tasks
-    }
-    initial_eval = evaluate_matching_candidate(
-        tasks,
-        initial_matching,
-        actual_positions,
-        service_positions,
-        cfg,
-        cache_nodes,
-        cache_cfg,
-    )
-    full_vs_incremental = {
-        "matching_equal": full_result.matching == incremental_result.matching,
-        "J_diff": abs(full_result.task_utility_sum - incremental_result.task_utility_sum),
-        "updates_equal": full_result.updates == incremental_result.updates,
-        "transfer_updates_equal": full_result.transfer_updates == incremental_result.transfer_updates,
-        "exchange_updates_equal": full_result.exchange_updates == incremental_result.exchange_updates,
-        "stop_reason_equal": full_result.stop_reason == incremental_result.stop_reason,
-        "stable_equal": full_result.transfer_exchange_stable == incremental_result.transfer_exchange_stable,
-        "stable_check_passed_equal": full_result.stable_check_passed == incremental_result.stable_check_passed,
-        "max_remaining_delta_diff": abs(
-            full_result.max_remaining_delta - incremental_result.max_remaining_delta
-        ),
-        "delay_max_diff": _max_abs_mapping_diff(
-            full_result.per_task_delay_s,
-            incremental_result.per_task_delay_s,
-        ),
-        "energy_max_diff": _max_abs_mapping_diff(
-            full_result.per_task_vehicle_energy_j,
-            incremental_result.per_task_vehicle_energy_j,
-        ),
-        "Q_max_diff": _max_abs_mapping_diff(
-            full_result.per_task_utility,
-            incremental_result.per_task_utility,
-        ),
-        "CPU_max_diff": _max_abs_nested_mapping_diff(
-            full_result.cpu_allocations,
-            incremental_result.cpu_allocations,
-        ),
-        "BW_max_diff": _max_abs_nested_mapping_diff(
-            full_result.bandwidth_allocations,
-            incremental_result.bandwidth_allocations,
-        ),
-        "candidate_evaluations_equal": (
-            full_result.candidate_evaluations_total
-            == incremental_result.candidate_evaluations_total
-        ),
-        "resource_infeasible_candidates_equal": (
-            full_result.resource_infeasible_candidates
-            == incremental_result.resource_infeasible_candidates
-        ),
-    }
-    if (
-        not full_vs_incremental["matching_equal"]
-        or full_vs_incremental["J_diff"] > 1.0e-10
-        or not full_vs_incremental["updates_equal"]
-        or not full_vs_incremental["transfer_updates_equal"]
-        or not full_vs_incremental["exchange_updates_equal"]
-        or not full_vs_incremental["stop_reason_equal"]
-        or not full_vs_incremental["stable_equal"]
-        or not full_vs_incremental["stable_check_passed_equal"]
-        or full_vs_incremental["max_remaining_delta_diff"] > 1.0e-10
-        or full_vs_incremental["delay_max_diff"] > 1.0e-10
-        or full_vs_incremental["energy_max_diff"] > 1.0e-10
-        or full_vs_incremental["Q_max_diff"] > 1.0e-10
-        or full_vs_incremental["CPU_max_diff"] > 1.0e-10
-        or full_vs_incremental["BW_max_diff"] > 1.0e-10
-    ):
-        raise AssertionError(f"full/incremental Matching 结果不一致：{full_vs_incremental}")
-
-    repeat = optimize_task_matching(
-        tasks,
-        actual_positions,
-        service_positions,
-        local_cache,
-        edge_cache_state,
-        cfg,
-        cache_nodes,
-        cache_cfg,
-    )
-    repeat_mismatch = (
-        result.matching != repeat.matching
-        or not math.isclose(result.task_utility_sum, repeat.task_utility_sum)
-        or _max_abs_nested_mapping_diff(result.cpu_allocations, repeat.cpu_allocations) > 1.0e-12
-        or _max_abs_nested_mapping_diff(result.bandwidth_allocations, repeat.bandwidth_allocations) > 1.0e-12
-        or _max_abs_mapping_diff(result.per_task_delay_s, repeat.per_task_delay_s) > 1.0e-12
-        or _max_abs_mapping_diff(result.per_task_vehicle_energy_j, repeat.per_task_vehicle_energy_j) > 1.0e-12
-        or _max_abs_mapping_diff(result.per_task_utility, repeat.per_task_utility) > 1.0e-12
-    )
-    if repeat_mismatch:
-        raise AssertionError("Matching repeated-run 不确定。")
-
-    edge_ids_by_task = {
-        task.task_id: [
-            target
-            for target in result.feasible_targets[task.task_id]
-            if target not in {LOCAL, CLOUD}
-        ]
-        for task in tasks
-    }
-    controlled_pairs = [
-        (task, edge_ids_by_task[task.task_id][0])
-        for task in tasks
-        if edge_ids_by_task[task.task_id]
-    ]
-    multi_task_rsu_case: dict[str, Any] = {"tested": False}
-    if len(controlled_pairs) >= 2:
-        first_task, first_edge = controlled_pairs[0]
-        second_task, second_edge = controlled_pairs[1]
-        controlled_current_matching = dict(initial_matching)
-        controlled_current_matching[first_task.task_id] = first_edge
-        controlled_current_matching[second_task.task_id] = second_edge
-        fallback_targets = [
-            target
-            for target in initial_targets[first_task.task_id]
-            if target != first_edge
-        ]
-        if fallback_targets:
-            controlled_candidate_matching = dict(controlled_current_matching)
-            controlled_candidate_matching[first_task.task_id] = fallback_targets[0]
-            controlled_current_evaluation = evaluate_matching_candidate(
-                tasks,
-                controlled_current_matching,
-                actual_positions,
-                service_positions,
-                cfg,
-                cache_nodes,
-                cache_cfg,
-            )
-            controlled_full_evaluation = evaluate_matching_candidate(
-                tasks,
-                controlled_candidate_matching,
-                actual_positions,
-                service_positions,
-                cfg,
-                cache_nodes,
-                cache_cfg,
-            )
-            controlled_incremental_evaluation = evaluate_matching_candidate_incremental(
-                tasks,
-                controlled_current_matching,
-                controlled_current_evaluation,
-                controlled_candidate_matching,
-                [first_task.task_id],
-                actual_positions,
-                service_positions,
-                cfg,
-                cache_nodes,
-                cache_cfg,
-            )
-            if not controlled_full_evaluation.resource_feasible:
-                raise AssertionError(
-                    "dynamic multi-task edge candidate 不可行："
-                    f"{controlled_full_evaluation.infeasible_reason}"
-                )
-            if not controlled_incremental_evaluation.resource_feasible:
-                raise AssertionError("dynamic multi-task incremental candidate 不可行。")
-            multi_task_differences = _assert_evaluation_equivalent(
-                controlled_full_evaluation,
-                controlled_incremental_evaluation,
-                "dynamic multi-task edge candidate",
-            )
-            multi_task_rsu_case = {
-                "tested": True,
-                "current_matching": controlled_current_matching,
-                "candidate_matching": controlled_candidate_matching,
-                "first_edge": first_edge,
-                "second_edge": second_edge,
-                "fallback_target": fallback_targets[0],
-                "full_J": controlled_full_evaluation.task_utility_sum,
-                "incremental_J": controlled_incremental_evaluation.task_utility_sum,
-                "J_diff": multi_task_differences["J_diff"],
-                "full_incremental_equal": True,
-                "max_allocation_diff": max(
-                    multi_task_differences["CPU_max_diff"],
-                    multi_task_differences["BW_max_diff"],
-                ),
-                "evaluation_differences": multi_task_differences,
-            }
-    task_rows = []
-    for task in tasks:
-        task_rows.append(
-            {
-                "task_id": task.task_id,
-                "service_id": task.service_id,
-                "local_cached_services": sorted(local_cache.get(task.vehicle_id, set())),
-                "local_hit": task.service_id in local_cache.get(task.vehicle_id, set()),
-                "feasible_targets": result.feasible_targets[task.task_id],
-                "final_target": result.matching[task.task_id],
-                "delay_s": result.per_task_delay_s[task.task_id],
-                "energy_j": result.per_task_vehicle_energy_j[task.task_id],
-                "Q": result.per_task_utility[task.task_id],
-            }
-        )
-    op_sanity = operation_generation_sanity()
-    if not all(op_sanity.values()):
-        raise AssertionError(f"operation sanity failed: {op_sanity}")
-    return {
-        "slot": slot,
-        "time_s": time_s,
-        "arrival_task_count": len(tasks),
-        "initial_J": float(initial_eval.task_utility_sum),
-        "result": result,
-        "full_result": full_result,
-        "incremental_result": incremental_result,
-        "full_vs_incremental": full_vs_incremental,
-        "multi_task_rsu_case": multi_task_rsu_case,
-        "repeat_deterministic": not repeat_mismatch,
-        "task_rows": task_rows,
-        "operation_sanity": op_sanity,
-    }
 
 
-def _summary(result: TransferExchangeMatchingResult) -> dict[str, Any]:
-    return {
-        "matching": result.matching,
-        "J": result.task_utility_sum,
-        "updates": result.updates,
-        "transfer_updates": result.transfer_updates,
-        "exchange_updates": result.exchange_updates,
-        "candidate_evaluations_total": result.candidate_evaluations_total,
-        "transfer_candidates_evaluated": result.transfer_candidates_evaluated,
-        "exchange_candidates_evaluated": result.exchange_candidates_evaluated,
-        "resource_infeasible_candidates": result.resource_infeasible_candidates,
-        "feasibility_rejected_without_kkt": result.feasibility_rejected_without_kkt,
-        "candidate_definitions_total": result.candidate_definitions_total,
-        "upper_bound_screen_calls": result.upper_bound_screen_calls,
-        "upper_bound_pruned_candidates": result.upper_bound_pruned_candidates,
-        "transfer_upper_bound_pruned": result.transfer_upper_bound_pruned,
-        "exchange_upper_bound_pruned": result.exchange_upper_bound_pruned,
-        "full_evaluator_calls": result.full_evaluator_calls,
-        "kkt_cache_requests": result.kkt_cache_requests,
-        "kkt_cache_hits": result.kkt_cache_hits,
-        "kkt_cache_misses": result.kkt_cache_misses,
-        "KKT_CACHE_REQUEST_COUNT": result.kkt_cache_requests,
-        "KKT_CACHE_HIT_COUNT": result.kkt_cache_hits,
-        "KKT_CACHE_MISS_COUNT": result.kkt_cache_misses,
-        "KKT_SOLVER_CALL_COUNT": result.kkt_solver_calls,
-        "KKT_SOLVE_COUNT": result.kkt_solve_count,
-        "KKT_CONVERGED_COUNT": result.kkt_converged_count,
-        "KKT_MAX_ITER_HIT_COUNT": result.kkt_max_iterations_hit_count,
-        "KKT_FINITE_COUNT": result.kkt_finite_count,
-        "KKT_ITERATION_MEAN": result.kkt_iteration_mean,
-        "KKT_ITERATION_P95": result.kkt_iteration_p95,
-        "KKT_ITERATION_MAX": result.kkt_iteration_max,
-        "KKT_RESOURCE_RESIDUAL_MEAN": result.kkt_resource_residual_mean,
-        "KKT_RESOURCE_RESIDUAL_MAX": result.kkt_resource_residual_max,
-        "KKT_STATIONARITY_RESIDUAL_MEAN": result.kkt_stationarity_residual_mean,
-        "KKT_STATIONARITY_RESIDUAL_MAX": result.kkt_stationarity_residual_max,
-        "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": (
-            result.kkt_complementary_slackness_residual_mean
-        ),
-        "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": (
-            result.kkt_complementary_slackness_residual_max
-        ),
-        "KKT_SOLVE_DIAGNOSTICS": [
-            dict(record) for record in result.kkt_solve_diagnostics
-        ],
-        "stop_reason": result.stop_reason,
-        "stable": result.transfer_exchange_stable,
-        "stable_check_passed": result.stable_check_passed,
-        "max_remaining_delta": result.max_remaining_delta,
-        "history": result.history,
-        "cpu_allocations": result.cpu_allocations,
-        "bandwidth_allocations": result.bandwidth_allocations,
-    }
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Actual-State Transfer-Exchange Matching validation.")
-    parser.add_argument("--config", default="configs/proposed/system_config.toml")
-    parser.add_argument(
-        "--cloud-resource-sharing-audit",
-        action="store_true",
-        help="写出 analysis-only 的 Cloud 固定每任务资源审计。",
-    )
-    return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.cloud_resource_sharing_audit:
-        cfg = project_config.load_config(args.config)
-        project_root = Path(cfg["_meta"]["project_root"])
-        cache_cfg = cache_configuration.cache_config_from_project(cfg)
-        tasks_path = cache_configuration.resolve_path(
-            project_root,
-            project_config.get_config_value(cfg, "paths.tasks"),
-        )
-        output_path = project_root / "data/analysis/cloud_resource_sharing_audit.csv"
-        audit = write_cloud_resource_sharing_audit(tasks_path, output_path, cache_cfg)
-        print(json.dumps({"output": str(output_path), **audit}, ensure_ascii=False, indent=2))
-        return 0
-    validation = run_slot20_validation(args.config)
-    print(
-        json.dumps(
-            {
-                "slot": validation["slot"],
-                "time_s": validation["time_s"],
-                "arrival_task_count": validation["arrival_task_count"],
-                "initial_J": validation["initial_J"],
-                "tasks": validation["task_rows"],
-                "operation_sanity": validation["operation_sanity"],
-                "full_reference": _summary(validation["full_result"]),
-                "incremental": _summary(validation["incremental_result"]),
-                "full_vs_incremental": validation["full_vs_incremental"],
-                "multi_task_rsu_case": validation["multi_task_rsu_case"],
-                "repeat_deterministic": validation["repeat_deterministic"],
-                "result": _summary(validation["result"]),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
 
 # ---- KKT actual-state resource allocation ----
 # KKT actual-state resource allocation implementation；数学求解保持不变。
@@ -1753,6 +1343,53 @@ class Task:
     service_id: int
     input_bits: float
     cpu_cycles: float
+
+
+def load_actual_tasks(tasks_csv: Path, slot: int) -> list[Task]:
+    """Load arrived tasks for one formal episode slot."""
+    tasks: list[Task] = []
+    with tasks_csv.open("r", encoding="utf-8", newline="") as stream:
+        for row in csv.DictReader(stream):
+            if int(row["slot"]) != slot or int(row["arrival"]) != 1:
+                continue
+            vehicle_id = str(row["vehicle_id"])
+            tasks.append(
+                Task(
+                    task_id=vehicle_id,
+                    vehicle_id=vehicle_id,
+                    service_id=int(row["service_id"]),
+                    input_bits=float(row["input_size"]),
+                    cpu_cycles=float(row["cpu_cycles"]),
+                )
+            )
+    return tasks
+
+
+def load_vehicle_positions(
+    trajectory_csv: Path,
+    time_s: float,
+    vehicle_ids: set[str],
+) -> dict[str, np.ndarray]:
+    """Load exact-time vehicle positions needed by formal rollout execution."""
+    positions: dict[str, np.ndarray] = {}
+    with trajectory_csv.open("r", encoding="utf-8", newline="") as stream:
+        for row in csv.DictReader(stream):
+            vehicle_id = str(row["vehicle_id"])
+            if vehicle_id not in vehicle_ids:
+                continue
+            if not math.isclose(
+                float(row["time_s"]), time_s, rel_tol=0.0, abs_tol=1e-9
+            ):
+                continue
+            positions[vehicle_id] = np.asarray(
+                [float(row["x_m"]), float(row["y_m"])], dtype=np.float64
+            )
+    missing = sorted(vehicle_ids - set(positions))
+    if missing:
+        raise ValueError(
+            f"trajectory.csv 缺少当前 time_s={time_s} 的车辆位置：{missing}"
+        )
+    return positions
 
 
 @dataclass(frozen=True)
@@ -3333,273 +2970,21 @@ def evaluate_matching_candidate_incremental(
     )
 
 
-def _max_abs_mapping_diff(
-    left: dict[str, float],
-    right: dict[str, float],
-) -> float:
-    if set(left) != set(right):
-        return float("inf")
-    return max(
-        (abs(float(left[key]) - float(right[key])) for key in left),
-        default=0.0,
-    )
 
 
-def _max_abs_nested_mapping_diff(
-    left: dict[str, dict[str, float]],
-    right: dict[str, dict[str, float]],
-) -> float:
-    if set(left) != set(right):
-        return float("inf")
-    return max(
-        (_max_abs_mapping_diff(left[node_id], right[node_id]) for node_id in left),
-        default=0.0,
-    )
 
 
-def _evaluation_differences(
-    full: KKTMatchingEvaluation,
-    incremental: KKTMatchingEvaluation,
-) -> dict[str, float]:
-    return {
-        "J_diff": abs(float(full.task_utility_sum) - float(incremental.task_utility_sum)),
-        "CPU_max_diff": _max_abs_nested_mapping_diff(
-            full.cpu_allocations,
-            incremental.cpu_allocations,
-        ),
-        "BW_max_diff": _max_abs_nested_mapping_diff(
-            full.bandwidth_allocations,
-            incremental.bandwidth_allocations,
-        ),
-        "delay_max_diff": _max_abs_mapping_diff(
-            full.per_task_delay_s,
-            incremental.per_task_delay_s,
-        ),
-        "energy_max_diff": _max_abs_mapping_diff(
-            full.per_task_vehicle_energy_j,
-            incremental.per_task_vehicle_energy_j,
-        ),
-        "Q_max_diff": _max_abs_mapping_diff(
-            full.per_task_utility,
-            incremental.per_task_utility,
-        ),
-    }
 
 
-def _assert_evaluation_equivalent(
-    full: KKTMatchingEvaluation,
-    incremental: KKTMatchingEvaluation,
-    label: str,
-    tolerance: float = 1.0e-10,
-) -> dict[str, float]:
-    if full.resource_feasible != incremental.resource_feasible:
-        raise AssertionError(f"{label} full/incremental resource feasibility 不一致。")
-    if not full.resource_feasible:
-        if full.infeasible_reason != incremental.infeasible_reason:
-            raise AssertionError(f"{label} full/incremental infeasible reason 不一致。")
-        return {key: 0.0 for key in ("J_diff", "CPU_max_diff", "BW_max_diff", "delay_max_diff", "energy_max_diff", "Q_max_diff")}
-    if full.per_task_execution_target != incremental.per_task_execution_target:
-        raise AssertionError(f"{label} full/incremental task target 不一致。")
-    if full.per_node_task_counts != incremental.per_node_task_counts:
-        raise AssertionError(f"{label} full/incremental node task counts 不一致。")
-    differences = _evaluation_differences(full, incremental)
-    differences["CPU_sum_max_diff"] = _max_abs_mapping_diff(
-        full.cpu_resource_sums,
-        incremental.cpu_resource_sums,
-    )
-    differences["BW_sum_max_diff"] = _max_abs_mapping_diff(
-        full.bandwidth_resource_sums,
-        incremental.bandwidth_resource_sums,
-    )
-    if any(value > tolerance for value in differences.values()):
-        raise AssertionError(f"{label} full/incremental 数值不一致：{differences}")
-    return differences
 
 
-def _evaluate_matching_equal_allocation(
-    tasks: list[Task],
-    matching: dict[str, str],
-    vehicle_positions: dict[str, np.ndarray],
-    service_node_positions: dict[str, np.ndarray],
-    cache_nodes: dict[str, Any],
-    cache_config: cache_configuration.CacheOptimizationConfig,
-) -> float:
-    """仅用于最小验证的 equal allocation 对照，不作为正式 solver 暴露。"""
-
-    grouped = _group_edge_tasks(tasks, matching, cache_nodes)
-    total = 0.0
-    for task in tasks:
-        target = matching[task.task_id]
-        if target == LOCAL:
-            result = system_model.local_execution(
-                task.cpu_cycles,
-                cache_config.local_cpu_cycles_per_s,
-                cache_config.local_energy_per_cycle_j,
-            )
-            delay = result["delay_s"]
-            energy = result["vehicle_energy_j"]
-        elif target == CLOUD:
-            result = system_model.cloud_execution(
-                task.input_bits,
-                task.cpu_cycles,
-                cache_config.cloud_total_bandwidth_bps,
-                cache_config.cloud_total_cpu_cycles_per_s,
-                cache_config.cloud_delay_factor,
-                cache_config.tx_power_w,
-            )
-            delay = result["total_delay_s"]
-            energy = result["vehicle_energy_j"]
-        else:
-            role = _edge_node_role(target, cache_nodes)
-            assert role is not None
-            share = 1.0 / len(grouped[target])
-            gain = _channel_gain(
-                role,
-                vehicle_positions[task.vehicle_id],
-                service_node_positions[target],
-                cache_config,
-            )
-            result = system_model.edge_execution(
-                task.input_bits,
-                task.cpu_cycles,
-                _node_bandwidth(role, cache_config),
-                share,
-                cache_config.tx_power_w,
-                gain,
-                cache_config.noise_power_w,
-                _node_cpu(role, cache_config),
-                share,
-            )
-            delay = result["total_delay_s"]
-            energy = result["vehicle_energy_j"]
-        total += system_model.task_utility(
-            delay,
-            energy,
-            cache_config.time_ref_s,
-            cache_config.energy_ref_j,
-            cache_config.omega_t,
-            cache_config.omega_e,
-        )
-    return float(total)
 
 
-def load_actual_tasks(tasks_csv: Path, slot: int) -> list[Task]:
-    tasks: list[Task] = []
-    with tasks_csv.open("r", encoding="utf-8", newline="") as stream:
-        for row in csv.DictReader(stream):
-            if int(row["slot"]) != slot or int(row["arrival"]) != 1:
-                continue
-            vehicle_id = str(row["vehicle_id"])
-            tasks.append(
-                Task(
-                    task_id=vehicle_id,
-                    vehicle_id=vehicle_id,
-                    service_id=int(row["service_id"]),
-                    input_bits=float(row["input_size"]),
-                    cpu_cycles=float(row["cpu_cycles"]),
-                )
-            )
-    return tasks
 
 
-CLOUD_RESOURCE_AUDIT_FIELDS = (
-    "slot",
-    "cloud_task_count",
-    "task_id",
-    "cloud_total_cpu_cycles_per_s",
-    "cloud_total_bandwidth_bps",
-    "allocated_cpu_cycles_per_s",
-    "allocated_bandwidth_bps",
-    "cloud_compute_delay_s",
-    "cloud_communication_delay_s",
-    "cloud_total_delay_s",
-    "audit_scope",
-)
 
 
-def write_cloud_resource_sharing_audit(
-    tasks_csv: Path,
-    output_path: Path,
-    cache_config: cache_configuration.CacheOptimizationConfig,
-) -> dict[str, int]:
-    """Write a deterministic Cloud fixed-per-task compatibility audit.
 
-    The audit treats every arrived task in a slot as a Cloud task so that the
-    fixed per-task resources are directly visible without running a trajectory,
-    prediction, PPO, or Matching sweep.  ``cloud_task_count`` is retained only
-    as an observed slot statistic; it does not change the Cloud formula.
-    """
-
-    tasks_by_slot: dict[int, list[Task]] = {}
-    with tasks_csv.open("r", encoding="utf-8", newline="") as stream:
-        for row in csv.DictReader(stream):
-            if int(row["arrival"]) != 1:
-                continue
-            slot = int(row["slot"])
-            task = Task(
-                task_id=str(row["vehicle_id"]),
-                vehicle_id=str(row["vehicle_id"]),
-                service_id=int(row["service_id"]),
-                input_bits=float(row["input_size"]),
-                cpu_cycles=float(row["cpu_cycles"]),
-            )
-            tasks_by_slot.setdefault(slot, []).append(task)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    row_count = 0
-    with output_path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=CLOUD_RESOURCE_AUDIT_FIELDS)
-        writer.writeheader()
-        for slot in sorted(tasks_by_slot):
-            slot_tasks = sorted(tasks_by_slot[slot], key=lambda task: str(task.task_id))
-            cloud_task_count = len(slot_tasks)
-            for task in slot_tasks:
-                execution = system_model.cloud_execution(
-                    task.input_bits,
-                    task.cpu_cycles,
-                    cache_config.cloud_total_bandwidth_bps,
-                    cache_config.cloud_total_cpu_cycles_per_s,
-                    cache_config.cloud_delay_factor,
-                    cache_config.tx_power_w,
-                )
-                writer.writerow(
-                    {
-                        "slot": slot,
-                        "cloud_task_count": cloud_task_count,
-                        "task_id": task.task_id,
-                        "cloud_total_cpu_cycles_per_s": cache_config.cloud_total_cpu_cycles_per_s,
-                        "cloud_total_bandwidth_bps": cache_config.cloud_total_bandwidth_bps,
-                        "allocated_cpu_cycles_per_s": execution["allocated_cpu_cycles_per_s"],
-                        "allocated_bandwidth_bps": execution["allocated_bandwidth_bps"],
-                        "cloud_compute_delay_s": execution["compute_delay_s"],
-                        "cloud_communication_delay_s": execution["communication_delay_s"],
-                        "cloud_total_delay_s": execution["total_delay_s"],
-                        "audit_scope": "all_arrivals_as_cloud_tasks_fixed_per_task",
-                    }
-                )
-                row_count += 1
-
-    return {
-        "slot_count": len(tasks_by_slot),
-        "row_count": row_count,
-        "max_cloud_task_count": max((len(values) for values in tasks_by_slot.values()), default=0),
-    }
-
-
-def load_vehicle_positions(trajectory_csv: Path, time_s: float, vehicle_ids: set[str]) -> dict[str, np.ndarray]:
-    positions: dict[str, np.ndarray] = {}
-    with trajectory_csv.open("r", encoding="utf-8", newline="") as stream:
-        for row in csv.DictReader(stream):
-            vehicle_id = str(row["vehicle_id"])
-            if vehicle_id not in vehicle_ids:
-                continue
-            if not math.isclose(float(row["time_s"]), time_s, rel_tol=0.0, abs_tol=1e-9):
-                continue
-            positions[vehicle_id] = np.asarray([float(row["x_m"]), float(row["y_m"])], dtype=np.float64)
-    missing = sorted(vehicle_ids - set(positions))
-    if missing:
-        raise ValueError(f"trajectory.csv 缺少当前 time_s={time_s} 的车辆位置：{missing}")
-    return positions
 
 
 def build_service_node_positions(
@@ -3618,238 +3003,3 @@ def build_service_node_positions(
         elif role == "UAV":
             positions[node_id] = np.asarray(uav_positions[node_id], dtype=np.float64)
     return positions
-
-
-def _find_edge_case(
-    tasks: list[Task],
-    cache_state: np.ndarray,
-    cache_nodes: dict[str, Any],
-    prefer_two: bool,
-) -> tuple[str, list[Task]] | None:
-    node_ids = [str(value) for value in cache_nodes["node_ids"]]
-    for node_index, node_id in enumerate(node_ids):
-        matched = [task for task in tasks if int(cache_state[node_index, task.service_id]) == 1]
-        if prefer_two and len(matched) >= 2:
-            return node_id, matched[:2]
-        if not prefer_two and matched:
-            return node_id, matched[:1]
-    return None
-
-
-def run_minimal_validation(config_path: str = "configs/proposed/system_config.toml") -> dict[str, Any]:
-    """Run KKT/Cloud formula diagnostics; Cloud-only cases bypass candidate gating."""
-
-    cfg = project_config.load_config(config_path)
-    project_config.validate_config(cfg)
-    project_config.validate_for_formal_experiment(cfg)
-    project_root = Path(cfg["_meta"]["project_root"])
-    cache_cfg = cache_configuration.cache_config_from_project(cfg)
-    slot = 20
-    warmup_time_s = float(project_config.get_config_value(cfg, "simulation.warmup_time_s"))
-    dt_s = float(project_config.get_config_value(cfg, "simulation.dt_s"))
-    time_s = warmup_time_s + slot * dt_s
-    # 只用 configuration 模块的数据读取 helper 生成一个确定性 C(t) 供 KKT actual-state 验证。
-    scenarios = cache_configuration.load_prediction_scenarios(
-        cache_configuration.resolve_path(
-            project_root,
-            project_config.get_config_value(cfg, "paths.prediction_scenarios"),
-        )
-    )
-    origin = cache_configuration.scenario_at_origin(scenarios, slot)
-    if int(origin["origin_slot"]) != slot:
-        raise AssertionError(
-            f"prediction origin_slot={origin['origin_slot']} 与 slot={slot} 不一致。"
-        )
-    catalog = cache_configuration.load_service_catalog(
-        cache_configuration.resolve_path(
-            project_root,
-            project_config.get_config_value(cfg, "paths.service_catalog"),
-        )
-    )
-    cache_nodes = cache_configuration.build_cache_nodes(origin, cache_cfg)
-    cache_state = cache_configuration.deterministic_initial_cache(
-        origin,
-        catalog,
-        cache_nodes,
-        cache_cfg,
-    )
-    tasks = load_actual_tasks(project_root / "data/generated/tasks.csv", slot)
-    roles = cache_configuration.load_json(project_root / "data/generated/vehicle_roles.json")
-    sv_ids = {str(value) for value in roles["service_vehicles"]}
-    tv_ids = {task.vehicle_id for task in tasks}
-    actual_positions = load_vehicle_positions(
-        project_root / "data/generated/trajectory.csv",
-        time_s,
-        tv_ids | sv_ids,
-    )
-    uav_positions = {
-        str(item["id"]): np.asarray([float(item["initial_x_m"]), float(item["initial_y_m"])], dtype=np.float64)
-        for item in project_config.get_config_value(cfg, "nodes.uav.instances", [])
-    }
-    service_positions = build_service_node_positions(cache_nodes, actual_positions, uav_positions)
-
-    math_coeff = [1.0, 4.0, 9.0]
-    expected = (np.sqrt(math_coeff) / np.sum(np.sqrt(math_coeff))).tolist()
-    got, _, ok, reason = solve_kkt_fraction_allocation(
-        math_coeff,
-        1.0e-6,
-        1.0e-12,
-        100,
-    )
-    if not ok:
-        raise AssertionError(reason)
-    closed_form_error = float(np.max(np.abs(np.asarray(got) - np.asarray(expected))))
-    single, _, ok, reason = solve_kkt_fraction_allocation([3.0], 1.0e-6, 1.0e-12, 100)
-    if not ok or not math.isclose(single[0], 1.0, abs_tol=1e-12):
-        raise AssertionError(f"单任务 KKT 验证失败：{single}, {reason}")
-
-    # This is a pure formula diagnostic, not a production Matching candidate.
-    matching_cloud = {task.task_id: CLOUD for task in tasks}
-    case_a = evaluate_matching_with_kkt(
-        tasks,
-        matching_cloud,
-        actual_positions,
-        service_positions,
-        cfg,
-        cache_nodes,
-        cache_cfg,
-    )
-
-    case_b = None
-    case_c = None
-    equal_c = None
-    edge_one = _find_edge_case(tasks, cache_state, cache_nodes, prefer_two=False)
-    if edge_one is not None:
-        node_id, selected = edge_one
-        matching_b = dict(matching_cloud)
-        matching_b[selected[0].task_id] = node_id
-        case_b = evaluate_matching_with_kkt(
-            tasks,
-            matching_b,
-            actual_positions,
-            service_positions,
-            cfg,
-            cache_nodes,
-            cache_cfg,
-        )
-    edge_two = _find_edge_case(tasks, cache_state, cache_nodes, prefer_two=True)
-    if edge_two is not None:
-        node_id, selected = edge_two
-        matching_c = dict(matching_cloud)
-        for task in selected:
-            matching_c[task.task_id] = node_id
-        case_c = evaluate_matching_with_kkt(
-            tasks,
-            matching_c,
-            actual_positions,
-            service_positions,
-            cfg,
-            cache_nodes,
-            cache_cfg,
-        )
-        equal_c = _evaluate_matching_equal_allocation(
-            tasks,
-            matching_c,
-            actual_positions,
-            service_positions,
-            cache_nodes,
-            cache_cfg,
-        )
-        if case_c.task_utility_sum + 1e-9 < equal_c:
-            raise AssertionError("KKT utility 小于 equal allocation。")
-
-    repeat = evaluate_matching_with_kkt(
-        tasks,
-        matching_cloud,
-        actual_positions,
-        service_positions,
-        cfg,
-        cache_nodes,
-        cache_cfg,
-    )
-    if case_a != repeat:
-        raise AssertionError("KKT repeated-run 不确定。")
-
-    # 代表任务逐项复算：Cloud case 中取第一个任务。
-    per_task_check = True
-    if tasks:
-        task = tasks[0]
-        cloud = system_model.cloud_execution(
-            task.input_bits,
-            task.cpu_cycles,
-            cache_cfg.cloud_total_bandwidth_bps,
-            cache_cfg.cloud_total_cpu_cycles_per_s,
-            cache_cfg.cloud_delay_factor,
-            cache_cfg.tx_power_w,
-        )
-        q = system_model.task_utility(
-            cloud["total_delay_s"],
-            cloud["vehicle_energy_j"],
-            cache_cfg.time_ref_s,
-            cache_cfg.energy_ref_j,
-            cache_cfg.omega_t,
-            cache_cfg.omega_e,
-        )
-        per_task_check = (
-            math.isclose(case_a.per_task_delay_s[task.task_id], cloud["total_delay_s"], rel_tol=1e-12)
-            and math.isclose(case_a.per_task_vehicle_energy_j[task.task_id], cloud["vehicle_energy_j"], rel_tol=1e-12)
-            and math.isclose(case_a.per_task_utility[task.task_id], q, rel_tol=1e-12)
-        )
-    if not per_task_check:
-        raise AssertionError("per-task system_model 复算不一致。")
-
-    return {
-        "slot": slot,
-        "time_s": time_s,
-        "arrival_task_count": len(tasks),
-        "closed_form_error": closed_form_error,
-        "single_task_allocation": single,
-        "case_a": case_a,
-        "case_b": case_b,
-        "case_c": case_c,
-        "equal_case_c_utility": equal_c,
-        "per_task_check": per_task_check,
-    }
-
-
-def _summary_dict(result: KKTMatchingEvaluation | None) -> dict[str, Any] | None:
-    if result is None:
-        return None
-    return {
-        "resource_feasible": result.resource_feasible,
-        "infeasible_reason": result.infeasible_reason,
-        "J_mu": result.task_utility_sum,
-        "per_node_task_counts": result.per_node_task_counts,
-        "cpu_allocations": result.cpu_allocations,
-        "bandwidth_allocations": result.bandwidth_allocations,
-        "cpu_sums": result.cpu_resource_sums,
-        "bandwidth_sums": result.bandwidth_resource_sums,
-    }
-
-
-def build_kkt_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Given matching -> KKT resource allocation validation.")
-    parser.add_argument("--config", default="configs/proposed/system_config.toml")
-    return parser
-
-
-def kkt_main(argv: list[str] | None = None) -> int:
-    args = build_kkt_parser().parse_args(argv)
-    result = run_minimal_validation(args.config)
-    printable = {
-        "slot": result["slot"],
-        "time_s": result["time_s"],
-        "arrival_task_count": result["arrival_task_count"],
-        "closed_form_error": result["closed_form_error"],
-        "single_task_allocation": result["single_task_allocation"],
-        "case_a": _summary_dict(result["case_a"]),
-        "case_b": _summary_dict(result["case_b"]),
-        "case_c": _summary_dict(result["case_c"]),
-        "equal_case_c_utility": result["equal_case_c_utility"],
-        "per_task_check": result["per_task_check"],
-    }
-    print(json.dumps(printable, ensure_ascii=False, indent=2))
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())

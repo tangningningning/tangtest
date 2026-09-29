@@ -8,7 +8,6 @@ the system model, Matching, KKT, or any policy code.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import numpy as np
@@ -272,18 +271,3 @@ def execution_ratio_statistics(
             "std_execution_ratio": float(np.std(values, ddof=1)),
         }
     return result
-
-
-def infer_episode_seed(realization_dir: str | Path | None) -> int | None:
-    """Infer an explicit episode seed only from a conventional episode directory."""
-
-    if realization_dir is None:
-        return None
-    name = Path(realization_dir).name
-    if not name.startswith("episode_"):
-        return None
-    suffix = name.removeprefix("episode_")
-    try:
-        return int(suffix)
-    except ValueError:
-        return None

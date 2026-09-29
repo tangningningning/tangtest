@@ -8,8 +8,6 @@
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -355,79 +353,12 @@ def _materialise_node_instances(config: dict[str, Any]) -> None:
         node_config["instances"] = instances
 
 
-def parse_override_value(raw: str) -> Any:
-    lowered = raw.strip().lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    try:
-        return int(raw)
-    except ValueError:
-        pass
-    try:
-        return float(raw)
-    except ValueError:
-        pass
-    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
-        return raw[1:-1]
-    return raw
 
 
-def apply_overrides(config: dict[str, Any], overrides: list[str] | None) -> dict[str, Any]:
-    updated = copy.deepcopy(config)
-    if not overrides:
-        validate_config(updated)
-        return updated
-    for override in overrides:
-        if "=" not in override:
-            raise ValueError(f"--set override 必须形如 a.b=value：{override}")
-        dotted_key, raw_value = override.split("=", 1)
-        parts = [part.strip() for part in dotted_key.split(".") if part.strip()]
-        if not parts:
-            raise ValueError(f"override key 为空：{override}")
-        current: Any = updated
-        for part in parts[:-1]:
-            if part not in current or not isinstance(current[part], dict):
-                raise KeyError(f"override 路径不存在或不是 table：{'.'.join(parts[:-1])}")
-            current = current[part]
-        leaf = parts[-1]
-        if leaf not in current:
-            raise KeyError(f"override key 不存在：{dotted_key}")
-        old_value = current[leaf]
-        new_value = parse_override_value(raw_value)
-        if old_value is not None and not isinstance(new_value, type(old_value)):
-            if isinstance(old_value, float) and isinstance(new_value, int):
-                new_value = float(new_value)
-            elif isinstance(old_value, int) and isinstance(new_value, float) and new_value.is_integer():
-                new_value = int(new_value)
-            else:
-                raise TypeError(
-                    f"override {dotted_key} 类型不匹配：原类型 {type(old_value).__name__}，"
-                    f"新类型 {type(new_value).__name__}"
-                )
-        current[leaf] = new_value
-    validate_config(updated)
-    return updated
 
 
-def config_hash(config: dict[str, Any]) -> str:
-    canonical = copy.deepcopy(config)
-    canonical.pop("_meta", None)
-    payload = json.dumps(
-        canonical,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
-def get_parameter_status(config: dict[str, Any], dotted_key: str) -> str | None:
-    statuses = config.get("parameter_status", {})
-    value = statuses.get(dotted_key)
-    return str(value) if value is not None else None
 
 
 def list_unresolved_parameters(config: dict[str, Any]) -> dict[str, str]:
@@ -689,7 +620,7 @@ def validate_config(
             configured_tv,
         ):
             raise ValueError(
-                "vehicle_roles.json 车辆数量必须与 configs/proposed/system_config.toml 的正式 baseline 一致。"
+                "vehicle_roles.json 车辆数量必须与 configs/proposed/system_config.toml 的正式配置一致。"
             )
         if len(research) != len(set(research)) or len(sv) != len(set(sv)) or len(tv) != len(set(tv)):
             raise ValueError("vehicle_roles.json 研究车辆角色列表不能包含重复 ID。")
@@ -1203,11 +1134,11 @@ def validate_config(
     if float(get_config_value(config, "nodes.cloud.cpu_cycles_per_s")) != float(
         get_config_value(config, "nodes.cloud.total_cpu_cycles_per_s")
     ):
-        raise ValueError("Cloud legacy CPU 字段必须与唯一总 CPU 容量一致。")
+        raise ValueError("Cloud 重复 CPU 字段必须与唯一总 CPU 容量一致。")
     if float(get_config_value(config, "nodes.cloud.uplink_rate_bps")) != float(
         get_config_value(config, "nodes.cloud.total_bandwidth_bps")
     ):
-        raise ValueError("Cloud legacy uplink 字段必须与唯一总带宽容量一致。")
+        raise ValueError("Cloud 重复 uplink 字段必须与唯一总带宽容量一致。")
 
     for key, status in config.get("parameter_status", {}).items():
         if status not in {
@@ -1232,23 +1163,3 @@ def validate_config(
             "paths.tv_local_cache",
         ):
             _require_path_exists(config, key)
-
-
-def main() -> int:
-    config = load_config()
-    print("configs/proposed/system_config.toml 解析与校验通过")
-    print(f"config_hash={config_hash(config)}")
-    print(
-        "vehicle_counts="
-        f"research:{get_config_value(config, 'simulation.num_research_vehicles')},"
-        f"SV:{get_config_value(config, 'simulation.num_service_vehicles')},"
-        f"TV:{get_config_value(config, 'simulation.num_task_vehicles')}"
-    )
-    print(f"rsu_count={get_config_value(config, 'nodes.rsu.count')}")
-    print(f"uav_count={get_config_value(config, 'nodes.uav.count')}")
-    print(f"service_count={get_config_value(config, 'service.count')}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

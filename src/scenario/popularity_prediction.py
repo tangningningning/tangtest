@@ -21,11 +21,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import math
-import random
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,11 +34,7 @@ import torch.nn.functional as F
 from scenario.task_scenario import (
     TaskConfig,
     build_observed_popularity,
-    generate_tasks,
     load_json,
-    make_popularity_trace,
-    make_rngs,
-    make_service_catalog,
     task_config_from_project_config,
 )
 
@@ -129,15 +122,6 @@ def resolve_path(project_root: Path, value: str | Path) -> Path:
     return path.resolve(strict=False)
 
 
-def set_reproducible(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
 
 
 def write_csv_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -281,11 +265,6 @@ def build_causal_formal_inputs(
     return stacked, combined_rho_obs
 
 
-def rho_obs_quality(rho_obs: np.ndarray, rho_star: np.ndarray) -> dict[str, float]:
-    return {
-        "mae": float(np.mean(np.abs(rho_obs - rho_star))),
-        "cross_entropy": distribution_cross_entropy_np(rho_obs, rho_star),
-    }
 
 
 # ============================================================================
@@ -319,117 +298,12 @@ def task_config_from_catalog(
     )
 
 
-def make_sequence_seeds(config: PopularityPredictionConfig) -> dict[str, list[int]]:
-    total = (
-        config.num_train_sequences
-        + config.num_val_sequences
-        + config.num_test_sequences
-    )
-    seeds = [config.sequence_seed_base + index for index in range(total)]
-    train_end = config.num_train_sequences
-    val_end = train_end + config.num_val_sequences
-    return {
-        "train": seeds[:train_end],
-        "val": seeds[train_end:val_end],
-        "test": seeds[val_end:],
-    }
 
 
-def generate_popularity_request_sequence(
-    sequence_seed: int,
-    task_config: TaskConfig,
-    num_tv: int,
-    num_slots: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """生成一条独立 popularity/request sequence，不运行 SUMO。"""
-    stream_names = (
-        "service_catalog",
-        "popularity_evolution",
-        "task_arrival",
-        "service_request",
-        "workload_variation",
-    )
-    rngs, _ = make_rngs(sequence_seed, stream_names)
-    catalog = make_service_catalog(task_config, rngs["service_catalog"])
-    _, rho_star, _ = make_popularity_trace(
-        task_config.num_services,
-        num_slots,
-        task_config.fallback_dt_s,
-        0.0,
-        task_config,
-        rngs["popularity_evolution"],
-    )
-    task_vehicles = [f"tv_{index}" for index in range(num_tv)]
-    _, request_counts = generate_tasks(
-        task_vehicles,
-        catalog,
-        rho_star,
-        num_slots,
-        task_config.fallback_dt_s,
-        0.0,
-        task_config,
-        rngs["task_arrival"],
-        rngs["service_request"],
-        rngs["workload_variation"],
-    )
-    return rho_star.astype(np.float64), request_counts.astype(np.float64)
 
 
-def build_windows(
-    rho_obs: np.ndarray,
-    rho_star: np.ndarray,
-    history_length: int,
-    horizon_steps: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    inputs: list[np.ndarray] = []
-    labels: list[np.ndarray] = []
-    origins: list[int] = []
-    max_origin = rho_star.shape[0] - horizon_steps
-    for origin in range(history_length, max_origin + 1):
-        inputs.append(rho_obs[origin - history_length : origin])
-        labels.append(rho_star[origin : origin + horizon_steps])
-        origins.append(origin)
-    if not inputs:
-        raise ValueError("没有可用滑动窗口样本。")
-    return (
-        np.stack(inputs).astype(np.float32),
-        np.stack(labels).astype(np.float32),
-        np.asarray(origins, dtype=np.int64),
-    )
 
 
-def make_split_dataset(
-    seeds: list[int],
-    task_config: TaskConfig,
-    num_tv: int,
-    pred_config: PopularityPredictionConfig,
-) -> dict[str, Any]:
-    all_x: list[np.ndarray] = []
-    all_y: list[np.ndarray] = []
-    all_sequence_ids: list[int] = []
-    for sequence_index, seed in enumerate(seeds):
-        rho_star, request_counts = generate_popularity_request_sequence(
-            seed,
-            task_config,
-            num_tv,
-            pred_config.sequence_length,
-        )
-        rho_obs = build_observed_popularity(request_counts)
-        x, y, _ = build_windows(
-            rho_obs,
-            rho_star,
-            pred_config.history_length,
-            pred_config.horizon_steps,
-        )
-        all_x.append(x)
-        all_y.append(y)
-        all_sequence_ids.extend([sequence_index] * len(x))
-    return {
-        "x": np.concatenate(all_x, axis=0),
-        "y": np.concatenate(all_y, axis=0),
-        "sequence_ids": np.asarray(all_sequence_ids, dtype=np.int64),
-        "seeds": list(seeds),
-    }
 
 
 # ============================================================================
@@ -465,14 +339,8 @@ class PopularityGRU(nn.Module):
         return logits.reshape(-1, self.horizon_steps, self.num_services)
 
 
-def distribution_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    log_prob = F.log_softmax(logits, dim=-1)
-    return -(target * log_prob).sum(dim=-1).mean()
 
 
-def distribution_cross_entropy_np(pred: np.ndarray, target: np.ndarray) -> float:
-    clipped = np.clip(pred, 1e-12, 1.0)
-    return float(-(target * np.log(clipped)).sum(axis=-1).mean())
 
 
 def iter_batches(
@@ -490,114 +358,8 @@ def iter_batches(
     ]
 
 
-def evaluate_loss(
-    model: PopularityGRU,
-    x: np.ndarray,
-    y: np.ndarray,
-    batch_size: int,
-    device: torch.device,
-) -> float:
-    model.eval()
-    total_loss = 0.0
-    total_samples = 0
-    with torch.no_grad():
-        for xb, yb in iter_batches(x, y, batch_size, None):
-            logits = model(torch.from_numpy(xb).to(device))
-            target = torch.from_numpy(yb).to(device)
-            batch_loss = float(distribution_cross_entropy(logits, target).cpu())
-            batch_samples = len(xb)
-            total_loss += batch_loss * batch_samples
-            total_samples += batch_samples
-    if total_samples == 0:
-        raise ValueError("评估数据集不能为空。")
-    return float(total_loss / total_samples)
 
 
-def train_model(
-    datasets: dict[str, dict[str, Any]],
-    num_services: int,
-    config: PopularityPredictionConfig,
-    device: torch.device,
-) -> tuple[PopularityGRU, dict[str, Any]]:
-    set_reproducible(config.training_seed)
-    model = PopularityGRU(
-        num_services=num_services,
-        hidden_size=config.hidden_size,
-        horizon_steps=config.horizon_steps,
-        num_layers=config.num_layers,
-    ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    train_rng = np.random.default_rng(config.training_seed)
-
-    best_state: dict[str, torch.Tensor] | None = None
-    best_val = float("inf")
-    best_epoch = 0
-    epochs_without_improvement = 0
-    history: list[dict[str, float]] = []
-
-    for epoch in range(1, config.max_epochs + 1):
-        model.train()
-        train_loss_sum = 0.0
-        train_sample_count = 0
-        for xb, yb in iter_batches(
-            datasets["train"]["x"],
-            datasets["train"]["y"],
-            config.batch_size,
-            train_rng,
-        ):
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(torch.from_numpy(xb).to(device))
-            target = torch.from_numpy(yb).to(device)
-            loss = distribution_cross_entropy(logits, target)
-            if not torch.isfinite(loss):
-                raise FloatingPointError("训练 loss 出现 NaN/Inf。")
-            loss.backward()
-            optimizer.step()
-            batch_samples = len(xb)
-            train_loss_sum += float(loss.detach().cpu()) * batch_samples
-            train_sample_count += batch_samples
-
-        if train_sample_count == 0:
-            raise ValueError("训练数据集不能为空。")
-        train_loss = float(train_loss_sum / train_sample_count)
-        val_loss = evaluate_loss(
-            model,
-            datasets["val"]["x"],
-            datasets["val"]["y"],
-            config.batch_size,
-            device,
-        )
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        if val_loss + 1e-12 < best_val:
-            best_val = val_loss
-            best_epoch = epoch
-            best_state = {
-                key: value.detach().cpu().clone()
-                for key, value in model.state_dict().items()
-            }
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= config.patience:
-                break
-
-    if best_state is None:
-        raise RuntimeError("训练没有产生有效 checkpoint。")
-    model.load_state_dict(best_state)
-    test_loss = evaluate_loss(
-        model,
-        datasets["test"]["x"],
-        datasets["test"]["y"],
-        config.batch_size,
-        device,
-    )
-    return model, {
-        "best_validation_loss": best_val,
-        "best_epoch": best_epoch,
-        "stopped_epoch": history[-1]["epoch"],
-        "test_loss": test_loss,
-        "history": history,
-    }
 
 
 # ============================================================================
@@ -623,30 +385,6 @@ def predict_probabilities(
     return np.concatenate(chunks, axis=0).astype(np.float64)
 
 
-def evaluate_predictions(pred: np.ndarray, truth: np.ndarray) -> dict[str, Any]:
-    horizon_steps = pred.shape[1]
-    metrics: dict[str, Any] = {"per_horizon": {}, "probability_sum_mean": {}}
-    for horizon in range(horizon_steps):
-        pred_h = pred[:, horizon, :]
-        truth_h = truth[:, horizon, :]
-        pred_top1 = np.argmax(pred_h, axis=1)
-        truth_top1 = np.argmax(truth_h, axis=1)
-        top1 = float(np.mean(pred_top1 == truth_top1))
-        top3_overlap = []
-        for row in range(len(pred_h)):
-            pred_top3 = set(np.argsort(pred_h[row])[-3:])
-            truth_top3 = set(np.argsort(truth_h[row])[-3:])
-            top3_overlap.append(len(pred_top3 & truth_top3) / 3.0)
-        metrics["per_horizon"][str(horizon)] = {
-            "cross_entropy": distribution_cross_entropy_np(pred_h, truth_h),
-            "mae": float(np.mean(np.abs(pred_h - truth_h))),
-            "top1_accuracy": top1,
-            "top3_overlap": float(np.mean(top3_overlap)),
-        }
-        metrics["probability_sum_mean"][str(horizon)] = float(
-            np.mean(pred_h.sum(axis=1))
-        )
-    return metrics
 
 
 def canonical_prediction_rows(
@@ -712,20 +450,6 @@ def canonical_prediction_rows(
     return rows
 
 
-def save_checkpoint(
-    path: Path,
-    model: PopularityGRU,
-    metadata: dict[str, Any],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    payload = {"model_state_dict": model.state_dict(), "metadata": metadata}
-    try:
-        torch.save(payload, tmp)
-        tmp.replace(path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
 
 
 def load_checkpoint_model(
@@ -738,7 +462,7 @@ def load_checkpoint_model(
         raise ValueError("GRU checkpoint 缺少 metadata。")
     if metadata.get("observation_definition") != OBSERVATION_DEFINITION:
         raise ValueError(
-            "old GRU checkpoint uses incompatible popularity observation "
+            "GRU checkpoint uses an incompatible popularity observation "
             "definition; retrain popularity GRU"
         )
     model = PopularityGRU(
@@ -819,14 +543,8 @@ def verify_outputs(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="训练服务流行度 GRU 并预测 canonical episode。")
+    parser = argparse.ArgumentParser(description="使用冻结的服务流行度 GRU 生成 canonical episode 预测。")
     parser.add_argument("--config", default="configs/proposed/system_config.toml")
-    parser.add_argument(
-        "--mode",
-        choices=("train", "predict"),
-        default="train",
-        help="Legacy defaults to training; realization generation must use predict.",
-    )
     parser.add_argument("--popularity-file", default=None)
     parser.add_argument("--popularity-history-file", default=None)
     parser.add_argument("--service-catalog-file", default=None)
@@ -834,143 +552,107 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--prediction-file", default=None)
-    parser.add_argument("--horizon", type=int, default=None)
-    parser.add_argument("--history-length", type=int, default=None)
-    parser.add_argument("--hidden-size", type=int, default=None)
-    parser.add_argument("--training-seed", type=int, default=None)
-    parser.add_argument("--sequence-seed-base", type=int, default=None)
-    parser.add_argument("--num-train-sequences", type=int, default=None)
-    parser.add_argument("--num-val-sequences", type=int, default=None)
-    parser.add_argument("--num-test-sequences", type=int, default=None)
-    parser.add_argument("--sequence-length", type=int, default=None)
-    parser.add_argument("--learning-rate", type=float, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--max-epochs", type=int, default=None)
-    parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--device", default=None, choices=("cpu", "cuda"))
     return parser
 
 
-def config_from_args(
-    args: argparse.Namespace,
-    project_config: dict[str, Any] | None = None,
+def config_from_project_config(
+    project_config: dict[str, Any],
 ) -> PopularityPredictionConfig:
-    if project_config is None:
-        base = DEFAULT_CONFIG
-    else:
-        from common.project_config import get_config_value
+    from common.project_config import get_config_value
 
-        simulation_steps = int(
-            round(
-                float(get_config_value(project_config, "simulation.episode_time_s"))
-                / float(get_config_value(project_config, "simulation.dt_s"))
-            )
+    simulation_steps = int(
+        round(
+            float(get_config_value(project_config, "simulation.episode_time_s"))
+            / float(get_config_value(project_config, "simulation.dt_s"))
         )
-        base = PopularityPredictionConfig(
-            horizon_steps=int(
-                get_config_value(
-                    project_config,
-                    "prediction.vehicle.horizon",
-                    DEFAULT_CONFIG.horizon_steps,
-                )
-            ),
-            history_length=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.history_length",
-                    DEFAULT_CONFIG.history_length,
-                )
-            ),
-            hidden_size=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.hidden_size",
-                    DEFAULT_CONFIG.hidden_size,
-                )
-            ),
-            training_seed=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.training_seed",
-                    DEFAULT_CONFIG.training_seed,
-                )
-            ),
-            sequence_seed_base=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.sequence_seed_base",
-                    DEFAULT_CONFIG.sequence_seed_base,
-                )
-            ),
-            num_train_sequences=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.num_train_sequences",
-                    DEFAULT_CONFIG.num_train_sequences,
-                )
-            ),
-            num_val_sequences=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.num_val_sequences",
-                    DEFAULT_CONFIG.num_val_sequences,
-                )
-            ),
-            num_test_sequences=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.num_test_sequences",
-                    DEFAULT_CONFIG.num_test_sequences,
-                )
-            ),
-            sequence_length=simulation_steps,
-            learning_rate=float(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.learning_rate",
-                    DEFAULT_CONFIG.learning_rate,
-                )
-            ),
-            batch_size=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.batch_size",
-                    DEFAULT_CONFIG.batch_size,
-                )
-            ),
-            max_epochs=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.max_epochs",
-                    DEFAULT_CONFIG.max_epochs,
-                )
-            ),
-            patience=int(
-                get_config_value(
-                    project_config,
-                    "prediction.popularity.patience",
-                    DEFAULT_CONFIG.patience,
-                )
-            ),
-        )
-
-    def choose(name: str, value: Any) -> Any:
-        return getattr(base, name) if value is None else value
-
+    )
     return PopularityPredictionConfig(
-        horizon_steps=choose("horizon_steps", args.horizon),
-        history_length=choose("history_length", args.history_length),
-        hidden_size=choose("hidden_size", args.hidden_size),
-        training_seed=choose("training_seed", args.training_seed),
-        sequence_seed_base=choose("sequence_seed_base", args.sequence_seed_base),
-        num_train_sequences=choose("num_train_sequences", args.num_train_sequences),
-        num_val_sequences=choose("num_val_sequences", args.num_val_sequences),
-        num_test_sequences=choose("num_test_sequences", args.num_test_sequences),
-        sequence_length=choose("sequence_length", args.sequence_length),
-        learning_rate=choose("learning_rate", args.learning_rate),
-        batch_size=choose("batch_size", args.batch_size),
-        max_epochs=choose("max_epochs", args.max_epochs),
-        patience=choose("patience", args.patience),
+        horizon_steps=int(
+            get_config_value(
+                project_config,
+                "prediction.vehicle.horizon",
+                DEFAULT_CONFIG.horizon_steps,
+            )
+        ),
+        history_length=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.history_length",
+                DEFAULT_CONFIG.history_length,
+            )
+        ),
+        hidden_size=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.hidden_size",
+                DEFAULT_CONFIG.hidden_size,
+            )
+        ),
+        training_seed=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.training_seed",
+                DEFAULT_CONFIG.training_seed,
+            )
+        ),
+        sequence_seed_base=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.sequence_seed_base",
+                DEFAULT_CONFIG.sequence_seed_base,
+            )
+        ),
+        num_train_sequences=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.num_train_sequences",
+                DEFAULT_CONFIG.num_train_sequences,
+            )
+        ),
+        num_val_sequences=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.num_val_sequences",
+                DEFAULT_CONFIG.num_val_sequences,
+            )
+        ),
+        num_test_sequences=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.num_test_sequences",
+                DEFAULT_CONFIG.num_test_sequences,
+            )
+        ),
+        sequence_length=simulation_steps,
+        learning_rate=float(
+            get_config_value(
+                project_config,
+                "prediction.popularity.learning_rate",
+                DEFAULT_CONFIG.learning_rate,
+            )
+        ),
+        batch_size=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.batch_size",
+                DEFAULT_CONFIG.batch_size,
+            )
+        ),
+        max_epochs=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.max_epochs",
+                DEFAULT_CONFIG.max_epochs,
+            )
+        ),
+        patience=int(
+            get_config_value(
+                project_config,
+                "prediction.popularity.patience",
+                DEFAULT_CONFIG.patience,
+            )
+        ),
     )
 
 
@@ -983,9 +665,9 @@ def main(argv: list[str] | None = None) -> int:
 
         formal_config = project_config_module.load_config(
             args.config,
-            require_artifacts=args.mode == "train",
+            require_artifacts=False,
         )
-        config = config_from_args(args, formal_config)
+        config = config_from_project_config(formal_config)
         config.validate()
         device_name = args.device or "cpu"
         if device_name == "cuda" and not torch.cuda.is_available():
@@ -1037,11 +719,7 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint_file = resolve_path(
             project_root,
             args.checkpoint
-            or (
-                config_path(formal_config, "paths.popularity_gru")
-                if args.mode == "predict"
-                else output_dir / "popularity_gru.pt"
-            ),
+            or config_path(formal_config, "paths.popularity_gru"),
         )
         prediction_file = resolve_path(
             project_root,
@@ -1108,94 +786,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"{configured_num_slots} 不一致。"
             )
         origin_slots = np.arange(canonical_rho_star.shape[0], dtype=np.int64)
-        x_can, combined_rho_obs = build_causal_formal_inputs(
+        x_can, _ = build_causal_formal_inputs(
             history_request_counts,
             canonical_request_counts,
             config.history_length,
             origin_slots,
         )
-        canonical_rho_obs = combined_rho_obs[len(history_request_counts) :]
-        valid_count = canonical_rho_star.shape[0] - config.horizon_steps + 1
-        if valid_count <= 0:
-            raise ValueError("formal episode 长度不足以评估一个完整 H_p。")
-        eval_origins = np.arange(valid_count, dtype=np.int64)
-        y_can = np.stack(
-            [
-                canonical_rho_star[origin : origin + config.horizon_steps]
-                for origin in eval_origins.tolist()
-            ],
-            axis=0,
-        ).astype(np.float32)
 
-        if args.mode == "predict":
-            expected = {
-                "F": task_config.num_services,
-                "H_p": config.horizon_steps,
-                "L_rho": config.history_length,
-            }
-            pred_can, _ = run_frozen_inference(
-                checkpoint_file,
-                x_can,
-                config.batch_size,
-                device,
-                expected,
-            )
-            rows = canonical_prediction_rows(
-                pred_can,
-                canonical_rho_star,
-                origin_slots,
-                canonical_times,
-                dt_s=(canonical_times[1] - canonical_times[0])
-                if len(canonical_times) > 1
-                else 1.0,
-            )
-            repeat_pred, _ = run_frozen_inference(
-                checkpoint_file,
-                x_can,
-                config.batch_size,
-                device,
-                expected,
-            )
-            verify_outputs(
-                rows,
-                pred_can,
-                canonical_rho_star,
-                origin_slots,
-                config,
-                repeat_pred,
-            )
-            write_csv_atomic(prediction_file, rows)
-            print("服务流行度 frozen-GRU 推理完成：")
-            print(f"  checkpoint_unchanged=True")
-            print(f"  formal origins={len(origin_slots)}，canonical rows={len(rows)}")
-            print(f"  output: {prediction_file}")
-            return 0
-
-        sequence_seeds = make_sequence_seeds(config)
-        datasets = {
-            split: make_split_dataset(seeds, task_config, num_tv, config)
-            for split, seeds in sequence_seeds.items()
+        expected = {
+            "F": task_config.num_services,
+            "H_p": config.horizon_steps,
+            "L_rho": config.history_length,
         }
-        if set(sequence_seeds["train"]) & set(sequence_seeds["val"]):
-            raise AssertionError("train/val sequence seed 存在交集。")
-        if set(sequence_seeds["train"]) & set(sequence_seeds["test"]):
-            raise AssertionError("train/test sequence seed 存在交集。")
-        if set(sequence_seeds["val"]) & set(sequence_seeds["test"]):
-            raise AssertionError("val/test sequence seed 存在交集。")
-
-        model, training_summary = train_model(
-            datasets,
-            task_config.num_services,
-            config,
-            device,
-        )
-        pred_can = predict_probabilities(
-            model,
+        pred_can, _ = run_frozen_inference(
+            checkpoint_file,
             x_can,
             config.batch_size,
             device,
+            expected,
         )
-        canonical_metrics = evaluate_predictions(pred_can[:valid_count], y_can)
         rows = canonical_prediction_rows(
             pred_can,
             canonical_rho_star,
@@ -1205,63 +814,12 @@ def main(argv: list[str] | None = None) -> int:
             if len(canonical_times) > 1
             else 1.0,
         )
-
-        metadata = {
-            "schema_version": 3,
-            "F": task_config.num_services,
-            "H_p": config.horizon_steps,
-            "L_rho": config.history_length,
-            "hidden_size": config.hidden_size,
-            "num_layers": config.num_layers,
-            "observation_definition": OBSERVATION_DEFINITION,
-            "training_seed": config.training_seed,
-            "sequence_seed_base": config.sequence_seed_base,
-            "train_sequence_seeds": sequence_seeds["train"],
-            "val_sequence_seeds": sequence_seeds["val"],
-            "test_sequence_seeds": sequence_seeds["test"],
-            "num_train_sequences": len(sequence_seeds["train"]),
-            "num_val_sequences": len(sequence_seeds["val"]),
-            "num_test_sequences": len(sequence_seeds["test"]),
-            "sequence_length": config.sequence_length,
-            "learning_rate": config.learning_rate,
-            "batch_size": config.batch_size,
-            "max_epochs": config.max_epochs,
-            "patience": config.patience,
-            "task_generation_parameters": {
-                "num_services": task_config.num_services,
-                "arrival_probability": task_config.arrival_probability,
-                "zipf_exponent": task_config.zipf_exponent,
-                "popularity_epoch_length": task_config.popularity_epoch_length,
-                "popularity_changes_per_epoch": task_config.popularity_changes_per_epoch,
-                "num_task_vehicles": num_tv,
-            },
-            "training_summary": training_summary,
-            "canonical_metrics": canonical_metrics,
-            "rho_obs_quality": rho_obs_quality(canonical_rho_obs, canonical_rho_star),
-            "canonical_episode_used_for_training": False,
-            "formal_time_slot_count": int(canonical_rho_star.shape[0]),
-            "formal_origin_count": int(len(origin_slots)),
-            "truth_evaluation_origin_count": int(valid_count),
-            "prediction_tail_origins_without_formal_truth": [
-                int(origin) for origin in origin_slots if origin >= valid_count
-            ],
-            "prehistory": {
-                "file": str(popularity_history_file),
-                "history_slots": int(len(history_request_counts)),
-                "formal_slots": [int(value) for value in history_formal_slots],
-                "formal_origin_0_uses": "prehistory request_count only",
-            },
-            "official_pytorch_api": ["torch.nn.GRU", "torch.nn.Linear", "torch.optim.Adam"],
-            "config": asdict(config),
-        }
-
-        save_checkpoint(checkpoint_file, model, metadata)
-        reloaded_model, _ = load_checkpoint_model(checkpoint_file, device)
-        reload_pred = predict_probabilities(
-            reloaded_model,
+        repeat_pred, _ = run_frozen_inference(
+            checkpoint_file,
             x_can,
             config.batch_size,
             device,
+            expected,
         )
         verify_outputs(
             rows,
@@ -1269,38 +827,15 @@ def main(argv: list[str] | None = None) -> int:
             canonical_rho_star,
             origin_slots,
             config,
-            reload_pred,
+            repeat_pred,
         )
         write_csv_atomic(prediction_file, rows)
-
-        print("服务流行度预测完成：")
-        print(
-            f"  sequences train/val/test="
-            f"{len(sequence_seeds['train'])}/{len(sequence_seeds['val'])}/"
-            f"{len(sequence_seeds['test'])}"
-        )
-        print(
-            f"  F={task_config.num_services}, L_rho={config.history_length}, "
-            f"H_p={config.horizon_steps}, hidden={config.hidden_size}"
-        )
-        print(
-            f"  best_val={training_summary['best_validation_loss']:.6f}, "
-            f"best_epoch={training_summary['best_epoch']}, "
-            f"stopped_epoch={training_summary['stopped_epoch']}"
-        )
-        print(
-            f"  formal origins={len(origin_slots)}，"
-            f"truth-evaluated origins={valid_count}，tail origins={len(origin_slots) - valid_count}"
-        )
-        print(f"  canonical rows={len(rows)}")
-        print(f"  checkpoint_reload_consistent=True")
-        print(f"  output: {checkpoint_file}")
+        print("服务流行度 frozen-GRU 推理完成：")
+        print(f"  checkpoint_unchanged=True")
+        print(f"  formal origins={len(origin_slots)}，canonical rows={len(rows)}")
         print(f"  output: {prediction_file}")
         return 0
+
     except Exception as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

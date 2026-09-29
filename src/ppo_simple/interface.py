@@ -6,12 +6,12 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
 from common import project_config
-from decision import cache_configuration, task_allocation, uav_configuration
+from decision import cache_configuration, task_allocation
 
 
 def _validate_binary_vector(value: Any, expected_length: int, name: str) -> np.ndarray:
@@ -530,62 +530,6 @@ def build_step_observation(
     )
 
 
-def build_trigger_action_mask_provider(
-    previous_cache_state: np.ndarray,
-    previous_uav_positions: dict[str, Any],
-    service_catalog: dict[str, Any],
-    project_cfg: dict[str, Any],
-    cache_nodes: dict[str, Any],
-    flight_boundary: tuple[float, float, float, float],
-    action_spec: TriggerActionSpec,
-) -> Callable[[int, np.ndarray], np.ndarray]:
-    """构造当前 state 下的 binary request mask。"""
-
-    previous_cache = np.asarray(previous_cache_state, dtype=np.int8)
-    cache_node_ids = [str(value) for value in cache_nodes["node_ids"]]
-    if tuple(cache_node_ids) != tuple(action_spec.cache_node_ids):
-        raise ValueError("action_spec.cache_node_ids 与 cache_nodes 不一致。")
-    if previous_cache.shape != (
-        len(cache_node_ids),
-        int(service_catalog["num_services"]),
-    ):
-        raise ValueError("previous_cache_state shape 与 cache_nodes/service catalog 不一致。")
-    if not np.all(np.isin(previous_cache, [0, 1])):
-        raise ValueError("previous_cache_state 必须是 0/1。")
-
-    previous_uav = {
-        str(uav_id): np.asarray(xy, dtype=np.float64).copy()
-        for uav_id, xy in previous_uav_positions.items()
-    }
-    cache_count = len(action_spec.cache_node_ids)
-
-    def provider(action_index: int, prefix_actions: np.ndarray) -> np.ndarray:
-        index = int(action_index)
-        prefix = np.asarray(prefix_actions, dtype=np.int8).reshape(-1)
-        if index < 0 or index >= action_spec.action_dim or len(prefix) != index:
-            raise ValueError("action mask provider 收到非法 action index/prefix。")
-        if not np.all(np.isin(prefix, [0, 1])):
-            raise ValueError("action mask prefix 必须是 0/1。")
-        if index < cache_count:
-            return np.asarray([True, True], dtype=bool)
-
-        uav_index = index - cache_count
-        triggers = {uav_id: 0 for uav_id in action_spec.uav_ids}
-        for prior_index in range(uav_index):
-            triggers[action_spec.uav_ids[prior_index]] = int(
-                prefix[cache_count + prior_index]
-            )
-        current_uav_id = action_spec.uav_ids[uav_index]
-        triggers[current_uav_id] = 1
-        can_trigger = uav_configuration.has_feasible_trigger_assignment(
-            previous_uav,
-            triggers,
-            project_cfg,
-            flight_boundary,
-        )
-        return np.asarray([True, bool(can_trigger)], dtype=bool)
-
-    return provider
 
 
 def _copy_uav_positions(positions: dict[str, Any]) -> dict[str, tuple[float, float]]:

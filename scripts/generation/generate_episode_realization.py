@@ -704,8 +704,6 @@ def run_episode(
         [
             "--config",
             str(config_file),
-            "--mode",
-            "predict",
             "--popularity-file",
             str(popularity_file),
             "--popularity-history-file",

@@ -2721,7 +2721,7 @@ def _branch_kl_update_metric_fields(update: UpdateResult) -> dict[str, Any]:
     if not update.kl_epoch_diagnostics:
         return {}
     epoch_fields = (
-        "cache_only_kl_trigger_count",
+        "cache_without_uav_kl_trigger_count",
         "uav_only_kl_trigger_count",
         "both_kl_trigger_count",
         "neither_kl_trigger_count",
@@ -9315,7 +9315,7 @@ class PPOTrainer:
                         uav_operation_epoch_full_rollout_kl > target_kl_value
                     )
                 )
-                cache_only_trigger = (
+                cache_without_uav_trigger = (
                     cache_epoch_over_target is True
                     and uav_epoch_over_target is False
                 )
@@ -9456,7 +9456,9 @@ class PPOTrainer:
                         "remaining_update_epochs_suppressed": (
                             remaining_epochs_suppressed
                         ),
-                        "cache_only_kl_trigger_count": int(cache_only_trigger),
+                        "cache_without_uav_kl_trigger_count": int(
+                            cache_without_uav_trigger
+                        ),
                         "uav_only_kl_trigger_count": int(uav_only_trigger),
                         "both_kl_trigger_count": int(both_trigger),
                         "neither_kl_trigger_count": int(neither_trigger),

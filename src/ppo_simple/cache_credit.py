@@ -336,7 +336,6 @@ def _execute_cache_branch(
         slot_id=step.slot,
         time_s=step.time_s,
         performance_profile=None,
-        configuration_profile=cache_configuration.ConfigurationEvaluationProfile(),
         configuration_override=configuration_override,
     )
     if not result.step_feasible:
@@ -927,7 +926,7 @@ def evaluate_cache_full_information_values(
         float(candidate_temperature), 1.0, rel_tol=0.0, abs_tol=0.0
     ):
         raise ValueError(
-            "state-head Candidate teacher compatibility temperature must equal 1.0"
+            "state-head Candidate teacher temperature must equal 1.0"
         )
     transitions = tuple(rollout.transitions)
     if not transitions:
@@ -1132,7 +1131,7 @@ def evaluate_cache_full_information_values(
                 index
                 for index, candidate in enumerate(universe_candidates)
                 if str(candidate.proposal_source)
-                in {"prediction", "replica_aware", "intermediate"}
+                in {"prediction", "coverage_anchor", "intermediate"}
             )
             random_audit_index = (
                 None

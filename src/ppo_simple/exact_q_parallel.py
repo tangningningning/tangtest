@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
+from decision import slot_environment, task_allocation, uav_configuration
 
 from .primitive_control import _intermediate_observation
 from .rollout import _check_request_contract, _check_reward
@@ -404,7 +404,6 @@ def evaluate_transition(plan: ExactQTransitionPlan, context: Any | None = None) 
                 slot_id=plan.step.slot,
                 time_s=plan.step.time_s,
                 performance_profile=None,
-                configuration_profile=cache_configuration.ConfigurationEvaluationProfile(),
                 configuration_override=configuration_override,
                 matching_kkt_cache=transition_kkt_cache,
                 node_evaluation_cache=transition_node_evaluation_cache,

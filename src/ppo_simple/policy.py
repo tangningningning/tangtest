@@ -1355,7 +1355,7 @@ class _JointCacheUavOperationActorCriticBase(
         uav_candidate_selected_indices: Any,
         cache_trigger_aux: Any,
     ) -> PolicyEvaluation:
-        """重新计算不包含旧 Trigger head 的联合 log-probability。"""
+        """重新计算不包含 Cache Trigger 概率项的联合 log-probability。"""
 
         cache_evaluation = self.evaluate_cache_operation_primitive(
             observations,

@@ -17,21 +17,18 @@ SUMO 项目采用 Eclipse Public License 2.0。本项目通过 API 调用 SUMO�
 
 from __future__ import annotations
 
-import argparse
 import csv
 import hashlib
 import json
 import math
 import os
 import random
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -160,25 +157,8 @@ class TrafficSource:
 # ============================================================================
 
 
-def find_project_root() -> Path:
-    """从脚本位置或当前工作目录找到包含 data/ 的项目根目录。"""
-    candidates = (
-        Path(__file__).resolve().parents[2],
-        Path.cwd().resolve(),
-    )
-    for candidate in candidates:
-        if (candidate / "data").is_dir():
-            return candidate
-    raise FileNotFoundError(
-        "无法定位项目根目录：期望在项目根目录下找到 data/。"
-    )
 
 
-def _resolve_from_project(project_root: Path, value: str | Path) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = project_root / path
-    return path.resolve(strict=False)
 
 
 def _is_readable_file(path: Path) -> bool:
@@ -217,61 +197,10 @@ def _copy_bytes_to_canonical_file(source_file: Path, destination_file: Path) -> 
         os.fsync(destination_stream.fileno())
 
 
-def discover_sumo_files(project_root: Path) -> dict[str, list[Path]]:
-    """自动发现 data/ 下的 SUMO 路网、配置、路线和 trips 文件。"""
-    data_root = project_root / "data"
-    networks: list[Path] = []
-    configurations: list[Path] = []
-    route_files: list[Path] = []
-
-    for path in data_root.rglob("*"):
-        try:
-            if not path.is_file():
-                continue
-        except OSError:
-            continue
-
-        name = path.name.lower()
-        if name.endswith(".net.xml") or name.endswith(".net.xml.gz"):
-            networks.append(path.resolve(strict=False))
-        elif name.endswith(".sumocfg"):
-            configurations.append(path.resolve(strict=False))
-        elif (
-            name.endswith(".rou.xml")
-            or name.endswith(".rou.xml.gz")
-            or name.endswith(".trips.xml")
-            or name.endswith(".trips.xml.gz")
-        ):
-            route_files.append(path.resolve(strict=False))
-
-    key = lambda path: path.relative_to(project_root).as_posix().lower()
-    return {
-        "networks": sorted(networks, key=key),
-        "configurations": sorted(configurations, key=key),
-        "route_files": sorted(route_files, key=key),
-    }
 
 
-def _format_inventory_path(project_root: Path, path: Path) -> str:
-    try:
-        return path.relative_to(project_root).as_posix()
-    except ValueError:
-        return str(path)
 
 
-def print_sumo_inventory(project_root: Path, inventory: dict[str, list[Path]]) -> None:
-    """把自动发现结果打印出来，便于确认没有覆盖原始文件。"""
-    print("发现的 SUMO 文件：")
-    for label, key in (
-        ("路网", "networks"),
-        ("配置", "configurations"),
-        ("路线/需求", "route_files"),
-    ):
-        paths = inventory[key]
-        print(f"  {label} ({len(paths)}):")
-        for path in paths:
-            readable = "可读" if _is_readable_file(path) else "不可读"
-            print(f"    - {_format_inventory_path(project_root, path)} [{readable}]")
 
 
 def find_sumo_home(explicit: str | None = None) -> Path:
@@ -335,65 +264,25 @@ def find_sumo_binary(sumolib: Any, gui: bool) -> str:
 # ============================================================================
 
 
-def _local_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1]
 
 
-def _xml_value(root: ET.Element, tag_name: str) -> str | None:
-    for element in root.iter():
-        if _local_name(element.tag) == tag_name:
-            value = element.get("value")
-            if value:
-                return value.strip()
-    return None
 
 
-def _split_file_references(value: str) -> list[str]:
-    # SUMO 配置通常使用逗号；兼容少量手工配置中的分号分隔。
-    return [token.strip() for token in re.split(r"[,;]", value) if token.strip()]
 
 
-def _resolve_config_reference(config_file: Path, value: str) -> list[Path]:
-    references: list[Path] = []
-    for token in _split_file_references(value):
-        path = Path(token).expanduser()
-        if not path.is_absolute():
-            path = config_file.parent / path
-        references.append(path.resolve(strict=False))
-    return references
 
 
-def _source_from_config(config_file: Path) -> TrafficSource | None:
-    """读取已有 .sumocfg，仅在所有引用文件都实际可读时复用。"""
-    try:
-        root = ET.parse(config_file).getroot()
-    except (OSError, ET.ParseError):
-        return None
-
-    network_value = _xml_value(root, "net-file")
-    route_value = _xml_value(root, "route-files")
-    if not network_value or not route_value:
-        return None
-
-    networks = _resolve_config_reference(config_file, network_value)
-    routes = _resolve_config_reference(config_file, route_value)
-    if len(networks) != 1 or not routes:
-        return None
-    if not _is_readable_file(networks[0]):
-        return None
-    if not all(_is_readable_file(path) for path in routes):
-        return None
-
-    return TrafficSource(
-        network_file=networks[0],
-        route_files=tuple(routes),
-        configuration_file=config_file,
-        generated_by_random_trips=False,
-    )
 
 
 def _managed_demand_metadata_path(route_file: Path) -> Path:
     return route_file.with_name("sumo_demand.meta.json")
+
+
+def _format_inventory_path(project_root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(project_root).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def _network_metadata_path(project_root: Path, network_file: Path) -> str:
@@ -448,80 +337,8 @@ def _managed_demand_matches(
     return all(metadata.get(key) == value for key, value in expected.items())
 
 
-def _choose_network(
-    project_root: Path,
-    inventory: dict[str, list[Path]],
-    explicit_network: str | None,
-) -> Path:
-    if explicit_network:
-        network = _resolve_from_project(project_root, explicit_network)
-        if not _is_readable_file(network):
-            raise FileNotFoundError(f"指定的 SUMO 路网不可读：{network}")
-        return network
-
-    for network in inventory["networks"]:
-        if _is_readable_file(network):
-            return network
-
-    raise FileNotFoundError("data/ 下没有可读的 *.net.xml 或 *.net.xml.gz 路网文件。")
 
 
-def _choose_existing_source(
-    project_root: Path,
-    inventory: dict[str, list[Path]],
-    explicit_config: str | None,
-    explicit_network: str | None,
-    explicit_routes: list[str],
-) -> TrafficSource | None:
-    """优先复用可运行配置，其次复用可读的独立 route/trips 文件。"""
-    if explicit_config:
-        config_file = _resolve_from_project(project_root, explicit_config)
-        source = _source_from_config(config_file)
-        if source is None:
-            raise RuntimeError(
-                f"指定的 SUMO 配置不可直接运行或引用文件不可读：{config_file}"
-            )
-        return source
-
-    # 有显式 net/route 时按用户指定组合，不使用别的配置隐式覆盖它们。
-    if explicit_network or explicit_routes:
-        network = _choose_network(project_root, inventory, explicit_network)
-        routes = tuple(
-            _resolve_from_project(project_root, value) for value in explicit_routes
-        )
-        if not routes:
-            return None
-        if not all(_is_readable_file(path) for path in routes):
-            raise FileNotFoundError("至少一个指定的 SUMO route/trips 文件不可读。")
-        return TrafficSource(network_file=network, route_files=routes)
-
-    # 先尝试已有配置；配置中的相对路径以 .sumocfg 所在目录为基准。
-    managed_route = (
-        project_root / "data" / "generated" / "sumo_demand.rou.xml"
-    ).resolve(strict=False)
-    for config_file in inventory["configurations"]:
-        source = _source_from_config(config_file)
-        if source is not None and managed_route not in source.route_files:
-            return source
-
-    network = _choose_network(project_root, inventory, None)
-    generated_dir = (project_root / "data" / "generated").resolve(strict=False)
-
-    # 已有交通需求优先于本模块之前生成的文件；排序保证跨平台稳定。
-    candidates = [
-        path
-        for path in inventory["route_files"]
-        if path.parent != generated_dir and path != managed_route
-    ] + [
-        path
-        for path in inventory["route_files"]
-        if path.parent == generated_dir and path != managed_route
-    ]
-    for route_file in candidates:
-        if _is_readable_file(route_file):
-            return TrafficSource(network_file=network, route_files=(route_file,))
-
-    return None
 
 
 def generate_random_trips(
@@ -814,63 +631,6 @@ def _valid_trajectory_row(row: dict[str, Any]) -> bool:
     return True
 
 
-def load_existing_trajectory(
-    trajectory_file: Path,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], set[str], list[float]]:
-    """读取已有 SUMO 轨迹并恢复筛选所需的 route metadata。
-
-    该入口只复用已经落盘的真实 SUMO 记录，不启动 SUMO、不生成车辆，
-    用于在系统规模变化时重新执行正式的完整轨迹过滤和角色划分。
-    """
-
-    numeric_fields = (
-        "time_s",
-        "x_m",
-        "y_m",
-        "speed_mps",
-        "acceleration_mps2",
-        "lane_position_m",
-        "distance_m",
-    )
-    rows: list[dict[str, Any]] = []
-    route_cache: dict[str, dict[str, Any]] = {}
-    seen_vehicle_ids: set[str] = set()
-    observed_times: list[float] = []
-    previous_time = -math.inf
-    with trajectory_file.open("r", encoding="utf-8", newline="") as stream:
-        reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != TRAJECTORY_FIELDS:
-            raise ValueError("已有 trajectory.csv 字段与正式约定不一致。")
-        for raw_row in reader:
-            row = dict(raw_row)
-            for field in numeric_fields:
-                row[field] = float(row[field])
-            vehicle_id = str(row["vehicle_id"])
-            route_edges = tuple(
-                edge for edge in str(row["route_edges"]).split() if edge
-            )
-            route = {
-                "route_id": str(row["route_id"]),
-                "route_edges": route_edges,
-            }
-            if vehicle_id in route_cache and route_cache[vehicle_id] != route:
-                raise ValueError(
-                    f"vehicle {vehicle_id} 的已有轨迹 route metadata 不一致。"
-                )
-            route_cache[vehicle_id] = route
-            time_s = float(row["time_s"])
-            if time_s < previous_time - 1.0e-9:
-                raise ValueError("已有 trajectory.csv 的 time_s 不是单调不减。")
-            if not observed_times or not math.isclose(
-                time_s, observed_times[-1], rel_tol=0.0, abs_tol=1.0e-9
-            ):
-                observed_times.append(time_s)
-            previous_time = time_s
-            seen_vehicle_ids.add(vehicle_id)
-            rows.append(row)
-    if not rows:
-        raise ValueError("已有 trajectory.csv 为空。")
-    return rows, route_cache, seen_vehicle_ids, observed_times
 
 
 def find_complete_vehicles(
@@ -1160,442 +920,8 @@ def validate_outputs(
     }
 
 
-def reuse_existing_trajectory_roles(
-    trajectory_file: Path,
-    roles_file: Path,
-    config: ScenarioConfig,
-) -> tuple[dict[str, Any], dict[str, Any], list[str], list[float]]:
-    """基于已有真实 SUMO trajectory 重新筛选并写入动态角色文件。"""
-
-    rows, route_cache, seen_ids, observed_times = load_existing_trajectory(
-        trajectory_file
-    )
-    complete_ids, route_metadata, formal_steps = find_complete_vehicles(
-        rows,
-        route_cache,
-        config,
-    )
-    if len(complete_ids) < config.num_research_vehicles:
-        raise RuntimeError(
-            f"已有 trajectory.csv 中完整研究车辆只有 {len(complete_ids)} 辆，"
-            f"少于要求的 {config.num_research_vehicles} 辆。"
-        )
-    roles, selection_reproducible = build_role_assignments(
-        complete_ids,
-        route_metadata,
-        seen_ids,
-        config,
-    )
-    if not selection_reproducible:
-        raise AssertionError("角色选择可复现性验证失败。")
-    write_roles_json(roles, roles_file)
-    validation = validate_outputs(trajectory_file, roles_file, complete_ids, config)
-    validation["trajectory_reused_without_sumo"] = True
-    validation["formal_step_count"] = len(formal_steps)
-    return roles, validation, complete_ids, observed_times
 
 
 # ============================================================================
 # CLI
 # ============================================================================
-
-
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="SUMO 完整交通生成、TraCI 轨迹采集和固定 TV/SV 角色划分。"
-    )
-    parser.add_argument("--config", default="configs/proposed/system_config.toml")
-    parser.add_argument(
-        "--episode-seed",
-        type=int,
-        default=None,
-        help="从一个 episode seed 派生交通、SUMO 和角色随机流。",
-    )
-    parser.add_argument("--dt", type=float, default=None)
-    parser.add_argument(
-        "--warmup-time",
-        type=float,
-        default=None,
-        help="warm-up 时长，单位秒。",
-    )
-    parser.add_argument(
-        "--episode-time",
-        type=float,
-        default=None,
-        help="正式 episode 时长，单位秒。",
-    )
-    parser.add_argument(
-        "--num-research-vehicles",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--num-service-vehicles",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--num-task-vehicles",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--random-seed",
-        "--sumo-dynamics-seed",
-        dest="random_seed",
-        type=int,
-        default=None,
-    )
-    parser.add_argument("--traffic-seed", type=int, default=None)
-    parser.add_argument("--research-vehicle-role-seed", type=int, default=None)
-    parser.add_argument("--service-vehicle-role-seed", type=int, default=None)
-    parser.add_argument("--departure-begin", type=float, default=None)
-    parser.add_argument("--departure-end", type=float, default=None)
-    parser.add_argument("--random-trips-period", type=float, default=None)
-    parser.add_argument("--random-trips-min-distance", type=float, default=None)
-    parser.add_argument("--random-trips-intermediate", type=int, default=None)
-    parser.add_argument("--random-trips-maxtries", type=int, default=None)
-    parser.add_argument("--sumo-home", default=None)
-    parser.add_argument("--sumo-config", default=None)
-    parser.add_argument("--net-file", default=None)
-    parser.add_argument(
-        "--trajectory-file",
-        default=None,
-        help="复用已有真实 SUMO trajectory.csv 时使用的输入文件。",
-    )
-    parser.add_argument(
-        "--reuse-existing-trajectory",
-        action="store_true",
-        help="只重用已有真实轨迹并重新划分角色，不启动 SUMO。",
-    )
-    parser.add_argument(
-        "--route-file",
-        action="append",
-        default=[],
-        help="显式指定 route/trips 文件；可重复传入。",
-    )
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--gui", action="store_true", help="使用 sumo-gui。")
-    return parser
-
-
-def config_from_arguments(
-    args: argparse.Namespace,
-    project_config: dict[str, Any] | None = None,
-) -> ScenarioConfig:
-    if project_config is None:
-        base = DEFAULT_CONFIG
-    else:
-        from common import project_config as project_config_module
-
-        get_value = project_config_module.get_config_value
-        base = ScenarioConfig(
-            dt_s=float(get_value(project_config, "simulation.dt_s", DEFAULT_CONFIG.dt_s)),
-            warmup_time_s=float(
-                get_value(
-                    project_config,
-                    "simulation.warmup_time_s",
-                    DEFAULT_CONFIG.warmup_time_s,
-                )
-            ),
-            episode_time_s=float(
-                get_value(
-                    project_config,
-                    "simulation.episode_time_s",
-                    DEFAULT_CONFIG.episode_time_s,
-                )
-            ),
-            num_research_vehicles=int(
-                get_value(
-                    project_config,
-                    "simulation.num_research_vehicles",
-                    DEFAULT_CONFIG.num_research_vehicles,
-                )
-            ),
-            num_service_vehicles=int(
-                get_value(
-                    project_config,
-                    "simulation.num_service_vehicles",
-                    DEFAULT_CONFIG.num_service_vehicles,
-                )
-            ),
-            num_task_vehicles=int(
-                get_value(
-                    project_config,
-                    "simulation.num_task_vehicles",
-                    DEFAULT_CONFIG.num_task_vehicles,
-                )
-            ),
-            random_seed=int(
-                get_value(
-                    project_config,
-                    "simulation.sumo_seed",
-                    DEFAULT_CONFIG.random_seed,
-                )
-            ),
-            traffic_seed=int(
-                get_value(
-                    project_config,
-                    "simulation.traffic_seed",
-                    DEFAULT_CONFIG.traffic_seed,
-                )
-            ),
-            research_vehicle_role_seed=None,
-            service_vehicle_role_seed=None,
-            random_trips_period_s=float(
-                get_value(
-                    project_config,
-                    "simulation.random_trips_period_s",
-                    DEFAULT_CONFIG.random_trips_period_s,
-                )
-            ),
-            random_trips_departure_begin_s=float(
-                get_value(
-                    project_config,
-                    "simulation.random_trips_departure_begin_s",
-                    DEFAULT_CONFIG.random_trips_departure_begin_s,
-                )
-            ),
-            random_trips_departure_end_s=float(
-                get_value(
-                    project_config,
-                    "simulation.random_trips_departure_end_s",
-                    DEFAULT_CONFIG.random_trips_departure_end_s,
-                )
-            ),
-            random_trips_min_distance_m=float(
-                get_value(
-                    project_config,
-                    "simulation.random_trips_min_distance_m",
-                    DEFAULT_CONFIG.random_trips_min_distance_m,
-                )
-            ),
-            random_trips_intermediate=int(
-                get_value(
-                    project_config,
-                    "simulation.random_trips_intermediate",
-                    DEFAULT_CONFIG.random_trips_intermediate,
-                )
-            ),
-            random_trips_maxtries=int(
-                get_value(
-                    project_config,
-                    "simulation.random_trips_maxtries",
-                    DEFAULT_CONFIG.random_trips_maxtries,
-                )
-            ),
-        )
-
-    def choose(name: str, value: Any) -> Any:
-        return getattr(base, name) if value is None else value
-
-    return ScenarioConfig(
-        dt_s=choose("dt_s", args.dt),
-        warmup_time_s=choose("warmup_time_s", args.warmup_time),
-        episode_time_s=choose("episode_time_s", args.episode_time),
-        num_research_vehicles=choose(
-            "num_research_vehicles", args.num_research_vehicles
-        ),
-        num_service_vehicles=choose(
-            "num_service_vehicles", args.num_service_vehicles
-        ),
-        num_task_vehicles=choose("num_task_vehicles", args.num_task_vehicles),
-        random_seed=choose("random_seed", args.random_seed),
-        traffic_seed=choose("traffic_seed", args.traffic_seed),
-        research_vehicle_role_seed=choose(
-            "research_vehicle_role_seed", args.research_vehicle_role_seed
-        ),
-        service_vehicle_role_seed=choose(
-            "service_vehicle_role_seed", args.service_vehicle_role_seed
-        ),
-        random_trips_period_s=choose(
-            "random_trips_period_s", args.random_trips_period
-        ),
-        random_trips_departure_begin_s=choose(
-            "random_trips_departure_begin_s", args.departure_begin
-        ),
-        random_trips_departure_end_s=choose(
-            "random_trips_departure_end_s", args.departure_end
-        ),
-        random_trips_min_distance_m=choose(
-            "random_trips_min_distance_m", args.random_trips_min_distance
-        ),
-        random_trips_intermediate=choose(
-            "random_trips_intermediate", args.random_trips_intermediate
-        ),
-        random_trips_maxtries=choose(
-            "random_trips_maxtries", args.random_trips_maxtries
-        ),
-    )
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_argument_parser()
-    args = parser.parse_args(argv)
-
-    try:
-        project_root = find_project_root()
-        from common import project_config as project_config_module
-
-        formal_config = project_config_module.load_config(
-            args.config,
-            require_artifacts=args.episode_seed is None,
-        )
-        config = config_from_arguments(args, formal_config)
-        if args.episode_seed is not None:
-            seeds = derive_episode_seeds(args.episode_seed)
-            config = replace(
-                config,
-                random_seed=seeds["sumo_seed"],
-                traffic_seed=seeds["traffic_seed"],
-                research_vehicle_role_seed=seeds["research_role_seed"],
-                service_vehicle_role_seed=seeds["service_role_seed"],
-            )
-        config.validate()
-
-        output_dir = _resolve_from_project(
-            project_root,
-            args.output_dir
-            or Path(
-                project_config_module.get_config_value(
-                    formal_config,
-                    "paths.vehicle_roles",
-                    "data/generated/vehicle_roles.json",
-                )
-            ).parent,
-        )
-
-        if args.reuse_existing_trajectory:
-            trajectory_file = _resolve_from_project(
-                project_root,
-                args.trajectory_file
-                or project_config_module.get_config_value(
-                    formal_config,
-                    "paths.trajectory",
-                    "data/generated/trajectory.csv",
-                ),
-            )
-            roles_file = output_dir / "vehicle_roles.json"
-            roles, validation, complete_ids, observed_times = reuse_existing_trajectory_roles(
-                trajectory_file,
-                roles_file,
-                config,
-            )
-            print("复用已有真实 SUMO trajectory，未启动 SUMO：")
-            print(f"  trajectory: {trajectory_file}")
-            print(f"  complete candidates: {len(complete_ids)}")
-            print(f"  observed times: {len(observed_times)}")
-            print("最小验证通过：")
-            for key, value in validation.items():
-                print(f"  {key}: {value}")
-            print(f"正式输出：{roles_file}")
-            print(f"研究车辆({len(roles['research_vehicles'])})：{roles['research_vehicles']}")
-            print(f"SV({len(roles['service_vehicles'])})：{roles['service_vehicles']}")
-            print(f"TV({len(roles['task_vehicles'])})：{roles['task_vehicles']}")
-            return 0
-
-        inventory = discover_sumo_files(project_root)
-        print_sumo_inventory(project_root, inventory)
-
-        sumo_home = find_sumo_home(args.sumo_home)
-        sumolib, traci = load_sumo_modules(sumo_home)
-
-        source = None if args.episode_seed is not None else _choose_existing_source(
-            project_root=project_root,
-            inventory=inventory,
-            explicit_config=args.sumo_config,
-            explicit_network=args.net_file
-            or project_config_module.get_config_value(
-                formal_config,
-                "paths.sumo_net",
-            ),
-            explicit_routes=args.route_file,
-        )
-        if source is None:
-            network = _choose_network(
-                project_root,
-                inventory,
-                args.net_file
-                or project_config_module.get_config_value(
-                    formal_config,
-                    "paths.sumo_net",
-                ),
-            )
-            source = generate_random_trips(
-                project_root=project_root,
-                sumo_home=sumo_home,
-                network_file=network,
-                output_dir=output_dir,
-                config=config,
-            )
-        else:
-            source_type = "randomTrips 生成需求" if source.generated_by_random_trips else "已有需求"
-            print(f"复用 {source_type}：")
-            print(f"  路网：{source.network_file}")
-            print(f"  路线：{', '.join(str(path) for path in source.route_files)}")
-            if source.configuration_file:
-                print(f"  配置：{source.configuration_file}")
-
-        binary = find_sumo_binary(sumolib, args.gui)
-        command = build_sumo_command(binary, source, config)
-        rows, route_cache, seen_ids, observed_times = collect_trajectories(
-            traci,
-            command,
-            config,
-        )
-        if not rows:
-            raise RuntimeError("SUMO 运行结束但没有采集到任何车辆轨迹。")
-
-        complete_ids, route_metadata, formal_steps = find_complete_vehicles(
-            rows,
-            route_cache,
-            config,
-        )
-        print(
-            f"采集 {len(rows)} 条轨迹记录，发现 {len(seen_ids)} 辆车辆；"
-            f"正式 episode 有 {len(complete_ids)} 辆完整车辆。"
-        )
-        if len(complete_ids) < config.num_research_vehicles:
-            raise RuntimeError(
-                f"正式 episode 中完整轨迹车辆只有 {len(complete_ids)} 辆，"
-                f"少于要求的 {config.num_research_vehicles} 辆。"
-                "请增加 SUMO 车辆量、缩短 episode，或调整路线生成参数。"
-            )
-
-        roles, selection_reproducible = build_role_assignments(
-            complete_ids,
-            route_metadata,
-            seen_ids,
-            config,
-        )
-        if not selection_reproducible:
-            raise AssertionError("角色选择可复现性验证失败。")
-
-        trajectory_file = output_dir / "trajectory.csv"
-        roles_file = output_dir / "vehicle_roles.json"
-        write_trajectory_csv(rows, trajectory_file)
-        write_roles_json(roles, roles_file)
-        validation = validate_outputs(
-            trajectory_file,
-            roles_file,
-            complete_ids,
-            config,
-        )
-
-        print("最小验证通过：")
-        for key, value in validation.items():
-            print(f"  {key}: {value}")
-        print(f"正式输出：{trajectory_file}")
-        print(f"正式输出：{roles_file}")
-        print(f"研究车辆：{roles['research_vehicles']}")
-        print(f"SV({len(roles['service_vehicles'])})：{roles['service_vehicles']}")
-        print(f"TV({len(roles['task_vehicles'])})：{roles['task_vehicles']}")
-        print(f"正式时隙数：{len(formal_steps)}；采集时刻数：{len(observed_times)}")
-        return 0
-    except Exception as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

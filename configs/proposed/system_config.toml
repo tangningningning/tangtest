@@ -1,8 +1,8 @@
 # adaptive_cache_mec 统一系统配置入口
 #
 # 本文件是后续所有模块的唯一系统参数入口。场景生成、任务生成、车辆预测、
-# 流行度预测、预测场景生成、缓存配置、UAV 优化、Matching、KKT、PPO
-# 和对比实验都应优先读取这里，避免不同模块各自维护 CPU、带宽、缓存容量、
+# 流行度预测、预测场景生成、缓存配置、UAV 优化、Matching、KKT 和 PPO
+# 都应读取这里，避免不同模块各自维护 CPU、带宽、缓存容量、
 # UAV 参数、通信参数和 cost 参数。
 #
 # 数据依赖说明：
@@ -56,10 +56,9 @@ prediction_scenarios = "data/generated/prediction_scenarios.npz"
 sumo_net = "data/sumo/map/osm.net.xml.gz"
 # RSU/UAV 节点位置由 node_placement.py 根据 sumo_net 自动生成。
 node_positions = "data/generated/node_positions.json"
-# 残差库。修改 H_p、sigma 或车辆预测参数后需要重新生成。
-# 该旧路径仅作为 legacy 配置记录，正式流程不读取，也不再要求其存在。
+# 保留的残差库路径字段；正式生成器读取 paths.vehicle_residual_bank。
 residual_bank = "data/generated/residual_blocks.npz"
-# 独立车辆 calibration 的角色/轨迹输入，不得指向正式 episode trajectory。
+# 校准输入路径元数据；正式 episode 生成器不读取这两个输入字段。
 vehicle_calibration_roles = "data/calibration/vehicle_roles.json"
 vehicle_calibration_trajectory = "data/calibration/trajectory.csv"
 # 由 vehicle_prediction.py 从独立 calibration trajectory 冻结生成的 Q/R/residual bank。
@@ -79,11 +78,11 @@ dt_s = 1.0
 warmup_time_s = 100.0
 # 正式优化 episode 长度，单位 s。当前正式数据覆盖 300 个 slot。
 episode_time_s = 300.0
-# 研究车辆数量。正式 baseline 为 5 SV + 20 TV；ID 从 vehicle_roles.json 读取。
+# 研究车辆数量。正式固定值为 5 SV + 20 TV；ID 从 vehicle_roles.json 读取。
 num_research_vehicles = 25
-# TV 数量。正式 baseline 为 20；TV ID 从 vehicle_roles.json 读取。
+# TV 数量。正式固定值为 20；TV ID 从 vehicle_roles.json 读取。
 num_task_vehicles = 20
-# SV 数量。最终冻结 baseline 为 5；SV ID 从 vehicle_roles.json 读取。
+# SV 数量。正式固定值为 5；SV ID 从 vehicle_roles.json 读取。
 num_service_vehicles = 5
 # SUMO / 角色筛选主 seed。当前实际值来自已有 vehicle_roles.json。
 sumo_seed = 4401
@@ -102,7 +101,7 @@ random_trips_maxtries = 1000
 cross_slot_task_model = "independent_per_slot"
 
 [service]
-# 服务总数 F。正式 baseline 为 10；修改后必须通过统一入口重生成依赖 artifact，
+# 服务总数 F。正式固定值为 10；修改后必须通过统一入口重生成依赖 artifact，
 # 生成新的 service_catalog.json、popularity.csv、tasks.csv，并重跑依赖链。
 count = 10
 
@@ -118,7 +117,7 @@ cycles_per_bit_min = 400.0
 cycles_per_bit_max = 1000.0
 
 [task]
-# Bernoulli 任务到达概率 lambda。最终冻结 baseline 为 0.7；修改需要重生成任务。
+# Bernoulli 任务到达概率 lambda。正式固定值为 0.7；修改需要重生成任务。
 arrival_probability = 0.7
 # Zipf 指数 zeta。当前实际值；修改会改变真实 rho_star，需要重生成 popularity/tasks。
 popularity_zeta = 0.8
@@ -160,7 +159,7 @@ transmit_power_w = 0.1995262315
 # SV 公共缓存容量，单位 MB；由 cache.capacity_policy.sv_ratio 自动生成。
 cache_capacity_mb = 16744.750324713
 # SV 总 CPU 能力，单位 cycle/s。
-# 正式 baseline：SV 总 CPU 能力为 1GHz，单位 cycle/s。
+# 正式固定值：SV 总 CPU 能力为 1GHz，单位 cycle/s。
 # 这是文献校准实验基线，不代表硬件实测数据。
 cpu_cycles_per_s = 1.0e9
 # SV 链路带宽，单位 Hz。
@@ -175,9 +174,7 @@ eta_ca = 0.20
 # SV 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
 # 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
 xi_ca = 1.0e-3
-# Legacy compatibility parameter.
-# 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
-# 距离只通过正式 ground/air channel model 影响 rate、delay、energy 和 utility。
+# 正式 Cache 候选评分使用的 SV 服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 100.0
 
 [nodes.rsu]
@@ -188,7 +185,7 @@ deployment_altitude_m = 10.0
 # RSU 公共缓存容量，单位 MB；由 cache.capacity_policy.rsu_ratio 自动生成。
 cache_capacity_mb = 44652.6675325681
 # RSU 总 CPU 能力，单位 cycle/s。
-# 最终冻结 baseline：RSU MEC server computation rate 为 5GHz。
+# 正式固定值：RSU MEC server computation rate 为 5GHz。
 cpu_cycles_per_s = 5.0e9
 # RSU 带宽，单位 Hz。
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
@@ -202,9 +199,7 @@ eta_ca = 0.10
 # RSU 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
 # 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
 xi_ca = 0.7e-3
-# Legacy compatibility parameter.
-# 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
-# 距离只通过正式 ground/air channel model 影响 rate、delay、energy 和 utility。
+# 正式 Cache 候选评分使用的 RSU 服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 250.0
 
 [nodes.uav]
@@ -227,7 +222,7 @@ altitude_m = 100.0
 # UAV 公共缓存容量，单位 MB；由 cache.capacity_policy.uav_ratio 自动生成。
 cache_capacity_mb = 33489.5006494261
 # UAV 总 CPU 能力，单位 cycle/s。
-# 最终冻结 baseline：UAV MEC computation rate 为 5GHz。
+# 正式固定值：UAV MEC computation rate 为 5GHz。
 cpu_cycles_per_s = 5.0e9
 # UAV 链路带宽，单位 Hz。
 # 文献来源同上，Table 1 给出 Total bandwidth B = 10 MHz；
@@ -244,9 +239,7 @@ eta_ca = 0.15
 # UAV 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
 # 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
 xi_ca = 1.2e-3
-# Legacy compatibility parameter.
-# 当前 formal predictive cache / Matching/KKT 不使用该值作为 hard coverage cutoff；
-# 距离只通过正式 ground/air channel model 影响 rate、delay、energy 和 utility。
+# 正式 UAV 候选评分使用的服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 300.0
 # 参数状态：文献校准实验基线。
 # UAV 最大水平飞行速度，单位 m/s。
@@ -254,7 +247,7 @@ range_m = 300.0
 max_horizontal_speed_mps = 15.0
 # 系统模型 C8：任意两个 UAV 在同一时隙满足
 # ||q_u(t) - q_u'(t)||_2 >= d_U_min，单位 m。
-# 主实验采用 d_U_min = 10m，作为文献校准实验 baseline；
+# 主实验采用 d_U_min = 10m，作为文献校准实验固定值；
 # 该值不是航空法规强制值、硬件实测值或通用安全标准。
 # 文献依据1：Xiang et al., "Towards Power-Efficient Aerial Communications via
 # Dynamic Multi-UAV Cooperation," IEEE WCNC 2020, DOI: 10.1109/WCNC45663.2020.9120587；
@@ -304,7 +297,7 @@ resource_sharing = false
 # 200 Mbps 作为单 Cloud 节点总 uplink，直接换算为 200.0e6 bit/s。
 # 这是文献校准实验基线，不代表硬件实测值。
 # Cloud 传输扩展系数 psi_c，配置键 cloud_delay_factor，当前系统公式中作为 D_v/R_c 的乘法因子。
-# 系统模型要求 psi_c >= 1；当前 baseline 固定为 11.0。
+# 系统模型要求 psi_c >= 1；当前固定值为 11.0。
 # 该固定系数将远程 Cloud 的回传、核心网及跨域附加时延统一吸收到
 # psi_c * D/R_c 中，不读取未来任务或运行时请求统计动态重算。
 cloud_delay_factor = 11.0
@@ -332,7 +325,7 @@ bandwidth_hz = 10.0e6
 # P_LoS = 1 / (1 + eta1 * exp(-eta2 * (theta - eta1)))，theta 使用 degree。
 # 该 S 型概率形式来自 Al-Hourani et al., IEEE Wireless Communications Letters 2014,
 # DOI 10.1109/LWC.2014.2342736。eta1=9.61、eta2=0.16 采用后续公开文献
-# 中常用的 Urban 仿真 baseline；不声称这是 Al-Hourani 原文直接表格值。
+# 中常用的 Urban 仿真参数；不声称这是 Al-Hourani 原文直接表格值。
 eta1 = 9.61
 eta2 = 0.16
 # 载波频率，单位 Hz；用于构造 1m 参考自由空间信道增益。
@@ -357,7 +350,7 @@ alpha_nlos = 2.0
 noise_power_w = 3.16227766e-13
 
 [communication.cloud]
-# Legacy compatibility parameter；正式固定每任务速率与 nodes.cloud.uplink_rate_bps 一致。
+# Cloud 每任务固定等效上行速率，须与 nodes.cloud.uplink_rate_bps 相同。
 uplink_rate_bps = 200.0e6
 
 [cache]
@@ -369,7 +362,7 @@ knapsack_initialization = "uniform_feasible"
 
 [cache.capacity_policy]
 # cache 容量由统一 artifact 入口根据 service_catalog 总大小自动换算为 MB；
-# 以下比例是正式 baseline 的唯一容量规则，不在配置中复制服务大小。
+# 以下比例是正式配置的唯一容量规则，不在配置中复制服务大小。
 tv_ratio = 0.05
 sv_ratio = 0.15
 rsu_ratio = 0.40
@@ -377,18 +370,18 @@ uav_ratio = 0.30
 
 [objective]
 # 主实验采用时延权重 0.6、车辆能耗权重 0.4。
-# 该值属于 experiment-design baseline，不是硬件物理常数或 confirmed data。
+# 该值属于实验设计参数，不是硬件物理常数或已确认数据。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_delay = 0.6
 # 主实验采用时延权重 0.6、车辆能耗权重 0.4。
-# 该值属于 experiment-design baseline，不是硬件物理常数或 confirmed data。
+# 该值属于实验设计参数，不是硬件物理常数或已确认数据。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_energy = 0.4
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
 # Cache 配置成本权重 lambda_cache，是系统目标函数中唯一的 lambda^ca 入口。
 # 它只把 cache loading energy 映射为 objective cost，
 # 用于人为控制 reconfiguration energy 相对于 task utility 的惩罚尺度。
-# 当前 0.1 是固定的 objective trade-off baseline，不声称为 physical 或 literature calibration。
+# 当前 0.1 是固定的目标权衡参数，不声称为物理量或文献校准值。
 # 既有配置说明曾把典型单节点配置动作约占 normal-slot utility 约 10% 作为设计假设；
 # 本轮将其明确为 experiment-design interpretation，不使用 accepted action 反向选择它。
 # 后续正式实验只做 one-factor-at-a-time 的 0.5x/1x/2x sensitivity；本轮不运行。
@@ -399,7 +392,7 @@ lambda_cache = 0.1
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
 # 它只把 UAV movement energy 映射为 objective cost，
 # 用于人为控制 movement energy 相对于 task utility 的惩罚尺度。
-# 当前 1.76e-5 是固定的 objective trade-off baseline，不声称为 physical 或 literature calibration。
+# 当前 1.76e-5 是固定的目标权衡参数，不声称为物理量或文献校准值。
 # 不使用 accepted movement 或 optimizer 最终位置反向选择它；后续正式实验只做
 # one-factor-at-a-time 的 0.5x/1x/2x sensitivity，本轮不运行。
 lambda_movement = 1.76e-5
@@ -534,12 +527,10 @@ max_updates = 100
 objective_tolerance = 1.0e-9
 
 [algorithm.ppo]
-# Standard PPO v2 training path for binary Cache/UAV requests.
+# 正式 PPO 训练路径，处理 Cache/UAV 请求。
 enabled = true
 method = "ppo_simple_v2"
-# legacy_exact keeps the K=100 iterative reference path. Legacy policy_primitive
-# modes remain only for preserved baselines. v2 appends one normalized finite-horizon time-to-go
-# state feature; v1 remains available only for its preserved baseline checkpoint.
+# 当前配置固定使用正式的联合 Cache/UAV 重配置模式和策略结构。
 configuration_control_mode = "adaptive_joint_cache_uav_reconfiguration"
 # Proposed joint mainline: Cache Trigger and Candidate share the full-information
 # best-update/candidate-specific value teacher. UAV Operation and Candidate use
@@ -558,7 +549,7 @@ value_loss_coefficient = 0.01
 entropy_coefficient = 0.0
 max_grad_norm = 0.5
 # PPO full-episode update: one optimization phase with ten minibatches.
-# 参考经典OpenAI Baselines PPO2实现的默认训练结构。
+# 参考经典 PPO2 实现的默认训练结构。
 # 不是系统物理参数，也不声称为当前任务最优值。
 # 后续实验如需要再进行有限敏感性分析。
 update_epochs = 4

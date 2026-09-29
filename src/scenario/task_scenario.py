@@ -13,11 +13,9 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
 import math
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -205,165 +203,10 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_roles_and_tv(
-    roles_file: Path,
-) -> tuple[dict[str, Any], list[str], list[str]]:
-    roles = load_json(roles_file)
-    task_vehicles = [str(vehicle_id) for vehicle_id in roles.get("task_vehicles", [])]
-    service_vehicles = [
-        str(vehicle_id) for vehicle_id in roles.get("service_vehicles", [])
-    ]
-    background_vehicles = {
-        str(vehicle_id) for vehicle_id in roles.get("background_vehicles", [])
-    }
-
-    if not task_vehicles:
-        raise ValueError("vehicle_roles.json 中没有 task_vehicles。")
-    if len(task_vehicles) != len(set(task_vehicles)):
-        raise ValueError("task_vehicles 中存在重复 vehicle_id。")
-    if set(task_vehicles) & set(service_vehicles):
-        raise ValueError("task_vehicles 与 service_vehicles 存在交集。")
-    if set(task_vehicles) & background_vehicles:
-        raise ValueError("task_vehicles 与 background_vehicles 存在交集。")
-
-    declared_count = roles.get("num_task_vehicles")
-    if declared_count is not None and int(declared_count) != len(task_vehicles):
-        raise ValueError(
-            "vehicle_roles.json 的 num_task_vehicles 与 task_vehicles 长度不一致。"
-        )
-    return roles, task_vehicles, service_vehicles
 
 
-def resolve_time_metadata(
-    roles: dict[str, Any],
-    args: argparse.Namespace,
-    defaults: TaskConfig,
-    project_config: dict[str, Any] | None = None,
-    *,
-    check_role_seed: bool = True,
-) -> tuple[float, float, float, int]:
-    """读取正式时间轴；TOML 默认值和 CLI 覆盖优先于 artifact 元数据。"""
-    if project_config is not None:
-        from common.project_config import get_config_value
-
-        configured_dt = float(get_config_value(project_config, "simulation.dt_s"))
-        configured_warmup = float(
-            get_config_value(project_config, "simulation.warmup_time_s")
-        )
-        configured_episode = float(
-            get_config_value(project_config, "simulation.episode_time_s")
-        )
-        configured_seed = int(get_config_value(project_config, "task.master_seed"))
-    else:
-        configured_dt = defaults.fallback_dt_s
-        configured_warmup = defaults.fallback_warmup_time_s
-        configured_episode = defaults.fallback_episode_time_s
-        configured_seed = defaults.fallback_master_seed
-
-    dt_s = float(
-        args.dt
-        if args.dt is not None
-        else configured_dt
-    )
-    warmup_s = float(
-        args.warmup_time
-        if args.warmup_time is not None
-        else configured_warmup
-    )
-    episode_s = float(
-        args.episode_time
-        if args.episode_time is not None
-        else configured_episode
-    )
-    master_seed = int(
-        args.master_seed
-        if args.master_seed is not None
-        else configured_seed
-    )
-
-    # 角色文件是由上游 SUMO 生成的事实记录；它用于发现漂移，不再悄悄
-    # 覆盖 configs/proposed/system_config.toml 的正式默认值。
-    if project_config is not None:
-        for label, selected, key in (
-            ("dt", dt_s, "dt"),
-            ("warmup_time", warmup_s, "warmup_time"),
-            ("episode_time", episode_s, "episode_time"),
-        ):
-            if key in roles and not math.isclose(
-                float(roles[key]), selected, rel_tol=0.0, abs_tol=1e-9
-            ):
-                raise ValueError(
-                    f"vehicle_roles.json 的 {label}={roles[key]} 与正式配置 {selected} 不一致。"
-                )
-        if check_role_seed and "seed" in roles and int(roles["seed"]) != master_seed:
-            raise ValueError(
-                f"vehicle_roles.json 的 seed={roles['seed']} 与正式 task.master_seed="
-                f"{master_seed} 不一致。"
-            )
-
-    if dt_s <= 0.0 or warmup_s < 0.0 or episode_s <= 0.0:
-        raise ValueError("dt/warmup_time/episode_time 的数值范围无效。")
-    for name, value in (("warmup_time", warmup_s), ("episode_time", episode_s)):
-        steps = value / dt_s
-        if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
-            raise ValueError(
-                f"{name}={value} 不是 dt={dt_s} 的整数倍，无法建立正式时隙。"
-            )
-    return dt_s, warmup_s, episode_s, master_seed
 
 
-def read_formal_trajectory_alignment(
-    trajectory_file: Path,
-    task_vehicles: list[str],
-    dt_s: float,
-    warmup_s: float,
-    episode_s: float,
-) -> tuple[int, list[float]]:
-    """确认所有 TV 在每个正式时隙有且仅有一条 SUMO 轨迹记录。"""
-    steps = int(round(episode_s / dt_s))
-    expected_times = [
-        round(warmup_s + slot * dt_s, 9)
-        for slot in range(steps)
-    ]
-    expected_step_set = set(range(steps))
-    task_set = set(task_vehicles)
-    seen: dict[str, dict[int, int]] = {vehicle_id: {} for vehicle_id in task_vehicles}
-
-    try:
-        stream = trajectory_file.open("r", encoding="utf-8", newline="")
-    except OSError as exc:
-        raise FileNotFoundError(f"无法读取 trajectory.csv：{trajectory_file}") from exc
-
-    with stream:
-        reader = csv.DictReader(stream)
-        required = {"time_s", "vehicle_id"}
-        if not required.issubset(set(reader.fieldnames or ())):
-            raise ValueError("trajectory.csv 缺少 time_s 或 vehicle_id 字段。")
-        for row in reader:
-            vehicle_id = str(row["vehicle_id"])
-            if vehicle_id not in task_set:
-                continue
-            time_s = float(row["time_s"])
-            relative_step = int(round((time_s - warmup_s) / dt_s))
-            if relative_step not in expected_step_set:
-                continue
-            expected_time = expected_times[relative_step]
-            if not math.isclose(time_s, expected_time, rel_tol=0.0, abs_tol=1e-6):
-                continue
-            per_vehicle = seen[vehicle_id]
-            per_vehicle[relative_step] = per_vehicle.get(relative_step, 0) + 1
-
-    for vehicle_id in task_vehicles:
-        per_vehicle = seen[vehicle_id]
-        if set(per_vehicle) != expected_step_set or any(
-            count != 1 for count in per_vehicle.values()
-        ):
-            missing = sorted(expected_step_set - set(per_vehicle))[:5]
-            raise RuntimeError(
-                f"TV {vehicle_id} 未与 trajectory.csv 正式时隙完全对齐；"
-                f"缺失示例 slot={missing}。"
-            )
-    return steps, expected_times
 
 
 # ============================================================================
@@ -371,19 +214,6 @@ def read_formal_trajectory_alignment(
 # ============================================================================
 
 
-def make_rngs(
-    master_seed: int,
-    stream_names: tuple[str, ...],
-) -> tuple[dict[str, np.random.Generator], dict[str, int]]:
-    """用 SeedSequence 派生互不耦合的 numpy Generator。"""
-    root = np.random.SeedSequence(master_seed)
-    children = root.spawn(len(stream_names))
-    rngs: dict[str, np.random.Generator] = {}
-    child_seeds: dict[str, int] = {}
-    for name, child in zip(stream_names, children):
-        rngs[name] = np.random.default_rng(child)
-        child_seeds[name] = int(child.generate_state(1, dtype=np.uint64)[0])
-    return rngs, child_seeds
 
 
 def stratified_uniform_samples(
@@ -422,61 +252,6 @@ def stratified_uniform_samples(
     return np.clip(samples, lower, upper).astype(np.float64, copy=False)
 
 
-def make_service_catalog(
-    config: TaskConfig,
-    rng: np.random.Generator,
-) -> list[dict[str, Any]]:
-    """生成 service_id 对应的 task type 及其三维服务参数。
-
-    每个参数维度单独分层采样，再由独立 permutation 随机分配给 service
-    identity；因此 service_id 不携带 workload 大小排序语义。
-    """
-    service_size_samples_gb = stratified_uniform_samples(
-        rng,
-        config.num_services,
-        config.service_size_min_gb,
-        config.service_size_max_gb,
-    )
-    input_size_samples_kb = stratified_uniform_samples(
-        rng,
-        config.num_services,
-        config.input_size_min_kb,
-        config.input_size_max_kb,
-    )
-    cycle_samples = stratified_uniform_samples(
-        rng,
-        config.num_services,
-        config.cycles_per_bit_min,
-        config.cycles_per_bit_max,
-    )
-
-    # 三次 permutation 都从同一个 service_catalog child RNG 独立抽取；
-    # 这里只共享随机流，不共享维度顺序。
-    program_permutation = rng.permutation(config.num_services)
-    input_permutation = rng.permutation(config.num_services)
-    cycle_permutation = rng.permutation(config.num_services)
-
-    catalog: list[dict[str, Any]] = []
-    for service_id in range(config.num_services):
-        service_size_gb = float(
-            service_size_samples_gb[program_permutation[service_id]]
-        )
-        input_size_kb = float(input_size_samples_kb[input_permutation[service_id]])
-        catalog.append(
-            {
-                "service_id": service_id,
-                # program_size 保留运行时既有字段，单位为 MB。
-                "program_size": service_size_gb * SERVICE_SIZE_MB_PER_GB,
-                # service_size/service_size_gb 面向 artifact 阅读，单位为 GB。
-                "service_size": service_size_gb,
-                "service_size_gb": service_size_gb,
-                # mean_input_size 保留任务公式接口，单位为 bit。
-                "mean_input_size": input_size_kb * INPUT_SIZE_BITS_PER_KB,
-                "input_size_kb": input_size_kb,
-                "cycles_per_bit": float(cycle_samples[cycle_permutation[service_id]]),
-            }
-        )
-    return catalog
 
 
 def catalog_by_id(catalog: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -658,25 +433,6 @@ def evolve_ranking(
     return ranking
 
 
-def make_popularity_trace(
-    num_services: int,
-    num_slots: int,
-    dt_s: float,
-    time_origin_s: float,
-    config: TaskConfig,
-    rng: np.random.Generator,
-) -> tuple[list[dict[str, Any]], np.ndarray, dict[str, Any]]:
-    """兼容接口：只生成没有 prehistory 的独立序列。"""
-    formal_rows, _, probabilities_by_slot, _, schedule = make_popularity_trace_with_history(
-        num_services,
-        num_slots,
-        0,
-        dt_s,
-        time_origin_s,
-        config,
-        rng,
-    )
-    return formal_rows, probabilities_by_slot, schedule
 
 
 def make_popularity_trace_with_history(
@@ -985,8 +741,6 @@ def attach_history_observed_counts(
 # ============================================================================
 
 
-def json_canonical(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _stable_id_key(value: str) -> tuple[int, int | str]:
@@ -1093,7 +847,7 @@ def generate_tv_local_cache(
             "tv_ids": tv_ids,
             "fixed_over_episode": True,
             "uses_future_requests": False,
-            "parameter_basis": "system-scale experimental baseline derived from current service catalog",
+            "parameter_basis": "system-scale parameters derived from current service catalog",
             "service_size_sanity": sanity,
         },
         "vehicles": vehicles,
@@ -1151,76 +905,6 @@ def load_tv_local_cache(path: Path) -> dict[str, set[int]]:
     }
 
 
-def build_artifacts(
-    task_vehicles: list[str],
-    dt_s: float,
-    warmup_s: float,
-    episode_s: float,
-    master_seed: int,
-    config: TaskConfig,
-) -> dict[str, Any]:
-    num_slots = int(round(episode_s / dt_s))
-    history_slots = int(config.popularity_history_length)
-    rngs, child_seeds = make_rngs(master_seed, config.rng_stream_names)
-    catalog = make_service_catalog(config, rngs["service_catalog"])
-    (
-        popularity_rows,
-        popularity_history_rows,
-        probabilities,
-        combined_probabilities,
-        schedule,
-    ) = make_popularity_trace_with_history(
-        config.num_services,
-        num_slots,
-        history_slots,
-        dt_s,
-        warmup_s,
-        config,
-        rngs["popularity_evolution"],
-    )
-    combined_task_rows, combined_request_counts = generate_tasks(
-        task_vehicles,
-        catalog,
-        combined_probabilities,
-        history_slots + num_slots,
-        dt_s,
-        warmup_s - history_slots * dt_s,
-        config,
-        rngs["task_arrival"],
-        rngs["service_request"],
-        rngs["workload_variation"],
-        slot_offset=-history_slots,
-    )
-    task_rows = [row for row in combined_task_rows if int(row["slot"]) >= 0]
-    history_request_counts = combined_request_counts[:history_slots].copy()
-    request_counts = combined_request_counts[history_slots:].copy()
-    # history 与 formal 必须共享同一条连续 observed popularity；否则 formal
-    # slot 0 的空请求无法正确继承 prehistory slot -1 的观测比例。
-    combined_rho_obs = build_observed_popularity(combined_request_counts)
-    history_rho_obs = combined_rho_obs[:history_slots].copy()
-    rho_obs = combined_rho_obs[history_slots:].copy()
-    attach_observed_counts(popularity_rows, request_counts, rho_obs)
-    attach_history_observed_counts(
-        popularity_history_rows,
-        history_request_counts,
-        history_rho_obs,
-    )
-
-    return {
-        "catalog": catalog,
-        "popularity_rows": popularity_rows,
-        "popularity_history_rows": popularity_history_rows,
-        "task_rows": task_rows,
-        "probabilities": probabilities,
-        "combined_probabilities": combined_probabilities,
-        "combined_rho_obs": combined_rho_obs,
-        "request_counts": request_counts,
-        "history_request_counts": history_request_counts,
-        "schedule": schedule,
-        "child_seeds": child_seeds,
-        "num_slots": num_slots,
-        "history_slots": history_slots,
-    }
 
 
 def build_episode_artifacts(
@@ -1235,7 +919,7 @@ def build_episode_artifacts(
     """Generate one episode's task data from explicit named streams.
 
     The service catalog is read-only input.  Popularity prehistory and the formal
-    episode are generated as one continuous process, matching legacy semantics.
+    episode are generated as one continuous process.
     """
 
     required = {
@@ -1504,86 +1188,6 @@ def write_csv_atomic(path: Path, fieldnames: tuple[str, ...], rows: list[dict[st
             temporary.unlink()
 
 
-def make_service_catalog_output(
-    artifacts: dict[str, Any],
-    config: TaskConfig,
-    dt_s: float,
-    warmup_s: float,
-    episode_s: float,
-    master_seed: int,
-    child_seeds: dict[str, int],
-    task_vehicles: list[str],
-    validation: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "service_count": config.num_services,
-        "units": {
-            "service_size": config.service_size_unit,
-            "program_size": config.program_size_unit,
-            "input_size_range": config.input_size_range_unit,
-            "mean_input_size": config.input_size_unit,
-            "cycles_per_bit": config.cycles_per_bit_unit,
-            "tasks.input_size": config.input_size_unit,
-            "tasks.cpu_cycles": config.cpu_cycles_unit,
-        },
-        "provisional_defaults": False,
-        "task_type_definition": TASK_TYPE_DEFINITION,
-        "service_generation_mode": SERVICE_GENERATION_MODE,
-        "parameter_assignment": SERVICE_PARAMETER_ASSIGNMENT,
-        "parameter_ranges": {
-            "service_size_gb": [
-                float(config.service_size_min_gb),
-                float(config.service_size_max_gb),
-            ],
-            "input_size_kb": [
-                float(config.input_size_min_kb),
-                float(config.input_size_max_kb),
-            ],
-            "cycles_per_bit": [
-                float(config.cycles_per_bit_min),
-                float(config.cycles_per_bit_max),
-            ],
-        },
-        "strata_count": config.num_services,
-        "parameter_ranges_status": "Table I calibrated baseline ranges",
-        "services": [
-            {
-                **row,
-                # popularity 保存正式 episode 第一个 slot 的 rho_star，完整动态
-                # 流行度仍由 popularity.csv 和 popularity_generation 保存。
-                "popularity": float(
-                    artifacts["probabilities"][0][int(row["service_id"])]
-                ),
-            }
-            for row in artifacts["catalog"]
-        ],
-        "generation_config": {
-            "master_seed": master_seed,
-            "child_seeds": child_seeds,
-            "num_task_vehicles": len(task_vehicles),
-            "task_vehicle_ids": task_vehicles,
-            "dt_s": dt_s,
-            "warmup_time_s": warmup_s,
-            "episode_time_s": episode_s,
-            "num_slots": artifacts["num_slots"],
-            "popularity_history_length": artifacts["history_slots"],
-            "arrival_probability": config.arrival_probability,
-            "zipf_exponent": config.zipf_exponent,
-            "popularity_epoch_length": config.popularity_epoch_length,
-            "popularity_changes_per_epoch": config.popularity_changes_per_epoch,
-            "service_size_min_gb": config.service_size_min_gb,
-            "service_size_max_gb": config.service_size_max_gb,
-            "input_size_min_kb": config.input_size_min_kb,
-            "input_size_max_kb": config.input_size_max_kb,
-            "cycles_per_bit_min": config.cycles_per_bit_min,
-            "cycles_per_bit_max": config.cycles_per_bit_max,
-            "input_relative_jitter": config.input_relative_jitter,
-            "load_relative_jitter": config.load_relative_jitter,
-        },
-        "popularity_generation": artifacts["schedule"],
-        "validation_summary": validation,
-    }
 
 
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -1599,27 +1203,6 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
             temporary.unlink()
 
 
-def output_artifacts(
-    output_dir: Path,
-    catalog_output: dict[str, Any],
-    popularity_history_rows: list[dict[str, Any]],
-    popularity_rows: list[dict[str, Any]],
-    task_rows: list[dict[str, Any]],
-) -> tuple[Path, Path, Path, Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    catalog_file = output_dir / "service_catalog.json"
-    popularity_history_file = output_dir / "popularity_history.csv"
-    popularity_file = output_dir / "popularity.csv"
-    tasks_file = output_dir / "tasks.csv"
-    write_json_atomic(catalog_file, catalog_output)
-    write_csv_atomic(
-        popularity_history_file,
-        POPULARITY_HISTORY_FIELDS,
-        popularity_history_rows,
-    )
-    write_csv_atomic(popularity_file, POPULARITY_FIELDS, popularity_rows)
-    write_csv_atomic(tasks_file, TASK_FIELDS, task_rows)
-    return catalog_file, popularity_history_file, popularity_file, tasks_file
 
 
 def output_realization_artifacts(
@@ -1776,379 +1359,3 @@ def task_config_from_project_config(
 # ============================================================================
 # CLI
 # ============================================================================
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="生成真实动态 rho_star、TV 任务到达和服务相关 D/L。"
-    )
-    parser.add_argument("--config", default="configs/proposed/system_config.toml")
-    parser.add_argument(
-        "--episode-seed",
-        type=int,
-        default=None,
-        help="Derive independent task/popularity/cache streams for one episode.",
-    )
-    parser.add_argument("--roles-file", default=None)
-    parser.add_argument("--trajectory-file", default=None)
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--num-services", type=int, default=None)
-    parser.add_argument(
-        "--arrival-probability",
-        type=float,
-        default=None,
-    )
-    parser.add_argument("--zipf-exponent", type=float, default=None)
-    parser.add_argument(
-        "--popularity-epoch-length",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--popularity-changes-per-epoch",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--input-relative-jitter",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--load-relative-jitter",
-        type=float,
-        default=None,
-    )
-    parser.add_argument("--popularity-history-length", type=int, default=None)
-    parser.add_argument("--dt", type=float, default=None)
-    parser.add_argument("--warmup-time", type=float, default=None)
-    parser.add_argument("--episode-time", type=float, default=None)
-    parser.add_argument("--master-seed", type=int, default=None)
-    return parser
-
-
-def config_from_args(
-    args: argparse.Namespace,
-    project_config: dict[str, Any] | None = None,
-) -> TaskConfig:
-    base = (
-        task_config_from_project_config(project_config)
-        if project_config is not None
-        else DEFAULT_CONFIG
-    )
-    return TaskConfig(
-        num_services=(
-            base.num_services if args.num_services is None else args.num_services
-        ),
-        service_size_min_gb=base.service_size_min_gb,
-        service_size_max_gb=base.service_size_max_gb,
-        input_size_min_kb=base.input_size_min_kb,
-        input_size_max_kb=base.input_size_max_kb,
-        cycles_per_bit_min=base.cycles_per_bit_min,
-        cycles_per_bit_max=base.cycles_per_bit_max,
-        arrival_probability=(
-            base.arrival_probability
-            if args.arrival_probability is None
-            else args.arrival_probability
-        ),
-        zipf_exponent=(
-            base.zipf_exponent if args.zipf_exponent is None else args.zipf_exponent
-        ),
-        popularity_epoch_length=(
-            base.popularity_epoch_length
-            if args.popularity_epoch_length is None
-            else args.popularity_epoch_length
-        ),
-        popularity_changes_per_epoch=(
-            base.popularity_changes_per_epoch
-            if args.popularity_changes_per_epoch is None
-            else args.popularity_changes_per_epoch
-        ),
-        popularity_history_length=(
-            base.popularity_history_length
-            if args.popularity_history_length is None
-            else args.popularity_history_length
-        ),
-        input_relative_jitter=(
-            base.input_relative_jitter
-            if args.input_relative_jitter is None
-            else args.input_relative_jitter
-        ),
-        load_relative_jitter=(
-            base.load_relative_jitter
-            if args.load_relative_jitter is None
-            else args.load_relative_jitter
-        ),
-        fallback_dt_s=base.fallback_dt_s,
-        fallback_warmup_time_s=base.fallback_warmup_time_s,
-        fallback_episode_time_s=base.fallback_episode_time_s,
-        fallback_master_seed=base.fallback_master_seed,
-        rng_stream_names=base.rng_stream_names,
-        service_size_unit=base.service_size_unit,
-        program_size_unit=base.program_size_unit,
-        input_size_range_unit=base.input_size_range_unit,
-        input_size_unit=base.input_size_unit,
-        cpu_cycles_unit=base.cpu_cycles_unit,
-        cycles_per_bit_unit=base.cycles_per_bit_unit,
-    )
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        project_root = find_project_root()
-        from common import project_config as project_config_module
-
-        formal_config = project_config_module.load_config(
-            args.config,
-            require_artifacts=args.episode_seed is None,
-        )
-        config = config_from_args(args, formal_config)
-        episode_seeds = (
-            derive_episode_seeds(args.episode_seed)
-            if args.episode_seed is not None
-            else None
-        )
-        roles_file = resolve_path(
-            project_root,
-            args.roles_file or "data/generated/vehicle_roles.json",
-        )
-        if args.roles_file is None:
-            roles_file = project_config_module.resolve_path(
-                project_root,
-                project_config_module.get_config_value(
-                    formal_config, "paths.vehicle_roles"
-                ),
-            )
-        trajectory_file = resolve_path(
-            project_root,
-            args.trajectory_file
-            or project_config_module.get_config_value(
-                formal_config,
-                "paths.trajectory",
-                "data/generated/trajectory.csv",
-            ),
-        )
-        output_dir = resolve_path(
-            project_root,
-            args.output_dir
-            or Path(
-                project_config_module.get_config_value(
-                    formal_config,
-                    "paths.service_catalog",
-                    "data/generated/service_catalog.json",
-                )
-            ).parent,
-        )
-
-        roles, task_vehicles, service_vehicles = load_roles_and_tv(roles_file)
-        expected_tv = int(
-            project_config_module.get_config_value(
-                formal_config,
-                "simulation.num_task_vehicles",
-            )
-        )
-        expected_sv = int(
-            project_config_module.get_config_value(
-                formal_config,
-                "simulation.num_service_vehicles",
-            )
-        )
-        if len(task_vehicles) != expected_tv or len(service_vehicles) != expected_sv:
-            raise ValueError(
-                "vehicle_roles.json 的 TV/SV 数量与 configs/proposed/system_config.toml 不一致。"
-            )
-        config.validate(len(task_vehicles))
-        dt_s, warmup_s, episode_s, master_seed = resolve_time_metadata(
-            roles,
-            args,
-            config,
-            formal_config,
-            check_role_seed=episode_seeds is None,
-        )
-        num_slots, _ = read_formal_trajectory_alignment(
-            trajectory_file,
-            task_vehicles,
-            dt_s,
-            warmup_s,
-            episode_s,
-        )
-        declared_slots = roles.get("formal_time_slot_count")
-        if declared_slots is not None and int(declared_slots) != num_slots:
-            raise ValueError(
-                "角色元数据 formal_time_slot_count 与 dt/warmup/episode 不一致。"
-            )
-
-        if episode_seeds is not None:
-            named_seeds = {
-                "popularity_evolution": episode_seeds["popularity_seed"],
-                "task_arrival": episode_seeds["task_arrival_seed"],
-                "service_request": episode_seeds["service_request_seed"],
-                "workload_variation": episode_seeds["workload_seed"],
-            }
-            episode_catalog = load_json(
-                project_config_module.resolve_path(
-                    project_root,
-                    project_config_module.get_config_value(
-                        formal_config,
-                        "paths.service_catalog",
-                    ),
-                )
-            )
-            artifacts = build_episode_artifacts(
-                task_vehicles,
-                episode_catalog,
-                dt_s,
-                warmup_s,
-                episode_s,
-                config,
-                named_seeds,
-            )
-        else:
-            named_seeds = {}
-            episode_catalog = {}
-            artifacts = build_artifacts(
-                task_vehicles,
-                dt_s,
-                warmup_s,
-                episode_s,
-                master_seed,
-                config,
-            )
-        validation = validate_artifacts(
-            artifacts,
-            task_vehicles,
-            config,
-            config.arrival_probability,
-        )
-
-        # 不重新写文件，只在内存中重复生成一次，验证所有独立 RNG 的完全复现。
-        repeated = (
-            build_episode_artifacts(
-                task_vehicles,
-                episode_catalog,
-                dt_s,
-                warmup_s,
-                episode_s,
-                config,
-                named_seeds,
-            )
-            if episode_seeds is not None
-            else build_artifacts(
-                task_vehicles,
-                dt_s,
-                warmup_s,
-                episode_s,
-                master_seed,
-                config,
-            )
-        )
-        if json_canonical(artifacts["catalog"]) != json_canonical(repeated["catalog"]):
-            raise AssertionError("相同 seed 重复生成的 service catalog 不一致。")
-        if json_canonical(artifacts["popularity_rows"]) != json_canonical(
-            repeated["popularity_rows"]
-        ):
-            raise AssertionError("相同 seed 重复生成的 popularity 不一致。")
-        if json_canonical(artifacts["task_rows"]) != json_canonical(repeated["task_rows"]):
-            raise AssertionError("相同 seed 重复生成的 tasks 不一致。")
-        if json_canonical(artifacts["popularity_history_rows"]) != json_canonical(
-            repeated["popularity_history_rows"]
-        ):
-            raise AssertionError("相同 seed 重复生成的 popularity history 不一致。")
-
-        if episode_seeds is not None:
-            child_seeds = artifacts["child_seeds"]
-            catalog_output = episode_catalog
-        else:
-            rngs, child_seeds = make_rngs(master_seed, config.rng_stream_names)
-            del rngs
-            catalog_output = make_service_catalog_output(
-                artifacts,
-                config,
-                dt_s,
-                warmup_s,
-                episode_s,
-                master_seed,
-                child_seeds,
-                task_vehicles,
-                validation,
-            )
-        local_cache_capacity_mb = float(
-            project_config_module.get_config_value(
-                formal_config,
-                "nodes.vehicle.local_cache_capacity_mb",
-            )
-        )
-        tv_local_cache_path = project_config_module.resolve_path(
-            project_root,
-            project_config_module.get_config_value(
-                formal_config,
-                "paths.tv_local_cache",
-            ),
-        )
-        tv_local_cache = generate_tv_local_cache(
-            task_vehicles,
-            catalog_output,
-            local_cache_capacity_mb,
-            int(episode_seeds["tv_cache_seed"])
-            if episode_seeds is not None
-            else master_seed,
-        )
-        tv_local_cache_validation = validate_tv_local_cache(
-            tv_local_cache,
-            task_vehicles,
-            catalog_output,
-            local_cache_capacity_mb,
-        )
-        write_json_atomic(tv_local_cache_path, tv_local_cache)
-        files = (
-            output_realization_artifacts(
-                output_dir,
-                artifacts["popularity_history_rows"],
-                artifacts["popularity_rows"],
-                artifacts["task_rows"],
-            )
-            if episode_seeds is not None
-            else output_artifacts(
-                output_dir,
-                catalog_output,
-                artifacts["popularity_history_rows"],
-                artifacts["popularity_rows"],
-                artifacts["task_rows"],
-            )
-        )
-
-        print("任务环境生成完成：")
-        print(f"  TV={len(task_vehicles)}，SV={len(service_vehicles)}（SV 不生成任务）")
-        print(f"  F={config.num_services}，formal slots={num_slots}")
-        print(f"  popularity prehistory slots={artifacts['history_slots']}")
-        print(f"  formal rho_star epoch 数={validation['epoch_count']}")
-        print(f"  tasks rows={validation['task_rows']}，arrivals={validation['total_arrivals']}")
-        print(f"  empirical lambda={validation['empirical_arrival_rate']:.6f}")
-        print(
-            "  rho_star normalized=True，"
-            f"same-seed reproducible=True，"
-            f"adjacent-same={validation['adjacent_same_probability_fraction']:.6f}"
-        )
-        print("  TV local cache generated")
-        print(f"  TV count = {tv_local_cache_validation['tv_count']}")
-        print(
-            "  one service per TV = "
-            f"{tv_local_cache_validation['all_tv_exactly_once']}"
-        )
-        print(
-            "  fixed over episode = "
-            f"{tv_local_cache['metadata']['fixed_over_episode']}"
-        )
-        print(f"  output: {tv_local_cache_path}")
-        for path in files:
-            print(f"  output: {path}")
-        return 0
-    except Exception as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

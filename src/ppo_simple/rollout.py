@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import time
 from typing import Any, Callable
 
 import numpy as np
 
-from decision import cache_configuration, slot_environment
+from decision import slot_environment
 
 from . import interface
 from .evaluation_metrics import task_metrics_from_result
@@ -69,7 +69,6 @@ class SimpleTransition:
     policy_selection_seconds: float
     configuration_seconds: float
     actual_matching_seconds: float
-    online_k100_configuration_calls: int
     matching_summary: dict[str, Any]
     origin_runtime_seconds: float
     # 保存转移开始时的状态，供 Exact-Q 反事实计算使用，避免重建 rollout 前缀。
@@ -377,7 +376,6 @@ def collect_rollout(
         )
         policy_selection_seconds = time.perf_counter() - selection_started_at
         performance_profile: dict[str, Any] = {}
-        configuration_profile = cache_configuration.ConfigurationEvaluationProfile()
         result = slot_environment.execute_slot(
             previous_cache,
             previous_uav,
@@ -395,7 +393,6 @@ def collect_rollout(
             slot_id=step.slot,
             time_s=step.time_s,
             performance_profile=performance_profile,
-            configuration_profile=configuration_profile,
             configuration_override=configuration_override,
         )
         if not result.step_feasible:
@@ -462,9 +459,6 @@ def collect_rollout(
                 configuration_seconds=float(performance_profile.get("config_seconds", 0.0)),
                 actual_matching_seconds=float(
                     performance_profile.get("matching_kkt_seconds", 0.0)
-                ),
-                online_k100_configuration_calls=int(
-                    performance_profile.get("online_k100_configuration_calls", 0)
                 ),
                 matching_summary=dict(result.matching_summary),
                 origin_runtime_seconds=float(

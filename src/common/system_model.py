@@ -135,28 +135,18 @@ def cloud_execution(
     cloud_cpu_cycles_per_s: float,
     cloud_delay_factor: float,
     transmit_power_w: float,
-    cloud_task_count: int = 1,
 ) -> dict[str, float]:
-    """Evaluate one task with fixed per-task Cloud resources.
-
-    cloud_rate_bps and cloud_cpu_cycles_per_s are the fixed equivalent
-    per-task resources in the formal model. cloud_task_count remains as a
-    validated compatibility argument for existing callers, but it does not
-    change the resource allocation or any returned value.
-    """
+    """Evaluate one task with fixed per-task Cloud resources."""
     bits = _require_finite("input_bits", input_bits)
     cycles = _require_finite("cpu_cycles", cpu_cycles)
     rate = _require_finite("cloud_rate_bps", cloud_rate_bps)
     cpu = _require_finite("cloud_cpu_cycles_per_s", cloud_cpu_cycles_per_s)
     factor = _require_finite("cloud_delay_factor", cloud_delay_factor)
     power = _require_finite("transmit_power_w", transmit_power_w)
-    count_value = _require_finite("cloud_task_count", float(cloud_task_count))
     if bits < 0.0 or cycles < 0.0:
         raise ValueError("input_bits/cpu_cycles 不能为负数。")
     if rate <= 0.0 or cpu <= 0.0:
         raise ValueError("cloud_rate_bps/cloud_cpu_cycles_per_s 必须大于 0。")
-    if count_value < 1.0 or not math.isclose(count_value, round(count_value), rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError("cloud_task_count 必须是正整数。")
     if factor < 1.0:
         raise ValueError("cloud_delay_factor/psi_c 必须不小于 1。")
     if power < 0.0:

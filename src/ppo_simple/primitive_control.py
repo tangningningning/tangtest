@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
-import torch
 
 from common import project_config
 from decision import cache_configuration, uav_configuration
