@@ -67,12 +67,6 @@ def semantic_config_hash(config: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def semantic_config_hash_from_file(path: str | Path) -> str:
-    """解析 TOML 快照后计算其语义哈希。"""
-
-    return semantic_config_hash(parse_toml_file(path))
-
-
 def raw_config_sha256(path: str | Path) -> str:
     """计算 TOML 文件原始字节哈希，仅用于来源记录。"""
 

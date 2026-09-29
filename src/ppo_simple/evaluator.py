@@ -249,22 +249,15 @@ def _seed_policy_sampling(seed: int) -> None:
 def _load_proposed_trainer(
     context: Any,
     checkpoint: Path,
-    config_raw_sha256: str,
-    config_semantic_sha256: str,
-    checkpoint_metadata: dict[str, Any],
     device: str,
 ) -> PPOTrainer:
-    trainer = PPOTrainer(
-        context,
-        device=device,
-        config_semantic_sha256=config_semantic_sha256,
-    )
+    trainer = PPOTrainer(context, device=device)
     if trainer.policy.architecture_id != context.policy_schema:
         raise TypeError(
             "Trainer policy factory did not construct the configured proposed schema: "
             f"{trainer.policy.architecture_id!r} != {context.policy_schema!r}"
         )
-    trainer.load_checkpoint(checkpoint, config_raw_sha256)
+    trainer.load_checkpoint(checkpoint)
     if trainer.policy.architecture_id != PROPOSED_POLICY_SCHEMA:
         raise TypeError("proposed checkpoint restored an unexpected policy schema")
     trainer.policy.eval()
@@ -496,9 +489,6 @@ def evaluate_pool(
         trainer = _load_proposed_trainer(
             context,
             checkpoint,
-            config_raw_sha256,
-            config_semantic_sha256,
-            checkpoint_metadata,
             device,
         )
         parameter_snapshot = [

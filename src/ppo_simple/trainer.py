@@ -1245,17 +1245,10 @@ class PPOTrainer:
         actor_learning_rate_override: float | None = None,
         critic_learning_rate_override: float | None = None,
         exact_q_parallel_workers: int = 1,
-        config_semantic_sha256: str | None = None,
     ) -> None:
         _require_torch()
         self.context = context
-        self.config_semantic_sha256 = (
-            project_config.semantic_config_hash(context.cfg)
-            if config_semantic_sha256 is None
-            else str(config_semantic_sha256)
-        )
-        if not self.config_semantic_sha256:
-            raise ValueError("config_semantic_sha256 不能为空。")
+        self.config_semantic_sha256 = project_config.semantic_config_hash(context.cfg)
         self.exact_q_parallel_workers = int(exact_q_parallel_workers)
         if self.exact_q_parallel_workers not in {1, 2, 4}:
             raise ValueError("exact_q_parallel_workers must be one of 1, 2, or 4")
@@ -2309,21 +2302,24 @@ class PPOTrainer:
             "uav_operation": int(self.uav_operation_optimizer_steps),
             "uav_candidate": int(self.uav_candidate_optimizer_steps),
         }
-        bootstrap_value = 0.0
-        if rollout.bootstrap_observation is not None:
-            with torch.no_grad():
-                bootstrap_tensor = self.policy.critic_value(rollout.bootstrap_observation)
-            bootstrap_value = float(bootstrap_tensor.detach().cpu())
-        advantages, returns = compute_gae(
-            rollout.rewards,
-            rollout.old_values,
-            rollout.dones,
-            bootstrap_value,
-            hyper.gamma,
-            hyper.gae_lambda,
-        )
-        if not np.all(np.isfinite(returns)) or not np.all(np.isfinite(advantages)):
-            raise FloatingPointError("critic warmup returns or advantages are non-finite")
+        # Warmup 对完整 TRAIN episode 使用 MC return；正式 PPO 更新仍使用 GAE/lambda return。
+        warmup_rewards = np.asarray(rollout.rewards, dtype=np.float32).reshape(-1)
+        warmup_dones = np.asarray(rollout.dones, dtype=bool).reshape(-1)
+        if (
+            len(warmup_rewards) != sample_count
+            or len(warmup_dones) != sample_count
+            or not np.all(np.isfinite(warmup_rewards))
+        ):
+            raise ValueError("Critic warmup 的 MC 回报输入长度不一致或 reward 非有限。")
+        returns = np.zeros_like(warmup_rewards, dtype=np.float32)
+        running_return = 0.0
+        for index in range(sample_count - 1, -1, -1):
+            if bool(warmup_dones[index]):
+                running_return = 0.0
+            running_return = float(warmup_rewards[index]) + float(hyper.gamma) * running_return
+            returns[index] = running_return
+        if not np.all(np.isfinite(returns)):
+            raise FloatingPointError("Critic warmup 的 MC return 包含 NaN/Inf。")
 
         popart_critic = self._uses_popart_critic()
         popart_before = self.policy.popart_statistics() if popart_critic else None
@@ -8413,7 +8409,6 @@ class PPOTrainer:
     def load_checkpoint(
         self,
         checkpoint: Path,
-        config_raw_sha256: str,
     ) -> TrainingCursor:
         payload = torch.load(checkpoint, map_location=self.device, weights_only=False)
         _validate_learning_rate_metadata(
@@ -8605,14 +8600,9 @@ class PPOTrainer:
             )
         if payload.get("configuration_control_mode") != self.context.configuration_control_mode:
             raise ValueError("PPO checkpoint configuration_control_mode mismatch.")
-        config_compatible = _checkpoint_config_compatible(
-            payload,
-            Path(checkpoint),
-            config_raw_sha256,
-            self.config_semantic_sha256,
-        )
-        if payload.get("method") != CHECKPOINT_METHOD or not config_compatible:
-            raise ValueError("checkpoint 方法标识或配置语义不匹配。")
+        # 配置哈希仅记录来源；恢复由 checkpoint 版本、模型结构和训练状态合同决定。
+        if payload.get("method") != CHECKPOINT_METHOD:
+            raise ValueError("PPO checkpoint 方法标识不匹配。")
         if int(payload.get("action_dim")) != int(self.context.action_spec.action_dim):
             raise ValueError("checkpoint action_dim 与当前策略不匹配。")
         self.policy.load_state_dict(payload["policy_state_dict"], strict=True)
@@ -8847,52 +8837,6 @@ class PPOTrainer:
         )
 
 
-def _checkpoint_config_compatible(
-    payload: dict[str, Any],
-    checkpoint: Path,
-    current_raw_sha256: str,
-    current_semantic_sha256: str,
-) -> bool:
-    """按语义哈希、正式快照和旧 raw 哈希的顺序核对配置。"""
-
-    stored_semantic_sha256 = payload.get("config_semantic_sha256")
-    if stored_semantic_sha256 is not None:
-        return (
-            isinstance(stored_semantic_sha256, str)
-            and bool(stored_semantic_sha256)
-            and stored_semantic_sha256 == current_semantic_sha256
-        )
-
-    checkpoint_path = Path(checkpoint)
-    run_dir = (
-        checkpoint_path.parent.parent
-        if checkpoint_path.parent.name == "checkpoints"
-        else checkpoint_path.parent
-    )
-    snapshot_names = (
-        "run_config.toml",
-        "config_snapshot.toml",
-        "system_config.toml",
-        "config.toml",
-    )
-    for snapshot_name in snapshot_names:
-        snapshot_path = run_dir / snapshot_name
-        if not snapshot_path.is_file():
-            continue
-        try:
-            snapshot_semantic_sha256 = project_config.semantic_config_hash_from_file(
-                snapshot_path
-            )
-        except (OSError, TypeError, ValueError):
-            continue
-        return snapshot_semantic_sha256 == current_semantic_sha256
-
-    stored_raw_sha256 = payload.get("config_raw_sha256")
-    if stored_raw_sha256 is None:
-        stored_raw_sha256 = payload.get("config_sha256")
-    return stored_raw_sha256 == current_raw_sha256
-
-
 def _run_protocol_metadata(
     context: EnvironmentContext,
     rollout_steps: int,
@@ -9092,10 +9036,7 @@ def run_training(
     if resume:
         if not checkpoint.exists():
             raise FileNotFoundError(f"resume checkpoint 不存在：{checkpoint}")
-        cursor = trainer.load_checkpoint(
-            checkpoint,
-            config_raw_sha256,
-        )
+        cursor = trainer.load_checkpoint(checkpoint)
         completed_episodes = cursor.completed_episodes
         current_train_origin = cursor.current_train_origin
         current_cache_state = cursor.current_cache_state
