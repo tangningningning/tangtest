@@ -16,8 +16,13 @@ except ModuleNotFoundError:  # pragma: no cover - 无 PyTorch 环境也可检查
     torch = None  # type: ignore[assignment]
 
 from common import project_config
+from .macro_targets import (
+    build_macro_n2_target,
+    build_macro_smdp_lambda_return_target,
+)
 
 SLOT_METRICS_FILENAME = "slot_metrics.jsonl"
+MACRO_TRANSITION_TRACE_FILENAME = "macro_transition_trace.npz"
 
 EPISODE_METRICS_FILENAME = "episode_metrics.jsonl"
 
@@ -676,6 +681,7 @@ FRESH_RUN_ARTIFACTS = (
     f"{CHECKPOINTS_DIRECTORY}/latest_checkpoint.pt",
     f"{CHECKPOINTS_DIRECTORY}/best_train_return_checkpoint.pt",
     f"plots/{TRAINING_EPOCH_RETURN_PLOT_FILENAME}",
+    MACRO_TRANSITION_TRACE_FILENAME,
 )
 
 
@@ -2907,6 +2913,375 @@ def append_dual_timescale_record(path: Path, record: dict[str, Any]) -> None:
         stream.write("\n")
 
 
+def _integer_histogram(values: np.ndarray) -> dict[str, int]:
+    unique, counts = np.unique(np.asarray(values, dtype=np.int64), return_counts=True)
+    return {str(int(value)): int(count) for value, count in zip(unique, counts, strict=True)}
+
+
+def build_macro_transition_trace_arrays(
+    episode_batches: Iterable[dict[str, Any]], *, gamma: float,
+    target_mode: str = "one_step_smdp_td",
+    lambda_return_lambda: float | None = None,
+    expected_macro_frame_counts: dict[int, int] | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Assemble and validate the minimal per-transition Macro trace."""
+
+    batches = list(episode_batches)
+    if not batches:
+        raise ValueError("Macro transition trace requires at least one episode.")
+    gamma_value = float(gamma)
+    if not math.isfinite(gamma_value) or gamma_value < 0.0:
+        raise ValueError("Macro transition trace gamma must be finite and non-negative.")
+    target_mode_value = str(target_mode)
+    if target_mode_value not in {
+        "one_step_smdp_td",
+        "two_step_smdp_td",
+        "smdp_lambda_return",
+    }:
+        raise ValueError(f"Unsupported Macro transition trace target mode: {target_mode_value!r}.")
+    lambda_value = None if lambda_return_lambda is None else float(lambda_return_lambda)
+    if target_mode_value == "smdp_lambda_return":
+        if lambda_value is None or not math.isfinite(lambda_value) or not 0.0 <= lambda_value <= 1.0:
+            raise ValueError("SMDP lambda-return trace requires a finite lambda in [0, 1].")
+
+    fields = (
+        "observation",
+        "next_observation",
+        "macro_reward",
+        "requested_duration",
+        "actual_duration",
+        "done",
+        "old_value",
+        "old_next_value",
+        "critic_training_target",
+        "realized_return_to_go",
+        "macro_frame_index",
+    )
+    chunks: dict[str, list[np.ndarray]] = {name: [] for name in fields}
+    n2_trace_fields = (
+        "n2_target",
+        "n2_bootstrap_old_value",
+        "n2_bootstrap_frame_index",
+    )
+    if target_mode_value == "two_step_smdp_td":
+        chunks.update({name: [] for name in n2_trace_fields})
+    lambda_trace_fields = (
+        "lambda_return_target",
+        "macro_critic_lambda_return_lambda",
+    )
+    if target_mode_value == "smdp_lambda_return":
+        chunks.update({name: [] for name in lambda_trace_fields})
+    chunks["episode_id"] = []
+    chunks["episode_seed"] = []
+    episode_transition_counts: dict[str, int] = {}
+    seen_episodes: set[int] = set()
+    episode_order: list[int] = []
+    target_max_abs_error = 0.0
+    return_max_abs_error = 0.0
+
+    for batch in batches:
+        episode_value = batch.get("episode_id", batch.get("episode"))
+        if episode_value is None:
+            raise ValueError("Macro transition trace episode_id is missing.")
+        episode = int(episode_value)
+        episode_seed = int(batch["episode_seed"])
+        if episode in seen_episodes:
+            raise ValueError(f"Macro transition trace repeats episode {episode}.")
+        seen_episodes.add(episode)
+        episode_order.append(episode)
+        raw = {name: np.asarray(batch[name]) for name in fields}
+        observation = np.asarray(raw["observation"], dtype=np.float32)
+        next_observation = np.asarray(raw["next_observation"], dtype=np.float32)
+        reward = np.asarray(raw["macro_reward"], dtype=np.float32).reshape(-1)
+        requested_raw = np.asarray(raw["requested_duration"]).reshape(-1)
+        duration_raw = np.asarray(raw["actual_duration"]).reshape(-1)
+        if (
+            not np.isfinite(requested_raw).all()
+            or not np.isfinite(duration_raw).all()
+            or np.any(requested_raw != np.floor(requested_raw))
+            or np.any(duration_raw != np.floor(duration_raw))
+        ):
+            raise ValueError(f"Macro transition trace episode {episode} has non-finite/non-integer durations.")
+        requested = requested_raw.astype(np.int64)
+        duration = duration_raw.astype(np.int64)
+        done = np.asarray(raw["done"], dtype=bool).reshape(-1)
+        old_value = np.asarray(raw["old_value"], dtype=np.float32).reshape(-1)
+        old_next_value = np.asarray(raw["old_next_value"], dtype=np.float32).reshape(-1)
+        critic_target = np.asarray(raw["critic_training_target"], dtype=np.float32).reshape(-1)
+        realized_return = np.asarray(raw["realized_return_to_go"], dtype=np.float32).reshape(-1)
+        frame_index = np.asarray(raw["macro_frame_index"], dtype=np.int64).reshape(-1)
+        if target_mode_value == "two_step_smdp_td":
+            missing_n2_fields = [name for name in n2_trace_fields if name not in batch]
+            if missing_n2_fields:
+                raise ValueError(
+                    f"Macro transition trace episode {episode} is missing N2 linkage fields: {missing_n2_fields}."
+                )
+            n2_target = np.asarray(batch["n2_target"], dtype=np.float32).reshape(-1)
+            n2_bootstrap_old_value = np.asarray(
+                batch["n2_bootstrap_old_value"], dtype=np.float32
+            ).reshape(-1)
+            n2_bootstrap_frame_index = np.asarray(
+                batch["n2_bootstrap_frame_index"], dtype=np.int64
+            ).reshape(-1)
+        elif target_mode_value == "smdp_lambda_return":
+            missing_lambda_fields = [name for name in lambda_trace_fields if name not in batch]
+            if missing_lambda_fields:
+                raise ValueError(
+                    f"Macro transition trace episode {episode} is missing lambda-return fields: {missing_lambda_fields}."
+                )
+            lambda_return_target = np.asarray(
+                batch["lambda_return_target"], dtype=np.float32
+            ).reshape(-1)
+            recorded_lambda = np.asarray(
+                batch["macro_critic_lambda_return_lambda"], dtype=np.float64
+            ).reshape(-1)
+        count = int(reward.size)
+        if count <= 0:
+            raise ValueError(f"Macro transition trace episode {episode} is empty.")
+        vector_fields = (requested, duration, done, old_value, old_next_value, critic_target, realized_return, frame_index)
+        if target_mode_value == "two_step_smdp_td":
+            vector_fields += (n2_target, n2_bootstrap_old_value, n2_bootstrap_frame_index)
+        elif target_mode_value == "smdp_lambda_return":
+            vector_fields += (lambda_return_target, recorded_lambda)
+        if any(value.shape != (count,) for value in vector_fields):
+            raise ValueError(f"Macro transition trace episode {episode} has misaligned fields.")
+        if observation.shape != (count, 400) or next_observation.shape != (count, 400):
+            raise ValueError(f"Macro transition trace episode {episode} must have 400D observations.")
+        floats = (observation, next_observation, reward, old_value, old_next_value, critic_target, realized_return)
+        if target_mode_value == "two_step_smdp_td":
+            floats += (n2_target, n2_bootstrap_old_value)
+        elif target_mode_value == "smdp_lambda_return":
+            floats += (lambda_return_target, recorded_lambda)
+        if any(not np.isfinite(value).all() for value in floats):
+            raise ValueError(f"Macro transition trace episode {episode} contains NaN/Inf.")
+        if np.any(requested <= 0) or np.any(duration <= 0) or np.any(duration > requested):
+            raise ValueError(f"Macro transition trace episode {episode} has invalid durations.")
+        if not np.array_equal(frame_index, np.arange(count, dtype=np.int64)):
+            raise ValueError(f"Macro frame indexes are not continuous in episode {episode}.")
+        if not bool(done[-1]) or bool(np.any(done[:-1])):
+            raise ValueError(f"Terminal flag must occur only on the final transition of episode {episode}.")
+        if float(old_next_value[-1]) != 0.0:
+            raise ValueError(f"Terminal old_next_value must be zero in episode {episode}.")
+        if np.any(next_observation[-1] != 0.0):
+            raise ValueError(f"Terminal next_observation must be zero in episode {episode}.")
+        if count > 1 and not np.allclose(
+            next_observation[:-1], observation[1:], rtol=0.0, atol=1.0e-6
+        ):
+            raise ValueError(f"Macro next-observation linkage breaks within episode {episode}.")
+
+        if target_mode_value == "two_step_smdp_td":
+            expected_bootstrap_frame_index = np.full(count, -1, dtype=np.int64)
+            expected_bootstrap_old_value = np.zeros(count, dtype=np.float32)
+            for index in range(count):
+                if done[index] or done[index + 1]:
+                    continue
+                expected_bootstrap_frame_index[index] = frame_index[index + 2]
+                expected_bootstrap_old_value[index] = old_value[index + 2]
+            if not np.array_equal(
+                n2_bootstrap_frame_index, expected_bootstrap_frame_index
+            ) or not np.array_equal(n2_bootstrap_old_value, expected_bootstrap_old_value):
+                raise ValueError(
+                    f"N2 frozen old-value k+2 linkage breaks in episode {episode}."
+                )
+        elif target_mode_value == "smdp_lambda_return":
+            if not np.array_equal(
+                recorded_lambda,
+                np.full(count, lambda_value, dtype=np.float64),
+            ):
+                raise ValueError(
+                    f"Critic lambda-return lambda changes within episode {episode}."
+                )
+
+        if target_mode_value == "one_step_smdp_td":
+            target_expected = (
+                reward + np.power(gamma_value, duration) * old_next_value * (~done)
+            ).astype(np.float32)
+        elif target_mode_value == "two_step_smdp_td":
+            target_expected = build_macro_n2_target(
+                reward, old_value, duration, done, gamma_value
+            )
+        else:
+            target_expected = build_macro_smdp_lambda_return_target(
+                reward,
+                old_next_value,
+                duration,
+                done,
+                gamma_value,
+                lambda_value,
+            )
+        # The shared builder keeps all arithmetic in float64. Training then
+        # casts the target to the network's float32 dtype, so compare the trace
+        # against that same cast rather than counting dtype quantization as a
+        # target-reconstruction error.
+        target_expected_for_training = np.asarray(target_expected, dtype=np.float32)
+        target_outputs = [critic_target]
+        if target_mode_value == "two_step_smdp_td":
+            target_outputs.append(n2_target)
+        elif target_mode_value == "smdp_lambda_return":
+            target_outputs.append(lambda_return_target)
+        target_error = max(
+            float(
+                np.max(
+                    np.abs(
+                        target_expected_for_training.astype(np.float64)
+                        - target_output.astype(np.float64)
+                    )
+                )
+            )
+            for target_output in target_outputs
+        )
+        if target_error > 1.0e-6:
+            raise ValueError(
+                f"{target_mode_value} trace reconstruction error {target_error} exceeds 1e-6 in episode {episode}."
+            )
+        terminal_target = (
+            n2_target
+            if target_mode_value == "two_step_smdp_td"
+            else lambda_return_target
+            if target_mode_value == "smdp_lambda_return"
+            else critic_target
+        )
+        terminal_target_error = float(np.max(np.abs(terminal_target[done] - reward[done])))
+        if terminal_target_error > 1.0e-6:
+            raise ValueError(
+                f"Terminal {target_mode_value} target differs from reward in episode {episode}."
+            )
+
+        return_expected = np.zeros(count, dtype=np.float64)
+        running_return = 0.0
+        reward64 = reward.astype(np.float64)
+        for index in range(count - 1, -1, -1):
+            if done[index]:
+                running_return = 0.0
+            running_return = float(
+                reward64[index]
+                + gamma_value ** int(duration[index]) * running_return
+            )
+            return_expected[index] = running_return
+        return_error = float(
+            np.max(
+                np.abs(
+                    return_expected.astype(np.float32).astype(np.float64)
+                    - realized_return.astype(np.float64)
+                )
+            )
+        )
+        if return_error > 1.0e-6:
+            raise ValueError(
+                f"Realized return-to-go reconstruction error {return_error} exceeds 1e-6 in episode {episode}."
+            )
+        target_max_abs_error = max(target_max_abs_error, target_error)
+        return_max_abs_error = max(return_max_abs_error, return_error)
+        episode_transition_counts[f"E{episode}"] = count
+        chunks["episode_id"].append(np.full(count, episode, dtype=np.int64))
+        chunks["episode_seed"].append(np.full(count, episode_seed, dtype=np.int64))
+        chunks["observation"].append(observation)
+        chunks["next_observation"].append(next_observation)
+        chunks["macro_reward"].append(reward)
+        chunks["requested_duration"].append(requested)
+        chunks["actual_duration"].append(duration)
+        chunks["done"].append(done)
+        chunks["old_value"].append(old_value)
+        chunks["old_next_value"].append(old_next_value)
+        chunks["critic_training_target"].append(critic_target)
+        chunks["realized_return_to_go"].append(realized_return)
+        chunks["macro_frame_index"].append(frame_index)
+        if target_mode_value == "two_step_smdp_td":
+            chunks["n2_target"].append(n2_target)
+            chunks["n2_bootstrap_old_value"].append(n2_bootstrap_old_value)
+            chunks["n2_bootstrap_frame_index"].append(n2_bootstrap_frame_index)
+        elif target_mode_value == "smdp_lambda_return":
+            chunks["lambda_return_target"].append(lambda_return_target)
+            chunks["macro_critic_lambda_return_lambda"].append(recorded_lambda)
+
+    if episode_order != sorted(episode_order):
+        raise ValueError("Macro transition trace episodes must be ordered and unique.")
+    if expected_macro_frame_counts is not None:
+        expected = {int(key): int(value) for key, value in expected_macro_frame_counts.items()}
+        actual = {int(key[1:]): int(value) for key, value in episode_transition_counts.items()}
+        if actual != expected:
+            raise ValueError(
+                f"Macro transition trace frame counts disagree with episode metrics: {actual} != {expected}."
+            )
+
+    arrays = {name: np.concatenate(parts, axis=0) for name, parts in chunks.items()}
+    arrays["gamma"] = np.asarray(gamma_value, dtype=np.float64)
+    requested = arrays["requested_duration"]
+    duration = arrays["actual_duration"]
+    pair_histogram: dict[str, int] = {}
+    tail_histogram: dict[str, int] = {}
+    for requested_value, actual_value in zip(requested, duration, strict=True):
+        pair_key = f"{int(requested_value)}->{int(actual_value)}"
+        pair_histogram[pair_key] = pair_histogram.get(pair_key, 0) + 1
+        if int(actual_value) < int(requested_value):
+            tail_histogram[pair_key] = tail_histogram.get(pair_key, 0) + 1
+    summary = {
+        "macro_transition_trace_path": None,
+        "transition_count": int(len(arrays["episode_id"])),
+        "episode_transition_counts": episode_transition_counts,
+        "requested_duration_histogram": _integer_histogram(requested),
+        "actual_duration_histogram": _integer_histogram(duration),
+        "requested_actual_duration_pair_histogram": pair_histogram,
+        "tail_truncated_duration_counts": tail_histogram,
+        "critic_training_target_mode": target_mode_value,
+        "macro_critic_lambda_return_lambda": lambda_value,
+        "critic_target_recompute_max_abs_error": target_max_abs_error,
+        "realized_return_recompute_max_abs_error": return_max_abs_error,
+        "macro_transition_trace_fields": list(arrays),
+        "reporting_only_change": True,
+    }
+    return arrays, summary
+
+
+def write_macro_transition_trace_artifact(
+    run_dir: Path,
+    episode_batches: Iterable[dict[str, Any]],
+    *,
+    gamma: float,
+    target_mode: str = "one_step_smdp_td",
+    lambda_return_lambda: float | None = None,
+) -> dict[str, Any]:
+    """Write a compressed validated Macro trace and add its index to run reports."""
+
+    destination = Path(run_dir)
+    episode_records, _ = _read_jsonl(destination / EPISODE_METRICS_FILENAME)
+    expected_counts = {
+        int(record["episode"]): int(record["macro_frame_count"])
+        for record in episode_records
+        if record.get("record_type") == "episode"
+    }
+    arrays, summary = build_macro_transition_trace_arrays(
+        episode_batches,
+        gamma=gamma,
+        target_mode=target_mode,
+        lambda_return_lambda=lambda_return_lambda,
+        expected_macro_frame_counts=expected_counts,
+    )
+    trace_path = destination / MACRO_TRANSITION_TRACE_FILENAME
+    try:
+        with trace_path.open("wb") as stream:
+            np.savez_compressed(stream, **arrays)
+    except Exception:
+        if trace_path.exists():
+            trace_path.unlink()
+        raise
+    summary["macro_transition_trace_path"] = str(trace_path.resolve())
+    summary["macro_transition_trace_format"] = "npz"
+    summary["trace_format_version"] = (
+        4
+        if target_mode == "smdp_lambda_return"
+        else 3
+        if target_mode == "two_step_smdp_td"
+        else 2
+    )
+    for filename in (RUN_MANIFEST_FILENAME, RUN_SUMMARY_FILENAME):
+        report_path = destination / filename
+        payload = _read_json(report_path)
+        payload.update(summary)
+        _write_json(report_path, payload)
+    return summary
+
+
 def write_dual_timescale_run_manifest(
     path: Path,
     *,
@@ -2932,6 +3307,18 @@ def write_dual_timescale_run_manifest(
         "episode_pool": None if episode_pool is None else str(Path(episode_pool).resolve()),
         "policy_schema": trainer.policy.architecture_id,
         "checkpoint_version": int(trainer.checkpoint_version),
+        "macro_actor_advantage_mode": "duration_aware_smdp_gae",
+        "macro_critic_target_mode": str(trainer.macro_critic_target_mode),
+        "macro_critic_lambda_return_lambda": trainer.macro_critic_lambda_return_lambda,
+        "long_value_enabled": bool(trainer.long_value_enabled),
+        "long_value_target": str(trainer.long_value_target),
+        "long_value_architecture": "observation_dim->128->128->1 (SiLU)",
+        "long_value_input_transform": "raw_macro_observation",
+        "long_value_optimizer": "Adam",
+        "long_value_learning_rate": float(trainer.learning_rates["long_value"]),
+        "long_value_optimizer_epsilon": 1.0e-5,
+        "long_value_max_grad_norm": float(trainer.long_value_max_grad_norm),
+        "long_value_steps_per_update": int(trainer.long_value_steps_per_update),
         "architecture_version": int(trainer.policy.architecture_version),
         "observation_dim": int(context.observation_spec.observation_dim),
         "macro_cache_candidate_feature_dim": int(trainer.policy.macro_cache_feature_dim),

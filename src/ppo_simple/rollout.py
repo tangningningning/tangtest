@@ -9,6 +9,11 @@ from typing import Any, Mapping
 
 import numpy as np
 
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - 仅静态导入环境
+    torch = None  # type: ignore[assignment]
+
 from decision import cache_configuration, slot_environment, uav_configuration
 
 from . import interface
@@ -140,6 +145,7 @@ class MacroTransition:
     old_macro_log_prob: float
     old_macro_entropy: float
     old_value: float
+    old_next_value: float
     frame_reward: float
     next_observation: np.ndarray
     done: bool
@@ -172,6 +178,10 @@ class MacroRolloutBuffer:
             raise ValueError("不能在 terminal Macro transition 后追加数据。")
         if int(transition.actual_duration) <= 0:
             raise ValueError("Macro actual_duration 必须为正数。")
+        if not np.isfinite(float(transition.old_next_value)):
+            raise ValueError("Macro rollout old_next_value must be finite.")
+        if bool(transition.done) and float(transition.old_next_value) != 0.0:
+            raise ValueError("Terminal Macro transitions must have zero old_next_value.")
         self.transitions.append(transition)
 
     def __len__(self) -> int:
@@ -764,6 +774,15 @@ def collect_dual_timescale_episode(
                 if done
                 else _observation(cache, uav, aligned_steps[slot_index + 1], context)
             )
+            if done:
+                frame_old_next_value = 0.0
+            else:
+                if torch is None:
+                    raise ImportError("Formal Macro rollout requires PyTorch.")
+                with torch.no_grad():
+                    frame_old_next_value = float(
+                        policy.macro_value(next_macro_state).detach().cpu()
+                    )
             macro_buffer.append(
                 MacroTransition(
                     observation=frame_observation.copy(),
@@ -777,6 +796,7 @@ def collect_dual_timescale_episode(
                     old_macro_log_prob=frame_old_log_prob,
                     old_macro_entropy=frame_old_entropy,
                     old_value=frame_old_value,
+                    old_next_value=frame_old_next_value,
                     frame_reward=float(frame_reward),
                     next_observation=next_macro_state.copy(),
                     done=done,
@@ -902,7 +922,11 @@ def collect_dual_timescale_episode(
             else 0.0
         ),
         "uav0_stay_rate": float(stay_counts[0] / max(micro_count, 1)),
+        "uav0_stay_count": int(stay_counts[0]),
+        "uav0_move_count": int(micro_count - stay_counts[0]),
         "uav1_stay_rate": float(stay_counts[1] / max(micro_count, 1)),
+        "uav1_stay_count": int(stay_counts[1]),
+        "uav1_move_count": int(micro_count - stay_counts[1]),
         "uav0_move_rate": float(1.0 - stay_counts[0] / max(micro_count, 1)),
         "uav1_move_rate": float(1.0 - stay_counts[1] / max(micro_count, 1)),
         "uav0_action_pattern": uav_action_patterns[0],

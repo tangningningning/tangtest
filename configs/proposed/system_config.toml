@@ -549,6 +549,15 @@ learning_rate = 3.0e-4
 actor_learning_rate = 3.0e-4
 critic_learning_rate = 1.0e-3
 macro_critic_learning_rate = 1.0e-3
+macro_critic_target_mode = "two_step_smdp_td"
+# Critic-only duration-aware lambda-return parameter. This is an algorithm design
+# choice, independent of the Macro Actor's gae_lambda and not fitted on held-out data.
+macro_critic_lambda_return_lambda = 0.7706141475
+long_value_enabled = true
+long_value_target = "realized_return_to_go"
+long_value_learning_rate = 1.0e-3
+long_value_steps_per_update = 50
+long_value_max_grad_norm = 0.5
 micro_critic_learning_rate = 3.0e-3
 value_loss_coefficient = 0.01
 entropy_coefficient = 0.0
@@ -556,7 +565,7 @@ max_grad_norm = 0.5
 # 每个完整 episode 收集完毕后先更新 Micro，再用全部 Macro frames full-batch 更新。
 update_epochs = 4
 macro_critic_steps_per_update = 50
-macro_critic_replay_history_episodes = 4
+macro_critic_replay_history_episodes = 0
 target_kl = 0.10
 num_minibatches = 10
 minibatch_size = 30
@@ -621,6 +630,12 @@ terminal_origin = 299
 "nodes.rsu.xi_ca" = "EXPERIMENT_DESIGN"
 "nodes.uav.xi_ca" = "EXPERIMENT_DESIGN"
 "cache.discount_beta" = "ALGORITHM_DESIGN"
+"algorithm.ppo.macro_critic_lambda_return_lambda" = "ALGORITHM_DESIGN"
+"algorithm.ppo.long_value_enabled" = "ALGORITHM_DESIGN"
+"algorithm.ppo.long_value_target" = "ALGORITHM_DESIGN"
+"algorithm.ppo.long_value_learning_rate" = "ALGORITHM_DESIGN"
+"algorithm.ppo.long_value_steps_per_update" = "ALGORITHM_DESIGN"
+"algorithm.ppo.long_value_max_grad_norm" = "ALGORITHM_DESIGN"
 "nodes.vehicle.local_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.vehicle.local_cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.vehicle.kappa" = "CONFIRMED_DATA"

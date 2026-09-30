@@ -171,10 +171,10 @@ def _mlp(
 
 
 class DualTimescaleActorCritic(nn.Module if nn is not None else object):
-    """Macro Cache SMDP 与 Micro UAV PPO 的独立 Actor/Critic。"""
+    """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
     architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
-    architecture_version = 9
+    architecture_version = 10
 
     def __init__(
         self,
@@ -237,6 +237,13 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.observation_dim, sizes, 1, activation=nn.SiLU
         )
 
+        # Keep this module independent and construct it after the existing
+        # networks so architecture-v9 Actor/N2/Micro initialization remains
+        # unchanged for the same seed.
+        self.long_value_critic = _mlp(
+            self.observation_dim, (128, 128), 1, activation=nn.SiLU
+        )
+
     def _macro_critic_inputs(self, observations: Any) -> Any:
         return 2.0 * observations - 1.0
 
@@ -288,6 +295,17 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     def micro_value(self, observations: Any) -> Any:
         obs, single = self._observation_batch(observations, next(self.parameters()).device)
         values = self.micro_critic(self._micro_critic_inputs(obs)).squeeze(-1)
+        return values.squeeze(0) if single else values
+
+    def long_value(self, observations: Any) -> Any:
+        """Evaluate the independent Long Critic on the raw Macro observation."""
+
+        obs, single = self._observation_batch(
+            observations, next(self.parameters()).device
+        )
+        if int(obs.shape[-1]) != self.observation_dim:
+            raise ValueError("Long-Value Critic observation dimension mismatch.")
+        values = self.long_value_critic(obs).squeeze(-1)
         return values.squeeze(0) if single else values
 
     @staticmethod
@@ -696,6 +714,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     def macro_critic_parameters(self) -> tuple[Any, ...]:
         return tuple(self.macro_critic.parameters())
 
+    def long_value_critic_parameters(self) -> tuple[Any, ...]:
+        return tuple(self.long_value_critic.parameters())
+
     def micro_actor_parameters(self) -> tuple[Any, ...]:
         modules = (self.micro_actor_encoder, self.micro_uav_candidate_scorer)
         return tuple(parameter for module in modules for parameter in module.parameters())
@@ -735,10 +756,27 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             if key.startswith(prefixes)
         }
 
+    def long_value_critic_state_dict(self) -> dict[str, Any]:
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in self.long_value_critic.state_dict().items()
+        }
+
+    def n2_critic_state_dict(self) -> dict[str, Any]:
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in self.macro_critic.state_dict().items()
+        }
+
     def load_separated_state_dicts(
         self,
         macro_state: dict[str, Any],
         micro_state: dict[str, Any],
+        long_value_critic_state: dict[str, Any],
     ) -> None:
-        combined = {**macro_state, **micro_state}
+        long_state = {
+            f"long_value_critic.{key}": value
+            for key, value in long_value_critic_state.items()
+        }
+        combined = {**macro_state, **micro_state, **long_state}
         self.load_state_dict(combined, strict=True)
