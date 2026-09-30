@@ -414,11 +414,11 @@ def _read_episode_returns(path: Path) -> tuple[np.ndarray, np.ndarray]:
                 )
             if record.get("record_type", "episode") != "episode":
                 continue
-            if "epoch" not in record:
+            if "epoch" not in record and "episode" not in record:
                 raise ValueError(
-                    f"episode_metrics line {line_number} is missing epoch"
+                    f"episode_metrics line {line_number} is missing epoch/episode"
                 )
-            raw_epoch = record["epoch"]
+            raw_epoch = record.get("epoch", record.get("episode"))
             try:
                 epoch = int(raw_epoch)
                 epoch_as_float = float(raw_epoch)
@@ -506,6 +506,201 @@ def update_training_epoch_return_plot(run_dir: Path) -> Path:
         axis.legend(frameon=False)
         figure.tight_layout()
         output_path = run_path / "plots" / TRAINING_EPOCH_RETURN_PLOT_FILENAME
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=320, facecolor="white")
+    finally:
+        plt.close(figure)
+    return output_path
+
+
+def _format_learning_rate(value: Any) -> str:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    if not math.isfinite(converted):
+        return "NA"
+    return f"{converted:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+
+
+def _format_metric(value: Any, precision: int) -> str:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    if not math.isfinite(converted):
+        return "NA"
+    return f"{converted:.{int(precision)}f}"
+
+
+def _format_rate_percent(value: Any) -> str:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    return _format_metric(100.0 * converted, 1)
+
+
+def format_training_epoch_log(
+    record: dict[str, Any],
+    *,
+    target_epochs: int,
+    macro_actor_learning_rate: float,
+) -> str:
+    """Format one compact formal PPO epoch line from episode/update metrics."""
+
+    epoch = record.get("epoch", record.get("episode", "?"))
+    uav_move_rates = [record.get("uav0_move_rate"), record.get("uav1_move_rate")]
+    if all(value is not None for value in uav_move_rates):
+        try:
+            uav_move_rate = sum(float(value) for value in uav_move_rates) / 2.0
+        except (TypeError, ValueError):
+            uav_move_rate = math.nan
+    else:
+        uav_move_rate = math.nan
+    return (
+        f"[PPO] Epoch {epoch}/{int(target_epochs)} "
+        f"| LR={_format_learning_rate(macro_actor_learning_rate)} "
+        f"| Return={_format_metric(record.get('episode_return'), 2)} "
+        f"| N2EV={_format_metric(record.get('n2_post_ev', record.get('post_update_target_ev')), 3)} "
+        f"| LongCorr={_format_metric(record.get('long_value_post_correlation'), 3)} "
+        f"| CacheChange={_format_rate_percent(record.get('actual_cache_update_rate'))}% "
+        f"| UAVMove={_format_rate_percent(uav_move_rate)}% "
+        f"| Entropy={_format_metric(record.get('macro_entropy'), 2)} "
+        f"| KL={_format_metric(record.get('macro_approx_kl'), 5)} "
+        f"| Time={_format_metric(record.get('training_epoch_runtime_seconds', record.get('episode_runtime_seconds')), 1)}s"
+    )
+
+
+FORMAL_ACTOR_LR_COMPARISON_RUNS = (
+    ("LR=1e-4", "formal_actor_lr_1e_minus_4_300", 1.0e-4),
+    ("LR=3e-4", "formal_actor_lr_3e_minus_4_300", 3.0e-4),
+    ("LR=1e-3", "formal_actor_lr_1e_minus_3_300", 1.0e-3),
+    ("LR=3e-3", "formal_actor_lr_3e_minus_3_300", 3.0e-3),
+)
+
+
+def plot_formal_actor_lr_comparison_300(project_root: Path | None = None) -> Path:
+    """Plot four complete 300-epoch runs; refuse to draw if any run is incomplete."""
+
+    root = (
+        Path(project_root).expanduser().resolve()
+        if project_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    runs_root = root / "runs"
+    validated: list[tuple[str, np.ndarray, np.ndarray]] = []
+    run_identities: list[tuple[Any, ...]] = []
+    missing: list[str] = []
+
+    for label, run_name, expected_lr in FORMAL_ACTOR_LR_COMPARISON_RUNS:
+        run_path = runs_root / run_name
+        metrics_path = run_path / EPISODE_METRICS_FILENAME
+        manifest_path = run_path / RUN_MANIFEST_FILENAME
+        summary_path = run_path / RUN_SUMMARY_FILENAME
+        checkpoint_path = run_path / CHECKPOINTS_DIRECTORY / "latest_checkpoint.pt"
+        try:
+            if not metrics_path.is_file():
+                raise ValueError("episode_metrics.jsonl is missing")
+            if not manifest_path.is_file():
+                raise ValueError("run_manifest.json is missing")
+            if not summary_path.is_file():
+                raise ValueError("run_summary.json is missing")
+            if not checkpoint_path.is_file():
+                raise ValueError("latest_checkpoint.pt is missing")
+            with manifest_path.open("r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            with summary_path.open("r", encoding="utf-8") as stream:
+                summary = json.load(stream)
+            if not isinstance(manifest, dict) or not isinstance(summary, dict):
+                raise ValueError("manifest/summary must contain JSON objects")
+            if int(manifest.get("target_episodes", -1)) != 300:
+                raise ValueError("manifest target_episodes is not 300")
+            if int(summary.get("target_episodes", -1)) != 300:
+                raise ValueError("summary target_episodes is not 300")
+            if int(summary.get("completed_episodes", -1)) != 300:
+                raise ValueError("run_summary does not report 300 completed epochs")
+            counters = manifest.get("training_counters")
+            if not isinstance(counters, dict) or int(
+                counters.get("completed_episodes", -1)
+            ) != 300:
+                raise ValueError("run manifest does not report 300 completed epochs")
+            recorded_lr = float(
+                manifest.get("macro_actor_learning_rate", manifest.get("actor_learning_rate"))
+            )
+            if not math.isclose(recorded_lr, expected_lr, rel_tol=0.0, abs_tol=1.0e-12):
+                raise ValueError(f"Macro Actor LR is {recorded_lr:g}, expected {expected_lr:g}")
+            if int(manifest.get("architecture_version", -1)) != 10:
+                raise ValueError("architecture_version is not 10")
+            if int(manifest.get("checkpoint_version", -1)) != 33:
+                raise ValueError("checkpoint_version is not 33")
+            if manifest.get("macro_actor_advantage_mode") != "duration_aware_smdp_gae":
+                raise ValueError("Macro Actor advantage mode does not match the formal run")
+            if manifest.get("macro_critic_target_mode") != "two_step_smdp_td":
+                raise ValueError("Macro Critic target is not N2")
+            if manifest.get("long_value_target") != "realized_return_to_go":
+                raise ValueError("Long Critic target does not match the formal run")
+            if manifest.get("long_value_enabled") is not True:
+                raise ValueError("independent Long Critic is not enabled")
+            if int(manifest.get("seed", -1)) != 27005:
+                raise ValueError("initialization seed does not match the shared seed 27005")
+            if int(manifest.get("episode_seed_start", -1)) != 20001:
+                raise ValueError("episode seed start does not match the shared order 20001")
+            if Path(str(manifest.get("config_path", ""))).resolve() != (
+                root / "configs" / "proposed" / "system_config.toml"
+            ).resolve():
+                raise ValueError("run does not use the common formal system_config.toml")
+            epochs, returns = _read_episode_returns(metrics_path)
+            if len(epochs) != 300 or not np.array_equal(epochs, np.arange(1, 301)):
+                raise ValueError("episode_metrics does not contain exactly epochs 1..300")
+            run_identities.append(
+                (
+                    int(manifest["seed"]),
+                    int(manifest["episode_seed_start"]),
+                    str(Path(str(manifest["episode_pool"])).resolve()),
+                    str(Path(str(manifest["config_path"])).resolve()),
+                    str(manifest["config_raw_sha256"]),
+                    str(manifest["config_semantic_sha256"]),
+                    float(manifest.get("micro_actor_learning_rate", math.nan)),
+                    float(manifest["macro_critic_learning_rate"]),
+                    float(manifest["micro_critic_learning_rate"]),
+                    float(manifest["long_value_learning_rate"]),
+                )
+            )
+            validated.append((label, epochs, returns))
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            missing.append(f"{run_name}: {exc}")
+
+    if missing:
+        raise RuntimeError(
+            "Formal actor-LR comparison refused; incomplete or invalid run data: "
+            + "; ".join(missing)
+        )
+    if len(set(run_identities)) != 1:
+        raise RuntimeError(
+            "Formal actor-LR comparison refused; shared seed, episode order/pool, "
+            "config, Micro Actor LR, or Critic LR differs between runs."
+        )
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(12, 6))
+    try:
+        for label, epochs, returns in validated:
+            ma20 = _full_window_moving_average(returns, 20)
+            valid = np.isfinite(ma20)
+            axis.plot(epochs[valid], ma20[valid], label=label, linewidth=2.0)
+        axis.set_xlabel("Training Epoch")
+        axis.set_ylabel("Episode Return (MA20)")
+        axis.set_title("Formal Macro Actor Learning-Rate Comparison (300 Epochs)")
+        axis.grid(True, axis="y", alpha=0.25)
+        axis.set_axisbelow(True)
+        axis.legend(frameon=False)
+        figure.tight_layout()
+        output_path = root / "reports" / "plots" / "formal_actor_lr_comparison_300.png"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(output_path, dpi=320, facecolor="white")
     finally:
@@ -3293,6 +3488,7 @@ def write_dual_timescale_run_manifest(
     context: Any,
     target_episodes: int,
     episode_pool: str | Path | None = None,
+    episode_seed_start: int | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     """记录双时间尺度 checkpoint、动作和 PPO 配置合同。"""
@@ -3305,6 +3501,9 @@ def write_dual_timescale_run_manifest(
         "seed": int(seed),
         "target_episodes": int(target_episodes),
         "episode_pool": None if episode_pool is None else str(Path(episode_pool).resolve()),
+        "episode_seed_start": (
+            None if episode_seed_start is None else int(episode_seed_start)
+        ),
         "policy_schema": trainer.policy.architecture_id,
         "checkpoint_version": int(trainer.checkpoint_version),
         "macro_actor_advantage_mode": "duration_aware_smdp_gae",
@@ -3325,7 +3524,9 @@ def write_dual_timescale_run_manifest(
         "micro_uav_candidate_feature_dim": int(trainer.policy.micro_uav_feature_dim),
         "prediction_horizon": int(trainer.policy.prediction_horizon),
         "macro_duration_candidates": list(trainer.policy.duration_candidates),
-        "actor_learning_rate": float(trainer.learning_rates["actor"]),
+        "actor_learning_rate": float(trainer.learning_rates["macro_actor"]),
+        "macro_actor_learning_rate": float(trainer.learning_rates["macro_actor"]),
+        "micro_actor_learning_rate": float(trainer.learning_rates["micro_actor"]),
         "macro_critic_learning_rate": float(trainer.learning_rates["macro_critic"]),
         "micro_critic_learning_rate": float(trainer.learning_rates["micro_critic"]),
         "critic_input_transform": "2*x-1",

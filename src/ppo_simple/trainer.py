@@ -10,6 +10,7 @@ import math
 import random
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,8 @@ from .reporting import (
     checkpoint_path_for_write,
     ensure_fresh_run_dir_is_clean,
     ensure_run_artifact_directories,
+    format_training_epoch_log,
+    update_training_epoch_return_plot,
     write_dual_timescale_run_manifest,
     write_macro_transition_trace_artifact,
 )
@@ -342,6 +345,7 @@ class PPOTrainer:
         *,
         device: str = "cpu",
         actor_learning_rate_override: float | None = None,
+        macro_actor_learning_rate_override: float | None = None,
         critic_learning_rate_override: float | None = None,
         capture_macro_transition_trace: bool = False,
     ) -> None:
@@ -420,6 +424,13 @@ class PPOTrainer:
             if actor_learning_rate_override is not None
             else self.config.get("actor_learning_rate", self.config["learning_rate"])
         )
+        macro_actor_lr = float(
+            macro_actor_learning_rate_override
+            if macro_actor_learning_rate_override is not None
+            else actor_lr
+        )
+        if not math.isfinite(macro_actor_lr) or macro_actor_lr <= 0.0:
+            raise ValueError("macro actor learning rate must be finite and positive.")
         critic_lr = float(
             critic_learning_rate_override
             if critic_learning_rate_override is not None
@@ -440,7 +451,7 @@ class PPOTrainer:
             raise ValueError("long_value_learning_rate must be finite and positive.")
         self.macro_optimizer = torch.optim.Adam(
             [
-                {"params": self.policy.macro_actor_parameters(), "lr": actor_lr},
+                {"params": self.policy.macro_actor_parameters(), "lr": macro_actor_lr},
                 {"params": self.policy.macro_critic_parameters(), "lr": macro_critic_lr},
             ],
             eps=1.0e-5,
@@ -459,6 +470,8 @@ class PPOTrainer:
         )
         self.learning_rates = {
             "actor": actor_lr,
+            "macro_actor": macro_actor_lr,
+            "micro_actor": actor_lr,
             "critic": critic_lr,
             "macro_critic": macro_critic_lr,
             "micro_critic": micro_critic_lr,
@@ -1631,6 +1644,7 @@ def run_training(
     generate_missing_episodes: bool = False,
     episode_generation_device: str = "cpu",
     actor_learning_rate_override: float | None = None,
+    macro_actor_learning_rate_override: float | None = None,
     critic_learning_rate_override: float | None = None,
     seed: int = 0,
     resume: bool = False,
@@ -1668,6 +1682,7 @@ def run_training(
     trainer = PPOTrainer(
         context,
         actor_learning_rate_override=actor_learning_rate_override,
+        macro_actor_learning_rate_override=macro_actor_learning_rate_override,
         critic_learning_rate_override=critic_learning_rate_override,
         capture_macro_transition_trace=save_macro_transition_trace,
     )
@@ -1711,6 +1726,7 @@ def run_training(
         context=context,
         target_episodes=target_episodes,
         episode_pool=str(pool_path),
+        episode_seed_start=episode_seed_start,
         resume=resume,
     )
 
@@ -1720,6 +1736,7 @@ def run_training(
     trace_episode_batches: list[dict[str, Any]] = []
     trace_summary = None
     for episode_index in range(completed, int(target_episodes)):
+        epoch_started_at = time.perf_counter()
         realization_path = episode_paths[episode_index]
         next_context = load_environment_context(
             str(config_file), realization_dir=realization_path
@@ -1734,6 +1751,7 @@ def run_training(
             deterministic=False,
         )
         update_metrics = trainer.update_from_episode(collection)
+        training_epoch_runtime = time.perf_counter() - epoch_started_at
         completed = episode_index + 1
         if save_macro_transition_trace:
             trace = trainer.last_macro_transition_trace
@@ -1781,6 +1799,7 @@ def run_training(
                 if episode_seed_start is not None
                 else realization_path.name
             ),
+            "training_epoch_runtime_seconds": float(training_epoch_runtime),
             **collection.summary,
         }
         episode_record.update(
@@ -1847,6 +1866,14 @@ def run_training(
         }
         append_dual_timescale_record(episode_metrics_path, episode_record)
         append_dual_timescale_record(update_metrics_path, update_record)
+        print(
+            format_training_epoch_log(
+                episode_record,
+                target_epochs=int(target_episodes),
+                macro_actor_learning_rate=trainer.learning_rates["macro_actor"],
+            ),
+            flush=True,
+        )
         append_dual_timescale_slot_metrics(
             slot_metrics_path, episode=completed, transitions=collection.micro.transitions
         )
@@ -1868,6 +1895,7 @@ def run_training(
             context=context,
             target_episodes=target_episodes,
             episode_pool=str(pool_path),
+            episode_seed_start=episode_seed_start,
             resume=resume,
         )
         summary = {
@@ -1883,6 +1911,7 @@ def run_training(
         with summary_path.open("w", encoding="utf-8", newline="\n") as stream:
             json.dump(summary, stream, ensure_ascii=False, sort_keys=True, indent=2)
             stream.write("\n")
+        update_training_epoch_return_plot(run_path)
         if save_macro_transition_trace:
             # Persist each validated cumulative trace before starting the next
             # episode so a later report/finalization failure cannot lose raw rows.
@@ -1915,6 +1944,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generate-missing-episodes", action="store_true")
     parser.add_argument("--episode-generation-device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--actor-learning-rate", type=float, default=None)
+    parser.add_argument("--macro-actor-learning-rate", type=float, default=None)
     parser.add_argument("--critic-learning-rate", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
@@ -1934,6 +1964,7 @@ def main(argv: list[str] | None = None) -> int:
         generate_missing_episodes=bool(args.generate_missing_episodes),
         episode_generation_device=args.episode_generation_device,
         actor_learning_rate_override=args.actor_learning_rate,
+        macro_actor_learning_rate_override=args.macro_actor_learning_rate,
         critic_learning_rate_override=args.critic_learning_rate,
         seed=args.seed,
         resume=bool(args.resume),
