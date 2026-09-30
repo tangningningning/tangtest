@@ -2953,6 +2953,9 @@ def write_dual_timescale_run_manifest(
         "macro_critic_steps_per_update": int(
             trainer.config.get("macro_critic_steps_per_update", 50)
         ),
+        "macro_critic_replay_history_episodes": int(
+            trainer.config.get("macro_critic_replay_history_episodes", 4)
+        ),
         "micro_macro_buffers_separate": True,
         "exact_q_training_enabled": False,
         "critic_mc_warmup_required": False,

@@ -335,6 +335,7 @@ class PPOTrainer:
             "matching_calls": 0,
             "kkt_calls": 0,
         }
+        self.macro_critic_replay_batches: list[dict[str, Any]] = []
 
     @property
     def config_contract(self) -> dict[str, Any]:
@@ -526,6 +527,11 @@ class PPOTrainer:
         normalized, adv_mean, adv_std = _normalize_advantages(advantages)
         batch["advantages"] = normalized
         batch["returns"] = returns
+        critic_training_batch = self._append_macro_critic_replay_batch(
+            batch["observations"],
+            returns,
+            episode_index=int(self.training_counters["completed_episodes"]) + 1,
+        )
         clip = float(self.config["clip_epsilon"])
         value_coefficient = float(self.config["value_loss_coefficient"])
         entropy_coefficient = float(self.config["entropy_coefficient"])
@@ -594,11 +600,13 @@ class PPOTrainer:
         result = self._aggregate_update_metrics("macro", records)
         critic_steps = int(self.config.get("macro_critic_steps_per_update", 50))
         critic_fit = self._update_macro_critic_only(
-            batch["observations"],
-            returns,
+            critic_training_batch["observations"],
+            critic_training_batch["returns"],
             steps=critic_steps,
             value_loss_coefficient=value_coefficient,
             max_grad_norm=max_grad_norm,
+            evaluation_observations=batch["observations"],
+            evaluation_targets=returns,
         )
         with torch.no_grad():
             predictions = (
@@ -633,6 +641,19 @@ class PPOTrainer:
                     returns, predictions
                 ),
                 "macro_critic_fit_snapshots": critic_fit["snapshots"],
+                "macro_critic_replay_episode_indices": critic_training_batch[
+                    "episode_indices"
+                ],
+                "macro_critic_replay_episode_count": len(
+                    critic_training_batch["episode_indices"]
+                ),
+                "macro_critic_replay_sample_count": len(
+                    critic_training_batch["returns"]
+                ),
+                "macro_critic_replay_fit_snapshots": critic_fit[
+                    "training_snapshots"
+                ],
+                "macro_critic_replay_fit_final": critic_fit["training_final"],
                 "macro_critic_grad_norm_before_clip": critic_fit[
                     "grad_norm_before_clip_mean"
                 ],
@@ -645,6 +666,46 @@ class PPOTrainer:
         )
         return result
 
+    def _append_macro_critic_replay_batch(
+        self,
+        observations: np.ndarray,
+        value_targets: np.ndarray,
+        *,
+        episode_index: int,
+    ) -> dict[str, Any]:
+        """Append one frozen Macro batch and return the bounded current+history batch."""
+
+        history_episodes = int(
+            self.config.get("macro_critic_replay_history_episodes", 4)
+        )
+        if history_episodes < 0:
+            raise ValueError("macro_critic_replay_history_episodes 不能为负数。")
+        observation_values = np.asarray(observations, dtype=np.float32)
+        target_values = np.asarray(value_targets, dtype=np.float32).reshape(-1)
+        if observation_values.ndim != 2 or len(observation_values) != len(target_values):
+            raise ValueError("Macro Critic replay batch observations/targets shape mismatch。")
+        if len(target_values) == 0:
+            raise ValueError("Macro Critic replay batch 不能为空。")
+        self.macro_critic_replay_batches.append(
+            {
+                "episode_index": int(episode_index),
+                "observations": observation_values.copy(),
+                "returns": target_values.copy(),
+            }
+        )
+        del self.macro_critic_replay_batches[: -max(1, history_episodes + 1)]
+        return {
+            "episode_indices": [
+                int(item["episode_index"]) for item in self.macro_critic_replay_batches
+            ],
+            "observations": np.concatenate(
+                [item["observations"] for item in self.macro_critic_replay_batches], axis=0
+            ),
+            "returns": np.concatenate(
+                [item["returns"] for item in self.macro_critic_replay_batches], axis=0
+            ),
+        }
+
     def _update_macro_critic_only(
         self,
         observations: np.ndarray,
@@ -653,6 +714,8 @@ class PPOTrainer:
         steps: int,
         value_loss_coefficient: float,
         max_grad_norm: float,
+        evaluation_observations: np.ndarray | None = None,
+        evaluation_targets: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """Update only the Macro Critic on one frozen full-episode target batch."""
 
@@ -665,9 +728,27 @@ class PPOTrainer:
             value_targets, dtype=torch.float32, device=self.device
         ).reshape(-1).detach().clone()
         frozen_targets = target_tensor.clone()
+        if (evaluation_observations is None) != (evaluation_targets is None):
+            raise ValueError("Macro Critic evaluation observations/targets 必须同时提供。")
+        if evaluation_observations is None:
+            evaluation_observation_tensor = observation_tensor
+            evaluation_target_tensor = target_tensor
+        else:
+            evaluation_observation_tensor = torch.as_tensor(
+                evaluation_observations, dtype=torch.float32, device=self.device
+            ).detach()
+            evaluation_target_tensor = torch.as_tensor(
+                evaluation_targets, dtype=torch.float32, device=self.device
+            ).reshape(-1).detach().clone()
+        frozen_evaluation_targets = evaluation_target_tensor.clone()
         actor_parameters = self.policy.macro_actor_parameters()
         critic_parameters = self.policy.macro_critic_parameters()
         snapshots: dict[str, dict[str, float | None]] = {
+            "0": self._macro_critic_fit_metrics(
+                evaluation_observation_tensor, evaluation_target_tensor
+            )
+        }
+        training_snapshots: dict[str, dict[str, float | None]] = {
             "0": self._macro_critic_fit_metrics(observation_tensor, target_tensor)
         }
         snapshot_steps = {10, 25, 50}
@@ -695,20 +776,33 @@ class PPOTrainer:
             self.training_counters["macro_critic_optimizer_steps"] += 1
             if not torch.equal(target_tensor, frozen_targets):
                 raise RuntimeError("Macro value targets changed during critic-only updates.")
+            if not torch.equal(evaluation_target_tensor, frozen_evaluation_targets):
+                raise RuntimeError("Macro Critic evaluation targets changed during updates.")
             if step in snapshot_steps:
                 snapshots[str(step)] = self._macro_critic_fit_metrics(
+                    evaluation_observation_tensor, evaluation_target_tensor
+                )
+                training_snapshots[str(step)] = self._macro_critic_fit_metrics(
                     observation_tensor, target_tensor
                 )
         if optimizer_steps != int(steps):
             raise RuntimeError("Macro Critic optimizer step count did not match its budget.")
         final = snapshots.get(str(int(steps)))
         if final is None:
-            final = self._macro_critic_fit_metrics(observation_tensor, target_tensor)
+            final = self._macro_critic_fit_metrics(
+                evaluation_observation_tensor, evaluation_target_tensor
+            )
             snapshots[str(int(steps))] = final
+        training_final = training_snapshots.get(str(int(steps)))
+        if training_final is None:
+            training_final = self._macro_critic_fit_metrics(observation_tensor, target_tensor)
+            training_snapshots[str(int(steps))] = training_final
         return {
             "optimizer_steps": optimizer_steps,
             "snapshots": snapshots,
             "final": final,
+            "training_snapshots": training_snapshots,
+            "training_final": training_final,
             "grad_norm_before_clip_mean": float(np.mean(gradient_before)),
             "grad_norm_after_clip_mean": float(np.mean(gradient_after)),
         }
@@ -798,6 +892,14 @@ class PPOTrainer:
             "macro_optimizer_state_dict": self.macro_optimizer.state_dict(),
             "value_normalization_states": {"micro": None, "macro": None},
             "training_counters": dict(self.training_counters),
+            "macro_critic_replay_batches": [
+                {
+                    "episode_index": int(item["episode_index"]),
+                    "observations": np.asarray(item["observations"], dtype=np.float32).copy(),
+                    "returns": np.asarray(item["returns"], dtype=np.float32).copy(),
+                }
+                for item in self.macro_critic_replay_batches
+            ],
             "seed": int(seed),
             "best_episode_return": best_episode_return,
             "python_rng_state": random.getstate(),
@@ -895,6 +997,37 @@ class PPOTrainer:
         restored_counters = dict(self.training_counters)
         restored_counters.update({key: int(value) for key, value in counters.items()})
         self.training_counters = restored_counters
+        replay_batches = payload.get("macro_critic_replay_batches", [])
+        if not isinstance(replay_batches, list):
+            raise ValueError("checkpoint Macro Critic replay batches must be a list.")
+        history_episodes = int(
+            self.config.get("macro_critic_replay_history_episodes", 4)
+        )
+        max_replay_batches = history_episodes + 1
+        if len(replay_batches) > max_replay_batches:
+            raise ValueError("checkpoint Macro Critic replay buffer exceeds configured window.")
+        restored_replay_batches: list[dict[str, Any]] = []
+        for item in replay_batches:
+            if not isinstance(item, dict) or set(item) != {
+                "episode_index", "observations", "returns"
+            }:
+                raise ValueError("checkpoint Macro Critic replay batch schema mismatch.")
+            observations = np.asarray(item["observations"], dtype=np.float32)
+            returns = np.asarray(item["returns"], dtype=np.float32).reshape(-1)
+            if observations.ndim != 2 or observations.shape[1] != self.policy.observation_dim:
+                raise ValueError("checkpoint Macro Critic replay observation shape mismatch.")
+            if len(observations) != len(returns) or len(returns) == 0:
+                raise ValueError("checkpoint Macro Critic replay target shape mismatch.")
+            if not np.isfinite(observations).all() or not np.isfinite(returns).all():
+                raise ValueError("checkpoint Macro Critic replay data contains NaN/Inf.")
+            restored_replay_batches.append(
+                {
+                    "episode_index": int(item["episode_index"]),
+                    "observations": observations.copy(),
+                    "returns": returns.copy(),
+                }
+            )
+        self.macro_critic_replay_batches = restored_replay_batches
         if restore_rng:
             if "python_rng_state" not in payload or "numpy_rng_state" not in payload:
                 raise ValueError("checkpoint 缺少可恢复的 RNG 状态。")

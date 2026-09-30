@@ -556,6 +556,7 @@ max_grad_norm = 0.5
 # 每个完整 episode 收集完毕后先更新 Micro，再用全部 Macro frames full-batch 更新。
 update_epochs = 4
 macro_critic_steps_per_update = 50
+macro_critic_replay_history_episodes = 4
 target_kl = 0.10
 num_minibatches = 10
 minibatch_size = 30
