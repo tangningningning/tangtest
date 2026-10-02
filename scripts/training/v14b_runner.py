@@ -1,4 +1,4 @@
-"""Shared formal V14b runner configuration and non-rollout preflight."""
+"""Shared V14b formal runner and Actor-LR fairness preflight."""
 
 from __future__ import annotations
 
@@ -15,45 +15,83 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
 CONFIG_PATH = PROJECT_ROOT / "configs" / "proposed" / "system_config.toml"
 EPISODE_POOL = PROJECT_ROOT / "environment_data" / "proposed_joint_training"
-REPORT_PATH = PROJECT_ROOT / "reports" / "v14b_training_preflight.json"
-TARGET_EPISODES = 300
+REPORT_PATH = PROJECT_ROOT / "reports" / "v14b_four_actor_lr_training_preflight.json"
+BASE_SEED = 27005
 EPISODE_SEED_START = 20001
-REPEAT_SEEDS = {1: 27005, 2: 27006, 3: 27007, 4: 27008}
-FORMAL_TRAINING_STARTED = False
+TARGET_EPISODES = 300
+CANONICAL_MICRO_ACTOR_LR = 3.0e-4
+CANONICAL_MACRO_CRITIC_LR = 1.0e-3
+EXPECTED_RUNS = (
+    {
+        "actor_lr": 1.0e-4,
+        "lr_label": "1e_minus_4",
+        "run_name": "formal_v14b_actor_lr_1e_minus_4",
+        "run_dir": "runs/formal_v14b_actor_lr_1e_minus_4",
+        "script": "scripts/training/run_v14b_actor_lr_1e_minus_4.py",
+    },
+    {
+        "actor_lr": 5.0e-4,
+        "lr_label": "5e_minus_4",
+        "run_name": "formal_v14b_actor_lr_5e_minus_4",
+        "run_dir": "runs/formal_v14b_actor_lr_5e_minus_4",
+        "script": "scripts/training/run_v14b_actor_lr_5e_minus_4.py",
+    },
+    {
+        "actor_lr": 1.0e-3,
+        "lr_label": "1e_minus_3",
+        "run_name": "formal_v14b_actor_lr_1e_minus_3",
+        "run_dir": "runs/formal_v14b_actor_lr_1e_minus_3",
+        "script": "scripts/training/run_v14b_actor_lr_1e_minus_3.py",
+    },
+    {
+        "actor_lr": 5.0e-3,
+        "lr_label": "5e_minus_3",
+        "run_name": "formal_v14b_actor_lr_5e_minus_3",
+        "run_dir": "runs/formal_v14b_actor_lr_5e_minus_3",
+        "script": "scripts/training/run_v14b_actor_lr_5e_minus_3.py",
+    },
+)
 
 for import_path in (PROJECT_ROOT, SOURCE_ROOT):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
 
-def run_name(repeat_id: int, seed: int) -> str:
-    if repeat_id not in REPEAT_SEEDS:
-        raise ValueError(f"repeat_id must be in {sorted(REPEAT_SEEDS)}")
-    return f"formal_v14b_repeat{repeat_id:02d}_seed{int(seed)}"
-
-
-def build_v14b_run_arguments(
-    *, repeat_id: int, seed: int, verbose: bool = False
+def build_v14b_run_spec(
+    *,
+    actor_lr: float,
+    lr_label: str,
+    run_name: str,
+    run_dir: str | Path,
+    verbose: bool = False,
 ) -> dict[str, Any]:
-    """Build one fresh run from the shared, unchanged formal TOML config."""
+    """Build a fresh run with the swept rate applied only to Macro Actor."""
 
-    if REPEAT_SEEDS.get(int(repeat_id)) != int(seed):
-        raise ValueError("V14b repeat id and formal training seed do not match.")
+    resolved_run_dir = Path(run_dir).expanduser()
+    if not resolved_run_dir.is_absolute():
+        resolved_run_dir = PROJECT_ROOT / resolved_run_dir
+    resolved_run_dir = resolved_run_dir.resolve(strict=False)
     return {
-        "config_path": CONFIG_PATH,
-        "target_episodes": TARGET_EPISODES,
-        "run_dir": PROJECT_ROOT / "runs" / run_name(int(repeat_id), int(seed)),
-        "episode_pool": EPISODE_POOL,
-        "episode_seed_start": EPISODE_SEED_START,
-        "generate_missing_episodes": False,
-        "episode_generation_device": "cpu",
-        "actor_learning_rate_override": None,
-        "macro_actor_learning_rate_override": None,
-        "critic_learning_rate_override": None,
-        "seed": int(seed),
-        "resume": False,
-        "verbose": bool(verbose),
-        "save_macro_transition_trace": False,
+        "actor_lr": float(actor_lr),
+        "lr_label": str(lr_label),
+        "run_name": str(run_name),
+        "run_dir": resolved_run_dir,
+        "training_arguments": {
+            "config_path": CONFIG_PATH,
+            "target_episodes": TARGET_EPISODES,
+            "run_dir": resolved_run_dir,
+            "episode_pool": EPISODE_POOL,
+            "episode_seed_start": EPISODE_SEED_START,
+            "generate_missing_episodes": False,
+            "episode_generation_device": "cpu",
+            "actor_learning_rate_override": None,
+            "macro_actor_learning_rate_override": float(actor_lr),
+            "critic_learning_rate_override": None,
+            "seed": BASE_SEED,
+            "resume": False,
+            "verbose": bool(verbose),
+            "save_macro_transition_trace": False,
+        },
     }
 
 
@@ -71,33 +109,60 @@ def _assert_run_directory_is_safe(run_dir: Path) -> None:
             )
 
 
-def main_for_repeat(repeat_id: int, seed: int, argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=f"Fresh V14b repeat {repeat_id:02d}.")
+def main_for_run_spec(spec: dict[str, Any], argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=f"Fresh V14b Actor LR {spec['lr_label']}.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
-    run_arguments = build_v14b_run_arguments(
-        repeat_id=repeat_id, seed=seed, verbose=args.verbose
+    runtime_spec = build_v14b_run_spec(
+        actor_lr=spec["actor_lr"],
+        lr_label=spec["lr_label"],
+        run_name=spec["run_name"],
+        run_dir=spec["run_dir"],
+        verbose=args.verbose,
     )
-    _assert_run_directory_is_safe(run_arguments["run_dir"])
-
+    if runtime_spec["run_name"] != runtime_spec["run_dir"].name:
+        raise ValueError("run_name must match the formal run directory name.")
+    _assert_run_directory_is_safe(runtime_spec["run_dir"])
     from ppo_simple.trainer import run_training
 
-    run_training(**run_arguments)
+    run_training(**runtime_spec["training_arguments"])
     return 0
 
 
 def _stable_hash(value: Any) -> str:
     encoded = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _state_hash(state_dict: dict[str, Any], prefixes: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(state_dict.items()):
+        if not name.startswith(prefixes):
+            continue
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _parameter_ids(parameters: Any) -> set[int]:
+    return {id(parameter) for parameter in parameters}
+
+
 def build_preflight_report() -> dict[str, Any]:
-    """Validate runner/config contracts without constructing an environment."""
+    """Build configs/optimizers and compare initialization without rollout."""
 
     from common import project_config
     from ppo_simple import trainer as trainer_module
+    from ppo_simple.interface import load_environment_context
     from ppo_simple.policy import DualTimescaleActorCritic
     from ppo_simple.trainer import PPOTrainer
     from scenario.realization import REALIZATION_ARTIFACT_FILENAMES
@@ -105,40 +170,54 @@ def build_preflight_report() -> dict[str, Any]:
     parsed_config = project_config.parse_toml_file(CONFIG_PATH)
     ppo_config = parsed_config["algorithm"]["ppo"]
     runner_specs: list[dict[str, Any]] = []
-    config_hashes: list[str] = []
+    normalized_configs: list[dict[str, Any]] = []
     occupied_run_directories: list[str] = []
-    for repeat_id, expected_seed in REPEAT_SEEDS.items():
-        module = importlib.import_module(
-            f"scripts.training.run_v14b_repeat_{repeat_id:02d}"
-        )
-        if int(module.REPEAT_ID) != repeat_id or int(module.TRAINING_SEED) != expected_seed:
-            raise ValueError(f"runner {repeat_id:02d} has an unexpected repeat/seed.")
-        arguments = module.build_run_arguments()
-        if arguments["config_path"] != CONFIG_PATH:
-            raise ValueError(f"runner {repeat_id:02d} does not use the canonical config.")
-        run_dir = Path(arguments["run_dir"]).resolve(strict=False)
-        run_name_value = run_name(repeat_id, expected_seed)
-        shared_arguments = {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in arguments.items()
-            if key not in {"seed", "run_dir"}
-        }
-        config_hashes.append(
-            _stable_hash({"canonical_config": parsed_config, "run_arguments": shared_arguments})
-        )
-        if run_dir.exists() and (
-            not run_dir.is_dir() or any(run_dir.iterdir())
+    runner_import_errors: list[str] = []
+    for expected in EXPECTED_RUNS:
+        script_path = PROJECT_ROOT / expected["script"]
+        module_name = f"scripts.training.{script_path.stem}"
+        try:
+            module = importlib.import_module(module_name)
+            spec = module.build_run_spec()
+        except Exception as exc:
+            runner_import_errors.append(
+                f"{module_name}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        spec_run_dir = Path(spec["run_dir"]).resolve(strict=False)
+        if (
+            float(spec["actor_lr"]) != expected["actor_lr"]
+            or str(spec["lr_label"]) != expected["lr_label"]
+            or str(spec["run_name"]) != expected["run_name"]
+            or spec_run_dir
+            != (PROJECT_ROOT / expected["run_dir"]).resolve(strict=False)
         ):
-            occupied_run_directories.append(str(run_dir))
+            runner_import_errors.append(f"{module_name}: RUN_SPEC differs from contract")
+        args = dict(spec["training_arguments"])
+        normalized_arguments = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in args.items()
+            if key != "run_dir"
+        }
+        normalized_arguments["macro_actor_learning_rate_override"] = "<actor_lr>"
+        normalized_configs.append(
+            {"canonical_config": parsed_config, "training_arguments": normalized_arguments}
+        )
+        if spec_run_dir.exists() and (
+            not spec_run_dir.is_dir() or any(spec_run_dir.iterdir())
+        ):
+            occupied_run_directories.append(str(spec_run_dir))
         runner_specs.append(
             {
-                "repeat_id": repeat_id,
-                "script": f"scripts/training/run_v14b_repeat_{repeat_id:02d}.py",
-                "seed": expected_seed,
-                "run_name": run_name_value,
-                "run_dir": str(run_dir),
-                "target_episodes": int(arguments["target_episodes"]),
-                "resume": bool(arguments["resume"]),
+                "script": expected["script"],
+                "actor_lr": float(spec["actor_lr"]),
+                "lr_label": str(spec["lr_label"]),
+                "run_name": str(spec["run_name"]),
+                "run_dir": str(spec_run_dir),
+                "target_episodes": int(args["target_episodes"]),
+                "base_seed": int(args["seed"]),
+                "episode_seed_start": int(args["episode_seed_start"]),
+                "resume": bool(args["resume"]),
             }
         )
 
@@ -146,34 +225,109 @@ def build_preflight_report() -> dict[str, Any]:
         EPISODE_POOL / f"episode_{seed}"
         for seed in range(EPISODE_SEED_START, EPISODE_SEED_START + TARGET_EPISODES)
     ]
-    required_realization_files = tuple(REALIZATION_ARTIFACT_FILENAMES.values())
+    required_files = tuple(REALIZATION_ARTIFACT_FILENAMES.values())
     missing_realizations = [
         str(directory)
         for directory in episode_dirs
         if not directory.is_dir()
-        or any(not (directory / filename).is_file() for filename in required_realization_files)
+        or any(not (directory / filename).is_file() for filename in required_files)
     ]
 
-    # Construct only a policy module to verify the fixed 400-128-128-1 scalar head.
-    # No environment, simulator, rollout, Matching, or KKT object is created here.
-    policy = DualTimescaleActorCritic(
-        observation_dim=400,
-        macro_cache_feature_dim=1,
-        micro_uav_feature_dim=1,
-        duration_candidates=(1,),
-        prediction_horizon=1,
-        hidden_sizes=tuple(int(size) for size in ppo_config["hidden_sizes"]),
-    )
-    macro_linear_shapes = [
-        [int(layer.in_features), int(layer.out_features)]
-        for layer in policy.macro_critic
-        if layer.__class__.__name__ == "Linear"
-    ]
-    macro_activations = [
-        layer.__class__.__name__
-        for layer in policy.macro_critic
-        if layer.__class__.__name__ != "Linear"
-    ]
+    # This builds a static context from the fixed data; it does not step an
+    # environment or execute Matching/KKT.
+    context = load_environment_context(str(CONFIG_PATH), realization_dir=episode_dirs[0])
+    actor_hashes: dict[str, str] = {}
+    main_critic_hashes: dict[str, str] = {}
+    micro_critic_hashes: dict[str, str] = {}
+    long_critic_hashes: dict[str, str] = {}
+    macro_actor_optimizer_lrs: dict[str, float] = {}
+    micro_actor_optimizer_lrs: dict[str, float] = {}
+    macro_critic_optimizer_lrs: dict[str, float] = {}
+    micro_critic_optimizer_lrs: dict[str, float] = {}
+    long_value_optimizer_lrs: dict[str, float] = {}
+    optimizer_groups_valid: dict[str, bool] = {}
+    optimizer_counters_zero: dict[str, bool] = {}
+    macro_critic_shapes: list[list[int]] = []
+    macro_critic_activations: list[str] = []
+
+    for spec in runner_specs:
+        run_name = spec["run_name"]
+        module_name = f"scripts.training.{Path(spec['script']).stem}"
+        args = importlib.import_module(module_name).build_run_spec()["training_arguments"]
+        trainer_module._seed_everything(BASE_SEED)
+        trainer = PPOTrainer(
+            context,
+            actor_learning_rate_override=args["actor_learning_rate_override"],
+            macro_actor_learning_rate_override=args[
+                "macro_actor_learning_rate_override"
+            ],
+            critic_learning_rate_override=args["critic_learning_rate_override"],
+        )
+        state = trainer.policy.state_dict()
+        actor_prefixes = (
+            "macro_actor_encoder.",
+            "macro_cache_candidate_encoder.",
+            "macro_cache_scorer.",
+            "macro_duration_scorer.",
+            "micro_actor_encoder.",
+            "micro_uav_candidate_scorer.",
+        )
+        actor_hashes[run_name] = _state_hash(state, actor_prefixes)
+        main_critic_hashes[run_name] = _state_hash(state, ("macro_critic.",))
+        micro_critic_hashes[run_name] = _state_hash(state, ("micro_critic.",))
+        long_critic_hashes[run_name] = _state_hash(state, ("long_value_critic.",))
+
+        macro_actor_optimizer_lrs[run_name] = float(
+            trainer.macro_optimizer.param_groups[0]["lr"]
+        )
+        micro_actor_optimizer_lrs[run_name] = float(
+            trainer.micro_optimizer.param_groups[0]["lr"]
+        )
+        micro_critic_optimizer_lrs[run_name] = float(
+            trainer.micro_optimizer.param_groups[1]["lr"]
+        )
+        macro_critic_optimizer_lrs[run_name] = float(
+            trainer.macro_critic_optimizer.param_groups[0]["lr"]
+        )
+        long_value_optimizer_lrs[run_name] = float(
+            trainer.long_value_optimizer.param_groups[0]["lr"]
+        )
+        if not macro_critic_shapes:
+            macro_critic_shapes = [
+                [int(layer.in_features), int(layer.out_features)]
+                for layer in trainer.policy.macro_critic
+                if hasattr(layer, "in_features") and hasattr(layer, "out_features")
+            ]
+            macro_critic_activations = [
+                layer.__class__.__name__
+                for layer in trainer.policy.macro_critic
+                if not (hasattr(layer, "in_features") and hasattr(layer, "out_features"))
+            ]
+
+        macro_optimizer_ids = {
+            id(parameter)
+            for group in trainer.macro_optimizer.param_groups
+            for parameter in group["params"]
+        }
+        micro_actor_group_ids = _parameter_ids(
+            trainer.micro_optimizer.param_groups[0]["params"]
+        )
+        optimizer_groups_valid[run_name] = (
+            macro_optimizer_ids == _parameter_ids(trainer.policy.macro_actor_parameters())
+            and micro_actor_group_ids
+            == _parameter_ids(trainer.policy.micro_actor_parameters())
+            and macro_actor_optimizer_lrs[run_name] == spec["actor_lr"]
+            and micro_actor_optimizer_lrs[run_name] == CANONICAL_MICRO_ACTOR_LR
+            and macro_critic_optimizer_lrs[run_name] == CANONICAL_MACRO_CRITIC_LR
+            and micro_critic_optimizer_lrs[run_name]
+            == float(ppo_config["micro_critic_learning_rate"])
+            and long_value_optimizer_lrs[run_name]
+            == float(ppo_config["long_value_learning_rate"])
+        )
+        optimizer_counters_zero[run_name] = all(
+            int(value) == 0 for value in trainer.training_counters.values()
+        )
+
     policy_source = inspect.getsource(DualTimescaleActorCritic).lower()
     critic_fit_source = inspect.getsource(PPOTrainer._update_macro_critic_only).lower()
     macro_update_source = inspect.getsource(PPOTrainer._update_macro).lower()
@@ -182,128 +336,156 @@ def build_preflight_report() -> dict[str, Any]:
         token in critic_fit_source
         for token in ("/ target_std", "/target_std", "target_std ** 2", "target_std**2")
     )
-    ensemble_active = any(
-        token in policy_source for token in ("ensemble", "macro_critics")
-    )
+    ensemble_active = any(token in policy_source for token in ("ensemble", "macro_critics"))
     heteroscedastic_active = any(
-        token in policy_source for token in ("heteroscedastic", "variance_head", "gaussian_nll")
+        token in policy_source
+        for token in ("heteroscedastic", "variance_head", "gaussian_nll")
     )
-    last1_active = "last1_macro_transition_buffer" in macro_update_source
+    last1_enabled = "last1_macro_transition_buffer" in macro_update_source
+    last1_length_one = last1_enabled and "episode_index - 1" in macro_update_source
     gradient_norm_matching = (
         "current_norm_tensor / (last1_norm_raw_tensor" in pcgrad_source
         and "current_norm_tensor / mixed_norm_tensor" in pcgrad_source
     )
-    pcgrad_current_priority = (
+    current_priority_pcgrad = (
         "historical - projection_coefficient * present" in pcgrad_source
         and "current_gradient_projected" not in pcgrad_source
     )
-    last1_length_one = last1_active and "episode_index - 1" in macro_update_source
     alpha = float(trainer_module.MACRO_CRITIC_LAST1_ALPHA)
+    architecture_version = int(DualTimescaleActorCritic.architecture_version)
+    checkpoint_version = int(trainer_module.CHECKPOINT_VERSION)
     target_mode = str(ppo_config.get("macro_critic_target_mode", ""))
-    target_episodes = all(item["target_episodes"] == TARGET_EPISODES for item in runner_specs)
-    resume_disabled = all(item["resume"] is False for item in runner_specs)
-    output_dirs_unique = len({item["run_dir"] for item in runner_specs}) == 4
-    config_identical = len(set(config_hashes)) == 1
-    learning_rate_sweep = any("lr_1e" in item["script"] or "lr_3e" in item["script"] for item in runner_specs)
 
+    config_hashes = [_stable_hash(config) for config in normalized_configs]
+    expected_lr_values = [float(spec["actor_lr"]) for spec in EXPECTED_RUNS]
+    actual_lr_values = [float(spec["actor_lr"]) for spec in runner_specs]
+    same_actor_initialization = len(set(actor_hashes.values())) == 1 and len(actor_hashes) == 4
+    same_main_critic_initialization = (
+        len(set(main_critic_hashes.values())) == 1 and len(main_critic_hashes) == 4
+    )
+    same_other_critic_initialization = (
+        len(set(micro_critic_hashes.values())) == 1
+        and len(set(long_critic_hashes.values())) == 1
+        and len(micro_critic_hashes) == 4
+        and len(long_critic_hashes) == 4
+    )
+    episode_sequence_identical = (
+        not missing_realizations
+        and all(spec["episode_seed_start"] == EPISODE_SEED_START for spec in runner_specs)
+    )
+    only_actor_lr_diff = (
+        len(runner_specs) == len(EXPECTED_RUNS)
+        and len(set(config_hashes)) == 1
+        and actual_lr_values == expected_lr_values
+        and all(spec["base_seed"] == BASE_SEED for spec in runner_specs)
+        and all(spec["target_episodes"] == TARGET_EPISODES for spec in runner_specs)
+        and all(spec["resume"] is False for spec in runner_specs)
+        and all(optimizer_groups_valid.values())
+    )
     checks = {
+        "all_four_launchers_import": not runner_import_errors and len(runner_specs) == 4,
         "canonical_config_exists": CONFIG_PATH.is_file(),
         "training_pool_exists": EPISODE_POOL.is_dir(),
-        "all_300_training_realizations_complete": not missing_realizations,
-        "formal_run_directories_are_fresh": not occupied_run_directories,
+        "episode_realizations_20001_20300_complete": not missing_realizations,
+        "episode_realization_sequence_identical": episode_sequence_identical,
+        "run_directories_are_unique": len({spec["run_dir"] for spec in runner_specs}) == 4,
+        "run_directories_are_fresh": not occupied_run_directories,
         "architecture_is_400_128_128_1_scalar_silu": (
-            macro_linear_shapes == [[400, 128], [128, 128], [128, 1]]
-            and macro_activations == ["SiLU", "SiLU"]
+            macro_critic_shapes == [[400, 128], [128, 128], [128, 1]]
+            and macro_critic_activations == ["SiLU", "SiLU"]
         ),
-        "architecture_version_is_15": int(DualTimescaleActorCritic.architecture_version) == 15,
-        "checkpoint_version_is_37": int(trainer_module.CHECKPOINT_VERSION) == 37,
+        "architecture_version_is_15": architecture_version == 15,
+        "checkpoint_version_is_37": checkpoint_version == 37,
         "target_mode_is_two_step_smdp_td": target_mode == "two_step_smdp_td",
+        "only_macro_actor_lr_is_overridden": all(optimizer_groups_valid.values()),
+        "macro_actor_lr_values_match_spec": actual_lr_values == expected_lr_values,
+        "same_initial_actor_parameters": same_actor_initialization,
+        "same_initial_main_critic_parameters": same_main_critic_initialization,
+        "same_initial_micro_and_long_critic_parameters": same_other_critic_initialization,
+        "only_actor_lr_diff": only_actor_lr_diff,
         "target_scale_normalization_disabled": not target_scale_normalization_active,
         "ensemble_disabled": not ensemble_active,
         "heteroscedastic_disabled": not heteroscedastic_active,
-        "last1_enabled": last1_active and last1_length_one,
         "last1_length_is_one": last1_length_one,
-        "last1_norm_matching_enabled": gradient_norm_matching,
-        "pcgrad_current_priority": pcgrad_current_priority,
+        "gradient_norm_matching_enabled": gradient_norm_matching,
+        "current_priority_pcgrad": current_priority_pcgrad,
         "alpha_is_one": alpha == 1.0,
-        "macro_critic_steps_is_50": int(ppo_config["macro_critic_steps_per_update"]) == 50,
-        "macro_critic_value_loss_coefficient_is_0_01": float(ppo_config["value_loss_coefficient"]) == 0.01,
-        "max_grad_norm_is_0_5": float(ppo_config["max_grad_norm"]) == 0.5,
-        "target_episodes_is_300": target_episodes,
-        "resume_is_false": resume_disabled,
-        "run_directories_are_unique": output_dirs_unique,
-        "config_identical_except_seed_and_run_id": config_identical,
-        "learning_rate_sweep_disabled": not learning_rate_sweep,
+        "target_episodes_is_300": all(
+            spec["target_episodes"] == TARGET_EPISODES for spec in runner_specs
+        ),
+        "base_seed_is_27005": all(spec["base_seed"] == BASE_SEED for spec in runner_specs),
+        "resume_is_false": all(spec["resume"] is False for spec in runner_specs),
+        "optimizer_counters_untouched": all(optimizer_counters_zero.values()),
+        "no_optimizer_step_called": all(optimizer_counters_zero.values()),
     }
     ready = all(checks.values())
     report = {
         "LATEST_ALGORITHM": "V14b",
-        "ARCHITECTURE_VERSION": int(DualTimescaleActorCritic.architecture_version),
-        "CHECKPOINT_VERSION": int(trainer_module.CHECKPOINT_VERSION),
-        "MAIN_TRAINING_SCRIPTS": [item["script"] for item in runner_specs],
-        "REPEAT_SEEDS": [item["seed"] for item in runner_specs],
+        "ARCHITECTURE_VERSION": architecture_version,
+        "CHECKPOINT_VERSION": checkpoint_version,
+        "ACTOR_LR_VALUES": actual_lr_values,
+        "SCRIPT_1": EXPECTED_RUNS[0]["script"],
+        "SCRIPT_2": EXPECTED_RUNS[1]["script"],
+        "SCRIPT_3": EXPECTED_RUNS[2]["script"],
+        "SCRIPT_4": EXPECTED_RUNS[3]["script"],
         "RUNS": runner_specs,
         "TARGET_EPISODES": TARGET_EPISODES,
-        "LEARNING_RATE_SWEEP": learning_rate_sweep,
-        "CONFIG_IDENTICAL_EXCEPT_SEED_AND_RUN_ID": config_identical,
-        "CONFIG_HASH_EXCLUDING_SEED_AND_RUN_ID": config_hashes[0] if config_hashes else None,
-        "CANONICAL_CONFIG_PATH": str(CONFIG_PATH),
-        "CANONICAL_CONFIG_RAW_SHA256": project_config.raw_config_sha256(CONFIG_PATH),
+        "BASE_SEED": BASE_SEED,
+        "EPISODE_SEEDS": "20001-20300",
+        "EPISODE_REALIZATION_SEQUENCE_IDENTICAL": episode_sequence_identical,
+        "FRESH_INITIALIZATION": True,
+        "RESUME": False,
+        "ACTOR_INITIAL_STATE_SHA256": next(iter(actor_hashes.values()), None),
+        "ACTOR_INITIAL_STATE_SHA256_BY_RUN": actor_hashes,
+        "MAIN_CRITIC_INITIAL_STATE_SHA256": next(iter(main_critic_hashes.values()), None),
+        "MAIN_CRITIC_INITIAL_STATE_SHA256_BY_RUN": main_critic_hashes,
+        "MICRO_CRITIC_INITIAL_STATE_SHA256_BY_RUN": micro_critic_hashes,
+        "LONG_CRITIC_INITIAL_STATE_SHA256_BY_RUN": long_critic_hashes,
+        "SAME_INITIAL_ACTOR_PARAMETERS": same_actor_initialization,
+        "SAME_INITIAL_CRITIC_PARAMETERS": (
+            same_main_critic_initialization and same_other_critic_initialization
+        ),
+        "ONLY_ACTOR_LR_DIFF": only_actor_lr_diff,
+        "CANONICAL_CONFIG_HASH_EXCLUDING_SWEEP_FIELDS": (
+            config_hashes[0] if config_hashes else None
+        ),
+        "MACRO_ACTOR_OPTIMIZER_LR_BY_RUN": macro_actor_optimizer_lrs,
+        "MICRO_ACTOR_OPTIMIZER_LR_BY_RUN": micro_actor_optimizer_lrs,
+        "MACRO_CRITIC_OPTIMIZER_LR_BY_RUN": macro_critic_optimizer_lrs,
+        "MICRO_CRITIC_OPTIMIZER_LR_BY_RUN": micro_critic_optimizer_lrs,
+        "LONG_VALUE_OPTIMIZER_LR_BY_RUN": long_value_optimizer_lrs,
+        "LR_AFFECTED_OPTIMIZERS": ["Macro Actor optimizer (macro_optimizer)"],
+        "MACRO_CRITIC_LR": float(ppo_config["macro_critic_learning_rate"]),
+        "MICRO_ACTOR_LR": float(ppo_config["actor_learning_rate"]),
+        "MICRO_CRITIC_LR": float(ppo_config["micro_critic_learning_rate"]),
+        "LONG_VALUE_LR": float(ppo_config["long_value_learning_rate"]),
+        "PPO_CLIP": float(ppo_config["clip_epsilon"]),
+        "PPO_EPOCHS": int(ppo_config["update_epochs"]),
+        "CRITIC_STEPS": int(ppo_config["macro_critic_steps_per_update"]),
+        "MAIN_VALUE_LOSS_COEFFICIENT": float(ppo_config["value_loss_coefficient"]),
+        "MACRO_CRITIC_MAX_GRAD_NORM": float(ppo_config["max_grad_norm"]),
         "TARGET_MODE": target_mode,
+        "LAST1_ENABLED": last1_enabled,
+        "LAST1_LENGTH": 1 if last1_length_one else 0,
+        "GRADIENT_NORM_MATCHING": gradient_norm_matching,
+        "CURRENT_PRIORITY_PCGRAD": current_priority_pcgrad,
+        "ALPHA": alpha,
         "TARGET_SCALE_NORMALIZATION_ACTIVE": target_scale_normalization_active,
         "ENSEMBLE_ACTIVE": ensemble_active,
         "HETEROSCEDASTIC_ACTIVE": heteroscedastic_active,
-        "LAST1_ENABLED": last1_active,
-        "LAST1_LENGTH": 1 if last1_length_one else 0,
-        "GRADIENT_NORM_MATCHING": gradient_norm_matching,
-        "PCGRAD_CURRENT_PRIORITY": pcgrad_current_priority,
-        "ALPHA": alpha,
-        "MACRO_CRITIC_LEARNING_RATE": float(ppo_config["macro_critic_learning_rate"]),
-        "MACRO_CRITIC_STEPS_PER_UPDATE": int(ppo_config["macro_critic_steps_per_update"]),
-        "MACRO_CRITIC_VALUE_LOSS_COEFFICIENT": float(ppo_config["value_loss_coefficient"]),
-        "MACRO_CRITIC_MAX_GRAD_NORM": float(ppo_config["max_grad_norm"]),
-        "LEARNING_RATES": {
-            "actor": float(ppo_config["actor_learning_rate"]),
-            "macro_critic": float(ppo_config["macro_critic_learning_rate"]),
-            "micro_actor": float(ppo_config["actor_learning_rate"]),
-            "micro_critic": float(ppo_config["micro_critic_learning_rate"]),
-            "long_value": float(ppo_config["long_value_learning_rate"]),
-        },
-        "PPO": {
-            "clip_epsilon": float(ppo_config["clip_epsilon"]),
-            "update_epochs": int(ppo_config["update_epochs"]),
-            "target_kl": float(ppo_config["target_kl"]),
-            "num_minibatches": int(ppo_config["num_minibatches"]),
-            "minibatch_size": int(ppo_config["minibatch_size"]),
-        },
-        "SEED_PROTOCOL": {
-            "model_and_training_random_seed": "REPEAT_SEEDS",
-            "episode_realization_seed_start": EPISODE_SEED_START,
-            "episode_realization_count": TARGET_EPISODES,
-            "episode_realization_pool_shared_across_repeats": True,
-            "generate_missing_episodes": False,
-        },
-        "FORMAL_TRAINING_STARTED": FORMAL_TRAINING_STARTED,
-        "READY_FOR_FORMAL_TRAINING": ready,
+        "TRAINING_EXECUTED": False,
+        "ROLLOUT_EXECUTED": False,
+        "OPTIMIZER_STEP_EXECUTED": False,
+        "READY_FOR_FOUR_LR_TRAINING": ready,
         "CHECKS": checks,
         "BLOCKERS": [
-            f"missing/incomplete training realization: {path}"
-            for path in missing_realizations
-        ]
-        + [f"formal run directory is non-empty: {path}" for path in occupied_run_directories],
-        "MISSING_TRAINING_REALIZATIONS": missing_realizations,
-        "OCCUPIED_RUN_DIRECTORIES": occupied_run_directories,
-        "FORMAL_ARTIFACTS_PER_RUN": [
-            "run_config.toml",
-            "run_manifest.json",
-            "run_summary.json",
-            "episode_metrics.jsonl",
-            "update_metrics.jsonl",
-            "critic_diagnostics.jsonl",
-            "slot_metrics.jsonl",
-            "checkpoints/latest_checkpoint.pt",
-            "checkpoints/best_train_return_checkpoint.pt",
+            *runner_import_errors,
+            *[f"missing/incomplete realization: {path}" for path in missing_realizations],
+            *[f"run directory is non-empty: {path}" for path in occupied_run_directories],
         ],
+        "MISSING_REALIZATIONS": missing_realizations,
+        "OCCUPIED_RUN_DIRECTORIES": occupied_run_directories,
+        "FORMAL_TRAINING_STARTED": False,
     }
     return report
 
