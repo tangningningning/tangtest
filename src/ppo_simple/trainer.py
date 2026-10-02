@@ -9,6 +9,7 @@ import json
 import math
 import random
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -35,7 +36,6 @@ from .interface import (
 )
 from .macro_targets import (
     build_macro_n2_target,
-    build_macro_smdp_lambda_return_target,
 )
 from .policy import DualTimescaleActorCritic
 from .primitive_control import PrimitiveTensorSpec
@@ -67,15 +67,11 @@ from .rollout import (
 CHECKPOINT_METHOD = "ppo_dual_timescale_v1"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
-CHECKPOINT_VERSION = 33
+CHECKPOINT_VERSION = 37
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 MACRO_ACTOR_ADVANTAGE_MODE = "duration_aware_smdp_gae"
-MACRO_CRITIC_TARGET_MODES = {
-    "formal_gae",
-    "one_step_smdp_td",
-    "two_step_smdp_td",
-    "smdp_lambda_return",
-}
+MACRO_CRITIC_TARGET_MODE = "two_step_smdp_td"
+MACRO_CRITIC_LAST1_ALPHA = 1.0
 
 
 def _require_torch() -> None:
@@ -189,37 +185,6 @@ def _normalize_advantages(values: np.ndarray) -> tuple[np.ndarray, float, float]
     return (array - mean) / (std + 1.0e-8), mean, std
 
 
-def _one_step_smdp_td_targets(
-    rewards: Any,
-    old_next_values: Any,
-    actual_durations: Any,
-    dones: Any,
-    gamma: float,
-) -> np.ndarray:
-    """Build detached rollout-frozen N1 targets using actual SMDP durations."""
-
-    reward_values = np.asarray(rewards, dtype=np.float64).reshape(-1)
-    next_values = np.asarray(old_next_values, dtype=np.float64).reshape(-1)
-    durations = np.asarray(actual_durations, dtype=np.int64).reshape(-1)
-    terminal = np.asarray(dones, dtype=bool).reshape(-1)
-    if not (
-        reward_values.shape == next_values.shape == durations.shape == terminal.shape
-    ):
-        raise ValueError("N1 Macro target arrays must have matching shapes.")
-    if np.any(durations <= 0):
-        raise ValueError("N1 Macro target actual durations must be positive.")
-    gamma_value = float(gamma)
-    if not np.isfinite(gamma_value) or gamma_value < 0.0:
-        raise ValueError("N1 Macro target gamma must be finite and non-negative.")
-    if not all(np.isfinite(values).all() for values in (reward_values, next_values)):
-        raise ValueError("N1 Macro target inputs contain NaN/Inf.")
-    discounts = np.power(gamma_value, durations.astype(np.float64))
-    targets = reward_values + discounts * next_values * (~terminal)
-    if not np.isfinite(targets).all():
-        raise ValueError("N1 Macro targets contain NaN/Inf.")
-    return targets.astype(np.float32)
-
-
 def _realized_smdp_return_to_go(
     rewards: Any, actual_durations: Any, dones: Any, gamma: float
 ) -> np.ndarray:
@@ -259,6 +224,119 @@ def _gradient_norm(parameters: Any) -> float:
     if not norms:
         return 0.0
     return float(torch.linalg.vector_norm(torch.stack(norms), ord=2).detach().cpu())
+
+
+def _pcgrad_lite_current_priority(
+    current_gradients: tuple[Any, ...],
+    last1_gradients: tuple[Any, ...],
+    *,
+    eps: float = 1.0e-12,
+) -> dict[str, Any]:
+    """Match last1's norm, project only it on conflict, then restore current norm."""
+
+    if len(current_gradients) != len(last1_gradients) or not current_gradients:
+        raise ValueError("PCGrad groups must contain matching non-empty gradients.")
+    current = []
+    last1 = []
+    for current_gradient, last1_gradient in zip(
+        current_gradients, last1_gradients, strict=True
+    ):
+        if tuple(current_gradient.shape) != tuple(last1_gradient.shape):
+            raise ValueError("PCGrad group gradient tensor shapes must match.")
+        current.append(current_gradient.detach())
+        last1.append(last1_gradient.detach())
+    current = tuple(current)
+    last1 = tuple(last1)
+
+    def dot(left: tuple[Any, ...], right: tuple[Any, ...]) -> Any:
+        return sum(torch.sum(a * b) for a, b in zip(left, right, strict=True))
+
+    def norm(gradients: tuple[Any, ...]) -> Any:
+        return torch.sqrt(dot(gradients, gradients))
+
+    current_norm_tensor = norm(current)
+    last1_norm_raw_tensor = norm(last1)
+    dot_raw_tensor = dot(current, last1)
+    current_norm = float(current_norm_tensor.cpu())
+    last1_norm_raw = float(last1_norm_raw_tensor.cpu())
+    dot_raw = float(dot_raw_tensor.cpu())
+    cosine_raw = dot_raw / (current_norm * last1_norm_raw + float(eps))
+
+    current_zero_fallback = current_norm <= float(eps)
+    if last1_norm_raw > float(eps) and not current_zero_fallback:
+        last_scale_tensor = current_norm_tensor / (last1_norm_raw_tensor + float(eps))
+        last1_scaled = tuple(gradient * last_scale_tensor for gradient in last1)
+        last_scale = float(last_scale_tensor.cpu())
+    else:
+        last_scale_tensor = current_norm_tensor.new_zeros(())
+        last1_scaled = tuple(torch.zeros_like(gradient) for gradient in last1)
+        last_scale = 0.0
+    last1_scaled_norm_tensor = norm(last1_scaled)
+    last1_scaled_norm = float(last1_scaled_norm_tensor.cpu())
+    scaled_to_current_ratio = (
+        last1_scaled_norm / current_norm if current_norm > float(eps) else 0.0
+    )
+
+    dot_scaled_tensor = dot(current, last1_scaled)
+    projection_active = bool(float(dot_scaled_tensor.cpu()) < 0.0)
+    if projection_active and not current_zero_fallback:
+        projection_coefficient = dot_scaled_tensor / (
+            current_norm_tensor.square() + float(eps)
+        )
+        last1_adjusted = tuple(
+            historical - projection_coefficient * present
+            for present, historical in zip(current, last1_scaled, strict=True)
+        )
+    else:
+        last1_adjusted = tuple(item.clone() for item in last1_scaled)
+
+    dot_post_tensor = dot(current, last1_adjusted)
+    last1_adjusted_norm_tensor = norm(last1_adjusted)
+    cosine_post = float(
+        dot_post_tensor.cpu()
+        / (current_norm_tensor * last1_adjusted_norm_tensor + float(eps))
+    )
+    mixed = tuple(
+        present + MACRO_CRITIC_LAST1_ALPHA * historical
+        for present, historical in zip(current, last1_adjusted, strict=True)
+    )
+    mixed_norm_tensor = norm(mixed)
+    mixed_norm = float(mixed_norm_tensor.cpu())
+    if current_zero_fallback or mixed_norm <= float(eps):
+        combined = tuple(gradient.clone() for gradient in current)
+    else:
+        final_scale = current_norm_tensor / mixed_norm_tensor
+        combined = tuple(gradient * final_scale for gradient in mixed)
+    combined_norm_tensor = norm(combined)
+    combined_norm = float(combined_norm_tensor.cpu())
+    final_to_current_ratio = (
+        combined_norm / current_norm if current_norm > float(eps)
+        else 1.0 if combined_norm <= float(eps)
+        else float("inf")
+    )
+    if not math.isfinite(final_to_current_ratio) or abs(final_to_current_ratio - 1.0) > 1.0e-5:
+        raise RuntimeError("V14b final gradient norm failed current norm matching.")
+    if projection_active and abs(cosine_post) > 1.0e-5:
+        raise RuntimeError("V14b last1 projection failed orthogonality tolerance.")
+    if not all(bool(torch.all(torch.isfinite(item)).item()) for item in combined):
+        raise FloatingPointError("V14b combined gradient contains NaN/Inf.")
+    return {
+        "dot_raw": dot_raw,
+        "cosine_raw": float(cosine_raw),
+        "current_norm": current_norm,
+        "last1_norm_raw": last1_norm_raw,
+        "last1_norm_scaled": last1_scaled_norm,
+        "last1_scale_factor": last_scale,
+        "scaled_to_current_norm_ratio": scaled_to_current_ratio,
+        "current_zero_fallback": current_zero_fallback,
+        "projection_active": bool(projection_active),
+        "last1_adjusted": last1_adjusted,
+        "cosine_post_projection": float(cosine_post),
+        "combined": combined,
+        "combined_norm_before_clip": combined_norm,
+        "final_to_current_norm_ratio": final_to_current_ratio,
+        "mixed_norm": mixed_norm,
+    }
 
 
 def _explained_variance(targets: np.ndarray, predictions: np.ndarray) -> float | None:
@@ -358,12 +436,11 @@ class PPOTrainer:
         self.capture_macro_transition_trace = bool(capture_macro_transition_trace)
         self.last_macro_transition_trace: dict[str, np.ndarray] | None = None
         self.macro_critic_target_mode = str(
-            self.config.get("macro_critic_target_mode", "formal_gae")
+            self.config.get("macro_critic_target_mode", MACRO_CRITIC_TARGET_MODE)
         )
-        if self.macro_critic_target_mode not in MACRO_CRITIC_TARGET_MODES:
+        if self.macro_critic_target_mode != MACRO_CRITIC_TARGET_MODE:
             raise ValueError(
-                "macro_critic_target_mode must be one of "
-                f"{sorted(MACRO_CRITIC_TARGET_MODES)}."
+                "V14b requires macro_critic_target_mode = two_step_smdp_td."
             )
         raw_critic_lambda = self.config.get("macro_critic_lambda_return_lambda")
         self.macro_critic_lambda_return_lambda = (
@@ -376,19 +453,12 @@ class PPOTrainer:
             raise ValueError(
                 "macro_critic_lambda_return_lambda must be finite and in [0, 1]."
             )
-        if (
-            self.macro_critic_target_mode == "smdp_lambda_return"
-            and self.macro_critic_lambda_return_lambda is None
-        ):
-            raise ValueError(
-                "smdp_lambda_return requires macro_critic_lambda_return_lambda."
-            )
         self.long_value_enabled = bool(self.config.get("long_value_enabled", False))
         self.long_value_target = str(
             self.config.get("long_value_target", "realized_return_to_go")
         )
         if not self.long_value_enabled:
-            raise ValueError("architecture v10 requires long_value_enabled = true.")
+            raise ValueError("architecture v15 requires long_value_enabled = true.")
         if self.long_value_target != "realized_return_to_go":
             raise ValueError(
                 "Long-Value Critic target must be realized_return_to_go."
@@ -450,12 +520,23 @@ class PPOTrainer:
         if not math.isfinite(long_value_lr) or long_value_lr <= 0.0:
             raise ValueError("long_value_learning_rate must be finite and positive.")
         self.macro_optimizer = torch.optim.Adam(
-            [
-                {"params": self.policy.macro_actor_parameters(), "lr": macro_actor_lr},
-                {"params": self.policy.macro_critic_parameters(), "lr": macro_critic_lr},
-            ],
+            self.policy.macro_actor_parameters(),
+            lr=macro_actor_lr,
             eps=1.0e-5,
         )
+        self.macro_critic_optimizer = torch.optim.Adam(
+            self.policy.macro_critic_parameters(),
+            lr=macro_critic_lr,
+            eps=1.0e-5,
+        )
+        macro_actor_parameter_ids = {
+            id(parameter) for parameter in self.policy.macro_actor_parameters()
+        }
+        macro_critic_parameter_ids = {
+            id(parameter) for parameter in self.policy.macro_critic_parameters()
+        }
+        if macro_actor_parameter_ids.intersection(macro_critic_parameter_ids):
+            raise RuntimeError("V14 Macro Actor and scalar Critic parameters must be disjoint.")
         self.micro_optimizer = torch.optim.Adam(
             [
                 {"params": self.policy.micro_actor_parameters(), "lr": actor_lr},
@@ -493,7 +574,7 @@ class PPOTrainer:
             "matching_calls": 0,
             "kkt_calls": 0,
         }
-        self.macro_critic_replay_batches: list[dict[str, Any]] = []
+        self.last1_macro_transition_buffer: dict[str, Any] | None = None
 
     @property
     def config_contract(self) -> dict[str, Any]:
@@ -508,6 +589,14 @@ class PPOTrainer:
             "architecture_version": int(self.policy.architecture_version),
             "macro_critic_target_mode": self.macro_critic_target_mode,
             "macro_critic_lambda_return_lambda": self.macro_critic_lambda_return_lambda,
+            "macro_critic_value_loss_coefficient": float(
+                self.config["value_loss_coefficient"]
+            ),
+            "macro_critic_architecture": "400-128-128-1 (SiLU)",
+            "macro_critic_optimizer": "single Adam",
+            "macro_critic_optimizer_epsilon": 1.0e-5,
+            "macro_critic_group_objective": "0.01 times raw current and last1 MSE",
+            "macro_critic_conflict_projection": "last1 norm-matched; current-priority projection; final norm matched to current",
             "long_value_enabled": self.long_value_enabled,
             "long_value_target": self.long_value_target,
             "long_value_learning_rate": self.learning_rates["long_value"],
@@ -664,9 +753,13 @@ class PPOTrainer:
     def _update_macro(self, buffer: MacroRolloutBuffer) -> dict[str, Any]:
         batch = _macro_batch(buffer)
         count = len(batch["rewards"])
+        episode_index = int(self.training_counters["completed_episodes"]) + 1
+        last1_buffer = self.last1_macro_transition_buffer
+        if last1_buffer is not None and int(last1_buffer["episode_index"]) != episode_index - 1:
+            raise RuntimeError("V14 last1 buffer must contain exactly the preceding episode.")
         next_values = batch["old_next_values"].astype(np.float32, copy=True)
         values = batch["old_values"].astype(np.float64)
-        macro_actor_advantage, gae_value_targets = compute_macro_smdp_gae(
+        macro_actor_advantage, _gae_value_targets = compute_macro_smdp_gae(
             batch["rewards"],
             values,
             next_values,
@@ -678,34 +771,46 @@ class PPOTrainer:
         normalized_actor_advantage, adv_mean, adv_std = _normalize_advantages(
             macro_actor_advantage
         )
-        if self.macro_critic_target_mode == "one_step_smdp_td":
-            macro_critic_target = _one_step_smdp_td_targets(
-                batch["rewards"],
-                next_values,
-                batch["durations"],
-                batch["dones"],
-                float(self.config["gamma"]),
+        current_observations = batch["observations"].astype(np.float32, copy=True)
+        last1_observations = (
+            None
+            if last1_buffer is None
+            else np.asarray(last1_buffer["observations"], dtype=np.float32).copy()
+        )
+        # Reuse exact rollout-frozen values to avoid batch-kernel round-off in
+        # the two-step SMDP target.
+        frozen_current_values = batch["old_values"].astype(np.float32, copy=True)
+        with torch.no_grad():
+            frozen_last1_values = (
+                None
+                if last1_observations is None
+                else self.policy.macro_value(
+                    torch.as_tensor(
+                        last1_observations, dtype=torch.float32, device=self.device
+                    )
+                )
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=True)
             )
-        elif self.macro_critic_target_mode == "two_step_smdp_td":
-            macro_critic_target = build_macro_n2_target(
-                batch["rewards"],
-                values,
-                batch["durations"],
-                batch["dones"],
+        macro_critic_target = build_macro_n2_target(
+            batch["rewards"],
+            frozen_current_values,
+            batch["durations"],
+            batch["dones"],
+            float(self.config["gamma"]),
+        ).astype(np.float32)
+        last1_target = None
+        if last1_buffer is not None:
+            assert frozen_last1_values is not None
+            last1_target = build_macro_n2_target(
+                last1_buffer["macro_rewards"],
+                frozen_last1_values,
+                last1_buffer["actual_durations"],
+                last1_buffer["dones"],
                 float(self.config["gamma"]),
             ).astype(np.float32)
-        elif self.macro_critic_target_mode == "smdp_lambda_return":
-            assert self.macro_critic_lambda_return_lambda is not None
-            macro_critic_target = build_macro_smdp_lambda_return_target(
-                batch["rewards"],
-                next_values,
-                batch["durations"],
-                batch["dones"],
-                float(self.config["gamma"]),
-                self.macro_critic_lambda_return_lambda,
-            ).astype(np.float32, copy=True)
-        else:
-            macro_critic_target = np.asarray(gae_value_targets, dtype=np.float32)
         realized_return_to_go = _realized_smdp_return_to_go(
             batch["rewards"],
             batch["durations"],
@@ -721,49 +826,28 @@ class PPOTrainer:
                 "requested_duration": batch["requested_durations"].astype(np.int64, copy=True),
                 "actual_duration": batch["durations"].astype(np.int64, copy=True),
                 "done": batch["dones"].astype(bool, copy=True),
-                "old_value": batch["old_values"].astype(np.float32, copy=True),
+                "old_value": frozen_current_values.copy(),
                 "old_next_value": next_values.astype(np.float32, copy=True),
                 "critic_training_target": macro_critic_target.astype(np.float32, copy=True),
                 "realized_return_to_go": realized_return_to_go.astype(np.float32, copy=True),
             }
-            if self.macro_critic_target_mode == "two_step_smdp_td":
-                n2_bootstrap_old_value = np.zeros(count, dtype=np.float32)
-                n2_bootstrap_frame_index = np.full(count, -1, dtype=np.int64)
-                for index in range(count):
-                    if batch["dones"][index] or batch["dones"][index + 1]:
-                        continue
-                    n2_bootstrap_old_value[index] = batch["old_values"][index + 2]
-                    n2_bootstrap_frame_index[index] = index + 2
-                self.last_macro_transition_trace.update(
-                    {
-                        "n2_target": macro_critic_target.astype(np.float32, copy=True),
-                        "n2_bootstrap_old_value": n2_bootstrap_old_value,
-                        "n2_bootstrap_frame_index": n2_bootstrap_frame_index,
-                    }
-                )
-            elif self.macro_critic_target_mode == "smdp_lambda_return":
-                assert self.macro_critic_lambda_return_lambda is not None
-                self.last_macro_transition_trace.update(
-                    {
-                        "lambda_return_target": macro_critic_target.astype(
-                            np.float32, copy=True
-                        ),
-                        "macro_critic_lambda_return_lambda": np.full(
-                            count,
-                            self.macro_critic_lambda_return_lambda,
-                            dtype=np.float64,
-                        ),
-                    }
-                )
+            n2_bootstrap_old_value = np.zeros(count, dtype=np.float32)
+            n2_bootstrap_frame_index = np.full(count, -1, dtype=np.int64)
+            for index in range(count):
+                if batch["dones"][index] or batch["dones"][index + 1]:
+                    continue
+                n2_bootstrap_old_value[index] = frozen_current_values[index + 2]
+                n2_bootstrap_frame_index[index] = index + 2
+            self.last_macro_transition_trace.update(
+                {
+                    "n2_target": macro_critic_target.astype(np.float32, copy=True),
+                    "n2_bootstrap_old_value": n2_bootstrap_old_value,
+                    "n2_bootstrap_frame_index": n2_bootstrap_frame_index,
+                }
+            )
         batch["macro_actor_advantage"] = normalized_actor_advantage
         batch["macro_critic_targets"] = macro_critic_target.copy()
-        critic_training_batch = self._append_macro_critic_replay_batch(
-            batch["observations"],
-            macro_critic_target,
-            episode_index=int(self.training_counters["completed_episodes"]) + 1,
-        )
         clip = float(self.config["clip_epsilon"])
-        value_coefficient = float(self.config["value_loss_coefficient"])
         entropy_coefficient = float(self.config["entropy_coefficient"])
         target_kl = float(self.config["target_kl"])
         max_grad_norm = float(self.config["max_grad_norm"])
@@ -793,6 +877,7 @@ class PPOTrainer:
             entropy_mean = entropy.mean()
             loss = actor_loss - entropy_coefficient * entropy_mean
             self.macro_optimizer.zero_grad(set_to_none=True)
+            self.macro_critic_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             macro_actor_parameters = self.policy.macro_actor_parameters()
             macro_critic_parameters = self.policy.macro_critic_parameters()
@@ -829,21 +914,47 @@ class PPOTrainer:
         self.training_counters["macro_update_count"] += 1
         result = self._aggregate_update_metrics("macro", records)
         critic_steps = int(self.config.get("macro_critic_steps_per_update", 50))
+        if critic_steps != 50:
+            raise ValueError("V14 Macro Critic update budget is fixed at 50 iterations.")
+        value_loss_coefficient = float(self.config["value_loss_coefficient"])
+        if not math.isfinite(value_loss_coefficient) or value_loss_coefficient <= 0.0:
+            raise ValueError("value_loss_coefficient must be finite and positive.")
         critic_fit = self._update_macro_critic_only(
-            critic_training_batch["observations"],
-            critic_training_batch["returns"],
+            current_observations,
+            macro_critic_target,
+            last1_observations=last1_observations,
+            last1_targets=last1_target,
             steps=critic_steps,
-            value_loss_coefficient=value_coefficient,
+            value_loss_coefficient=value_loss_coefficient,
             max_grad_norm=max_grad_norm,
-            evaluation_observations=batch["observations"],
-            evaluation_targets=macro_critic_target,
-            evaluation_references=realized_return_to_go,
         )
+        self.last1_macro_transition_buffer = {
+            "episode_index": episode_index,
+            "observations": current_observations.copy(),
+            "next_observations": batch["next_observations"].astype(
+                np.float32, copy=True
+            ),
+            "macro_rewards": batch["rewards"].astype(np.float32, copy=True),
+            "actual_durations": batch["durations"].astype(np.int64, copy=True),
+            "dones": batch["dones"].astype(bool, copy=True),
+        }
         long_value_fit = self._update_long_value_critic_only(
             batch["observations"],
             realized_return_to_go,
             steps=self.long_value_steps_per_update,
             max_grad_norm=self.long_value_max_grad_norm,
+        )
+        current_pre = critic_fit["current_snapshots"]["0"]
+        current_post = critic_fit["current_snapshots"][str(critic_steps)]
+        last1_pre = (
+            None
+            if critic_fit["last1_snapshots"] is None
+            else critic_fit["last1_snapshots"]["0"]
+        )
+        last1_post = (
+            None
+            if critic_fit["last1_snapshots"] is None
+            else critic_fit["last1_snapshots"][str(critic_steps)]
         )
         with torch.no_grad():
             predictions = (
@@ -860,6 +971,9 @@ class PPOTrainer:
             {
                 "macro_actor_optimizer_steps_this_update": len(records),
                 "macro_critic_optimizer_steps_this_update": critic_fit["optimizer_steps"],
+                "macro_critic_update_iterations_this_update": critic_fit[
+                    "update_iterations"
+                ],
                 "long_value_optimizer_steps_this_update": long_value_fit[
                     "optimizer_steps"
                 ],
@@ -886,8 +1000,16 @@ class PPOTrainer:
                 "realized_return_to_go_std": float(np.std(realized_return_to_go)),
                 "critic_target_detached": critic_fit["target_detached"],
                 "critic_target_frozen_during_update": critic_fit["target_frozen"],
-                "critic_target_sha256_before": critic_fit["target_sha256_before"],
-                "critic_target_sha256_after": critic_fit["target_sha256_after"],
+                "critic_target_sha256_before": critic_fit["current_target_sha256_before"],
+                "critic_target_sha256_after": critic_fit["current_target_sha256_after"],
+                "current_and_last1_use_same_frozen_value_snapshot": True,
+                "current_target_frozen": critic_fit["target_frozen"],
+                "last1_target_frozen": critic_fit["last1_target_frozen"],
+                "macro_critic_common_n2_target": True,
+                "macro_critic_target_detached": critic_fit["target_detached"],
+                "macro_critic_target_frozen_during_50_steps": critic_fit[
+                    "target_frozen"
+                ],
                 "macro_adv_mean": float(adv_mean),
                 "macro_adv_std": float(adv_std),
                 "macro_normalized_adv_mean": float(np.mean(normalized_actor_advantage)),
@@ -902,39 +1024,176 @@ class PPOTrainer:
                 "macro_value_rmse": float(
                     np.sqrt(np.mean((macro_critic_target - predictions) ** 2))
                 ),
-                "macro_explained_variance": _explained_variance(
-                    macro_critic_target, predictions
+                "macro_explained_variance": current_post["explained_variance"],
+                "pre_update_target_ev": current_pre["explained_variance"],
+                "post_update_target_ev": current_post["explained_variance"],
+                "pre_update_target_correlation": current_pre["correlation"],
+                "post_update_target_correlation": current_post["correlation"],
+                "pre_update_target_std_ratio": current_pre["std_ratio"],
+                "post_update_target_std_ratio": current_post["std_ratio"],
+                "pre_update_return_ev": None,
+                "post_update_return_ev": None,
+                "macro_critic_fit_snapshots": critic_fit["fit_snapshots"],
+                "n2_pre_ev": current_pre["explained_variance"],
+                "n2_post_ev": current_post["explained_variance"],
+                "n2_pre_correlation": current_pre["correlation"],
+                "n2_post_correlation": current_post["correlation"],
+                "n2_pre_std_ratio": current_pre["std_ratio"],
+                "n2_post_std_ratio": current_post["std_ratio"],
+                "n2_std_ratio": current_post["std_ratio"],
+                "current_pre_ev": current_pre["explained_variance"],
+                "current_post_ev": current_post["explained_variance"],
+                "last1_pre_update_ev": (
+                    None if last1_pre is None else last1_pre["explained_variance"]
                 ),
-                "pre_update_target_ev": critic_fit["snapshots"]["0"]["explained_variance"],
-                "post_update_target_ev": critic_fit["snapshots"][str(critic_steps)]["explained_variance"],
-                "pre_update_target_correlation": critic_fit["snapshots"]["0"]["correlation"],
-                "post_update_target_correlation": critic_fit["snapshots"][str(critic_steps)]["correlation"],
-                "pre_update_target_std_ratio": critic_fit["snapshots"]["0"]["std_ratio"],
-                "post_update_target_std_ratio": critic_fit["snapshots"][str(critic_steps)]["std_ratio"],
-                "pre_update_return_ev": critic_fit["snapshots"]["0"]["realized_return"]["explained_variance"],
-                "post_update_return_ev": critic_fit["snapshots"][str(critic_steps)]["realized_return"]["explained_variance"],
-                "pre_update_return_correlation": critic_fit["snapshots"]["0"]["realized_return"]["correlation"],
-                "post_update_return_correlation": critic_fit["snapshots"][str(critic_steps)]["realized_return"]["correlation"],
-                "pre_update_return_std_ratio": critic_fit["snapshots"]["0"]["realized_return"]["std_ratio"],
-                "post_update_return_std_ratio": critic_fit["snapshots"][str(critic_steps)]["realized_return"]["std_ratio"],
-                "macro_critic_fit_snapshots": critic_fit["snapshots"],
-                "n2_pre_ev": critic_fit["snapshots"]["0"]["explained_variance"],
-                "n2_post_ev": critic_fit["snapshots"][str(critic_steps)][
-                    "explained_variance"
+                "last1_post_update_ev": (
+                    None if last1_post is None else last1_post["explained_variance"]
+                ),
+                "retention_delta": (
+                    None
+                    if last1_pre is None
+                    or last1_post is None
+                    or last1_pre["explained_variance"] is None
+                    or last1_post["explained_variance"] is None
+                    else float(
+                        last1_post["explained_variance"]
+                        - last1_pre["explained_variance"]
+                    )
+                ),
+                "last1_policy_age_updates": None if last1_buffer is None else 1,
+                "target_std_current": critic_fit["target_std_current"],
+                "target_std_last1": critic_fit["target_std_last1"],
+                "target_std_used_for_gradient_scaling": False,
+                "target_scale_normalization_active": False,
+                "raw_mse_current": critic_fit["raw_mse_current_mean"],
+                "raw_mse_last1": critic_fit["raw_mse_last1_mean"],
+                "episode1_v10_compatibility_path": episode_index == 1,
+                "critic_group_episode_indices": (
+                    [episode_index]
+                    if last1_buffer is None
+                    else [episode_index, int(last1_buffer["episode_index"])]
+                ),
+                "macro_critic_grad_norm_before_clip": critic_fit[
+                    "combined_grad_norm_before_clip_mean"
                 ],
-                "n2_pre_correlation": critic_fit["snapshots"]["0"][
-                    "correlation"
+                "macro_critic_grad_norm_before_clip_p95": critic_fit[
+                    "combined_grad_norm_before_clip_p95"
                 ],
-                "n2_post_correlation": critic_fit["snapshots"][str(critic_steps)][
-                    "correlation"
+                "macro_critic_grad_norm_before_clip_max": critic_fit[
+                    "combined_grad_norm_before_clip_max"
                 ],
-                "n2_pre_std_ratio": critic_fit["snapshots"]["0"]["std_ratio"],
-                "n2_post_std_ratio": critic_fit["snapshots"][str(critic_steps)][
-                    "std_ratio"
+                "macro_critic_grad_clip_fraction": critic_fit[
+                    "grad_clip_fraction"
                 ],
-                "n2_std_ratio": critic_fit["snapshots"][str(critic_steps)][
-                    "std_ratio"
+                "macro_critic_grad_norm_after_clip": critic_fit[
+                    "combined_grad_norm_after_clip_mean"
                 ],
+                "raw_grad_cosine_current_last1": critic_fit[
+                    "raw_grad_cosine_by_step"
+                ],
+                "grad_cosine_raw_mean": critic_fit["grad_cosine_raw_mean"],
+                "grad_cosine_raw_median": critic_fit["grad_cosine_raw_median"],
+                "grad_cosine_raw_min": critic_fit["grad_cosine_raw_min"],
+                "grad_cosine_raw_p10": critic_fit["grad_cosine_raw_p10"],
+                "grad_conflict_fraction": critic_fit["grad_conflict_fraction"],
+                "post_projection_cosine_mean": critic_fit[
+                    "post_projection_cosine_mean"
+                ],
+                "post_projection_cosine_min": critic_fit[
+                    "post_projection_cosine_min"
+                ],
+                "post_projection_cosine_max": critic_fit[
+                    "post_projection_cosine_max"
+                ],
+                "post_projection_cosine_max_abs_on_conflict": critic_fit[
+                    "post_projection_cosine_max_abs_on_conflict"
+                ],
+                "projection_orthogonality_max_abs_error": critic_fit[
+                    "projection_orthogonality_max_abs_error"
+                ],
+                "pcgrad_projection_active_fraction": critic_fit[
+                    "pcgrad_projection_active_fraction"
+                ],
+                "pcgrad_priority": "CURRENT",
+                "current_gradient_projected": False,
+                "current_grad_norm_raw_mean": critic_fit[
+                    "current_grad_norm_raw_mean"
+                ],
+                "current_grad_norm_raw_p95": critic_fit[
+                    "current_grad_norm_raw_p95"
+                ],
+                "current_grad_norm_raw_max": critic_fit[
+                    "current_grad_norm_raw_max"
+                ],
+                "last1_grad_norm_raw_mean": critic_fit[
+                    "last1_grad_norm_raw_mean"
+                ],
+                "last1_grad_norm_raw_p95": critic_fit[
+                    "last1_grad_norm_raw_p95"
+                ],
+                "last1_grad_norm_raw_max": critic_fit[
+                    "last1_grad_norm_raw_max"
+                ],
+                "last1_grad_norm_scaled_mean": critic_fit[
+                    "last1_grad_norm_scaled_mean"
+                ],
+                "last1_grad_norm_scaled_p95": critic_fit[
+                    "last1_grad_norm_scaled_p95"
+                ],
+                "last1_grad_norm_scaled_max": critic_fit[
+                    "last1_grad_norm_scaled_max"
+                ],
+                "last1_norm_scale_factor_mean": critic_fit[
+                    "last1_norm_scale_factor_mean"
+                ],
+                "scaled_to_current_norm_ratio_mean": critic_fit[
+                    "scaled_to_current_norm_ratio_mean"
+                ],
+                "scaled_to_current_norm_ratio_max_abs_error": critic_fit[
+                    "scaled_to_current_norm_ratio_max_abs_error"
+                ],
+                "current_grad_zero_fallback_fraction": critic_fit[
+                    "current_grad_zero_fallback_fraction"
+                ],
+                "grad_norm_mix_before_final_rescale_mean": critic_fit[
+                    "grad_norm_mix_before_final_rescale_mean"
+                ],
+                "grad_norm_final_before_clip_mean": critic_fit[
+                    "grad_norm_final_before_clip_mean"
+                ],
+                "grad_norm_final_before_clip_p95": critic_fit[
+                    "grad_norm_final_before_clip_p95"
+                ],
+                "grad_norm_final_before_clip_max": critic_fit[
+                    "grad_norm_final_before_clip_max"
+                ],
+                "final_to_current_norm_ratio_mean": critic_fit[
+                    "final_to_current_norm_ratio_mean"
+                ],
+                "final_to_current_norm_ratio_max_abs_error": critic_fit[
+                    "final_to_current_norm_ratio_max_abs_error"
+                ],
+                "combined_grad_norm_before_clip_mean": critic_fit[
+                    "combined_grad_norm_before_clip_mean"
+                ],
+                "combined_grad_norm_before_clip_p95": critic_fit[
+                    "combined_grad_norm_before_clip_p95"
+                ],
+                "combined_grad_norm_before_clip_max": critic_fit[
+                    "combined_grad_norm_before_clip_max"
+                ],
+                "combined_grad_norm_after_clip_mean": critic_fit[
+                    "combined_grad_norm_after_clip_mean"
+                ],
+                "current_to_last1_grad_norm_ratio": critic_fit[
+                    "current_to_last1_grad_norm_ratio"
+                ],
+                "macro_actor_loss_changed": False,
+                "smdp_gae_changed": False,
+                "actor_uses_last1_data": False,
+                "macro_critic_value_loss_coefficient": value_loss_coefficient,
+                "macro_critic_value_loss": current_post["mse"],
+                "macro_early_stop": bool(stopped),
                 "long_value_target": self.long_value_target,
                 "long_value_fit_snapshots": long_value_fit["snapshots"],
                 "long_value_target_detached": long_value_fit["target_detached"],
@@ -968,207 +1227,394 @@ class PPOTrainer:
                 "long_value_rmse": long_value_fit["snapshots"][
                     str(self.long_value_steps_per_update)
                 ]["rmse"],
-                "macro_critic_replay_episode_indices": critic_training_batch[
-                    "episode_indices"
-                ],
-                "macro_critic_replay_episode_count": len(
-                    critic_training_batch["episode_indices"]
-                ),
-                "macro_critic_replay_sample_count": len(
-                    critic_training_batch["returns"]
-                ),
-                "macro_critic_replay_fit_snapshots": critic_fit[
-                    "training_snapshots"
-                ],
-                "macro_critic_replay_fit_final": critic_fit["training_final"],
-                "macro_critic_grad_norm_before_clip": critic_fit[
-                    "grad_norm_before_clip_mean"
-                ],
-                "macro_critic_grad_norm_after_clip": critic_fit[
-                    "grad_norm_after_clip_mean"
-                ],
-                "macro_value_loss": critic_fit["final"]["rmse"] ** 2,
-                "macro_early_stop": bool(stopped),
             }
         )
         return result
 
-    def _append_macro_critic_replay_batch(
-        self,
-        observations: np.ndarray,
-        value_targets: np.ndarray,
-        *,
-        episode_index: int,
-    ) -> dict[str, Any]:
-        """Append one frozen Macro batch and return the bounded current+history batch."""
-
-        history_episodes = int(
-            self.config.get("macro_critic_replay_history_episodes", 4)
-        )
-        if history_episodes < 0:
-            raise ValueError("macro_critic_replay_history_episodes 不能为负数。")
-        observation_values = np.asarray(observations, dtype=np.float32)
-        target_values = np.asarray(value_targets, dtype=np.float32).reshape(-1)
-        if observation_values.ndim != 2 or len(observation_values) != len(target_values):
-            raise ValueError("Macro Critic replay batch observations/targets shape mismatch。")
-        if len(target_values) == 0:
-            raise ValueError("Macro Critic replay batch 不能为空。")
-        self.macro_critic_replay_batches.append(
-            {
-                "episode_index": int(episode_index),
-                "observations": observation_values.copy(),
-                "returns": target_values.copy(),
-            }
-        )
-        del self.macro_critic_replay_batches[: -max(1, history_episodes + 1)]
-        return {
-            "episode_indices": [
-                int(item["episode_index"]) for item in self.macro_critic_replay_batches
-            ],
-            "observations": np.concatenate(
-                [item["observations"] for item in self.macro_critic_replay_batches], axis=0
-            ),
-            "returns": np.concatenate(
-                [item["returns"] for item in self.macro_critic_replay_batches], axis=0
-            ),
-        }
-
     def _update_macro_critic_only(
         self,
-        observations: np.ndarray,
-        value_targets: np.ndarray,
+        current_observations: np.ndarray,
+        current_targets: np.ndarray,
         *,
+        last1_observations: np.ndarray | None,
+        last1_targets: np.ndarray | None,
         steps: int,
         value_loss_coefficient: float,
         max_grad_norm: float,
-        evaluation_observations: np.ndarray | None = None,
-        evaluation_targets: np.ndarray | None = None,
-        evaluation_references: np.ndarray | None = None,
     ) -> dict[str, Any]:
-        """Update only the Macro Critic on one frozen full-episode target batch."""
+        """Fit raw-MSE N2 groups with V10 current-gradient scale preserved."""
 
-        if int(steps) <= 0:
-            raise ValueError("macro_critic_steps_per_update 必须为正整数。")
-        observation_tensor = torch.as_tensor(
-            observations, dtype=torch.float32, device=self.device
+        if int(steps) != 50:
+            raise ValueError("Macro Critic update budget is fixed at 50 iterations.")
+        if not math.isclose(float(value_loss_coefficient), 0.01, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("V14b requires the V10 Macro Critic loss coefficient 0.01.")
+        if (last1_observations is None) != (last1_targets is None):
+            raise ValueError("last1 observations and targets must be provided together.")
+        current_observation_tensor = torch.as_tensor(
+            current_observations, dtype=torch.float32, device=self.device
         ).detach()
-        target_tensor = torch.as_tensor(
-            value_targets, dtype=torch.float32, device=self.device
+        current_target_tensor = torch.as_tensor(
+            current_targets, dtype=torch.float32, device=self.device
         ).reshape(-1).detach().clone()
-        frozen_targets = target_tensor.clone()
-        if (evaluation_observations is None) != (evaluation_targets is None):
-            raise ValueError("Macro Critic evaluation observations/targets 必须同时提供。")
-        if evaluation_observations is None:
-            evaluation_observation_tensor = observation_tensor
-            evaluation_target_tensor = target_tensor
-        else:
-            evaluation_observation_tensor = torch.as_tensor(
-                evaluation_observations, dtype=torch.float32, device=self.device
+        if (
+            current_observation_tensor.ndim != 2
+            or int(current_observation_tensor.shape[-1]) != self.policy.observation_dim
+            or len(current_observation_tensor) != len(current_target_tensor)
+            or len(current_target_tensor) == 0
+        ):
+            raise ValueError("Current Macro Critic observations/targets shape mismatch.")
+        last1_observation_tensor = None
+        last1_target_tensor = None
+        if last1_observations is not None:
+            last1_observation_tensor = torch.as_tensor(
+                last1_observations, dtype=torch.float32, device=self.device
             ).detach()
-            evaluation_target_tensor = torch.as_tensor(
-                evaluation_targets, dtype=torch.float32, device=self.device
+            last1_target_tensor = torch.as_tensor(
+                last1_targets, dtype=torch.float32, device=self.device
             ).reshape(-1).detach().clone()
-        frozen_evaluation_targets = evaluation_target_tensor.clone()
+            if (
+                last1_observation_tensor.ndim != 2
+                or int(last1_observation_tensor.shape[-1]) != self.policy.observation_dim
+                or len(last1_observation_tensor) != len(last1_target_tensor)
+                or len(last1_target_tensor) == 0
+            ):
+                raise ValueError("Last1 Macro Critic observations/targets shape mismatch.")
+        tensors_to_check = [current_observation_tensor, current_target_tensor]
+        if last1_observation_tensor is not None:
+            tensors_to_check.extend([last1_observation_tensor, last1_target_tensor])
+        if not all(bool(torch.all(torch.isfinite(item)).item()) for item in tensors_to_check):
+            raise FloatingPointError("Macro Critic group contains NaN/Inf.")
+        frozen_current_targets = current_target_tensor.clone()
+        frozen_last1_targets = (
+            None if last1_target_tensor is None else last1_target_tensor.clone()
+        )
+        current_target_std = float(current_target_tensor.std(unbiased=False).cpu())
+        last1_target_std = (
+            None
+            if last1_target_tensor is None
+            else float(last1_target_tensor.std(unbiased=False).cpu())
+        )
+        parameters = tuple(self.policy.macro_critic_parameters())
         actor_parameters = self.policy.macro_actor_parameters()
-        critic_parameters = self.policy.macro_critic_parameters()
-        evaluation_reference_tensor = None
-        if evaluation_references is not None:
-            evaluation_reference_tensor = torch.as_tensor(
-                evaluation_references, dtype=torch.float32, device=self.device
-            ).reshape(-1).detach().clone()
-            if len(evaluation_reference_tensor) != len(evaluation_observation_tensor):
-                raise ValueError("Macro Critic realized-return reference shape mismatch.")
-        frozen_evaluation_references = (
-            None if evaluation_reference_tensor is None else evaluation_reference_tensor.clone()
+        self.macro_optimizer.zero_grad(set_to_none=True)
+        self.micro_optimizer.zero_grad(set_to_none=True)
+        self.macro_critic_optimizer.zero_grad(set_to_none=True)
+        current_sha_before = hashlib.sha256(
+            current_target_tensor.cpu().numpy().tobytes()
+        ).hexdigest()
+        last1_sha_before = (
+            None
+            if last1_target_tensor is None
+            else hashlib.sha256(last1_target_tensor.cpu().numpy().tobytes()).hexdigest()
         )
 
-        def evaluation_snapshot() -> dict[str, Any]:
-            metrics: dict[str, Any] = self._macro_critic_fit_metrics(
-                evaluation_observation_tensor, evaluation_target_tensor
-            )
-            if evaluation_reference_tensor is not None:
-                metrics["realized_return"] = self._macro_critic_fit_metrics(
-                    evaluation_observation_tensor, evaluation_reference_tensor
-                )
-            return metrics
+        def fit_snapshot(
+            observations: Any, targets: Any
+        ) -> dict[str, float | None]:
+            return self._macro_critic_fit_metrics(observations, targets)
 
-        snapshots: dict[str, dict[str, Any]] = {"0": evaluation_snapshot()}
-        training_snapshots: dict[str, dict[str, float | None]] = {
-            "0": self._macro_critic_fit_metrics(observation_tensor, target_tensor)
+        current_snapshots: dict[str, dict[str, float | None]] = {
+            "0": fit_snapshot(current_observation_tensor, current_target_tensor)
         }
-        snapshot_steps = {10, 25, 50}
-        gradient_before: list[float] = []
-        gradient_after: list[float] = []
+        last1_snapshots: dict[str, dict[str, float | None]] | None = (
+            None
+            if last1_observation_tensor is None
+            else {"0": fit_snapshot(last1_observation_tensor, last1_target_tensor)}
+        )
+        fit_snapshots: dict[str, dict[str, Any]] = {
+            "0": {"current": current_snapshots["0"], "last1": None if last1_snapshots is None else last1_snapshots["0"]}
+        }
+        raw_mse_current: list[float] = []
+        raw_mse_last1: list[float] = []
+        cosine_raw_values: list[float] = []
+        cosine_post_values: list[float] = []
+        post_cosine_abs_on_conflict: list[float] = []
+        current_gradient_norms: list[float] = []
+        last1_raw_gradient_norms: list[float] = []
+        last1_scaled_gradient_norms: list[float] = []
+        mixed_gradient_norms: list[float] = []
+        final_gradient_norms: list[float] = []
+        combined_gradient_norms_after_clip: list[float] = []
+        gradient_clip_events: list[bool] = []
+        projection_events: list[bool] = []
+        last1_scale_factors: list[float] = []
+        scaled_to_current_ratios: list[float] = []
+        final_to_current_ratios: list[float] = []
+        current_zero_fallback_events: list[bool] = []
         optimizer_steps = 0
-        target_sha256_before = hashlib.sha256(
-            target_tensor.detach().cpu().numpy().tobytes()
-        ).hexdigest()
+        snapshot_steps = {10, 25, 50}
         for step in range(1, int(steps) + 1):
-            self.macro_optimizer.zero_grad(set_to_none=True)
-            predictions = self.policy.macro_value(observation_tensor)
-            value_loss = torch.mean((predictions - target_tensor) ** 2)
-            (float(value_loss_coefficient) * value_loss).backward()
+            current_prediction = self.policy.macro_value(current_observation_tensor)
+            current_errors = current_prediction - current_target_tensor
+            current_raw_mse_value = torch.mean(current_errors.square())
+            current_loss = 0.01 * current_raw_mse_value
+            if not bool(torch.isfinite(current_loss).item()):
+                raise FloatingPointError("Current Macro Critic loss is non-finite.")
+            raw_mse_current.append(float(current_raw_mse_value.detach().cpu()))
+
+            if last1_observation_tensor is not None:
+                assert last1_target_tensor is not None
+                current_gradients_optional = torch.autograd.grad(
+                    current_loss, parameters, allow_unused=True
+                )
+                current_gradients = tuple(
+                    torch.zeros_like(parameter)
+                    if gradient is None
+                    else gradient.detach()
+                    for parameter, gradient in zip(
+                        parameters, current_gradients_optional, strict=True
+                    )
+                )
+                last1_prediction = self.policy.macro_value(last1_observation_tensor)
+                last1_errors = last1_prediction - last1_target_tensor
+                last1_raw_mse_value = torch.mean(last1_errors.square())
+                last1_loss = 0.01 * last1_raw_mse_value
+                if not bool(torch.isfinite(last1_loss).item()):
+                    raise FloatingPointError("Last1 Macro Critic loss is non-finite.")
+                last1_gradients_optional = torch.autograd.grad(
+                    last1_loss, parameters, allow_unused=True
+                )
+                last1_gradients = tuple(
+                    torch.zeros_like(parameter)
+                    if gradient is None
+                    else gradient.detach()
+                    for parameter, gradient in zip(
+                        parameters, last1_gradients_optional, strict=True
+                    )
+                )
+                pcgrad = _pcgrad_lite_current_priority(
+                    tuple(current_gradients), tuple(last1_gradients)
+                )
+                gradients_to_apply = pcgrad["combined"]
+                current_gradient_norms.append(pcgrad["current_norm"])
+                last1_raw_gradient_norms.append(pcgrad["last1_norm_raw"])
+                last1_scaled_gradient_norms.append(pcgrad["last1_norm_scaled"])
+                mixed_gradient_norms.append(pcgrad["mixed_norm"])
+                final_gradient_norms.append(pcgrad["combined_norm_before_clip"])
+                cosine_raw_values.append(pcgrad["cosine_raw"])
+                cosine_post_values.append(pcgrad["cosine_post_projection"])
+                projection_events.append(pcgrad["projection_active"])
+                if pcgrad["projection_active"]:
+                    post_cosine_abs_on_conflict.append(
+                        abs(pcgrad["cosine_post_projection"])
+                    )
+                last1_scale_factors.append(pcgrad["last1_scale_factor"])
+                scaled_to_current_ratios.append(
+                    pcgrad["scaled_to_current_norm_ratio"]
+                )
+                final_to_current_ratios.append(
+                    pcgrad["final_to_current_norm_ratio"]
+                )
+                current_zero_fallback_events.append(pcgrad["current_zero_fallback"])
+                raw_mse_last1.append(float(last1_raw_mse_value.detach().cpu()))
+            else:
+                # Episode 1 has no last1 group, so apply the raw current-loss gradient.
+                self.macro_critic_optimizer.zero_grad(set_to_none=True)
+                current_loss.backward()
+                current_gradient_norm = _gradient_norm(parameters)
+                current_gradient_norms.append(current_gradient_norm)
+                final_gradient_norms.append(current_gradient_norm)
+                mixed_gradient_norms.append(current_gradient_norm)
+                gradients_to_apply = None
+            if gradients_to_apply is not None:
+                self.macro_critic_optimizer.zero_grad(set_to_none=True)
+                for parameter, gradient in zip(parameters, gradients_to_apply, strict=True):
+                    parameter.grad = gradient.detach().clone()
             if any(parameter.grad is not None for parameter in actor_parameters):
                 raise RuntimeError("Macro Critic-only update produced Macro Actor gradients.")
-            grad_before = float(
-                torch.nn.utils.clip_grad_norm_(critic_parameters, max_grad_norm)
-                .detach()
-                .cpu()
+            grad_before_clip = float(
+                torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm).detach().cpu()
             )
-            grad_after = _gradient_norm(critic_parameters)
-            gradient_before.append(grad_before)
-            gradient_after.append(grad_after)
-            self.macro_optimizer.step()
+            if not math.isfinite(grad_before_clip):
+                raise FloatingPointError("Macro Critic combined gradient norm is non-finite.")
+            grad_after_clip = _gradient_norm(parameters)
+            combined_gradient_norms_after_clip.append(grad_after_clip)
+            gradient_clip_events.append(grad_before_clip > float(max_grad_norm))
+            self.macro_critic_optimizer.step()
             optimizer_steps += 1
             self.training_counters["macro_optimizer_steps"] += 1
             self.training_counters["macro_critic_optimizer_steps"] += 1
-            if not torch.equal(target_tensor, frozen_targets):
-                raise RuntimeError("Macro value targets changed during critic-only updates.")
-            if not torch.equal(evaluation_target_tensor, frozen_evaluation_targets):
-                raise RuntimeError("Macro Critic evaluation targets changed during updates.")
-            if frozen_evaluation_references is not None and not torch.equal(
-                evaluation_reference_tensor, frozen_evaluation_references
+            if not torch.equal(current_target_tensor, frozen_current_targets):
+                raise RuntimeError("Current N2 target changed during Critic optimization.")
+            if last1_target_tensor is not None and not torch.equal(
+                last1_target_tensor, frozen_last1_targets
             ):
-                raise RuntimeError("Macro Critic realized-return references changed during updates.")
+                raise RuntimeError("Last1 N2 target changed during Critic optimization.")
             if step in snapshot_steps:
-                snapshots[str(step)] = evaluation_snapshot()
-                training_snapshots[str(step)] = self._macro_critic_fit_metrics(
-                    observation_tensor, target_tensor
+                current_snapshots[str(step)] = fit_snapshot(
+                    current_observation_tensor, current_target_tensor
                 )
-        if optimizer_steps != int(steps):
-            raise RuntimeError("Macro Critic optimizer step count did not match its budget.")
-        final = snapshots.get(str(int(steps)))
-        if final is None:
-            final = evaluation_snapshot()
-            snapshots[str(int(steps))] = final
-        training_final = training_snapshots.get(str(int(steps)))
-        if training_final is None:
-            training_final = self._macro_critic_fit_metrics(observation_tensor, target_tensor)
-            training_snapshots[str(int(steps))] = training_final
-        target_sha256_after = hashlib.sha256(
-            target_tensor.detach().cpu().numpy().tobytes()
+                last1_snap = (
+                    None
+                    if last1_observation_tensor is None
+                    else fit_snapshot(last1_observation_tensor, last1_target_tensor)
+                )
+                if last1_snap is not None:
+                    assert last1_snapshots is not None
+                    last1_snapshots[str(step)] = last1_snap
+                fit_snapshots[str(step)] = {
+                    "current": current_snapshots[str(step)],
+                    "last1": last1_snap,
+                }
+        current_sha_after = hashlib.sha256(
+            current_target_tensor.cpu().numpy().tobytes()
         ).hexdigest()
-        target_frozen = bool(
-            torch.equal(target_tensor, frozen_targets)
-            and target_sha256_before == target_sha256_after
+        last1_sha_after = (
+            None
+            if last1_target_tensor is None
+            else hashlib.sha256(last1_target_tensor.cpu().numpy().tobytes()).hexdigest()
         )
-        target_detached = not bool(target_tensor.requires_grad)
-        if not target_detached:
-            raise RuntimeError("Macro Critic target must be detached before the update.")
-        if not target_frozen:
-            raise RuntimeError("Macro Critic frozen target changed during critic-only updates.")
+        target_frozen = bool(
+            torch.equal(current_target_tensor, frozen_current_targets)
+            and current_sha_before == current_sha_after
+        )
+        last1_target_frozen = (
+            None
+            if last1_target_tensor is None
+            else bool(
+                torch.equal(last1_target_tensor, frozen_last1_targets)
+                and last1_sha_before == last1_sha_after
+            )
+        )
+        if not target_frozen or last1_target_frozen is False:
+            raise RuntimeError("V14 N2 group targets must stay detached and frozen.")
+        if current_target_tensor.requires_grad or (
+            last1_target_tensor is not None and last1_target_tensor.requires_grad
+        ):
+            raise RuntimeError("V14 N2 group targets must be detached.")
+        if optimizer_steps != int(steps):
+            raise RuntimeError("V14 scalar Macro Critic optimizer step count mismatch.")
+
+        def summarize(values: list[float]) -> dict[str, float | None]:
+            if not values:
+                return {"mean": None, "p95": None, "max": None, "median": None, "min": None, "p10": None}
+            return {
+                "mean": float(np.mean(values)),
+                "p95": float(np.percentile(values, 95)),
+                "max": float(np.max(values)),
+                "median": float(np.median(values)),
+                "min": float(np.min(values)),
+                "p10": float(np.percentile(values, 10)),
+            }
+
+        current_norm_stats = summarize(current_gradient_norms)
+        last1_raw_norm_stats = summarize(last1_raw_gradient_norms)
+        last1_scaled_norm_stats = summarize(last1_scaled_gradient_norms)
+        mixed_norm_stats = summarize(mixed_gradient_norms)
+        final_norm_stats = summarize(final_gradient_norms)
+        clipped_norm_stats = summarize(combined_gradient_norms_after_clip)
+        cosine_stats = summarize(cosine_raw_values)
+        post_cosine_stats = summarize(cosine_post_values)
+        last1_scale_stats = summarize(last1_scale_factors)
+        scaled_ratio_stats = summarize(scaled_to_current_ratios)
+        final_ratio_stats = summarize(final_to_current_ratios)
         return {
-            "optimizer_steps": optimizer_steps,
-            "target_detached": target_detached,
+            "optimizer_steps": int(optimizer_steps),
+            "update_iterations": int(steps),
+            "target_detached": True,
             "target_frozen": target_frozen,
-            "target_sha256_before": target_sha256_before,
-            "target_sha256_after": target_sha256_after,
-            "snapshots": snapshots,
-            "final": final,
-            "training_snapshots": training_snapshots,
-            "training_final": training_final,
-            "grad_norm_before_clip_mean": float(np.mean(gradient_before)),
-            "grad_norm_after_clip_mean": float(np.mean(gradient_after)),
+            "last1_target_frozen": last1_target_frozen,
+            "current_target_sha256_before": current_sha_before,
+            "current_target_sha256_after": current_sha_after,
+            "last1_target_sha256_before": last1_sha_before,
+            "last1_target_sha256_after": last1_sha_after,
+            "current_snapshots": current_snapshots,
+            "last1_snapshots": last1_snapshots,
+            "fit_snapshots": fit_snapshots,
+            "target_std_current": current_target_std,
+            "target_std_last1": last1_target_std,
+            "raw_mse_current_mean": float(np.mean(raw_mse_current)),
+            "raw_mse_last1_mean": None if not raw_mse_last1 else float(np.mean(raw_mse_last1)),
+            "raw_grad_cosine_by_step": cosine_raw_values,
+            "grad_cosine_raw_mean": cosine_stats["mean"],
+            "grad_cosine_raw_median": cosine_stats["median"],
+            "grad_cosine_raw_min": cosine_stats["min"],
+            "grad_cosine_raw_p10": cosine_stats["p10"],
+            "grad_conflict_fraction": (
+                None if not cosine_raw_values else float(np.mean(np.asarray(cosine_raw_values) < 0.0))
+            ),
+            "post_projection_cosine_by_step": cosine_post_values,
+            "post_projection_cosine_mean": post_cosine_stats["mean"],
+            "post_projection_cosine_min": post_cosine_stats["min"],
+            "post_projection_cosine_max": post_cosine_stats["max"],
+            "post_projection_cosine_max_abs_on_conflict": (
+                None
+                if not post_cosine_abs_on_conflict
+                else float(max(post_cosine_abs_on_conflict))
+            ),
+            "projection_orthogonality_max_abs_error": (
+                None
+                if not post_cosine_abs_on_conflict
+                else float(max(post_cosine_abs_on_conflict))
+            ),
+            "pcgrad_projection_active_fraction": (
+                None if not projection_events else float(np.mean(projection_events))
+            ),
+            "current_grad_zero_fallback_fraction": (
+                None
+                if not current_zero_fallback_events
+                else float(np.mean(current_zero_fallback_events))
+            ),
+            "current_grad_norm_raw_mean": current_norm_stats["mean"],
+            "current_grad_norm_raw_p95": current_norm_stats["p95"],
+            "current_grad_norm_raw_max": current_norm_stats["max"],
+            "last1_grad_norm_raw_mean": last1_raw_norm_stats["mean"],
+            "last1_grad_norm_raw_p95": last1_raw_norm_stats["p95"],
+            "last1_grad_norm_raw_max": last1_raw_norm_stats["max"],
+            "last1_grad_norm_scaled_mean": last1_scaled_norm_stats["mean"],
+            "last1_grad_norm_scaled_p95": last1_scaled_norm_stats["p95"],
+            "last1_grad_norm_scaled_max": last1_scaled_norm_stats["max"],
+            "last1_norm_scale_factor_mean": last1_scale_stats["mean"],
+            "scaled_to_current_norm_ratio_mean": scaled_ratio_stats["mean"],
+            "scaled_to_current_norm_ratio_max_abs_error": (
+                None
+                if not scaled_to_current_ratios
+                else float(np.max(np.abs(np.asarray(scaled_to_current_ratios) - 1.0)))
+            ),
+            "grad_norm_mix_before_final_rescale_mean": mixed_norm_stats["mean"],
+            "grad_norm_final_before_clip_mean": final_norm_stats["mean"],
+            "grad_norm_final_before_clip_p95": final_norm_stats["p95"],
+            "grad_norm_final_before_clip_max": final_norm_stats["max"],
+            "combined_grad_norm_before_clip_mean": final_norm_stats["mean"],
+            "combined_grad_norm_before_clip_p95": final_norm_stats["p95"],
+            "combined_grad_norm_before_clip_max": final_norm_stats["max"],
+            "combined_grad_norm_after_clip_mean": clipped_norm_stats["mean"],
+            "grad_clip_fraction": float(np.mean(gradient_clip_events)),
+            "final_to_current_norm_ratio_mean": final_ratio_stats["mean"],
+            "final_to_current_norm_ratio_max_abs_error": (
+                None
+                if not final_to_current_ratios
+                else float(np.max(np.abs(np.asarray(final_to_current_ratios) - 1.0)))
+            ),
+            "current_to_last1_grad_norm_ratio": scaled_ratio_stats["mean"],
+        }
+
+    def _macro_critic_fit_metrics(
+        self, observations: Any, value_targets: Any
+    ) -> dict[str, float | None]:
+        with torch.no_grad():
+            predictions = (
+                self.policy.macro_value(observations)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+        target_tensor = torch.as_tensor(value_targets, dtype=torch.float32, device=self.device)
+        targets = target_tensor.detach().cpu().numpy().astype(np.float64)
+        if predictions.shape != targets.shape:
+            raise ValueError("Macro Critic prediction/target shape mismatch.")
+        target_std = float(np.std(targets))
+        prediction_std = float(np.std(predictions))
+        rmse = float(np.sqrt(np.mean((targets - predictions) ** 2)))
+        return {
+            "explained_variance": _explained_variance(targets, predictions),
+            "rmse": rmse,
+            "mse": float(rmse**2),
+            "prediction_std": prediction_std,
+            "target_std": target_std,
+            "std_ratio": prediction_std / target_std if target_std > 1.0e-12 else None,
+            "correlation": _pearson_correlation(targets, predictions),
         }
 
     def _update_long_value_critic_only(
@@ -1212,6 +1658,11 @@ class PPOTrainer:
             for group in self.macro_optimizer.param_groups
             for parameter in group["params"]
         }
+        macro_critic_optimizer_ids = {
+            id(parameter)
+            for group in self.macro_critic_optimizer.param_groups
+            for parameter in group["params"]
+        }
         micro_optimizer_ids = {
             id(parameter)
             for group in self.micro_optimizer.param_groups
@@ -1225,6 +1676,7 @@ class PPOTrainer:
         if (
             long_optimizer_ids != long_ids
             or long_ids.intersection(macro_optimizer_ids)
+            or long_ids.intersection(macro_critic_optimizer_ids)
             or long_ids.intersection(micro_optimizer_ids)
         ):
             raise RuntimeError(
@@ -1238,6 +1690,7 @@ class PPOTrainer:
         )
         protected_before = tuple(parameter.detach().clone() for parameter in protected_parameters)
         self.macro_optimizer.zero_grad(set_to_none=True)
+        self.macro_critic_optimizer.zero_grad(set_to_none=True)
         self.micro_optimizer.zero_grad(set_to_none=True)
         self.long_value_optimizer.zero_grad(set_to_none=True)
 
@@ -1304,31 +1757,6 @@ class PPOTrainer:
             "snapshots": snapshots,
             "grad_norm_before_clip_mean": float(np.mean(gradient_before)),
             "grad_norm_after_clip_mean": float(np.mean(gradient_after)),
-        }
-
-    def _macro_critic_fit_metrics(
-        self, observations: Any, value_targets: Any
-    ) -> dict[str, float | None]:
-        with torch.no_grad():
-            predictions = (
-                self.policy.macro_value(observations)
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(np.float64)
-            )
-        targets = value_targets.detach().cpu().numpy().astype(np.float64)
-        target_std = float(np.std(targets))
-        prediction_std = float(np.std(predictions))
-        rmse = float(np.sqrt(np.mean((targets - predictions) ** 2)))
-        return {
-            "explained_variance": _explained_variance(targets, predictions),
-            "rmse": rmse,
-            "mse": float(rmse**2),
-            "prediction_std": prediction_std,
-            "target_std": target_std,
-            "std_ratio": prediction_std / target_std if target_std > 1.0e-12 else None,
-            "correlation": _pearson_correlation(targets, predictions),
         }
 
     def _long_value_fit_metrics(
@@ -1404,8 +1832,9 @@ class PPOTrainer:
         seed: int,
         best_episode_return: float | None = None,
     ) -> dict[str, Any]:
-        """构造带独立策略、优化器和结构合同的 checkpoint。"""
+        """Construct a resumable V14b checkpoint, including the raw last1 group."""
 
+        last1 = self.last1_macro_transition_buffer
         return {
             "checkpoint_version": CHECKPOINT_VERSION,
             "macro_critic_target_mode": self.macro_critic_target_mode,
@@ -1427,20 +1856,32 @@ class PPOTrainer:
             "micro_state_dict": self.policy.micro_state_dict(),
             "macro_state_dict": self.policy.macro_state_dict(),
             "n2_critic_state_dict": self.policy.n2_critic_state_dict(),
+            "macro_critic_state_dict": self.policy.n2_critic_state_dict(),
             "long_value_critic_state_dict": self.policy.long_value_critic_state_dict(),
             "micro_optimizer_state_dict": self.micro_optimizer.state_dict(),
             "macro_optimizer_state_dict": self.macro_optimizer.state_dict(),
+            "macro_critic_optimizer_state_dict": self.macro_critic_optimizer.state_dict(),
             "long_value_optimizer_state_dict": self.long_value_optimizer.state_dict(),
             "value_normalization_states": {"micro": None, "macro": None},
             "training_counters": dict(self.training_counters),
-            "macro_critic_replay_batches": [
-                {
-                    "episode_index": int(item["episode_index"]),
-                    "observations": np.asarray(item["observations"], dtype=np.float32).copy(),
-                    "returns": np.asarray(item["returns"], dtype=np.float32).copy(),
+            "last1_macro_transition_buffer": (
+                None
+                if last1 is None
+                else {
+                    "episode_index": int(last1["episode_index"]),
+                    "observations": np.asarray(last1["observations"], dtype=np.float32).copy(),
+                    "next_observations": np.asarray(
+                        last1["next_observations"], dtype=np.float32
+                    ).copy(),
+                    "macro_rewards": np.asarray(
+                        last1["macro_rewards"], dtype=np.float32
+                    ).copy(),
+                    "actual_durations": np.asarray(
+                        last1["actual_durations"], dtype=np.int64
+                    ).copy(),
+                    "dones": np.asarray(last1["dones"], dtype=bool).copy(),
                 }
-                for item in self.macro_critic_replay_batches
-            ],
+            ),
             "seed": int(seed),
             "best_episode_return": best_episode_return,
             "python_rng_state": random.getstate(),
@@ -1484,37 +1925,29 @@ class PPOTrainer:
         episode_pool: str | None = None,
         restore_rng: bool = False,
     ) -> dict[str, Any]:
-        """严格恢复当前结构；旧架构 checkpoint 不做迁移。"""
+        """Restore only a structurally complete V14b checkpoint."""
 
         payload = torch.load(Path(path), map_location=self.device, weights_only=False)
         if not isinstance(payload, dict):
-            raise ValueError("checkpoint payload 必须是 mapping。")
-        if "macro_critic_target_mode" not in payload:
+            raise ValueError("checkpoint payload must be a mapping.")
+        if (
+            payload.get("checkpoint_version") != CHECKPOINT_VERSION
+            or payload.get("architecture_version")
+            != int(self.policy.architecture_version)
+        ):
             raise ValueError(
-                "checkpoint is missing macro_critic_target_mode; legacy Macro Critic "
-                "target semantics cannot be interpreted as the current mode."
+                "V14b architecture 15 / checkpoint 37 is required."
             )
-        if payload["macro_critic_target_mode"] != self.macro_critic_target_mode:
-            raise ValueError(
-                "checkpoint macro_critic_target_mode mismatch: "
-                f"{payload['macro_critic_target_mode']!r} != "
-                f"{self.macro_critic_target_mode!r}"
-            )
+        if payload.get("macro_critic_target_mode") != self.macro_critic_target_mode:
+            raise ValueError("checkpoint macro_critic_target_mode mismatch.")
         if payload.get("macro_critic_lambda_return_lambda") != (
             self.macro_critic_lambda_return_lambda
         ):
-            raise ValueError(
-                "checkpoint macro_critic_lambda_return_lambda mismatch: "
-                f"{payload.get('macro_critic_lambda_return_lambda')!r} != "
-                f"{self.macro_critic_lambda_return_lambda!r}"
-            )
+            raise ValueError("checkpoint macro_critic_lambda_return_lambda mismatch.")
         if payload.get("long_value_enabled") is not self.long_value_enabled:
             raise ValueError("checkpoint long_value_enabled mismatch.")
         if payload.get("long_value_target") != self.long_value_target:
-            raise ValueError(
-                "checkpoint long_value_target mismatch: "
-                f"{payload.get('long_value_target')!r} != {self.long_value_target!r}"
-            )
+            raise ValueError("checkpoint long_value_target mismatch.")
         required = {
             "checkpoint_version": CHECKPOINT_VERSION,
             "method": CHECKPOINT_METHOD,
@@ -1526,18 +1959,17 @@ class PPOTrainer:
                 raise ValueError(
                     f"checkpoint {field} mismatch: {payload.get(field)!r} != {expected!r}"
                 )
-        checks = (
+        for field, expected in (
             ("config_raw_sha256", config_raw_sha256),
             ("config_semantic_sha256", config_semantic_sha256),
             ("episode_pool", episode_pool),
-        )
-        for field, expected in checks:
+        ):
             if expected is not None and payload.get(field) != expected:
-                raise ValueError(f"checkpoint {field} mismatch。")
+                raise ValueError(f"checkpoint {field} mismatch.")
         if payload.get("config_contract") != self.config_contract:
-            raise ValueError("checkpoint policy tensor/configuration contract mismatch。")
+            raise ValueError("checkpoint policy tensor/configuration contract mismatch.")
         if payload.get("data_protocol") != self.context.data_protocol:
-            raise ValueError("checkpoint data protocol mismatch。")
+            raise ValueError("checkpoint data protocol mismatch.")
         for field, expected in (
             ("episode_slots", self.context.episode_slots),
             ("origin_start", self.context.train_origin_start),
@@ -1545,78 +1977,96 @@ class PPOTrainer:
             ("terminal_origin", self.context.terminal_origin),
         ):
             if int(payload.get(field, -1)) != int(expected):
-                raise ValueError(f"checkpoint {field} mismatch。")
-        macro_state = payload["macro_state_dict"]
+                raise ValueError(f"checkpoint {field} mismatch.")
+        macro_state = payload.get("macro_state_dict")
         explicit_n2_state = payload.get("n2_critic_state_dict")
-        if not isinstance(explicit_n2_state, dict):
-            raise ValueError("checkpoint is missing the explicit N2 Critic state.")
+        explicit_critic_state = payload.get("macro_critic_state_dict")
+        if not isinstance(macro_state, dict) or not isinstance(explicit_n2_state, dict):
+            raise ValueError("checkpoint is missing the scalar N2 Critic state.")
+        if not isinstance(explicit_critic_state, dict):
+            raise ValueError("checkpoint is missing the scalar Main Critic state.")
         embedded_n2_state = {
             key.removeprefix("macro_critic."): value
             for key, value in macro_state.items()
             if key.startswith("macro_critic.")
         }
-        if set(embedded_n2_state) != set(explicit_n2_state) or any(
-            not torch.equal(embedded_n2_state[key], explicit_n2_state[key])
-            for key in embedded_n2_state
-        ):
-            raise ValueError("checkpoint N2 Critic state copies disagree.")
+        for explicit_state in (explicit_n2_state, explicit_critic_state):
+            if set(embedded_n2_state) != set(explicit_state) or any(
+                not torch.equal(embedded_n2_state[key], explicit_state[key])
+                for key in embedded_n2_state
+            ):
+                raise ValueError("checkpoint scalar N2 Critic state copies disagree.")
         self.policy.load_separated_state_dicts(
             macro_state,
             payload["micro_state_dict"],
             payload["long_value_critic_state_dict"],
         )
         self.macro_optimizer.load_state_dict(payload["macro_optimizer_state_dict"])
+        self.macro_critic_optimizer.load_state_dict(
+            payload["macro_critic_optimizer_state_dict"]
+        )
         self.micro_optimizer.load_state_dict(payload["micro_optimizer_state_dict"])
         self.long_value_optimizer.load_state_dict(
             payload["long_value_optimizer_state_dict"]
         )
         counters = payload.get("training_counters")
-        legacy_counter_keys = set(self.training_counters) - {
-            "micro_actor_optimizer_steps",
-            "micro_critic_optimizer_steps",
-            "macro_actor_optimizer_steps",
-            "macro_critic_optimizer_steps",
+        if not isinstance(counters, dict) or set(counters) != set(self.training_counters):
+            raise ValueError("checkpoint training counter schema mismatch.")
+        self.training_counters = {
+            key: int(value) for key, value in counters.items()
         }
-        counter_keys = set(counters) if isinstance(counters, dict) else set()
-        if counter_keys not in (legacy_counter_keys, set(self.training_counters)):
-            raise ValueError("checkpoint training counter schema mismatch。")
-        restored_counters = dict(self.training_counters)
-        restored_counters.update({key: int(value) for key, value in counters.items()})
-        self.training_counters = restored_counters
-        replay_batches = payload.get("macro_critic_replay_batches", [])
-        if not isinstance(replay_batches, list):
-            raise ValueError("checkpoint Macro Critic replay batches must be a list.")
-        history_episodes = int(
-            self.config.get("macro_critic_replay_history_episodes", 4)
-        )
-        max_replay_batches = history_episodes + 1
-        if len(replay_batches) > max_replay_batches:
-            raise ValueError("checkpoint Macro Critic replay buffer exceeds configured window.")
-        restored_replay_batches: list[dict[str, Any]] = []
-        for item in replay_batches:
-            if not isinstance(item, dict) or set(item) != {
-                "episode_index", "observations", "returns"
-            }:
-                raise ValueError("checkpoint Macro Critic replay batch schema mismatch.")
-            observations = np.asarray(item["observations"], dtype=np.float32)
-            returns = np.asarray(item["returns"], dtype=np.float32).reshape(-1)
-            if observations.ndim != 2 or observations.shape[1] != self.policy.observation_dim:
-                raise ValueError("checkpoint Macro Critic replay observation shape mismatch.")
-            if len(observations) != len(returns) or len(returns) == 0:
-                raise ValueError("checkpoint Macro Critic replay target shape mismatch.")
-            if not np.isfinite(observations).all() or not np.isfinite(returns).all():
-                raise ValueError("checkpoint Macro Critic replay data contains NaN/Inf.")
-            restored_replay_batches.append(
-                {
-                    "episode_index": int(item["episode_index"]),
-                    "observations": observations.copy(),
-                    "returns": returns.copy(),
-                }
+        raw_last1 = payload.get("last1_macro_transition_buffer")
+        completed_episodes = int(self.training_counters["completed_episodes"])
+        if raw_last1 is None:
+            if completed_episodes != 0:
+                raise ValueError("V14 checkpoint is missing its last1 Macro transition buffer.")
+            self.last1_macro_transition_buffer = None
+        else:
+            expected_keys = {
+                "episode_index",
+                "observations",
+                "next_observations",
+                "macro_rewards",
+                "actual_durations",
+                "dones",
+            }
+            if not isinstance(raw_last1, dict) or set(raw_last1) != expected_keys:
+                raise ValueError("V14 last1 Macro transition buffer schema mismatch.")
+            observations = np.asarray(raw_last1["observations"], dtype=np.float32)
+            next_observations = np.asarray(
+                raw_last1["next_observations"], dtype=np.float32
             )
-        self.macro_critic_replay_batches = restored_replay_batches
+            rewards = np.asarray(raw_last1["macro_rewards"], dtype=np.float32).reshape(-1)
+            durations = np.asarray(raw_last1["actual_durations"], dtype=np.int64).reshape(-1)
+            dones = np.asarray(raw_last1["dones"], dtype=bool).reshape(-1)
+            size = len(rewards)
+            if (
+                observations.shape != (size, self.policy.observation_dim)
+                or next_observations.shape != observations.shape
+                or durations.shape != (size,)
+                or dones.shape != (size,)
+                or size == 0
+                or np.any(durations <= 0)
+                or not dones[-1]
+                or np.any(dones[:-1])
+                or int(raw_last1["episode_index"]) != completed_episodes
+                or not all(
+                    np.isfinite(item).all()
+                    for item in (observations, next_observations, rewards)
+                )
+            ):
+                raise ValueError("V14 last1 Macro transition buffer is invalid.")
+            self.last1_macro_transition_buffer = {
+                "episode_index": completed_episodes,
+                "observations": observations.copy(),
+                "next_observations": next_observations.copy(),
+                "macro_rewards": rewards.copy(),
+                "actual_durations": durations.copy(),
+                "dones": dones.copy(),
+            }
         if restore_rng:
             if "python_rng_state" not in payload or "numpy_rng_state" not in payload:
-                raise ValueError("checkpoint 缺少可恢复的 RNG 状态。")
+                raise ValueError("checkpoint is missing recoverable RNG state.")
             random.setstate(payload["python_rng_state"])
             np.random.set_state(payload["numpy_rng_state"])
             torch.set_rng_state(payload["torch_rng_state"].cpu())
@@ -1715,6 +2165,12 @@ def run_training(
     else:
         ensure_fresh_run_dir_is_clean(run_path)
         run_path.mkdir(parents=True, exist_ok=True)
+    run_config_path = run_path / "run_config.toml"
+    if run_config_path.is_file():
+        if project_config.raw_config_sha256(run_config_path) != raw_hash:
+            raise ValueError("run_config.toml does not match the canonical config.")
+    else:
+        shutil.copyfile(config_file, run_config_path)
     ensure_run_artifact_directories(run_path)
     write_dual_timescale_run_manifest(
         manifest_path,
@@ -1732,6 +2188,7 @@ def run_training(
 
     episode_metrics_path = run_path / "episode_metrics.jsonl"
     update_metrics_path = run_path / "update_metrics.jsonl"
+    critic_diagnostics_path = run_path / "critic_diagnostics.jsonl"
     slot_metrics_path = run_path / SLOT_METRICS_FILENAME
     trace_episode_batches: list[dict[str, Any]] = []
     trace_summary = None
@@ -1811,6 +2268,7 @@ def run_training(
                         "macro_actor_advantage",
                         "macro_cache_advantage",
                         "macro_duration_advantage",
+                        "macro_critic_",
                         "macro_critic_target",
                         "n2_",
                         "long_value_",
@@ -1866,6 +2324,18 @@ def run_training(
         }
         append_dual_timescale_record(episode_metrics_path, episode_record)
         append_dual_timescale_record(update_metrics_path, update_record)
+        critic_diagnostics_record = {
+            "record_type": "critic_diagnostics",
+            "episode": completed,
+            **{
+                key: value
+                for key, value in update_metrics.items()
+                if "critic" in key.lower() or key.startswith("n2_")
+            },
+        }
+        append_dual_timescale_record(
+            critic_diagnostics_path, critic_diagnostics_record
+        )
         print(
             format_training_epoch_log(
                 episode_record,

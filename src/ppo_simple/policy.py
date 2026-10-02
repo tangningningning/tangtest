@@ -174,7 +174,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
     architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
-    architecture_version = 10
+    architecture_version = 15
 
     def __init__(
         self,
@@ -237,9 +237,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.observation_dim, sizes, 1, activation=nn.SiLU
         )
 
-        # Keep this module independent and construct it after the existing
-        # networks so architecture-v9 Actor/N2/Micro initialization remains
-        # unchanged for the same seed.
+        # Keep this module independent and construct it after the Actor/Critic
+        # networks so its initialization does not change their seeded weights.
         self.long_value_critic = _mlp(
             self.observation_dim, (128, 128), 1, activation=nn.SiLU
         )
@@ -288,7 +287,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         return feature_values, mask_values
 
     def macro_value(self, observations: Any) -> Any:
-        obs, single = self._observation_batch(observations, next(self.parameters()).device)
+        obs, single = self._observation_batch(
+            observations, next(self.parameters()).device
+        )
         values = self.macro_critic(self._macro_critic_inputs(obs)).squeeze(-1)
         return values.squeeze(0) if single else values
 
@@ -406,7 +407,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 ).item()
             ):
                 raise ValueError("Macro duration action 被 rollout mask 屏蔽。")
-        values = self.macro_critic(self._macro_critic_inputs(obs)).squeeze(-1)
+        values = self.macro_value(obs)
         return cache_dist.logits, duration_dist.logits, values, masks, duration_mask, cache_action
 
     def sample_macro(
@@ -481,7 +482,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 requested_duration=self.duration_candidates[duration_index],
                 log_prob=cache_dist.log_prob(cache_tensor) + duration_dist.log_prob(duration_tensor),
                 entropy=cache_entropy + duration_entropy,
-                value=self.macro_critic(self._macro_critic_inputs(obs)).squeeze(),
+                value=self.macro_value(obs).squeeze(),
                 cache_mask=cache_mask.copy(),
                 duration_mask=durations_mask,
                 cache_probabilities=cache_dist.probs.detach().cpu().numpy().copy(),

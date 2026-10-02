@@ -3494,6 +3494,7 @@ def write_dual_timescale_run_manifest(
     """记录双时间尺度 checkpoint、动作和 PPO 配置合同。"""
 
     manifest = {
+        "experiment_label": "V14b",
         "experiment_type": "macro_cache_smdp_micro_uav_ppo",
         "config_path": str(Path(config_path).resolve()),
         "config_raw_sha256": str(config_raw_sha256),
@@ -3509,6 +3510,41 @@ def write_dual_timescale_run_manifest(
         "macro_actor_advantage_mode": "duration_aware_smdp_gae",
         "macro_critic_target_mode": str(trainer.macro_critic_target_mode),
         "macro_critic_lambda_return_lambda": trainer.macro_critic_lambda_return_lambda,
+        "num_macro_critics": 1,
+        "macro_critic_architecture": (
+            f"{int(context.observation_spec.observation_dim)}-128-128-1 (SiLU)"
+        ),
+        "ensemble_active": False,
+        "heteroscedastic_active": False,
+        "macro_critic_optimizer": "single scalar Critic Adam optimizer",
+        "macro_critic_optimizer_epsilon": 1.0e-5,
+        "macro_critic_group_objective": "0.01 times raw current and last1 MSE",
+        "target_std_used_for_gradient_scaling": False,
+        "target_scale_normalization_active": False,
+        "macro_critic_last1_length": 1,
+        "macro_critic_gradient_norm_matching": True,
+        "macro_critic_last1_alpha": 1.0,
+        "macro_critic_gradient_conflict_method": "last1 norm matching, current-priority last1-only projection, final norm matching to current",
+        "pcgrad_priority": "CURRENT",
+        "current_gradient_projected": False,
+        "current_loss_v10_equivalence": True,
+        "macro_actor_loss_changed": False,
+        "smdp_gae_changed": False,
+        "actor_uses_last1_data": False,
+        "macro_critic_last1_policy_age_updates": 1,
+        "macro_critic_last1_buffer_transition_fields": [
+            "observation",
+            "next_observation",
+            "macro_reward",
+            "actual_duration",
+            "done",
+        ],
+        "macro_critic_value_loss_coefficient": float(
+            trainer.config["value_loss_coefficient"]
+        ),
+        "macro_critic_optimizer_max_grad_norm": float(
+            trainer.config["max_grad_norm"]
+        ),
         "long_value_enabled": bool(trainer.long_value_enabled),
         "long_value_target": str(trainer.long_value_target),
         "long_value_architecture": "observation_dim->128->128->1 (SiLU)",
@@ -3541,8 +3577,11 @@ def write_dual_timescale_run_manifest(
         "macro_critic_steps_per_update": int(
             trainer.config.get("macro_critic_steps_per_update", 50)
         ),
-        "macro_critic_replay_history_episodes": int(
-            trainer.config.get("macro_critic_replay_history_episodes", 4)
+        "macro_critic_update_iterations_per_episode": int(
+            trainer.config.get("macro_critic_steps_per_update", 50)
+        ),
+        "macro_critic_optimizer_steps_per_episode": int(
+            trainer.config.get("macro_critic_steps_per_update", 50)
         ),
         "micro_macro_buffers_separate": True,
         "exact_q_training_enabled": False,
