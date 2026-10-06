@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Any
 
 import numpy as np
@@ -208,8 +207,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
 
     architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo_v15c"
     architecture_version = 23
-    unified_architecture_id = "adaptive_dual_timescale_unified_cache_candidate_smdp_micro_uav_ppo_v16"
-    unified_architecture_version = 24
     cardinality_corrected_unified_architecture_id = (
         "adaptive_dual_timescale_unified_cache_candidate_cardinality_corrected_ppo_v17"
     )
@@ -224,8 +221,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         prediction_horizon: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
         *,
-        unified_cache_action: bool = False,
-        cardinality_corrected_cache_action: bool = False,
+        unified_cache_action: bool = True,
+        cardinality_corrected_cache_action: bool = True,
     ) -> None:
         _require_torch()
         super().__init__()
@@ -238,16 +235,12 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
         )
-        if self.cardinality_corrected_cache_action and not self.unified_cache_action:
+        if not self.unified_cache_action or not self.cardinality_corrected_cache_action:
             raise ValueError(
-                "Cache cardinality correction requires the unified Cache action."
+                "The formal policy supports only V49 Unified Cache Candidate with cardinality correction."
             )
-        if self.unified_cache_action:
-            self.architecture_id = self.unified_architecture_id
-            self.architecture_version = self.unified_architecture_version
-        if self.cardinality_corrected_cache_action:
-            self.architecture_id = self.cardinality_corrected_unified_architecture_id
-            self.architecture_version = self.cardinality_corrected_unified_architecture_version
+        self.architecture_id = self.cardinality_corrected_unified_architecture_id
+        self.architecture_version = self.cardinality_corrected_unified_architecture_version
         self.trigger_observation_mean = np.zeros(self.observation_dim, dtype=np.float32)
         self.trigger_observation_std = np.ones(self.observation_dim, dtype=np.float32)
         self.trigger_observation_raw_std = np.ones(self.observation_dim, dtype=np.float32)
@@ -304,8 +297,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.observation_dim, (128, 128), 1, activation=nn.SiLU
         )
 
-        # Construct the new actor last so every pre-existing V14b/V15-A2
-        # parameter receives exactly the same seeded initialization.
+        # Retain the inactive module at the end of the state dict for V49
+        # checkpoint compatibility; the current policy never calls it.
         self.macro_cache_trigger_actor = nn.Sequential(
             nn.Linear(self.observation_dim, 128),
             nn.SiLU(),
@@ -332,81 +325,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             raise ValueError("observations 必须是有限的 [B,D] 张量。")
         return values, single
 
-    def set_trigger_observation_normalization(
-        self, mean: Any, std: Any, *, metadata: dict[str, Any] | None = None
-    ) -> None:
-        """Set the Trigger-only 400D normalizer without changing other policy inputs."""
 
-        mean_values = np.asarray(mean, dtype=np.float32).reshape(-1)
-        std_values = np.asarray(std, dtype=np.float32).reshape(-1)
-        normalization_metadata = dict(metadata or {})
-        if (
-            mean_values.shape != (self.observation_dim,)
-            or std_values.shape != (self.observation_dim,)
-            or not np.isfinite(mean_values).all()
-            or not np.isfinite(std_values).all()
-            or np.any(std_values < 0.0)
-        ):
-            raise ValueError("Trigger normalization must have finite mean/std vectors matching observation_dim.")
-        threshold = float(
-            normalization_metadata.get("low_variance_threshold", 1.0e-6)
-        )
-        if not math.isfinite(threshold) or threshold < 0.0:
-            raise ValueError("Trigger low-variance threshold must be finite and non-negative.")
-        low_variance_mask = std_values <= threshold
-        if normalization_metadata.get("scale_rule") == "unit_scale_for_low_variance":
-            scale_values = np.where(low_variance_mask, 1.0, std_values).astype(
-                np.float32, copy=False
-            )
-            clip = normalization_metadata.get("input_clip", [-10.0, 10.0])
-            if (
-                not isinstance(clip, (list, tuple))
-                or len(clip) != 2
-                or not all(math.isfinite(float(value)) for value in clip)
-                or float(clip[0]) >= float(clip[1])
-            ):
-                raise ValueError("Trigger input clip must be a finite increasing pair.")
-            self.trigger_observation_input_clip = (float(clip[0]), float(clip[1]))
-        else:
-            # Preserve the V15-C/C1 behavior when loading their historical
-            # checkpoints; the unit-scale rule is opt-in for V15-C2.
-            scale_values = np.maximum(std_values, 1.0e-6).astype(
-                np.float32, copy=False
-            )
-            self.trigger_observation_input_clip = None
-        self.trigger_observation_mean = mean_values.copy()
-        self.trigger_observation_raw_std = std_values.copy()
-        self.trigger_observation_std = scale_values.copy()
-        self.trigger_observation_low_variance_feature_count = int(
-            low_variance_mask.sum()
-        )
-        self.trigger_observation_normalization_active = True
-        self.trigger_observation_normalization_metadata = normalization_metadata
 
-    def _preclip_normalized_trigger_observations(self, observations: Any) -> Any:
-        if not self.trigger_observation_normalization_active:
-            return observations
-        mean = torch.as_tensor(
-            self.trigger_observation_mean,
-            dtype=observations.dtype,
-            device=observations.device,
-        )
-        std = torch.as_tensor(
-            self.trigger_observation_std,
-            dtype=observations.dtype,
-            device=observations.device,
-        )
-        normalized = (observations - mean) / std
-        if not bool(torch.isfinite(normalized).all().item()):
-            raise FloatingPointError("Normalized Trigger observation contains NaN/Inf.")
-        return normalized
-
-    def _normalized_trigger_observations(self, observations: Any) -> Any:
-        normalized = self._preclip_normalized_trigger_observations(observations)
-        if self.trigger_observation_input_clip is None:
-            return normalized
-        lower, upper = self.trigger_observation_input_clip
-        return normalized.clamp(min=lower, max=upper)
 
     def trigger_observation_normalization_payload(self) -> dict[str, Any]:
         return {
@@ -542,8 +462,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         cache_logits = self.macro_cache_scorer(
             torch.cat((expanded_hidden, candidate_hidden), dim=-1)
         ).squeeze(-1)
-        if self.cardinality_corrected_cache_action:
-            cache_logits = self._cardinality_corrected_cache_logits(cache_logits, masks)
+        cache_logits = self._cardinality_corrected_cache_logits(cache_logits, masks)
 
         if cache_actions is None:
             raise ValueError("Macro duration probability requires selected Cache candidates。")
@@ -622,197 +541,72 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 torch.cat((hidden.unsqueeze(1).expand(-1, len(features), -1), embedded), dim=-1)
             ).squeeze(-1).squeeze(0)
 
-            if self.unified_cache_action:
-                raw_candidate_logits = candidate_logits
-                raw_cache_dist = None
-                if self.cardinality_corrected_cache_action:
-                    raw_cache_dist = _masked_categorical(candidate_logits, cache_mask_t[0])
-                    candidate_logits = self._cardinality_corrected_cache_logits(
-                        candidate_logits, cache_mask_t[0]
-                    )
-                cache_dist = _masked_categorical(candidate_logits, cache_mask_t[0])
-                deterministic_cache_diagnostics = None
-                if deterministic and self.cardinality_corrected_cache_action:
-                    group_ids = torch.ones_like(cache_mask_t[0], dtype=torch.long)
-                    group_ids[0] = 0
-                    cache_index, selected_cache_group = _group_aware_deterministic_candidate(
-                        raw_candidate_logits,
-                        cache_dist.probs,
-                        cache_mask_t[0],
-                        group_ids,
-                    )
-                    legacy_flat_index = int(torch.argmax(cache_dist.logits).item())
-                    legacy_reference_logits = self._cardinality_corrected_cache_logits(
-                        raw_candidate_logits, cache_mask_t[0]
-                    )
-                    legacy_reference_dist = _masked_categorical(
-                        legacy_reference_logits, cache_mask_t[0]
-                    )
-                    probability_max_difference = float(
-                        torch.max(torch.abs(cache_dist.probs - legacy_reference_dist.probs))
-                        .detach()
-                        .cpu()
-                    )
-                    probability_sum_error = float(
-                        torch.abs(cache_dist.probs.sum() - 1.0).detach().cpu()
-                    )
-                    update_mask = cache_mask_t[0] & (group_ids == 1)
-                    legal_update_count = int(update_mask.sum().item())
-                    legal_update_best_score = (
-                        float(raw_candidate_logits.masked_fill(~update_mask, -float("inf")).max().cpu())
-                        if legal_update_count
-                        else None
-                    )
-                    selected_raw_score = float(raw_candidate_logits[cache_index].detach().cpu())
-                    selected_candidate_is_legal = bool(cache_mask_t[0, cache_index].item())
-                    update_inner_argmax_violation = bool(
-                        selected_cache_group == 1
-                        and (
-                            cache_index <= 0
-                            or not selected_candidate_is_legal
-                            or selected_raw_score != legal_update_best_score
-                        )
-                    )
-                    p_keep_value = float(cache_dist.probs[0].detach().cpu())
-                    p_update_group_value = float(cache_dist.probs[1:].sum().detach().cpu())
-                    deterministic_cache_diagnostics = {
-                        "p_keep": p_keep_value,
-                        "p_update_group": p_update_group_value,
-                        "new_selected_group": "KEEP" if selected_cache_group == 0 else "UPDATE",
-                        "new_selected_candidate_index": cache_index,
-                        "legacy_flat_selected_candidate_index": legacy_flat_index,
-                        "legacy_flat_selected_group": "KEEP" if legacy_flat_index == 0 else "UPDATE",
-                        "old_new_disagreement": cache_index != legacy_flat_index,
-                        "group_tie_break": "KEEP",
-                        "legal_update_candidate_count": legal_update_count,
-                        "selected_candidate_is_legal": selected_candidate_is_legal,
-                        "selected_raw_score": selected_raw_score,
-                        "legal_update_best_raw_score": legal_update_best_score,
-                        "update_inner_argmax_violation": update_inner_argmax_violation,
-                        "probability_sum_error": probability_sum_error,
-                        "probability_max_difference_vs_legacy_formula": probability_max_difference,
-                    }
-                else:
-                    cache_index = (
-                        int(torch.argmax(cache_dist.logits).item())
-                        if deterministic
-                        else int(cache_dist.sample().item())
-                    )
-                    selected_cache_group = 0 if cache_index == 0 else 1
-                selected_embed = embedded[0, cache_index]
-                duration_values = torch.as_tensor(
-                    self.duration_candidates, dtype=torch.float32, device=device
-                ) / float(self.prediction_horizon)
-                duration_input = torch.cat(
-                    (
-                        hidden.expand(len(self.duration_candidates), -1),
-                        selected_embed.expand(len(self.duration_candidates), -1),
-                        duration_values.reshape(-1, 1),
-                    ),
-                    dim=-1,
-                )
-                duration_logits = self.macro_duration_scorer(duration_input).squeeze(-1)
-                duration_dist = _masked_categorical(
-                    duration_logits,
-                    torch.as_tensor(durations_mask, dtype=torch.bool, device=device),
-                )
-                duration_index = (
-                    int(torch.argmax(duration_dist.logits).item())
-                    if deterministic
-                    else int(duration_dist.sample().item())
-                )
-                cache_tensor = torch.as_tensor(cache_index, dtype=torch.long, device=device)
-                duration_tensor = torch.as_tensor(duration_index, dtype=torch.long, device=device)
-                cache_probabilities = cache_dist.probs
-                probability_sum = cache_probabilities.sum()
-                if (
-                    not bool(torch.isfinite(cache_probabilities).all().item())
-                    or not torch.allclose(
-                        probability_sum,
-                        probability_sum.new_ones(()),
-                        atol=1.0e-6,
-                        rtol=0.0,
-                    )
-                ):
-                    raise FloatingPointError("Unified Cache Candidate probabilities are invalid.")
-                cache_log_prob = cache_dist.log_prob(cache_tensor)
-                duration_log_prob = duration_dist.log_prob(duration_tensor)
-                cache_entropy = cache_dist.entropy()
-                duration_entropy = duration_dist.entropy()
-                zero = cache_log_prob.new_zeros(())
-                p_keep = cache_probabilities[0]
-                p_update = cache_probabilities[1:].sum()
-                log_p_keep = torch.log(p_keep.clamp_min(1.0e-30))
-                log_p_update = torch.log(p_update.clamp_min(1.0e-30))
-                return MacroActionSample(
-                    cache_index=cache_index,
-                    duration_index=duration_index,
-                    requested_duration=self.duration_candidates[duration_index],
-                    log_prob=cache_log_prob + duration_log_prob,
-                    entropy=cache_entropy + duration_entropy,
-                    value=self.macro_value(obs).squeeze(),
-                    cache_mask=cache_mask.copy(),
-                    duration_mask=durations_mask,
-                    cache_probabilities=cache_probabilities.detach().cpu().numpy().copy(),
-                    raw_cache_probabilities=(
-                        cache_probabilities.detach().cpu().numpy().copy()
-                        if raw_cache_dist is None
-                        else raw_cache_dist.probs.detach().cpu().numpy().copy()
-                    ),
-                    conditional_update_probabilities=cache_probabilities.detach().cpu().numpy().copy(),
-                    cache_entropy=cache_entropy,
-                    trigger_entropy=zero,
-                    duration_entropy=duration_entropy,
-                    cache_selected_group="KEEP" if selected_cache_group == 0 else "UPDATE",
-                    trigger_log_prob=zero,
-                    conditional_update_log_prob=cache_log_prob,
-                    p_keep=p_keep,
-                    p_update=p_update,
-                    log_p_keep=log_p_keep,
-                    log_p_update=log_p_update,
-                    duration_log_prob=duration_log_prob,
-                    deterministic_cache_diagnostics=deterministic_cache_diagnostics,
-                )
-
-            has_update_candidates = bool(torch.any(cache_mask_t[0, 1:]).item())
-            trigger_mask = torch.as_tensor(
-                [True, has_update_candidates], dtype=torch.bool, device=device
+            raw_candidate_logits = candidate_logits
+            raw_cache_dist = _masked_categorical(candidate_logits, cache_mask_t[0])
+            candidate_logits = self._cardinality_corrected_cache_logits(
+                candidate_logits, cache_mask_t[0]
             )
-            trigger_dist = _masked_categorical(
-                self.macro_cache_trigger_actor(
-                    self._normalized_trigger_observations(obs)
-                ).squeeze(0),
-                trigger_mask,
+            cache_dist = _masked_categorical(candidate_logits, cache_mask_t[0])
+            deterministic_cache_diagnostics = None
+            group_ids = torch.ones_like(cache_mask_t[0], dtype=torch.long)
+            group_ids[0] = 0
+            cache_index, selected_cache_group = _group_aware_deterministic_candidate(
+                raw_candidate_logits,
+                cache_dist.probs,
+                cache_mask_t[0],
+                group_ids,
             )
-            trigger_index = (
-                int(torch.argmax(trigger_dist.logits).item())
-                if deterministic
-                else int(trigger_dist.sample().item())
+            legacy_flat_index = int(torch.argmax(cache_dist.logits).item())
+            legacy_reference_logits = self._cardinality_corrected_cache_logits(
+                raw_candidate_logits, cache_mask_t[0]
             )
-            if not has_update_candidates:
-                trigger_index = 0
-
-            if has_update_candidates:
-                update_dist = _masked_categorical(
-                    candidate_logits[1:], cache_mask_t[0, 1:]
+            legacy_reference_dist = _masked_categorical(
+                legacy_reference_logits, cache_mask_t[0]
+            )
+            probability_max_difference = float(
+                torch.max(torch.abs(cache_dist.probs - legacy_reference_dist.probs))
+                .detach()
+                .cpu()
+            )
+            probability_sum_error = float(
+                torch.abs(cache_dist.probs.sum() - 1.0).detach().cpu()
+            )
+            update_mask = cache_mask_t[0] & (group_ids == 1)
+            legal_update_count = int(update_mask.sum().item())
+            legal_update_best_score = (
+                float(raw_candidate_logits.masked_fill(~update_mask, -float("inf")).max().cpu())
+                if legal_update_count
+                else None
+            )
+            selected_raw_score = float(raw_candidate_logits[cache_index].detach().cpu())
+            selected_candidate_is_legal = bool(cache_mask_t[0, cache_index].item())
+            update_inner_argmax_violation = bool(
+                selected_cache_group == 1
+                and (
+                    cache_index <= 0
+                    or not selected_candidate_is_legal
+                    or selected_raw_score != legal_update_best_score
                 )
-                update_offset = -1
-                if trigger_index == 1:
-                    update_offset = (
-                        int(torch.argmax(update_dist.logits).item())
-                        if deterministic
-                        else int(update_dist.sample().item())
-                    )
-                conditional_update_probabilities = update_dist.probs
-            else:
-                update_dist = None
-                update_offset = -1
-                conditional_update_probabilities = torch.zeros(
-                    max(len(features) - 1, 0), dtype=torch.float32, device=device
-                )
-
-            cache_index = update_offset + 1 if trigger_index == 1 else 0
-            cache_group = trigger_index
+            )
+            p_keep_value = float(cache_dist.probs[0].detach().cpu())
+            p_update_group_value = float(cache_dist.probs[1:].sum().detach().cpu())
+            deterministic_cache_diagnostics = {
+                "p_keep": p_keep_value,
+                "p_update_group": p_update_group_value,
+                "new_selected_group": "KEEP" if selected_cache_group == 0 else "UPDATE",
+                "new_selected_candidate_index": cache_index,
+                "legacy_flat_selected_candidate_index": legacy_flat_index,
+                "legacy_flat_selected_group": "KEEP" if legacy_flat_index == 0 else "UPDATE",
+                "old_new_disagreement": cache_index != legacy_flat_index,
+                "group_tie_break": "KEEP",
+                "legal_update_candidate_count": legal_update_count,
+                "selected_candidate_is_legal": selected_candidate_is_legal,
+                "selected_raw_score": selected_raw_score,
+                "legal_update_best_raw_score": legal_update_best_score,
+                "update_inner_argmax_violation": update_inner_argmax_violation,
+                "probability_sum_error": probability_sum_error,
+                "probability_max_difference_vs_legacy_formula": probability_max_difference,
+            }
             selected_embed = embedded[0, cache_index]
             duration_values = torch.as_tensor(
                 self.duration_candidates, dtype=torch.float32, device=device
@@ -837,174 +631,58 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             )
             cache_tensor = torch.as_tensor(cache_index, dtype=torch.long, device=device)
             duration_tensor = torch.as_tensor(duration_index, dtype=torch.long, device=device)
-            duration_entropy = duration_dist.entropy()
-            p_keep = trigger_dist.probs[0]
-            p_update = trigger_dist.probs[1] if has_update_candidates else p_keep.new_zeros(())
-            log_p_keep = trigger_dist.logits[0]
-            log_p_update = (
-                trigger_dist.logits[1]
-                if has_update_candidates
-                else log_p_keep.new_zeros(())
-            )
-            trigger_log_prob = trigger_dist.logits[trigger_index]
-            conditional_update_log_prob = (
-                update_dist.log_prob(torch.as_tensor(update_offset, dtype=torch.long, device=device))
-                if cache_index > 0 and update_dist is not None
-                else trigger_log_prob.new_zeros(())
-            )
-            marginal_cache_probabilities = torch.zeros(
-                len(features), dtype=torch.float32, device=device
-            )
-            marginal_cache_probabilities[0] = p_keep
-            if has_update_candidates:
-                marginal_cache_probabilities[1:] = p_update * conditional_update_probabilities
-            positive_cache_probabilities = marginal_cache_probabilities > 0.0
-            cache_entropy = -torch.sum(
-                torch.where(
-                    positive_cache_probabilities,
-                    marginal_cache_probabilities
-                    * torch.log(marginal_cache_probabilities.clamp_min(1.0e-30)),
-                    torch.zeros_like(marginal_cache_probabilities),
-                )
-            )
-            # Validate the categorical factorization from its component
-            # probabilities in float64.  Using Distribution.logits here can
-            # differ from log(probs) by a little over 1e-6 for subnormal
-            # float32 candidate probabilities, although both represent the
-            # same sampled categorical distribution.
-            if cache_index == 0:
-                selected_cache_probability_64 = p_keep.to(torch.float64)
-                decomposed_probability_log_64 = torch.log(
-                    selected_cache_probability_64
-                )
-            else:
-                trigger_probability_64 = p_update.to(torch.float64)
-                conditional_probability_64 = conditional_update_probabilities[
-                    update_offset
-                ].to(torch.float64)
-                selected_cache_probability_64 = (
-                    trigger_probability_64 * conditional_probability_64
-                )
-                decomposed_probability_log_64 = (
-                    torch.log(trigger_probability_64)
-                    + torch.log(conditional_probability_64)
-                )
-            selected_cache_log_prob = torch.log(selected_cache_probability_64)
-            decomposition_error = torch.abs(
-                selected_cache_log_prob - decomposed_probability_log_64
-            )
+            cache_probabilities = cache_dist.probs
+            probability_sum = cache_probabilities.sum()
             if (
-                not bool(torch.isfinite(decomposition_error).item())
-                or float(decomposition_error.detach().cpu()) > 1.0e-6
-            ):
-                raise RuntimeError(
-                    "Independent Trigger/conditional candidate log-probability decomposition exceeds 1e-6: "
-                    f"{float(decomposition_error.detach().cpu()):.9g}."
+                not bool(torch.isfinite(cache_probabilities).all().item())
+                or not torch.allclose(
+                    probability_sum,
+                    probability_sum.new_ones(()),
+                    atol=1.0e-6,
+                    rtol=0.0,
                 )
-            decomposed_cache_log_prob = trigger_log_prob + conditional_update_log_prob
+            ):
+                raise FloatingPointError("Unified Cache Candidate probabilities are invalid.")
+            cache_log_prob = cache_dist.log_prob(cache_tensor)
             duration_log_prob = duration_dist.log_prob(duration_tensor)
+            cache_entropy = cache_dist.entropy()
+            duration_entropy = duration_dist.entropy()
+            zero = cache_log_prob.new_zeros(())
+            p_keep = cache_probabilities[0]
+            p_update = cache_probabilities[1:].sum()
+            log_p_keep = torch.log(p_keep.clamp_min(1.0e-30))
+            log_p_update = torch.log(p_update.clamp_min(1.0e-30))
             return MacroActionSample(
                 cache_index=cache_index,
                 duration_index=duration_index,
                 requested_duration=self.duration_candidates[duration_index],
-                log_prob=decomposed_cache_log_prob + duration_log_prob,
+                log_prob=cache_log_prob + duration_log_prob,
                 entropy=cache_entropy + duration_entropy,
                 value=self.macro_value(obs).squeeze(),
                 cache_mask=cache_mask.copy(),
                 duration_mask=durations_mask,
-                cache_probabilities=marginal_cache_probabilities.detach().cpu().numpy().copy(),
-                raw_cache_probabilities=marginal_cache_probabilities.detach().cpu().numpy().copy(),
-                conditional_update_probabilities=(
-                    np.concatenate(
-                        (
-                            np.zeros(1, dtype=np.float32),
-                            conditional_update_probabilities.detach()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32, copy=True),
-                        )
-                    )
-                    if has_update_candidates
-                    else np.zeros(len(features), dtype=np.float32)
+                cache_probabilities=cache_probabilities.detach().cpu().numpy().copy(),
+                raw_cache_probabilities=(
+                    cache_probabilities.detach().cpu().numpy().copy()
+                    if raw_cache_dist is None
+                    else raw_cache_dist.probs.detach().cpu().numpy().copy()
                 ),
+                conditional_update_probabilities=cache_probabilities.detach().cpu().numpy().copy(),
                 cache_entropy=cache_entropy,
-                trigger_entropy=trigger_dist.entropy(),
+                trigger_entropy=zero,
                 duration_entropy=duration_entropy,
-                cache_selected_group="KEEP" if cache_group == 0 else "UPDATE",
-                trigger_log_prob=trigger_log_prob,
-                conditional_update_log_prob=conditional_update_log_prob,
+                cache_selected_group="KEEP" if selected_cache_group == 0 else "UPDATE",
+                trigger_log_prob=zero,
+                conditional_update_log_prob=cache_log_prob,
                 p_keep=p_keep,
                 p_update=p_update,
                 log_p_keep=log_p_keep,
                 log_p_update=log_p_update,
                 duration_log_prob=duration_log_prob,
+                deterministic_cache_diagnostics=deterministic_cache_diagnostics,
             )
 
-    def duration_probabilities_for_candidates(
-        self, observation: Any, cache_candidate_features: Any
-    ) -> Any:
-        """Evaluate the frozen Duration policy for every candidate in one state."""
 
-        device = next(self.parameters()).device
-        obs, single = self._observation_batch(observation, device)
-        if not single or int(obs.shape[0]) != 1 or int(obs.shape[-1]) != self.observation_dim:
-            raise ValueError("Duration candidate evaluation requires one Macro observation.")
-        features = torch.as_tensor(
-            cache_candidate_features, dtype=torch.float32, device=device
-        )
-        if (
-            features.ndim != 2
-            or int(features.shape[-1]) != self.macro_cache_feature_dim
-            or int(features.shape[0]) <= 0
-            or not bool(torch.isfinite(features).all().item())
-        ):
-            raise ValueError("cache_candidate_features must be finite [C,F] values.")
-        with torch.no_grad():
-            hidden = self.macro_actor_encoder(obs).squeeze(0)
-            candidate_hidden = self.macro_cache_candidate_encoder(features)
-            duration_values = torch.as_tensor(
-                self.duration_candidates, dtype=torch.float32, device=device
-            ) / float(self.prediction_horizon)
-            count = int(features.shape[0])
-            duration_values = duration_values.reshape(1, -1, 1).expand(count, -1, -1)
-            duration_inputs = torch.cat(
-                (
-                    hidden.reshape(1, 1, -1).expand(
-                        count, len(self.duration_candidates), -1
-                    ),
-                    candidate_hidden.unsqueeze(1).expand(
-                        -1, len(self.duration_candidates), -1
-                    ),
-                    duration_values,
-                ),
-                dim=-1,
-            )
-            logits = self.macro_duration_scorer(duration_inputs).squeeze(-1)
-            if not bool(torch.isfinite(logits).all().item()):
-                raise FloatingPointError("Duration candidate logits contain NaN/Inf.")
-            return torch.softmax(logits, dim=-1).detach()
-
-    def cache_trigger_distribution(
-        self, observations: Any, has_update_candidates: Any | None = None
-    ) -> Any:
-        """Return the independent binary Trigger distribution for Macro states."""
-
-        device = next(self.macro_cache_trigger_actor.parameters()).device
-        obs, _ = self._observation_batch(observations, device)
-        if int(obs.shape[-1]) != self.observation_dim:
-            raise ValueError("Macro Trigger observation dimension mismatch.")
-        logits = self.macro_cache_trigger_actor(
-            self._normalized_trigger_observations(obs)
-        )
-        if has_update_candidates is None:
-            return torch.distributions.Categorical(logits=logits)
-        has_update = torch.as_tensor(
-            has_update_candidates, dtype=torch.bool, device=device
-        ).reshape(-1)
-        if tuple(has_update.shape) != (int(obs.shape[0]),):
-            raise ValueError("has_update_candidates must have one boolean per state.")
-        trigger_masks = torch.stack((torch.ones_like(has_update), has_update), dim=-1)
-        return _masked_categorical(logits, trigger_masks)
 
     def evaluate_macro(
         self,
@@ -1056,150 +734,44 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         duration_dist = _masked_categorical(duration_logits, d_masks)
         duration_log_prob = duration_dist.log_prob(duration_actions_t)
 
-        if self.unified_cache_action:
-            cache_dist = _masked_categorical(cache_logits, masks)
-            cache_log_prob = cache_dist.log_prob(cache_actions_t)
-            cache_probabilities = cache_dist.probs
-            cache_entropy = cache_dist.entropy()
-            p_keep = cache_probabilities[:, 0]
-            p_update = cache_probabilities[:, 1:].sum(dim=-1)
-            log_p_keep = torch.log(p_keep.clamp_min(1.0e-30))
-            log_p_update = torch.log(p_update.clamp_min(1.0e-30))
-            zero = torch.zeros_like(cache_log_prob)
-            joint_log_prob = cache_log_prob + duration_log_prob
-            decomposition_error = torch.abs(
-                joint_log_prob.to(torch.float64)
-                - cache_log_prob.to(torch.float64)
-                - duration_log_prob.to(torch.float64)
-            )
-            if not bool(torch.isfinite(cache_probabilities).all().item()) or not torch.allclose(
-                cache_probabilities.sum(dim=-1),
-                torch.ones_like(cache_probabilities.sum(dim=-1)),
-                atol=1.0e-6,
-                rtol=0.0,
-            ):
-                raise FloatingPointError("Unified Cache Candidate probabilities are invalid.")
-            return MacroComponentsEvaluation(
-                cache_log_prob=cache_log_prob,
-                duration_log_prob=duration_log_prob,
-                trigger_log_prob=zero,
-                conditional_update_log_prob=cache_log_prob,
-                p_keep=p_keep,
-                p_update=p_update,
-                log_p_keep=log_p_keep,
-                log_p_update=log_p_update,
-                joint_log_prob=joint_log_prob,
-                cache_entropy=cache_entropy,
-                trigger_entropy=zero,
-                conditional_update_entropy=cache_entropy,
-                duration_entropy=duration_dist.entropy(),
-                value=values,
-                joint_logprob_decomposition_error=decomposition_error,
-            )
-
-        has_update_candidates = torch.any(masks[:, 1:], dim=-1)
-        trigger_masks = torch.stack(
-            (torch.ones_like(has_update_candidates), has_update_candidates), dim=-1
+        cache_dist = _masked_categorical(cache_logits, masks)
+        cache_log_prob = cache_dist.log_prob(cache_actions_t)
+        cache_probabilities = cache_dist.probs
+        cache_entropy = cache_dist.entropy()
+        p_keep = cache_probabilities[:, 0]
+        p_update = cache_probabilities[:, 1:].sum(dim=-1)
+        log_p_keep = torch.log(p_keep.clamp_min(1.0e-30))
+        log_p_update = torch.log(p_update.clamp_min(1.0e-30))
+        zero = torch.zeros_like(cache_log_prob)
+        joint_log_prob = cache_log_prob + duration_log_prob
+        decomposition_error = torch.abs(
+            joint_log_prob.to(torch.float64)
+            - cache_log_prob.to(torch.float64)
+            - duration_log_prob.to(torch.float64)
         )
-        trigger_dist = _masked_categorical(
-            self.macro_cache_trigger_actor(
-                self._normalized_trigger_observations(observations_t)
-            ),
-            trigger_masks,
-        )
-        log_p_keep = trigger_dist.logits[:, 0]
-        log_p_update = torch.where(
-            has_update_candidates,
-            trigger_dist.logits[:, 1],
-            torch.zeros_like(log_p_keep),
-        )
-        p_keep = trigger_dist.probs[:, 0]
-        p_update = torch.where(
-            has_update_candidates,
-            trigger_dist.probs[:, 1],
-            torch.zeros_like(p_keep),
-        )
-
-        conditional_masks = masks.clone()
-        conditional_masks[:, 0] = False
-        no_update_rows = ~has_update_candidates
-        conditional_masks[no_update_rows, 0] = True
-        conditional_logits = cache_logits.clone()
-        conditional_logits[no_update_rows, 0] = 0.0
-        conditional_update_dist = _masked_categorical(
-            conditional_logits, conditional_masks
-        )
-        conditional_update_probabilities = conditional_update_dist.probs
-        conditional_update_entropy = conditional_update_dist.entropy()
-        conditional_update_entropy = torch.where(
-            has_update_candidates,
-            conditional_update_entropy,
-            torch.zeros_like(conditional_update_entropy),
-        )
-
-        is_update = cache_actions_t > 0
-        if bool(torch.any(is_update & ~has_update_candidates).item()):
-            raise ValueError("UPDATE action has no legal UPDATE candidate.")
-        trigger_log_prob = torch.where(is_update, log_p_update, log_p_keep)
-        conditional_update_log_prob = torch.where(
-            is_update,
-            conditional_update_dist.log_prob(cache_actions_t),
-            torch.zeros_like(duration_log_prob),
-        )
-        cache_log_prob = trigger_log_prob + conditional_update_log_prob
-        reconstructed_joint_log_prob = (
-            cache_log_prob + duration_log_prob
-        )
-        # Check the hierarchical factorization in float64 so harmless float32
-        # addition-order rounding cannot cross the 1e-6 contract.
-        cache_log_prob64 = cache_log_prob.to(torch.float64)
-        duration_log_prob64 = duration_log_prob.to(torch.float64)
-        trigger_log_prob64 = trigger_log_prob.to(torch.float64)
-        conditional_update_log_prob64 = conditional_update_log_prob.to(torch.float64)
-        decomposed_joint_log_prob64 = (
-            trigger_log_prob64
-            + conditional_update_log_prob64
-            + duration_log_prob64
-        )
-        joint_logprob_decomposition_error = torch.abs(
-            cache_log_prob64 + duration_log_prob64 - decomposed_joint_log_prob64
-        )
-        maximum_error = float(joint_logprob_decomposition_error.max().detach().cpu())
-        if not np.isfinite(maximum_error) or maximum_error > 1.0e-6:
-            raise RuntimeError(
-                "Macro joint log-probability decomposition exceeds 1e-6: "
-                f"{maximum_error:.9g}"
-            )
-        trigger_entropy = trigger_dist.entropy()
-        cache_entropy = trigger_entropy + p_update * conditional_update_entropy
-        joint_cache_probabilities = torch.cat(
-            (
-                p_keep.unsqueeze(-1),
-                p_update.unsqueeze(-1) * conditional_update_probabilities[:, 1:],
-            ),
-            dim=-1,
-        )
-        if tuple(joint_cache_probabilities.shape) != tuple(masks.shape):
-            raise RuntimeError("Hierarchical Cache probability shape mismatch.")
-        probability_sums = joint_cache_probabilities.sum(dim=-1)
-        if not bool(torch.allclose(probability_sums, torch.ones_like(probability_sums), atol=1e-6, rtol=0.0)):
-            raise RuntimeError("Hierarchical Cache probabilities do not sum to one.")
+        if not bool(torch.isfinite(cache_probabilities).all().item()) or not torch.allclose(
+            cache_probabilities.sum(dim=-1),
+            torch.ones_like(cache_probabilities.sum(dim=-1)),
+            atol=1.0e-6,
+            rtol=0.0,
+        ):
+            raise FloatingPointError("Unified Cache Candidate probabilities are invalid.")
         return MacroComponentsEvaluation(
             cache_log_prob=cache_log_prob,
             duration_log_prob=duration_log_prob,
-            trigger_log_prob=trigger_log_prob,
-            conditional_update_log_prob=conditional_update_log_prob,
+            trigger_log_prob=zero,
+            conditional_update_log_prob=cache_log_prob,
             p_keep=p_keep,
             p_update=p_update,
             log_p_keep=log_p_keep,
             log_p_update=log_p_update,
-            joint_log_prob=reconstructed_joint_log_prob,
+            joint_log_prob=joint_log_prob,
             cache_entropy=cache_entropy,
-            trigger_entropy=trigger_entropy,
-            conditional_update_entropy=conditional_update_entropy,
+            trigger_entropy=zero,
+            conditional_update_entropy=cache_entropy,
             duration_entropy=duration_dist.entropy(),
             value=values,
-            joint_logprob_decomposition_error=joint_logprob_decomposition_error,
+            joint_logprob_decomposition_error=decomposition_error,
         )
 
     def _micro_candidate_raw_logits(

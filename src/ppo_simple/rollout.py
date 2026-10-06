@@ -221,120 +221,6 @@ class EpisodeCollection:
     summary: dict[str, Any]
 
 
-@dataclass(frozen=True)
-class PairedCounterfactualBranchResult:
-    valid: bool
-    option_returns: dict[int, float]
-    actual_durations: dict[int, int]
-    runtime_seconds: float
-    state_restore_valid: bool
-    environment_execution_count: int
-
-
-class CounterfactualRestoreError(RuntimeError):
-    """Raised when a trigger teacher branch cannot restore the live rollout."""
-
-
-def _capture_global_rng_state() -> dict[str, Any]:
-    state: dict[str, Any] = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-    }
-    if torch is not None:
-        state["torch_cpu"] = torch.get_rng_state().clone()
-        state["torch_cuda"] = (
-            [item.clone() for item in torch.cuda.get_rng_state_all()]
-            if torch.cuda.is_available()
-            else None
-        )
-    else:
-        state["torch_cpu"] = None
-        state["torch_cuda"] = None
-    return state
-
-
-def _restore_global_rng_state(state: Mapping[str, Any]) -> None:
-    random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
-    if torch is None:
-        return
-    if state["torch_cpu"] is not None:
-        torch.set_rng_state(state["torch_cpu"].cpu())
-    if state["torch_cuda"] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
-
-
-def _paired_trajectory_state_hash(
-    cache: np.ndarray,
-    uav: Mapping[str, Any],
-    slot_index: int,
-    rng_state: Mapping[str, Any],
-) -> str:
-    digest = hashlib.sha256()
-    digest.update(np.ascontiguousarray(cache, dtype=np.int8).tobytes())
-    digest.update(str(int(slot_index)).encode("ascii"))
-    for key in sorted(uav):
-        digest.update(str(key).encode("utf-8"))
-        digest.update(
-            np.ascontiguousarray(uav[key], dtype=np.float64).tobytes()
-        )
-    digest.update(repr(rng_state["python"]).encode("utf-8"))
-    numpy_state = rng_state["numpy"]
-    digest.update(str(numpy_state[0]).encode("ascii"))
-    digest.update(np.ascontiguousarray(numpy_state[1], dtype=np.uint32).tobytes())
-    digest.update(repr(tuple(numpy_state[2:])).encode("ascii"))
-    torch_cpu = rng_state.get("torch_cpu")
-    if torch_cpu is not None:
-        digest.update(torch_cpu.cpu().contiguous().numpy().tobytes())
-    for cuda_state in rng_state.get("torch_cuda") or ():
-        digest.update(cuda_state.cpu().contiguous().numpy().tobytes())
-    return digest.hexdigest()
-
-
-def _derived_counterfactual_seed(
-    base_seed: int, rollout_index: int, macro_index: int, sample_index: int
-) -> int:
-    payload = (
-        f"{int(base_seed)}|rollout_{int(rollout_index)}|{int(macro_index)}|"
-        f"cache_trigger_k4_candidate_{int(sample_index)}"
-    ).encode("ascii")
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
-
-
-def _sample_policy_conditional_update_candidates(
-    conditional_update_probabilities: Any,
-    *,
-    base_seed: int,
-    rollout_index: int,
-    macro_index: int,
-    count: int,
-) -> tuple[int, ...]:
-    conditional = np.asarray(
-        conditional_update_probabilities, dtype=np.float64
-    ).reshape(-1)
-    if len(conditional) <= 1 or not np.all(np.isfinite(conditional)):
-        return ()
-    if np.any(conditional < 0.0):
-        return ()
-    conditional_update = conditional[1:].copy()
-    total = float(np.sum(conditional_update))
-    if total <= 0.0 or not np.isclose(total, 1.0, rtol=1e-6, atol=1e-7):
-        return ()
-    legal_offsets = np.flatnonzero(conditional_update > 0.0)
-    if not len(legal_offsets):
-        return ()
-    legal = legal_offsets + 1
-    choice_probabilities = conditional_update[legal_offsets].copy()
-    choice_probabilities /= float(choice_probabilities.sum())
-    samples = []
-    for sample_index in range(int(count)):
-        local_rng = np.random.default_rng(
-            _derived_counterfactual_seed(
-                base_seed, rollout_index, macro_index, sample_index
-            )
-        )
-        samples.append(int(local_rng.choice(legal, p=choice_probabilities)))
-    return tuple(samples)
 
 
 def actual_duration_for_frame(
@@ -541,165 +427,6 @@ def _uav_candidates(
     return candidates, np.stack(features).astype(np.float32)
 
 
-def _execute_paired_counterfactual_branch(
-    policy: DualTimescaleActorCritic,
-    context: Any,
-    aligned_steps: list[Any],
-    *,
-    start_slot: int,
-    initial_cache: np.ndarray,
-    initial_uav: Mapping[str, Any],
-    target_cache: np.ndarray,
-    requested_durations: tuple[int, ...],
-    rng_snapshot: Mapping[str, Any],
-) -> PairedCounterfactualBranchResult:
-    """Return reward-only prefix values and restore environment plus all RNGs."""
-
-    total_slots = len(aligned_steps)
-    requested = tuple(int(value) for value in requested_durations)
-    if not requested or tuple(sorted(set(requested))) != requested:
-        raise ValueError("Trigger teacher durations must be sorted, unique, and non-empty.")
-    actual_by_requested = {
-        duration: actual_duration_for_frame(duration, start_slot, total_slots)
-        for duration in requested
-    }
-    expected_duration = max(actual_by_requested.values())
-    cache_snapshot = np.asarray(initial_cache, dtype=np.int8).copy()
-    uav_snapshot = {
-        key: np.asarray(value, dtype=np.float64).copy()
-        for key, value in initial_uav.items()
-    }
-    before_hash = _paired_trajectory_state_hash(
-        cache_snapshot, uav_snapshot, start_slot, rng_snapshot
-    )
-    started = time.perf_counter()
-    branch_cache = cache_snapshot.copy()
-    branch_uav = {key: value.copy() for key, value in uav_snapshot.items()}
-    branch_reward = 0.0
-    actual_duration = 0
-    branch_valid = True
-    option_returns: dict[int, float] = {}
-    try:
-        _restore_global_rng_state(rng_snapshot)
-        for elapsed in range(expected_duration):
-            slot_index = start_slot + elapsed
-            step = aligned_steps[slot_index]
-            previous_uav = {key: value.copy() for key, value in branch_uav.items()}
-            observation = _observation(target_cache, branch_uav, step, context)
-            current_trial = {key: value.copy() for key, value in branch_uav.items()}
-            previous_positions = {key: value.copy() for key, value in branch_uav.items()}
-            selected_uav0_condition = np.zeros(2, dtype=np.float32)
-            actions: list[int] = []
-            for uav_index, uav_id in enumerate(context.action_spec.uav_ids):
-                candidates, candidate_features = _uav_candidates(
-                    uav_index,
-                    current_trial,
-                    previous_positions,
-                    target_cache,
-                    step,
-                    context,
-                )
-                condition = (
-                    np.zeros(2, dtype=np.float32)
-                    if uav_index == 0
-                    else selected_uav0_condition.copy()
-                )
-                sample = policy.sample_micro_head(
-                    observation,
-                    candidate_features,
-                    np.ones(len(candidate_features), dtype=bool),
-                    uav_index=uav_index,
-                    uav0_position_condition=condition,
-                    deterministic=False,
-                )
-                selected_candidate = candidates[int(sample.selected_index)]
-                uav_configuration.apply_uav_candidate(
-                    current_trial,
-                    previous_positions,
-                    str(uav_id),
-                    selected_candidate.target_position,
-                    {key: 1 for key in context.action_spec.uav_ids},
-                    context.cfg,
-                    context.flight_boundary,
-                )
-                if uav_index == 0:
-                    selected_uav0_condition = _positions_condition(
-                        current_trial[str(uav_id)], context
-                    )
-                actions.append(int(sample.selected_index))
-            uav_configuration.validate_uav_configuration_transition(
-                previous_positions,
-                current_trial,
-                {
-                    uav_id: int(
-                        np.linalg.norm(
-                            current_trial[uav_id] - previous_positions[uav_id]
-                        )
-                        > float(
-                            uav_configuration.uav_search_config_from_project(
-                                context.cfg
-                            ).position_tolerance_m
-                        )
-                    )
-                    for uav_id in context.action_spec.uav_ids
-                },
-                context.cfg,
-                context.flight_boundary,
-            )
-            result = slot_environment.execute_configured_slot(
-                branch_cache,
-                previous_uav,
-                target_cache,
-                current_trial,
-                step.scenario_slice,
-                step.actual_tasks,
-                step.actual_vehicle_positions,
-                context.local_cache,
-                context.service_catalog,
-                context.cfg,
-                context.cache_nodes,
-                context.cache_cfg,
-                context.flight_boundary,
-                slot_id=int(step.slot),
-                time_s=float(step.time_s),
-            )
-            if not result.step_feasible or result.system_utility is None:
-                branch_valid = False
-                break
-            _check_request_contract(
-                branch_cache, previous_uav, result, context.action_spec
-            )
-            branch_reward += (float(context.cfg["algorithm"]["ppo"]["gamma"]) ** elapsed) * _check_reward(result)
-            branch_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
-            branch_uav = {
-                key: np.asarray(value, dtype=np.float64).copy()
-                for key, value in result.next_uav_positions.items()
-            }
-            actual_duration += 1
-            for requested_duration, actual_requested_duration in actual_by_requested.items():
-                if actual_requested_duration == actual_duration:
-                    option_returns[requested_duration] = float(branch_reward)
-        if actual_duration != expected_duration or not branch_valid:
-            branch_valid = False
-        if branch_valid and set(option_returns) != set(requested):
-            branch_valid = False
-        if branch_valid and not all(np.isfinite(value) for value in option_returns.values()):
-            raise FloatingPointError("Trigger option reward contains NaN/Inf.")
-    finally:
-        _restore_global_rng_state(rng_snapshot)
-    runtime = time.perf_counter() - started
-    after_hash = _paired_trajectory_state_hash(
-        cache_snapshot, uav_snapshot, start_slot, _capture_global_rng_state()
-    )
-    restore_valid = before_hash == after_hash
-    return PairedCounterfactualBranchResult(
-        valid=bool(branch_valid),
-        option_returns={int(key): float(value) for key, value in option_returns.items()},
-        actual_durations=dict(actual_by_requested),
-        runtime_seconds=float(runtime),
-        state_restore_valid=bool(restore_valid),
-        environment_execution_count=int(actual_duration),
-    )
 
 
 def _positions_condition(
@@ -737,10 +464,7 @@ def collect_dual_timescale_episode(
     duration_candidates: tuple[int, ...],
     *,
     deterministic: bool = False,
-    critic_independent_trigger_teacher: bool = False,
-    base_seed: int = 0,
     episode_seed: int | None = None,
-    rollout_index: int | None = None,
 ) -> EpisodeCollection:
     """冻结两套策略，采完整 episode，再分别交给 Micro/Macro 更新。"""
 
@@ -753,8 +477,6 @@ def collect_dual_timescale_episode(
     total_slots = len(aligned_steps)
     if total_slots != int(context.episode_slots):
         raise ValueError("双时间尺度正式 rollout 必须覆盖完整 episode。")
-    if critic_independent_trigger_teacher and rollout_index is None:
-        raise ValueError("Trigger option teacher requires a rollout ordinal for its isolated sampler.")
     tensor_spec = PrimitiveTensorSpec.create(context)
     max_uav_candidates = int(tensor_spec.uav_max_candidates) + 1
     micro_buffer = MicroRolloutBuffer()
@@ -764,13 +486,6 @@ def collect_dual_timescale_episode(
         key: np.asarray(value, dtype=np.float64).copy()
         for key, value in _copy_uav_positions(context.initial_uav).items()
     }
-    if critic_independent_trigger_teacher:
-        if bool(getattr(policy, "unified_cache_action", False)):
-            raise ValueError("Unified Cache Action must not invoke the Trigger teacher.")
-        if torch is None:
-            raise ImportError("Paired Cache teacher requires PyTorch.")
-        if tuple(policy.duration_candidates) != (1, 3, 5):
-            raise ValueError("Critic-independent Trigger teacher requires durations (1, 3, 5).")
     frame_start = 0
     frame_observation: np.ndarray | None = None
     frame_candidate_features: np.ndarray | None = None
@@ -863,26 +578,13 @@ def collect_dual_timescale_episode(
             frame_duration_masks = selected.duration_mask.copy()
             frame_old_log_prob = float(selected.log_prob.detach().cpu())
             frame_old_entropy = float(selected.entropy.detach().cpu())
-            if bool(getattr(policy, "unified_cache_action", False)):
-                frame_old_trigger_log_prob = 0.0
-                frame_old_trigger_p_keep = 0.0
-                frame_old_trigger_p_update = 0.0
-                frame_old_trigger_log_p_keep = 0.0
-                frame_old_trigger_log_p_update = 0.0
-                frame_old_update_conditional_log_prob = 0.0
-                frame_update_conditional_log_prob_valid = False
-            else:
-                frame_old_trigger_log_prob = float(
-                    selected.trigger_log_prob.detach().cpu()
-                )
-                frame_old_trigger_p_keep = float(selected.p_keep.detach().cpu())
-                frame_old_trigger_p_update = float(selected.p_update.detach().cpu())
-                frame_old_trigger_log_p_keep = float(selected.log_p_keep.detach().cpu())
-                frame_old_trigger_log_p_update = float(selected.log_p_update.detach().cpu())
-                frame_old_update_conditional_log_prob = float(
-                    selected.conditional_update_log_prob.detach().cpu()
-                )
-                frame_update_conditional_log_prob_valid = frame_cache_index > 0
+            frame_old_trigger_log_prob = 0.0
+            frame_old_trigger_p_keep = 0.0
+            frame_old_trigger_p_update = 0.0
+            frame_old_trigger_log_p_keep = 0.0
+            frame_old_trigger_log_p_update = 0.0
+            frame_old_update_conditional_log_prob = 0.0
+            frame_update_conditional_log_prob_valid = False
             frame_old_duration_log_prob = float(
                 selected.duration_log_prob.detach().cpu()
             )
@@ -896,55 +598,53 @@ def collect_dual_timescale_episode(
             update_group_probability = float(cache_probabilities[1:].sum())
             keep_probabilities.append(keep_probability)
             update_group_probabilities.append(update_group_probability)
-            if bool(getattr(policy, "cardinality_corrected_cache_action", False)):
-                raw_cache_probabilities = np.asarray(
-                    selected.raw_cache_probabilities, dtype=np.float64
+            raw_cache_probabilities = np.asarray(
+                selected.raw_cache_probabilities, dtype=np.float64
+            )
+            if (
+                raw_cache_probabilities.shape != frame_candidate_masks.shape
+                or not np.isfinite(raw_cache_probabilities).all()
+                or not np.isclose(
+                    float(raw_cache_probabilities.sum()),
+                    1.0,
+                    rtol=1.0e-6,
+                    atol=1.0e-7,
                 )
-                if (
-                    raw_cache_probabilities.shape != frame_candidate_masks.shape
-                    or not np.isfinite(raw_cache_probabilities).all()
-                    or not np.isclose(
-                        float(raw_cache_probabilities.sum()),
-                        1.0,
-                        rtol=1.0e-6,
-                        atol=1.0e-7,
-                    )
-                ):
-                    raise AssertionError("Raw flat Cache Candidate probabilities are invalid.")
-                raw_candidate0_probabilities.append(float(raw_cache_probabilities[0]))
-                legal_update_candidate_counts.append(
-                    int(np.count_nonzero(frame_candidate_masks[1:]))
-                )
+            ):
+                raise AssertionError("Raw flat Cache Candidate probabilities are invalid.")
+            raw_candidate0_probabilities.append(float(raw_cache_probabilities[0]))
+            legal_update_candidate_counts.append(
+                int(np.count_nonzero(frame_candidate_masks[1:]))
+            )
             cache_entropies.append(float(selected.cache_entropy.detach().cpu()))
             trigger_entropies.append(float(selected.trigger_entropy.detach().cpu()))
             duration_entropies.append(float(selected.duration_entropy.detach().cpu()))
-            if bool(getattr(policy, "unified_cache_action", False)):
-                positive_candidate_probabilities = cache_probabilities[cache_probabilities > 0.0]
-                candidate_entropy = float(
-                    -np.sum(
-                        positive_candidate_probabilities
-                        * np.log(positive_candidate_probabilities)
-                    )
+            positive_candidate_probabilities = cache_probabilities[cache_probabilities > 0.0]
+            candidate_entropy = float(
+                -np.sum(
+                    positive_candidate_probabilities
+                    * np.log(positive_candidate_probabilities)
                 )
-                best_update_probability = (
-                    float(np.max(cache_probabilities[1:]))
-                    if bool(np.any(frame_candidate_masks[1:]))
-                    else 0.0
-                )
-                update_margin = best_update_probability - keep_probability
-                unified_candidate0_probabilities.append(keep_probability)
-                unified_candidate_entropies.append(candidate_entropy)
-                unified_update_margins.append(update_margin)
-                unified_candidate_state_diagnostics.append(
-                    {
-                        "macro_index": int(len(macro_buffer.transitions)),
-                        "selected_candidate_id": int(frame_cache_index),
-                        "candidate0_probability": keep_probability,
-                        "best_nonzero_candidate_probability": best_update_probability,
-                        "candidate_entropy": candidate_entropy,
-                        "update_margin": float(update_margin),
-                    }
-                )
+            )
+            best_update_probability = (
+                float(np.max(cache_probabilities[1:]))
+                if bool(np.any(frame_candidate_masks[1:]))
+                else 0.0
+            )
+            update_margin = best_update_probability - keep_probability
+            unified_candidate0_probabilities.append(keep_probability)
+            unified_candidate_entropies.append(candidate_entropy)
+            unified_update_margins.append(update_margin)
+            unified_candidate_state_diagnostics.append(
+                {
+                    "macro_index": int(len(macro_buffer.transitions)),
+                    "selected_candidate_id": int(frame_cache_index),
+                    "candidate0_probability": keep_probability,
+                    "best_nonzero_candidate_probability": best_update_probability,
+                    "candidate_entropy": candidate_entropy,
+                    "update_margin": float(update_margin),
+                }
+            )
             update_candidate_probabilities = cache_probabilities[1:]
             conditional_update_probabilities = np.asarray(
                 selected.conditional_update_probabilities, dtype=np.float64
@@ -955,33 +655,11 @@ def collect_dual_timescale_episode(
                 or np.any(conditional_update_probabilities < 0.0)
             ):
                 raise AssertionError("Macro conditional Candidate probabilities are invalid.")
-            if bool(getattr(policy, "unified_cache_action", False)):
-                update_candidate_entropies.append(unified_candidate_entropies[-1])
-            else:
-                if frame_candidate_masks[1:].any():
-                    if not np.isclose(
-                        float(conditional_update_probabilities[1:].sum()),
-                        1.0,
-                        rtol=1e-6,
-                        atol=1e-7,
-                    ):
-                        raise AssertionError("Old conditional Candidate distribution does not sum to one.")
-                    positive_update_probabilities = conditional_update_probabilities[1:][
-                        conditional_update_probabilities[1:] > 0.0
-                    ]
-                    update_candidate_entropies.append(
-                        float(-np.sum(positive_update_probabilities * np.log(positive_update_probabilities)))
-                    )
-                else:
-                    update_candidate_entropies.append(0.0)
+            update_candidate_entropies.append(unified_candidate_entropies[-1])
             frame_cache = _candidates[frame_cache_index].copy()
             frame_cache_changed = bool(np.any(frame_cache != cache))
             frame_macro_index = len(macro_buffer.transitions)
-            frame_trigger_learning_valid = (
-                False
-                if bool(getattr(policy, "unified_cache_action", False))
-                else bool(np.any(frame_candidate_masks[1:]))
-            )
+            frame_trigger_learning_valid = False
             frame_trigger_teacher_valid = False
             frame_trigger_credit_active = False
             frame_teacher_q_keep = None
@@ -994,114 +672,6 @@ def collect_dual_timescale_episode(
             frame_counterfactual_runtime_seconds = 0.0
             frame_counterfactual_state_restore_valid = True
             frame_counterfactual_branch_count = 0
-            if critic_independent_trigger_teacher and frame_trigger_learning_valid:
-                assert episode_seed is not None
-                duration_probabilities = (
-                    policy.duration_probabilities_for_candidates(
-                        frame_observation, frame_candidate_features
-                    )
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float64, copy=True)
-                )
-                if (
-                    duration_probabilities.shape
-                    != (len(_candidates), len(policy.duration_candidates))
-                    or not np.isfinite(duration_probabilities).all()
-                    or np.any(duration_probabilities < 0.0)
-                    or not np.allclose(
-                        duration_probabilities.sum(axis=1), 1.0, atol=1.0e-7, rtol=1.0e-6
-                    )
-                ):
-                    raise FloatingPointError("Old Duration probabilities are invalid.")
-                sampled_update_indices = _sample_policy_conditional_update_candidates(
-                    conditional_update_probabilities,
-                    base_seed=int(base_seed),
-                    rollout_index=int(rollout_index),
-                    macro_index=frame_macro_index,
-                    count=4,
-                )
-                if len(sampled_update_indices) != 4:
-                    raise RuntimeError("Old conditional Candidate policy could not construct K=4 samples.")
-                frame_update_candidate_indices = sampled_update_indices
-                post_macro_rng = _capture_global_rng_state()
-
-                def option_return_for_candidate(candidate_index: int) -> tuple[float, float]:
-                    nonlocal frame_counterfactual_branch_count
-                    nonlocal frame_counterfactual_runtime_seconds
-                    nonlocal frame_counterfactual_state_restore_valid
-                    nonlocal counterfactual_branch_count
-                    nonlocal counterfactual_runtime_seconds
-                    nonlocal counterfactual_environment_execution_count
-                    nonlocal counterfactual_state_restore_valid
-                    branch = _execute_paired_counterfactual_branch(
-                        policy,
-                        context,
-                        aligned_steps,
-                        start_slot=slot_index,
-                        initial_cache=cache,
-                        initial_uav=uav,
-                        target_cache=_candidates[candidate_index],
-                        requested_durations=tuple(policy.duration_candidates),
-                        rng_snapshot=post_macro_rng,
-                    )
-                    frame_counterfactual_branch_count += 1
-                    frame_counterfactual_runtime_seconds += branch.runtime_seconds
-                    counterfactual_branch_count += 1
-                    counterfactual_runtime_seconds += branch.runtime_seconds
-                    counterfactual_environment_execution_count += (
-                        branch.environment_execution_count
-                    )
-                    counterfactual_state_restore_valid = (
-                        counterfactual_state_restore_valid
-                        and branch.state_restore_valid
-                    )
-                    frame_counterfactual_state_restore_valid = (
-                        frame_counterfactual_state_restore_valid
-                        and branch.state_restore_valid
-                    )
-                    if not branch.state_restore_valid:
-                        raise CounterfactualRestoreError(
-                            "Counterfactual option branch failed environment/RNG restore."
-                        )
-                    if not branch.valid:
-                        raise FloatingPointError(
-                            "Counterfactual option branch did not produce all duration returns."
-                        )
-                    probabilities = duration_probabilities[candidate_index]
-                    returns = np.asarray(
-                        [branch.option_returns[int(value)] for value in policy.duration_candidates],
-                        dtype=np.float64,
-                    )
-                    option_value = float(np.dot(probabilities, returns))
-                    if not np.isfinite(option_value):
-                        raise FloatingPointError("Duration-weighted option value is NaN/Inf.")
-                    return option_value, float(branch.runtime_seconds)
-
-                frame_teacher_q_keep, _ = option_return_for_candidate(0)
-                candidate_option_returns = [
-                    option_return_for_candidate(candidate_index)[0]
-                    for candidate_index in sampled_update_indices
-                ]
-                frame_update_candidate_returns = tuple(
-                    float(value) for value in candidate_option_returns
-                )
-                frame_teacher_q_update = float(np.mean(candidate_option_returns))
-                frame_teacher_delta = float(
-                    frame_teacher_q_update - frame_teacher_q_keep
-                )
-                frame_trigger_update_se = float(
-                    np.std(candidate_option_returns, ddof=1) / np.sqrt(4.0)
-                )
-                frame_trigger_confidence_ratio = float(
-                    abs(frame_teacher_delta) / (frame_trigger_update_se + 1.0e-8)
-                )
-                frame_trigger_teacher_valid = True
-                frame_trigger_credit_active = bool(
-                    abs(frame_teacher_delta) > frame_trigger_update_se
-                )
-                frame_trigger_learning_valid = True
             if deterministic:
                 selected_cache_id = hashlib.sha256(
                     np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
@@ -1119,50 +689,49 @@ def collect_dual_timescale_episode(
                     "probability_inf_count": int(np.isinf(cache_probabilities).sum()),
                 }
                 protocol_diagnostic = selected.deterministic_cache_diagnostics
-                if bool(getattr(policy, "cardinality_corrected_cache_action", False)):
-                    if protocol_diagnostic is None:
-                        raise AssertionError(
-                            "Deterministic corrected Cache frame lacks protocol diagnostics."
-                        )
-                    p_keep = float(protocol_diagnostic["p_keep"])
-                    p_update_group = float(protocol_diagnostic["p_update_group"])
-                    expected_group = "KEEP" if p_keep >= p_update_group else "UPDATE"
-                    if str(protocol_diagnostic["new_selected_group"]) != expected_group:
-                        cache_group_rule_violation_count += 1
-                    if str(protocol_diagnostic["new_selected_group"]) == "UPDATE" and bool(
-                        protocol_diagnostic["update_inner_argmax_violation"]
-                    ):
-                        cache_update_inner_argmax_violation_count += 1
-                    probability_difference = float(
-                        protocol_diagnostic["probability_max_difference_vs_legacy_formula"]
+                if protocol_diagnostic is None:
+                    raise AssertionError(
+                        "Deterministic corrected Cache frame lacks protocol diagnostics."
                     )
-                    probability_sum_error = float(protocol_diagnostic["probability_sum_error"])
-                    cache_probability_max_difference = max(
-                        cache_probability_max_difference, probability_difference
+                p_keep = float(protocol_diagnostic["p_keep"])
+                p_update_group = float(protocol_diagnostic["p_update_group"])
+                expected_group = "KEEP" if p_keep >= p_update_group else "UPDATE"
+                if str(protocol_diagnostic["new_selected_group"]) != expected_group:
+                    cache_group_rule_violation_count += 1
+                if str(protocol_diagnostic["new_selected_group"]) == "UPDATE" and bool(
+                    protocol_diagnostic["update_inner_argmax_violation"]
+                ):
+                    cache_update_inner_argmax_violation_count += 1
+                probability_difference = float(
+                    protocol_diagnostic["probability_max_difference_vs_legacy_formula"]
+                )
+                probability_sum_error = float(protocol_diagnostic["probability_sum_error"])
+                cache_probability_max_difference = max(
+                    cache_probability_max_difference, probability_difference
+                )
+                cache_probability_sum_error_max = max(
+                    cache_probability_sum_error_max, probability_sum_error
+                )
+                if not np.isfinite(
+                    [p_keep, p_update_group, probability_difference, probability_sum_error]
+                ).all():
+                    cache_probability_nonfinite_count += 1
+                cache_probability_nan_count += int(
+                    np.isnan(cache_probabilities).sum()
+                )
+                cache_probability_inf_count += int(
+                    np.isinf(cache_probabilities).sum()
+                )
+                selection_record["selected_update_raw_score_best"] = (
+                    None
+                    if str(protocol_diagnostic["new_selected_group"]) != "UPDATE"
+                    else bool(
+                        protocol_diagnostic["selected_candidate_is_legal"]
+                        and protocol_diagnostic["selected_raw_score"]
+                        == protocol_diagnostic["legal_update_best_raw_score"]
                     )
-                    cache_probability_sum_error_max = max(
-                        cache_probability_sum_error_max, probability_sum_error
-                    )
-                    if not np.isfinite(
-                        [p_keep, p_update_group, probability_difference, probability_sum_error]
-                    ).all():
-                        cache_probability_nonfinite_count += 1
-                    cache_probability_nan_count += int(
-                        np.isnan(cache_probabilities).sum()
-                    )
-                    cache_probability_inf_count += int(
-                        np.isinf(cache_probabilities).sum()
-                    )
-                    selection_record["selected_update_raw_score_best"] = (
-                        None
-                        if str(protocol_diagnostic["new_selected_group"]) != "UPDATE"
-                        else bool(
-                            protocol_diagnostic["selected_candidate_is_legal"]
-                            and protocol_diagnostic["selected_raw_score"]
-                            == protocol_diagnostic["legal_update_best_raw_score"]
-                        )
-                    )
-                    selection_record.update(protocol_diagnostic)
+                )
+                selection_record.update(protocol_diagnostic)
                 deterministic_cache_selections.append(selection_record)
             if frame_cache_index > 0:
                 candidate_signature = np.ascontiguousarray(
@@ -1586,17 +1155,12 @@ def collect_dual_timescale_episode(
     summary = {
         "episode_return": episode_return,
         "episode_seed": None if episode_seed is None else int(episode_seed),
-        "base_seed": int(base_seed),
         "macro_return": float(sum(item.frame_reward for item in macro_buffer.transitions)),
         "macro_frame_count": macro_count,
         "trigger_teacher_valid_count": int(len(valid_teacher_transitions)),
-        "trigger_teacher_used": bool(critic_independent_trigger_teacher),
-        "trigger_active": not bool(getattr(policy, "unified_cache_action", False)),
-        "trigger_teacher_invalid_count": int(
-            macro_count - len(valid_teacher_transitions)
-            if critic_independent_trigger_teacher
-            else 0
-        ),
+        "trigger_teacher_used": False,
+        "trigger_active": False,
+        "trigger_teacher_invalid_count": 0,
         "trigger_credit_eligible_count": int(len(eligible_trigger_transitions)),
         "trigger_credit_active_count": int(len(active_trigger_transitions)),
         "trigger_credit_active_fraction": float(
@@ -1669,8 +1233,7 @@ def collect_dual_timescale_episode(
         ),
         "corrected_candidate0_probability_mean": (
             float(np.mean(unified_candidate0_probabilities))
-            if bool(getattr(policy, "cardinality_corrected_cache_action", False))
-            and unified_candidate0_probabilities
+            if unified_candidate0_probabilities
             else None
         ),
         "raw_candidate0_probability_mean": (
@@ -1680,8 +1243,7 @@ def collect_dual_timescale_episode(
         ),
         "corrected_update_group_probability_mean": (
             float(np.mean(update_group_probabilities))
-            if bool(getattr(policy, "cardinality_corrected_cache_action", False))
-            and update_group_probabilities
+            if update_group_probabilities
             else None
         ),
         "legal_update_candidate_count_mean": (
@@ -1816,11 +1378,7 @@ def collect_dual_timescale_episode(
             "cache": deterministic_cache_selections,
             "uav": deterministic_uav_selections,
         }
-    if (
-        deterministic
-        and bool(getattr(policy, "unified_cache_action", False))
-        and bool(getattr(policy, "cardinality_corrected_cache_action", False))
-    ):
+    if deterministic:
         summary["deterministic_cache_protocol"] = {
             "cache_deterministic_protocol": "group_mass_then_raw_score_argmax",
             "cache_group_decision": "argmax_keep_vs_update_group_mass",

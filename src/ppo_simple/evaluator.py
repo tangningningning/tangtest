@@ -28,7 +28,8 @@ from .interface import (
 )
 from .reporting import resolve_checkpoint_reference
 from .rollout import collect_dual_timescale_episode
-from .trainer import CHECKPOINT_VERSION, PPOTrainer
+from .policy import DualTimescaleActorCritic
+from .trainer import ALGORITHM_ID, CHECKPOINT_METHOD, CHECKPOINT_VERSION, PPOTrainer
 
 
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
@@ -105,10 +106,46 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError("checkpoint payload must be a mapping")
+    if (
+        path.name == "best_train_return_checkpoint.pt"
+        or payload.get("checkpoint_role")
+        == "TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION"
+        or payload.get("artifact_role")
+        == "TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION"
+    ):
+        raise ValueError(
+            "training-return diagnostic checkpoint is not a formal evaluation input"
+        )
     if int(payload.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
-        raise ValueError("checkpoint version is not the current dual-timescale architecture")
-    if payload.get("policy_schema") != PROPOSED_POLICY_SCHEMA:
-        raise ValueError("checkpoint policy schema mismatch")
+        raise ValueError("checkpoint version is not the current V49 mainline")
+    expected_architecture = (
+        DualTimescaleActorCritic.cardinality_corrected_unified_architecture_version
+    )
+    expected_schema = DualTimescaleActorCritic.cardinality_corrected_unified_architecture_id
+    if int(payload.get("architecture_version", -1)) != expected_architecture:
+        raise ValueError(
+            f"checkpoint architecture_version is not {expected_architecture}"
+        )
+    if payload.get("algorithm_id") != ALGORITHM_ID:
+        raise ValueError("checkpoint algorithm_id is not the current V49 mainline")
+    if payload.get("method") != CHECKPOINT_METHOD:
+        raise ValueError("checkpoint method is not the current V49 mainline")
+    if payload.get("policy_schema") != expected_schema:
+        raise ValueError("checkpoint policy architecture schema mismatch")
+    if payload.get("unified_cache_action") is not True:
+        raise ValueError("checkpoint does not use the unified Cache candidate action")
+    if payload.get("cardinality_corrected_cache_action") is not True:
+        raise ValueError("checkpoint does not use Cache cardinality correction")
+    contract = payload.get("config_contract")
+    if (
+        not isinstance(contract, dict)
+        or contract.get("algorithm_id") != ALGORITHM_ID
+        or contract.get("architecture_version") != expected_architecture
+        or contract.get("policy_schema") != expected_schema
+        or contract.get("unified_cache_action") is not True
+        or contract.get("cardinality_corrected_cache_action") is not True
+    ):
+        raise ValueError("checkpoint V49 configuration contract mismatch")
     return payload
 
 
@@ -289,7 +326,12 @@ def evaluate_pool(
         context = load_environment_context(str(config_file), realization_dir=realization_path)
         _assert_realization_context_compatible(reference_context, context)
         if trainer is None:
-            trainer = PPOTrainer(context, device=device)
+            trainer = PPOTrainer(
+                context,
+                device=device,
+                unified_cache_action=True,
+                cardinality_corrected_cache_action=True,
+            )
             trainer.load_checkpoint(
                 checkpoint,
                 config_raw_sha256=raw_config_sha256,
