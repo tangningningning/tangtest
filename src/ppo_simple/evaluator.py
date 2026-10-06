@@ -169,6 +169,12 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
     deterministic_actions = collection.summary.get("deterministic_action_selection")
     if deterministic_actions is not None:
         record["deterministic_action_selection"] = deterministic_actions
+    deterministic_cache_protocol = collection.summary.get("deterministic_cache_protocol")
+    if deterministic_cache_protocol is not None:
+        record["deterministic_cache_protocol"] = deterministic_cache_protocol
+        record["deterministic_cache_protocol_checks"] = collection.summary.get(
+            "deterministic_cache_protocol_checks", {}
+        )
     return record
 
 
@@ -377,6 +383,15 @@ def evaluate_pool(
         "environment_means": environment_means,
         "repeat_summaries": summaries,
     }
+    cache_protocols = [
+        item["deterministic_cache_protocol"]
+        for item in summaries
+        if "deterministic_cache_protocol" in item
+    ]
+    if cache_protocols:
+        if any(protocol != cache_protocols[0] for protocol in cache_protocols[1:]):
+            raise RuntimeError("evaluation repeats used inconsistent deterministic Cache protocols")
+        aggregate["deterministic_cache_protocol"] = cache_protocols[0]
     with (output_path / "proposed_episode_pool_summary.json").open(
         "w", encoding="utf-8", newline="\n"
     ) as stream:

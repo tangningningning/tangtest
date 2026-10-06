@@ -828,6 +828,11 @@ def collect_dual_timescale_episode(
     update_candidate_selection_counts: dict[bytes, int] = {}
     deterministic_cache_selections: list[dict[str, Any]] = []
     deterministic_uav_selections: list[dict[str, Any]] = []
+    cache_group_rule_violation_count = 0
+    cache_update_inner_argmax_violation_count = 0
+    cache_probability_max_difference = 0.0
+    cache_probability_sum_error_max = 0.0
+    cache_probability_nonfinite_count = 0
     start_time = time.perf_counter()
 
     for slot_index, step in enumerate(aligned_steps):
@@ -1099,15 +1104,44 @@ def collect_dual_timescale_episode(
                 selected_cache_id = hashlib.sha256(
                     np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
                 ).hexdigest()[:16]
-                deterministic_cache_selections.append(
-                    {
-                        "decision_slot": int(step.slot),
-                        "selected_group": str(selected.cache_selected_group),
-                        "selected_candidate_index": frame_cache_index,
-                        "selected_candidate_id": selected_cache_id,
-                        "selected_duration": frame_requested_duration,
-                    }
-                )
+                selection_record = {
+                    "decision_slot": int(step.slot),
+                    "selected_group": str(selected.cache_selected_group),
+                    "selected_candidate_index": frame_cache_index,
+                    "selected_candidate_id": selected_cache_id,
+                    "selected_duration": frame_requested_duration,
+                }
+                protocol_diagnostic = selected.deterministic_cache_diagnostics
+                if bool(getattr(policy, "cardinality_corrected_cache_action", False)):
+                    if protocol_diagnostic is None:
+                        raise AssertionError(
+                            "Deterministic corrected Cache frame lacks protocol diagnostics."
+                        )
+                    p_keep = float(protocol_diagnostic["p_keep"])
+                    p_update_group = float(protocol_diagnostic["p_update_group"])
+                    expected_group = "KEEP" if p_keep >= p_update_group else "UPDATE"
+                    if str(protocol_diagnostic["new_selected_group"]) != expected_group:
+                        cache_group_rule_violation_count += 1
+                    if str(protocol_diagnostic["new_selected_group"]) == "UPDATE" and bool(
+                        protocol_diagnostic["update_inner_argmax_violation"]
+                    ):
+                        cache_update_inner_argmax_violation_count += 1
+                    probability_difference = float(
+                        protocol_diagnostic["probability_max_difference_vs_legacy_formula"]
+                    )
+                    probability_sum_error = float(protocol_diagnostic["probability_sum_error"])
+                    cache_probability_max_difference = max(
+                        cache_probability_max_difference, probability_difference
+                    )
+                    cache_probability_sum_error_max = max(
+                        cache_probability_sum_error_max, probability_sum_error
+                    )
+                    if not np.isfinite(
+                        [p_keep, p_update_group, probability_difference, probability_sum_error]
+                    ).all():
+                        cache_probability_nonfinite_count += 1
+                    selection_record.update(protocol_diagnostic)
+                deterministic_cache_selections.append(selection_record)
             if frame_cache_index > 0:
                 candidate_signature = np.ascontiguousarray(
                     frame_cache, dtype=np.int8
@@ -1759,6 +1793,32 @@ def collect_dual_timescale_episode(
         summary["deterministic_action_selection"] = {
             "cache": deterministic_cache_selections,
             "uav": deterministic_uav_selections,
+        }
+    if (
+        deterministic
+        and bool(getattr(policy, "unified_cache_action", False))
+        and bool(getattr(policy, "cardinality_corrected_cache_action", False))
+    ):
+        summary["deterministic_cache_protocol"] = {
+            "cache_deterministic_protocol": "group_mass_then_raw_score_argmax",
+            "cache_group_decision": "argmax_keep_vs_update_group_mass",
+            "cache_update_candidate_decision": (
+                "argmax_raw_score_within_legal_update_group"
+            ),
+            "cache_group_tie_break": "KEEP",
+            "cardinality_corrected_cache_action": True,
+        }
+        summary["deterministic_cache_protocol_checks"] = {
+            "group_rule_violation_count": cache_group_rule_violation_count,
+            "update_inner_argmax_violation_count": (
+                cache_update_inner_argmax_violation_count
+            ),
+            "probability_max_difference_vs_legacy_formula": (
+                cache_probability_max_difference
+            ),
+            "probability_sum_error_max": cache_probability_sum_error_max,
+            "probability_nonfinite_count": cache_probability_nonfinite_count,
+            "group_tie_break": "KEEP",
         }
     return EpisodeCollection(micro_buffer, macro_buffer, summary)
 
