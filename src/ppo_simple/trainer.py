@@ -751,6 +751,7 @@ class PPOTrainer:
         trigger_observation_normalization: dict[str, Any] | None = None,
         unified_cache_action: bool = False,
         cardinality_corrected_cache_action: bool = False,
+        freeze_micro_updates: bool = False,
     ) -> None:
         _require_torch()
         self.context = context
@@ -762,6 +763,7 @@ class PPOTrainer:
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
         )
+        self.freeze_micro_updates = bool(freeze_micro_updates)
         if self.cardinality_corrected_cache_action and not self.unified_cache_action:
             raise ValueError(
                 "Cache cardinality correction requires the unified Cache action."
@@ -1294,6 +1296,9 @@ class PPOTrainer:
                 "micro_optimizer_frozen": True,
             }
             macro_metrics = self._update_trigger_only(collection.macro)
+        elif self.freeze_micro_updates:
+            micro_metrics = self._diagnose_micro_without_update(collection.micro)
+            macro_metrics = self._update_macro(collection.macro)
         else:
             micro_metrics = self._update_micro(collection.micro)
             macro_metrics = self._update_macro(collection.macro)
@@ -1999,6 +2004,121 @@ class PPOTrainer:
         }
         if self.training_counters["trigger_update_count"] >= 0:
             self.training_counters["trigger_update_count"] += 1
+        return result
+
+    def _diagnose_micro_without_update(
+        self, buffer: MicroRolloutBuffer
+    ) -> dict[str, Any]:
+        """Compute frozen Micro rollout diagnostics without backward or optimizer calls."""
+
+        batch = _micro_batch(buffer)
+        count = len(batch["rewards"])
+        values = batch["old_values"].astype(np.float64)
+        advantages, returns = compute_gae(
+            batch["rewards"],
+            values,
+            batch["dones"],
+            0.0,
+            float(self.config["gamma"]),
+            float(self.config["gae_lambda"]),
+        )
+        normalized, adv_mean, adv_std = _normalize_advantages(advantages)
+        batch["advantages"] = normalized
+        batch["returns"] = returns
+        minibatches = min(int(self.config["num_minibatches"]), count)
+        if minibatches <= 0:
+            raise ValueError("Micro rollout 不能为空。")
+        records: list[dict[str, float]] = []
+        predictions = np.empty(count, dtype=np.float64)
+        indices = np.arange(count, dtype=np.int64)
+        for index_group in np.array_split(indices, minibatches):
+            if len(index_group) == 0:
+                continue
+            tensors = self._tensor_batch(batch, index_group)
+            with torch.no_grad():
+                evaluated = self.policy.evaluate_micro_joint(
+                    tensors["observations"],
+                    tensors["candidate_features"],
+                    tensors["candidate_masks"],
+                    tensors["actions"],
+                    tensors["conditions"],
+                )
+                log_ratio = evaluated.log_prob - tensors["old_log_probs"]
+                ratio = torch.exp(log_ratio)
+                advantage = tensors["advantages"]
+                actor_loss = -torch.minimum(
+                    ratio * advantage,
+                    torch.clamp(
+                        ratio,
+                        1.0 - float(self.config["clip_epsilon"]),
+                        1.0 + float(self.config["clip_epsilon"]),
+                    )
+                    * advantage,
+                ).mean()
+                value_loss = torch.mean(
+                    (evaluated.value - tensors["returns"]) ** 2
+                )
+                entropy = evaluated.entropy.mean()
+                approx_kl = torch.mean((ratio - 1.0) - log_ratio)
+                clip_fraction = torch.mean(
+                    (
+                        torch.abs(ratio - 1.0)
+                        > float(self.config["clip_epsilon"])
+                    ).float()
+                )
+                scalar_metrics = (
+                    actor_loss,
+                    value_loss,
+                    entropy,
+                    approx_kl,
+                    clip_fraction,
+                    evaluated.log_prob,
+                    evaluated.value,
+                )
+                if not all(bool(torch.isfinite(value).all().item()) for value in scalar_metrics):
+                    raise FloatingPointError(
+                        "Frozen Micro diagnostics contain NaN/Inf."
+                    )
+                predictions[index_group] = (
+                    evaluated.value.detach().cpu().numpy().astype(np.float64)
+                )
+                records.append(
+                    {
+                        "actor_loss": float(actor_loss.cpu()),
+                        "value_loss": float(value_loss.cpu()),
+                        "entropy": float(entropy.cpu()),
+                        "approx_kl": float(approx_kl.cpu()),
+                        "clip_fraction": float(clip_fraction.cpu()),
+                    }
+                )
+        result = self._aggregate_update_metrics("micro", records)
+        result.update(
+            {
+                "micro_actor_optimizer_steps_this_update": 0,
+                "micro_critic_optimizer_steps_this_update": 0,
+                "micro_optimizer_frozen": True,
+                "micro_backward_calls": 0,
+                "micro_transition_count": int(count),
+                "micro_adv_mean": float(adv_mean),
+                "micro_adv_std": float(adv_std),
+                "micro_normalized_adv_mean": float(np.mean(normalized)),
+                "micro_normalized_adv_std": float(np.std(normalized)),
+                "micro_value_prediction_mean": float(np.mean(predictions)),
+                "micro_value_prediction_std": float(np.std(predictions)),
+                "micro_value_target_mean": float(np.mean(returns)),
+                "micro_value_target_std": float(np.std(returns)),
+                "micro_value_target_prediction_corr": _pearson_correlation(
+                    returns, predictions
+                ),
+                "micro_value_rmse": float(
+                    np.sqrt(np.mean((returns - predictions) ** 2))
+                ),
+                "micro_explained_variance": _explained_variance(
+                    returns, predictions
+                ),
+                "micro_early_stop": False,
+            }
+        )
         return result
 
     def _update_micro(self, buffer: MicroRolloutBuffer) -> dict[str, Any]:
