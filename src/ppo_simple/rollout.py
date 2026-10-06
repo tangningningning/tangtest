@@ -466,7 +466,11 @@ def collect_dual_timescale_episode(
     deterministic: bool = False,
     episode_seed: int | None = None,
 ) -> EpisodeCollection:
-    """冻结两套策略，采完整 episode，再分别交给 Micro/Macro 更新。"""
+    """Freeze both policies for a full episode, then return Micro/Macro rollouts.
+
+    Training passes ``deterministic=False`` so Cache, Duration, and UAV actions are
+    sampled. Evaluation can request group-aware deterministic Cache and UAV actions.
+    """
 
     if not aligned_steps:
         raise ValueError("完整 episode rollout 不能为空。")

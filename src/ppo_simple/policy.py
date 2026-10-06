@@ -205,10 +205,10 @@ def _mlp(
 class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
-    architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo_v15c"
+    architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
     architecture_version = 23
     cardinality_corrected_unified_architecture_id = (
-        "adaptive_dual_timescale_unified_cache_candidate_cardinality_corrected_ppo_v17"
+        "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo"
     )
     cardinality_corrected_unified_architecture_version = 25
 
@@ -237,7 +237,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         )
         if not self.unified_cache_action or not self.cardinality_corrected_cache_action:
             raise ValueError(
-                "The formal policy supports only V49 Unified Cache Candidate with cardinality correction."
+                "The PROPOSED policy supports only the unified Cache candidate action with cardinality correction."
             )
         self.architecture_id = self.cardinality_corrected_unified_architecture_id
         self.architecture_version = self.cardinality_corrected_unified_architecture_version
@@ -297,8 +297,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.observation_dim, (128, 128), 1, activation=nn.SiLU
         )
 
-        # Retain the inactive module at the end of the state dict for V49
-        # checkpoint compatibility; the current policy never calls it.
+        # Retain the inactive module at the end of the state dict for checkpoint
+        # compatibility; the current policy never calls it.
         self.macro_cache_trigger_actor = nn.Sequential(
             nn.Linear(self.observation_dim, 128),
             nn.SiLU(),
@@ -523,6 +523,11 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         *,
         deterministic: bool = False,
     ) -> MacroActionSample:
+        """Sample stochastic rollout actions or deterministic evaluation actions.
+
+        Stochastic mode samples both Cache and Duration categoricals. Deterministic
+        mode uses group-aware Cache selection and the highest-probability Duration.
+        """
         features = np.asarray(cache_candidate_features, dtype=np.float32)
         cache_mask = np.asarray(cache_candidate_mask, dtype=bool).reshape(-1)
         if features.ndim != 2 or len(features) != len(cache_mask) or not len(cache_mask):
@@ -550,63 +555,67 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             deterministic_cache_diagnostics = None
             group_ids = torch.ones_like(cache_mask_t[0], dtype=torch.long)
             group_ids[0] = 0
-            cache_index, selected_cache_group = _group_aware_deterministic_candidate(
-                raw_candidate_logits,
-                cache_dist.probs,
-                cache_mask_t[0],
-                group_ids,
-            )
-            legacy_flat_index = int(torch.argmax(cache_dist.logits).item())
-            legacy_reference_logits = self._cardinality_corrected_cache_logits(
-                raw_candidate_logits, cache_mask_t[0]
-            )
-            legacy_reference_dist = _masked_categorical(
-                legacy_reference_logits, cache_mask_t[0]
-            )
-            probability_max_difference = float(
-                torch.max(torch.abs(cache_dist.probs - legacy_reference_dist.probs))
-                .detach()
-                .cpu()
-            )
-            probability_sum_error = float(
-                torch.abs(cache_dist.probs.sum() - 1.0).detach().cpu()
-            )
-            update_mask = cache_mask_t[0] & (group_ids == 1)
-            legal_update_count = int(update_mask.sum().item())
-            legal_update_best_score = (
-                float(raw_candidate_logits.masked_fill(~update_mask, -float("inf")).max().cpu())
-                if legal_update_count
-                else None
-            )
-            selected_raw_score = float(raw_candidate_logits[cache_index].detach().cpu())
-            selected_candidate_is_legal = bool(cache_mask_t[0, cache_index].item())
-            update_inner_argmax_violation = bool(
-                selected_cache_group == 1
-                and (
-                    cache_index <= 0
-                    or not selected_candidate_is_legal
-                    or selected_raw_score != legal_update_best_score
+            if deterministic:
+                cache_index, selected_cache_group = _group_aware_deterministic_candidate(
+                    raw_candidate_logits,
+                    cache_dist.probs,
+                    cache_mask_t[0],
+                    group_ids,
                 )
-            )
-            p_keep_value = float(cache_dist.probs[0].detach().cpu())
-            p_update_group_value = float(cache_dist.probs[1:].sum().detach().cpu())
-            deterministic_cache_diagnostics = {
-                "p_keep": p_keep_value,
-                "p_update_group": p_update_group_value,
-                "new_selected_group": "KEEP" if selected_cache_group == 0 else "UPDATE",
-                "new_selected_candidate_index": cache_index,
-                "legacy_flat_selected_candidate_index": legacy_flat_index,
-                "legacy_flat_selected_group": "KEEP" if legacy_flat_index == 0 else "UPDATE",
-                "old_new_disagreement": cache_index != legacy_flat_index,
-                "group_tie_break": "KEEP",
-                "legal_update_candidate_count": legal_update_count,
-                "selected_candidate_is_legal": selected_candidate_is_legal,
-                "selected_raw_score": selected_raw_score,
-                "legal_update_best_raw_score": legal_update_best_score,
-                "update_inner_argmax_violation": update_inner_argmax_violation,
-                "probability_sum_error": probability_sum_error,
-                "probability_max_difference_vs_legacy_formula": probability_max_difference,
-            }
+                legacy_flat_index = int(torch.argmax(cache_dist.logits).item())
+                legacy_reference_logits = self._cardinality_corrected_cache_logits(
+                    raw_candidate_logits, cache_mask_t[0]
+                )
+                legacy_reference_dist = _masked_categorical(
+                    legacy_reference_logits, cache_mask_t[0]
+                )
+                probability_max_difference = float(
+                    torch.max(torch.abs(cache_dist.probs - legacy_reference_dist.probs))
+                    .detach()
+                    .cpu()
+                )
+                probability_sum_error = float(
+                    torch.abs(cache_dist.probs.sum() - 1.0).detach().cpu()
+                )
+                update_mask = cache_mask_t[0] & (group_ids == 1)
+                legal_update_count = int(update_mask.sum().item())
+                legal_update_best_score = (
+                    float(raw_candidate_logits.masked_fill(~update_mask, -float("inf")).max().cpu())
+                    if legal_update_count
+                    else None
+                )
+                selected_raw_score = float(raw_candidate_logits[cache_index].detach().cpu())
+                selected_candidate_is_legal = bool(cache_mask_t[0, cache_index].item())
+                update_inner_argmax_violation = bool(
+                    selected_cache_group == 1
+                    and (
+                        cache_index <= 0
+                        or not selected_candidate_is_legal
+                        or selected_raw_score != legal_update_best_score
+                    )
+                )
+                p_keep_value = float(cache_dist.probs[0].detach().cpu())
+                p_update_group_value = float(cache_dist.probs[1:].sum().detach().cpu())
+                deterministic_cache_diagnostics = {
+                    "p_keep": p_keep_value,
+                    "p_update_group": p_update_group_value,
+                    "new_selected_group": "KEEP" if selected_cache_group == 0 else "UPDATE",
+                    "new_selected_candidate_index": cache_index,
+                    "legacy_flat_selected_candidate_index": legacy_flat_index,
+                    "legacy_flat_selected_group": "KEEP" if legacy_flat_index == 0 else "UPDATE",
+                    "old_new_disagreement": cache_index != legacy_flat_index,
+                    "group_tie_break": "KEEP",
+                    "legal_update_candidate_count": legal_update_count,
+                    "selected_candidate_is_legal": selected_candidate_is_legal,
+                    "selected_raw_score": selected_raw_score,
+                    "legal_update_best_raw_score": legal_update_best_score,
+                    "update_inner_argmax_violation": update_inner_argmax_violation,
+                    "probability_sum_error": probability_sum_error,
+                    "probability_max_difference_vs_legacy_formula": probability_max_difference,
+                }
+            else:
+                cache_index = int(cache_dist.sample().item())
+                selected_cache_group = 0 if cache_index == 0 else 1
             selected_embed = embedded[0, cache_index]
             duration_values = torch.as_tensor(
                 self.duration_candidates, dtype=torch.float32, device=device

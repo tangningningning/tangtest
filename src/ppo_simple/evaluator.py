@@ -117,7 +117,7 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
             "training-return diagnostic checkpoint is not a formal evaluation input"
         )
     if int(payload.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
-        raise ValueError("checkpoint version is not the current V49 mainline")
+        raise ValueError("checkpoint format is not supported by PROPOSED")
     expected_architecture = (
         DualTimescaleActorCritic.cardinality_corrected_unified_architecture_version
     )
@@ -126,26 +126,37 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         raise ValueError(
             f"checkpoint architecture_version is not {expected_architecture}"
         )
-    if payload.get("algorithm_id") != ALGORITHM_ID:
-        raise ValueError("checkpoint algorithm_id is not the current V49 mainline")
-    if payload.get("method") != CHECKPOINT_METHOD:
-        raise ValueError("checkpoint method is not the current V49 mainline")
-    if payload.get("policy_schema") != expected_schema:
-        raise ValueError("checkpoint policy architecture schema mismatch")
+    contract = payload.get("config_contract")
+    identity = {
+        "algorithm_id": payload.get("algorithm_id"),
+        "method": payload.get("method"),
+        "policy_schema": payload.get("policy_schema"),
+    }
+    if not all(isinstance(value, str) and value for value in identity.values()):
+        raise ValueError("checkpoint algorithm identity metadata is incomplete")
+    if not isinstance(contract, dict) or (
+        contract.get("algorithm_id") != identity["algorithm_id"]
+        or contract.get("policy_schema") != identity["policy_schema"]
+    ):
+        raise ValueError("checkpoint algorithm identity metadata is inconsistent")
     if payload.get("unified_cache_action") is not True:
         raise ValueError("checkpoint does not use the unified Cache candidate action")
     if payload.get("cardinality_corrected_cache_action") is not True:
         raise ValueError("checkpoint does not use Cache cardinality correction")
-    contract = payload.get("config_contract")
     if (
-        not isinstance(contract, dict)
-        or contract.get("algorithm_id") != ALGORITHM_ID
-        or contract.get("architecture_version") != expected_architecture
-        or contract.get("policy_schema") != expected_schema
+        contract.get("architecture_version") != expected_architecture
         or contract.get("unified_cache_action") is not True
         or contract.get("cardinality_corrected_cache_action") is not True
     ):
-        raise ValueError("checkpoint V49 configuration contract mismatch")
+        raise ValueError("checkpoint PROPOSED configuration contract mismatch")
+    payload = dict(payload)
+    payload["algorithm_id"] = ALGORITHM_ID
+    payload["method"] = CHECKPOINT_METHOD
+    payload["policy_schema"] = expected_schema
+    normalized_contract = dict(contract)
+    normalized_contract["algorithm_id"] = ALGORITHM_ID
+    normalized_contract["policy_schema"] = expected_schema
+    payload["config_contract"] = normalized_contract
     return payload
 
 

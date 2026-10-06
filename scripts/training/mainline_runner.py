@@ -1,4 +1,4 @@
-"""Shared launcher for current V49 Macro Actor learning-rate runs."""
+"""Shared launcher for PROPOSED Macro Actor learning-rate runs."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 CONFIG_PATH = "configs/proposed/system_config.toml"
 EPISODE_POOL = "environment_data/proposed_joint_training"
-EPISODE_COUNT = 15
+EPISODE_COUNT = 300
 EPISODE_SEED_START = 20001
 TRAINING_SEED = 27005
 
@@ -24,7 +24,7 @@ def main_for_run_spec(spec: Mapping[str, Any]) -> int:
         "run_name",
     }
     if set(spec) != required:
-        raise ValueError(f"V49 LR launcher spec must contain exactly {sorted(required)}")
+        raise ValueError(f"PROPOSED LR launcher spec must contain exactly {sorted(required)}")
     rate = float(spec["macro_actor_learning_rate"])
     if rate <= 0.0:
         raise ValueError("macro_actor_learning_rate must be positive")

@@ -64,11 +64,11 @@ from .rollout import (
     compute_macro_smdp_gae,
 )
 
-CHECKPOINT_METHOD = "ppo_unified_cache_candidate_cardinality_corrected_smdp_micro_uav_v17"
+CHECKPOINT_METHOD = "ppo_proposed_unified_cache_candidate_cardinality_corrected_smdp_micro_uav"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 CHECKPOINT_VERSION = 49
-ALGORITHM_ID = "UNIFIED_CACHE_ACTION_CARDINALITY_CORRECTED_V1"
+ALGORITHM_ID = "PROPOSED"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; unified Candidate and Duration PPO"
 MACRO_CRITIC_TARGET_MODE = "two_step_smdp_td"
@@ -554,14 +554,14 @@ class PPOTrainer:
         )
         if not self.unified_cache_action or not self.cardinality_corrected_cache_action:
             raise ValueError(
-                "The formal trainer supports only V49 Unified Cache Candidate with cardinality correction."
+                "The PROPOSED trainer supports only the unified Cache candidate action with cardinality correction."
             )
         self.checkpoint_version = CHECKPOINT_VERSION
         self.algorithm_id = ALGORITHM_ID
         self.checkpoint_method = CHECKPOINT_METHOD
         self.capture_macro_transition_trace = bool(capture_macro_transition_trace)
         self.last_macro_transition_trace: dict[str, np.ndarray] | None = None
-        # These inactive V49 fields remain in the serialized contract for existing checkpoints.
+        # These inactive compatibility fields remain in the serialized contract.
         self.stage1_trigger_only = False
         self.trigger_max_grad_norm = 0.0
         self.initialization_metadata: dict[str, Any] = {}
@@ -570,7 +570,7 @@ class PPOTrainer:
         )
         if self.macro_critic_target_mode != MACRO_CRITIC_TARGET_MODE:
             raise ValueError(
-                "The V49 mainline requires macro_critic_target_mode = two_step_smdp_td."
+                "The PROPOSED mainline requires macro_critic_target_mode = two_step_smdp_td."
             )
         raw_critic_lambda = self.config.get("macro_critic_lambda_return_lambda")
         self.macro_critic_lambda_return_lambda = (
@@ -588,7 +588,7 @@ class PPOTrainer:
             self.config.get("long_value_target", "realized_return_to_go")
         )
         if not self.long_value_enabled:
-            raise ValueError("The V49 mainline requires long_value_enabled = true.")
+            raise ValueError("The PROPOSED mainline requires long_value_enabled = true.")
         if self.long_value_target != "realized_return_to_go":
             raise ValueError(
                 "Long-Value Critic target must be realized_return_to_go."
@@ -810,12 +810,12 @@ class PPOTrainer:
         }
 
     def update_from_episode(self, collection: EpisodeCollection) -> dict[str, Any]:
-        """Update the V49 Macro and Micro policies from one completed episode."""
+        """Update the PROPOSED Macro and Micro policies from one completed episode."""
 
         if not bool(collection.summary.get("counterfactual_state_restore_valid")):
             raise RuntimeError("COUNTERFACTUAL_STATE_RESTORE_VALID failed before PPO update.")
         if not bool(collection.summary.get("rollout_rng_unchanged")):
-            raise RuntimeError("V49 rollout RNG invariant failed before PPO update.")
+            raise RuntimeError("PROPOSED rollout RNG invariant failed before PPO update.")
         non_trigger_counter_keys = (
             "macro_actor_optimizer_steps",
             "macro_critic_optimizer_steps",
@@ -2303,7 +2303,7 @@ class PPOTrainer:
         best_episode_return: float | None = None,
         checkpoint_role: str = "RESUMABLE_MAINLINE_CHECKPOINT",
     ) -> dict[str, Any]:
-        """Construct a resumable V49 checkpoint with current policy state."""
+        """Construct a resumable checkpoint with current PROPOSED policy state."""
 
         last1 = self.last1_macro_transition_buffer
         return {
@@ -2416,7 +2416,7 @@ class PPOTrainer:
         episode_pool: str | None = None,
         restore_rng: bool = False,
     ) -> dict[str, Any]:
-        """Restore only a structurally complete V49 checkpoint."""
+        """Restore only a structurally complete PROPOSED checkpoint."""
 
         payload = torch.load(Path(path), map_location=self.device, weights_only=False)
         if not isinstance(payload, dict):
@@ -2439,11 +2439,23 @@ class PPOTrainer:
             raise ValueError("checkpoint long_value_enabled mismatch.")
         if payload.get("long_value_target") != self.long_value_target:
             raise ValueError("checkpoint long_value_target mismatch.")
+        saved_contract = payload.get("config_contract")
+        if not isinstance(saved_contract, dict):
+            raise ValueError("checkpoint policy tensor/configuration contract is missing.")
+        saved_identity = {
+            "algorithm_id": payload.get("algorithm_id"),
+            "method": payload.get("method"),
+            "policy_schema": payload.get("policy_schema"),
+        }
+        if not all(isinstance(value, str) and value for value in saved_identity.values()):
+            raise ValueError("checkpoint algorithm identity metadata is incomplete.")
+        if (
+            saved_contract.get("algorithm_id") != saved_identity["algorithm_id"]
+            or saved_contract.get("policy_schema") != saved_identity["policy_schema"]
+        ):
+            raise ValueError("checkpoint algorithm identity metadata is inconsistent.")
         required = {
             "checkpoint_version": self.checkpoint_version,
-            "algorithm_id": self.algorithm_id,
-            "method": self.checkpoint_method,
-            "policy_schema": self.policy.architecture_id,
             "architecture_version": int(self.policy.architecture_version),
             "unified_cache_action": self.unified_cache_action,
         }
@@ -2461,17 +2473,22 @@ class PPOTrainer:
         ):
             if expected is not None and payload.get(field) != expected:
                 raise ValueError(f"checkpoint {field} mismatch.")
-        saved_contract = payload.get("config_contract")
-        if not isinstance(saved_contract, dict):
-            raise ValueError("checkpoint policy tensor/configuration contract is missing.")
         normalized_saved_contract = dict(saved_contract)
-        # V49 checkpoints serialized this field as active in the nested legacy
-        # contract, although the top-level checkpoint and training counters show
-        # Trigger PPO was bypassed. Accept that single historical metadata value.
+        # Prior checkpoints serialized this field as active in the nested legacy
+        # contract, although Trigger PPO was bypassed. Accept that metadata value.
         if normalized_saved_contract.get("trigger_ppo_active") is True:
             normalized_saved_contract["trigger_ppo_active"] = False
+        # The algorithm and schema names are descriptive metadata. Normalize them
+        # so structurally compatible checkpoints keep working after the rename.
+        normalized_saved_contract["algorithm_id"] = self.algorithm_id
+        normalized_saved_contract["policy_schema"] = self.policy.architecture_id
         if normalized_saved_contract != self.config_contract:
             raise ValueError("checkpoint policy tensor/configuration contract mismatch.")
+        payload = dict(payload)
+        payload["algorithm_id"] = self.algorithm_id
+        payload["method"] = self.checkpoint_method
+        payload["policy_schema"] = self.policy.architecture_id
+        payload["config_contract"] = normalized_saved_contract
         if bool(payload.get("stage1_trigger_only", False)) != self.stage1_trigger_only:
             raise ValueError("checkpoint Stage-1 compatibility field mismatch.")
         if bool(payload.get("unified_cache_action", False)) != self.unified_cache_action:
@@ -2499,7 +2516,7 @@ class PPOTrainer:
             raise ValueError("checkpoint is missing the scalar Main Critic state.")
         trigger_state = payload.get("macro_cache_trigger_actor_state_dict")
         if not isinstance(trigger_state, dict):
-            raise ValueError("checkpoint is missing the V49 compatibility module state.")
+            raise ValueError("checkpoint is missing the inactive compatibility module state.")
         embedded_n2_state = {
             key.removeprefix("macro_critic."): value
             for key, value in macro_state.items()
@@ -2519,7 +2536,7 @@ class PPOTrainer:
         )
         normalizer = payload.get("trigger_observation_normalization")
         if not isinstance(normalizer, dict) or normalizer.get("active") is not False:
-            raise ValueError("V49 checkpoint must keep Trigger normalization inactive.")
+            raise ValueError("PROPOSED checkpoint must keep Trigger normalization inactive.")
         self.initialization_metadata = dict(payload.get("initialization_metadata", {}))
         self.macro_optimizer.load_state_dict(payload["macro_optimizer_state_dict"])
         self.macro_cache_trigger_actor_optimizer.load_state_dict(
@@ -2542,7 +2559,7 @@ class PPOTrainer:
         completed_episodes = int(self.training_counters["completed_episodes"])
         if raw_last1 is None:
             if completed_episodes != 0 and not self.stage1_trigger_only:
-                raise ValueError("V49 checkpoint is missing its last1 Macro transition buffer.")
+                raise ValueError("PROPOSED checkpoint is missing its last1 Macro transition buffer.")
             self.last1_macro_transition_buffer = None
         else:
             expected_keys = {
@@ -2554,7 +2571,7 @@ class PPOTrainer:
                 "dones",
             }
             if not isinstance(raw_last1, dict) or set(raw_last1) != expected_keys:
-                raise ValueError("V49 last1 Macro transition buffer schema mismatch.")
+                raise ValueError("PROPOSED last1 Macro transition buffer schema mismatch.")
             observations = np.asarray(raw_last1["observations"], dtype=np.float32)
             next_observations = np.asarray(
                 raw_last1["next_observations"], dtype=np.float32
@@ -2578,7 +2595,7 @@ class PPOTrainer:
                     for item in (observations, next_observations, rewards)
                 )
             ):
-                raise ValueError("V49 last1 Macro transition buffer is invalid.")
+                raise ValueError("PROPOSED last1 Macro transition buffer is invalid.")
             self.last1_macro_transition_buffer = {
                 "episode_index": completed_episodes,
                 "observations": observations.copy(),
@@ -2642,7 +2659,7 @@ def run_training(
     verbose: bool = False,
     save_macro_transition_trace: bool = False,
 ) -> dict[str, Any]:
-    """按完整 episode 收集 on-policy 数据并更新固定 V49 主线策略。"""
+    """按完整 episode 收集 on-policy 数据并更新 PROPOSED 主线策略。"""
 
     _require_torch()
     if int(target_episodes) <= 0:
@@ -2688,10 +2705,11 @@ def run_training(
             ("config_raw_sha256", raw_hash),
             ("config_semantic_sha256", semantic_hash),
             ("episode_pool", str(pool_path)),
-            ("policy_schema", trainer.policy.architecture_id),
         ):
             if manifest.get(field) != expected:
                 raise ValueError(f"run manifest {field} mismatch。")
+        if not isinstance(manifest.get("policy_schema"), str):
+            raise ValueError("run manifest policy_schema is missing。")
         payload = trainer.load_checkpoint(
             checkpoint_path,
             config_raw_sha256=raw_hash,

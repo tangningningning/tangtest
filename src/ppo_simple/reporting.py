@@ -3494,18 +3494,7 @@ def write_dual_timescale_run_manifest(
     """记录双时间尺度 checkpoint、动作和 PPO 配置合同。"""
 
     manifest = {
-        "experiment_label": (
-            "UNIFIED_CACHE_ACTION"
-            if bool(getattr(trainer, "unified_cache_action", False))
-            else
-            "V15-C2"
-            if str(trainer.algorithm_id).startswith("V15-C2")
-            else "V15-C1"
-            if str(trainer.algorithm_id).startswith("V15-C1")
-            else "V15-C"
-            if str(trainer.algorithm_id).startswith("V15-C")
-            else "V15-B"
-        ),
+        "experiment_label": "PROPOSED",
         "algorithm_id": str(trainer.algorithm_id),
         "experiment_type": "macro_cache_smdp_micro_uav_ppo",
         "config_path": str(Path(config_path).resolve()),
@@ -3770,13 +3759,13 @@ def append_dual_timescale_slot_metrics(
     return count
 
 
-def write_v15a5_multirealization_trigger_probe_artifacts(
+def write_multirealization_trigger_probe_artifacts(
     report: dict[str, Any],
     *,
     report_path: str | Path,
     curves_path: str | Path,
 ) -> tuple[Path, Path]:
-    """Write the V15-A5 synchronized Trigger probe report and four-panel figure."""
+    """Write a synchronized Trigger probe report and four-panel figure."""
 
     import matplotlib
 
@@ -3791,7 +3780,7 @@ def write_v15a5_multirealization_trigger_probe_artifacts(
     heldout = report.get("heldout", {})
     seen_history = list(report.get("seen_block_evaluation_history", []))
     if len(blocks) != 4 or not heldout or len(seen_history) != 4:
-        raise ValueError("V15-A5 reporting requires four blocks and held-out metrics.")
+        raise ValueError("Trigger probe reporting requires four blocks and held-out metrics.")
 
     figure, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
     block_x = np.arange(1, len(blocks) + 1)
@@ -3875,7 +3864,7 @@ def write_v15a5_multirealization_trigger_probe_artifacts(
     baseline = float(report["comparison"]["PREVIOUS_GROUPED_CV_TEST_BA"])
     heldout_ba = float(heldout["HELDOUT_BALANCED_ACCURACY"])
     axes[1, 1].bar(
-        ["Previous grouped CV", "V15-A5 held-out"],
+        ["Previous grouped CV", "Held-out realizations"],
         [baseline, heldout_ba],
         color=["#929292", "#2457A7"],
         width=0.58,
@@ -3890,7 +3879,7 @@ def write_v15a5_multirealization_trigger_probe_artifacts(
     for index, value in enumerate((baseline, heldout_ba)):
         axes[1, 1].text(index, value + 0.025, f"{value:.3f}", ha="center")
 
-    figure.suptitle("V15-A5 multi-realization synchronized Trigger probe", fontsize=15)
+    figure.suptitle("Multi-realization synchronized Trigger probe", fontsize=15)
     figure.savefig(figure_path, dpi=180)
     plt.close(figure)
 
