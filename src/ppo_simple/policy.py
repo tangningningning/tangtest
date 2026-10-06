@@ -522,11 +522,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         *,
         deterministic: bool = False,
     ) -> MacroActionSample:
-        """Sample stochastic rollout actions or deterministic evaluation actions.
-
-        Stochastic mode samples both Cache and Duration categoricals. Deterministic
-        mode uses group-aware Cache selection and the highest-probability Duration.
-        """
+        """训练时随机采样 Cache 与 Duration 动作，评价时使用确定性动作选择。"""
         features = np.asarray(cache_candidate_features, dtype=np.float32)
         cache_mask = np.asarray(cache_candidate_mask, dtype=bool).reshape(-1)
         if features.ndim != 2 or len(features) != len(cache_mask) or not len(cache_mask):
