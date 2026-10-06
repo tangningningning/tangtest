@@ -1,0 +1,2181 @@
+{
+  "experiment": "MACRO_CRITIC_SHADOW_A0_10B_ALL_HISTORY_COVERAGE_ORACLE_AND_PER_DOMAIN_GRADIENT_COSINE",
+  "status": "COMPLETED",
+  "SCOPE": {
+    "A0_10b_only": true,
+    "formal_trainer_modified": false,
+    "Actor_or_Micro_used": false,
+    "formal_algorithm_trained": false,
+    "checkpoint_written": false,
+    "environment_resampled": false,
+    "A0_11_executed": false,
+    "git_add_commit_push_performed": false,
+    "E7_E10_transition_data_decompressed_or_used": false
+  },
+  "SOURCE_TRACE": {
+    "path": "runs/formal_macro_dual_value_archv10_ckptv33_short10/macro_transition_trace.npz",
+    "trace_sha256": "9a700e336b6e9fea9f450cd9fb36315100442452a441e5ba54c57471eb6f634b",
+    "expected_sha256": "9a700e336b6e9fea9f450cd9fb36315100442452a441e5ba54c57471eb6f634b",
+    "TRACE_HASH_MATCHES_A0_10": "YES",
+    "selected_episodes": [
+      {
+        "episode": "E1",
+        "transition_count": 105
+      },
+      {
+        "episode": "E2",
+        "transition_count": 102
+      },
+      {
+        "episode": "E3",
+        "transition_count": 104
+      },
+      {
+        "episode": "E4",
+        "transition_count": 105
+      },
+      {
+        "episode": "E5",
+        "transition_count": 96
+      },
+      {
+        "episode": "E6",
+        "transition_count": 106
+      }
+    ],
+    "decoded_transition_prefix_count": 618,
+    "E7_E10_untouched_confirmation": {
+      "episode_id_or_seed_members_not_loaded": true,
+      "no_transition_rows_after_E6_decompressed_or_materialized": true,
+      "whole_trace_bytes_read_only_as_opaque_SHA256_input": true,
+      "prefix_member_decode_details": {
+        "observation": {
+          "member": "observation.npy",
+          "decoded_prefix_shape": [
+            618,
+            400
+          ],
+          "decoded_prefix_rows": 618,
+          "decoded_prefix_bytes": 988800,
+          "rows_after_E6_materialized": 0
+        },
+        "next_observation": {
+          "member": "next_observation.npy",
+          "decoded_prefix_shape": [
+            618,
+            400
+          ],
+          "decoded_prefix_rows": 618,
+          "decoded_prefix_bytes": 988800,
+          "rows_after_E6_materialized": 0
+        },
+        "macro_reward": {
+          "member": "macro_reward.npy",
+          "decoded_prefix_shape": [
+            618
+          ],
+          "decoded_prefix_rows": 618,
+          "decoded_prefix_bytes": 2472,
+          "rows_after_E6_materialized": 0
+        },
+        "actual_duration": {
+          "member": "actual_duration.npy",
+          "decoded_prefix_shape": [
+            618
+          ],
+          "decoded_prefix_rows": 618,
+          "decoded_prefix_bytes": 4944,
+          "rows_after_E6_materialized": 0
+        },
+        "done": {
+          "member": "done.npy",
+          "decoded_prefix_shape": [
+            618
+          ],
+          "decoded_prefix_rows": 618,
+          "decoded_prefix_bytes": 618,
+          "rows_after_E6_materialized": 0
+        }
+      }
+    },
+    "gamma_from_A0_10_source_metadata": 1.0
+  },
+  "ALGORITHM": {
+    "formal_target_function": "src.ppo_simple.rollout.compute_macro_smdp_gae",
+    "target": "SMDP lambda-return / formal GAE returns",
+    "lambda": 0.7,
+    "scale": "Raw",
+    "observation_transform": "2*x-1",
+    "critic": "official Main Macro Critic 400->128->128->1 SiLU",
+    "value_loss_coefficient": 0.01,
+    "optimizer_for_reconstruction": {
+      "name": "Adam",
+      "lr": 0.001,
+      "eps": 1e-05,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "max_grad_norm": 0.5,
+      "steps_per_episode": 50
+    },
+    "gradient_diagnostic": "one un-clipped, pre-optimizer-step backward per domain; no optimizer.step",
+    "running_norm_popart_target_normalization": false
+  },
+  "PART_A_ALL_HISTORY_GEOMETRIC_COVERAGE_ORACLE": {
+    "observation_transform": "2*x-1 in float32; Euclidean L2 accumulated in float64",
+    "within_episode_nn_definition": "nearest other observation in same episode; self-distance excluded",
+    "within_episode_nn_p95": {
+      "E1": 4.050955186921948,
+      "E2": 4.01874195687904,
+      "E3": 3.6044740475227712,
+      "E4": 4.045342520850218,
+      "E5": 4.073227248091904,
+      "E6": 4.085986345048692
+    },
+    "reference_membership": {
+      "E3": {
+        "Current": [
+          "E2"
+        ],
+        "Recent3": [
+          "E1",
+          "E2"
+        ],
+        "AllHistory": [
+          "E1",
+          "E2"
+        ]
+      },
+      "E4": {
+        "Current": [
+          "E3"
+        ],
+        "Recent3": [
+          "E1",
+          "E2",
+          "E3"
+        ],
+        "AllHistory": [
+          "E1",
+          "E2",
+          "E3"
+        ]
+      },
+      "E5": {
+        "Current": [
+          "E4"
+        ],
+        "Recent3": [
+          "E2",
+          "E3",
+          "E4"
+        ],
+        "AllHistory": [
+          "E1",
+          "E2",
+          "E3",
+          "E4"
+        ]
+      },
+      "E6": {
+        "Current": [
+          "E5"
+        ],
+        "Recent3": [
+          "E3",
+          "E4",
+          "E5"
+        ],
+        "AllHistory": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5"
+        ]
+      }
+    },
+    "all_history_incremental_test_targets": [
+      "E5",
+      "E6"
+    ],
+    "target_pool_diagnostics": [
+      {
+        "target": "E3",
+        "pool": "Current",
+        "reference_episodes": [
+          "E2"
+        ],
+        "target_state_count": 104,
+        "nearest_neighbor_distance": {
+          "min": 8.85486936895551,
+          "p05": 10.225616028264849,
+          "median": 12.230118473706266,
+          "mean": 12.047673857716935,
+          "p90": 12.712841166056569,
+          "p95": 12.885854752451413,
+          "max": 16.15958106562107
+        },
+        "nearest_source_episode_state_counts": {
+          "E2": 104
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.03748391375808,
+            "p05": 8.03748391375808,
+            "median": 8.03748391375808,
+            "mean": 8.03748391375808,
+            "p90": 8.03748391375808,
+            "p95": 8.03748391375808,
+            "max": 8.03748391375808
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      },
+      {
+        "target": "E3",
+        "pool": "Recent3",
+        "reference_episodes": [
+          "E1",
+          "E2"
+        ],
+        "target_state_count": 104,
+        "nearest_neighbor_distance": {
+          "min": 8.47476055235528,
+          "p05": 9.974523435460597,
+          "median": 11.441190806688054,
+          "mean": 11.358936583568543,
+          "p90": 12.156561898356086,
+          "p95": 12.26692554140554,
+          "max": 13.58394898514209
+        },
+        "nearest_source_episode_state_counts": {
+          "E1": 94,
+          "E2": 10
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.03748391375808,
+            "p05": 8.03748391375808,
+            "median": 8.101910373843896,
+            "mean": 8.095715521912565,
+            "p90": 8.101910373843896,
+            "p95": 8.101910373843896,
+            "max": 8.101910373843896
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      },
+      {
+        "target": "E3",
+        "pool": "AllHistory",
+        "reference_episodes": [
+          "E1",
+          "E2"
+        ],
+        "target_state_count": 104,
+        "nearest_neighbor_distance": {
+          "min": 8.47476055235528,
+          "p05": 9.974523435460597,
+          "median": 11.441190806688054,
+          "mean": 11.358936583568543,
+          "p90": 12.156561898356086,
+          "p95": 12.26692554140554,
+          "max": 13.58394898514209
+        },
+        "nearest_source_episode_state_counts": {
+          "E1": 94,
+          "E2": 10
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.03748391375808,
+            "p05": 8.03748391375808,
+            "median": 8.101910373843896,
+            "mean": 8.095715521912565,
+            "p90": 8.101910373843896,
+            "p95": 8.101910373843896,
+            "max": 8.101910373843896
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      },
+      {
+        "target": "E4",
+        "pool": "Current",
+        "reference_episodes": [
+          "E3"
+        ],
+        "target_state_count": 105,
+        "nearest_neighbor_distance": {
+          "min": 9.145338697940291,
+          "p05": 10.904736438061143,
+          "median": 12.147376089700364,
+          "mean": 12.122694509678448,
+          "p90": 12.878974092738975,
+          "p95": 12.951000109055864,
+          "max": 13.501605317920399
+        },
+        "nearest_source_episode_state_counts": {
+          "E3": 105
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.090685041700436,
+            "p05": 8.090685041700436,
+            "median": 8.090685041700436,
+            "mean": 8.090685041700437,
+            "p90": 8.090685041700436,
+            "p95": 8.090685041700436,
+            "max": 8.090685041700436
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      },
+      {
+        "target": "E4",
+        "pool": "Recent3",
+        "reference_episodes": [
+          "E1",
+          "E2",
+          "E3"
+        ],
+        "target_state_count": 105,
+        "nearest_neighbor_distance": {
+          "min": 7.735394218602845,
+          "p05": 10.534912260095364,
+          "median": 11.635639859782787,
+          "mean": 11.692463969303285,
+          "p90": 12.720556380970466,
+          "p95": 12.818737335364043,
+          "max": 12.954240278732815
+        },
+        "nearest_source_episode_state_counts": {
+          "E1": 48,
+          "E2": 28,
+          "E3": 29
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.090685041700436,
+            "p05": 8.090685041700436,
+            "median": 8.090685041700436,
+            "mean": 8.095816622108874,
+            "p90": 8.101910373843896,
+            "p95": 8.101910373843896,
+            "max": 8.101910373843896
+          },
+          "overlap_count": 1,
+          "overlap_fraction": 0.009523809523809525
+        }
+      },
+      {
+        "target": "E4",
+        "pool": "AllHistory",
+        "reference_episodes": [
+          "E1",
+          "E2",
+          "E3"
+        ],
+        "target_state_count": 105,
+        "nearest_neighbor_distance": {
+          "min": 7.735394218602845,
+          "p05": 10.534912260095364,
+          "median": 11.635639859782787,
+          "mean": 11.692463969303285,
+          "p90": 12.720556380970466,
+          "p95": 12.818737335364043,
+          "max": 12.954240278732815
+        },
+        "nearest_source_episode_state_counts": {
+          "E1": 48,
+          "E2": 28,
+          "E3": 29
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.090685041700436,
+            "p05": 8.090685041700436,
+            "median": 8.090685041700436,
+            "mean": 8.095816622108874,
+            "p90": 8.101910373843896,
+            "p95": 8.101910373843896,
+            "max": 8.101910373843896
+          },
+          "overlap_count": 1,
+          "overlap_fraction": 0.009523809523809525
+        }
+      },
+      {
+        "target": "E5",
+        "pool": "Current",
+        "reference_episodes": [
+          "E4"
+        ],
+        "target_state_count": 96,
+        "nearest_neighbor_distance": {
+          "min": 9.10688856984065,
+          "p05": 11.1446385330317,
+          "median": 12.325765951779882,
+          "mean": 12.244996521168448,
+          "p90": 12.993547376939063,
+          "p95": 13.273117252323187,
+          "max": 15.256260122738684
+        },
+        "nearest_source_episode_state_counts": {
+          "E4": 96
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.146454496183807,
+            "p05": 8.146454496183807,
+            "median": 8.146454496183807,
+            "mean": 8.146454496183807,
+            "p90": 8.146454496183807,
+            "p95": 8.146454496183807,
+            "max": 8.146454496183807
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      },
+      {
+        "target": "E5",
+        "pool": "Recent3",
+        "reference_episodes": [
+          "E2",
+          "E3",
+          "E4"
+        ],
+        "target_state_count": 96,
+        "nearest_neighbor_distance": {
+          "min": 7.802418374190942,
+          "p05": 10.105191975889166,
+          "median": 11.999138773913383,
+          "mean": 11.934921394829674,
+          "p90": 12.839264479287841,
+          "p95": 12.974345168333398,
+          "max": 13.204171544736031
+        },
+        "nearest_source_episode_state_counts": {
+          "E2": 29,
+          "E3": 23,
+          "E4": 44
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.146454496183807,
+            "p05": 8.146454496183807,
+            "median": 8.146454496183807,
+            "mean": 8.146454496183807,
+            "p90": 8.146454496183807,
+            "p95": 8.146454496183807,
+            "max": 8.146454496183807
+          },
+          "overlap_count": 1,
+          "overlap_fraction": 0.010416666666666666
+        }
+      },
+      {
+        "target": "E5",
+        "pool": "AllHistory",
+        "reference_episodes": [
+          "E1",
+          "E2",
+          "E3",
+          "E4"
+        ],
+        "target_state_count": 96,
+        "nearest_neighbor_distance": {
+          "min": 7.802418374190942,
+          "p05": 10.105191975889166,
+          "median": 11.928705516372968,
+          "mean": 11.90729038066496,
+          "p90": 12.839264479287841,
+          "p95": 12.903553510241426,
+          "max": 13.149597941090645
+        },
+        "nearest_source_episode_state_counts": {
+          "E1": 17,
+          "E2": 22,
+          "E3": 15,
+          "E4": 42
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.146454496183807,
+            "p05": 8.146454496183807,
+            "median": 8.146454496183807,
+            "mean": 8.146454496183807,
+            "p90": 8.146454496183807,
+            "p95": 8.146454496183807,
+            "max": 8.146454496183807
+          },
+          "overlap_count": 1,
+          "overlap_fraction": 0.010416666666666666
+        }
+      },
+      {
+        "target": "E6",
+        "pool": "Current",
+        "reference_episodes": [
+          "E5"
+        ],
+        "target_state_count": 106,
+        "nearest_neighbor_distance": {
+          "min": 8.664099031258113,
+          "p05": 9.385358777896794,
+          "median": 12.598385611110292,
+          "mean": 12.308136352447605,
+          "p90": 13.350505948435258,
+          "p95": 13.400588639458789,
+          "max": 14.385104708668623
+        },
+        "nearest_source_episode_state_counts": {
+          "E5": 106
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.171972690097384,
+            "p05": 8.171972690097384,
+            "median": 8.171972690097384,
+            "mean": 8.171972690097387,
+            "p90": 8.171972690097384,
+            "p95": 8.171972690097384,
+            "max": 8.171972690097384
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      },
+      {
+        "target": "E6",
+        "pool": "Recent3",
+        "reference_episodes": [
+          "E3",
+          "E4",
+          "E5"
+        ],
+        "target_state_count": 106,
+        "nearest_neighbor_distance": {
+          "min": 8.312945424219386,
+          "p05": 9.091268687392784,
+          "median": 12.276141884249755,
+          "mean": 11.895963403499888,
+          "p90": 12.746025783306536,
+          "p95": 12.943821525919189,
+          "max": 13.204910216936847
+        },
+        "nearest_source_episode_state_counts": {
+          "E3": 61,
+          "E4": 37,
+          "E5": 8
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.171972690097384,
+            "p05": 8.171972690097384,
+            "median": 8.171972690097384,
+            "mean": 8.171972690097387,
+            "p90": 8.171972690097384,
+            "p95": 8.171972690097384,
+            "max": 8.171972690097384
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      },
+      {
+        "target": "E6",
+        "pool": "AllHistory",
+        "reference_episodes": [
+          "E1",
+          "E2",
+          "E3",
+          "E4",
+          "E5"
+        ],
+        "target_state_count": 106,
+        "nearest_neighbor_distance": {
+          "min": 8.293274721866183,
+          "p05": 9.091268687392784,
+          "median": 11.836655972548314,
+          "mean": 11.57917429902072,
+          "p90": 12.53282026028892,
+          "p95": 12.609429632533054,
+          "max": 12.965954496759307
+        },
+        "nearest_source_episode_state_counts": {
+          "E1": 66,
+          "E2": 9,
+          "E3": 23,
+          "E4": 6,
+          "E5": 2
+        },
+        "overlap_like_1x_auxiliary": {
+          "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        },
+        "overlap_like_2x_primary": {
+          "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+          "threshold_distribution": {
+            "min": 8.171972690097384,
+            "p05": 8.171972690097384,
+            "median": 8.171972690097384,
+            "mean": 8.171972690097387,
+            "p90": 8.171972690097384,
+            "p95": 8.171972690097384,
+            "max": 8.171972690097384
+          },
+          "overlap_count": 0,
+          "overlap_fraction": 0.0
+        }
+      }
+    ],
+    "by_target": {
+      "E3": {
+        "Current": {
+          "reference_episodes": [
+            "E2"
+          ],
+          "target_state_count": 104,
+          "nearest_neighbor_distance": {
+            "min": 8.85486936895551,
+            "p05": 10.225616028264849,
+            "median": 12.230118473706266,
+            "mean": 12.047673857716935,
+            "p90": 12.712841166056569,
+            "p95": 12.885854752451413,
+            "max": 16.15958106562107
+          },
+          "nearest_source_episode_state_counts": {
+            "E2": 104
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.03748391375808,
+              "p05": 8.03748391375808,
+              "median": 8.03748391375808,
+              "mean": 8.03748391375808,
+              "p90": 8.03748391375808,
+              "p95": 8.03748391375808,
+              "max": 8.03748391375808
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.0,
+            "mean": 0.0,
+            "p90": 0.0
+          }
+        },
+        "Recent3": {
+          "reference_episodes": [
+            "E1",
+            "E2"
+          ],
+          "target_state_count": 104,
+          "nearest_neighbor_distance": {
+            "min": 8.47476055235528,
+            "p05": 9.974523435460597,
+            "median": 11.441190806688054,
+            "mean": 11.358936583568543,
+            "p90": 12.156561898356086,
+            "p95": 12.26692554140554,
+            "max": 13.58394898514209
+          },
+          "nearest_source_episode_state_counts": {
+            "E1": 94,
+            "E2": 10
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.03748391375808,
+              "p05": 8.03748391375808,
+              "median": 8.101910373843896,
+              "mean": 8.095715521912565,
+              "p90": 8.101910373843896,
+              "p95": 8.101910373843896,
+              "max": 8.101910373843896
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.06450695213740909,
+            "mean": 0.05716765595436779,
+            "p90": 0.0437572734870435
+          }
+        },
+        "AllHistory": {
+          "reference_episodes": [
+            "E1",
+            "E2"
+          ],
+          "target_state_count": 104,
+          "nearest_neighbor_distance": {
+            "min": 8.47476055235528,
+            "p05": 9.974523435460597,
+            "median": 11.441190806688054,
+            "mean": 11.358936583568543,
+            "p90": 12.156561898356086,
+            "p95": 12.26692554140554,
+            "max": 13.58394898514209
+          },
+          "nearest_source_episode_state_counts": {
+            "E1": 94,
+            "E2": 10
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.03748391375808,
+              "p05": 8.03748391375808,
+              "median": 8.101910373843896,
+              "mean": 8.095715521912565,
+              "p90": 8.101910373843896,
+              "p95": 8.101910373843896,
+              "max": 8.101910373843896
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.06450695213740909,
+            "mean": 0.05716765595436779,
+            "p90": 0.0437572734870435
+          }
+        }
+      },
+      "E4": {
+        "Current": {
+          "reference_episodes": [
+            "E3"
+          ],
+          "target_state_count": 105,
+          "nearest_neighbor_distance": {
+            "min": 9.145338697940291,
+            "p05": 10.904736438061143,
+            "median": 12.147376089700364,
+            "mean": 12.122694509678448,
+            "p90": 12.878974092738975,
+            "p95": 12.951000109055864,
+            "max": 13.501605317920399
+          },
+          "nearest_source_episode_state_counts": {
+            "E3": 105
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.090685041700436,
+              "p05": 8.090685041700436,
+              "median": 8.090685041700436,
+              "mean": 8.090685041700437,
+              "p90": 8.090685041700436,
+              "p95": 8.090685041700436,
+              "max": 8.090685041700436
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.0,
+            "mean": 0.0,
+            "p90": 0.0
+          }
+        },
+        "Recent3": {
+          "reference_episodes": [
+            "E1",
+            "E2",
+            "E3"
+          ],
+          "target_state_count": 105,
+          "nearest_neighbor_distance": {
+            "min": 7.735394218602845,
+            "p05": 10.534912260095364,
+            "median": 11.635639859782787,
+            "mean": 11.692463969303285,
+            "p90": 12.720556380970466,
+            "p95": 12.818737335364043,
+            "max": 12.954240278732815
+          },
+          "nearest_source_episode_state_counts": {
+            "E1": 48,
+            "E2": 28,
+            "E3": 29
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.090685041700436,
+              "p05": 8.090685041700436,
+              "median": 8.090685041700436,
+              "mean": 8.095816622108874,
+              "p90": 8.101910373843896,
+              "p95": 8.101910373843896,
+              "max": 8.101910373843896
+            },
+            "overlap_count": 1,
+            "overlap_fraction": 0.009523809523809525
+          },
+          "reduction_vs_current": {
+            "median": 0.04212730602384773,
+            "mean": 0.03548967929792157,
+            "p90": 0.012300491531994195
+          }
+        },
+        "AllHistory": {
+          "reference_episodes": [
+            "E1",
+            "E2",
+            "E3"
+          ],
+          "target_state_count": 105,
+          "nearest_neighbor_distance": {
+            "min": 7.735394218602845,
+            "p05": 10.534912260095364,
+            "median": 11.635639859782787,
+            "mean": 11.692463969303285,
+            "p90": 12.720556380970466,
+            "p95": 12.818737335364043,
+            "max": 12.954240278732815
+          },
+          "nearest_source_episode_state_counts": {
+            "E1": 48,
+            "E2": 28,
+            "E3": 29
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.090685041700436,
+              "p05": 8.090685041700436,
+              "median": 8.090685041700436,
+              "mean": 8.095816622108874,
+              "p90": 8.101910373843896,
+              "p95": 8.101910373843896,
+              "max": 8.101910373843896
+            },
+            "overlap_count": 1,
+            "overlap_fraction": 0.009523809523809525
+          },
+          "reduction_vs_current": {
+            "median": 0.04212730602384773,
+            "mean": 0.03548967929792157,
+            "p90": 0.012300491531994195
+          }
+        }
+      },
+      "E5": {
+        "Current": {
+          "reference_episodes": [
+            "E4"
+          ],
+          "target_state_count": 96,
+          "nearest_neighbor_distance": {
+            "min": 9.10688856984065,
+            "p05": 11.1446385330317,
+            "median": 12.325765951779882,
+            "mean": 12.244996521168448,
+            "p90": 12.993547376939063,
+            "p95": 13.273117252323187,
+            "max": 15.256260122738684
+          },
+          "nearest_source_episode_state_counts": {
+            "E4": 96
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.146454496183807,
+              "p05": 8.146454496183807,
+              "median": 8.146454496183807,
+              "mean": 8.146454496183807,
+              "p90": 8.146454496183807,
+              "p95": 8.146454496183807,
+              "max": 8.146454496183807
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.0,
+            "mean": 0.0,
+            "p90": 0.0
+          }
+        },
+        "Recent3": {
+          "reference_episodes": [
+            "E2",
+            "E3",
+            "E4"
+          ],
+          "target_state_count": 96,
+          "nearest_neighbor_distance": {
+            "min": 7.802418374190942,
+            "p05": 10.105191975889166,
+            "median": 11.999138773913383,
+            "mean": 11.934921394829674,
+            "p90": 12.839264479287841,
+            "p95": 12.974345168333398,
+            "max": 13.204171544736031
+          },
+          "nearest_source_episode_state_counts": {
+            "E2": 29,
+            "E3": 23,
+            "E4": 44
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.146454496183807,
+              "p05": 8.146454496183807,
+              "median": 8.146454496183807,
+              "mean": 8.146454496183807,
+              "p90": 8.146454496183807,
+              "p95": 8.146454496183807,
+              "max": 8.146454496183807
+            },
+            "overlap_count": 1,
+            "overlap_fraction": 0.010416666666666666
+          },
+          "reduction_vs_current": {
+            "median": 0.02649954405627286,
+            "mean": 0.02532259815694793,
+            "p90": 0.011873808835687338
+          }
+        },
+        "AllHistory": {
+          "reference_episodes": [
+            "E1",
+            "E2",
+            "E3",
+            "E4"
+          ],
+          "target_state_count": 96,
+          "nearest_neighbor_distance": {
+            "min": 7.802418374190942,
+            "p05": 10.105191975889166,
+            "median": 11.928705516372968,
+            "mean": 11.90729038066496,
+            "p90": 12.839264479287841,
+            "p95": 12.903553510241426,
+            "max": 13.149597941090645
+          },
+          "nearest_source_episode_state_counts": {
+            "E1": 17,
+            "E2": 22,
+            "E3": 15,
+            "E4": 42
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.146454496183807,
+              "p05": 8.146454496183807,
+              "median": 8.146454496183807,
+              "mean": 8.146454496183807,
+              "p90": 8.146454496183807,
+              "p95": 8.146454496183807,
+              "max": 8.146454496183807
+            },
+            "overlap_count": 1,
+            "overlap_fraction": 0.010416666666666666
+          },
+          "reduction_vs_current": {
+            "median": 0.03221385485983341,
+            "mean": 0.027579112817196827,
+            "p90": 0.011873808835687338
+          }
+        },
+        "all_history_incremental_reduction_vs_recent3": {
+          "median": 0.005869859401371413,
+          "mean": 0.0023151400206693484,
+          "p90": 0.0
+        },
+        "all_history_overlap_increment_vs_recent3": {
+          "overlap_count_delta": 0,
+          "overlap_fraction_delta": 0.0
+        }
+      },
+      "E6": {
+        "Current": {
+          "reference_episodes": [
+            "E5"
+          ],
+          "target_state_count": 106,
+          "nearest_neighbor_distance": {
+            "min": 8.664099031258113,
+            "p05": 9.385358777896794,
+            "median": 12.598385611110292,
+            "mean": 12.308136352447605,
+            "p90": 13.350505948435258,
+            "p95": 13.400588639458789,
+            "max": 14.385104708668623
+          },
+          "nearest_source_episode_state_counts": {
+            "E5": 106
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.171972690097384,
+              "p05": 8.171972690097384,
+              "median": 8.171972690097384,
+              "mean": 8.171972690097387,
+              "p90": 8.171972690097384,
+              "p95": 8.171972690097384,
+              "max": 8.171972690097384
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.0,
+            "mean": 0.0,
+            "p90": 0.0
+          }
+        },
+        "Recent3": {
+          "reference_episodes": [
+            "E3",
+            "E4",
+            "E5"
+          ],
+          "target_state_count": 106,
+          "nearest_neighbor_distance": {
+            "min": 8.312945424219386,
+            "p05": 9.091268687392784,
+            "median": 12.276141884249755,
+            "mean": 11.895963403499888,
+            "p90": 12.746025783306536,
+            "p95": 12.943821525919189,
+            "max": 13.204910216936847
+          },
+          "nearest_source_episode_state_counts": {
+            "E3": 61,
+            "E4": 37,
+            "E5": 8
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.171972690097384,
+              "p05": 8.171972690097384,
+              "median": 8.171972690097384,
+              "mean": 8.171972690097387,
+              "p90": 8.171972690097384,
+              "p95": 8.171972690097384,
+              "max": 8.171972690097384
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.025578176189205992,
+            "mean": 0.03348784390625892,
+            "p90": 0.04527769714971508
+          }
+        },
+        "AllHistory": {
+          "reference_episodes": [
+            "E1",
+            "E2",
+            "E3",
+            "E4",
+            "E5"
+          ],
+          "target_state_count": 106,
+          "nearest_neighbor_distance": {
+            "min": 8.293274721866183,
+            "p05": 9.091268687392784,
+            "median": 11.836655972548314,
+            "mean": 11.57917429902072,
+            "p90": 12.53282026028892,
+            "p95": 12.609429632533054,
+            "max": 12.965954496759307
+          },
+          "nearest_source_episode_state_counts": {
+            "E1": 66,
+            "E2": 9,
+            "E3": 23,
+            "E4": 6,
+            "E5": 2
+          },
+          "overlap_like_1x_auxiliary": {
+            "definition": "cross NN <= max(within_p95_target, within_p95_nearest_source_episode)",
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "overlap_like_2x_primary": {
+            "definition": "cross NN <= 2 * max(within_p95_target, within_p95_nearest_source_episode)",
+            "threshold_distribution": {
+              "min": 8.171972690097384,
+              "p05": 8.171972690097384,
+              "median": 8.171972690097384,
+              "mean": 8.171972690097387,
+              "p90": 8.171972690097384,
+              "p95": 8.171972690097384,
+              "max": 8.171972690097384
+            },
+            "overlap_count": 0,
+            "overlap_fraction": 0.0
+          },
+          "reduction_vs_current": {
+            "median": 0.0604624800411111,
+            "mean": 0.05922603004653282,
+            "p90": 0.06124754307473823
+          }
+        },
+        "all_history_incremental_reduction_vs_recent3": {
+          "median": 0.03580000262666394,
+          "mean": 0.026629966294782537,
+          "p90": 0.016727215733146394
+        },
+        "all_history_overlap_increment_vs_recent3": {
+          "overlap_count_delta": 0,
+          "overlap_fraction_delta": 0.0
+        }
+      }
+    },
+    "E5_ALL_HISTORY_INCREMENTAL_MEDIAN_REDUCTION": 0.005869859401371413,
+    "E6_ALL_HISTORY_INCREMENTAL_MEDIAN_REDUCTION": 0.03580000262666394,
+    "MEAN_INCREMENTAL_REDUCTION_E5_E6": 0.020834931014017677,
+    "MEDIAN_INCREMENTAL_REDUCTION_E5_E6": 0.020834931014017677,
+    "MEAN_DISTANCE_INCREMENTAL_REDUCTION_E5_E6": 0.014472553157725943,
+    "MEDIAN_DISTANCE_INCREMENTAL_REDUCTION_E5_E6": 0.014472553157725943,
+    "MEAN_P90_INCREMENTAL_REDUCTION_E5_E6": 0.008363607866573197,
+    "ALL_HISTORY_COVERAGE_GAIN": "WEAK",
+    "classification_evidence": {
+      "median_incremental_reductions_E5_E6": [
+        0.005869859401371413,
+        0.03580000262666394
+      ],
+      "mean_incremental_reductions_E5_E6": [
+        0.0023151400206693484,
+        0.026629966294782537
+      ],
+      "p90_incremental_reductions_E5_E6": [
+        0.0,
+        0.016727215733146394
+      ],
+      "2x_overlap_count_deltas_E5_E6": [
+        0,
+        0
+      ],
+      "2x_overlap_fraction_deltas_E5_E6": [
+        0.0,
+        0.0
+      ],
+      "rule": "MATERIAL requires positive median/mean/P90 reductions for both E5/E6, at least 5% for each measure in both targets, and increased 2x overlap counts in both; otherwise WEAK. This is a multi-metric judgment, not a single 6-8% cutoff."
+    },
+    "E3_E4_recent3_equals_allhistory_note": "E3/E4 Recent3 pools equal AllHistory pools by construction and are descriptive only; incremental gain classification uses E5/E6."
+  },
+  "PART_B_REPLAY_LAST3_RECONSTRUCTION": {
+    "initial_critic_sha256": "db142467f635f7db2669c4f82c5af52d7a68a30840c63179a00157f0f028e1d8",
+    "snapshot_hashes": {
+      "pre-E3": "2aa1c985a99d72008f367c27f39b30bc09c402f7197f924384e19b8bc9e90883",
+      "pre-E4": "d585c9054c33c04cf64bc5bc8bed7eb6ad35ab1d0f3ed18c86f5560d86c677e2",
+      "pre-E5": "03f904e9a4abb9e6f7ecd23b1e95bb266228f9ac338d4996342212018a678169"
+    },
+    "expected_snapshot_hashes": {
+      "pre-E3": "2aa1c985a99d72008f367c27f39b30bc09c402f7197f924384e19b8bc9e90883",
+      "pre-E4": "d585c9054c33c04cf64bc5bc8bed7eb6ad35ab1d0f3ed18c86f5560d86c677e2",
+      "pre-E5": "03f904e9a4abb9e6f7ecd23b1e95bb266228f9ac338d4996342212018a678169"
+    },
+    "snapshot_hash_matches": {
+      "pre-E3": true,
+      "pre-E4": true,
+      "pre-E5": true
+    },
+    "reconstruction_checks": [
+      {
+        "trained_through_episode": "E1",
+        "pre_update_snapshot_sha256": "db142467f635f7db2669c4f82c5af52d7a68a30840c63179a00157f0f028e1d8",
+        "A0_10_snapshot_sha256": "db142467f635f7db2669c4f82c5af52d7a68a30840c63179a00157f0f028e1d8",
+        "snapshot_hash_match": true,
+        "local_target_hashes": {
+          "E1": "47f955d96023cfb6ae9e38fbc4f8e536dfaf3dbdfbf84943dbfe0c1023296b02"
+        },
+        "A0_10_target_hashes": {
+          "E1": "47f955d96023cfb6ae9e38fbc4f8e536dfaf3dbdfbf84943dbfe0c1023296b02"
+        },
+        "target_hashes_match": true
+      },
+      {
+        "trained_through_episode": "E2",
+        "pre_update_snapshot_sha256": "4fefabb6d605a1e7e5f5baaafe3a94d3ce2d765f111d045cdbdaaa53a6bff96e",
+        "A0_10_snapshot_sha256": "4fefabb6d605a1e7e5f5baaafe3a94d3ce2d765f111d045cdbdaaa53a6bff96e",
+        "snapshot_hash_match": true,
+        "local_target_hashes": {
+          "E1": "7fe7c40cfe8161bc87fc9cf1562a3f8a2fa6e89f0691c51421a8ff7464cf340f",
+          "E2": "41d4cadca5d575034156f286f21653f1e4c50d865560b3063b05d0fb34875b36"
+        },
+        "A0_10_target_hashes": {
+          "E1": "7fe7c40cfe8161bc87fc9cf1562a3f8a2fa6e89f0691c51421a8ff7464cf340f",
+          "E2": "41d4cadca5d575034156f286f21653f1e4c50d865560b3063b05d0fb34875b36"
+        },
+        "target_hashes_match": true
+      },
+      {
+        "trained_through_episode": "E3",
+        "pre_update_snapshot_sha256": "2aa1c985a99d72008f367c27f39b30bc09c402f7197f924384e19b8bc9e90883",
+        "A0_10_snapshot_sha256": "2aa1c985a99d72008f367c27f39b30bc09c402f7197f924384e19b8bc9e90883",
+        "snapshot_hash_match": true,
+        "local_target_hashes": {
+          "E1": "3fa74150b58dbedbb47444aabab10ec9a31a04ddf2c22605564b454222a3187f",
+          "E2": "6bce9e6e4c4dbe3d05964ccae5503e72f4d1dc9e649bc330390bd032e042a12c",
+          "E3": "93f96a3b71d01e8b6583b755eebd45bf3cc035c31a45294f46e4281928d91407"
+        },
+        "A0_10_target_hashes": {
+          "E1": "3fa74150b58dbedbb47444aabab10ec9a31a04ddf2c22605564b454222a3187f",
+          "E2": "6bce9e6e4c4dbe3d05964ccae5503e72f4d1dc9e649bc330390bd032e042a12c",
+          "E3": "93f96a3b71d01e8b6583b755eebd45bf3cc035c31a45294f46e4281928d91407"
+        },
+        "target_hashes_match": true
+      },
+      {
+        "trained_through_episode": "E4",
+        "pre_update_snapshot_sha256": "d585c9054c33c04cf64bc5bc8bed7eb6ad35ab1d0f3ed18c86f5560d86c677e2",
+        "A0_10_snapshot_sha256": "d585c9054c33c04cf64bc5bc8bed7eb6ad35ab1d0f3ed18c86f5560d86c677e2",
+        "snapshot_hash_match": true,
+        "local_target_hashes": {
+          "E2": "e719beafdcaa4cbba0f47ceb03f5bb3d7983a639169953e0b0664e3ae051fea2",
+          "E3": "fb68d49252b50859c60a2f8ad353557040598e36d6ee53d2cb66558cba46dd9e",
+          "E4": "a38f8131de28a62b51d9180dc1f41a9119116e2d814a7a109216abe959379c6e"
+        },
+        "A0_10_target_hashes": {
+          "E2": "e719beafdcaa4cbba0f47ceb03f5bb3d7983a639169953e0b0664e3ae051fea2",
+          "E3": "fb68d49252b50859c60a2f8ad353557040598e36d6ee53d2cb66558cba46dd9e",
+          "E4": "a38f8131de28a62b51d9180dc1f41a9119116e2d814a7a109216abe959379c6e"
+        },
+        "target_hashes_match": true
+      },
+      {
+        "trained_through_episode": "pre-E5",
+        "pre_update_snapshot_sha256": "03f904e9a4abb9e6f7ecd23b1e95bb266228f9ac338d4996342212018a678169",
+        "A0_10_snapshot_sha256": "03f904e9a4abb9e6f7ecd23b1e95bb266228f9ac338d4996342212018a678169",
+        "snapshot_hash_match": true,
+        "local_target_hashes": {
+          "E3": "49c93d6b3f8e42b938d241513415c7c91111d0f0461aed939d502d7a0894eff2",
+          "E4": "12eb9f2e2175f866a29d8717810e83343776c23fb5727d9f35ecea7624066b84",
+          "E5": "d3864f27f7ec795d502397bce055da95c887dbd75d7dc84d431196ca0192c1b9"
+        },
+        "A0_10_target_hashes": {
+          "E3": "49c93d6b3f8e42b938d241513415c7c91111d0f0461aed939d502d7a0894eff2",
+          "E4": "12eb9f2e2175f866a29d8717810e83343776c23fb5727d9f35ecea7624066b84",
+          "E5": "d3864f27f7ec795d502397bce055da95c887dbd75d7dc84d431196ca0192c1b9"
+        },
+        "target_hashes_match": true
+      }
+    ],
+    "training_optimizer_steps": 200,
+    "all_reconstruction_target_hashes_match": true,
+    "pre_E5_snapshot_captured": true,
+    "PRE_E3_HASH_MATCH": "YES",
+    "PRE_E4_HASH_MATCH": "YES",
+    "PRE_E5_HASH_MATCH": "YES",
+    "TARGET_HASH_MATCH_A0_10": "YES",
+    "gradient_analysis_skipped_reason": null
+  },
+  "PART_B_PER_DOMAIN_GRADIENT_COSINE": {
+    "contexts": {
+      "pre-E3": {
+        "domains_in_order": [
+          "E1",
+          "E2",
+          "E3"
+        ],
+        "snapshot_sha256": "2aa1c985a99d72008f367c27f39b30bc09c402f7197f924384e19b8bc9e90883",
+        "target_hashes": {
+          "E1": "3fa74150b58dbedbb47444aabab10ec9a31a04ddf2c22605564b454222a3187f",
+          "E2": "6bce9e6e4c4dbe3d05964ccae5503e72f4d1dc9e649bc330390bd032e042a12c",
+          "E3": "93f96a3b71d01e8b6583b755eebd45bf3cc035c31a45294f46e4281928d91407"
+        },
+        "A0_10_target_hashes": {
+          "E1": "3fa74150b58dbedbb47444aabab10ec9a31a04ddf2c22605564b454222a3187f",
+          "E2": "6bce9e6e4c4dbe3d05964ccae5503e72f4d1dc9e649bc330390bd032e042a12c",
+          "E3": "93f96a3b71d01e8b6583b755eebd45bf3cc035c31a45294f46e4281928d91407"
+        },
+        "TARGET_HASH_MATCH_A0_10": "YES",
+        "same_frozen_snapshot_for_target_and_gradient_domains": true,
+        "parameter_order_signature": [
+          {
+            "name": "0.weight",
+            "shape": [
+              128,
+              400
+            ],
+            "dtype": "torch.float32",
+            "numel": 51200
+          },
+          {
+            "name": "0.bias",
+            "shape": [
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "2.weight",
+            "shape": [
+              128,
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 16384
+          },
+          {
+            "name": "2.bias",
+            "shape": [
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "4.weight",
+            "shape": [
+              1,
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "4.bias",
+            "shape": [
+              1
+            ],
+            "dtype": "torch.float32",
+            "numel": 1
+          }
+        ],
+        "parameter_order_identical_across_contexts": true,
+        "gradient_dimension": 67969,
+        "gradient_matrix_order": [
+          "E1",
+          "E2",
+          "E3"
+        ],
+        "pairwise_gradient_cosine_matrix": [
+          [
+            1.0,
+            0.7035378151726286,
+            0.5422975174832859
+          ],
+          [
+            0.7035378151726286,
+            1.0,
+            0.7207437667067164
+          ],
+          [
+            0.5422975174832859,
+            0.7207437667067164,
+            1.0
+          ]
+        ],
+        "zero_or_near_zero_norm_pairs": [],
+        "domain_gradients": {
+          "E1": {
+            "episode": "E1",
+            "unscaled_mean_mse": 1711.96142578125,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 17.119613647460938,
+            "target_sha256": "3fa74150b58dbedbb47444aabab10ec9a31a04ddf2c22605564b454222a3187f",
+            "GLOBAL_GRAD_L2_NORM": 33.393752559989956,
+            "per_parameter_tensor_grad_norm_mean": 8.837052825838327,
+            "per_parameter_tensor_grad_norm_max": 28.986038208007812,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          },
+          "E2": {
+            "episode": "E2",
+            "unscaled_mean_mse": 37295.75390625,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 372.95751953125,
+            "target_sha256": "6bce9e6e4c4dbe3d05964ccae5503e72f4d1dc9e649bc330390bd032e042a12c",
+            "GLOBAL_GRAD_L2_NORM": 317.402770216116,
+            "per_parameter_tensor_grad_norm_mean": 83.04759657382965,
+            "per_parameter_tensor_grad_norm_max": 282.5417785644531,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          },
+          "E3": {
+            "episode": "E3",
+            "unscaled_mean_mse": 3537.837158203125,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 35.37837219238281,
+            "target_sha256": "93f96a3b71d01e8b6583b755eebd45bf3cc035c31a45294f46e4281928d91407",
+            "GLOBAL_GRAD_L2_NORM": 26.28183420405619,
+            "per_parameter_tensor_grad_norm_mean": 7.4886310795942945,
+            "per_parameter_tensor_grad_norm_max": 20.349224090576172,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          }
+        },
+        "history_domains": [
+          "E1",
+          "E2"
+        ],
+        "current_domain": "E3",
+        "history_raw_mean_gradient_GLOBAL_NORM": 170.86078775054406,
+        "all_replay_mean_gradient_GLOBAL_NORM": 120.38874418786074,
+        "RAW_HISTORY_CURRENT_COS": 0.7224460934883445,
+        "ALL_REPLAY_CURRENT_COS": 0.7563200179225259,
+        "DIRECTION_BALANCED_HISTORY_CURRENT_COS": 0.6842686753697312,
+        "history_raw_cosine_zero_norm": false,
+        "all_replay_cosine_zero_norm": false,
+        "direction_balanced_cosine_zero_norm": false,
+        "zero_norm_history_domains": [],
+        "A0_10_current_corr_delta_last3_minus_replay0": 0.24588926304514808,
+        "A0_10_next_unseen_corr_delta_last3_minus_replay0": 0.10999263906582263,
+        "A0_10_current_or_next_degraded": false,
+        "optimizer_steps_during_gradient_diagnostics": 0,
+        "gradient_clipping_applied": false
+      },
+      "pre-E4": {
+        "domains_in_order": [
+          "E2",
+          "E3",
+          "E4"
+        ],
+        "snapshot_sha256": "d585c9054c33c04cf64bc5bc8bed7eb6ad35ab1d0f3ed18c86f5560d86c677e2",
+        "target_hashes": {
+          "E2": "e719beafdcaa4cbba0f47ceb03f5bb3d7983a639169953e0b0664e3ae051fea2",
+          "E3": "fb68d49252b50859c60a2f8ad353557040598e36d6ee53d2cb66558cba46dd9e",
+          "E4": "a38f8131de28a62b51d9180dc1f41a9119116e2d814a7a109216abe959379c6e"
+        },
+        "A0_10_target_hashes": {
+          "E2": "e719beafdcaa4cbba0f47ceb03f5bb3d7983a639169953e0b0664e3ae051fea2",
+          "E3": "fb68d49252b50859c60a2f8ad353557040598e36d6ee53d2cb66558cba46dd9e",
+          "E4": "a38f8131de28a62b51d9180dc1f41a9119116e2d814a7a109216abe959379c6e"
+        },
+        "TARGET_HASH_MATCH_A0_10": "YES",
+        "same_frozen_snapshot_for_target_and_gradient_domains": true,
+        "parameter_order_signature": [
+          {
+            "name": "0.weight",
+            "shape": [
+              128,
+              400
+            ],
+            "dtype": "torch.float32",
+            "numel": 51200
+          },
+          {
+            "name": "0.bias",
+            "shape": [
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "2.weight",
+            "shape": [
+              128,
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 16384
+          },
+          {
+            "name": "2.bias",
+            "shape": [
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "4.weight",
+            "shape": [
+              1,
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "4.bias",
+            "shape": [
+              1
+            ],
+            "dtype": "torch.float32",
+            "numel": 1
+          }
+        ],
+        "parameter_order_identical_across_contexts": true,
+        "gradient_dimension": 67969,
+        "gradient_matrix_order": [
+          "E2",
+          "E3",
+          "E4"
+        ],
+        "pairwise_gradient_cosine_matrix": [
+          [
+            1.0,
+            0.7091060905770586,
+            -0.08348583837021821
+          ],
+          [
+            0.7091060905770586,
+            1.0,
+            -0.15482715382682896
+          ],
+          [
+            -0.08348583837021821,
+            -0.15482715382682896,
+            1.0
+          ]
+        ],
+        "zero_or_near_zero_norm_pairs": [],
+        "domain_gradients": {
+          "E2": {
+            "episode": "E2",
+            "unscaled_mean_mse": 37199.2734375,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 371.99273681640625,
+            "target_sha256": "e719beafdcaa4cbba0f47ceb03f5bb3d7983a639169953e0b0664e3ae051fea2",
+            "GLOBAL_GRAD_L2_NORM": 608.8297566538189,
+            "per_parameter_tensor_grad_norm_mean": 165.59230230251947,
+            "per_parameter_tensor_grad_norm_max": 508.4744567871094,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          },
+          "E3": {
+            "episode": "E3",
+            "unscaled_mean_mse": 3567.0205078125,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 35.670204162597656,
+            "target_sha256": "fb68d49252b50859c60a2f8ad353557040598e36d6ee53d2cb66558cba46dd9e",
+            "GLOBAL_GRAD_L2_NORM": 57.94511887562075,
+            "per_parameter_tensor_grad_norm_mean": 16.15660730501016,
+            "per_parameter_tensor_grad_norm_max": 47.9190788269043,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          },
+          "E4": {
+            "episode": "E4",
+            "unscaled_mean_mse": 8726.466796875,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 87.26466369628906,
+            "target_sha256": "a38f8131de28a62b51d9180dc1f41a9119116e2d814a7a109216abe959379c6e",
+            "GLOBAL_GRAD_L2_NORM": 49.818166395982544,
+            "per_parameter_tensor_grad_norm_mean": 13.918472478787104,
+            "per_parameter_tensor_grad_norm_max": 39.1934814453125,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          }
+        },
+        "history_domains": [
+          "E2",
+          "E3"
+        ],
+        "current_domain": "E4",
+        "history_raw_mean_gradient_GLOBAL_NORM": 325.6009863958898,
+        "all_replay_mean_gradient_GLOBAL_NORM": 216.1757495834842,
+        "RAW_HISTORY_CURRENT_COS": -0.09183040437712342,
+        "ALL_REPLAY_CURRENT_COS": -0.0153917574256129,
+        "DIRECTION_BALANCED_HISTORY_CURRENT_COS": -0.12889860309793436,
+        "history_raw_cosine_zero_norm": false,
+        "all_replay_cosine_zero_norm": false,
+        "direction_balanced_cosine_zero_norm": false,
+        "zero_norm_history_domains": [],
+        "A0_10_current_corr_delta_last3_minus_replay0": -0.08311201437169752,
+        "A0_10_next_unseen_corr_delta_last3_minus_replay0": -0.5443255108789451,
+        "A0_10_current_or_next_degraded": true,
+        "optimizer_steps_during_gradient_diagnostics": 0,
+        "gradient_clipping_applied": false
+      },
+      "pre-E5": {
+        "domains_in_order": [
+          "E3",
+          "E4",
+          "E5"
+        ],
+        "snapshot_sha256": "03f904e9a4abb9e6f7ecd23b1e95bb266228f9ac338d4996342212018a678169",
+        "target_hashes": {
+          "E3": "49c93d6b3f8e42b938d241513415c7c91111d0f0461aed939d502d7a0894eff2",
+          "E4": "12eb9f2e2175f866a29d8717810e83343776c23fb5727d9f35ecea7624066b84",
+          "E5": "d3864f27f7ec795d502397bce055da95c887dbd75d7dc84d431196ca0192c1b9"
+        },
+        "A0_10_target_hashes": {
+          "E3": "49c93d6b3f8e42b938d241513415c7c91111d0f0461aed939d502d7a0894eff2",
+          "E4": "12eb9f2e2175f866a29d8717810e83343776c23fb5727d9f35ecea7624066b84",
+          "E5": "d3864f27f7ec795d502397bce055da95c887dbd75d7dc84d431196ca0192c1b9"
+        },
+        "TARGET_HASH_MATCH_A0_10": "YES",
+        "same_frozen_snapshot_for_target_and_gradient_domains": true,
+        "parameter_order_signature": [
+          {
+            "name": "0.weight",
+            "shape": [
+              128,
+              400
+            ],
+            "dtype": "torch.float32",
+            "numel": 51200
+          },
+          {
+            "name": "0.bias",
+            "shape": [
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "2.weight",
+            "shape": [
+              128,
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 16384
+          },
+          {
+            "name": "2.bias",
+            "shape": [
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "4.weight",
+            "shape": [
+              1,
+              128
+            ],
+            "dtype": "torch.float32",
+            "numel": 128
+          },
+          {
+            "name": "4.bias",
+            "shape": [
+              1
+            ],
+            "dtype": "torch.float32",
+            "numel": 1
+          }
+        ],
+        "parameter_order_identical_across_contexts": true,
+        "gradient_dimension": 67969,
+        "gradient_matrix_order": [
+          "E3",
+          "E4",
+          "E5"
+        ],
+        "pairwise_gradient_cosine_matrix": [
+          [
+            1.0,
+            0.5891456348903782,
+            -0.6711189062551438
+          ],
+          [
+            0.5891456348903782,
+            1.0,
+            -0.5654429032762756
+          ],
+          [
+            -0.6711189062551438,
+            -0.5654429032762756,
+            1.0
+          ]
+        ],
+        "zero_or_near_zero_norm_pairs": [],
+        "domain_gradients": {
+          "E3": {
+            "episode": "E3",
+            "unscaled_mean_mse": 3879.39111328125,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 38.79391098022461,
+            "target_sha256": "49c93d6b3f8e42b938d241513415c7c91111d0f0461aed939d502d7a0894eff2",
+            "GLOBAL_GRAD_L2_NORM": 90.2504685279547,
+            "per_parameter_tensor_grad_norm_mean": 24.264769807457924,
+            "per_parameter_tensor_grad_norm_max": 79.85562133789062,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          },
+          "E4": {
+            "episode": "E4",
+            "unscaled_mean_mse": 8351.51953125,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 83.51519012451172,
+            "target_sha256": "12eb9f2e2175f866a29d8717810e83343776c23fb5727d9f35ecea7624066b84",
+            "GLOBAL_GRAD_L2_NORM": 153.64774524650363,
+            "per_parameter_tensor_grad_norm_mean": 40.320434053738914,
+            "per_parameter_tensor_grad_norm_max": 138.2523651123047,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          },
+          "E5": {
+            "episode": "E5",
+            "unscaled_mean_mse": 3165.369384765625,
+            "value_loss_coefficient": 0.01,
+            "scaled_domain_loss": 31.6536922454834,
+            "target_sha256": "d3864f27f7ec795d502397bce055da95c887dbd75d7dc84d431196ca0192c1b9",
+            "GLOBAL_GRAD_L2_NORM": 114.92366389676287,
+            "per_parameter_tensor_grad_norm_mean": 32.29291567206383,
+            "per_parameter_tensor_grad_norm_max": 92.50757598876953,
+            "per_parameter_tensor_count": 6,
+            "flattened_gradient_dimension": 67969,
+            "missing_gradient_parameters": [],
+            "unexpected_parameter_names": [],
+            "pre_clip_raw_gradient": true
+          }
+        },
+        "history_domains": [
+          "E3",
+          "E4"
+        ],
+        "current_domain": "E5",
+        "history_raw_mean_gradient_GLOBAL_NORM": 109.64930879546704,
+        "all_replay_mean_gradient_GLOBAL_NORM": 55.18538868865129,
+        "RAW_HISTORY_CURRENT_COS": -0.6723609318713161,
+        "ALL_REPLAY_CURRENT_COS": -0.1964539271331762,
+        "DIRECTION_BALANCED_HISTORY_CURRENT_COS": -0.693615807200498,
+        "history_raw_cosine_zero_norm": false,
+        "all_replay_cosine_zero_norm": false,
+        "direction_balanced_cosine_zero_norm": false,
+        "zero_norm_history_domains": [],
+        "A0_10_current_corr_delta_last3_minus_replay0": -0.7576225907406298,
+        "A0_10_next_unseen_corr_delta_last3_minus_replay0": -0.05679591693209707,
+        "A0_10_current_or_next_degraded": true,
+        "optimizer_steps_during_gradient_diagnostics": 0,
+        "gradient_clipping_applied": false
+      }
+    },
+    "parameter_order_signature_by_context": {
+      "pre-E3": [
+        {
+          "name": "0.weight",
+          "shape": [
+            128,
+            400
+          ],
+          "dtype": "torch.float32",
+          "numel": 51200
+        },
+        {
+          "name": "0.bias",
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "2.weight",
+          "shape": [
+            128,
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 16384
+        },
+        {
+          "name": "2.bias",
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "4.weight",
+          "shape": [
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "4.bias",
+          "shape": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "numel": 1
+        }
+      ],
+      "pre-E4": [
+        {
+          "name": "0.weight",
+          "shape": [
+            128,
+            400
+          ],
+          "dtype": "torch.float32",
+          "numel": 51200
+        },
+        {
+          "name": "0.bias",
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "2.weight",
+          "shape": [
+            128,
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 16384
+        },
+        {
+          "name": "2.bias",
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "4.weight",
+          "shape": [
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "4.bias",
+          "shape": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "numel": 1
+        }
+      ],
+      "pre-E5": [
+        {
+          "name": "0.weight",
+          "shape": [
+            128,
+            400
+          ],
+          "dtype": "torch.float32",
+          "numel": 51200
+        },
+        {
+          "name": "0.bias",
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "2.weight",
+          "shape": [
+            128,
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 16384
+        },
+        {
+          "name": "2.bias",
+          "shape": [
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "4.weight",
+          "shape": [
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "numel": 128
+        },
+        {
+          "name": "4.bias",
+          "shape": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "numel": 1
+        }
+      ]
+    },
+    "parameter_ordering_identical_across_contexts": true,
+    "gradient_dimensionality_by_domain": {
+      "E1": 67969,
+      "E2": 67969,
+      "E3": 67969,
+      "E4": 67969,
+      "E5": 67969
+    },
+    "pairwise_cosines_all_contexts": [
+      {
+        "context": "pre-E3",
+        "pair": "E1,E2",
+        "cosine": 0.7035378151726286,
+        "history_current_pair": false
+      },
+      {
+        "context": "pre-E3",
+        "pair": "E1,E3",
+        "cosine": 0.5422975174832859,
+        "history_current_pair": true
+      },
+      {
+        "context": "pre-E3",
+        "pair": "E2,E3",
+        "cosine": 0.7207437667067164,
+        "history_current_pair": true
+      },
+      {
+        "context": "pre-E4",
+        "pair": "E2,E3",
+        "cosine": 0.7091060905770586,
+        "history_current_pair": false
+      },
+      {
+        "context": "pre-E4",
+        "pair": "E2,E4",
+        "cosine": -0.08348583837021821,
+        "history_current_pair": true
+      },
+      {
+        "context": "pre-E4",
+        "pair": "E3,E4",
+        "cosine": -0.15482715382682896,
+        "history_current_pair": true
+      },
+      {
+        "context": "pre-E5",
+        "pair": "E3,E4",
+        "cosine": 0.5891456348903782,
+        "history_current_pair": false
+      },
+      {
+        "context": "pre-E5",
+        "pair": "E3,E5",
+        "cosine": -0.6711189062551438,
+        "history_current_pair": true
+      },
+      {
+        "context": "pre-E5",
+        "pair": "E4,E5",
+        "cosine": -0.5654429032762756,
+        "history_current_pair": true
+      }
+    ],
+    "NEGATIVE_PAIR_COUNT": 4,
+    "STRONGLY_NEGATIVE_PAIR_COUNT": 2,
+    "history_current_pair_count": 6,
+    "history_current_negative_pair_count": 4,
+    "history_current_strongly_negative_pair_count": 2,
+    "PRE_E3_HISTORY_CURRENT_COS": 0.7224460934883445,
+    "PRE_E4_HISTORY_CURRENT_COS": -0.09183040437712342,
+    "PRE_E5_HISTORY_CURRENT_COS": -0.6723609318713161,
+    "PRE_E3_DIRECTION_BALANCED_HISTORY_CURRENT_COS": 0.6842686753697312,
+    "PRE_E4_DIRECTION_BALANCED_HISTORY_CURRENT_COS": -0.12889860309793436,
+    "PRE_E5_DIRECTION_BALANCED_HISTORY_CURRENT_COS": -0.693615807200498,
+    "GRADIENT_INTERFERENCE_SUPPORTED": "PARTIAL",
+    "GRADIENT_SCALE_DOMINATION_SUSPECTED": "NO",
+    "scale_domination_contexts": [],
+    "decision_rule": {
+      "strong": "YES if >=4 of 6 history-current pair cosines are below -0.3 and at least 2 degraded contexts contain such a negative pair, or if >=2 contexts have raw history-current cosine < -0.3 and the corresponding A0.10 current or next Corr delta is negative",
+      "partial": "PARTIAL if any pairwise or history-current cosine is negative but strong rule does not hold",
+      "no": "NO if no negative pairwise/history-current cosine is observed",
+      "scale_domination": "YES if raw history mean cosine is negative but direction-balanced history cosine is positive in any context",
+      "strong_negative_threshold": -0.3
+    },
+    "all_target_hashes_match_A0_10": true,
+    "all_gradient_diagnostics_finite": true,
+    "history_current_strong_negative_pair_count": 2,
+    "history_current_strong_negative_contexts": [
+      "pre-E5"
+    ],
+    "degraded_contexts_with_strong_history_current_pair": [
+      "pre-E5"
+    ],
+    "raw_history_current_strong_negative_degraded_contexts": [
+      "pre-E5"
+    ],
+    "strong_interference_rule_triggered": false
+  },
+  "GRADIENT_INTERFERENCE_SUPPORTED": "PARTIAL",
+  "GRADIENT_SCALE_DOMINATION_SUSPECTED": "NO",
+  "NAN_INF_DETECTED": false,
+  "NUMERICAL_FINITE_CHECKS": {
+    "all_E1_E6_observations_and_rewards_finite": true,
+    "all_distance_statistics_finite": true,
+    "all_snapshot_reconstruction_training_steps_finite": true,
+    "all_gradient_norms_losses_cosines_finite": true,
+    "finite_checks_passed": true
+  },
+  "FINAL_CASE": "HISTORICAL_REPLAY_CANNOT_CLOSE_OOD_GAP",
+  "RECOMMENDED_NEXT_ACTION": "E1-E5 all-history adds only weak future-support coverage beyond recent-3. Move next to an A0.11 Context/Domain Conditioning diagnostic as separately authorized; this result does not prove Context insufficiency. Do not run A0.11 or modify formal code in this task.",
+  "EXECUTION_SECONDS": 2.4403603076934814
+}

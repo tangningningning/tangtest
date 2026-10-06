@@ -1,0 +1,240 @@
+{
+  "advantage_scale": "active-transition MAD; A/max(MAD, 1e-8), clipped to [-5, 5]",
+  "algorithm_id": "V15-B_CRITIC_INDEPENDENT_TRIGGER",
+  "architecture_version": 21,
+  "base_seed": 27005,
+  "cache_actual_update_rate_last10_mean": 0.58277937742395,
+  "candidate_sample_source": "K=4 draws with replacement from the old conditional UPDATE Candidate distribution; local sampler uses base seed + rollout ordinal, not the environment episode seed",
+  "checkpoint_version": 43,
+  "convergence_checks": {
+    "active_fraction_at_least_0_10": true,
+    "cache_update_varies_by_state": true,
+    "p_update_not_collapsed": true,
+    "return_last10_not_significantly_below_first10": true,
+    "trigger_entropy_changed_from_first10": true,
+    "trigger_entropy_remains_nonzero": true,
+    "trigger_kl_stable_below_0_05": false
+  },
+  "convergence_repair_supported": "PARTIAL",
+  "critic_bootstrap_used_by_trigger": false,
+  "critic_ev_last10_mean": 0.8904566111838845,
+  "critic_independent_probe_evidence": {
+    "boot_cv_test_spearman_mean": -0.031482,
+    "boot_hc_balanced_accuracy": 0.513316,
+    "bootstrap_sign_flip_fraction": 0.435,
+    "critic_bootstrap_root_cause_supported": "PARTIAL",
+    "delta_test_spearman": 0.266304,
+    "noboot_cv_test_spearman_mean": 0.234822,
+    "noboot_hc_balanced_accuracy": 0.637468,
+    "state_count": 200
+  },
+  "duration_candidates": [
+    1,
+    3,
+    5
+  ],
+  "duration_probability_source": "old rollout policy, evaluated per KEEP/UPDATE candidate and fixed throughout the PPO update",
+  "early_gate_episodes": 10,
+  "early_gate_passed": true,
+  "early_stop_detail": null,
+  "early_stop_reason": null,
+  "episodes_completed": 30,
+  "existing_probe_k4_k8_high_confidence_sign_agreement": {
+    "environment_probe_rerun": false,
+    "high_confidence_definition": "abs(DELTA_K) > sample_std(K candidate option returns)/sqrt(K), tested independently for K=4 and K=8",
+    "k4_high_confidence_count": 148,
+    "k8_high_confidence_count": 31,
+    "sign_agreement_count": 24,
+    "sign_agreement_fraction": 1.0,
+    "sign_disagreement_count": 0,
+    "simultaneous_high_confidence_count": 24,
+    "source_report": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\reports\\critic_independent_trigger_target_probe.json",
+    "state_count": 200
+  },
+  "failed_convergence_checks": [
+    "trigger_kl_stable_below_0_05"
+  ],
+  "first_episode_counterfactual_restore_smoke": {
+    "branch_count": 470,
+    "counterfactual_state_restore_valid": true,
+    "pass": true,
+    "rollout_rng_unchanged": true
+  },
+  "first_episode_k4_teacher_construction_smoke": {
+    "candidate_option_returns": [
+      -123.41296832275205,
+      -125.26637648968878,
+      18.179477931678058,
+      6.837290849991467
+    ],
+    "confidence_ratio": 1.6541677934481374,
+    "pass": true,
+    "sampled_candidate_indices": [
+      335,
+      233,
+      351,
+      141
+    ]
+  },
+  "formal_command": "conda activate adaptive_cache_mec; python scripts/training/run_v15b_critic_independent_trigger_gate.py",
+  "formal_run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\formal_v15_critic_independent_trigger_gate",
+  "formal_runner_path": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\scripts\\training\\run_v15b_critic_independent_trigger_gate.py",
+  "fresh_policy_initialization": true,
+  "macro_actor_learning_rate": 0.001,
+  "nan_inf_free": true,
+  "p_update_first10_mean": 0.47206994593143464,
+  "p_update_last10_mean": 0.5979947805404663,
+  "preflight_checks": {
+    "nan_inf_preflight": {
+      "checked": "synthetic ratio and optimizer parameter metadata",
+      "pass": true
+    },
+    "optimizer_parameter_overlap_check": {
+      "architecture_version": 21,
+      "checkpoint_version": 43,
+      "overlaps": {
+        "macro_actor_optimizer_set_mismatch": 0,
+        "trigger_optimizer_set_mismatch": 0,
+        "trigger_vs_candidate_duration": 0,
+        "trigger_vs_main_critic": 0
+      },
+      "parameter_counts": {
+        "candidate_duration": 14,
+        "main_critic": 6,
+        "trigger": 6
+      },
+      "pass": true
+    },
+    "synthetic_trigger_ppo_ratio_check": {
+      "actions": [
+        0,
+        1
+      ],
+      "candidate_duration_joint_log_prob_used": false,
+      "clipped_ppo_loss": -0.20000001788139343,
+      "independent_trigger_ratios": [
+        1.2000000476837158,
+        0.800000011920929
+      ],
+      "new_log_probs": [
+        -0.5108255743980408,
+        -0.9162907004356384
+      ],
+      "old_log_probs": [
+        -0.6931471824645996,
+        -0.6931471824645996
+      ],
+      "pass": true
+    }
+  },
+  "primary_failure_mode": "trigger_kl_stable_below_0_05",
+  "ready_for_longer_training": false,
+  "report_type": "V15-B critic-independent Cache Trigger convergence gate",
+  "resume": false,
+  "return_first10_mean": -326.8271188192474,
+  "return_last10_mean": -356.67093904012347,
+  "return_last10_minus_first10": -29.84382022087607,
+  "run_result": {
+    "best_episode_return": 1855.6709436311003,
+    "checkpoint": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\formal_v15_critic_independent_trigger_gate\\checkpoints\\latest_checkpoint.pt",
+    "completed_episodes": 30,
+    "early_gate_passed": true,
+    "early_stop_reason": null,
+    "macro_transition_trace": null,
+    "run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\formal_v15_critic_independent_trigger_gate",
+    "target_episodes": 30
+  },
+  "target_episodes": 30,
+  "training_episode_seeds": [
+    20001,
+    20030
+  ],
+  "trigger_active_fraction_mean": 0.5857011015460226,
+  "trigger_collapse": false,
+  "trigger_credit_source": "E[R_UPDATE_option] - E[R_KEEP_option]; critic-independent reward-only counterfactual branches",
+  "trigger_entropy_first10_mean": 0.680625319480896,
+  "trigger_entropy_last10_mean": 0.6713497400283813,
+  "trigger_kl_max": 0.0632239431142807,
+  "trigger_kl_mean": 0.005841659181123759,
+  "trigger_p_update_state_std_last10_mean": 0.005779979808721691,
+  "trigger_ratio": "exp(new_trigger_log_prob - old_trigger_log_prob), independent from Candidate and Duration ratios",
+  "uncertainty_gate_active": true,
+  "uncertainty_gate_rule": "active iff abs(A_trigger) > sample_std(four UPDATE candidate option returns)/sqrt(4)",
+  "update_candidate_samples_k": 4,
+  "v15a2_mechanism_comparison": {
+    "same_mechanism": false,
+    "v15_a2": "single-sample paired teacher; one sampled UPDATE candidate/action-duration paired branch per state",
+    "v15_b": "old-policy conditional K=4 UPDATE candidate expectation; exact policy-weighted L={1,3,5} returns for KEEP and each candidate; reward-only target; SE uncertainty gate; independent clipped Trigger PPO"
+  },
+  "v15a_comparison_read_only": {
+    "V15-A": {
+      "algorithm_id": "V15-A_CACHE_TRIGGER_COUNTERFACTUAL_CREDIT",
+      "architecture_version": 16,
+      "available": true,
+      "checkpoint_version": 38,
+      "completed_episodes": null,
+      "final_gates": null,
+      "supported": null
+    },
+    "V15-A2": {
+      "actual_cache_update_rate_last20": 0.13955867462186114,
+      "algorithm_id": "V15-A2_PAIRED_COUNTERFACTUAL_CACHE_TRIGGER",
+      "architecture_version": 17,
+      "available": true,
+      "checkpoint_version": 39,
+      "completed_episodes": 50,
+      "final_gates": {
+        "episode_alignment_ge_0_70": false,
+        "local_alignment_ge_0_95": true,
+        "missed_update_fraction_lt_0_50": false,
+        "nan_inf_false": true,
+        "return_last20_gt_0_75_baseline": false,
+        "ten_episode_gate_passed": true,
+        "trigger_kl_max_lt_0_10": true,
+        "trigger_kl_mean_lt_0_02": true
+      },
+      "missed_update_fraction": 1.0,
+      "p_update_last20": 0.13893140656187142,
+      "return_last20_mean": 1479.2823557925635,
+      "supported": false,
+      "trigger_kl_mean": 0.00033602620418881653
+    },
+    "V15-A3": {
+      "algorithm_id": null,
+      "architecture_version": null,
+      "available": true,
+      "checkpoint_version": null,
+      "completed_episodes": null,
+      "final_gates": null,
+      "supported": null
+    },
+    "V15-A4": {
+      "algorithm_id": null,
+      "architecture_version": null,
+      "available": true,
+      "checkpoint_version": null,
+      "completed_episodes": null,
+      "final_gates": null,
+      "supported": null
+    },
+    "V15-A5": {
+      "algorithm_id": null,
+      "architecture_version": null,
+      "available": true,
+      "checkpoint_version": null,
+      "completed_episodes": null,
+      "final_gates": null,
+      "supported": null
+    },
+    "V15-A6": {
+      "algorithm_id": null,
+      "architecture_version": null,
+      "available": true,
+      "checkpoint_version": null,
+      "completed_episodes": null,
+      "final_gates": null,
+      "supported": null
+    }
+  },
+  "critic_ev_metric_source": "n2_post_ev (main Macro Critic post-update explained variance)"
+}

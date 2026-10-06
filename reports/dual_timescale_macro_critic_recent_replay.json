@@ -1,0 +1,545 @@
+{
+  "ARCHITECTURE_VERSION": 9,
+  "BASELINE_CURRENT_EPISODE_EV_BEFORE_UPDATE_BY_EPOCH": [
+    -4.806522229250376e-05,
+    0.12991944843713876,
+    0.06939666113388276,
+    0.16890393142745486,
+    -2.0091824836784395
+  ],
+  "BASELINE_CURRENT_EPISODE_MACRO_EV_FINAL_BY_EPOCH": [
+    0.6745102014945907,
+    0.8875590663793672,
+    0.7455461926002016,
+    0.950115519947922,
+    0.8197078759221688
+  ],
+  "CHECKPOINT_REPLAY_EPISODE_INDICES": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "CHECKPOINT_REPLAY_RESTORE": "PASS",
+  "CHECKPOINT_VERSION": 29,
+  "CONFIG_FILES_MODIFIED": [
+    "configs/proposed/system_config.toml"
+  ],
+  "CROSS_REALIZATION_GENERALIZATION": "NOT_IMPROVED_IN_THIS_FRESH5",
+  "CURRENT_EPISODE_EV_BEFORE_UPDATE_BY_EPOCH": [
+    -4.806522229250376e-05,
+    0.12991944843713876,
+    -0.08518494801402388,
+    -0.12165583092681431,
+    -2.7383708694357596
+  ],
+  "CURRENT_EPISODE_EV_BEFORE_UPDATE_DELTA_BY_EPOCH": [
+    0.0,
+    0.0,
+    -0.15458160914790664,
+    -0.29055976235426917,
+    -0.72918838575732
+  ],
+  "CURRENT_EPISODE_EV_TRAJECTORY_BY_EPOCH": [
+    [
+      -4.806522229250376e-05,
+      0.031111377715487887,
+      0.21503837198932874,
+      0.6745102014945907
+    ],
+    [
+      0.12991944843713876,
+      0.2992335975172391,
+      0.602680658140521,
+      0.8623898782030157
+    ],
+    [
+      -0.08518494801402388,
+      0.13728509981335957,
+      0.42650734729321016,
+      0.6623202466967812
+    ],
+    [
+      -0.12165583092681431,
+      0.27633775932148574,
+      0.6861597095989451,
+      0.837750337948956
+    ],
+    [
+      -2.7383708694357596,
+      -1.121703558858548,
+      0.09658520877078502,
+      0.6555368560352015
+    ]
+  ],
+  "CURRENT_EPISODE_MACRO_CORRELATION_FINAL_BY_EPOCH": [
+    0.8657391562270792,
+    0.9296665312104038,
+    0.819588373250219,
+    0.9161847413658155,
+    0.8134057475391311
+  ],
+  "CURRENT_EPISODE_MACRO_EV_FINAL_BY_EPOCH": [
+    0.6745102014945907,
+    0.8623898782030157,
+    0.6623202466967812,
+    0.837750337948956,
+    0.6555368560352015
+  ],
+  "CURRENT_EPISODE_MACRO_RMSE_FINAL_BY_EPOCH": [
+    87.15902709960938,
+    63.20503616333008,
+    113.24260711669922,
+    42.31806182861328,
+    37.7928581237793
+  ],
+  "CURRENT_EPISODE_MACRO_STD_RATIO_FINAL_BY_EPOCH": [
+    0.5918886767128285,
+    0.8861926189207461,
+    0.7226097422526687,
+    0.9567327667504137,
+    0.8914573592745143
+  ],
+  "DURATION_COUNTS_BY_EPOCH": [
+    {
+      "1": 40,
+      "3": 40,
+      "5": 28
+    },
+    {
+      "1": 38,
+      "3": 39,
+      "5": 29
+    },
+    {
+      "1": 38,
+      "3": 29,
+      "5": 35
+    },
+    {
+      "1": 40,
+      "3": 31,
+      "5": 33
+    },
+    {
+      "1": 35,
+      "3": 35,
+      "5": 32
+    }
+  ],
+  "EPISODE_RETURN_BY_EPOCH": [
+    -196.49259238461482,
+    -399.71849218254204,
+    -1227.3200699288623,
+    106.50505758198501,
+    410.40902167813374
+  ],
+  "EXACT_Q_ENV_EXECUTIONS": 0,
+  "FRESH_VALIDATION": {
+    "baseline_run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\dual_timescale_macro_critic_update_budget_fresh5_seed27005",
+    "episode_replays": 5,
+    "episode_seeds": [
+      20001,
+      20002,
+      20003,
+      20004,
+      20005
+    ],
+    "new_realizations_generated": false,
+    "resume": false,
+    "run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\dual_timescale_macro_critic_recent_replay_fresh5_seed27005",
+    "same_initialization_seed": 27005
+  },
+  "KEEP_RATE_BY_EPOCH": [
+    0.48148148148148145,
+    0.5188679245283019,
+    0.5294117647058824,
+    0.5714285714285714,
+    0.5196078431372549
+  ],
+  "MACRO_KL_BY_EPOCH": [
+    4.896742166238255e-05,
+    2.0373401639517397e-05,
+    2.3308630375140638e-05,
+    1.2198516003536497e-05,
+    8.413020452735509e-06
+  ],
+  "MEAN_CURRENT_EPISODE_EV_BEFORE_UPDATE_DELTA": -0.23486595145189915,
+  "MICRO_CRITIC_EV_BY_EPOCH": [
+    0.855632697120463,
+    0.9054028470025169,
+    0.734258702191342,
+    0.9027581746145822,
+    0.9201453500211991
+  ],
+  "MIXED_REPLAY_EV_FINAL_BY_EPOCH": [
+    0.6745102014945907,
+    0.8828747243329603,
+    0.8144004907467348,
+    0.8898125359986796,
+    0.9128580979462408
+  ],
+  "MIXED_REPLAY_EV_TRAJECTORY_BY_EPOCH": [
+    [
+      -4.806522229250376e-05,
+      0.031111377715487887,
+      0.21503837198932874,
+      0.6745102014945907
+    ],
+    [
+      0.3808579529550027,
+      0.5065582785278091,
+      0.6954164577788876,
+      0.8828747243329603
+    ],
+    [
+      0.4433053768508525,
+      0.553762648892423,
+      0.7158236635419961,
+      0.8144004907467348
+    ],
+    [
+      0.7171346482566006,
+      0.7762695751621873,
+      0.838206133434048,
+      0.8898125359986796
+    ],
+    [
+      0.7510093204869446,
+      0.8206801925213146,
+      0.8686859292286307,
+      0.9128580979462408
+    ]
+  ],
+  "NAN_OR_INF_DETECTED": "NO",
+  "NEXT_DECISION": "当前等权拼接能维持混合历史 batch 拟合，但没有改善新 episode 更新前 EV；下一轮应提高当前 batch 总权重、降低历史 replay 总权重，并沿用相同 realization/seed 对照。",
+  "OPTIMIZER_STEPS_BY_EPOCH": [
+    {
+      "macro_actor": 4,
+      "macro_critic": 50,
+      "micro_actor": 40,
+      "micro_critic": 40
+    },
+    {
+      "macro_actor": 4,
+      "macro_critic": 50,
+      "micro_actor": 40,
+      "micro_critic": 40
+    },
+    {
+      "macro_actor": 4,
+      "macro_critic": 50,
+      "micro_actor": 40,
+      "micro_critic": 40
+    },
+    {
+      "macro_actor": 4,
+      "macro_critic": 50,
+      "micro_actor": 40,
+      "micro_critic": 40
+    },
+    {
+      "macro_actor": 4,
+      "macro_critic": 50,
+      "micro_actor": 40,
+      "micro_critic": 40
+    }
+  ],
+  "OVERALL_STATUS": "PARTIAL",
+  "PER_EPISODE": [
+    {
+      "baseline_current_episode_ev_before_update": -4.806522229250376e-05,
+      "baseline_current_episode_macro_critic_ev_final": 0.6745102014945907,
+      "current_episode_ev_before_update_delta": 0.0,
+      "current_episode_macro_critic_correlation_final": 0.8657391562270792,
+      "current_episode_macro_critic_ev_by_step": [
+        -4.806522229250376e-05,
+        0.031111377715487887,
+        0.21503837198932874,
+        0.6745102014945907
+      ],
+      "current_episode_macro_critic_ev_final": 0.6745102014945907,
+      "current_episode_macro_critic_rmse_final": 87.15902709960938,
+      "current_episode_macro_critic_std_ratio_final": 0.5918886767128285,
+      "duration_counts_actual": {
+        "1": 40,
+        "3": 40,
+        "5": 28
+      },
+      "episode": 1,
+      "episode_return": -196.49259238461482,
+      "episode_seed": 20001,
+      "exact_q_environment_executions": 0,
+      "keep_rate": 0.48148148148148145,
+      "macro_kl": 4.896742166238255e-05,
+      "micro_critic_ev": 0.855632697120463,
+      "mixed_replay_ev_final": 0.6745102014945907,
+      "mixed_replay_macro_critic_ev_by_step": [
+        -4.806522229250376e-05,
+        0.031111377715487887,
+        0.21503837198932874,
+        0.6745102014945907
+      ],
+      "optimizer_steps": {
+        "macro_actor": 4,
+        "macro_critic": 50,
+        "micro_actor": 40,
+        "micro_critic": 40
+      },
+      "replay_current_episode_ev_before_update": -4.806522229250376e-05,
+      "replay_episode_count": 1,
+      "replay_episode_indices": [
+        1
+      ],
+      "replay_sample_count": 108,
+      "uav0_stay_rate": 0.4766666666666667,
+      "uav1_stay_rate": 0.5
+    },
+    {
+      "baseline_current_episode_ev_before_update": 0.12991944843713876,
+      "baseline_current_episode_macro_critic_ev_final": 0.8875590663793672,
+      "current_episode_ev_before_update_delta": 0.0,
+      "current_episode_macro_critic_correlation_final": 0.9296665312104038,
+      "current_episode_macro_critic_ev_by_step": [
+        0.12991944843713876,
+        0.2992335975172391,
+        0.602680658140521,
+        0.8623898782030157
+      ],
+      "current_episode_macro_critic_ev_final": 0.8623898782030157,
+      "current_episode_macro_critic_rmse_final": 63.20503616333008,
+      "current_episode_macro_critic_std_ratio_final": 0.8861926189207461,
+      "duration_counts_actual": {
+        "1": 38,
+        "3": 39,
+        "5": 29
+      },
+      "episode": 2,
+      "episode_return": -399.71849218254204,
+      "episode_seed": 20002,
+      "exact_q_environment_executions": 0,
+      "keep_rate": 0.5188679245283019,
+      "macro_kl": 2.0373401639517397e-05,
+      "micro_critic_ev": 0.9054028470025169,
+      "mixed_replay_ev_final": 0.8828747243329603,
+      "mixed_replay_macro_critic_ev_by_step": [
+        0.3808579529550027,
+        0.5065582785278091,
+        0.6954164577788876,
+        0.8828747243329603
+      ],
+      "optimizer_steps": {
+        "macro_actor": 4,
+        "macro_critic": 50,
+        "micro_actor": 40,
+        "micro_critic": 40
+      },
+      "replay_current_episode_ev_before_update": 0.12991944843713876,
+      "replay_episode_count": 2,
+      "replay_episode_indices": [
+        1,
+        2
+      ],
+      "replay_sample_count": 214,
+      "uav0_stay_rate": 0.51,
+      "uav1_stay_rate": 0.52
+    },
+    {
+      "baseline_current_episode_ev_before_update": 0.06939666113388276,
+      "baseline_current_episode_macro_critic_ev_final": 0.7455461926002016,
+      "current_episode_ev_before_update_delta": -0.15458160914790664,
+      "current_episode_macro_critic_correlation_final": 0.819588373250219,
+      "current_episode_macro_critic_ev_by_step": [
+        -0.08518494801402388,
+        0.13728509981335957,
+        0.42650734729321016,
+        0.6623202466967812
+      ],
+      "current_episode_macro_critic_ev_final": 0.6623202466967812,
+      "current_episode_macro_critic_rmse_final": 113.24260711669922,
+      "current_episode_macro_critic_std_ratio_final": 0.7226097422526687,
+      "duration_counts_actual": {
+        "1": 38,
+        "3": 29,
+        "5": 35
+      },
+      "episode": 3,
+      "episode_return": -1227.3200699288623,
+      "episode_seed": 20003,
+      "exact_q_environment_executions": 0,
+      "keep_rate": 0.5294117647058824,
+      "macro_kl": 2.3308630375140638e-05,
+      "micro_critic_ev": 0.734258702191342,
+      "mixed_replay_ev_final": 0.8144004907467348,
+      "mixed_replay_macro_critic_ev_by_step": [
+        0.4433053768508525,
+        0.553762648892423,
+        0.7158236635419961,
+        0.8144004907467348
+      ],
+      "optimizer_steps": {
+        "macro_actor": 4,
+        "macro_critic": 50,
+        "micro_actor": 40,
+        "micro_critic": 40
+      },
+      "replay_current_episode_ev_before_update": -0.08518494801402388,
+      "replay_episode_count": 3,
+      "replay_episode_indices": [
+        1,
+        2,
+        3
+      ],
+      "replay_sample_count": 316,
+      "uav0_stay_rate": 0.4633333333333333,
+      "uav1_stay_rate": 0.4266666666666667
+    },
+    {
+      "baseline_current_episode_ev_before_update": 0.16890393142745486,
+      "baseline_current_episode_macro_critic_ev_final": 0.950115519947922,
+      "current_episode_ev_before_update_delta": -0.29055976235426917,
+      "current_episode_macro_critic_correlation_final": 0.9161847413658155,
+      "current_episode_macro_critic_ev_by_step": [
+        -0.12165583092681431,
+        0.27633775932148574,
+        0.6861597095989451,
+        0.837750337948956
+      ],
+      "current_episode_macro_critic_ev_final": 0.837750337948956,
+      "current_episode_macro_critic_rmse_final": 42.31806182861328,
+      "current_episode_macro_critic_std_ratio_final": 0.9567327667504137,
+      "duration_counts_actual": {
+        "1": 40,
+        "3": 31,
+        "5": 33
+      },
+      "episode": 4,
+      "episode_return": 106.50505758198501,
+      "episode_seed": 20004,
+      "exact_q_environment_executions": 0,
+      "keep_rate": 0.5714285714285714,
+      "macro_kl": 1.2198516003536497e-05,
+      "micro_critic_ev": 0.9027581746145822,
+      "mixed_replay_ev_final": 0.8898125359986796,
+      "mixed_replay_macro_critic_ev_by_step": [
+        0.7171346482566006,
+        0.7762695751621873,
+        0.838206133434048,
+        0.8898125359986796
+      ],
+      "optimizer_steps": {
+        "macro_actor": 4,
+        "macro_critic": 50,
+        "micro_actor": 40,
+        "micro_critic": 40
+      },
+      "replay_current_episode_ev_before_update": -0.12165583092681431,
+      "replay_episode_count": 4,
+      "replay_episode_indices": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "replay_sample_count": 421,
+      "uav0_stay_rate": 0.5166666666666667,
+      "uav1_stay_rate": 0.49333333333333335
+    },
+    {
+      "baseline_current_episode_ev_before_update": -2.0091824836784395,
+      "baseline_current_episode_macro_critic_ev_final": 0.8197078759221688,
+      "current_episode_ev_before_update_delta": -0.72918838575732,
+      "current_episode_macro_critic_correlation_final": 0.8134057475391311,
+      "current_episode_macro_critic_ev_by_step": [
+        -2.7383708694357596,
+        -1.121703558858548,
+        0.09658520877078502,
+        0.6555368560352015
+      ],
+      "current_episode_macro_critic_ev_final": 0.6555368560352015,
+      "current_episode_macro_critic_rmse_final": 37.7928581237793,
+      "current_episode_macro_critic_std_ratio_final": 0.8914573592745143,
+      "duration_counts_actual": {
+        "1": 35,
+        "3": 35,
+        "5": 32
+      },
+      "episode": 5,
+      "episode_return": 410.40902167813374,
+      "episode_seed": 20005,
+      "exact_q_environment_executions": 0,
+      "keep_rate": 0.5196078431372549,
+      "macro_kl": 8.413020452735509e-06,
+      "micro_critic_ev": 0.9201453500211991,
+      "mixed_replay_ev_final": 0.9128580979462408,
+      "mixed_replay_macro_critic_ev_by_step": [
+        0.7510093204869446,
+        0.8206801925213146,
+        0.8686859292286307,
+        0.9128580979462408
+      ],
+      "optimizer_steps": {
+        "macro_actor": 4,
+        "macro_critic": 50,
+        "micro_actor": 40,
+        "micro_critic": 40
+      },
+      "replay_current_episode_ev_before_update": -2.7383708694357596,
+      "replay_episode_count": 5,
+      "replay_episode_indices": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "replay_sample_count": 523,
+      "uav0_stay_rate": 0.5666666666666667,
+      "uav1_stay_rate": 0.48333333333333334
+    }
+  ],
+  "REPLAY_IMPLEMENTATION": "PASS",
+  "REPLAY_SCHEME": {
+    "critic_optimizer_steps_per_episode": 50,
+    "history_episodes": 4,
+    "loss_weighting": "equal per sample across the concatenated full batch",
+    "targets": "computed once per episode and frozen in replay",
+    "training_batch": "current Macro batch concatenated with up to four recent Macro critic batches",
+    "window_including_current": 5
+  },
+  "REPORT_PATH": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\reports\\dual_timescale_macro_critic_recent_replay.json",
+  "SOURCE_FILES_MODIFIED": [
+    "src/ppo_simple/trainer.py",
+    "src/ppo_simple/reporting.py"
+  ],
+  "TEMP_FILES_CLEANED": true,
+  "TRAINING_COUNTERS": {
+    "completed_episodes": 5,
+    "environment_executions": 1500,
+    "kkt_calls": 154118,
+    "macro_actor_optimizer_steps": 20,
+    "macro_critic_optimizer_steps": 250,
+    "macro_optimizer_steps": 270,
+    "macro_update_count": 5,
+    "matching_calls": 1500,
+    "micro_actor_optimizer_steps": 200,
+    "micro_critic_optimizer_steps": 200,
+    "micro_optimizer_steps": 200,
+    "micro_update_count": 5
+  },
+  "UAV0_STAY_RATE_BY_EPOCH": [
+    0.4766666666666667,
+    0.51,
+    0.4633333333333333,
+    0.5166666666666667,
+    0.5666666666666667
+  ],
+  "UAV1_STAY_RATE_BY_EPOCH": [
+    0.5,
+    0.52,
+    0.4266666666666667,
+    0.49333333333333335,
+    0.48333333333333334
+  ]
+}

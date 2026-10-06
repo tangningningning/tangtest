@@ -1,0 +1,182 @@
+# Macro GAE Target Calibration Decomposition
+
+Offline analysis of the saved 300-transition trace. No environment rollout or formal training was run.
+
+## GAE reconstruction and decomposition
+
+- Recompute max absolute error: `0` (assert threshold `1e-05`; pass).
+- Component reconstruction max absolute error: `1.49961046e-05`.
+- Terminal rows: `5`; terminal next values are zero: `True`.
+- Additive identity: current value baseline + reward + next bootstrap − current value + recursive GAE = T1.
+
+## Episode target statistics
+
+| Target | Episode | Mean | Std | Min | Max |
+|---|---|---:|---:|---:|---:|
+| T1_FORMAL_GAE | episode_20001 | 105.798 | 150.657 | -399.434 | 264.167 |
+| T1_FORMAL_GAE | episode_20002 | 74.9765 | 88.662 | -100.266 | 204.227 |
+| T1_FORMAL_GAE | episode_20003 | 39.0335 | 94.423 | -87.0146 | 201.175 |
+| T1_FORMAL_GAE | episode_20004 | -9.91274 | 15.2569 | -38.0105 | 24.6168 |
+| T1_FORMAL_GAE | episode_20005 | 2.50229 | 25.1546 | -40.4263 | 56.8078 |
+| T2_REALIZED_RETURN | episode_20001 | 1079.16 | 639.762 | 30.3915 | 2007.82 |
+| T2_REALIZED_RETURN | episode_20002 | 611.975 | 422.911 | 38.0905 | 1324.76 |
+| T2_REALIZED_RETURN | episode_20003 | 706.483 | 398.582 | 31.3843 | 1411.25 |
+| T2_REALIZED_RETURN | episode_20004 | 318.779 | 269.337 | -52.9441 | 712.597 |
+| T2_REALIZED_RETURN | episode_20005 | 868.17 | 465.722 | 41.628 | 1627.38 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | episode_20001 | 141.207 | 54.2612 | -137.224 | 196.639 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | episode_20002 | 92.6406 | 36.8802 | 25.7408 | 147.166 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | episode_20003 | 97.3029 | 19.3985 | 31.3843 | 125.636 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | episode_20004 | 49.8941 | 42.0594 | -34.6564 | 106.962 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | episode_20005 | 111.948 | 30.8479 | 41.628 | 168.761 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | episode_20001 | -20.1835 | 150.847 | -462.743 | 144.758 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | episode_20002 | -1.55186 | 99.6829 | -237.395 | 101.976 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | episode_20003 | -33.9703 | 101.616 | -187.73 | 131.386 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | episode_20004 | -51.5684 | 41.7349 | -113.513 | 61.1343 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | episode_20005 | -87.1427 | 33.4435 | -149.449 | 41.628 |
+
+### Cross-episode scale stability
+
+| Target | Mean across episode means | Std of episode means | Std of episode stds | Max/min episode std | CV of episode stds |
+|---|---:|---:|---:|---:|---:|
+| T1_FORMAL_GAE | 42.4794 | 43.4056 | 49.682 | 9.87465 | 0.663926 |
+| T2_REALIZED_RETURN | 716.913 | 254.453 | 119.747 | 2.37532 | 0.27261 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 98.5986 | 29.6749 | 11.5822 | 2.79719 | 0.315683 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | -38.8834 | 29.1799 | 43.2581 | 4.51049 | 0.506151 |
+
+Most unstable by target-std CV: **T1_FORMAL_GAE**.
+
+## Bootstrap correlations
+
+| Pair | Global Pearson | Global Spearman |
+|---|---:|---:|
+| old_macro_value_vs_formal_gae_target | 0.766367 | 0.723461 |
+| next_macro_value_vs_formal_gae_target | 0.800845 | 0.770587 |
+| bootstrap_gap_vs_formal_gae_target | 0.156909 | 0.275353 |
+| bootstrap_gap_vs_gae_minus_realized_return | 0.00530901 | 0.0329502 |
+
+Per-episode correlation values are included in the JSON report.
+
+## Origin slots
+
+Across the five episodes, each requested origin has target mean, population std, min, and max in the JSON report, including T1−T2.
+
+## Offline critic folds
+
+| Target | Fold | Test episode | Step | EV | Correlation | Pred/target std | RMSE | Mean bias |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| T1_FORMAL_GAE | 1 | episode_20002 | 50 | -0.0923575 | -0.0942733 | 0.223917 | 93 | 7.87564 |
+| T1_FORMAL_GAE | 1 | episode_20002 | 100 | -0.140681 | 0.051846 | 0.430487 | 105.569 | -46.6677 |
+| T1_FORMAL_GAE | 1 | episode_20002 | 200 | -0.427928 | -0.100415 | 0.561409 | 118.266 | -52.5555 |
+| T2_REALIZED_RETURN | 1 | episode_20002 | 50 | 0.029188 | 0.818524 | 0.0180282 | 639.583 | -485.214 |
+| T2_REALIZED_RETURN | 1 | episode_20002 | 100 | 0.177295 | 0.823302 | 0.11582 | 392.392 | 82.6277 |
+| T2_REALIZED_RETURN | 1 | episode_20002 | 200 | 0.565029 | 0.819582 | 0.492954 | 532.003 | 453.024 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 1 | episode_20002 | 50 | -0.522527 | -0.909437 | 0.252287 | 52.793 | 26.7627 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 1 | episode_20002 | 100 | -0.751805 | -0.734894 | 0.401712 | 48.8553 | 2.03227 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 1 | episode_20002 | 200 | -1.29195 | -0.818871 | 0.582022 | 55.8815 | 2.31325 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 1 | episode_20002 | 50 | 0.0605755 | 0.252525 | 0.309036 | 101.426 | -30.8613 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 1 | episode_20002 | 100 | 0.125713 | 0.398138 | 0.579247 | 140.806 | -105.54 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 1 | episode_20002 | 200 | 0.109659 | 0.465187 | 0.791896 | 149.073 | -115.654 |
+| T1_FORMAL_GAE | 2 | episode_20003 | 50 | 0.0867839 | 0.448817 | 0.110213 | 101.232 | 45.8896 |
+| T1_FORMAL_GAE | 2 | episode_20003 | 100 | 0.390567 | 0.640386 | 0.500646 | 78.2502 | -26.2598 |
+| T1_FORMAL_GAE | 2 | episode_20003 | 200 | 0.483285 | 0.69595 | 0.728527 | 69.6881 | 15.7973 |
+| T2_REALIZED_RETURN | 2 | episode_20003 | 50 | -0.0146708 | -0.538347 | 0.0134576 | 701.051 | -574.695 |
+| T2_REALIZED_RETURN | 2 | episode_20003 | 100 | -0.0923169 | -0.507994 | 0.0839306 | 416.6 | 4.64125 |
+| T2_REALIZED_RETURN | 2 | episode_20003 | 200 | -1.49581 | -0.833159 | 0.646695 | 655.15 | 180.88 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 2 | episode_20003 | 50 | -0.013556 | 0.145806 | 0.332396 | 27.9606 | 20.0098 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 2 | episode_20003 | 100 | -0.509923 | 0.174604 | 0.909729 | 24.2648 | -4.53806 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 2 | episode_20003 | 200 | -0.860684 | 0.0619668 | 0.991765 | 27.017 | -5.45328 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 2 | episode_20003 | 50 | 0.196301 | 0.884763 | 0.118927 | 91.8188 | 11.4817 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 2 | episode_20003 | 100 | 0.323016 | 0.613334 | 0.382763 | 83.6521 | 2.69101 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 2 | episode_20003 | 200 | 0.453762 | 0.683426 | 0.568061 | 75.6004 | 8.66361 |
+| T1_FORMAL_GAE | 3 | episode_20004 | 50 | -0.0213166 | 0.365223 | 0.758548 | 72.354 | 70.6921 |
+| T1_FORMAL_GAE | 3 | episode_20004 | 100 | -12.1648 | 0.536058 | 4.06482 | 58.1885 | 17.93 |
+| T1_FORMAL_GAE | 3 | episode_20004 | 200 | -21.8298 | 0.624436 | 5.33821 | 83.1937 | 40.0877 |
+| T2_REALIZED_RETURN | 3 | episode_20004 | 50 | 0.112894 | 0.928498 | 0.0629264 | 310.225 | -178.569 |
+| T2_REALIZED_RETURN | 3 | episode_20004 | 100 | 0.510932 | 0.912723 | 0.345157 | 468.666 | 429.151 |
+| T2_REALIZED_RETURN | 3 | episode_20004 | 200 | 0.644198 | 0.865492 | 1.18934 | 572.063 | 549.04 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 3 | episode_20004 | 50 | 0.00460544 | 0.129186 | 0.23911 | 72.8553 | 59.5571 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 3 | episode_20004 | 100 | -0.285502 | -0.177134 | 0.385785 | 52.3605 | 21.6235 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 3 | episode_20004 | 200 | -1.35353 | -0.666884 | 0.67411 | 66.1755 | 14.6905 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 3 | episode_20004 | 50 | 0.473252 | 0.818205 | 0.375253 | 33.5103 | 14.3335 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 3 | episode_20004 | 100 | -0.141177 | 0.624799 | 1.35387 | 44.8989 | -5.31132 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 3 | episode_20004 | 200 | -2.36036 | 0.347382 | 1.92251 | 80.2355 | 24.1796 |
+| T1_FORMAL_GAE | 4 | episode_20005 | 50 | -0.468983 | 0.0485799 | 0.735124 | 43.262 | 30.6936 |
+| T1_FORMAL_GAE | 4 | episode_20005 | 100 | -1.3716 | 0.188651 | 1.3749 | 50.2021 | -31.9313 |
+| T1_FORMAL_GAE | 4 | episode_20005 | 200 | -7.23173 | -0.0840645 | 2.60644 | 78.2571 | -30.2572 |
+| T2_REALIZED_RETURN | 4 | episode_20005 | 50 | 0.0264213 | 0.837895 | 0.0159177 | 868.354 | -736.799 |
+| T2_REALIZED_RETURN | 4 | episode_20005 | 100 | 0.131736 | 0.81683 | 0.0850685 | 468.773 | -177.271 |
+| T2_REALIZED_RETURN | 4 | episode_20005 | 200 | 0.222629 | 0.486824 | 0.606694 | 412.495 | 39.2812 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 4 | episode_20005 | 50 | -0.262372 | -0.403839 | 0.248432 | 38.8287 | -17.5044 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 4 | episode_20005 | 100 | -2.41932 | -0.583111 | 1.07802 | 84.2573 | -62.0121 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | 4 | episode_20005 | 200 | -5.63771 | -0.623381 | 1.83147 | 110.17 | -76.2951 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 4 | episode_20005 | 50 | 0.295591 | 0.545677 | 0.592283 | 47.5619 | 38.3963 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 4 | episode_20005 | 100 | 0.0267589 | 0.663956 | 1.30744 | 50.5658 | -38.3191 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | 4 | episode_20005 | 200 | -0.143765 | 0.312931 | 0.804552 | 35.8958 | 3.04065 |
+
+Step-200 cross-fold medians:
+
+| Target | Test EV | Test correlation | Test std ratio |
+|---|---:|---:|---:|
+| T1_FORMAL_GAE | -3.82983 | 0.270186 | 1.66748 |
+| T2_REALIZED_RETURN | 0.393829 | 0.653203 | 0.626694 |
+| T3_REWARD_ONLY_LAMBDA_RETURN | -1.32274 | -0.645133 | 0.832938 |
+| T4_ONE_STEP_BOOTSTRAP_TARGET | -0.0170527 | 0.406284 | 0.798224 |
+
+Ranking present but scale misaligned: **YES**. The qualifying target/fold records with prediction std ratio and mean bias are in the JSON report.
+
+## Gate result
+
+- Bootstrap calibration propagation: **NO**.
+- Macro GAE bootstrap calibration instability: **PARTIAL**.
+- Critic bootstrap is primary source: **UNCLEAR**.
+- Bootstrap not primary: `False`.
+
+## Prior B/C fairness note
+
+Previous B/C gate did not reach `TRAIN_EV_GE_0_9_NOT_REACHED_WITHIN_200_STEPS`; permutation-invariant representation remains `NOT_SELECTED`, not proven useless. Formal architecture remains v9.
+
+## Requested fields
+
+```text
+GAE_RECOMPUTE_MAX_ABS_ERROR = 0.0
+T1_FORMAL_GAE_STD_BY_EPISODE = {"episode_20001": 150.65676553363434, "episode_20002": 88.66199519709416, "episode_20003": 94.42300475880253, "episode_20004": 15.2569172227951, "episode_20005": 25.154638026974617}
+T2_REALIZED_RETURN_STD_BY_EPISODE = {"episode_20001": 639.7619702372905, "episode_20002": 422.91138518556954, "episode_20003": 398.5819441460262, "episode_20004": 269.3367399137467, "episode_20005": 465.72155641015075}
+T3_REWARD_ONLY_LAMBDA_STD_BY_EPISODE = {"episode_20001": 54.2612296557523, "episode_20002": 36.88017625798915, "episode_20003": 19.39849392537468, "episode_20004": 42.059442878711934, "episode_20005": 30.847872589575985}
+T4_ONE_STEP_BOOTSTRAP_STD_BY_EPISODE = {"episode_20001": 150.84660392615064, "episode_20002": 99.68291339395707, "episode_20003": 101.61611712724819, "episode_20004": 41.73488768506389, "episode_20005": 33.44349755602159}
+T1_SCALE_MAX_MIN_RATIO = 9.874653138219866
+T2_SCALE_MAX_MIN_RATIO = 2.3753238063331796
+T3_SCALE_MAX_MIN_RATIO = 2.7971877540851025
+T4_SCALE_MAX_MIN_RATIO = 4.510491274827513
+GAE_MINUS_RETURN_STD = 536.0883099088313
+CORR_BOOTSTRAP_GAP_WITH_GAE_MINUS_RETURN = 0.00530901461157283
+SPEARMAN_BOOTSTRAP_GAP_WITH_GAE_MINUS_RETURN = 0.03295021711408733
+BOOTSTRAP_CALIBRATION_PROPAGATION = "NO"
+T1_TEST_EV_STEP200 = -3.8298306493128065
+T2_TEST_EV_STEP200 = 0.3938290863823857
+T3_TEST_EV_STEP200 = -1.3227416921440507
+T4_TEST_EV_STEP200 = -0.017052707782632737
+T1_TEST_CORRELATION_STEP200 = 0.27018597097844144
+T2_TEST_CORRELATION_STEP200 = 0.6532033359992271
+T3_TEST_CORRELATION_STEP200 = -0.6451327023289585
+T4_TEST_CORRELATION_STEP200 = 0.40628431941633864
+T1_TEST_STD_RATIO_STEP200 = 1.6674822224811203
+T2_TEST_STD_RATIO_STEP200 = 0.6266942971581076
+T3_TEST_STD_RATIO_STEP200 = 0.8329375406801607
+T4_TEST_STD_RATIO_STEP200 = 0.7982242839067657
+RANKING_PRESENT_BUT_SCALE_MISALIGNED = "YES"
+RANKING_PRESENT_BUT_SCALE_MISALIGNED_FOLDS = [{"target": "T1_FORMAL_GAE", "fold": 3, "test_episode": "episode_20004", "TEST_EV": -21.829775801819114, "TEST_CORRELATION": 0.6244364169451264, "PRED_STD_OVER_TARGET_STD": 5.338213738862909, "PRED_MEAN_MINUS_TARGET_MEAN": 40.087661258627975}]
+MACRO_GAE_BOOTSTRAP_CALIBRATION_INSTABILITY = "PARTIAL"
+CRITIC_BOOTSTRAP_IS_PRIMARY_SOURCE = "UNCLEAR"
+PERMUTATION_INVARIANT_REPRESENTATION = "NOT_SELECTED"
+FORMAL_OBSERVATION_CHANGED = "NO"
+FORMAL_GAE_CHANGED = "NO"
+ARCHITECTURE_VERSION = 9
+CHECKPOINT_VERSION = 29
+MATCHING_CALLS = 0
+KKT_CALLS = 0
+EXACT_Q_ENV_EXECUTIONS = 0
+FORMAL_OPTIMIZER_STEPS = 0
+REPORT_PATH = "reports/macro_gae_target_calibration_decomposition.json"
+TEMP_FILES_CLEANED = "YES"
+NEXT_DECISION = "Keep v9 and formal GAE unchanged. Continue with episode/origin-stratified value calibration diagnostics: T1 scale instability is large, but bootstrap-gap versus GAE-return discrepancy correlation is near zero and T3 unseen EV is worse than T2, so bootstrap is not established as the sole primary cause."
+```

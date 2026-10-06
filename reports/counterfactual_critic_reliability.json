@@ -1,0 +1,504 @@
+{
+  "CURRENT_HEAD": "52c75b0ec34dd06dda9fec407472fccf1746957e",
+  "GIT_STATUS": "?? environment_data/\n?? reports/cache_full_information_teacher_gate.md\n?? reports/cache_trigger_causal_gate.md\n?? reports/cache_trigger_conditional_expected_q_diagnosis.json\n?? reports/cache_trigger_conditional_expected_q_diagnosis.md\n?? reports/cache_trigger_gradient_dominance_diagnosis.json\n?? reports/cache_trigger_gradient_dominance_diagnosis.md\n?? reports/cache_trigger_input_information_sufficiency.json\n?? reports/cache_trigger_input_information_sufficiency.md\n?? reports/cache_trigger_minimal_predecision_feature_fix_v3.json\n?? reports/cache_trigger_minimal_predecision_feature_fix_v3.md\n?? reports/cache_trigger_missing_predecision_feature_audit.json\n?? reports/cache_trigger_missing_predecision_feature_audit.md\n?? reports/cache_trigger_operation_readout_geometry_diagnosis.json\n?? reports/cache_trigger_operation_readout_geometry_diagnosis.md\n?? reports/cache_trigger_polarization_temporal_causal_diagnosis.json\n?? reports/cache_trigger_polarization_temporal_causal_diagnosis.md\n?? reports/cache_trigger_saturation_recoverability_diagnosis.json\n?? reports/cache_trigger_saturation_recoverability_diagnosis.md\n?? reports/cache_trigger_state_discrimination_root_cause.json\n?? reports/cache_trigger_state_discrimination_root_cause.md\n?? reports/cache_trigger_symmetric_counterfactual_root_cause.json\n?? reports/cache_trigger_symmetric_counterfactual_root_cause.md\n?? reports/cache_trigger_task_marginalized_raw_generalization_gate.json\n?? reports/cache_trigger_task_marginalized_raw_generalization_gate.md\n?? reports/cache_trigger_v3_production_runtime_gate.json\n?? reports/cache_trigger_v3_production_runtime_gate.md\n?? reports/counterfactual_critic_reliability.json\n?? reports/counterfactual_critic_reliability_continuations.jsonl\n?? reports/one_epoch_training_gate.md\n?? reports/second_stage_joint_repair_gate.md\n?? reports/traceable_candidate_q_integrity_result.json\n?? reports/uav0_transition149_reward_root_cause.json\n?? scripts/diagnostics/run_counterfactual_critic_reliability.py\n?? scripts/diagnostics/run_counterfactual_critic_reliability_persistence_recovery.py",
+  "TRACEABLE_RESULT_HEAD": "4ebc2a94e219242f8023c9d35e3c36a960e935fb",
+  "REWARD_GATE_HEAD": "4ebc2a94e219242f8023c9d35e3c36a960e935fb",
+  "SOURCE_CODE_CHANGES_SINCE_TRACEABLE_HEAD": "scripts/diagnostics/run_cache_branch_reward_root_cause.py\nscripts/diagnostics/run_traceable_candidate_q_integrity.py",
+  "ARCHITECTURE_VERSION": 6,
+  "CHECKPOINT_VERSION": 26,
+  "CONFIG_SHA256": "131a5ba050cdc5c454800b1e814187ec4053a83b8dacfb6b881650e2d69c6805",
+  "GENERATION_CONFIG_FINGERPRINT": "9ad3c6179be6cea67a0c95695f0cc2802e7570274c9be5446e51d996d5f7045d",
+  "CRITIC_CHECKPOINT_SEARCH": {
+    "existing_compatible_diagnostic_checkpoint_found_before_run": "NO",
+    "compatible_checkpoint_found": "NO",
+    "reconstructed_checkpoint_path": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\diagnostics\\counterfactual_critic_reliability\\traceable_critic_v26.pt",
+    "checkpoint_sha256": "50ce48b6366d553289080f7149a4280f1cd5d95659dbe032ccb7f58bee97beee"
+  },
+  "CRITIC_STATE_SOURCE": "EXISTING_DIAGNOSTIC_CHECKPOINT",
+  "CRITIC_RECONSTRUCTION_GATE": "PASS",
+  "CRITIC_PARAMETER_DIGEST": "378d8fe6dc261574f598905dbb5446a4d84bbeb43dd8386ad8bf50b6ce5072d6",
+  "CRITIC_OPTIMIZER_STEPS": 40,
+  "POPART_MEAN": -50.259220123291016,
+  "POPART_STD": 115.27037811279297,
+  "RETURN_STAT_COUNT": 300,
+  "RETURN_STAT_MEAN": -50.259221265713386,
+  "RETURN_STAT_M2": 3986178.211722347,
+  "WARMUP_REALIZATION_ACTION": "GENERATE",
+  "WARMUP_REALIZATION_PATH": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\diagnostics\\counterfactual_critic_reliability\\warmup_train_realization",
+  "WARMUP_REALIZATION_GENERATED": "YES",
+  "WARMUP_SEEDS": {},
+  "DIAGNOSTIC_REALIZATION_REUSE_GATE": "PASS",
+  "DIAGNOSTIC_REALIZATION_ACTION": "GENERATE_COMPENSATORY_ONCE",
+  "DIAGNOSTIC_REALIZATION_PATH": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\diagnostics\\counterfactual_critic_reliability\\diagnostic_train_realization",
+  "DIAGNOSTIC_REALIZATION_GENERATED": "YES",
+  "DIAGNOSTIC_REALIZATION_PROVENANCE": {
+    "split": "TRAIN",
+    "split_evidence": "TRAIN_DIAGNOSTIC_PATH",
+    "action": "GENERATE_COMPENSATORY_ONCE",
+    "episode_seed": 12184115623283823756,
+    "episode_manifest_status": "READ_OPTIONAL",
+    "episode_slots": 300,
+    "generation_config_fingerprint": "9ad3c6179be6cea67a0c95695f0cc2802e7570274c9be5446e51d996d5f7045d",
+    "required_artifacts": [
+      "trajectory.csv",
+      "vehicle_roles.json",
+      "tasks.csv",
+      "popularity.csv",
+      "popularity_history.csv",
+      "vehicle_predictions.csv",
+      "popularity_predictions.csv",
+      "prediction_scenarios.npz",
+      "tv_local_cache.json",
+      "sumo_demand.rou.xml",
+      "sumo_demand.meta.json"
+    ],
+    "required_artifacts_status": "PASS",
+    "runtime_slot_validation": "PASS",
+    "explicit_compatibility_conflicts": [],
+    "rejected_incompatible_candidates": [],
+    "generated_during_compensatory_run": "YES",
+    "resumed_by_loading_same_realization": "YES",
+    "resume_action": "LOAD",
+    "removed_after_use": "YES"
+  },
+  "TARGET_TRANSITION": 149,
+  "TARGET_TRANSITION_FINGERPRINT_GATE": "PASS",
+  "ROLE_TARGETS": {
+    "SV": {
+      "head": "18",
+      "head_index": 1,
+      "candidate_config": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0
+      ],
+      "selection": {
+        "transition_index": 149,
+        "role": "SV",
+        "universe_index": 8,
+        "criterion": "argmax(abs(gamma_delta_v)) over saved legal Candidates for this role",
+        "saved_abs_gamma_delta_v": 9.785858154296875
+      },
+      "saved": {
+        "KEEP": {
+          "reward": 5.41466057555056,
+          "next_v": 7.599987030029297,
+          "q": 13.014647605579857
+        },
+        "CANDIDATE": {
+          "reward": 5.2324917339194235,
+          "next_v": -2.185871124267578,
+          "q": 3.0466206096518453
+        },
+        "saved_delta_v": -9.785858154296875,
+        "saved_gamma_delta_v": -9.785858154296875
+      },
+      "reproduced": {
+        "KEEP": {
+          "reward": 5.41466057555056,
+          "next_v": 7.599987030029297,
+          "q": 13.014647605579857
+        },
+        "CANDIDATE": {
+          "reward": 5.2324917339194235,
+          "next_v": -2.185871124267578,
+          "q": 3.0466206096518453
+        }
+      },
+      "DELTA_V_PRED": -9.785858154296875,
+      "replicate0": {
+        "continuation_seed": 7484406978966671078,
+        "KEEP_MC": -1491.652261532843,
+        "CANDIDATE_MC": -1095.4084694571793,
+        "DELTA_G_MC": 396.2437920756638,
+        "SIGN_AGREEMENT": "NO",
+        "KEEP_CONTINUATION": {
+          "future_return": -1491.652261532843,
+          "continuation_seed": 7484406978966671078
+        },
+        "CANDIDATE_CONTINUATION": {
+          "future_return": -1095.4084694571793,
+          "continuation_seed": 7484406978966671078
+        }
+      },
+      "replicate1": {
+        "continuation_seed": 602898064798220971,
+        "KEEP_MC": -355.71618895977736,
+        "CANDIDATE_MC": -355.71618895977736,
+        "DELTA_G_MC": 0.0,
+        "SIGN_AGREEMENT": "NO",
+        "KEEP_CONTINUATION": {
+          "future_return": -355.71618895977736,
+          "continuation_seed": 602898064798220971
+        },
+        "CANDIDATE_CONTINUATION": {
+          "future_return": -355.71618895977736,
+          "continuation_seed": 602898064798220971
+        }
+      },
+      "MC_KEEP_MEAN": -923.6842252463102,
+      "MC_CANDIDATE_MEAN": -725.5623292084783,
+      "DELTA_G_MC_R0": 396.2437920756638,
+      "DELTA_G_MC_R1": 0.0,
+      "DELTA_G_MC_MEAN": 198.1218960378319,
+      "DELTA_G_MC_STD": 280.1866723797742,
+      "MC_KEEP_STD": 803.228099910829,
+      "MC_CANDIDATE_STD": 523.0414275310548,
+      "DELTA_ERROR": -207.90775419212878,
+      "ABS_DELTA_ERROR": 207.90775419212878,
+      "SIGN_AGREEMENT_R0": "NO",
+      "SIGN_AGREEMENT_R1": "NO",
+      "SIGN_AGREEMENT_MEAN": "NO",
+      "V_KEEP_ABS_ERROR": 931.2842122763395,
+      "V_CANDIDATE_ABS_ERROR": 723.3764580842108,
+      "ROLE_MC_SIGN_STABILITY": "UNSTABLE",
+      "empirical_delta_signs": [
+        1,
+        0
+      ],
+      "critic_delta_sign": -1
+    },
+    "RSU": {
+      "head": "RSU_1",
+      "head_index": 6,
+      "candidate_config": [
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0
+      ],
+      "selection": {
+        "transition_index": 149,
+        "role": "RSU",
+        "universe_index": 79,
+        "criterion": "argmax(abs(gamma_delta_v)) over saved legal Candidates for this role",
+        "saved_abs_gamma_delta_v": 34.260969161987305
+      },
+      "saved": {
+        "KEEP": {
+          "reward": 5.41466057555056,
+          "next_v": 7.599987030029297,
+          "q": 13.014647605579857
+        },
+        "CANDIDATE": {
+          "reward": -8.01441269168359,
+          "next_v": -26.660982131958008,
+          "q": -34.6753948236416
+        },
+        "saved_delta_v": -34.260969161987305,
+        "saved_gamma_delta_v": -34.260969161987305
+      },
+      "reproduced": {
+        "KEEP": {
+          "reward": 5.41466057555056,
+          "next_v": 7.599987030029297,
+          "q": 13.014647605579857
+        },
+        "CANDIDATE": {
+          "reward": -8.01441269168359,
+          "next_v": -26.660982131958008,
+          "q": -34.6753948236416
+        }
+      },
+      "DELTA_V_PRED": -34.260969161987305,
+      "replicate0": {
+        "continuation_seed": 7484406978966671078,
+        "KEEP_MC": -1491.652261532843,
+        "CANDIDATE_MC": -408.8807896524668,
+        "DELTA_G_MC": 1082.7714718803763,
+        "SIGN_AGREEMENT": "NO",
+        "KEEP_CONTINUATION": {
+          "future_return": -1491.652261532843,
+          "continuation_seed": 7484406978966671078
+        },
+        "CANDIDATE_CONTINUATION": {
+          "future_return": -408.8807896524668,
+          "continuation_seed": 7484406978966671078
+        }
+      },
+      "replicate1": {
+        "continuation_seed": 602898064798220971,
+        "KEEP_MC": -355.71618895977736,
+        "CANDIDATE_MC": -1187.7858612425625,
+        "DELTA_G_MC": -832.0696722827852,
+        "SIGN_AGREEMENT": "YES",
+        "KEEP_CONTINUATION": {
+          "future_return": -355.71618895977736,
+          "continuation_seed": 602898064798220971
+        },
+        "CANDIDATE_CONTINUATION": {
+          "future_return": -1187.7858612425625,
+          "continuation_seed": 602898064798220971
+        }
+      },
+      "MC_KEEP_MEAN": -923.6842252463102,
+      "MC_CANDIDATE_MEAN": -798.3333254475147,
+      "DELTA_G_MC_R0": 1082.7714718803763,
+      "DELTA_G_MC_R1": -832.0696722827852,
+      "DELTA_G_MC_MEAN": 125.35089979879558,
+      "DELTA_G_MC_STD": 1353.997157932779,
+      "MC_KEEP_STD": 803.228099910829,
+      "MC_CANDIDATE_STD": 550.76905802195,
+      "DELTA_ERROR": -159.61186896078289,
+      "ABS_DELTA_ERROR": 159.61186896078289,
+      "SIGN_AGREEMENT_R0": "NO",
+      "SIGN_AGREEMENT_R1": "YES",
+      "SIGN_AGREEMENT_MEAN": "NO",
+      "V_KEEP_ABS_ERROR": 931.2842122763395,
+      "V_CANDIDATE_ABS_ERROR": 771.6723433155566,
+      "ROLE_MC_SIGN_STABILITY": "UNSTABLE",
+      "empirical_delta_signs": [
+        1,
+        -1
+      ],
+      "critic_delta_sign": -1
+    },
+    "UAV": {
+      "head": "UAV_1",
+      "head_index": 8,
+      "candidate_config": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0
+      ],
+      "selection": {
+        "transition_index": 149,
+        "role": "UAV",
+        "universe_index": 35,
+        "criterion": "argmax(abs(gamma_delta_v)) over saved legal Candidates for this role",
+        "saved_abs_gamma_delta_v": 13.137336730957031
+      },
+      "saved": {
+        "KEEP": {
+          "reward": -0.4923074473375999,
+          "next_v": 0.47078704833984375,
+          "q": -0.02152039899775615
+        },
+        "CANDIDATE": {
+          "reward": -3.2191842470793213,
+          "next_v": 13.608123779296875,
+          "q": 10.388939532217554
+        },
+        "saved_delta_v": 13.137336730957031,
+        "saved_gamma_delta_v": 13.137336730957031
+      },
+      "reproduced": {
+        "KEEP": {
+          "reward": -0.4923074473375999,
+          "next_v": 0.47078704833984375,
+          "q": -0.02152039899775615
+        },
+        "CANDIDATE": {
+          "reward": -3.2191842470793213,
+          "next_v": 13.608123779296875,
+          "q": 10.388939532217554
+        }
+      },
+      "DELTA_V_PRED": 13.137336730957031,
+      "replicate0": {
+        "continuation_seed": 7484406978966671078,
+        "KEEP_MC": -2198.524553619325,
+        "CANDIDATE_MC": -2303.3820177316666,
+        "DELTA_G_MC": -104.8574641123414,
+        "SIGN_AGREEMENT": "NO",
+        "KEEP_CONTINUATION": {
+          "future_return": -2198.524553619325,
+          "continuation_seed": 7484406978966671078
+        },
+        "CANDIDATE_CONTINUATION": {
+          "future_return": -2303.3820177316666,
+          "continuation_seed": 7484406978966671078
+        }
+      },
+      "replicate1": {
+        "continuation_seed": 602898064798220971,
+        "KEEP_MC": -690.6793977096677,
+        "CANDIDATE_MC": -1070.7564116343856,
+        "DELTA_G_MC": -380.0770139247179,
+        "SIGN_AGREEMENT": "NO",
+        "KEEP_CONTINUATION": {
+          "future_return": -690.6793977096677,
+          "continuation_seed": 602898064798220971
+        },
+        "CANDIDATE_CONTINUATION": {
+          "future_return": -1070.7564116343856,
+          "continuation_seed": 602898064798220971
+        }
+      },
+      "MC_KEEP_MEAN": -1444.6019756644964,
+      "MC_CANDIDATE_MEAN": -1687.069214683026,
+      "DELTA_G_MC_R0": -104.8574641123414,
+      "DELTA_G_MC_R1": -380.0770139247179,
+      "DELTA_G_MC_MEAN": -242.46723901852965,
+      "DELTA_G_MC_STD": 194.60960998744022,
+      "MC_KEEP_STD": 1066.207534723006,
+      "MC_CANDIDATE_STD": 871.5979247355656,
+      "DELTA_ERROR": 255.60457574948668,
+      "ABS_DELTA_ERROR": 255.60457574948668,
+      "SIGN_AGREEMENT_R0": "NO",
+      "SIGN_AGREEMENT_R1": "NO",
+      "SIGN_AGREEMENT_MEAN": "NO",
+      "V_KEEP_ABS_ERROR": 1445.0727627128363,
+      "V_CANDIDATE_ABS_ERROR": 1700.677338462323,
+      "ROLE_MC_SIGN_STABILITY": "STABLE",
+      "empirical_delta_signs": [
+        -1,
+        -1
+      ],
+      "critic_delta_sign": 1
+    }
+  },
+  "SAME_CRITIC_REPRODUCTION_GATE": "PASS",
+  "CRITIC_SNAPSHOT_BEFORE_GATE": {
+    "digest": "378d8fe6dc261574f598905dbb5446a4d84bbeb43dd8386ad8bf50b6ce5072d6",
+    "steps": 40,
+    "popart_mean": -50.259220123291016,
+    "popart_std": 115.27037811279297,
+    "return_stat_count": 300,
+    "return_stat_mean": -50.259221265713386,
+    "return_stat_m2": 3986178.211722347
+  },
+  "CRITIC_SNAPSHOT_AFTER_GATE": {
+    "digest": "378d8fe6dc261574f598905dbb5446a4d84bbeb43dd8386ad8bf50b6ce5072d6",
+    "steps": 40,
+    "popart_mean": -50.259220123291016,
+    "popart_std": 115.27037811279297,
+    "return_stat_count": 300,
+    "return_stat_mean": -50.259221265713386,
+    "return_stat_m2": 3986178.211722347
+  },
+  "CRITIC_FROZEN_DURING_GATE": "YES",
+  "ACTOR_OPTIMIZER_STEPS_BEFORE_GATE": 0,
+  "ACTOR_OPTIMIZER_STEPS_AFTER_GATE": 0,
+  "ACTOR_OPTIMIZER_STEPS_DURING_GATE": 0,
+  "ACTOR_PARAMETERS_FROZEN_DURING_GATE": "YES",
+  "SURROGATE_TRAINING_DURING_GATE": 0,
+  "FORMAL_PPO_UPDATE_EXECUTED": "NO",
+  "ONE_EPOCH_TRAINING_EXECUTED": "NO",
+  "ONE_EPOCH_COMPLETED_EPOCHS": 0,
+  "EPOCH_2_STARTED": "NO",
+  "READY_FOR_FORMAL_TRAINING_STAGE": "NO",
+  "COUNTERFACTUAL_CRITIC_RELIABILITY": "CONCERN",
+  "CANDIDATE_Q_LABEL_INTEGRITY_CLASSIFICATION": "CANDIDATE_Q_INTEGRITY_CONCERN",
+  "NEXT_STAGE": "COUNTERFACTUAL_CRITIC_REPAIR_DESIGN",
+  "TEMP_CLEANUP_STATUS": "REMOVED",
+  "GATE_STOP_REASON": null,
+  "RESULT_PERSISTENCE_GATE": "PASS",
+  "RUNNER_FINALIZATION_ERROR": null,
+  "CRITIC_CHECKPOINT_PATH": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\diagnostics\\counterfactual_critic_reliability\\traceable_critic_v26.pt",
+  "CRITIC_CHECKPOINT_METADATA_PATH": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\diagnostics\\counterfactual_critic_reliability\\traceable_critic_v26.metadata.json",
+  "CRITIC_CHECKPOINT_METADATA": {
+    "DIAGNOSTIC_ONLY": "YES",
+    "CURRENT_HEAD": "52c75b0ec34dd06dda9fec407472fccf1746957e",
+    "CHECKPOINT_VERSION": 26,
+    "ARCHITECTURE_VERSION": 6,
+    "CRITIC_PARAMETER_DIGEST": "378d8fe6dc261574f598905dbb5446a4d84bbeb43dd8386ad8bf50b6ce5072d6",
+    "CRITIC_OPTIMIZER_STEPS": 40,
+    "POPART_MEAN": -50.259220123291016,
+    "POPART_STD": 115.27037811279297,
+    "RETURN_STAT_COUNT": 300,
+    "RETURN_STAT_MEAN": -50.259221265713386,
+    "RETURN_STAT_M2": 3986178.211722347,
+    "WARMUP_REALIZATION_SEED": 7868781415413077432,
+    "WARMUP_GENERATION_RNG_SEED": 3505822017750818363,
+    "WARMUP_COLLECTION_RNG_SEED": 12077346021048424343,
+    "WARMUP_CRITIC_OPTIMIZER_RNG_SEED": 15135454869181435445,
+    "CONFIG_SHA256": "131a5ba050cdc5c454800b1e814187ec4053a83b8dacfb6b881650e2d69c6805",
+    "GENERATION_CONFIG_FINGERPRINT": "9ad3c6179be6cea67a0c95695f0cc2802e7570274c9be5446e51d996d5f7045d",
+    "WARMUP_REALIZATION_ACTION": "GENERATE",
+    "CHECKPOINT_SHA256": "50ce48b6366d553289080f7149a4280f1cd5d95659dbe032ccb7f58bee97beee"
+  },
+  "WARMUP_REALIZATION_SEARCH": {
+    "expected_seed": 7868781415413077432,
+    "compatible_existing_realization_found_before_run": "NO",
+    "action": "GENERATE_ONCE"
+  },
+  "WARMUP_REALIZATION_REMOVED_AFTER_CHECKPOINT": "YES",
+  "WARMUP_REALIZATION_PROVENANCE": {
+    "split": "TRAIN",
+    "episode_seed": 7868781415413077432,
+    "episode_slots": 300,
+    "generation_config_fingerprint": "9ad3c6179be6cea67a0c95695f0cc2802e7570274c9be5446e51d996d5f7045d",
+    "required_artifacts_status": "PASS",
+    "runtime_slot_validation": "PASS"
+  },
+  "WARMUP_METRICS_SUMMARY": {
+    "rollout_transition_count": 300,
+    "actor_parameter_delta": 0.0,
+    "actor_optimizer_steps": 0,
+    "critic_optimizer_steps": 40,
+    "executed_critic_optimizer_steps": 40,
+    "teacher_calls": {
+      "cache_full_information": 0,
+      "uav_exact": 0
+    }
+  },
+  "DIAGNOSTIC_REALIZATION_REMOVED_AFTER_USE": "YES",
+  "TARGET_TRANSITION_FINGERPRINT_SHA256": "2805d3e60f0b40457ab53652995bbbd58e4cb438bac06c3af5445284981d3408",
+  "TARGET_CANDIDATE_COUNT_IN_SOURCE_JSON": 953,
+  "ACTOR_PARAMETER_DELTA_NORM_DURING_GATE": 0.0,
+  "CONTINUATION_NAMESPACE": "counterfactual_critic_reliability",
+  "CONTINUATION_EXECUTION_GATE": "PASS_COMPENSATORY_RERUN",
+  "CONTINUATION_EXECUTION_COUNT": 12,
+  "CONTINUATION_METRICS_PERSISTENCE_GATE": "PASS",
+  "CONTINUATION_METRICS_PERSISTENCE_REASON": "Continuation metrics are persisted in the validated JSONL artifact with 12/12 complete records; the current persistence gate passed.",
+  "CONTINUATION_PROTOCOL": {
+    "first_transition": 150,
+    "terminal_transition": 299,
+    "transition_count_per_branch": 150,
+    "includes_transition_149_reward": "NO",
+    "terminal_bootstrap": "NO",
+    "replicates": 2
+  },
+  "TEMP_CLEANUP_ATTEMPT_COUNT": 1,
+  "HISTORICAL_ATTEMPTS": [
+    {
+      "attempt": "original_counterfactual_critic_reliability_gate",
+      "RUNNER_FINALIZATION_ERROR": "TypeError: final JSON serialization encountered an internal NumPy ndarray after all diagnostic calculations completed",
+      "RESULT_PERSISTENCE_GATE": "FAIL",
+      "CONTINUATION_EXECUTION_COUNT": 12,
+      "CONTINUATION_METRICS_PERSISTENCE_GATE": "FAIL"
+    }
+  ],
+  "PREVIOUS_RUNNER_FINALIZATION_ERROR": "TypeError: final JSON serialization encountered an internal NumPy ndarray after all diagnostic calculations completed",
+  "PREVIOUS_RESULT_PERSISTENCE_GATE": "FAIL",
+  "COMPENSATORY_RERUN_AUTHORIZED": "YES",
+  "COMPENSATORY_RERUN_COMPLETED": "YES",
+  "COMPENSATORY_CONTINUATION_EXECUTED": "YES",
+  "COMPENSATORY_CONTINUATION_COUNT": 12,
+  "COMPENSATORY_CONTINUATION_EXECUTION_COUNT": 12,
+  "CONTINUATION_JSONL_PATH": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\reports\\counterfactual_critic_reliability_continuations.jsonl",
+  "CONTINUATION_JSONL_LINE_COUNT": 12,
+  "CONTINUATION_REPLICATE_SEEDS": [
+    7484406978966671078,
+    602898064798220971
+  ],
+  "CRITIC_CHECKPOINT_REUSE_GATE": "PASS",
+  "CRITIC_OPTIMIZER_STEPS_DURING_GATE": 0,
+  "ACTOR_PARAMETER_DIGEST_BEFORE_GATE": "86213c13fd5efa62f059626e12243f4d6435fff3b8a933f9070788a6e6c3c0ac",
+  "ACTOR_PARAMETER_DIGEST_AFTER_GATE": "86213c13fd5efa62f059626e12243f4d6435fff3b8a933f9070788a6e6c3c0ac",
+  "LAST_COMPLETED_EPOCH": "NONE",
+  "FORMAL_300_EPOCH_TRAINING_EXECUTED": "NO",
+  "TRANSITION_REPRODUCTION_GATE": "PASS",
+  "DIAGNOSTIC_REALIZATION_GENERATED_DURING_COMPENSATORY_RUN": "YES"
+}

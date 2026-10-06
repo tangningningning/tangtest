@@ -1,0 +1,187 @@
+{
+  "ACTOR_INITIAL_STATE_SHA256": "282e88c8d793d15b7d067ea4cdbf3c6bbddcefda740e9b31cf9ed1c31b9477d8",
+  "ACTOR_INITIAL_STATE_SHA256_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": "282e88c8d793d15b7d067ea4cdbf3c6bbddcefda740e9b31cf9ed1c31b9477d8",
+    "formal_v14b_actor_lr_1e_minus_4": "282e88c8d793d15b7d067ea4cdbf3c6bbddcefda740e9b31cf9ed1c31b9477d8",
+    "formal_v14b_actor_lr_5e_minus_3": "282e88c8d793d15b7d067ea4cdbf3c6bbddcefda740e9b31cf9ed1c31b9477d8",
+    "formal_v14b_actor_lr_5e_minus_4": "282e88c8d793d15b7d067ea4cdbf3c6bbddcefda740e9b31cf9ed1c31b9477d8"
+  },
+  "ACTOR_LR_VALUES": [
+    0.0001,
+    0.0005,
+    0.001,
+    0.005
+  ],
+  "ALPHA": 1.0,
+  "ARCHITECTURE_VERSION": 15,
+  "BASE_SEED": 27005,
+  "BLOCKERS": [],
+  "CANONICAL_CONFIG_HASH_EXCLUDING_SWEEP_FIELDS": "9fa9b6c69eb3c22c60751ddb3e87b2b886109e969f094f054eabd49f8695d3a4",
+  "CHECKPOINT_VERSION": 37,
+  "CHECKS": {
+    "all_four_launchers_import": true,
+    "alpha_is_one": true,
+    "architecture_is_400_128_128_1_scalar_silu": true,
+    "architecture_version_is_15": true,
+    "base_seed_is_27005": true,
+    "canonical_config_exists": true,
+    "checkpoint_version_is_37": true,
+    "current_priority_pcgrad": true,
+    "ensemble_disabled": true,
+    "episode_realization_sequence_identical": true,
+    "episode_realizations_20001_20300_complete": true,
+    "gradient_norm_matching_enabled": true,
+    "heteroscedastic_disabled": true,
+    "last1_length_is_one": true,
+    "macro_actor_lr_values_match_spec": true,
+    "no_optimizer_step_called": true,
+    "only_actor_lr_diff": true,
+    "only_macro_actor_lr_is_overridden": true,
+    "optimizer_counters_untouched": true,
+    "resume_is_false": true,
+    "run_directories_are_fresh": true,
+    "run_directories_are_unique": true,
+    "same_initial_actor_parameters": true,
+    "same_initial_main_critic_parameters": true,
+    "same_initial_micro_and_long_critic_parameters": true,
+    "target_episodes_is_300": true,
+    "target_mode_is_two_step_smdp_td": true,
+    "target_scale_normalization_disabled": true,
+    "training_pool_exists": true
+  },
+  "CRITIC_STEPS": 50,
+  "CURRENT_PRIORITY_PCGRAD": true,
+  "ENSEMBLE_ACTIVE": false,
+  "EPISODE_REALIZATION_SEQUENCE_IDENTICAL": true,
+  "EPISODE_SEEDS": "20001-20300",
+  "FORMAL_TRAINING_STARTED": false,
+  "FRESH_INITIALIZATION": true,
+  "GRADIENT_NORM_MATCHING": true,
+  "HETEROSCEDASTIC_ACTIVE": false,
+  "LAST1_ENABLED": true,
+  "LAST1_LENGTH": 1,
+  "LATEST_ALGORITHM": "V14b",
+  "LONG_CRITIC_INITIAL_STATE_SHA256_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": "174494487d81992b583002cf3d90df6302b0b24744f7f07063a45f0e835d0ef2",
+    "formal_v14b_actor_lr_1e_minus_4": "174494487d81992b583002cf3d90df6302b0b24744f7f07063a45f0e835d0ef2",
+    "formal_v14b_actor_lr_5e_minus_3": "174494487d81992b583002cf3d90df6302b0b24744f7f07063a45f0e835d0ef2",
+    "formal_v14b_actor_lr_5e_minus_4": "174494487d81992b583002cf3d90df6302b0b24744f7f07063a45f0e835d0ef2"
+  },
+  "LONG_VALUE_LR": 0.001,
+  "LONG_VALUE_OPTIMIZER_LR_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": 0.001,
+    "formal_v14b_actor_lr_1e_minus_4": 0.001,
+    "formal_v14b_actor_lr_5e_minus_3": 0.001,
+    "formal_v14b_actor_lr_5e_minus_4": 0.001
+  },
+  "LR_AFFECTED_OPTIMIZERS": [
+    "Macro Actor optimizer (macro_optimizer)"
+  ],
+  "MACRO_ACTOR_OPTIMIZER_LR_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": 0.001,
+    "formal_v14b_actor_lr_1e_minus_4": 0.0001,
+    "formal_v14b_actor_lr_5e_minus_3": 0.005,
+    "formal_v14b_actor_lr_5e_minus_4": 0.0005
+  },
+  "MACRO_CRITIC_LR": 0.001,
+  "MACRO_CRITIC_MAX_GRAD_NORM": 0.5,
+  "MACRO_CRITIC_OPTIMIZER_LR_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": 0.001,
+    "formal_v14b_actor_lr_1e_minus_4": 0.001,
+    "formal_v14b_actor_lr_5e_minus_3": 0.001,
+    "formal_v14b_actor_lr_5e_minus_4": 0.001
+  },
+  "MAIN_CRITIC_INITIAL_STATE_SHA256": "1d7640ba74b645ac4dc84fa1118db75b4b6522062c9a9ea2df28f76637953154",
+  "MAIN_CRITIC_INITIAL_STATE_SHA256_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": "1d7640ba74b645ac4dc84fa1118db75b4b6522062c9a9ea2df28f76637953154",
+    "formal_v14b_actor_lr_1e_minus_4": "1d7640ba74b645ac4dc84fa1118db75b4b6522062c9a9ea2df28f76637953154",
+    "formal_v14b_actor_lr_5e_minus_3": "1d7640ba74b645ac4dc84fa1118db75b4b6522062c9a9ea2df28f76637953154",
+    "formal_v14b_actor_lr_5e_minus_4": "1d7640ba74b645ac4dc84fa1118db75b4b6522062c9a9ea2df28f76637953154"
+  },
+  "MAIN_VALUE_LOSS_COEFFICIENT": 0.01,
+  "MICRO_ACTOR_LR": 0.0003,
+  "MICRO_ACTOR_OPTIMIZER_LR_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": 0.0003,
+    "formal_v14b_actor_lr_1e_minus_4": 0.0003,
+    "formal_v14b_actor_lr_5e_minus_3": 0.0003,
+    "formal_v14b_actor_lr_5e_minus_4": 0.0003
+  },
+  "MICRO_CRITIC_INITIAL_STATE_SHA256_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": "b34b5e4ac461a9b5fcaed03fd82ec8466a3159350531c68473e0c8d0268d6709",
+    "formal_v14b_actor_lr_1e_minus_4": "b34b5e4ac461a9b5fcaed03fd82ec8466a3159350531c68473e0c8d0268d6709",
+    "formal_v14b_actor_lr_5e_minus_3": "b34b5e4ac461a9b5fcaed03fd82ec8466a3159350531c68473e0c8d0268d6709",
+    "formal_v14b_actor_lr_5e_minus_4": "b34b5e4ac461a9b5fcaed03fd82ec8466a3159350531c68473e0c8d0268d6709"
+  },
+  "MICRO_CRITIC_LR": 0.003,
+  "MICRO_CRITIC_OPTIMIZER_LR_BY_RUN": {
+    "formal_v14b_actor_lr_1e_minus_3": 0.003,
+    "formal_v14b_actor_lr_1e_minus_4": 0.003,
+    "formal_v14b_actor_lr_5e_minus_3": 0.003,
+    "formal_v14b_actor_lr_5e_minus_4": 0.003
+  },
+  "MISSING_REALIZATIONS": [],
+  "OCCUPIED_RUN_DIRECTORIES": [],
+  "ONLY_ACTOR_LR_DIFF": true,
+  "OPTIMIZER_STEP_EXECUTED": false,
+  "PPO_CLIP": 0.2,
+  "PPO_EPOCHS": 4,
+  "READY_FOR_FOUR_LR_TRAINING": true,
+  "RESUME": false,
+  "ROLLOUT_EXECUTED": false,
+  "RUNS": [
+    {
+      "actor_lr": 0.0001,
+      "base_seed": 27005,
+      "episode_seed_start": 20001,
+      "lr_label": "1e_minus_4",
+      "resume": false,
+      "run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\formal_v14b_actor_lr_1e_minus_4",
+      "run_name": "formal_v14b_actor_lr_1e_minus_4",
+      "script": "scripts/training/run_v14b_actor_lr_1e_minus_4.py",
+      "target_episodes": 300
+    },
+    {
+      "actor_lr": 0.0005,
+      "base_seed": 27005,
+      "episode_seed_start": 20001,
+      "lr_label": "5e_minus_4",
+      "resume": false,
+      "run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\formal_v14b_actor_lr_5e_minus_4",
+      "run_name": "formal_v14b_actor_lr_5e_minus_4",
+      "script": "scripts/training/run_v14b_actor_lr_5e_minus_4.py",
+      "target_episodes": 300
+    },
+    {
+      "actor_lr": 0.001,
+      "base_seed": 27005,
+      "episode_seed_start": 20001,
+      "lr_label": "1e_minus_3",
+      "resume": false,
+      "run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\formal_v14b_actor_lr_1e_minus_3",
+      "run_name": "formal_v14b_actor_lr_1e_minus_3",
+      "script": "scripts/training/run_v14b_actor_lr_1e_minus_3.py",
+      "target_episodes": 300
+    },
+    {
+      "actor_lr": 0.005,
+      "base_seed": 27005,
+      "episode_seed_start": 20001,
+      "lr_label": "5e_minus_3",
+      "resume": false,
+      "run_dir": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\runs\\formal_v14b_actor_lr_5e_minus_3",
+      "run_name": "formal_v14b_actor_lr_5e_minus_3",
+      "script": "scripts/training/run_v14b_actor_lr_5e_minus_3.py",
+      "target_episodes": 300
+    }
+  ],
+  "SAME_INITIAL_ACTOR_PARAMETERS": true,
+  "SAME_INITIAL_CRITIC_PARAMETERS": true,
+  "SCRIPT_1": "scripts/training/run_v14b_actor_lr_1e_minus_4.py",
+  "SCRIPT_2": "scripts/training/run_v14b_actor_lr_5e_minus_4.py",
+  "SCRIPT_3": "scripts/training/run_v14b_actor_lr_1e_minus_3.py",
+  "SCRIPT_4": "scripts/training/run_v14b_actor_lr_5e_minus_3.py",
+  "TARGET_EPISODES": 300,
+  "TARGET_MODE": "two_step_smdp_td",
+  "TARGET_SCALE_NORMALIZATION_ACTIVE": false,
+  "TRAINING_EXECUTED": false
+}

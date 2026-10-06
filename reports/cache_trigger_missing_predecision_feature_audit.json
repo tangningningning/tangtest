@@ -1,0 +1,357 @@
+{
+  "task": "CACHE_TRIGGER_MISSING_PREDECISION_FEATURE_AUDIT",
+  "audit_type": "SOURCE_STATIC_ONLY",
+  "closed_prior_findings_reused": {
+    "TASK_RANDOMNESS_ROOT_CAUSE": "NO",
+    "CONDITIONAL_EXPECTED_DELTA_Q_STATE_DEPENDENT": "YES",
+    "TRIGGER_OBSERVATION_INFORMATION_INSUFFICIENT": "YES",
+    "ENCODER_OR_LEARNING_FAILURE_REMAINS_PRIMARY": "NO",
+    "ROOT_CAUSE_BRANCH": "OBSERVATION_INFORMATION_INSUFFICIENT",
+    "previous_diagnostics_rerun": false
+  },
+  "active_route": {
+    "control_mode": "adaptive_joint_cache_uav_reconfiguration",
+    "policy_schema": "adaptive_joint_cache_uav_ppo",
+    "source_evidence": [
+      "configs/proposed/system_config.toml:543-547",
+      "src/ppo_simple/trainer.py:3572-3624",
+      "src/ppo_simple/rollout.py:230-274",
+      "src/ppo_simple/primitive_control.py:1202-1287",
+      "src/ppo_simple/policy.py:1741-1805,1891-1934"
+    ]
+  },
+  "active_observation_shape": {
+    "cache_nodes_M": 9,
+    "services_F": 10,
+    "uavs_U": 2,
+    "vehicles_V": 25,
+    "prediction_horizon_H": 5,
+    "cache_bits": 90,
+    "uav_xy": 4,
+    "predicted_vehicle_xy": 250,
+    "predicted_service_popularity": 50,
+    "horizon_mask": 5,
+    "time_to_go": 1,
+    "observation_dim": 400,
+    "cache_context_shape": "9 x 400",
+    "dimension_formula": "M*F + 2*U + 2*V*H + F*H + H + 1",
+    "source_evidence": [
+      "configs/proposed/system_config.toml:82-87,104-107,185,212,430-432",
+      "src/decision/cache_configuration.py:356-400",
+      "src/ppo_simple/interface.py:101-180,391-489",
+      "src/ppo_simple/primitive_control.py:1238-1240,1262-1268"
+    ]
+  },
+  "current_trigger_feature_groups": [
+    {
+      "feature_name": "working_cache_state",
+      "source_variable": "primitive_control.cache; initialized from previous_cache_state",
+      "dimension": "9 x 10 = 90",
+      "normalization": "raw 0/1",
+      "time_index": "current slot; sequential head prefix includes earlier same-slot decisions",
+      "predicted_or_current": "CURRENT / sequential conditional state",
+      "global_or_node_local": "GLOBAL node x service matrix",
+      "source_evidence": ["src/ppo_simple/primitive_control.py:1218-1228,1262-1268", "src/ppo_simple/interface.py:391-410,433-435,478-489"]
+    },
+    {
+      "feature_name": "uav_positions",
+      "source_variable": "primitive_control.current_uav from previous_uav_positions",
+      "dimension": "2 x 2 = 4",
+      "normalization": "min-max x/y against flight_boundary to [0,1]",
+      "time_index": "current slot before later UAV heads act",
+      "predicted_or_current": "CURRENT",
+      "global_or_node_local": "GLOBAL, both UAVs",
+      "source_evidence": ["src/ppo_simple/primitive_control.py:1220-1228,1445-1458", "src/ppo_simple/interface.py:206-228,412-439"]
+    },
+    {
+      "feature_name": "predicted_vehicle_positions",
+      "source_variable": "step.predicted_vehicle_positions_horizon",
+      "dimension": "25 x 5 x 2 = 250",
+      "normalization": "min-max x/y to [0,1]; invalid horizon zero-filled",
+      "time_index": "h=0..4, slots t..t+4",
+      "predicted_or_current": "PREDICTED",
+      "global_or_node_local": "GLOBAL over vehicles",
+      "source_evidence": ["src/ppo_simple/interface.py:519-536,290-318,441-459,884-925"]
+    },
+    {
+      "feature_name": "predicted_service_popularity",
+      "source_variable": "step.predicted_service_popularity_horizon / rho_pred",
+      "dimension": "10 x 5 = 50",
+      "normalization": "per-horizon service probability sums to 1",
+      "time_index": "h=0..4, slots t..t+4",
+      "predicted_or_current": "PREDICTED",
+      "global_or_node_local": "GLOBAL per service",
+      "source_evidence": ["src/ppo_simple/interface.py:703-737,927-958,321-348,427-432,460"]
+    },
+    {
+      "feature_name": "prediction_horizon_mask",
+      "source_variable": "step.prediction_horizon_mask",
+      "dimension": "5",
+      "normalization": "boolean / 0-1",
+      "time_index": "h=0..4 forecast validity",
+      "predicted_or_current": "PREDICTION metadata",
+      "global_or_node_local": "GLOBAL",
+      "source_evidence": ["src/ppo_simple/interface.py:371-388,417-425,461-465", "src/ppo_simple/trainer.py:3610-3624"]
+    },
+    {
+      "feature_name": "time_to_go",
+      "source_variable": "normalized_time_to_go(origin_index, train_start, train_end)",
+      "dimension": "1",
+      "normalization": "(end-origin)/(end-start), [0,1]",
+      "time_index": "current origin to training terminal",
+      "predicted_or_current": "CURRENT timing metadata",
+      "global_or_node_local": "GLOBAL",
+      "source_evidence": ["src/ppo_simple/interface.py:351-368,508-536,466-476"]
+    }
+  ],
+  "trigger_control_inputs_not_in_encoder_vector": [
+    {
+      "feature_name": "head_index",
+      "source_variable": "node_index",
+      "dimension": "one scalar metadata value",
+      "fed_to_encoder": false,
+      "source_evidence": ["src/ppo_simple/primitive_control.py:1262-1287", "src/ppo_simple/policy.py:1891-1907"]
+    },
+    {
+      "feature_name": "UPDATE_feasibility_mask",
+      "source_variable": "operation_mask = [true, bool(update_candidates)]",
+      "dimension": "2 boolean action-validity bits",
+      "fed_to_encoder": false,
+      "information_exposed": "only whether at least one UPDATE candidate exists",
+      "source_evidence": ["src/ppo_simple/primitive_control.py:1269-1287", "src/ppo_simple/policy.py:1891-1919"]
+    }
+  ],
+  "present_globally_but_not_head_conditioned": [
+    "Predicted vehicle coordinates and service popularity are global; no node x vehicle x service forecast workload/serviceability tensor is in cache_context.",
+    "All cache bits are present, but per-head MB occupancy/residual capacity is not.",
+    "UAV/SV forecast geometry is global; no explicit head-relative coverage is encoded, and fixed RSU coordinates remain external config.",
+    "Role/head identity is fixed output-row/config metadata, not an encoder feature."
+  ],
+  "value_dependency_chain": [
+    {"stage": "trigger mask", "source_facts": "candidate set enumerated before trigger, but only non-empty UPDATE mask is passed", "source_evidence": ["src/ppo_simple/primitive_control.py:1262-1287"]},
+    {"stage": "UPDATE target", "source_facts": "candidate generation uses cache bits, sizes/capacity, node-local predicted demand and TV local-cache usage", "source_evidence": ["src/decision/cache_configuration.py:1612-1694"]},
+    {"stage": "candidate scorer", "source_facts": "candidate features are generated only after UPDATE and include target/demand/cost/capacity/replica summaries", "source_evidence": ["src/ppo_simple/primitive_control.py:1324-1367,357-462", "src/ppo_simple/policy.py:1936-1968"]},
+    {"stage": "configuration cost", "source_facts": "build_policy_target_configuration computes cache cost from service sizes, eta/xi, lambda_cache and cache_cost_weight", "source_evidence": ["src/decision/slot_environment.py:843-917,793-810", "src/common/system_model.py:224-304"]},
+    {"stage": "feasible targets and Matching", "source_facts": "final cache/local cache/path determine task feasible targets; transfer/exchange matching optimizes task utility", "source_evidence": ["src/decision/slot_environment.py:425-460", "src/decision/task_allocation.py:227-294,1010-1023,1085-1135"]},
+    {"stage": "KKT/task utility", "source_facts": "KKT and edge execution use task bits/cycles, role resources, channel gain and allocations; utility combines delay/energy", "source_evidence": ["src/decision/task_allocation.py:2741-2822,1950-1967", "src/common/system_model.py:90-128,368-394"]},
+    {"stage": "reward and next state", "source_facts": "reward equals actual task utility minus cache/movement costs; final cache/UAV positions form next state", "source_evidence": ["src/decision/slot_environment.py:523-597", "src/ppo_simple/rollout.py:584-650"]},
+    {"stage": "critic bootstrap", "source_facts": "existing static helper defines q=reward+gamma*critic_value(next_observation); not executed", "source_evidence": ["src/ppo_simple/cache_credit.py:331-448,488-505"]}
+  ],
+  "value_relevant_variables": [
+    {
+      "value_relevant_variable": "current Cache node/service bits",
+      "where_used": "observation, candidate delta, feasible edge targets",
+      "how_it_can_change_update_vs_keep": "determines current services and target changes",
+      "available_before_decision": "YES",
+      "currently_in_trigger_observation": "YES",
+      "derivable_from_existing_observation": "YES",
+      "classification": "ALREADY_PRESENT",
+      "source_evidence": ["src/ppo_simple/interface.py:391-489", "src/decision/task_allocation.py:227-294"]
+    },
+    {
+      "value_relevant_variable": "other nodes' cache replicas",
+      "where_used": "replica-aware targets and Matching feasibility",
+      "how_it_can_change_update_vs_keep": "changes redundant coverage and alternatives",
+      "available_before_decision": "YES",
+      "currently_in_trigger_observation": "YES",
+      "derivable_from_existing_observation": "YES",
+      "classification": "ALREADY_PRESENT",
+      "source_evidence": ["src/ppo_simple/interface.py:433-489", "src/decision/cache_configuration.py:1642-1646"]
+    },
+    {
+      "value_relevant_variable": "node-local forecast service workload by service",
+      "where_used": "prediction scenario, node_specific_predicted_demand and Matching/KKT",
+      "how_it_can_change_update_vs_keep": "changes useful edge opportunities and workload/cycles at the node",
+      "available_before_decision": "YES as forecast summary",
+      "currently_in_trigger_observation": "NO",
+      "derivable_from_existing_observation": "NO; global probabilities/positions omit forecast arrival mass and node aggregation",
+      "classification": "DIRECTLY_MISSING",
+      "source_evidence": ["src/decision/cache_configuration.py:1429-1552", "src/scenario/scenario_generator.py:603-669", "src/decision/task_allocation.py:227-294,2741-2822"]
+    },
+    {
+      "value_relevant_variable": "vehicle-to-node predicted coverage/association",
+      "where_used": "node demand proposal and edge path feasibility",
+      "how_it_can_change_update_vs_keep": "changes which tasks are likely serviceable by a node",
+      "available_before_decision": "YES from forecast positions and fixed geometry",
+      "currently_in_trigger_observation": "PARTIAL",
+      "derivable_from_existing_observation": "PARTIAL",
+      "classification": "PARTIALLY_REPRESENTED",
+      "source_evidence": ["src/decision/cache_configuration.py:1407-1426,1525-1549", "src/decision/task_allocation.py:2018-2055"]
+    },
+    {
+      "value_relevant_variable": "TV local-cache membership",
+      "where_used": "build_feasible_targets and observed_local_service_usage",
+      "how_it_can_change_update_vs_keep": "local hit can remove marginal edge opportunity from an update",
+      "available_before_decision": "YES from fixed artifact",
+      "currently_in_trigger_observation": "NO",
+      "derivable_from_existing_observation": "NO",
+      "classification": "DIRECTLY_MISSING",
+      "source_evidence": ["src/decision/task_allocation.py:265-294", "src/decision/cache_configuration.py:1555-1574", "src/ppo_simple/primitive_control.py:1333-1347"]
+    },
+    {
+      "value_relevant_variable": "service MB size/current used/residual capacity",
+      "where_used": "candidate feasibility, cache cost and candidate features",
+      "how_it_can_change_update_vs_keep": "changes legal targets, loaded MB, immediate cost and next cache state",
+      "available_before_decision": "YES from catalog/config/current cache",
+      "currently_in_trigger_observation": "PARTIAL; bits yes, MB values no",
+      "derivable_from_existing_observation": "NO without external size/capacity metadata",
+      "classification": "PARTIALLY_REPRESENTED",
+      "source_evidence": ["src/decision/cache_configuration.py:293-315,1395-1404,1634-1637", "src/ppo_simple/primitive_control.py:395-398,420-435", "src/common/system_model.py:224-304"]
+    },
+    {
+      "value_relevant_variable": "candidate count/target/demand/cost/capacity/replica summary",
+      "where_used": "enumerator and candidate scorer",
+      "how_it_can_change_update_vs_keep": "changes conditional UPDATE outcome distribution and expected reward/next state",
+      "available_before_decision": "YES; enumerated before Trigger",
+      "currently_in_trigger_observation": "NO; only non-empty bit is provided",
+      "derivable_from_existing_observation": "NO from observation/mask",
+      "classification": "DIRECTLY_MISSING",
+      "source_evidence": ["src/ppo_simple/primitive_control.py:1269-1287,1324-1367,357-462", "src/decision/cache_configuration.py:1612-1694"]
+    },
+    {
+      "value_relevant_variable": "service computation and predicted input/cycles",
+      "where_used": "forecast scenario, Matching KKT and edge execution",
+      "how_it_can_change_update_vs_keep": "changes resource load, delay, energy and utility for services made available by UPDATE",
+      "available_before_decision": "YES for catalog/forecast summary; realized task values are not",
+      "currently_in_trigger_observation": "NO for numeric values/workload",
+      "derivable_from_existing_observation": "PARTIAL via service index only",
+      "classification": "PARTIALLY_REPRESENTED",
+      "source_evidence": ["src/decision/cache_configuration.py:293-315,342-345", "src/scenario/scenario_generator.py:603-669", "src/decision/task_allocation.py:2741-2822"]
+    },
+    {
+      "value_relevant_variable": "fixed role CPU/bandwidth/tx power",
+      "where_used": "KKT and edge feasibility/execution",
+      "how_it_can_change_update_vs_keep": "fixed role resources change feasibility and utility",
+      "available_before_decision": "YES",
+      "currently_in_trigger_observation": "NO as raw coordinate",
+      "derivable_from_existing_observation": "YES by fixed head/role/config mapping; not slot-varying",
+      "classification": "REDUNDANT_DERIVABLE",
+      "source_evidence": ["src/decision/task_allocation.py:1950-1967", "src/decision/cache_configuration.py:356-400", "configs/proposed/system_config.toml:159-246"]
+    },
+    {
+      "value_relevant_variable": "actual tasks and realized execution results",
+      "where_used": "execute_slot, Matching, KKT and reward",
+      "how_it_can_change_update_vs_keep": "defines realized branch outcome only after decision",
+      "available_before_decision": "NO",
+      "currently_in_trigger_observation": "NO",
+      "derivable_from_existing_observation": "NO",
+      "classification": "ILLEGAL_FUTURE_INFORMATION",
+      "source_evidence": ["src/ppo_simple/interface.py:1006-1026", "src/decision/slot_environment.py:231-259,448-460,523-597"]
+    },
+    {
+      "value_relevant_variable": "next-state critic value / exact candidate Q",
+      "where_used": "one-step branch bootstrap helper",
+      "how_it_can_change_update_vs_keep": "is a post-branch outcome, not a legal input feature",
+      "available_before_decision": "NO",
+      "currently_in_trigger_observation": "NO",
+      "derivable_from_existing_observation": "NO",
+      "classification": "ILLEGAL_FUTURE_INFORMATION / REJECTED",
+      "source_evidence": ["src/ppo_simple/cache_credit.py:331-448,488-505"]
+    }
+  ],
+  "candidate_information_audit": {
+    "candidates_enumerated_before_trigger": true,
+    "trigger_receives": "non-empty UPDATE mask only",
+    "candidate_count_seen_by_trigger": false,
+    "candidate_features_seen_by_trigger": false,
+    "candidate_policy_probabilities_seen_by_trigger": false,
+    "candidate_features_built_after_update_selection": true,
+    "TRIGGER_CANDIDATE_VALUE_CONTEXT_MISSING": "YES"
+  },
+  "feature_classification": {
+    "DIRECTLY_MISSING": [
+      "node-local forecast workload by service",
+      "TV local-cache hit/coverage summary aligned to predicted demand",
+      "UPDATE candidate policy summary of count, target/demand delta, cache load/cost and capacity/replica effect"
+    ],
+    "PARTIALLY_REPRESENTED": [
+      "vehicle/node geometry: global coordinates but no node-relative serviceability summary",
+      "service size and residual cache MB: bits exist but exact footprint does not",
+      "service computation parameters/workload: service index/popularity exist but cycles/input workload is absent"
+    ],
+    "ALREADY_PRESENT": [
+      "all current Cache node/service bits and other edge replicas",
+      "both current UAV positions",
+      "all vehicle predicted positions across 5 horizons",
+      "global per-service popularity across 5 horizons",
+      "horizon mask and normalized time-to-go"
+    ],
+    "ILLEGAL_FUTURE_INFORMATION": [
+      "actual task realization and realized matching/KKT/delay/energy/reward",
+      "actual task-ID-conditioned vehicle subset",
+      "branch Q / critic value after executing UPDATE or KEEP"
+    ],
+    "REDUNDANT_DERIVABLE": [
+      "fixed role/head identity and role-specific static CPU/bandwidth/tx-power configuration"
+    ]
+  },
+  "minimal_justified_feature_set": [
+    {
+      "feature_name": "node_local_predicted_service_workload[m,f,:]",
+      "source_variable": "step.scenario_slice[arrival, service_id, input_size, cpu_cycles, positions_xy] + context.local_cache + cache_nodes",
+      "suggested_dimension": "per cache head and service; request mass, input-bit workload and CPU-cycle workload channels, aggregated by predicted serviceability and optionally local-cache hit",
+      "PRE_DECISION_LEGAL": "YES",
+      "CURRENTLY_ABSENT": "YES",
+      "DIRECT_VALUE_PATH": "Forecast service opportunities change whether a newly cached service creates an edge target; input/cycles change Matching/KKT, delay, energy and utility; local cache changes feasible targets.",
+      "SOURCE_CODE_EVIDENCE": [
+        "src/decision/cache_configuration.py:1429-1552",
+        "src/scenario/scenario_generator.py:603-669",
+        "src/decision/task_allocation.py:227-294,2741-2822"
+      ]
+    },
+    {
+      "feature_name": "update_candidate_policy_summary[m]",
+      "source_variable": "update_candidates + candidate_features + candidate_probabilities",
+      "suggested_dimension": "candidate count plus candidate-policy-weighted per-service target/demand/usage deltas and scalar loaded-MB/cache-cost/capacity/replica summary",
+      "PRE_DECISION_LEGAL": "YES",
+      "CURRENTLY_ABSENT": "YES",
+      "DIRECT_VALUE_PATH": "Target controls updated services and next state; additions and eta/xi determine direct cache cost; candidate distribution defines the conditional UPDATE outcome. Uses forecast/catalog/state only, not exact Q/reward.",
+      "SOURCE_CODE_EVIDENCE": [
+        "src/ppo_simple/primitive_control.py:1269-1287,1324-1367,357-462",
+        "src/decision/cache_configuration.py:1612-1694",
+        "src/common/system_model.py:224-304",
+        "src/decision/slot_environment.py:843-917,523-597"
+      ]
+    }
+  ],
+  "TIER_B_PLAUSIBLE_BUT_INDIRECT": [
+    "Separate raw service catalog constants: their state-dependent size/workload effects can be represented in the two summaries.",
+    "Separate fixed per-head CPU/bandwidth/tx-power fields: role/head/config already fixes them and they are not dynamic state.",
+    "Fine-grained predicted link-rate margin: derivable proxy but less minimal/direct than node-local workload and candidate summary."
+  ],
+  "REJECTED_NOT_JUSTIFIED": [
+    "actual_tasks, realized task fields, matching/KKT outputs, delay, energy, reward and branch Q",
+    "raw future task draw instead of forecast expectations",
+    "duplicate global cache bits, predicted coordinates/popularity, or fixed head/role identity"
+  ],
+  "final": {
+    "CURRENT_TRIGGER_OBSERVATION_COMPLETE_FOR_CACHE_VALUE": "NO",
+    "NODE_LOCAL_VALUE_INFORMATION_MISSING": "YES",
+    "CANDIDATE_VALUE_CONTEXT_MISSING": "YES",
+    "RESOURCE_STATE_INFORMATION_MISSING": "YES",
+    "CACHE_COST_RELEVANT_INFORMATION_MISSING": "YES",
+    "DEMAND_LOCALIZATION_INFORMATION_MISSING": "YES",
+    "MINIMAL_JUSTIFIED_FEATURE_SET": [
+      "node_local_predicted_service_workload[m,f,:]",
+      "update_candidate_policy_summary[m]"
+    ],
+    "ACTUAL_TASKS_REQUIRED": "NO",
+    "FUTURE_INFORMATION_REQUIRED": "NO",
+    "TRIGGER_CANDIDATE_VALUE_CONTEXT_MISSING": "YES",
+    "resource_state_note": "Resource-state missing refers to forecast node/service workload and candidate storage/capacity/load summaries. Fixed role CPU, bandwidth and tx-power are determined by head/role/config and are not dynamic per-slot state."
+  },
+  "execution_boundary": {
+    "training_executed": "NO",
+    "backward_called": "NO",
+    "optimizer_step_calls": 0,
+    "validation_executed": "NO",
+    "test_executed": "NO",
+    "exact_q_branches_executed": 0,
+    "source_or_config_files_modified": "NO",
+    "temporary_scripts_created": 0,
+    "reports": [
+      "reports/cache_trigger_missing_predecision_feature_audit.md",
+      "reports/cache_trigger_missing_predecision_feature_audit.json"
+    ]
+  }
+}

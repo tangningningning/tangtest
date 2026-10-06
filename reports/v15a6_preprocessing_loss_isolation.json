@@ -1,0 +1,100 @@
+{
+  "experiment": "V15-A6 PREPROCESSING x LOSS-WEIGHTING ISOLATION",
+  "status": "BLOCKED_INPUT_MISSING",
+  "blocking_reason": "The exact 20041-20050 parity tensor and labels are absent. The preceding task report confirms the temporary dataset was deleted after that task. The saved report contains aggregate feature statistics and metadata only, which cannot reproduce the 997 individual observations/labels or verify the requested dataset hash.",
+  "required_dataset": {
+    "seeds": [
+      20041,
+      20042,
+      20043,
+      20044,
+      20045,
+      20046,
+      20047,
+      20048,
+      20049,
+      20050
+    ],
+    "state_count": 997,
+    "label_counts": {
+      "KEEP": 481,
+      "UPDATE": 491,
+      "TIE": 25
+    },
+    "expected_sha256": "56b3fddfe5adb94fccf882c370505d4168d802b87037d55775cc8ddaa52a0ed2",
+    "expected_prior_artifact": "runs/_tmp_v15a6_training_parity_check/frozen_parity_dataset.npz",
+    "artifact_found": false,
+    "dataset_hash_verified": false
+  },
+  "prior_report": "reports/v15a6_training_parity_check.json",
+  "protocol": {
+    "requested_conditions": [
+      {
+        "id": "E1",
+        "preprocessing": "RAW_400D",
+        "loss_weighting": "POOLED_CLASS_BALANCED"
+      },
+      {
+        "id": "E2",
+        "preprocessing": "STANDARDIZED_400D",
+        "loss_weighting": "POOLED_CLASS_BALANCED"
+      },
+      {
+        "id": "E3",
+        "preprocessing": "RAW_400D",
+        "loss_weighting": "REALIZATION_CLASS_BALANCED"
+      },
+      {
+        "id": "E4",
+        "preprocessing": "STANDARDIZED_400D",
+        "loss_weighting": "REALIZATION_CLASS_BALANCED"
+      }
+    ],
+    "architecture": "400-128-SiLU-128-SiLU-2",
+    "initialization": "A6; final Linear weight and bias zero",
+    "optimizer": "Adam",
+    "learning_rate": 0.001,
+    "epochs": 50,
+    "max_grad_norm": 0.5,
+    "seed": 27005,
+    "tie_rows_in_loss_or_ba": false,
+    "tie_rows_in_standardization_fit": true
+  },
+  "results": {
+    "RAW_POOLED_BA": null,
+    "RAW_POOLED_KEEP_RECALL": null,
+    "RAW_POOLED_UPDATE_RECALL": null,
+    "STD_POOLED_BA": null,
+    "STD_POOLED_KEEP_RECALL": null,
+    "STD_POOLED_UPDATE_RECALL": null,
+    "RAW_REALIZATION_BALANCED_BA": null,
+    "RAW_REALIZATION_BALANCED_KEEP_RECALL": null,
+    "RAW_REALIZATION_BALANCED_UPDATE_RECALL": null,
+    "STD_REALIZATION_BALANCED_BA": null,
+    "STD_REALIZATION_BALANCED_KEEP_RECALL": null,
+    "STD_REALIZATION_BALANCED_UPDATE_RECALL": null,
+    "STANDARDIZATION_EFFECT_POOLED": null,
+    "STANDARDIZATION_EFFECT_REALIZATION": null,
+    "LOSS_WEIGHTING_EFFECT_RAW": null,
+    "LOSS_WEIGHTING_EFFECT_STD": null,
+    "STANDARDIZATION_IS_PRIMARY_A6_TRAINING_FIX": "NOT_EVALUATED",
+    "REALIZATION_BALANCING_DEGRADES_SEEN_FIT": "NOT_EVALUATED",
+    "RECOMMENDED_TRIGGER_TRAINING": "NOT_DETERMINED",
+    "NEXT_STEP": "Restore the exact frozen_parity_dataset.npz matching the expected hash, then run the four requested fits without rollout."
+  },
+  "execution": {
+    "four_classifier_fits_run": false,
+    "environment_rollout_run": false,
+    "new_realization_generated": false,
+    "formal_algorithm_modified": false,
+    "formal_training_or_rl_run": false,
+    "validation_or_test_run": false,
+    "git_add_commit_push": false
+  },
+  "cleanup": {
+    "temporary_parity_dataset_found": false,
+    "temporary_scripts_found": false,
+    "pycache_directories_found": false,
+    "pyc_files_found": false
+  }
+}

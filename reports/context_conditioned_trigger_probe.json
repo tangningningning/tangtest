@@ -1,0 +1,6599 @@
+{
+  "experiment": "NORMALIZED CONTEXT-CONDITIONED CACHE TRIGGER PROBE",
+  "status": "PASS",
+  "input_report": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\reports\\expected_option_trigger_teacher_probe.json",
+  "dataset": {
+    "realizations": [
+      20041,
+      20042,
+      20043,
+      20044,
+      20045,
+      20046,
+      20047,
+      20048,
+      20049,
+      20050
+    ],
+    "state_count": 200,
+    "per_realization_state_count": {
+      "20041": 20,
+      "20042": 20,
+      "20043": 20,
+      "20044": 20,
+      "20045": 20,
+      "20046": 20,
+      "20047": 20,
+      "20048": 20,
+      "20049": 20,
+      "20050": 20
+    },
+    "state_identity_sha256": "b4849d19be0c0a4d38ed36945a36f6a8591cfd36f29bd35767f6d314ba9212a9",
+    "state_identities_preserved": true,
+    "teacher_values_reused_without_recomputation": [
+      "DELTA_EXPECTED",
+      "UNCERTAINTY_MARGIN",
+      "EXPECTED_LABEL",
+      "single_sample_repeats"
+    ],
+    "same_fold_assignment_as_previous_report": true,
+    "folds": [
+      {
+        "fold": 1,
+        "train_realizations": [
+          20041,
+          20042,
+          20043,
+          20044,
+          20047,
+          20048,
+          20049,
+          20050
+        ],
+        "test_realizations": [
+          20045,
+          20046
+        ]
+      },
+      {
+        "fold": 2,
+        "train_realizations": [
+          20041,
+          20042,
+          20043,
+          20045,
+          20046,
+          20047,
+          20048,
+          20050
+        ],
+        "test_realizations": [
+          20044,
+          20049
+        ]
+      },
+      {
+        "fold": 3,
+        "train_realizations": [
+          20042,
+          20043,
+          20044,
+          20045,
+          20046,
+          20047,
+          20049,
+          20050
+        ],
+        "test_realizations": [
+          20041,
+          20048
+        ]
+      },
+      {
+        "fold": 4,
+        "train_realizations": [
+          20041,
+          20044,
+          20045,
+          20046,
+          20047,
+          20048,
+          20049,
+          20050
+        ],
+        "test_realizations": [
+          20042,
+          20043
+        ]
+      },
+      {
+        "fold": 5,
+        "train_realizations": [
+          20041,
+          20042,
+          20043,
+          20044,
+          20045,
+          20046,
+          20048,
+          20049
+        ],
+        "test_realizations": [
+          20047,
+          20050
+        ]
+      }
+    ]
+  },
+  "reconstruction": {
+    "CONTEXT_RECONSTRUCTION_PASS": "YES",
+    "MAX_OBSERVATION_ABS_DIFF": 0.0,
+    "per_state_max_abs_diff": [
+      {
+        "episode_seed": 20041,
+        "slot": 13,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 29,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 43,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 57,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 72,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 86,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 98,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 113,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 126,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 140,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 156,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 170,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 198,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 213,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 227,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 242,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 256,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 270,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20041,
+        "slot": 285,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 13,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 28,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 42,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 57,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 71,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 87,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 102,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 114,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 128,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 144,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 155,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 169,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 201,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 213,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 228,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 243,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 254,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 269,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20042,
+        "slot": 285,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 14,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 29,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 44,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 56,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 71,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 87,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 101,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 114,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 130,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 142,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 156,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 171,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 198,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 213,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 225,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 241,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 257,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 272,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20043,
+        "slot": 284,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 14,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 30,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 44,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 56,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 72,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 88,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 99,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 115,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 126,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 143,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 156,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 169,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 198,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 213,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 227,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 243,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 256,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 271,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20044,
+        "slot": 284,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 14,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 30,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 42,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 57,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 72,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 85,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 102,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 114,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 128,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 144,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 157,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 170,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 197,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 214,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 228,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 241,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 254,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 269,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20045,
+        "slot": 285,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 14,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 27,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 42,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 58,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 73,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 86,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 102,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 115,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 129,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 143,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 158,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 171,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 199,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 212,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 227,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 241,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 258,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 270,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20046,
+        "slot": 284,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 16,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 27,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 42,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 56,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 74,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 86,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 98,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 114,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 126,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 143,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 157,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 171,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 186,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 199,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 214,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 229,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 240,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 256,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 269,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20047,
+        "slot": 283,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 14,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 27,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 44,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 58,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 72,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 87,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 100,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 114,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 126,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 141,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 156,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 171,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 183,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 199,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 213,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 226,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 241,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 254,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 272,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20048,
+        "slot": 285,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 15,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 30,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 42,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 57,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 74,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 85,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 102,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 114,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 129,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 143,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 158,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 169,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 201,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 212,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 225,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 241,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 258,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 270,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20049,
+        "slot": 282,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 15,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 30,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 42,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 58,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 74,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 85,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 98,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 113,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 128,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 142,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 156,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 173,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 185,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 199,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 214,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 225,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 244,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 256,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 270,
+        "max_abs_diff": 0.0
+      },
+      {
+        "episode_seed": 20050,
+        "slot": 286,
+        "max_abs_diff": 0.0
+      }
+    ],
+    "observation_state_slices": {
+      "cache_slice": [
+        0,
+        90
+      ],
+      "uav_position_slice": [
+        90,
+        94
+      ]
+    },
+    "method": "Restored predecision Cache/UAV slices from the saved observation; rebuilt formal forecast, popularity, horizon-mask and time fields from the same realization prediction artifacts. No policy, environment action, teacher or counterfactual branch was run.",
+    "max_diff_threshold": 1e-06,
+    "formal_policy_rollout_executed": false
+  },
+  "history": {
+    "H": 5,
+    "source": "prediction.vehicle.horizon=5; prediction.history_length_slots is not defined in this checkout",
+    "history_slots": "t-H through t-1, inclusive",
+    "popularity_shift_uses_previous_boundary": "t-H-1 through t-1, all strictly before t"
+  },
+  "dimensions": {
+    "STATE_DIM": 400,
+    "CONTEXT_REQUEST_LOAD_DIM": 74,
+    "CONTEXT_FULL_DIM": 82,
+    "GROUP_A_DIM": 65,
+    "GROUP_B_DIM": 8,
+    "GROUP_C_DIM": 8,
+    "GROUP_D_DIM": 1,
+    "MODEL_INPUT_DIMS": {
+      "STATE": 400,
+      "SR": 474,
+      "SRC": 482,
+      "CONTEXT_ONLY": 82
+    },
+    "CONTEXT_FEATURE_NAMES": [
+      "observed_popularity_lag5_service0",
+      "observed_popularity_lag5_service1",
+      "observed_popularity_lag5_service2",
+      "observed_popularity_lag5_service3",
+      "observed_popularity_lag5_service4",
+      "observed_popularity_lag5_service5",
+      "observed_popularity_lag5_service6",
+      "observed_popularity_lag5_service7",
+      "observed_popularity_lag5_service8",
+      "observed_popularity_lag5_service9",
+      "observed_popularity_lag4_service0",
+      "observed_popularity_lag4_service1",
+      "observed_popularity_lag4_service2",
+      "observed_popularity_lag4_service3",
+      "observed_popularity_lag4_service4",
+      "observed_popularity_lag4_service5",
+      "observed_popularity_lag4_service6",
+      "observed_popularity_lag4_service7",
+      "observed_popularity_lag4_service8",
+      "observed_popularity_lag4_service9",
+      "observed_popularity_lag3_service0",
+      "observed_popularity_lag3_service1",
+      "observed_popularity_lag3_service2",
+      "observed_popularity_lag3_service3",
+      "observed_popularity_lag3_service4",
+      "observed_popularity_lag3_service5",
+      "observed_popularity_lag3_service6",
+      "observed_popularity_lag3_service7",
+      "observed_popularity_lag3_service8",
+      "observed_popularity_lag3_service9",
+      "observed_popularity_lag2_service0",
+      "observed_popularity_lag2_service1",
+      "observed_popularity_lag2_service2",
+      "observed_popularity_lag2_service3",
+      "observed_popularity_lag2_service4",
+      "observed_popularity_lag2_service5",
+      "observed_popularity_lag2_service6",
+      "observed_popularity_lag2_service7",
+      "observed_popularity_lag2_service8",
+      "observed_popularity_lag2_service9",
+      "observed_popularity_lag1_service0",
+      "observed_popularity_lag1_service1",
+      "observed_popularity_lag1_service2",
+      "observed_popularity_lag1_service3",
+      "observed_popularity_lag1_service4",
+      "observed_popularity_lag1_service5",
+      "observed_popularity_lag1_service6",
+      "observed_popularity_lag1_service7",
+      "observed_popularity_lag1_service8",
+      "observed_popularity_lag1_service9",
+      "popularity_entropy_mean",
+      "popularity_entropy_std",
+      "popularity_shift_l1_mean",
+      "top1_popularity_mean",
+      "top1_popularity_std",
+      "recent_request_distribution_service0",
+      "recent_request_distribution_service1",
+      "recent_request_distribution_service2",
+      "recent_request_distribution_service3",
+      "recent_request_distribution_service4",
+      "recent_request_distribution_service5",
+      "recent_request_distribution_service6",
+      "recent_request_distribution_service7",
+      "recent_request_distribution_service8",
+      "recent_request_distribution_service9",
+      "arrival_rate_mean",
+      "arrival_rate_std",
+      "active_task_count_mean",
+      "active_task_count_std",
+      "input_bits_mean_active",
+      "input_bits_std_active",
+      "cpu_cycles_mean_active",
+      "cpu_cycles_std_active",
+      "mean_vehicle_speed",
+      "std_vehicle_speed",
+      "mean_speed_change",
+      "vehicle_centroid_x",
+      "vehicle_centroid_y",
+      "vehicle_spread_x",
+      "vehicle_spread_y",
+      "mean_interframe_displacement",
+      "episode_progress"
+    ],
+    "REMOVED_SUSPECT_REALIZATION_CONSTANT_FEATURES": []
+  },
+  "context_definition": {
+    "group_A": [
+      "observed_popularity_lag5_service0",
+      "observed_popularity_lag5_service1",
+      "observed_popularity_lag5_service2",
+      "observed_popularity_lag5_service3",
+      "observed_popularity_lag5_service4",
+      "observed_popularity_lag5_service5",
+      "observed_popularity_lag5_service6",
+      "observed_popularity_lag5_service7",
+      "observed_popularity_lag5_service8",
+      "observed_popularity_lag5_service9",
+      "observed_popularity_lag4_service0",
+      "observed_popularity_lag4_service1",
+      "observed_popularity_lag4_service2",
+      "observed_popularity_lag4_service3",
+      "observed_popularity_lag4_service4",
+      "observed_popularity_lag4_service5",
+      "observed_popularity_lag4_service6",
+      "observed_popularity_lag4_service7",
+      "observed_popularity_lag4_service8",
+      "observed_popularity_lag4_service9",
+      "observed_popularity_lag3_service0",
+      "observed_popularity_lag3_service1",
+      "observed_popularity_lag3_service2",
+      "observed_popularity_lag3_service3",
+      "observed_popularity_lag3_service4",
+      "observed_popularity_lag3_service5",
+      "observed_popularity_lag3_service6",
+      "observed_popularity_lag3_service7",
+      "observed_popularity_lag3_service8",
+      "observed_popularity_lag3_service9",
+      "observed_popularity_lag2_service0",
+      "observed_popularity_lag2_service1",
+      "observed_popularity_lag2_service2",
+      "observed_popularity_lag2_service3",
+      "observed_popularity_lag2_service4",
+      "observed_popularity_lag2_service5",
+      "observed_popularity_lag2_service6",
+      "observed_popularity_lag2_service7",
+      "observed_popularity_lag2_service8",
+      "observed_popularity_lag2_service9",
+      "observed_popularity_lag1_service0",
+      "observed_popularity_lag1_service1",
+      "observed_popularity_lag1_service2",
+      "observed_popularity_lag1_service3",
+      "observed_popularity_lag1_service4",
+      "observed_popularity_lag1_service5",
+      "observed_popularity_lag1_service6",
+      "observed_popularity_lag1_service7",
+      "observed_popularity_lag1_service8",
+      "observed_popularity_lag1_service9",
+      "popularity_entropy_mean",
+      "popularity_entropy_std",
+      "popularity_shift_l1_mean",
+      "top1_popularity_mean",
+      "top1_popularity_std",
+      "recent_request_distribution_service0",
+      "recent_request_distribution_service1",
+      "recent_request_distribution_service2",
+      "recent_request_distribution_service3",
+      "recent_request_distribution_service4",
+      "recent_request_distribution_service5",
+      "recent_request_distribution_service6",
+      "recent_request_distribution_service7",
+      "recent_request_distribution_service8",
+      "recent_request_distribution_service9"
+    ],
+    "group_B": [
+      "arrival_rate_mean",
+      "arrival_rate_std",
+      "active_task_count_mean",
+      "active_task_count_std",
+      "input_bits_mean_active",
+      "input_bits_std_active",
+      "cpu_cycles_mean_active",
+      "cpu_cycles_std_active"
+    ],
+    "group_C": [
+      "mean_vehicle_speed",
+      "std_vehicle_speed",
+      "mean_speed_change",
+      "vehicle_centroid_x",
+      "vehicle_centroid_y",
+      "vehicle_spread_x",
+      "vehicle_spread_y",
+      "mean_interframe_displacement"
+    ],
+    "group_D": [
+      "episode_progress"
+    ],
+    "MOBILITY_CONTEXT_FIELDS_USED": [
+      "mean_vehicle_speed",
+      "std_vehicle_speed",
+      "mean_speed_change",
+      "vehicle_centroid_x",
+      "vehicle_centroid_y",
+      "vehicle_spread_x",
+      "vehicle_spread_y",
+      "mean_interframe_displacement"
+    ],
+    "mobility_source_and_online_semantics": "Only vehicle_predictions.csv horizon=0 x_pred/y_pred at past origins t-H..t-1; derives speed from adjacent past estimates. Does not use trajectory.csv ground truth or x_true/y_true, nor current/future-origin predictions.",
+    "task_history_source": "tasks.csv fields arrival, service_id, input_size, cpu_cycles at past slots only",
+    "popularity_history_source": "popularity.csv/popularity_history.csv rho_obs at past formal slots only",
+    "episode_progress": "slot / episode_slots"
+  },
+  "leakage_audit": {
+    "future_leakage_pass": true,
+    "context_max_source_slot_minus_current_slot": -1,
+    "mobility_max_target_slot_minus_current_slot": -1,
+    "current_true_task_requests_used": false,
+    "future_task_requests_used": false,
+    "future_true_popularity_used": false,
+    "future_true_vehicle_positions_used": false,
+    "episode_seed_or_realization_id_in_model_features": false,
+    "source_slot_audit_per_state": [
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 8,
+        "history_slots_max_inclusive": 12,
+        "max_source_slot": 12,
+        "slot": 13,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 7,
+        "mobility_source_origins": [
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "mobility_max_observation_cutoff_slot": 11,
+        "mobility_max_target_slot": 12
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 24,
+        "history_slots_max_inclusive": 28,
+        "max_source_slot": 28,
+        "slot": 29,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 23,
+        "mobility_source_origins": [
+          24,
+          25,
+          26,
+          27,
+          28
+        ],
+        "mobility_max_observation_cutoff_slot": 27,
+        "mobility_max_target_slot": 28
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 38,
+        "history_slots_max_inclusive": 42,
+        "max_source_slot": 42,
+        "slot": 43,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 37,
+        "mobility_source_origins": [
+          38,
+          39,
+          40,
+          41,
+          42
+        ],
+        "mobility_max_observation_cutoff_slot": 41,
+        "mobility_max_target_slot": 42
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 52,
+        "history_slots_max_inclusive": 56,
+        "max_source_slot": 56,
+        "slot": 57,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 51,
+        "mobility_source_origins": [
+          52,
+          53,
+          54,
+          55,
+          56
+        ],
+        "mobility_max_observation_cutoff_slot": 55,
+        "mobility_max_target_slot": 56
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 67,
+        "history_slots_max_inclusive": 71,
+        "max_source_slot": 71,
+        "slot": 72,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 66,
+        "mobility_source_origins": [
+          67,
+          68,
+          69,
+          70,
+          71
+        ],
+        "mobility_max_observation_cutoff_slot": 70,
+        "mobility_max_target_slot": 71
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 81,
+        "history_slots_max_inclusive": 85,
+        "max_source_slot": 85,
+        "slot": 86,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 80,
+        "mobility_source_origins": [
+          81,
+          82,
+          83,
+          84,
+          85
+        ],
+        "mobility_max_observation_cutoff_slot": 84,
+        "mobility_max_target_slot": 85
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 93,
+        "history_slots_max_inclusive": 97,
+        "max_source_slot": 97,
+        "slot": 98,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 92,
+        "mobility_source_origins": [
+          93,
+          94,
+          95,
+          96,
+          97
+        ],
+        "mobility_max_observation_cutoff_slot": 96,
+        "mobility_max_target_slot": 97
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 108,
+        "history_slots_max_inclusive": 112,
+        "max_source_slot": 112,
+        "slot": 113,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 107,
+        "mobility_source_origins": [
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "mobility_max_observation_cutoff_slot": 111,
+        "mobility_max_target_slot": 112
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 121,
+        "history_slots_max_inclusive": 125,
+        "max_source_slot": 125,
+        "slot": 126,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 120,
+        "mobility_source_origins": [
+          121,
+          122,
+          123,
+          124,
+          125
+        ],
+        "mobility_max_observation_cutoff_slot": 124,
+        "mobility_max_target_slot": 125
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 135,
+        "history_slots_max_inclusive": 139,
+        "max_source_slot": 139,
+        "slot": 140,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 134,
+        "mobility_source_origins": [
+          135,
+          136,
+          137,
+          138,
+          139
+        ],
+        "mobility_max_observation_cutoff_slot": 138,
+        "mobility_max_target_slot": 139
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 151,
+        "history_slots_max_inclusive": 155,
+        "max_source_slot": 155,
+        "slot": 156,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 150,
+        "mobility_source_origins": [
+          151,
+          152,
+          153,
+          154,
+          155
+        ],
+        "mobility_max_observation_cutoff_slot": 154,
+        "mobility_max_target_slot": 155
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 165,
+        "history_slots_max_inclusive": 169,
+        "max_source_slot": 169,
+        "slot": 170,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 164,
+        "mobility_source_origins": [
+          165,
+          166,
+          167,
+          168,
+          169
+        ],
+        "mobility_max_observation_cutoff_slot": 168,
+        "mobility_max_target_slot": 169
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 193,
+        "history_slots_max_inclusive": 197,
+        "max_source_slot": 197,
+        "slot": 198,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 192,
+        "mobility_source_origins": [
+          193,
+          194,
+          195,
+          196,
+          197
+        ],
+        "mobility_max_observation_cutoff_slot": 196,
+        "mobility_max_target_slot": 197
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 208,
+        "history_slots_max_inclusive": 212,
+        "max_source_slot": 212,
+        "slot": 213,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 207,
+        "mobility_source_origins": [
+          208,
+          209,
+          210,
+          211,
+          212
+        ],
+        "mobility_max_observation_cutoff_slot": 211,
+        "mobility_max_target_slot": 212
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 222,
+        "history_slots_max_inclusive": 226,
+        "max_source_slot": 226,
+        "slot": 227,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 221,
+        "mobility_source_origins": [
+          222,
+          223,
+          224,
+          225,
+          226
+        ],
+        "mobility_max_observation_cutoff_slot": 225,
+        "mobility_max_target_slot": 226
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 237,
+        "history_slots_max_inclusive": 241,
+        "max_source_slot": 241,
+        "slot": 242,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 236,
+        "mobility_source_origins": [
+          237,
+          238,
+          239,
+          240,
+          241
+        ],
+        "mobility_max_observation_cutoff_slot": 240,
+        "mobility_max_target_slot": 241
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 251,
+        "history_slots_max_inclusive": 255,
+        "max_source_slot": 255,
+        "slot": 256,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 250,
+        "mobility_source_origins": [
+          251,
+          252,
+          253,
+          254,
+          255
+        ],
+        "mobility_max_observation_cutoff_slot": 254,
+        "mobility_max_target_slot": 255
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 265,
+        "history_slots_max_inclusive": 269,
+        "max_source_slot": 269,
+        "slot": 270,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 264,
+        "mobility_source_origins": [
+          265,
+          266,
+          267,
+          268,
+          269
+        ],
+        "mobility_max_observation_cutoff_slot": 268,
+        "mobility_max_target_slot": 269
+      },
+      {
+        "episode_seed_lookup_only": 20041,
+        "history_slots_min_inclusive": 280,
+        "history_slots_max_inclusive": 284,
+        "max_source_slot": 284,
+        "slot": 285,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 279,
+        "mobility_source_origins": [
+          280,
+          281,
+          282,
+          283,
+          284
+        ],
+        "mobility_max_observation_cutoff_slot": 283,
+        "mobility_max_target_slot": 284
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 8,
+        "history_slots_max_inclusive": 12,
+        "max_source_slot": 12,
+        "slot": 13,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 7,
+        "mobility_source_origins": [
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "mobility_max_observation_cutoff_slot": 11,
+        "mobility_max_target_slot": 12
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 23,
+        "history_slots_max_inclusive": 27,
+        "max_source_slot": 27,
+        "slot": 28,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 22,
+        "mobility_source_origins": [
+          23,
+          24,
+          25,
+          26,
+          27
+        ],
+        "mobility_max_observation_cutoff_slot": 26,
+        "mobility_max_target_slot": 27
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 37,
+        "history_slots_max_inclusive": 41,
+        "max_source_slot": 41,
+        "slot": 42,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 36,
+        "mobility_source_origins": [
+          37,
+          38,
+          39,
+          40,
+          41
+        ],
+        "mobility_max_observation_cutoff_slot": 40,
+        "mobility_max_target_slot": 41
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 52,
+        "history_slots_max_inclusive": 56,
+        "max_source_slot": 56,
+        "slot": 57,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 51,
+        "mobility_source_origins": [
+          52,
+          53,
+          54,
+          55,
+          56
+        ],
+        "mobility_max_observation_cutoff_slot": 55,
+        "mobility_max_target_slot": 56
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 66,
+        "history_slots_max_inclusive": 70,
+        "max_source_slot": 70,
+        "slot": 71,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 65,
+        "mobility_source_origins": [
+          66,
+          67,
+          68,
+          69,
+          70
+        ],
+        "mobility_max_observation_cutoff_slot": 69,
+        "mobility_max_target_slot": 70
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 82,
+        "history_slots_max_inclusive": 86,
+        "max_source_slot": 86,
+        "slot": 87,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 81,
+        "mobility_source_origins": [
+          82,
+          83,
+          84,
+          85,
+          86
+        ],
+        "mobility_max_observation_cutoff_slot": 85,
+        "mobility_max_target_slot": 86
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 97,
+        "history_slots_max_inclusive": 101,
+        "max_source_slot": 101,
+        "slot": 102,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 96,
+        "mobility_source_origins": [
+          97,
+          98,
+          99,
+          100,
+          101
+        ],
+        "mobility_max_observation_cutoff_slot": 100,
+        "mobility_max_target_slot": 101
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 109,
+        "history_slots_max_inclusive": 113,
+        "max_source_slot": 113,
+        "slot": 114,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 108,
+        "mobility_source_origins": [
+          109,
+          110,
+          111,
+          112,
+          113
+        ],
+        "mobility_max_observation_cutoff_slot": 112,
+        "mobility_max_target_slot": 113
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 123,
+        "history_slots_max_inclusive": 127,
+        "max_source_slot": 127,
+        "slot": 128,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 122,
+        "mobility_source_origins": [
+          123,
+          124,
+          125,
+          126,
+          127
+        ],
+        "mobility_max_observation_cutoff_slot": 126,
+        "mobility_max_target_slot": 127
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 139,
+        "history_slots_max_inclusive": 143,
+        "max_source_slot": 143,
+        "slot": 144,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 138,
+        "mobility_source_origins": [
+          139,
+          140,
+          141,
+          142,
+          143
+        ],
+        "mobility_max_observation_cutoff_slot": 142,
+        "mobility_max_target_slot": 143
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 150,
+        "history_slots_max_inclusive": 154,
+        "max_source_slot": 154,
+        "slot": 155,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 149,
+        "mobility_source_origins": [
+          150,
+          151,
+          152,
+          153,
+          154
+        ],
+        "mobility_max_observation_cutoff_slot": 153,
+        "mobility_max_target_slot": 154
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 164,
+        "history_slots_max_inclusive": 168,
+        "max_source_slot": 168,
+        "slot": 169,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 163,
+        "mobility_source_origins": [
+          164,
+          165,
+          166,
+          167,
+          168
+        ],
+        "mobility_max_observation_cutoff_slot": 167,
+        "mobility_max_target_slot": 168
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 196,
+        "history_slots_max_inclusive": 200,
+        "max_source_slot": 200,
+        "slot": 201,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 195,
+        "mobility_source_origins": [
+          196,
+          197,
+          198,
+          199,
+          200
+        ],
+        "mobility_max_observation_cutoff_slot": 199,
+        "mobility_max_target_slot": 200
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 208,
+        "history_slots_max_inclusive": 212,
+        "max_source_slot": 212,
+        "slot": 213,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 207,
+        "mobility_source_origins": [
+          208,
+          209,
+          210,
+          211,
+          212
+        ],
+        "mobility_max_observation_cutoff_slot": 211,
+        "mobility_max_target_slot": 212
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 223,
+        "history_slots_max_inclusive": 227,
+        "max_source_slot": 227,
+        "slot": 228,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 222,
+        "mobility_source_origins": [
+          223,
+          224,
+          225,
+          226,
+          227
+        ],
+        "mobility_max_observation_cutoff_slot": 226,
+        "mobility_max_target_slot": 227
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 238,
+        "history_slots_max_inclusive": 242,
+        "max_source_slot": 242,
+        "slot": 243,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 237,
+        "mobility_source_origins": [
+          238,
+          239,
+          240,
+          241,
+          242
+        ],
+        "mobility_max_observation_cutoff_slot": 241,
+        "mobility_max_target_slot": 242
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 249,
+        "history_slots_max_inclusive": 253,
+        "max_source_slot": 253,
+        "slot": 254,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 248,
+        "mobility_source_origins": [
+          249,
+          250,
+          251,
+          252,
+          253
+        ],
+        "mobility_max_observation_cutoff_slot": 252,
+        "mobility_max_target_slot": 253
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 264,
+        "history_slots_max_inclusive": 268,
+        "max_source_slot": 268,
+        "slot": 269,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 263,
+        "mobility_source_origins": [
+          264,
+          265,
+          266,
+          267,
+          268
+        ],
+        "mobility_max_observation_cutoff_slot": 267,
+        "mobility_max_target_slot": 268
+      },
+      {
+        "episode_seed_lookup_only": 20042,
+        "history_slots_min_inclusive": 280,
+        "history_slots_max_inclusive": 284,
+        "max_source_slot": 284,
+        "slot": 285,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 279,
+        "mobility_source_origins": [
+          280,
+          281,
+          282,
+          283,
+          284
+        ],
+        "mobility_max_observation_cutoff_slot": 283,
+        "mobility_max_target_slot": 284
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 9,
+        "history_slots_max_inclusive": 13,
+        "max_source_slot": 13,
+        "slot": 14,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 8,
+        "mobility_source_origins": [
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "mobility_max_observation_cutoff_slot": 12,
+        "mobility_max_target_slot": 13
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 24,
+        "history_slots_max_inclusive": 28,
+        "max_source_slot": 28,
+        "slot": 29,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 23,
+        "mobility_source_origins": [
+          24,
+          25,
+          26,
+          27,
+          28
+        ],
+        "mobility_max_observation_cutoff_slot": 27,
+        "mobility_max_target_slot": 28
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 39,
+        "history_slots_max_inclusive": 43,
+        "max_source_slot": 43,
+        "slot": 44,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 38,
+        "mobility_source_origins": [
+          39,
+          40,
+          41,
+          42,
+          43
+        ],
+        "mobility_max_observation_cutoff_slot": 42,
+        "mobility_max_target_slot": 43
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 51,
+        "history_slots_max_inclusive": 55,
+        "max_source_slot": 55,
+        "slot": 56,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 50,
+        "mobility_source_origins": [
+          51,
+          52,
+          53,
+          54,
+          55
+        ],
+        "mobility_max_observation_cutoff_slot": 54,
+        "mobility_max_target_slot": 55
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 66,
+        "history_slots_max_inclusive": 70,
+        "max_source_slot": 70,
+        "slot": 71,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 65,
+        "mobility_source_origins": [
+          66,
+          67,
+          68,
+          69,
+          70
+        ],
+        "mobility_max_observation_cutoff_slot": 69,
+        "mobility_max_target_slot": 70
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 82,
+        "history_slots_max_inclusive": 86,
+        "max_source_slot": 86,
+        "slot": 87,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 81,
+        "mobility_source_origins": [
+          82,
+          83,
+          84,
+          85,
+          86
+        ],
+        "mobility_max_observation_cutoff_slot": 85,
+        "mobility_max_target_slot": 86
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 96,
+        "history_slots_max_inclusive": 100,
+        "max_source_slot": 100,
+        "slot": 101,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 95,
+        "mobility_source_origins": [
+          96,
+          97,
+          98,
+          99,
+          100
+        ],
+        "mobility_max_observation_cutoff_slot": 99,
+        "mobility_max_target_slot": 100
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 109,
+        "history_slots_max_inclusive": 113,
+        "max_source_slot": 113,
+        "slot": 114,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 108,
+        "mobility_source_origins": [
+          109,
+          110,
+          111,
+          112,
+          113
+        ],
+        "mobility_max_observation_cutoff_slot": 112,
+        "mobility_max_target_slot": 113
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 125,
+        "history_slots_max_inclusive": 129,
+        "max_source_slot": 129,
+        "slot": 130,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 124,
+        "mobility_source_origins": [
+          125,
+          126,
+          127,
+          128,
+          129
+        ],
+        "mobility_max_observation_cutoff_slot": 128,
+        "mobility_max_target_slot": 129
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 137,
+        "history_slots_max_inclusive": 141,
+        "max_source_slot": 141,
+        "slot": 142,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 136,
+        "mobility_source_origins": [
+          137,
+          138,
+          139,
+          140,
+          141
+        ],
+        "mobility_max_observation_cutoff_slot": 140,
+        "mobility_max_target_slot": 141
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 151,
+        "history_slots_max_inclusive": 155,
+        "max_source_slot": 155,
+        "slot": 156,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 150,
+        "mobility_source_origins": [
+          151,
+          152,
+          153,
+          154,
+          155
+        ],
+        "mobility_max_observation_cutoff_slot": 154,
+        "mobility_max_target_slot": 155
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 166,
+        "history_slots_max_inclusive": 170,
+        "max_source_slot": 170,
+        "slot": 171,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 165,
+        "mobility_source_origins": [
+          166,
+          167,
+          168,
+          169,
+          170
+        ],
+        "mobility_max_observation_cutoff_slot": 169,
+        "mobility_max_target_slot": 170
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 193,
+        "history_slots_max_inclusive": 197,
+        "max_source_slot": 197,
+        "slot": 198,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 192,
+        "mobility_source_origins": [
+          193,
+          194,
+          195,
+          196,
+          197
+        ],
+        "mobility_max_observation_cutoff_slot": 196,
+        "mobility_max_target_slot": 197
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 208,
+        "history_slots_max_inclusive": 212,
+        "max_source_slot": 212,
+        "slot": 213,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 207,
+        "mobility_source_origins": [
+          208,
+          209,
+          210,
+          211,
+          212
+        ],
+        "mobility_max_observation_cutoff_slot": 211,
+        "mobility_max_target_slot": 212
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 220,
+        "history_slots_max_inclusive": 224,
+        "max_source_slot": 224,
+        "slot": 225,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 219,
+        "mobility_source_origins": [
+          220,
+          221,
+          222,
+          223,
+          224
+        ],
+        "mobility_max_observation_cutoff_slot": 223,
+        "mobility_max_target_slot": 224
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 236,
+        "history_slots_max_inclusive": 240,
+        "max_source_slot": 240,
+        "slot": 241,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 235,
+        "mobility_source_origins": [
+          236,
+          237,
+          238,
+          239,
+          240
+        ],
+        "mobility_max_observation_cutoff_slot": 239,
+        "mobility_max_target_slot": 240
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 252,
+        "history_slots_max_inclusive": 256,
+        "max_source_slot": 256,
+        "slot": 257,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 251,
+        "mobility_source_origins": [
+          252,
+          253,
+          254,
+          255,
+          256
+        ],
+        "mobility_max_observation_cutoff_slot": 255,
+        "mobility_max_target_slot": 256
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 267,
+        "history_slots_max_inclusive": 271,
+        "max_source_slot": 271,
+        "slot": 272,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 266,
+        "mobility_source_origins": [
+          267,
+          268,
+          269,
+          270,
+          271
+        ],
+        "mobility_max_observation_cutoff_slot": 270,
+        "mobility_max_target_slot": 271
+      },
+      {
+        "episode_seed_lookup_only": 20043,
+        "history_slots_min_inclusive": 279,
+        "history_slots_max_inclusive": 283,
+        "max_source_slot": 283,
+        "slot": 284,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 278,
+        "mobility_source_origins": [
+          279,
+          280,
+          281,
+          282,
+          283
+        ],
+        "mobility_max_observation_cutoff_slot": 282,
+        "mobility_max_target_slot": 283
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 9,
+        "history_slots_max_inclusive": 13,
+        "max_source_slot": 13,
+        "slot": 14,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 8,
+        "mobility_source_origins": [
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "mobility_max_observation_cutoff_slot": 12,
+        "mobility_max_target_slot": 13
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 25,
+        "history_slots_max_inclusive": 29,
+        "max_source_slot": 29,
+        "slot": 30,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 24,
+        "mobility_source_origins": [
+          25,
+          26,
+          27,
+          28,
+          29
+        ],
+        "mobility_max_observation_cutoff_slot": 28,
+        "mobility_max_target_slot": 29
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 39,
+        "history_slots_max_inclusive": 43,
+        "max_source_slot": 43,
+        "slot": 44,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 38,
+        "mobility_source_origins": [
+          39,
+          40,
+          41,
+          42,
+          43
+        ],
+        "mobility_max_observation_cutoff_slot": 42,
+        "mobility_max_target_slot": 43
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 51,
+        "history_slots_max_inclusive": 55,
+        "max_source_slot": 55,
+        "slot": 56,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 50,
+        "mobility_source_origins": [
+          51,
+          52,
+          53,
+          54,
+          55
+        ],
+        "mobility_max_observation_cutoff_slot": 54,
+        "mobility_max_target_slot": 55
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 67,
+        "history_slots_max_inclusive": 71,
+        "max_source_slot": 71,
+        "slot": 72,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 66,
+        "mobility_source_origins": [
+          67,
+          68,
+          69,
+          70,
+          71
+        ],
+        "mobility_max_observation_cutoff_slot": 70,
+        "mobility_max_target_slot": 71
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 83,
+        "history_slots_max_inclusive": 87,
+        "max_source_slot": 87,
+        "slot": 88,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 82,
+        "mobility_source_origins": [
+          83,
+          84,
+          85,
+          86,
+          87
+        ],
+        "mobility_max_observation_cutoff_slot": 86,
+        "mobility_max_target_slot": 87
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 94,
+        "history_slots_max_inclusive": 98,
+        "max_source_slot": 98,
+        "slot": 99,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 93,
+        "mobility_source_origins": [
+          94,
+          95,
+          96,
+          97,
+          98
+        ],
+        "mobility_max_observation_cutoff_slot": 97,
+        "mobility_max_target_slot": 98
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 110,
+        "history_slots_max_inclusive": 114,
+        "max_source_slot": 114,
+        "slot": 115,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 109,
+        "mobility_source_origins": [
+          110,
+          111,
+          112,
+          113,
+          114
+        ],
+        "mobility_max_observation_cutoff_slot": 113,
+        "mobility_max_target_slot": 114
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 121,
+        "history_slots_max_inclusive": 125,
+        "max_source_slot": 125,
+        "slot": 126,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 120,
+        "mobility_source_origins": [
+          121,
+          122,
+          123,
+          124,
+          125
+        ],
+        "mobility_max_observation_cutoff_slot": 124,
+        "mobility_max_target_slot": 125
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 138,
+        "history_slots_max_inclusive": 142,
+        "max_source_slot": 142,
+        "slot": 143,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 137,
+        "mobility_source_origins": [
+          138,
+          139,
+          140,
+          141,
+          142
+        ],
+        "mobility_max_observation_cutoff_slot": 141,
+        "mobility_max_target_slot": 142
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 151,
+        "history_slots_max_inclusive": 155,
+        "max_source_slot": 155,
+        "slot": 156,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 150,
+        "mobility_source_origins": [
+          151,
+          152,
+          153,
+          154,
+          155
+        ],
+        "mobility_max_observation_cutoff_slot": 154,
+        "mobility_max_target_slot": 155
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 164,
+        "history_slots_max_inclusive": 168,
+        "max_source_slot": 168,
+        "slot": 169,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 163,
+        "mobility_source_origins": [
+          164,
+          165,
+          166,
+          167,
+          168
+        ],
+        "mobility_max_observation_cutoff_slot": 167,
+        "mobility_max_target_slot": 168
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 193,
+        "history_slots_max_inclusive": 197,
+        "max_source_slot": 197,
+        "slot": 198,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 192,
+        "mobility_source_origins": [
+          193,
+          194,
+          195,
+          196,
+          197
+        ],
+        "mobility_max_observation_cutoff_slot": 196,
+        "mobility_max_target_slot": 197
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 208,
+        "history_slots_max_inclusive": 212,
+        "max_source_slot": 212,
+        "slot": 213,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 207,
+        "mobility_source_origins": [
+          208,
+          209,
+          210,
+          211,
+          212
+        ],
+        "mobility_max_observation_cutoff_slot": 211,
+        "mobility_max_target_slot": 212
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 222,
+        "history_slots_max_inclusive": 226,
+        "max_source_slot": 226,
+        "slot": 227,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 221,
+        "mobility_source_origins": [
+          222,
+          223,
+          224,
+          225,
+          226
+        ],
+        "mobility_max_observation_cutoff_slot": 225,
+        "mobility_max_target_slot": 226
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 238,
+        "history_slots_max_inclusive": 242,
+        "max_source_slot": 242,
+        "slot": 243,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 237,
+        "mobility_source_origins": [
+          238,
+          239,
+          240,
+          241,
+          242
+        ],
+        "mobility_max_observation_cutoff_slot": 241,
+        "mobility_max_target_slot": 242
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 251,
+        "history_slots_max_inclusive": 255,
+        "max_source_slot": 255,
+        "slot": 256,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 250,
+        "mobility_source_origins": [
+          251,
+          252,
+          253,
+          254,
+          255
+        ],
+        "mobility_max_observation_cutoff_slot": 254,
+        "mobility_max_target_slot": 255
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 266,
+        "history_slots_max_inclusive": 270,
+        "max_source_slot": 270,
+        "slot": 271,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 265,
+        "mobility_source_origins": [
+          266,
+          267,
+          268,
+          269,
+          270
+        ],
+        "mobility_max_observation_cutoff_slot": 269,
+        "mobility_max_target_slot": 270
+      },
+      {
+        "episode_seed_lookup_only": 20044,
+        "history_slots_min_inclusive": 279,
+        "history_slots_max_inclusive": 283,
+        "max_source_slot": 283,
+        "slot": 284,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 278,
+        "mobility_source_origins": [
+          279,
+          280,
+          281,
+          282,
+          283
+        ],
+        "mobility_max_observation_cutoff_slot": 282,
+        "mobility_max_target_slot": 283
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 9,
+        "history_slots_max_inclusive": 13,
+        "max_source_slot": 13,
+        "slot": 14,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 8,
+        "mobility_source_origins": [
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "mobility_max_observation_cutoff_slot": 12,
+        "mobility_max_target_slot": 13
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 25,
+        "history_slots_max_inclusive": 29,
+        "max_source_slot": 29,
+        "slot": 30,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 24,
+        "mobility_source_origins": [
+          25,
+          26,
+          27,
+          28,
+          29
+        ],
+        "mobility_max_observation_cutoff_slot": 28,
+        "mobility_max_target_slot": 29
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 37,
+        "history_slots_max_inclusive": 41,
+        "max_source_slot": 41,
+        "slot": 42,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 36,
+        "mobility_source_origins": [
+          37,
+          38,
+          39,
+          40,
+          41
+        ],
+        "mobility_max_observation_cutoff_slot": 40,
+        "mobility_max_target_slot": 41
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 52,
+        "history_slots_max_inclusive": 56,
+        "max_source_slot": 56,
+        "slot": 57,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 51,
+        "mobility_source_origins": [
+          52,
+          53,
+          54,
+          55,
+          56
+        ],
+        "mobility_max_observation_cutoff_slot": 55,
+        "mobility_max_target_slot": 56
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 67,
+        "history_slots_max_inclusive": 71,
+        "max_source_slot": 71,
+        "slot": 72,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 66,
+        "mobility_source_origins": [
+          67,
+          68,
+          69,
+          70,
+          71
+        ],
+        "mobility_max_observation_cutoff_slot": 70,
+        "mobility_max_target_slot": 71
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 80,
+        "history_slots_max_inclusive": 84,
+        "max_source_slot": 84,
+        "slot": 85,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 79,
+        "mobility_source_origins": [
+          80,
+          81,
+          82,
+          83,
+          84
+        ],
+        "mobility_max_observation_cutoff_slot": 83,
+        "mobility_max_target_slot": 84
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 97,
+        "history_slots_max_inclusive": 101,
+        "max_source_slot": 101,
+        "slot": 102,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 96,
+        "mobility_source_origins": [
+          97,
+          98,
+          99,
+          100,
+          101
+        ],
+        "mobility_max_observation_cutoff_slot": 100,
+        "mobility_max_target_slot": 101
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 109,
+        "history_slots_max_inclusive": 113,
+        "max_source_slot": 113,
+        "slot": 114,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 108,
+        "mobility_source_origins": [
+          109,
+          110,
+          111,
+          112,
+          113
+        ],
+        "mobility_max_observation_cutoff_slot": 112,
+        "mobility_max_target_slot": 113
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 123,
+        "history_slots_max_inclusive": 127,
+        "max_source_slot": 127,
+        "slot": 128,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 122,
+        "mobility_source_origins": [
+          123,
+          124,
+          125,
+          126,
+          127
+        ],
+        "mobility_max_observation_cutoff_slot": 126,
+        "mobility_max_target_slot": 127
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 139,
+        "history_slots_max_inclusive": 143,
+        "max_source_slot": 143,
+        "slot": 144,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 138,
+        "mobility_source_origins": [
+          139,
+          140,
+          141,
+          142,
+          143
+        ],
+        "mobility_max_observation_cutoff_slot": 142,
+        "mobility_max_target_slot": 143
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 152,
+        "history_slots_max_inclusive": 156,
+        "max_source_slot": 156,
+        "slot": 157,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 151,
+        "mobility_source_origins": [
+          152,
+          153,
+          154,
+          155,
+          156
+        ],
+        "mobility_max_observation_cutoff_slot": 155,
+        "mobility_max_target_slot": 156
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 165,
+        "history_slots_max_inclusive": 169,
+        "max_source_slot": 169,
+        "slot": 170,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 164,
+        "mobility_source_origins": [
+          165,
+          166,
+          167,
+          168,
+          169
+        ],
+        "mobility_max_observation_cutoff_slot": 168,
+        "mobility_max_target_slot": 169
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 192,
+        "history_slots_max_inclusive": 196,
+        "max_source_slot": 196,
+        "slot": 197,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 191,
+        "mobility_source_origins": [
+          192,
+          193,
+          194,
+          195,
+          196
+        ],
+        "mobility_max_observation_cutoff_slot": 195,
+        "mobility_max_target_slot": 196
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 209,
+        "history_slots_max_inclusive": 213,
+        "max_source_slot": 213,
+        "slot": 214,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 208,
+        "mobility_source_origins": [
+          209,
+          210,
+          211,
+          212,
+          213
+        ],
+        "mobility_max_observation_cutoff_slot": 212,
+        "mobility_max_target_slot": 213
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 223,
+        "history_slots_max_inclusive": 227,
+        "max_source_slot": 227,
+        "slot": 228,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 222,
+        "mobility_source_origins": [
+          223,
+          224,
+          225,
+          226,
+          227
+        ],
+        "mobility_max_observation_cutoff_slot": 226,
+        "mobility_max_target_slot": 227
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 236,
+        "history_slots_max_inclusive": 240,
+        "max_source_slot": 240,
+        "slot": 241,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 235,
+        "mobility_source_origins": [
+          236,
+          237,
+          238,
+          239,
+          240
+        ],
+        "mobility_max_observation_cutoff_slot": 239,
+        "mobility_max_target_slot": 240
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 249,
+        "history_slots_max_inclusive": 253,
+        "max_source_slot": 253,
+        "slot": 254,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 248,
+        "mobility_source_origins": [
+          249,
+          250,
+          251,
+          252,
+          253
+        ],
+        "mobility_max_observation_cutoff_slot": 252,
+        "mobility_max_target_slot": 253
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 264,
+        "history_slots_max_inclusive": 268,
+        "max_source_slot": 268,
+        "slot": 269,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 263,
+        "mobility_source_origins": [
+          264,
+          265,
+          266,
+          267,
+          268
+        ],
+        "mobility_max_observation_cutoff_slot": 267,
+        "mobility_max_target_slot": 268
+      },
+      {
+        "episode_seed_lookup_only": 20045,
+        "history_slots_min_inclusive": 280,
+        "history_slots_max_inclusive": 284,
+        "max_source_slot": 284,
+        "slot": 285,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 279,
+        "mobility_source_origins": [
+          280,
+          281,
+          282,
+          283,
+          284
+        ],
+        "mobility_max_observation_cutoff_slot": 283,
+        "mobility_max_target_slot": 284
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 9,
+        "history_slots_max_inclusive": 13,
+        "max_source_slot": 13,
+        "slot": 14,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 8,
+        "mobility_source_origins": [
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "mobility_max_observation_cutoff_slot": 12,
+        "mobility_max_target_slot": 13
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 22,
+        "history_slots_max_inclusive": 26,
+        "max_source_slot": 26,
+        "slot": 27,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 21,
+        "mobility_source_origins": [
+          22,
+          23,
+          24,
+          25,
+          26
+        ],
+        "mobility_max_observation_cutoff_slot": 25,
+        "mobility_max_target_slot": 26
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 37,
+        "history_slots_max_inclusive": 41,
+        "max_source_slot": 41,
+        "slot": 42,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 36,
+        "mobility_source_origins": [
+          37,
+          38,
+          39,
+          40,
+          41
+        ],
+        "mobility_max_observation_cutoff_slot": 40,
+        "mobility_max_target_slot": 41
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 53,
+        "history_slots_max_inclusive": 57,
+        "max_source_slot": 57,
+        "slot": 58,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 52,
+        "mobility_source_origins": [
+          53,
+          54,
+          55,
+          56,
+          57
+        ],
+        "mobility_max_observation_cutoff_slot": 56,
+        "mobility_max_target_slot": 57
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 68,
+        "history_slots_max_inclusive": 72,
+        "max_source_slot": 72,
+        "slot": 73,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 67,
+        "mobility_source_origins": [
+          68,
+          69,
+          70,
+          71,
+          72
+        ],
+        "mobility_max_observation_cutoff_slot": 71,
+        "mobility_max_target_slot": 72
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 81,
+        "history_slots_max_inclusive": 85,
+        "max_source_slot": 85,
+        "slot": 86,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 80,
+        "mobility_source_origins": [
+          81,
+          82,
+          83,
+          84,
+          85
+        ],
+        "mobility_max_observation_cutoff_slot": 84,
+        "mobility_max_target_slot": 85
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 97,
+        "history_slots_max_inclusive": 101,
+        "max_source_slot": 101,
+        "slot": 102,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 96,
+        "mobility_source_origins": [
+          97,
+          98,
+          99,
+          100,
+          101
+        ],
+        "mobility_max_observation_cutoff_slot": 100,
+        "mobility_max_target_slot": 101
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 110,
+        "history_slots_max_inclusive": 114,
+        "max_source_slot": 114,
+        "slot": 115,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 109,
+        "mobility_source_origins": [
+          110,
+          111,
+          112,
+          113,
+          114
+        ],
+        "mobility_max_observation_cutoff_slot": 113,
+        "mobility_max_target_slot": 114
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 124,
+        "history_slots_max_inclusive": 128,
+        "max_source_slot": 128,
+        "slot": 129,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 123,
+        "mobility_source_origins": [
+          124,
+          125,
+          126,
+          127,
+          128
+        ],
+        "mobility_max_observation_cutoff_slot": 127,
+        "mobility_max_target_slot": 128
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 138,
+        "history_slots_max_inclusive": 142,
+        "max_source_slot": 142,
+        "slot": 143,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 137,
+        "mobility_source_origins": [
+          138,
+          139,
+          140,
+          141,
+          142
+        ],
+        "mobility_max_observation_cutoff_slot": 141,
+        "mobility_max_target_slot": 142
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 153,
+        "history_slots_max_inclusive": 157,
+        "max_source_slot": 157,
+        "slot": 158,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 152,
+        "mobility_source_origins": [
+          153,
+          154,
+          155,
+          156,
+          157
+        ],
+        "mobility_max_observation_cutoff_slot": 156,
+        "mobility_max_target_slot": 157
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 166,
+        "history_slots_max_inclusive": 170,
+        "max_source_slot": 170,
+        "slot": 171,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 165,
+        "mobility_source_origins": [
+          166,
+          167,
+          168,
+          169,
+          170
+        ],
+        "mobility_max_observation_cutoff_slot": 169,
+        "mobility_max_target_slot": 170
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 194,
+        "history_slots_max_inclusive": 198,
+        "max_source_slot": 198,
+        "slot": 199,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 193,
+        "mobility_source_origins": [
+          194,
+          195,
+          196,
+          197,
+          198
+        ],
+        "mobility_max_observation_cutoff_slot": 197,
+        "mobility_max_target_slot": 198
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 207,
+        "history_slots_max_inclusive": 211,
+        "max_source_slot": 211,
+        "slot": 212,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 206,
+        "mobility_source_origins": [
+          207,
+          208,
+          209,
+          210,
+          211
+        ],
+        "mobility_max_observation_cutoff_slot": 210,
+        "mobility_max_target_slot": 211
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 222,
+        "history_slots_max_inclusive": 226,
+        "max_source_slot": 226,
+        "slot": 227,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 221,
+        "mobility_source_origins": [
+          222,
+          223,
+          224,
+          225,
+          226
+        ],
+        "mobility_max_observation_cutoff_slot": 225,
+        "mobility_max_target_slot": 226
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 236,
+        "history_slots_max_inclusive": 240,
+        "max_source_slot": 240,
+        "slot": 241,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 235,
+        "mobility_source_origins": [
+          236,
+          237,
+          238,
+          239,
+          240
+        ],
+        "mobility_max_observation_cutoff_slot": 239,
+        "mobility_max_target_slot": 240
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 253,
+        "history_slots_max_inclusive": 257,
+        "max_source_slot": 257,
+        "slot": 258,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 252,
+        "mobility_source_origins": [
+          253,
+          254,
+          255,
+          256,
+          257
+        ],
+        "mobility_max_observation_cutoff_slot": 256,
+        "mobility_max_target_slot": 257
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 265,
+        "history_slots_max_inclusive": 269,
+        "max_source_slot": 269,
+        "slot": 270,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 264,
+        "mobility_source_origins": [
+          265,
+          266,
+          267,
+          268,
+          269
+        ],
+        "mobility_max_observation_cutoff_slot": 268,
+        "mobility_max_target_slot": 269
+      },
+      {
+        "episode_seed_lookup_only": 20046,
+        "history_slots_min_inclusive": 279,
+        "history_slots_max_inclusive": 283,
+        "max_source_slot": 283,
+        "slot": 284,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 278,
+        "mobility_source_origins": [
+          279,
+          280,
+          281,
+          282,
+          283
+        ],
+        "mobility_max_observation_cutoff_slot": 282,
+        "mobility_max_target_slot": 283
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 11,
+        "history_slots_max_inclusive": 15,
+        "max_source_slot": 15,
+        "slot": 16,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 10,
+        "mobility_source_origins": [
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "mobility_max_observation_cutoff_slot": 14,
+        "mobility_max_target_slot": 15
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 22,
+        "history_slots_max_inclusive": 26,
+        "max_source_slot": 26,
+        "slot": 27,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 21,
+        "mobility_source_origins": [
+          22,
+          23,
+          24,
+          25,
+          26
+        ],
+        "mobility_max_observation_cutoff_slot": 25,
+        "mobility_max_target_slot": 26
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 37,
+        "history_slots_max_inclusive": 41,
+        "max_source_slot": 41,
+        "slot": 42,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 36,
+        "mobility_source_origins": [
+          37,
+          38,
+          39,
+          40,
+          41
+        ],
+        "mobility_max_observation_cutoff_slot": 40,
+        "mobility_max_target_slot": 41
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 51,
+        "history_slots_max_inclusive": 55,
+        "max_source_slot": 55,
+        "slot": 56,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 50,
+        "mobility_source_origins": [
+          51,
+          52,
+          53,
+          54,
+          55
+        ],
+        "mobility_max_observation_cutoff_slot": 54,
+        "mobility_max_target_slot": 55
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 69,
+        "history_slots_max_inclusive": 73,
+        "max_source_slot": 73,
+        "slot": 74,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 68,
+        "mobility_source_origins": [
+          69,
+          70,
+          71,
+          72,
+          73
+        ],
+        "mobility_max_observation_cutoff_slot": 72,
+        "mobility_max_target_slot": 73
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 81,
+        "history_slots_max_inclusive": 85,
+        "max_source_slot": 85,
+        "slot": 86,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 80,
+        "mobility_source_origins": [
+          81,
+          82,
+          83,
+          84,
+          85
+        ],
+        "mobility_max_observation_cutoff_slot": 84,
+        "mobility_max_target_slot": 85
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 93,
+        "history_slots_max_inclusive": 97,
+        "max_source_slot": 97,
+        "slot": 98,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 92,
+        "mobility_source_origins": [
+          93,
+          94,
+          95,
+          96,
+          97
+        ],
+        "mobility_max_observation_cutoff_slot": 96,
+        "mobility_max_target_slot": 97
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 109,
+        "history_slots_max_inclusive": 113,
+        "max_source_slot": 113,
+        "slot": 114,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 108,
+        "mobility_source_origins": [
+          109,
+          110,
+          111,
+          112,
+          113
+        ],
+        "mobility_max_observation_cutoff_slot": 112,
+        "mobility_max_target_slot": 113
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 121,
+        "history_slots_max_inclusive": 125,
+        "max_source_slot": 125,
+        "slot": 126,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 120,
+        "mobility_source_origins": [
+          121,
+          122,
+          123,
+          124,
+          125
+        ],
+        "mobility_max_observation_cutoff_slot": 124,
+        "mobility_max_target_slot": 125
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 138,
+        "history_slots_max_inclusive": 142,
+        "max_source_slot": 142,
+        "slot": 143,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 137,
+        "mobility_source_origins": [
+          138,
+          139,
+          140,
+          141,
+          142
+        ],
+        "mobility_max_observation_cutoff_slot": 141,
+        "mobility_max_target_slot": 142
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 152,
+        "history_slots_max_inclusive": 156,
+        "max_source_slot": 156,
+        "slot": 157,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 151,
+        "mobility_source_origins": [
+          152,
+          153,
+          154,
+          155,
+          156
+        ],
+        "mobility_max_observation_cutoff_slot": 155,
+        "mobility_max_target_slot": 156
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 166,
+        "history_slots_max_inclusive": 170,
+        "max_source_slot": 170,
+        "slot": 171,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 165,
+        "mobility_source_origins": [
+          166,
+          167,
+          168,
+          169,
+          170
+        ],
+        "mobility_max_observation_cutoff_slot": 169,
+        "mobility_max_target_slot": 170
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 181,
+        "history_slots_max_inclusive": 185,
+        "max_source_slot": 185,
+        "slot": 186,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 180,
+        "mobility_source_origins": [
+          181,
+          182,
+          183,
+          184,
+          185
+        ],
+        "mobility_max_observation_cutoff_slot": 184,
+        "mobility_max_target_slot": 185
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 194,
+        "history_slots_max_inclusive": 198,
+        "max_source_slot": 198,
+        "slot": 199,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 193,
+        "mobility_source_origins": [
+          194,
+          195,
+          196,
+          197,
+          198
+        ],
+        "mobility_max_observation_cutoff_slot": 197,
+        "mobility_max_target_slot": 198
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 209,
+        "history_slots_max_inclusive": 213,
+        "max_source_slot": 213,
+        "slot": 214,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 208,
+        "mobility_source_origins": [
+          209,
+          210,
+          211,
+          212,
+          213
+        ],
+        "mobility_max_observation_cutoff_slot": 212,
+        "mobility_max_target_slot": 213
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 224,
+        "history_slots_max_inclusive": 228,
+        "max_source_slot": 228,
+        "slot": 229,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 223,
+        "mobility_source_origins": [
+          224,
+          225,
+          226,
+          227,
+          228
+        ],
+        "mobility_max_observation_cutoff_slot": 227,
+        "mobility_max_target_slot": 228
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 235,
+        "history_slots_max_inclusive": 239,
+        "max_source_slot": 239,
+        "slot": 240,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 234,
+        "mobility_source_origins": [
+          235,
+          236,
+          237,
+          238,
+          239
+        ],
+        "mobility_max_observation_cutoff_slot": 238,
+        "mobility_max_target_slot": 239
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 251,
+        "history_slots_max_inclusive": 255,
+        "max_source_slot": 255,
+        "slot": 256,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 250,
+        "mobility_source_origins": [
+          251,
+          252,
+          253,
+          254,
+          255
+        ],
+        "mobility_max_observation_cutoff_slot": 254,
+        "mobility_max_target_slot": 255
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 264,
+        "history_slots_max_inclusive": 268,
+        "max_source_slot": 268,
+        "slot": 269,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 263,
+        "mobility_source_origins": [
+          264,
+          265,
+          266,
+          267,
+          268
+        ],
+        "mobility_max_observation_cutoff_slot": 267,
+        "mobility_max_target_slot": 268
+      },
+      {
+        "episode_seed_lookup_only": 20047,
+        "history_slots_min_inclusive": 278,
+        "history_slots_max_inclusive": 282,
+        "max_source_slot": 282,
+        "slot": 283,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 277,
+        "mobility_source_origins": [
+          278,
+          279,
+          280,
+          281,
+          282
+        ],
+        "mobility_max_observation_cutoff_slot": 281,
+        "mobility_max_target_slot": 282
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 9,
+        "history_slots_max_inclusive": 13,
+        "max_source_slot": 13,
+        "slot": 14,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 8,
+        "mobility_source_origins": [
+          9,
+          10,
+          11,
+          12,
+          13
+        ],
+        "mobility_max_observation_cutoff_slot": 12,
+        "mobility_max_target_slot": 13
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 22,
+        "history_slots_max_inclusive": 26,
+        "max_source_slot": 26,
+        "slot": 27,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 21,
+        "mobility_source_origins": [
+          22,
+          23,
+          24,
+          25,
+          26
+        ],
+        "mobility_max_observation_cutoff_slot": 25,
+        "mobility_max_target_slot": 26
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 39,
+        "history_slots_max_inclusive": 43,
+        "max_source_slot": 43,
+        "slot": 44,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 38,
+        "mobility_source_origins": [
+          39,
+          40,
+          41,
+          42,
+          43
+        ],
+        "mobility_max_observation_cutoff_slot": 42,
+        "mobility_max_target_slot": 43
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 53,
+        "history_slots_max_inclusive": 57,
+        "max_source_slot": 57,
+        "slot": 58,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 52,
+        "mobility_source_origins": [
+          53,
+          54,
+          55,
+          56,
+          57
+        ],
+        "mobility_max_observation_cutoff_slot": 56,
+        "mobility_max_target_slot": 57
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 67,
+        "history_slots_max_inclusive": 71,
+        "max_source_slot": 71,
+        "slot": 72,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 66,
+        "mobility_source_origins": [
+          67,
+          68,
+          69,
+          70,
+          71
+        ],
+        "mobility_max_observation_cutoff_slot": 70,
+        "mobility_max_target_slot": 71
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 82,
+        "history_slots_max_inclusive": 86,
+        "max_source_slot": 86,
+        "slot": 87,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 81,
+        "mobility_source_origins": [
+          82,
+          83,
+          84,
+          85,
+          86
+        ],
+        "mobility_max_observation_cutoff_slot": 85,
+        "mobility_max_target_slot": 86
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 95,
+        "history_slots_max_inclusive": 99,
+        "max_source_slot": 99,
+        "slot": 100,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 94,
+        "mobility_source_origins": [
+          95,
+          96,
+          97,
+          98,
+          99
+        ],
+        "mobility_max_observation_cutoff_slot": 98,
+        "mobility_max_target_slot": 99
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 109,
+        "history_slots_max_inclusive": 113,
+        "max_source_slot": 113,
+        "slot": 114,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 108,
+        "mobility_source_origins": [
+          109,
+          110,
+          111,
+          112,
+          113
+        ],
+        "mobility_max_observation_cutoff_slot": 112,
+        "mobility_max_target_slot": 113
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 121,
+        "history_slots_max_inclusive": 125,
+        "max_source_slot": 125,
+        "slot": 126,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 120,
+        "mobility_source_origins": [
+          121,
+          122,
+          123,
+          124,
+          125
+        ],
+        "mobility_max_observation_cutoff_slot": 124,
+        "mobility_max_target_slot": 125
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 136,
+        "history_slots_max_inclusive": 140,
+        "max_source_slot": 140,
+        "slot": 141,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 135,
+        "mobility_source_origins": [
+          136,
+          137,
+          138,
+          139,
+          140
+        ],
+        "mobility_max_observation_cutoff_slot": 139,
+        "mobility_max_target_slot": 140
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 151,
+        "history_slots_max_inclusive": 155,
+        "max_source_slot": 155,
+        "slot": 156,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 150,
+        "mobility_source_origins": [
+          151,
+          152,
+          153,
+          154,
+          155
+        ],
+        "mobility_max_observation_cutoff_slot": 154,
+        "mobility_max_target_slot": 155
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 166,
+        "history_slots_max_inclusive": 170,
+        "max_source_slot": 170,
+        "slot": 171,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 165,
+        "mobility_source_origins": [
+          166,
+          167,
+          168,
+          169,
+          170
+        ],
+        "mobility_max_observation_cutoff_slot": 169,
+        "mobility_max_target_slot": 170
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 178,
+        "history_slots_max_inclusive": 182,
+        "max_source_slot": 182,
+        "slot": 183,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 177,
+        "mobility_source_origins": [
+          178,
+          179,
+          180,
+          181,
+          182
+        ],
+        "mobility_max_observation_cutoff_slot": 181,
+        "mobility_max_target_slot": 182
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 194,
+        "history_slots_max_inclusive": 198,
+        "max_source_slot": 198,
+        "slot": 199,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 193,
+        "mobility_source_origins": [
+          194,
+          195,
+          196,
+          197,
+          198
+        ],
+        "mobility_max_observation_cutoff_slot": 197,
+        "mobility_max_target_slot": 198
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 208,
+        "history_slots_max_inclusive": 212,
+        "max_source_slot": 212,
+        "slot": 213,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 207,
+        "mobility_source_origins": [
+          208,
+          209,
+          210,
+          211,
+          212
+        ],
+        "mobility_max_observation_cutoff_slot": 211,
+        "mobility_max_target_slot": 212
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 221,
+        "history_slots_max_inclusive": 225,
+        "max_source_slot": 225,
+        "slot": 226,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 220,
+        "mobility_source_origins": [
+          221,
+          222,
+          223,
+          224,
+          225
+        ],
+        "mobility_max_observation_cutoff_slot": 224,
+        "mobility_max_target_slot": 225
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 236,
+        "history_slots_max_inclusive": 240,
+        "max_source_slot": 240,
+        "slot": 241,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 235,
+        "mobility_source_origins": [
+          236,
+          237,
+          238,
+          239,
+          240
+        ],
+        "mobility_max_observation_cutoff_slot": 239,
+        "mobility_max_target_slot": 240
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 249,
+        "history_slots_max_inclusive": 253,
+        "max_source_slot": 253,
+        "slot": 254,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 248,
+        "mobility_source_origins": [
+          249,
+          250,
+          251,
+          252,
+          253
+        ],
+        "mobility_max_observation_cutoff_slot": 252,
+        "mobility_max_target_slot": 253
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 267,
+        "history_slots_max_inclusive": 271,
+        "max_source_slot": 271,
+        "slot": 272,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 266,
+        "mobility_source_origins": [
+          267,
+          268,
+          269,
+          270,
+          271
+        ],
+        "mobility_max_observation_cutoff_slot": 270,
+        "mobility_max_target_slot": 271
+      },
+      {
+        "episode_seed_lookup_only": 20048,
+        "history_slots_min_inclusive": 280,
+        "history_slots_max_inclusive": 284,
+        "max_source_slot": 284,
+        "slot": 285,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 279,
+        "mobility_source_origins": [
+          280,
+          281,
+          282,
+          283,
+          284
+        ],
+        "mobility_max_observation_cutoff_slot": 283,
+        "mobility_max_target_slot": 284
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 10,
+        "history_slots_max_inclusive": 14,
+        "max_source_slot": 14,
+        "slot": 15,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 9,
+        "mobility_source_origins": [
+          10,
+          11,
+          12,
+          13,
+          14
+        ],
+        "mobility_max_observation_cutoff_slot": 13,
+        "mobility_max_target_slot": 14
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 25,
+        "history_slots_max_inclusive": 29,
+        "max_source_slot": 29,
+        "slot": 30,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 24,
+        "mobility_source_origins": [
+          25,
+          26,
+          27,
+          28,
+          29
+        ],
+        "mobility_max_observation_cutoff_slot": 28,
+        "mobility_max_target_slot": 29
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 37,
+        "history_slots_max_inclusive": 41,
+        "max_source_slot": 41,
+        "slot": 42,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 36,
+        "mobility_source_origins": [
+          37,
+          38,
+          39,
+          40,
+          41
+        ],
+        "mobility_max_observation_cutoff_slot": 40,
+        "mobility_max_target_slot": 41
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 52,
+        "history_slots_max_inclusive": 56,
+        "max_source_slot": 56,
+        "slot": 57,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 51,
+        "mobility_source_origins": [
+          52,
+          53,
+          54,
+          55,
+          56
+        ],
+        "mobility_max_observation_cutoff_slot": 55,
+        "mobility_max_target_slot": 56
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 69,
+        "history_slots_max_inclusive": 73,
+        "max_source_slot": 73,
+        "slot": 74,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 68,
+        "mobility_source_origins": [
+          69,
+          70,
+          71,
+          72,
+          73
+        ],
+        "mobility_max_observation_cutoff_slot": 72,
+        "mobility_max_target_slot": 73
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 80,
+        "history_slots_max_inclusive": 84,
+        "max_source_slot": 84,
+        "slot": 85,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 79,
+        "mobility_source_origins": [
+          80,
+          81,
+          82,
+          83,
+          84
+        ],
+        "mobility_max_observation_cutoff_slot": 83,
+        "mobility_max_target_slot": 84
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 97,
+        "history_slots_max_inclusive": 101,
+        "max_source_slot": 101,
+        "slot": 102,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 96,
+        "mobility_source_origins": [
+          97,
+          98,
+          99,
+          100,
+          101
+        ],
+        "mobility_max_observation_cutoff_slot": 100,
+        "mobility_max_target_slot": 101
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 109,
+        "history_slots_max_inclusive": 113,
+        "max_source_slot": 113,
+        "slot": 114,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 108,
+        "mobility_source_origins": [
+          109,
+          110,
+          111,
+          112,
+          113
+        ],
+        "mobility_max_observation_cutoff_slot": 112,
+        "mobility_max_target_slot": 113
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 124,
+        "history_slots_max_inclusive": 128,
+        "max_source_slot": 128,
+        "slot": 129,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 123,
+        "mobility_source_origins": [
+          124,
+          125,
+          126,
+          127,
+          128
+        ],
+        "mobility_max_observation_cutoff_slot": 127,
+        "mobility_max_target_slot": 128
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 138,
+        "history_slots_max_inclusive": 142,
+        "max_source_slot": 142,
+        "slot": 143,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 137,
+        "mobility_source_origins": [
+          138,
+          139,
+          140,
+          141,
+          142
+        ],
+        "mobility_max_observation_cutoff_slot": 141,
+        "mobility_max_target_slot": 142
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 153,
+        "history_slots_max_inclusive": 157,
+        "max_source_slot": 157,
+        "slot": 158,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 152,
+        "mobility_source_origins": [
+          153,
+          154,
+          155,
+          156,
+          157
+        ],
+        "mobility_max_observation_cutoff_slot": 156,
+        "mobility_max_target_slot": 157
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 164,
+        "history_slots_max_inclusive": 168,
+        "max_source_slot": 168,
+        "slot": 169,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 163,
+        "mobility_source_origins": [
+          164,
+          165,
+          166,
+          167,
+          168
+        ],
+        "mobility_max_observation_cutoff_slot": 167,
+        "mobility_max_target_slot": 168
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 196,
+        "history_slots_max_inclusive": 200,
+        "max_source_slot": 200,
+        "slot": 201,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 195,
+        "mobility_source_origins": [
+          196,
+          197,
+          198,
+          199,
+          200
+        ],
+        "mobility_max_observation_cutoff_slot": 199,
+        "mobility_max_target_slot": 200
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 207,
+        "history_slots_max_inclusive": 211,
+        "max_source_slot": 211,
+        "slot": 212,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 206,
+        "mobility_source_origins": [
+          207,
+          208,
+          209,
+          210,
+          211
+        ],
+        "mobility_max_observation_cutoff_slot": 210,
+        "mobility_max_target_slot": 211
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 220,
+        "history_slots_max_inclusive": 224,
+        "max_source_slot": 224,
+        "slot": 225,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 219,
+        "mobility_source_origins": [
+          220,
+          221,
+          222,
+          223,
+          224
+        ],
+        "mobility_max_observation_cutoff_slot": 223,
+        "mobility_max_target_slot": 224
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 236,
+        "history_slots_max_inclusive": 240,
+        "max_source_slot": 240,
+        "slot": 241,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 235,
+        "mobility_source_origins": [
+          236,
+          237,
+          238,
+          239,
+          240
+        ],
+        "mobility_max_observation_cutoff_slot": 239,
+        "mobility_max_target_slot": 240
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 253,
+        "history_slots_max_inclusive": 257,
+        "max_source_slot": 257,
+        "slot": 258,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 252,
+        "mobility_source_origins": [
+          253,
+          254,
+          255,
+          256,
+          257
+        ],
+        "mobility_max_observation_cutoff_slot": 256,
+        "mobility_max_target_slot": 257
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 265,
+        "history_slots_max_inclusive": 269,
+        "max_source_slot": 269,
+        "slot": 270,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 264,
+        "mobility_source_origins": [
+          265,
+          266,
+          267,
+          268,
+          269
+        ],
+        "mobility_max_observation_cutoff_slot": 268,
+        "mobility_max_target_slot": 269
+      },
+      {
+        "episode_seed_lookup_only": 20049,
+        "history_slots_min_inclusive": 277,
+        "history_slots_max_inclusive": 281,
+        "max_source_slot": 281,
+        "slot": 282,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 276,
+        "mobility_source_origins": [
+          277,
+          278,
+          279,
+          280,
+          281
+        ],
+        "mobility_max_observation_cutoff_slot": 280,
+        "mobility_max_target_slot": 281
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 10,
+        "history_slots_max_inclusive": 14,
+        "max_source_slot": 14,
+        "slot": 15,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 9,
+        "mobility_source_origins": [
+          10,
+          11,
+          12,
+          13,
+          14
+        ],
+        "mobility_max_observation_cutoff_slot": 13,
+        "mobility_max_target_slot": 14
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 25,
+        "history_slots_max_inclusive": 29,
+        "max_source_slot": 29,
+        "slot": 30,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 24,
+        "mobility_source_origins": [
+          25,
+          26,
+          27,
+          28,
+          29
+        ],
+        "mobility_max_observation_cutoff_slot": 28,
+        "mobility_max_target_slot": 29
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 37,
+        "history_slots_max_inclusive": 41,
+        "max_source_slot": 41,
+        "slot": 42,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 36,
+        "mobility_source_origins": [
+          37,
+          38,
+          39,
+          40,
+          41
+        ],
+        "mobility_max_observation_cutoff_slot": 40,
+        "mobility_max_target_slot": 41
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 53,
+        "history_slots_max_inclusive": 57,
+        "max_source_slot": 57,
+        "slot": 58,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 52,
+        "mobility_source_origins": [
+          53,
+          54,
+          55,
+          56,
+          57
+        ],
+        "mobility_max_observation_cutoff_slot": 56,
+        "mobility_max_target_slot": 57
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 69,
+        "history_slots_max_inclusive": 73,
+        "max_source_slot": 73,
+        "slot": 74,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 68,
+        "mobility_source_origins": [
+          69,
+          70,
+          71,
+          72,
+          73
+        ],
+        "mobility_max_observation_cutoff_slot": 72,
+        "mobility_max_target_slot": 73
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 80,
+        "history_slots_max_inclusive": 84,
+        "max_source_slot": 84,
+        "slot": 85,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 79,
+        "mobility_source_origins": [
+          80,
+          81,
+          82,
+          83,
+          84
+        ],
+        "mobility_max_observation_cutoff_slot": 83,
+        "mobility_max_target_slot": 84
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 93,
+        "history_slots_max_inclusive": 97,
+        "max_source_slot": 97,
+        "slot": 98,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 92,
+        "mobility_source_origins": [
+          93,
+          94,
+          95,
+          96,
+          97
+        ],
+        "mobility_max_observation_cutoff_slot": 96,
+        "mobility_max_target_slot": 97
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 108,
+        "history_slots_max_inclusive": 112,
+        "max_source_slot": 112,
+        "slot": 113,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 107,
+        "mobility_source_origins": [
+          108,
+          109,
+          110,
+          111,
+          112
+        ],
+        "mobility_max_observation_cutoff_slot": 111,
+        "mobility_max_target_slot": 112
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 123,
+        "history_slots_max_inclusive": 127,
+        "max_source_slot": 127,
+        "slot": 128,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 122,
+        "mobility_source_origins": [
+          123,
+          124,
+          125,
+          126,
+          127
+        ],
+        "mobility_max_observation_cutoff_slot": 126,
+        "mobility_max_target_slot": 127
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 137,
+        "history_slots_max_inclusive": 141,
+        "max_source_slot": 141,
+        "slot": 142,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 136,
+        "mobility_source_origins": [
+          137,
+          138,
+          139,
+          140,
+          141
+        ],
+        "mobility_max_observation_cutoff_slot": 140,
+        "mobility_max_target_slot": 141
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 151,
+        "history_slots_max_inclusive": 155,
+        "max_source_slot": 155,
+        "slot": 156,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 150,
+        "mobility_source_origins": [
+          151,
+          152,
+          153,
+          154,
+          155
+        ],
+        "mobility_max_observation_cutoff_slot": 154,
+        "mobility_max_target_slot": 155
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 168,
+        "history_slots_max_inclusive": 172,
+        "max_source_slot": 172,
+        "slot": 173,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 167,
+        "mobility_source_origins": [
+          168,
+          169,
+          170,
+          171,
+          172
+        ],
+        "mobility_max_observation_cutoff_slot": 171,
+        "mobility_max_target_slot": 172
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 180,
+        "history_slots_max_inclusive": 184,
+        "max_source_slot": 184,
+        "slot": 185,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 179,
+        "mobility_source_origins": [
+          180,
+          181,
+          182,
+          183,
+          184
+        ],
+        "mobility_max_observation_cutoff_slot": 183,
+        "mobility_max_target_slot": 184
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 194,
+        "history_slots_max_inclusive": 198,
+        "max_source_slot": 198,
+        "slot": 199,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 193,
+        "mobility_source_origins": [
+          194,
+          195,
+          196,
+          197,
+          198
+        ],
+        "mobility_max_observation_cutoff_slot": 197,
+        "mobility_max_target_slot": 198
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 209,
+        "history_slots_max_inclusive": 213,
+        "max_source_slot": 213,
+        "slot": 214,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 208,
+        "mobility_source_origins": [
+          209,
+          210,
+          211,
+          212,
+          213
+        ],
+        "mobility_max_observation_cutoff_slot": 212,
+        "mobility_max_target_slot": 213
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 220,
+        "history_slots_max_inclusive": 224,
+        "max_source_slot": 224,
+        "slot": 225,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 219,
+        "mobility_source_origins": [
+          220,
+          221,
+          222,
+          223,
+          224
+        ],
+        "mobility_max_observation_cutoff_slot": 223,
+        "mobility_max_target_slot": 224
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 239,
+        "history_slots_max_inclusive": 243,
+        "max_source_slot": 243,
+        "slot": 244,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 238,
+        "mobility_source_origins": [
+          239,
+          240,
+          241,
+          242,
+          243
+        ],
+        "mobility_max_observation_cutoff_slot": 242,
+        "mobility_max_target_slot": 243
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 251,
+        "history_slots_max_inclusive": 255,
+        "max_source_slot": 255,
+        "slot": 256,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 250,
+        "mobility_source_origins": [
+          251,
+          252,
+          253,
+          254,
+          255
+        ],
+        "mobility_max_observation_cutoff_slot": 254,
+        "mobility_max_target_slot": 255
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 265,
+        "history_slots_max_inclusive": 269,
+        "max_source_slot": 269,
+        "slot": 270,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 264,
+        "mobility_source_origins": [
+          265,
+          266,
+          267,
+          268,
+          269
+        ],
+        "mobility_max_observation_cutoff_slot": 268,
+        "mobility_max_target_slot": 269
+      },
+      {
+        "episode_seed_lookup_only": 20050,
+        "history_slots_min_inclusive": 281,
+        "history_slots_max_inclusive": 285,
+        "max_source_slot": 285,
+        "slot": 286,
+        "strictly_past_only": true,
+        "popularity_shift_min_source_slot": 280,
+        "mobility_source_origins": [
+          281,
+          282,
+          283,
+          284,
+          285
+        ],
+        "mobility_max_observation_cutoff_slot": 284,
+        "mobility_max_target_slot": 285
+      }
+    ],
+    "context_feature_within_between_realization_statistics": [
+      {
+        "feature": "observed_popularity_lag5_service0",
+        "within_realization_std_mean": 0.06267155952946582,
+        "between_realization_std_of_means": 0.014927122977641073,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service1",
+        "within_realization_std_mean": 0.09409905894244988,
+        "between_realization_std_of_means": 0.07462345315381443,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service2",
+        "within_realization_std_mean": 0.09190436324858763,
+        "between_realization_std_of_means": 0.0924419112556329,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service3",
+        "within_realization_std_mean": 0.07930632615417973,
+        "between_realization_std_of_means": 0.06208432129374631,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service4",
+        "within_realization_std_mean": 0.07448681764916072,
+        "between_realization_std_of_means": 0.02907685152349043,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service5",
+        "within_realization_std_mean": 0.07861978348294699,
+        "between_realization_std_of_means": 0.05171657025466611,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service6",
+        "within_realization_std_mean": 0.0674578433642888,
+        "between_realization_std_of_means": 0.04825409018526047,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service7",
+        "within_realization_std_mean": 0.07295870684433016,
+        "between_realization_std_of_means": 0.08693495361942805,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service8",
+        "within_realization_std_mean": 0.07693264957561831,
+        "between_realization_std_of_means": 0.0605265404736251,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag5_service9",
+        "within_realization_std_mean": 0.07394529284406501,
+        "between_realization_std_of_means": 0.06425308858788971,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service0",
+        "within_realization_std_mean": 0.06362303666077598,
+        "between_realization_std_of_means": 0.016629193930871165,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service1",
+        "within_realization_std_mean": 0.07312643448668948,
+        "between_realization_std_of_means": 0.07217360003067526,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service2",
+        "within_realization_std_mean": 0.08569725700949306,
+        "between_realization_std_of_means": 0.09637991576903333,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service3",
+        "within_realization_std_mean": 0.0788174967280372,
+        "between_realization_std_of_means": 0.07162718655720879,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service4",
+        "within_realization_std_mean": 0.06923566357327442,
+        "between_realization_std_of_means": 0.026475964648510607,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service5",
+        "within_realization_std_mean": 0.08271970611023596,
+        "between_realization_std_of_means": 0.05812491556244296,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service6",
+        "within_realization_std_mean": 0.07078473011826936,
+        "between_realization_std_of_means": 0.05400449030794811,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service7",
+        "within_realization_std_mean": 0.08707588367787558,
+        "between_realization_std_of_means": 0.07248496763599376,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service8",
+        "within_realization_std_mean": 0.07548343325751669,
+        "between_realization_std_of_means": 0.07208593921635646,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag4_service9",
+        "within_realization_std_mean": 0.08284129840089102,
+        "between_realization_std_of_means": 0.060925574985817674,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service0",
+        "within_realization_std_mean": 0.06637570422982422,
+        "between_realization_std_of_means": 0.021992726633284998,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service1",
+        "within_realization_std_mean": 0.07841036936880603,
+        "between_realization_std_of_means": 0.07839642079931239,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service2",
+        "within_realization_std_mean": 0.08963813210932756,
+        "between_realization_std_of_means": 0.08669807256812057,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service3",
+        "within_realization_std_mean": 0.07628219824334598,
+        "between_realization_std_of_means": 0.0762192000221306,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service4",
+        "within_realization_std_mean": 0.06960435618689924,
+        "between_realization_std_of_means": 0.03048273507907824,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service5",
+        "within_realization_std_mean": 0.07868322750886712,
+        "between_realization_std_of_means": 0.048423440968568515,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service6",
+        "within_realization_std_mean": 0.06832272971340667,
+        "between_realization_std_of_means": 0.047627461667832674,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service7",
+        "within_realization_std_mean": 0.0822759358524446,
+        "between_realization_std_of_means": 0.07718180089202659,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service8",
+        "within_realization_std_mean": 0.07384879811277345,
+        "between_realization_std_of_means": 0.05989123940822981,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag3_service9",
+        "within_realization_std_mean": 0.08257321982216542,
+        "between_realization_std_of_means": 0.0679998125143435,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service0",
+        "within_realization_std_mean": 0.061906486688653915,
+        "between_realization_std_of_means": 0.021584356040809924,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service1",
+        "within_realization_std_mean": 0.07767555184379221,
+        "between_realization_std_of_means": 0.07748129603130445,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service2",
+        "within_realization_std_mean": 0.0877743084721523,
+        "between_realization_std_of_means": 0.09335385156071008,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service3",
+        "within_realization_std_mean": 0.06964247816040237,
+        "between_realization_std_of_means": 0.05070728501159591,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service4",
+        "within_realization_std_mean": 0.0693793173355033,
+        "between_realization_std_of_means": 0.029789011641715022,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service5",
+        "within_realization_std_mean": 0.07614613899221467,
+        "between_realization_std_of_means": 0.05444383510126127,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service6",
+        "within_realization_std_mean": 0.07412019476073216,
+        "between_realization_std_of_means": 0.06847045744831132,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service7",
+        "within_realization_std_mean": 0.079740857998346,
+        "between_realization_std_of_means": 0.0767912613099556,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service8",
+        "within_realization_std_mean": 0.07571305777516883,
+        "between_realization_std_of_means": 0.04932154050651279,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag2_service9",
+        "within_realization_std_mean": 0.06804243062036193,
+        "between_realization_std_of_means": 0.07599468459659066,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service0",
+        "within_realization_std_mean": 0.05796328005995712,
+        "between_realization_std_of_means": 0.018996084746160186,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service1",
+        "within_realization_std_mean": 0.07874742570119707,
+        "between_realization_std_of_means": 0.07919516226014894,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service2",
+        "within_realization_std_mean": 0.09278414813939659,
+        "between_realization_std_of_means": 0.08970713687892219,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service3",
+        "within_realization_std_mean": 0.07790062546407533,
+        "between_realization_std_of_means": 0.061634626820052246,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service4",
+        "within_realization_std_mean": 0.06803909386455304,
+        "between_realization_std_of_means": 0.034645144175836466,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service5",
+        "within_realization_std_mean": 0.07849910387507439,
+        "between_realization_std_of_means": 0.0437965816335218,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service6",
+        "within_realization_std_mean": 0.06693164964350085,
+        "between_realization_std_of_means": 0.04764471688396483,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service7",
+        "within_realization_std_mean": 0.07854714669192701,
+        "between_realization_std_of_means": 0.07722419170756606,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service8",
+        "within_realization_std_mean": 0.0785992436644975,
+        "between_realization_std_of_means": 0.07001466518692007,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "observed_popularity_lag1_service9",
+        "within_realization_std_mean": 0.08224995134117373,
+        "between_realization_std_of_means": 0.08212099499079471,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "popularity_entropy_mean",
+        "within_realization_std_mean": 0.08090720529135699,
+        "between_realization_std_of_means": 0.028721374305678244,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "popularity_entropy_std",
+        "within_realization_std_mean": 0.06563572241359486,
+        "between_realization_std_of_means": 0.012563634929359937,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "popularity_shift_l1_mean",
+        "within_realization_std_mean": 0.11597053408804674,
+        "between_realization_std_of_means": 0.0250290692966012,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "top1_popularity_mean",
+        "within_realization_std_mean": 0.037465694808835326,
+        "between_realization_std_of_means": 0.010899470002196312,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "top1_popularity_std",
+        "within_realization_std_mean": 0.02815971064576997,
+        "between_realization_std_of_means": 0.006567940465670648,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service0",
+        "within_realization_std_mean": 0.028835296388277153,
+        "between_realization_std_of_means": 0.01367777368101494,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service1",
+        "within_realization_std_mean": 0.03910476412214105,
+        "between_realization_std_of_means": 0.07455131183134078,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service2",
+        "within_realization_std_mean": 0.045288165755494963,
+        "between_realization_std_of_means": 0.08887890453016968,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service3",
+        "within_realization_std_mean": 0.037713577569842956,
+        "between_realization_std_of_means": 0.06325719689784555,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service4",
+        "within_realization_std_mean": 0.034709532810968044,
+        "between_realization_std_of_means": 0.024490363306751743,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service5",
+        "within_realization_std_mean": 0.03875329735231353,
+        "between_realization_std_of_means": 0.04909532083739555,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service6",
+        "within_realization_std_mean": 0.03253024423469673,
+        "between_realization_std_of_means": 0.05103359096901522,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service7",
+        "within_realization_std_mean": 0.04093252512217839,
+        "between_realization_std_of_means": 0.07647109121078852,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service8",
+        "within_realization_std_mean": 0.03480085940301077,
+        "between_realization_std_of_means": 0.06159132970789844,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "recent_request_distribution_service9",
+        "within_realization_std_mean": 0.03822188334776414,
+        "between_realization_std_of_means": 0.06871021389411062,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "arrival_rate_mean",
+        "within_realization_std_mean": 0.043742031675511175,
+        "between_realization_std_of_means": 0.00950789145920377,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "arrival_rate_std",
+        "within_realization_std_mean": 0.03105193765184221,
+        "between_realization_std_of_means": 0.006639139103642177,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "active_task_count_mean",
+        "within_realization_std_mean": 0.8748406335102235,
+        "between_realization_std_of_means": 0.19015782918407603,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "active_task_count_std",
+        "within_realization_std_mean": 0.6210387530368444,
+        "between_realization_std_of_means": 0.13278278207284344,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "input_bits_mean_active",
+        "within_realization_std_mean": 1601442.3424610305,
+        "between_realization_std_of_means": 2185219.398104045,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "input_bits_std_active",
+        "within_realization_std_mean": 798451.8705431758,
+        "between_realization_std_of_means": 857044.3346822065,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "cpu_cycles_mean_active",
+        "within_realization_std_mean": 1294912485.5383759,
+        "between_realization_std_of_means": 2079188016.3764598,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "cpu_cycles_std_active",
+        "within_realization_std_mean": 668561847.7835486,
+        "between_realization_std_of_means": 808242830.0569508,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "mean_vehicle_speed",
+        "within_realization_std_mean": 3.710008451900182,
+        "between_realization_std_of_means": 0.36849757361640884,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "std_vehicle_speed",
+        "within_realization_std_mean": 1.3921724693283313,
+        "between_realization_std_of_means": 0.2258862693880947,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "mean_speed_change",
+        "within_realization_std_mean": 0.7076047907328342,
+        "between_realization_std_of_means": 0.10468579594426425,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "vehicle_centroid_x",
+        "within_realization_std_mean": 77.37433177603864,
+        "between_realization_std_of_means": 73.95870066998098,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "vehicle_centroid_y",
+        "within_realization_std_mean": 40.230561979,
+        "between_realization_std_of_means": 23.054582981616885,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "vehicle_spread_x",
+        "within_realization_std_mean": 45.92577015363157,
+        "between_realization_std_of_means": 15.475794117529908,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "vehicle_spread_y",
+        "within_realization_std_mean": 24.914810097264755,
+        "between_realization_std_of_means": 17.60703301003087,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "mean_interframe_displacement",
+        "within_realization_std_mean": 3.710008451900182,
+        "between_realization_std_of_means": 0.36849757361640884,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 10,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      },
+      {
+        "feature": "episode_progress",
+        "within_realization_std_mean": 0.27262658401532675,
+        "between_realization_std_of_means": 0.0007295356209413343,
+        "near_zero_within_std": false,
+        "unique_realization_mean_count": 9,
+        "realization_unique_constant_suspect": false,
+        "action": "kept"
+      }
+    ],
+    "realization_unique_constant_suspects_removed": []
+  },
+  "normalization_audit": {
+    "fold_wise_train_only_normalization_pass": true,
+    "target_scale_train_only_pass": true,
+    "constant_feature_scale_one_pass": true,
+    "folds": [
+      {
+        "fold": 1,
+        "fit_realizations": [
+          20041,
+          20042,
+          20043,
+          20044,
+          20047,
+          20048,
+          20049,
+          20050
+        ],
+        "heldout_realizations": [
+          20045,
+          20046
+        ],
+        "fit_row_count": 160,
+        "heldout_row_count": 40,
+        "heldout_excluded_from_state_normalization": true,
+        "heldout_excluded_from_context_normalization": true,
+        "state_normalization_mean_sha256": "70089fa49cf3056813e93da0316b9b9ede918e6972ced11f41ffae9e70f1012f",
+        "state_normalization_scale_sha256": "e8bbc187c76103c943525eec1e9b44a214f711b1292340fc4189e28403ac5ace",
+        "context_normalization_mean_sha256": "afe5e6c775359085cd60a22cb6d5ad74e0c0c571c5c5b5bb3400839987ee9424",
+        "context_normalization_scale_sha256": "5315871673afce2d4ba41d06d2857738b06c0b89c4524838b82aba0d9353be44",
+        "max_train_only_mean_reconstruction_diff": 0.0,
+        "constant_feature_scale_one": true,
+        "target_scale": 22.522607949810297,
+        "target_scale_method": "1.4826*MAD",
+        "train_target_mad": 15.191290941461148,
+        "train_target_std": 27.0989956644495,
+        "target_scale_train_rows_only": true
+      },
+      {
+        "fold": 2,
+        "fit_realizations": [
+          20041,
+          20042,
+          20043,
+          20045,
+          20046,
+          20047,
+          20048,
+          20050
+        ],
+        "heldout_realizations": [
+          20044,
+          20049
+        ],
+        "fit_row_count": 160,
+        "heldout_row_count": 40,
+        "heldout_excluded_from_state_normalization": true,
+        "heldout_excluded_from_context_normalization": true,
+        "state_normalization_mean_sha256": "254f641bfc90e6ce56335a5fb3b2d56d2b747429c9a051ff1f7a298cc1561ff2",
+        "state_normalization_scale_sha256": "b312357b0eccdc3717e333d6c6be619be40e7a3c6a1caa9b0bb99377a7f31564",
+        "context_normalization_mean_sha256": "bfd6e41ae1b9181ce85034b413979c7a7d900965405547cbb3628d923be8912f",
+        "context_normalization_scale_sha256": "c2f72c76208865520ddd37164db9981c0e9810f501665006ddf59f8f4d4daa17",
+        "max_train_only_mean_reconstruction_diff": 0.0,
+        "constant_feature_scale_one": true,
+        "target_scale": 20.8296949439447,
+        "target_scale_method": "1.4826*MAD",
+        "train_target_mad": 14.049436762407055,
+        "train_target_std": 24.309494547111946,
+        "target_scale_train_rows_only": true
+      },
+      {
+        "fold": 3,
+        "fit_realizations": [
+          20042,
+          20043,
+          20044,
+          20045,
+          20046,
+          20047,
+          20049,
+          20050
+        ],
+        "heldout_realizations": [
+          20041,
+          20048
+        ],
+        "fit_row_count": 160,
+        "heldout_row_count": 40,
+        "heldout_excluded_from_state_normalization": true,
+        "heldout_excluded_from_context_normalization": true,
+        "state_normalization_mean_sha256": "13a1aba05163aa3d6880e30472b5389e784fb49d5f7a5e081af363a2ef42a39e",
+        "state_normalization_scale_sha256": "1048f135e114123593516c9445a4ad34141d749b12019a5ee2ee20268f6350ee",
+        "context_normalization_mean_sha256": "1268b435cae8e428c3a18ab5f11716a32de243d0980ac012f81da586c7dabec3",
+        "context_normalization_scale_sha256": "272f5def10ba6b5529b9f961070315cbcc1e4d9e954709a1789965cee0e6985a",
+        "max_train_only_mean_reconstruction_diff": 0.0,
+        "constant_feature_scale_one": true,
+        "target_scale": 23.176178293579078,
+        "target_scale_method": "1.4826*MAD",
+        "train_target_mad": 15.632118099001133,
+        "train_target_std": 27.658611462255557,
+        "target_scale_train_rows_only": true
+      },
+      {
+        "fold": 4,
+        "fit_realizations": [
+          20041,
+          20044,
+          20045,
+          20046,
+          20047,
+          20048,
+          20049,
+          20050
+        ],
+        "heldout_realizations": [
+          20042,
+          20043
+        ],
+        "fit_row_count": 160,
+        "heldout_row_count": 40,
+        "heldout_excluded_from_state_normalization": true,
+        "heldout_excluded_from_context_normalization": true,
+        "state_normalization_mean_sha256": "544d0127a8f47b0735ca570b1550aeef54931b5e108699fd986df8184f022d35",
+        "state_normalization_scale_sha256": "7928207eb3ab53d500bf735ee06a1ccff9986df27d0ecf4f16c4577feebbc32d",
+        "context_normalization_mean_sha256": "f8d9a11ae0a84822238151912457a04fee54d37f8073271a4c83c78cc5588297",
+        "context_normalization_scale_sha256": "820ddc906e49b41b5736f8e3e3f4b74882d3d9a7bd0e9fada57f382bca7c42e0",
+        "max_train_only_mean_reconstruction_diff": 0.0,
+        "constant_feature_scale_one": true,
+        "target_scale": 22.605918272861768,
+        "target_scale_method": "1.4826*MAD",
+        "train_target_mad": 15.247482984528375,
+        "train_target_std": 26.376148317435938,
+        "target_scale_train_rows_only": true
+      },
+      {
+        "fold": 5,
+        "fit_realizations": [
+          20041,
+          20042,
+          20043,
+          20044,
+          20045,
+          20046,
+          20048,
+          20049
+        ],
+        "heldout_realizations": [
+          20047,
+          20050
+        ],
+        "fit_row_count": 160,
+        "heldout_row_count": 40,
+        "heldout_excluded_from_state_normalization": true,
+        "heldout_excluded_from_context_normalization": true,
+        "state_normalization_mean_sha256": "4efe7f62eeea766ec1c2ba948fb19a177047d780691332ce77818ca8320622d6",
+        "state_normalization_scale_sha256": "940a5f0c8a028827e0869e794e29e2e777b85ae3bd80c4c4a41296c62301a981",
+        "context_normalization_mean_sha256": "12027bb3258123925da3599dd5144d0c032f9c0570de75eaee4d41ab789f7ea2",
+        "context_normalization_scale_sha256": "bb264b67e4ec6fe70f16b748434efc721e6f3fed63dbb23aedc0a7870b2bcbe6",
+        "max_train_only_mean_reconstruction_diff": 0.0,
+        "constant_feature_scale_one": true,
+        "target_scale": 21.994666248521398,
+        "target_scale_method": "1.4826*MAD",
+        "train_target_mad": 14.835199142399432,
+        "train_target_std": 24.75952581452465,
+        "target_scale_train_rows_only": true
+      }
+    ]
+  },
+  "model": {
+    "architecture": "input_dim -> 128 SiLU -> 128 SiLU -> 1",
+    "optimizer": "Adam",
+    "learning_rate": 0.001,
+    "epochs": 100,
+    "max_grad_norm": 0.5,
+    "loss": "torch.nn.SmoothL1Loss() default beta",
+    "seed": 27005,
+    "training_rows_per_fold": "all 160 train states, including EXPECTED_LABEL=UNCERTAIN",
+    "target": "DELTA_EXPECTED / fold-train robust scale; 1.4826*MAD, fallback std",
+    "model_names": {
+      "STATE": "normalized 400D observation",
+      "SR": "normalized 400D + Group A + Group B + Group D",
+      "SRC": "normalized 400D + Group A + Group B + Group C + Group D",
+      "CONTEXT_ONLY": "normalized full context only; diagnostic baseline"
+    }
+  },
+  "grouped_cv_regression": {
+    "models": {
+      "STATE": {
+        "pearson": {
+          "mean": 0.03255909279881043,
+          "std": 0.07944041662388189,
+          "per_fold": [
+            0.07956615205025672,
+            0.16654195326675605,
+            -0.010630188782429214,
+            -0.032278808942301514,
+            -0.040403643598229864
+          ]
+        },
+        "spearman": {
+          "mean": 0.06525328330206379,
+          "std": 0.11119753272473915,
+          "per_fold": [
+            0.17448405253283306,
+            0.19455909943714825,
+            0.006378986866791747,
+            0.0577861163227017,
+            -0.10694183864915573
+          ]
+        },
+        "mae": {
+          "mean": 32.712231807274094,
+          "std": 2.695819989244335,
+          "per_fold": [
+            35.473709728407165,
+            30.15725512194582,
+            30.228635606429613,
+            36.441409528926535,
+            31.26014905066133
+          ]
+        },
+        "rmse": {
+          "mean": 40.85765995505267,
+          "std": 3.4720444039037854,
+          "per_fold": [
+            44.43707966457061,
+            40.896421697184984,
+            35.232691878858674,
+            44.4885855361496,
+            39.233520998499486
+          ]
+        }
+      },
+      "SR": {
+        "pearson": {
+          "mean": 0.039891897934535146,
+          "std": 0.0804752267953702,
+          "per_fold": [
+            0.010319829585356047,
+            -0.06748531734639246,
+            0.10729610066694542,
+            -0.006005727621065635,
+            0.15533460438783236
+          ]
+        },
+        "spearman": {
+          "mean": 0.05121951219512196,
+          "std": 0.056251522145189616,
+          "per_fold": [
+            0.06135084427767356,
+            -0.035459662288930584,
+            0.07711069418386493,
+            0.020637898686679177,
+            0.13245778611632272
+          ]
+        },
+        "mae": {
+          "mean": 28.358796660200863,
+          "std": 3.279350142351317,
+          "per_fold": [
+            31.904069659330524,
+            26.601274710137556,
+            29.832953532063605,
+            30.640621930169324,
+            22.81506346930332
+          ]
+        },
+        "rmse": {
+          "mean": 36.09653253685984,
+          "std": 2.7250568152322625,
+          "per_fold": [
+            40.52155925109363,
+            35.1827854510189,
+            36.819990039597684,
+            35.87968863957658,
+            32.07863930301242
+          ]
+        }
+      },
+      "SRC": {
+        "pearson": {
+          "mean": -0.014600793317321916,
+          "std": 0.08308200972733253,
+          "per_fold": [
+            -0.061839083536969326,
+            -0.11206760328699375,
+            0.03271651450613317,
+            -0.05479094497908239,
+            0.12297715071030273
+          ]
+        },
+        "spearman": {
+          "mean": -0.010206378986866793,
+          "std": 0.059092301305402675,
+          "per_fold": [
+            -0.0600375234521576,
+            -0.06378986866791746,
+            0.030769230769230774,
+            -0.04409005628517824,
+            0.08611632270168856
+          ]
+        },
+        "mae": {
+          "mean": 26.313505190263992,
+          "std": 1.8445317689855532,
+          "per_fold": [
+            27.272447036363737,
+            27.092209389022592,
+            25.38413739635505,
+            28.582861546250353,
+            23.235870583328246
+          ]
+        },
+        "rmse": {
+          "mean": 33.50896395940283,
+          "std": 1.9909554172167547,
+          "per_fold": [
+            34.77505466102794,
+            35.47258695068253,
+            30.48673502506125,
+            35.018498331954326,
+            31.791944828288088
+          ]
+        }
+      },
+      "CONTEXT_ONLY": {
+        "pearson": {
+          "mean": -0.07714894295582561,
+          "std": 0.11468000315209156,
+          "per_fold": [
+            -0.12234549768168734,
+            -0.080913703957403,
+            -0.263516946260852,
+            0.015240859723151048,
+            0.06579057339766317
+          ]
+        },
+        "spearman": {
+          "mean": -0.06915572232645406,
+          "std": 0.14290325818333488,
+          "per_fold": [
+            -0.09174484052532834,
+            -0.029455909943714824,
+            -0.3251407129455911,
+            -0.004315196998123829,
+            0.10487804878048781
+          ]
+        },
+        "mae": {
+          "mean": 27.53929862056963,
+          "std": 2.79734039666296,
+          "per_fold": [
+            28.173955659801187,
+            29.988764339163048,
+            30.77419939013493,
+            23.308973509177537,
+            25.450600204571476
+          ]
+        },
+        "rmse": {
+          "mean": 34.78030317371239,
+          "std": 2.662607809151829,
+          "per_fold": [
+            35.67876001773805,
+            38.09133807222797,
+            35.75112563772646,
+            30.03180167819063,
+            34.34849046267885
+          ]
+        }
+      }
+    },
+    "folds": [
+      {
+        "fold": 1,
+        "train_realizations": [
+          20041,
+          20042,
+          20043,
+          20044,
+          20047,
+          20048,
+          20049,
+          20050
+        ],
+        "test_realizations": [
+          20045,
+          20046
+        ],
+        "state_count": 40,
+        "models": {
+          "STATE": {
+            "pearson": 0.07956615205025672,
+            "spearman": 0.17448405253283306,
+            "mae": 35.473709728407165,
+            "rmse": 44.43707966457061,
+            "high_confidence": {
+              "state_count": 12,
+              "balanced_accuracy": 0.5,
+              "keep_recall": 0.6666666666666666,
+              "update_recall": 0.3333333333333333,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SR": {
+            "pearson": 0.010319829585356047,
+            "spearman": 0.06135084427767356,
+            "mae": 31.904069659330524,
+            "rmse": 40.52155925109363,
+            "high_confidence": {
+              "state_count": 12,
+              "balanced_accuracy": 0.5,
+              "keep_recall": 0.6666666666666666,
+              "update_recall": 0.3333333333333333,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SRC": {
+            "pearson": -0.061839083536969326,
+            "spearman": -0.0600375234521576,
+            "mae": 27.272447036363737,
+            "rmse": 34.77505466102794,
+            "high_confidence": {
+              "state_count": 12,
+              "balanced_accuracy": 0.41666666666666663,
+              "keep_recall": 0.5,
+              "update_recall": 0.3333333333333333,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "CONTEXT_ONLY": {
+            "pearson": -0.12234549768168734,
+            "spearman": -0.09174484052532834,
+            "mae": 28.173955659801187,
+            "rmse": 35.67876001773805,
+            "high_confidence": {
+              "state_count": 12,
+              "balanced_accuracy": 0.6666666666666666,
+              "keep_recall": 0.6666666666666666,
+              "update_recall": 0.6666666666666666,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          }
+        }
+      },
+      {
+        "fold": 2,
+        "train_realizations": [
+          20041,
+          20042,
+          20043,
+          20045,
+          20046,
+          20047,
+          20048,
+          20050
+        ],
+        "test_realizations": [
+          20044,
+          20049
+        ],
+        "state_count": 40,
+        "models": {
+          "STATE": {
+            "pearson": 0.16654195326675605,
+            "spearman": 0.19455909943714825,
+            "mae": 30.15725512194582,
+            "rmse": 40.896421697184984,
+            "high_confidence": {
+              "state_count": 13,
+              "balanced_accuracy": 0.5357142857142857,
+              "keep_recall": 0.5714285714285714,
+              "update_recall": 0.5,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SR": {
+            "pearson": -0.06748531734639246,
+            "spearman": -0.035459662288930584,
+            "mae": 26.601274710137556,
+            "rmse": 35.1827854510189,
+            "high_confidence": {
+              "state_count": 13,
+              "balanced_accuracy": 0.39285714285714285,
+              "keep_recall": 0.2857142857142857,
+              "update_recall": 0.5,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SRC": {
+            "pearson": -0.11206760328699375,
+            "spearman": -0.06378986866791746,
+            "mae": 27.092209389022592,
+            "rmse": 35.47258695068253,
+            "high_confidence": {
+              "state_count": 13,
+              "balanced_accuracy": 0.4642857142857143,
+              "keep_recall": 0.42857142857142855,
+              "update_recall": 0.5,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "CONTEXT_ONLY": {
+            "pearson": -0.080913703957403,
+            "spearman": -0.029455909943714824,
+            "mae": 29.988764339163048,
+            "rmse": 38.09133807222797,
+            "high_confidence": {
+              "state_count": 13,
+              "balanced_accuracy": 0.40476190476190477,
+              "keep_recall": 0.14285714285714285,
+              "update_recall": 0.6666666666666666,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          }
+        }
+      },
+      {
+        "fold": 3,
+        "train_realizations": [
+          20042,
+          20043,
+          20044,
+          20045,
+          20046,
+          20047,
+          20049,
+          20050
+        ],
+        "test_realizations": [
+          20041,
+          20048
+        ],
+        "state_count": 40,
+        "models": {
+          "STATE": {
+            "pearson": -0.010630188782429214,
+            "spearman": 0.006378986866791747,
+            "mae": 30.228635606429613,
+            "rmse": 35.232691878858674,
+            "high_confidence": {
+              "state_count": 9,
+              "balanced_accuracy": 0.16666666666666666,
+              "keep_recall": 0.3333333333333333,
+              "update_recall": 0.0,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SR": {
+            "pearson": 0.10729610066694542,
+            "spearman": 0.07711069418386493,
+            "mae": 29.832953532063605,
+            "rmse": 36.819990039597684,
+            "high_confidence": {
+              "state_count": 9,
+              "balanced_accuracy": 0.6666666666666666,
+              "keep_recall": 0.3333333333333333,
+              "update_recall": 1.0,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SRC": {
+            "pearson": 0.03271651450613317,
+            "spearman": 0.030769230769230774,
+            "mae": 25.38413739635505,
+            "rmse": 30.48673502506125,
+            "high_confidence": {
+              "state_count": 9,
+              "balanced_accuracy": 0.5833333333333334,
+              "keep_recall": 0.16666666666666666,
+              "update_recall": 1.0,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "CONTEXT_ONLY": {
+            "pearson": -0.263516946260852,
+            "spearman": -0.3251407129455911,
+            "mae": 30.77419939013493,
+            "rmse": 35.75112563772646,
+            "high_confidence": {
+              "state_count": 9,
+              "balanced_accuracy": 0.3333333333333333,
+              "keep_recall": 0.0,
+              "update_recall": 0.6666666666666666,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          }
+        }
+      },
+      {
+        "fold": 4,
+        "train_realizations": [
+          20041,
+          20044,
+          20045,
+          20046,
+          20047,
+          20048,
+          20049,
+          20050
+        ],
+        "test_realizations": [
+          20042,
+          20043
+        ],
+        "state_count": 40,
+        "models": {
+          "STATE": {
+            "pearson": -0.032278808942301514,
+            "spearman": 0.0577861163227017,
+            "mae": 36.441409528926535,
+            "rmse": 44.4885855361496,
+            "high_confidence": {
+              "state_count": 8,
+              "balanced_accuracy": 0.35714285714285715,
+              "keep_recall": 0.7142857142857143,
+              "update_recall": 0.0,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SR": {
+            "pearson": -0.006005727621065635,
+            "spearman": 0.020637898686679177,
+            "mae": 30.640621930169324,
+            "rmse": 35.87968863957658,
+            "high_confidence": {
+              "state_count": 8,
+              "balanced_accuracy": 0.2857142857142857,
+              "keep_recall": 0.5714285714285714,
+              "update_recall": 0.0,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SRC": {
+            "pearson": -0.05479094497908239,
+            "spearman": -0.04409005628517824,
+            "mae": 28.582861546250353,
+            "rmse": 35.018498331954326,
+            "high_confidence": {
+              "state_count": 8,
+              "balanced_accuracy": 0.2857142857142857,
+              "keep_recall": 0.5714285714285714,
+              "update_recall": 0.0,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "CONTEXT_ONLY": {
+            "pearson": 0.015240859723151048,
+            "spearman": -0.004315196998123829,
+            "mae": 23.308973509177537,
+            "rmse": 30.03180167819063,
+            "high_confidence": {
+              "state_count": 8,
+              "balanced_accuracy": 0.21428571428571427,
+              "keep_recall": 0.42857142857142855,
+              "update_recall": 0.0,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          }
+        }
+      },
+      {
+        "fold": 5,
+        "train_realizations": [
+          20041,
+          20042,
+          20043,
+          20044,
+          20045,
+          20046,
+          20048,
+          20049
+        ],
+        "test_realizations": [
+          20047,
+          20050
+        ],
+        "state_count": 40,
+        "models": {
+          "STATE": {
+            "pearson": -0.040403643598229864,
+            "spearman": -0.10694183864915573,
+            "mae": 31.26014905066133,
+            "rmse": 39.233520998499486,
+            "high_confidence": {
+              "state_count": 14,
+              "balanced_accuracy": 0.6041666666666666,
+              "keep_recall": 0.875,
+              "update_recall": 0.3333333333333333,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SR": {
+            "pearson": 0.15533460438783236,
+            "spearman": 0.13245778611632272,
+            "mae": 22.81506346930332,
+            "rmse": 32.07863930301242,
+            "high_confidence": {
+              "state_count": 14,
+              "balanced_accuracy": 0.5208333333333333,
+              "keep_recall": 0.375,
+              "update_recall": 0.6666666666666666,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "SRC": {
+            "pearson": 0.12297715071030273,
+            "spearman": 0.08611632270168856,
+            "mae": 23.235870583328246,
+            "rmse": 31.791944828288088,
+            "high_confidence": {
+              "state_count": 14,
+              "balanced_accuracy": 0.5,
+              "keep_recall": 0.5,
+              "update_recall": 0.5,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          },
+          "CONTEXT_ONLY": {
+            "pearson": 0.06579057339766317,
+            "spearman": 0.10487804878048781,
+            "mae": 25.450600204571476,
+            "rmse": 34.34849046267885,
+            "high_confidence": {
+              "state_count": 14,
+              "balanced_accuracy": 0.5833333333333333,
+              "keep_recall": 0.5,
+              "update_recall": 0.6666666666666666,
+              "prediction_zero_count_treated_as_keep": 0
+            }
+          }
+        }
+      }
+    ],
+    "STATE_TEST_SPEARMAN_MEAN": 0.06525328330206379,
+    "SR_TEST_SPEARMAN_MEAN": 0.05121951219512196,
+    "SRC_TEST_SPEARMAN_MEAN": -0.010206378986866793,
+    "CONTEXT_ONLY_TEST_SPEARMAN_MEAN": -0.06915572232645406,
+    "STATE_TEST_MAE_MEAN": 32.712231807274094,
+    "SR_TEST_MAE_MEAN": 28.358796660200863,
+    "SRC_TEST_MAE_MEAN": 26.313505190263992
+  },
+  "high_confidence_classification": {
+    "labels": "EXPECTED_LABEL != UNCERTAIN; regression prediction >0 UPDATE, otherwise KEEP",
+    "models": {
+      "STATE": {
+        "state_count": 56,
+        "balanced_accuracy": 0.482620320855615,
+        "keep_recall": 0.6470588235294118,
+        "update_recall": 0.3181818181818182,
+        "prediction_zero_count_treated_as_keep": 0
+      },
+      "SR": {
+        "state_count": 56,
+        "balanced_accuracy": 0.49331550802139035,
+        "keep_recall": 0.4411764705882353,
+        "update_recall": 0.5454545454545454,
+        "prediction_zero_count_treated_as_keep": 0
+      },
+      "SRC": {
+        "state_count": 56,
+        "balanced_accuracy": 0.47058823529411764,
+        "keep_recall": 0.4411764705882353,
+        "update_recall": 0.5,
+        "prediction_zero_count_treated_as_keep": 0
+      },
+      "CONTEXT_ONLY": {
+        "state_count": 56,
+        "balanced_accuracy": 0.4946524064171123,
+        "keep_recall": 0.35294117647058826,
+        "update_recall": 0.6363636363636364,
+        "prediction_zero_count_treated_as_keep": 0
+      }
+    },
+    "STATE_HC_BA": 0.482620320855615,
+    "SR_HC_BA": 0.49331550802139035,
+    "SRC_HC_BA": 0.47058823529411764,
+    "SRC_HC_KEEP_RECALL": 0.4411764705882353,
+    "SRC_HC_UPDATE_RECALL": 0.5
+  },
+  "margin_stratified_sign_agreement": {
+    "confidence_ratio": "abs(DELTA_EXPECTED) / max(abs(UNCERTAINTY_MARGIN), 1e-8)",
+    "bins": {
+      "LOW": 95,
+      "MID": 49,
+      "HIGH": 56
+    },
+    "models": {
+      "STATE": {
+        "LOW": {
+          "state_count": 95,
+          "sign_agreement": 0.5368421052631579
+        },
+        "MID": {
+          "state_count": 49,
+          "sign_agreement": 0.5102040816326531
+        },
+        "HIGH": {
+          "state_count": 56,
+          "sign_agreement": 0.5178571428571429
+        }
+      },
+      "SR": {
+        "LOW": {
+          "state_count": 95,
+          "sign_agreement": 0.4631578947368421
+        },
+        "MID": {
+          "state_count": 49,
+          "sign_agreement": 0.5714285714285714
+        },
+        "HIGH": {
+          "state_count": 56,
+          "sign_agreement": 0.48214285714285715
+        }
+      },
+      "SRC": {
+        "LOW": {
+          "state_count": 95,
+          "sign_agreement": 0.45263157894736844
+        },
+        "MID": {
+          "state_count": 49,
+          "sign_agreement": 0.5714285714285714
+        },
+        "HIGH": {
+          "state_count": 56,
+          "sign_agreement": 0.4642857142857143
+        }
+      },
+      "CONTEXT_ONLY": {
+        "LOW": {
+          "state_count": 95,
+          "sign_agreement": 0.5368421052631579
+        },
+        "MID": {
+          "state_count": 49,
+          "sign_agreement": 0.3469387755102041
+        },
+        "HIGH": {
+          "state_count": 56,
+          "sign_agreement": 0.4642857142857143
+        }
+      }
+    }
+  },
+  "ablation": {
+    "DELTA_SR_VS_STATE": -0.014033771106941824,
+    "DELTA_SRC_VS_SR": -0.061425891181988754,
+    "DELTA_SRC_VS_STATE": -0.07545966228893058,
+    "best_context_model_by_grouped_cv_spearman": "SR"
+  },
+  "decision": {
+    "CONTEXT_SUFFICIENCY_SUPPORTED": "NO",
+    "PRIMARY_DIAGNOSIS": "HANDCRAFTED_CONTEXT_INSUFFICIENT",
+    "matched_case": "D",
+    "case_conditions": {
+      "A": false,
+      "B": false,
+      "C": false,
+      "D": true
+    },
+    "case_B_clear_request_improvement_threshold": 0.08,
+    "case_precedence": [
+      "A",
+      "D",
+      "C",
+      "B"
+    ],
+    "context_only_interpretation": "diagnostic only; not a policy model",
+    "next_step": "进入 recurrent latent context / Meta-RL probe。"
+  },
+  "integrity": {
+    "formal_policy_rollout_executed": false,
+    "teacher_or_counterfactual_recomputed": false,
+    "formal_source_modified": false,
+    "full_tests_run": false,
+    "nan_inf_count": 0,
+    "same_state_identities": true,
+    "same_fold_assignment": true,
+    "future_leakage_pass": true,
+    "fold_normalization_leakage_pass": true,
+    "all_200_states_used_for_regression": true
+  },
+  "artifacts": {
+    "report": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\reports\\context_conditioned_trigger_probe.json",
+    "figure": "C:\\Users\\tangning\\Desktop\\code\\adaptive_cache_mec\\reports\\context_conditioned_trigger_probe.png"
+  }
+}

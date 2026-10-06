@@ -1,0 +1,130 @@
+{
+  "report": "LOCK FORMAL 300-EPOCH BASELINE PROVENANCE",
+  "inspection_only": true,
+  "selected_formal_run": {
+    "FORMAL_RUN_DIR": "runs/formal_v14b_actor_lr_1e_minus_3",
+    "selection_basis": "The run metadata matches V14b, architecture 15, checkpoint version 37, Macro Actor LR 1e-3, target 300 episodes, and completed 300 episodes. The user task identifies this LR as the baseline.",
+    "other_completed_v14b_lr_runs": [
+      {"run_dir": "runs/formal_v14b_actor_lr_1e_minus_4", "macro_actor_lr": 0.0001, "completed_episodes": 300},
+      {"run_dir": "runs/formal_v14b_actor_lr_5e_minus_4", "macro_actor_lr": 0.0005, "completed_episodes": 300},
+      {"run_dir": "runs/formal_v14b_actor_lr_5e_minus_3", "macro_actor_lr": 0.005, "completed_episodes": 300}
+    ],
+    "COMPLETED_EPOCHS": 300,
+    "completion_evidence": {
+      "run_summary_completed_episodes": 300,
+      "run_summary_target_episodes": 300,
+      "run_summary_last_episode": 300,
+      "run_summary_last_episode_seed": 20300,
+      "latest_checkpoint_completed_episodes": 300,
+      "manifest_training_counters_completed_episodes": 300,
+      "status_field_recorded": false
+    },
+    "run_config_path": "runs/formal_v14b_actor_lr_1e_minus_3/run_config.toml",
+    "run_manifest_path": "runs/formal_v14b_actor_lr_1e_minus_3/run_manifest.json",
+    "run_summary_path": "runs/formal_v14b_actor_lr_1e_minus_3/run_summary.json",
+    "config_hash": {
+      "manifest_config_raw_sha256": "89f4cf3109e73cc621d15d35cdedb535f849ca10488e1caa89c4a74553f61082",
+      "current_configs_proposed_system_config_toml_sha256": "89f4cf3109e73cc621d15d35cdedb535f849ca10488e1caa89c4a74553f61082",
+      "matches": true
+    },
+    "GIT_COMMIT_SHA": null,
+    "GIT_BRANCH": null,
+    "GIT_DIRTY_AT_RUN": null,
+    "MACRO_ACTOR_LR": 0.001,
+    "MACRO_CRITIC_LR": 0.001,
+    "credit_modes": {
+      "CACHE_TRIGGER_CREDIT_MODE": "No separate trigger credit field is recorded. KEEP is cache candidate 0 and UPDATE is selected from the same joint Macro Cache action; the recorded shared macro_actor_advantage_mode is duration_aware_smdp_gae.",
+      "CACHE_CANDIDATE_CREDIT_MODE": "No separate candidate credit field is recorded; the recorded shared macro_actor_advantage_mode is duration_aware_smdp_gae.",
+      "DURATION_CREDIT_MODE": "duration_aware_smdp_gae"
+    },
+    "TRAIN_EPISODE_SEED_START": 20001,
+    "TRAIN_EPISODE_SEED_END": 20300,
+    "TRAIN_REALIZATION_COUNT": 300,
+    "base_seed": 27005,
+    "resume": false,
+    "target_episodes": 300,
+    "recorded_macro_actor_advantage_mode": "duration_aware_smdp_gae",
+    "recorded_macro_cache_action": "(Cache configuration C_k, duration L_k)",
+    "recorded_cache_candidate_zero": "current actual Cache configuration (KEEP)"
+  },
+  "runner_provenance": {
+    "FORMAL_RUNNER_PATH": null,
+    "FORMAL_COMMAND": null,
+    "actual_invocation_recorded_in_run_manifest_or_summary": false,
+    "preflight_designated_launcher": "scripts/training/run_v14b_actor_lr_1e_minus_3.py",
+    "shared_runner_module": "scripts/training/v14b_runner.py",
+    "preflight_report": "reports/v14b_four_actor_lr_training_preflight.json",
+    "preflight_report_training_executed": false,
+    "preflight_report_formal_training_started": false,
+    "launcher_worktree_status": "untracked in current worktree",
+    "conclusion": "The preflight records the planned launcher and run directory, but explicitly says training had not started. The completed run artifacts do not record which entrypoint or command actually produced them, so the planned launcher is not asserted as the actual runner."
+  },
+  "checkpoint_metadata": {
+    "CHECKPOINT_EPISODE": 300,
+    "CHECKPOINT_ARCHITECTURE_VERSION": 15,
+    "CHECKPOINT_VERSION": 37,
+    "CHECKPOINT_GIT_SHA": null,
+    "CHECKPOINT_RNG_FIELDS": [
+      "python_rng_state",
+      "numpy_rng_state",
+      "torch_rng_state",
+      "torch_cuda_rng_states"
+    ],
+    "torch_cuda_rng_states_value": null,
+    "latest_checkpoint": {
+      "path": "runs/formal_v14b_actor_lr_1e_minus_3/checkpoints/latest_checkpoint.pt",
+      "sha256": "82a835d7e5be6325566f14ffa65afeb388d7e3ba47e4ddce487a14e6b7d1e55c",
+      "completed_episodes": 300
+    },
+    "best_train_return_checkpoint": {
+      "path": "runs/formal_v14b_actor_lr_1e_minus_3/checkpoints/best_train_return_checkpoint.pt",
+      "sha256": "3c9b4563b733c915502b89b79de2e15b3992c2090f7cea004418acc04e6fedd5",
+      "completed_episodes": 107
+    },
+    "read_only_metadata_inspection": true
+  },
+  "checkpoint_reference_discrepancy": {
+    "older_probe_reports": [
+      "reports/trigger_separability_probe.json",
+      "reports/expected_option_trigger_teacher_probe.json"
+    ],
+    "older_probe_recorded_checkpoint_episode": 237,
+    "older_probe_recorded_checkpoint_sha256": "56db01b01a704e7db7e1b7ea020a82025369a79309dc0db6e1ddd4f4281a8df1",
+    "current_latest_checkpoint_episode": 300,
+    "current_latest_checkpoint_sha256": "82a835d7e5be6325566f14ffa65afeb388d7e3ba47e4ddce487a14e6b7d1e55c",
+    "same_checkpoint_path_but_different_payload": true,
+    "interpretation": "The earlier probes used a different checkpoint payload at the same latest_checkpoint.pt path. Their episode-237 checkpoint is not the current episode-300 latest checkpoint."
+  },
+  "code_comparison": {
+    "CURRENT_HEAD": "50e0725f322eb36a2252679e32e925a47569d8b7",
+    "ORIGIN_MAIN": "50e0725f322eb36a2252679e32e925a47569d8b7",
+    "current_branch": "main",
+    "run_git_sha_available_for_comparison": false,
+    "current_files_different_from_HEAD_and_ORIGIN_MAIN": [
+      "src/ppo_simple/trainer.py",
+      "src/ppo_simple/rollout.py",
+      "src/ppo_simple/policy.py"
+    ],
+    "current_files_unchanged_vs_HEAD_and_ORIGIN_MAIN": [
+      "src/ppo_simple/cache_credit.py",
+      "src/ppo_simple/interface.py",
+      "configs/proposed/system_config.toml",
+      "scripts/training/v14b_runner.py"
+    ],
+    "runner_entrypoint_currently_untracked": "scripts/training/run_v14b_actor_lr_1e_minus_3.py",
+    "CURRENT_CODE_MATCHES_300EPOCH_RUN": "CANNOT_PROVE",
+    "FILES_DIFFERENT_FROM_FORMAL_RUN": null,
+    "reason": "The run manifest, summary, and checkpoint contain no source Git SHA, branch, or dirty-at-run value. Current HEAD equals origin/main, and the recorded run config hash matches the current config, but neither establishes the code revision used for training."
+  },
+  "AUTHORITATIVE_BASELINE": "CANNOT_PROVE; run artifacts identify a V14b architecture-15/checkpoint-37 300-episode candidate, but the required Git commit match is not recorded",
+  "NEXT_STEP": "Recover the original training host's run provenance or launch log containing its Git SHA, branch, dirty status, and actual command. Keep the earlier episode-237 probe checkpoint identity distinct from the current episode-300 checkpoint. Until provenance is recovered, treat this as the V14b metadata-matched baseline candidate, not a commit-verified baseline.",
+  "prohibited_actions_performed": {
+    "training": false,
+    "rollout": false,
+    "teacher_branch": false,
+    "data_generation": false,
+    "checkpoint_modified": false,
+    "source_or_config_modified": false,
+    "git_add_commit_push": false
+  }
+}
