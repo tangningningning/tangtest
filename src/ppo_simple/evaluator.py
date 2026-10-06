@@ -127,18 +127,18 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
             f"checkpoint architecture_version is not {expected_architecture}"
         )
     contract = payload.get("config_contract")
-    identity = {
-        "algorithm_id": payload.get("algorithm_id"),
-        "method": payload.get("method"),
-        "policy_schema": payload.get("policy_schema"),
-    }
-    if not all(isinstance(value, str) and value for value in identity.values()):
-        raise ValueError("checkpoint algorithm identity metadata is incomplete")
-    if not isinstance(contract, dict) or (
-        contract.get("algorithm_id") != identity["algorithm_id"]
-        or contract.get("policy_schema") != identity["policy_schema"]
-    ):
-        raise ValueError("checkpoint algorithm identity metadata is inconsistent")
+    if payload.get("algorithm_id") != ALGORITHM_ID:
+        raise ValueError("checkpoint algorithm_id mismatch")
+    if payload.get("method") != CHECKPOINT_METHOD:
+        raise ValueError("checkpoint method mismatch")
+    if payload.get("policy_schema") != expected_schema:
+        raise ValueError("checkpoint policy_schema mismatch")
+    if not isinstance(contract, dict):
+        raise ValueError("checkpoint PROPOSED configuration contract is missing")
+    if contract.get("algorithm_id") != ALGORITHM_ID:
+        raise ValueError("checkpoint config_contract algorithm_id mismatch")
+    if contract.get("policy_schema") != expected_schema:
+        raise ValueError("checkpoint config_contract policy_schema mismatch")
     if payload.get("unified_cache_action") is not True:
         raise ValueError("checkpoint does not use the unified Cache candidate action")
     if payload.get("cardinality_corrected_cache_action") is not True:
@@ -149,14 +149,16 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         or contract.get("cardinality_corrected_cache_action") is not True
     ):
         raise ValueError("checkpoint PROPOSED configuration contract mismatch")
-    payload = dict(payload)
-    payload["algorithm_id"] = ALGORITHM_ID
-    payload["method"] = CHECKPOINT_METHOD
-    payload["policy_schema"] = expected_schema
-    normalized_contract = dict(contract)
-    normalized_contract["algorithm_id"] = ALGORITHM_ID
-    normalized_contract["policy_schema"] = expected_schema
-    payload["config_contract"] = normalized_contract
+    for field in ("trigger_ppo_active", "trigger_active", "trigger_teacher_used"):
+        if contract.get(field) is not False:
+            raise ValueError(f"checkpoint config_contract {field} must be false")
+    if (
+        type(contract.get("trigger_counterfactual_branches")) is not int
+        or contract["trigger_counterfactual_branches"] != 0
+    ):
+        raise ValueError(
+            "checkpoint config_contract trigger_counterfactual_branches must be zero"
+        )
     return payload
 
 

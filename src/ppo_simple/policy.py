@@ -297,8 +297,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.observation_dim, (128, 128), 1, activation=nn.SiLU
         )
 
-        # Retain the inactive module at the end of the state dict for checkpoint
-        # compatibility; the current policy never calls it.
+        # 该模块暂时仅为当前 checkpoint 状态结构保留，正式策略不会调用。
         self.macro_cache_trigger_actor = nn.Sequential(
             nn.Linear(self.observation_dim, 128),
             nn.SiLU(),

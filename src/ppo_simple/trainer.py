@@ -561,7 +561,7 @@ class PPOTrainer:
         self.checkpoint_method = CHECKPOINT_METHOD
         self.capture_macro_transition_trace = bool(capture_macro_transition_trace)
         self.last_macro_transition_trace: dict[str, np.ndarray] | None = None
-        # These inactive compatibility fields remain in the serialized contract.
+        # Trigger 字段固定为未激活状态，并写入当前 checkpoint 合同。
         self.stage1_trigger_only = False
         self.trigger_max_grad_norm = 0.0
         self.initialization_metadata: dict[str, Any] = {}
@@ -2303,7 +2303,7 @@ class PPOTrainer:
         best_episode_return: float | None = None,
         checkpoint_role: str = "RESUMABLE_MAINLINE_CHECKPOINT",
     ) -> dict[str, Any]:
-        """Construct a resumable checkpoint with current PROPOSED policy state."""
+        """构造只包含当前 PROPOSED identity 的可恢复 checkpoint。"""
 
         last1 = self.last1_macro_transition_buffer
         return {
@@ -2416,7 +2416,7 @@ class PPOTrainer:
         episode_pool: str | None = None,
         restore_rng: bool = False,
     ) -> dict[str, Any]:
-        """Restore only a structurally complete PROPOSED checkpoint."""
+        """只恢复 identity 与配置合同均精确匹配的 PROPOSED checkpoint。"""
 
         payload = torch.load(Path(path), map_location=self.device, weights_only=False)
         if not isinstance(payload, dict):
@@ -2439,21 +2439,20 @@ class PPOTrainer:
             raise ValueError("checkpoint long_value_enabled mismatch.")
         if payload.get("long_value_target") != self.long_value_target:
             raise ValueError("checkpoint long_value_target mismatch.")
+        if payload.get("algorithm_id") != self.algorithm_id:
+            raise ValueError("checkpoint algorithm_id mismatch.")
+        if payload.get("method") != self.checkpoint_method:
+            raise ValueError("checkpoint method mismatch.")
+        if payload.get("policy_schema") != self.policy.architecture_id:
+            raise ValueError("checkpoint policy_schema mismatch.")
         saved_contract = payload.get("config_contract")
         if not isinstance(saved_contract, dict):
             raise ValueError("checkpoint policy tensor/configuration contract is missing.")
-        saved_identity = {
-            "algorithm_id": payload.get("algorithm_id"),
-            "method": payload.get("method"),
-            "policy_schema": payload.get("policy_schema"),
-        }
-        if not all(isinstance(value, str) and value for value in saved_identity.values()):
-            raise ValueError("checkpoint algorithm identity metadata is incomplete.")
         if (
-            saved_contract.get("algorithm_id") != saved_identity["algorithm_id"]
-            or saved_contract.get("policy_schema") != saved_identity["policy_schema"]
+            saved_contract.get("algorithm_id") != self.algorithm_id
+            or saved_contract.get("policy_schema") != self.policy.architecture_id
         ):
-            raise ValueError("checkpoint algorithm identity metadata is inconsistent.")
+            raise ValueError("checkpoint config_contract identity mismatch.")
         required = {
             "checkpoint_version": self.checkpoint_version,
             "architecture_version": int(self.policy.architecture_version),
@@ -2473,22 +2472,18 @@ class PPOTrainer:
         ):
             if expected is not None and payload.get(field) != expected:
                 raise ValueError(f"checkpoint {field} mismatch.")
-        normalized_saved_contract = dict(saved_contract)
-        # Prior checkpoints serialized this field as active in the nested legacy
-        # contract, although Trigger PPO was bypassed. Accept that metadata value.
-        if normalized_saved_contract.get("trigger_ppo_active") is True:
-            normalized_saved_contract["trigger_ppo_active"] = False
-        # The algorithm and schema names are descriptive metadata. Normalize them
-        # so structurally compatible checkpoints keep working after the rename.
-        normalized_saved_contract["algorithm_id"] = self.algorithm_id
-        normalized_saved_contract["policy_schema"] = self.policy.architecture_id
-        if normalized_saved_contract != self.config_contract:
+        for field in ("trigger_ppo_active", "trigger_active", "trigger_teacher_used"):
+            if saved_contract.get(field) is not False:
+                raise ValueError(f"checkpoint config_contract {field} must be false.")
+        if (
+            type(saved_contract.get("trigger_counterfactual_branches")) is not int
+            or saved_contract["trigger_counterfactual_branches"] != 0
+        ):
+            raise ValueError(
+                "checkpoint config_contract trigger_counterfactual_branches must be zero."
+            )
+        if saved_contract != self.config_contract:
             raise ValueError("checkpoint policy tensor/configuration contract mismatch.")
-        payload = dict(payload)
-        payload["algorithm_id"] = self.algorithm_id
-        payload["method"] = self.checkpoint_method
-        payload["policy_schema"] = self.policy.architecture_id
-        payload["config_contract"] = normalized_saved_contract
         if bool(payload.get("stage1_trigger_only", False)) != self.stage1_trigger_only:
             raise ValueError("checkpoint Stage-1 compatibility field mismatch.")
         if bool(payload.get("unified_cache_action", False)) != self.unified_cache_action:
