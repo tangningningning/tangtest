@@ -768,8 +768,8 @@ def validate_config(
             "configuration_control_mode 必须为 macro_cache_smdp_micro_uav_candidate。"
         )
     policy_schema = str(get_config_value(config, "algorithm.ppo.policy_schema", ""))
-    if policy_schema != "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo":
-        raise ValueError("当前正式配置要求双时间尺度 Macro/Micro policy schema。")
+    if policy_schema != "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo":
+        raise ValueError("algorithm.ppo.policy_schema 必须为当前 PROPOSED 正式策略 schema。")
     required_flags = {
         "macro_cache_enabled": True,
         "macro_full_batch": True,

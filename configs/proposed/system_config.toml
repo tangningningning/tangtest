@@ -529,7 +529,7 @@ objective_tolerance = 1.0e-9
 enabled = true
 method = "ppo_dual_timescale_v1"
 configuration_control_mode = "macro_cache_smdp_micro_uav_candidate"
-policy_schema = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
+policy_schema = "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo"
 macro_cache_enabled = true
 # 当前车辆预测 horizon H=5；默认候选为 sorted(unique([1, ceil(H/2), H]))。
 # candidate 0 始终是当前实际 Cache 配置，即 KEEP。
