@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,7 +17,6 @@ except ModuleNotFoundError:  # pragma: no cover - 无 PyTorch 环境也可检查
 from common import project_config
 from .macro_targets import (
     build_macro_n2_target,
-    build_macro_smdp_lambda_return_target,
 )
 
 SLOT_METRICS_FILENAME = "slot_metrics.jsonl"
@@ -27,353 +25,6 @@ MACRO_TRANSITION_TRACE_FILENAME = "macro_transition_trace.npz"
 EPISODE_METRICS_FILENAME = "episode_metrics.jsonl"
 
 TRAINING_EPOCH_RETURN_PLOT_FILENAME = "training_epoch_return.png"
-
-SLOT_DETAIL_FIELDS = (
-    "q",
-    "cache_cost",
-    "movement_cost",
-    "cache_trigger_count",
-    "cache_change_count",
-    "uav_trigger_count",
-    "uav_movement_count",
-)
-
-def _load_slot_contract(run_dir: Path) -> tuple[int, int]:
-    """从正式 run manifest 读取 episode slot 范围。"""
-
-    manifest_path = Path(run_dir) / "run_manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"缺少正式 run manifest：{manifest_path}")
-    try:
-        with manifest_path.open("r", encoding="utf-8") as stream:
-            manifest = json.load(stream)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"unable to read plotting protocol manifest: {manifest_path}") from exc
-    if not isinstance(manifest, dict):
-        raise ValueError(f"plotting protocol manifest must be an object: {manifest_path}")
-    raw_slots = manifest.get("episode_slots")
-    raw_start = manifest.get("origin_start")
-    raw_end = manifest.get("origin_end")
-    if raw_slots is None or raw_start is None or raw_end is None:
-        raise ValueError(f"正式 run manifest 缺少 episode slot 范围：{manifest_path}")
-    try:
-        episode_slots = int(raw_slots)
-        origin_start = int(raw_start)
-        origin_end = int(raw_end)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"plotting protocol manifest has invalid slot bounds: {manifest_path}") from exc
-    if episode_slots <= 0 or origin_end - origin_start + 1 != episode_slots:
-        raise ValueError(f"plotting protocol manifest has inconsistent slot bounds: {manifest_path}")
-    return episode_slots, origin_start
-
-def _resolve_slot_contract(
-    path: Path,
-    episode_slots: int | None,
-    origin_start: int | None,
-) -> tuple[int, int]:
-    if episode_slots is None:
-        return _load_slot_contract(path.parent)
-    slots = int(episode_slots)
-    start = 0 if origin_start is None else int(origin_start)
-    if slots <= 0:
-        raise ValueError("episode_slots must be positive")
-    return slots, start
-
-def _slot_metrics_finite_float(value: Any, field: str) -> float:
-    try:
-        converted = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"slot_metrics {field} must be numeric") from exc
-    if not math.isfinite(converted):
-        raise ValueError(f"slot_metrics {field} must be finite")
-    return converted
-
-def _nonnegative_int(value: Any, field: str) -> int:
-    converted = _slot_metrics_finite_float(value, field)
-    integer = int(converted)
-    if converted != integer or integer < 0:
-        raise ValueError(f"slot_metrics {field} must be a non-negative integer")
-    return integer
-
-def _read_slot_metrics(
-    path: Path,
-    *,
-    episode_slots: int | None = None,
-    origin_start: int | None = None,
-) -> dict[tuple[int, int], dict[str, Any]]:
-    active_slots, active_origin_start = _resolve_slot_contract(
-        Path(path), episode_slots, origin_start
-    )
-    records: dict[tuple[int, int], dict[str, Any]] = {}
-    if not path.exists():
-        return records
-    with path.open("r", encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                raise ValueError(f"slot_metrics contains a blank line at {line_number}")
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"slot_metrics contains invalid JSON at line {line_number}"
-                ) from exc
-            if not isinstance(record, dict):
-                raise ValueError(f"slot_metrics line {line_number} is not an object")
-            missing = {
-                "epoch",
-                "origin",
-                "global_training_slot",
-                "reward",
-            } - set(record)
-            if missing:
-                raise ValueError(
-                    f"slot_metrics line {line_number} missing fields: {sorted(missing)}"
-                )
-            epoch = int(record["epoch"])
-            origin = int(record["origin"])
-            global_slot = int(record["global_training_slot"])
-            if epoch < 1:
-                raise ValueError(f"slot_metrics epoch must be >=1 at line {line_number}")
-            origin_offset = origin - active_origin_start
-            if not 0 <= origin_offset < active_slots:
-                raise ValueError(
-                    f"slot_metrics origin must be in "
-                    f"[{active_origin_start},{active_origin_start + active_slots - 1}] "
-                    f"at line {line_number}"
-                )
-            expected_global_slot = (epoch - 1) * active_slots + origin_offset
-            if global_slot != expected_global_slot:
-                raise ValueError(
-                    "slot_metrics global_training_slot mismatch at "
-                    f"line {line_number}: {global_slot} != {expected_global_slot}"
-                )
-            reward = _slot_metrics_finite_float(record["reward"], "reward")
-            present_detail_fields = [field for field in SLOT_DETAIL_FIELDS if field in record]
-            if present_detail_fields and len(present_detail_fields) != len(SLOT_DETAIL_FIELDS):
-                missing_detail_fields = sorted(set(SLOT_DETAIL_FIELDS) - set(present_detail_fields))
-                raise ValueError(
-                    f"slot_metrics line {line_number} missing detail fields: "
-                    f"{missing_detail_fields}"
-                )
-            key = (epoch, origin)
-            if key in records:
-                raise ValueError(
-                    f"slot_metrics duplicate (epoch, origin)={key}"
-                )
-            parsed = {
-                "epoch": epoch,
-                "origin": origin,
-                "global_training_slot": global_slot,
-                "reward": reward,
-            }
-            if present_detail_fields:
-                parsed.update(
-                    {
-                        "q": _slot_metrics_finite_float(record["q"], "q"),
-                        "cache_cost": _slot_metrics_finite_float(record["cache_cost"], "cache_cost"),
-                        "movement_cost": _slot_metrics_finite_float(
-                            record["movement_cost"], "movement_cost"
-                        ),
-                        "cache_trigger_count": _nonnegative_int(
-                            record["cache_trigger_count"], "cache_trigger_count"
-                        ),
-                        "cache_change_count": _nonnegative_int(
-                            record["cache_change_count"], "cache_change_count"
-                        ),
-                        "uav_trigger_count": _nonnegative_int(
-                            record["uav_trigger_count"], "uav_trigger_count"
-                        ),
-                        "uav_movement_count": _nonnegative_int(
-                            record["uav_movement_count"], "uav_movement_count"
-                        ),
-                    }
-                )
-                expected_reward = (
-                    parsed["q"]
-                    - parsed["cache_cost"]
-                    - parsed["movement_cost"]
-                )
-                if not bool(
-                    np.isclose(reward, expected_reward, rtol=1.0e-12, atol=1.0e-9)
-                ):
-                    raise ValueError(
-                        "slot_metrics reward contract mismatch at "
-                        f"(epoch, origin)={key}: reward={reward}, "
-                        f"q-cache_cost-movement_cost={expected_reward}"
-                    )
-            records[key] = parsed
-    return records
-
-def append_training_slot_metrics(
-    path: Path,
-    *,
-    epoch: int,
-    rewards: Iterable[float],
-    episode_return: float,
-    episode_slots: int | None = None,
-    origin_start: int | None = None,
-    q_values: Iterable[float] | None = None,
-    cache_costs: Iterable[float] | None = None,
-    movement_costs: Iterable[float] | None = None,
-    cache_trigger_counts: Iterable[int] | None = None,
-    cache_change_counts: Iterable[int] | None = None,
-    uav_trigger_counts: Iterable[int] | None = None,
-    uav_movement_counts: Iterable[int] | None = None,
-) -> int:
-    """追加一个 epoch 的 transition reward；已有记录经过校验后可安全补全。"""
-
-    path = Path(path)
-    active_slots, active_origin_start = _resolve_slot_contract(
-        path, episode_slots, origin_start
-    )
-    epoch_i = int(epoch)
-    if epoch_i < 1:
-        raise ValueError("slot_metrics epoch must be >=1")
-    reward_array = np.asarray(list(rewards), dtype=np.float64).reshape(-1)
-    if reward_array.shape != (active_slots,):
-        raise ValueError(
-            "slot_metrics requires one complete episode; "
-            f"received {reward_array.size} rewards"
-        )
-    if not np.all(np.isfinite(reward_array)):
-        raise ValueError("slot_metrics rewards must be finite")
-    episode_return_f = _slot_metrics_finite_float(episode_return, "episode_return")
-    if not bool(
-        np.isclose(
-            float(reward_array.sum()),
-            episode_return_f,
-            rtol=1.0e-12,
-            atol=1.0e-9,
-        )
-    ):
-        raise ValueError(
-            "slot reward sum does not match episode_return: "
-            f"{float(reward_array.sum())} != {episode_return_f}"
-        )
-
-    detail_inputs = (
-        q_values,
-        cache_costs,
-        movement_costs,
-        cache_trigger_counts,
-        cache_change_counts,
-        uav_trigger_counts,
-        uav_movement_counts,
-    )
-    detailed = any(value is not None for value in detail_inputs)
-    if detailed and not all(value is not None for value in detail_inputs):
-        raise ValueError(
-            "slot_metrics detailed fields must be supplied together"
-        )
-    detail_arrays: dict[str, np.ndarray] = {}
-    if detailed:
-        detail_arrays = {
-            "q": np.asarray(list(q_values), dtype=np.float64).reshape(-1),  # type: ignore[arg-type]
-            "cache_cost": np.asarray(list(cache_costs), dtype=np.float64).reshape(-1),  # type: ignore[arg-type]
-            "movement_cost": np.asarray(list(movement_costs), dtype=np.float64).reshape(-1),  # type: ignore[arg-type]
-            "cache_trigger_count": np.asarray(
-                list(cache_trigger_counts), dtype=np.float64  # type: ignore[arg-type]
-            ).reshape(-1),
-            "cache_change_count": np.asarray(
-                list(cache_change_counts), dtype=np.float64  # type: ignore[arg-type]
-            ).reshape(-1),
-            "uav_trigger_count": np.asarray(
-                list(uav_trigger_counts), dtype=np.float64  # type: ignore[arg-type]
-            ).reshape(-1),
-            "uav_movement_count": np.asarray(
-                list(uav_movement_counts), dtype=np.float64  # type: ignore[arg-type]
-            ).reshape(-1),
-        }
-        for field, values in detail_arrays.items():
-            if values.shape != (active_slots,):
-                raise ValueError(
-                    f"slot_metrics {field} requires {active_slots} values; "
-                    f"received {values.size}"
-                )
-            if not np.all(np.isfinite(values)):
-                raise ValueError(f"slot_metrics {field} must be finite")
-        for field in (
-            "cache_trigger_count",
-            "cache_change_count",
-            "uav_trigger_count",
-            "uav_movement_count",
-        ):
-            values = detail_arrays[field]
-            if np.any(values < 0.0) or np.any(values != np.floor(values)):
-                raise ValueError(f"slot_metrics {field} must be non-negative integers")
-        expected_rewards = (
-            detail_arrays["q"]
-            - detail_arrays["cache_cost"]
-            - detail_arrays["movement_cost"]
-        )
-        if not np.allclose(reward_array, expected_rewards, rtol=1.0e-12, atol=1.0e-9):
-            mismatch = int(np.flatnonzero(~np.isclose(
-                reward_array, expected_rewards, rtol=1.0e-12, atol=1.0e-9
-            ))[0])
-            raise ValueError(
-                "slot reward contract mismatch at origin "
-                f"{mismatch}: reward={reward_array[mismatch]}, "
-                f"q-cache_cost-movement_cost={expected_rewards[mismatch]}"
-            )
-
-    records = _read_slot_metrics(
-        path,
-        episode_slots=active_slots,
-        origin_start=active_origin_start,
-    )
-    epoch_counts: dict[int, int] = {}
-    for existing_epoch, _ in records:
-        epoch_counts[existing_epoch] = epoch_counts.get(existing_epoch, 0) + 1
-    existing_epochs = sorted(epoch_counts)
-    if existing_epochs != list(range(1, len(existing_epochs) + 1)):
-        raise ValueError("slot_metrics epochs are not contiguous from epoch 1")
-    for existing_epoch, count in epoch_counts.items():
-        if existing_epoch > epoch_i:
-            raise ValueError(
-                f"slot_metrics contains a future epoch {existing_epoch} while writing {epoch_i}"
-            )
-        if existing_epoch < epoch_i and count != active_slots:
-            raise ValueError(
-                f"slot_metrics epoch {existing_epoch} is incomplete ({count}/"
-                f"{active_slots} records)"
-            )
-    to_append: list[dict[str, Any]] = []
-    for origin_offset, reward in enumerate(reward_array.tolist()):
-        origin = active_origin_start + origin_offset
-        key = (epoch_i, origin)
-        existing = records.get(key)
-        if existing is not None:
-            if not bool(np.isclose(existing["reward"], reward, rtol=0.0, atol=1.0e-12)):
-                raise ValueError(
-                    "existing slot reward conflicts with the completed episode at "
-                    f"(epoch, origin)={key}"
-                )
-            if detailed and all(field in existing for field in SLOT_DETAIL_FIELDS):
-                for field in SLOT_DETAIL_FIELDS:
-                    expected = (
-                        int(detail_arrays[field][origin_offset])
-                        if field.endswith("_count")
-                        else float(detail_arrays[field][origin_offset])
-                    )
-                    if existing[field] != expected:
-                        raise ValueError(
-                            f"existing slot {field} conflicts at (epoch, origin)={key}"
-                        )
-            continue
-        record = {
-            "epoch": epoch_i,
-            "origin": origin,
-            "global_training_slot": (epoch_i - 1) * active_slots + origin_offset,
-            "reward": float(reward),
-        }
-        if detailed:
-            for field in SLOT_DETAIL_FIELDS:
-                value = detail_arrays[field][origin_offset]
-                record[field] = int(value) if field.endswith("_count") else float(value)
-        to_append.append(record)
-    for record in to_append:
-        _append_jsonl(path, record)
-    return len(to_append)
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,393 +664,6 @@ def _finite_float(value: Any, field: str) -> float | None:
     return converted if math.isfinite(converted) else None
 
 
-def _git_identity(project_root: Path) -> tuple[str | None, bool | None]:
-    try:
-        sha_result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        dirty_result = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        if sha_result.returncode != 0 or dirty_result.returncode != 0:
-            raise RuntimeError(
-                f"git command failed: sha={sha_result.returncode}, "
-                f"dirty={dirty_result.returncode}"
-            )
-        sha = sha_result.stdout.strip()
-        if not sha:
-            raise RuntimeError("git rev-parse HEAD returned an empty SHA")
-        return sha, bool(dirty_result.stdout.strip())
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f"[REPORTING] Warning: unable to read git identity: {exc}", flush=True)
-        return None, None
-
-
-def _optimizer_learning_rate(optimizer: Any, label: str) -> float:
-    if optimizer is None:
-        raise ValueError(f"{label} optimizer is not initialized")
-    groups = list(getattr(optimizer, "param_groups", ()))
-    if not groups:
-        raise ValueError(f"{label} optimizer has no parameter groups")
-    rates = []
-    for group in groups:
-        rate = float(group["lr"])
-        if not math.isfinite(rate) or rate <= 0.0:
-            raise ValueError(f"{label} optimizer learning rate is invalid: {rate}")
-        rates.append(rate)
-    if any(rate != rates[0] for rate in rates[1:]):
-        raise ValueError(
-            f"{label} optimizer has multiple learning rates; manifest field is scalar"
-        )
-    return rates[0]
-
-
-def _actual_optimizers(trainer: Any) -> tuple[Any, Any]:
-    actor_optimizer = getattr(trainer, "cache_trigger_optimizer", None)
-    critic_optimizer = getattr(trainer, "critic_optimizer", None)
-    return actor_optimizer, critic_optimizer
-
-
-def build_run_manifest(
-    *,
-    config_path: str | Path,
-    config_raw_sha256: str,
-    config_semantic_sha256: str,
-    seed: int,
-    trainer: Any,
-    context: Any,
-    target_epochs: int,
-    rollout_steps: int,
-) -> dict[str, Any]:
-    """从当前 trainer、策略、优化器和配置生成正式 run manifest。"""
-
-    hyper = trainer.hyperparameters
-    actor_optimizer, critic_optimizer = _actual_optimizers(trainer)
-    protocol = project_config.get_ppo_data_protocol(context.cfg)
-    train_origin_start = int(context.train_origin_start)
-    train_origin_end = int(context.train_origin_end)
-    policy_schema = str(getattr(trainer.policy, "architecture_id", context.policy_schema))
-    if policy_schema != "adaptive_joint_cache_uav_ppo":
-        raise ValueError("run manifest 仅支持正式 proposed_joint 策略。")
-    git_sha, git_dirty = _git_identity(Path(context.root))
-    resolved_config_path = Path(
-        context.cfg.get("_meta", {}).get("config_path", config_path)
-    ).resolve()
-    learning_rate_metadata = trainer.learning_rate_metadata()
-    training_provenance = context.cfg.get("training_provenance", {})
-    cache_credit_manifest_fields: dict[str, Any] = {}
-    if hasattr(trainer, "cache_credit_metadata"):
-        cache_credit_manifest_fields = dict(trainer.cache_credit_metadata())
-    return {
-        "experiment_type": "main_training",
-        "architecture_version": int(getattr(trainer.policy, "architecture_version", 1)),
-        "checkpoint_version": int(trainer._expected_checkpoint_version()),
-        "initial_actor_sha256": training_provenance.get("ACTOR_INITIAL_STATE_SHA256"),
-        "initial_critic_sha256": training_provenance.get("CRITIC_INITIAL_STATE_SHA256"),
-        "initial_uav_candidate_encoder_sha256": training_provenance.get(
-            "INITIAL_UAV_CANDIDATE_ENCODER_SHA256"
-        ),
-        "uav_candidate_encoder_initialization": (
-            "deterministic deepcopy of the seeded base UAV encoder before optimization"
-        ),
-        "checkpoint_interval_epochs": 10,
-        "best_train_return_checkpoint_role": "TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION",
-        "final_checkpoint_selection_metric": "validation_mean_episode_return",
-        "git_commit_sha": git_sha,
-        "git_dirty": git_dirty,
-        "config_path": str(resolved_config_path),
-        "config_sha256": str(config_raw_sha256),
-        "config_raw_sha256": str(config_raw_sha256),
-        "config_semantic_sha256": str(config_semantic_sha256),
-        "seed": int(seed),
-        "device": str(trainer.device),
-        "policy_schema": policy_schema,
-        **(
-            trainer.critic_bootstrap_teacher_metadata()
-            if hasattr(trainer, "critic_bootstrap_teacher_metadata")
-            else {}
-        ),
-        "configuration_control_mode": str(context.configuration_control_mode),
-        "advantage_normalization_mode": str(hyper.advantage_normalization_mode),
-        "operation_advantage_normalization_mode": str(
-            hyper.operation_advantage_normalization_mode
-        ),
-        "operation_advantage_reference_scale": float(
-            hyper.operation_advantage_reference_scale
-        ),
-        "uav_operation_advantage_source": "FULL_INFORMATION_EXACT_Q_TEACHER",
-        "UAV_OPERATION_TEACHER": "FULL_INFORMATION_EXACT_Q_TEACHER",
-        "uav_candidate_advantage_source": "EXACT_Q_LISTWISE",
-        "UAV_CANDIDATE_TEACHER": "EXACT_Q_LISTWISE",
-        "candidate_advantage_normalization": "EXACT_Q_LISTWISE",
-        "critic_value_scale_mode": str(hyper.critic_value_scale_mode),
-        "critic_value_scale_epsilon": float(hyper.critic_value_scale_epsilon),
-        "critic_value_scale_warmup_samples": int(hyper.critic_value_scale_warmup_samples),
-        "observation_dim": int(context.observation_spec.observation_dim),
-        "action_dim": int(context.action_spec.action_dim),
-        "data_protocol": str(protocol["protocol"]),
-        "episode_slots": int(context.episode_slots),
-        "origin_start": train_origin_start,
-        "origin_end": train_origin_end,
-        "terminal_origin": int(context.terminal_origin),
-        "train_origin_start": train_origin_start,
-        "train_origin_end": train_origin_end,
-        "target_epochs": int(target_epochs),
-        "rollout_steps": int(rollout_steps),
-        "gamma": float(hyper.gamma),
-        "gae_lambda": float(hyper.gae_lambda),
-        "clip_epsilon": float(hyper.clip_epsilon),
-        "update_epochs": int(hyper.update_epochs),
-        "target_kl": hyper.target_kl,
-        "cache_kl_control": str(
-            getattr(trainer, "cache_kl_control", "minibatch_early_stop")
-        ),
-        "num_minibatches": int(hyper.num_minibatches),
-        "minibatch_size": int(context.minibatch_size),
-        "actor_learning_rate": _optimizer_learning_rate(
-            actor_optimizer, "actor"
-        ),
-        "critic_learning_rate": _optimizer_learning_rate(
-            critic_optimizer, "critic"
-        ),
-        "max_grad_norm": float(hyper.max_grad_norm),
-        "entropy_coefficient": float(hyper.entropy_coefficient),
-        **learning_rate_metadata,
-        **cache_credit_manifest_fields,
-    }
-
-
-def _manifest_protocol_identity(manifest: dict[str, Any]) -> dict[str, Any]:
-    """校验并规范化正式完整 episode manifest 的协议字段。"""
-
-    protocol = str(manifest["data_protocol"])
-    if protocol != project_config.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
-        raise ValueError(f"run manifest 使用了不支持的数据协议：{protocol}")
-    origin_start = int(manifest["origin_start"])
-    origin_end = int(manifest["origin_end"])
-    episode_slots = int(manifest["episode_slots"])
-    if episode_slots <= 0 or origin_end - origin_start + 1 != episode_slots:
-        raise ValueError("run manifest 中的 episode slot 范围不一致。")
-    terminal_origin = int(manifest["terminal_origin"])
-    if terminal_origin != origin_end:
-        raise ValueError("run manifest 的 terminal_origin 必须等于 origin_end。")
-    rollout_steps = int(manifest["rollout_steps"])
-    num_minibatches = int(manifest["num_minibatches"])
-    minibatch_size = int(manifest["minibatch_size"])
-    if rollout_steps != episode_slots:
-        raise ValueError("完整 episode 的 rollout_steps 必须等于 episode_slots。")
-    if num_minibatches <= 0 or episode_slots % num_minibatches != 0:
-        raise ValueError("完整 episode 的 num_minibatches 必须整除 episode_slots。")
-    if minibatch_size != episode_slots // num_minibatches:
-        raise ValueError("run manifest 的 minibatch_size 与 episode 范围不一致。")
-    return {
-        "data_protocol": protocol,
-        "episode_slots": episode_slots,
-        "origin_start": origin_start,
-        "origin_end": origin_end,
-        "terminal_origin": terminal_origin,
-        "rollout_steps": rollout_steps,
-        "num_minibatches": num_minibatches,
-        "minibatch_size": minibatch_size,
-    }
-
-
-def validate_run_manifest_for_resume(
-    existing: dict[str, Any], current: dict[str, Any]
-) -> None:
-    """拒绝恢复身份字段或完整 episode 协议不一致的 run。"""
-
-    required_match_fields = (
-        "policy_schema",
-        "advantage_normalization_mode",
-        "critic_value_scale_mode",
-        "observation_dim",
-        "rollout_steps",
-        "experiment_id",
-        "control_mode",
-        "configured_actor_learning_rate",
-        "configured_critic_learning_rate",
-        "effective_actor_learning_rate",
-        "effective_critic_learning_rate",
-        "actor_learning_rate_overridden",
-        "critic_learning_rate_overridden",
-    )
-    mismatches = {
-        field: (existing.get(field), current.get(field))
-        for field in required_match_fields
-        if existing.get(field) != current.get(field)
-    }
-    if mismatches:
-        details = ", ".join(
-            f"{field}: existing={old!r}, current={new!r}"
-            for field, (old, new) in mismatches.items()
-        )
-        raise ValueError(f"PPO resume run_manifest mismatch: {details}")
-
-    lifecycle_identity_fields = (
-        "checkpoint_version",
-        "critic_bootstrap_teacher_warmup_required",
-        "critic_warmup_seed_namespace",
-    )
-    lifecycle_mismatches = {
-        field: (existing.get(field), current.get(field))
-        for field in lifecycle_identity_fields
-        if existing.get(field) != current.get(field)
-    }
-    if lifecycle_mismatches:
-        details = ", ".join(
-            f"{field}: existing={old!r}, current={new!r}"
-            for field, (old, new) in lifecycle_mismatches.items()
-        )
-        raise ValueError(
-            f"PPO resume critic warmup manifest mismatch: {details}"
-        )
-
-    existing_protocol = _manifest_protocol_identity(existing)
-    current_protocol = _manifest_protocol_identity(current)
-    protocol_mismatches = {
-        field: (existing_protocol[field], current_protocol[field])
-        for field in (
-            "data_protocol",
-            "episode_slots",
-            "origin_start",
-            "origin_end",
-            "terminal_origin",
-            "rollout_steps",
-            "num_minibatches",
-            "minibatch_size",
-        )
-        if existing_protocol[field] != current_protocol[field]
-    }
-    if protocol_mismatches:
-        details = ", ".join(
-            f"{field}: existing={old!r}, current={new!r}"
-            for field, (old, new) in protocol_mismatches.items()
-        )
-        raise ValueError(f"PPO resume protocol mismatch: {details}")
-
-    existing_git_sha = existing.get("git_commit_sha")
-    current_git_sha = current.get("git_commit_sha")
-    if existing_git_sha is not None:
-        existing_git_sha = str(existing_git_sha).strip() or None
-    if current_git_sha is not None:
-        current_git_sha = str(current_git_sha).strip() or None
-    if (
-        existing_git_sha is not None
-        and current_git_sha is not None
-        and existing_git_sha != current_git_sha
-    ):
-        raise ValueError(
-            "PPO resume git_commit_sha mismatch; refusing cross-code-version resume"
-        )
-    if existing_git_sha is None or current_git_sha is None:
-        print(
-            "[REPORTING] Warning: Git provenance unavailable for resume; "
-            "allowing resume without cross-code-version verification.",
-            flush=True,
-        )
-
-
-def write_run_manifest(
-    path: Path,
-    *,
-    config_path: str | Path,
-    config_raw_sha256: str,
-    config_semantic_sha256: str,
-    seed: int,
-    trainer: Any,
-    context: Any,
-    target_epochs: int,
-    rollout_steps: int,
-    resume: bool,
-) -> dict[str, Any]:
-    """创建正式 manifest，或校验并更新正在恢复的 run。"""
-
-    current = build_run_manifest(
-        config_path=config_path,
-        config_raw_sha256=config_raw_sha256,
-        config_semantic_sha256=config_semantic_sha256,
-        seed=seed,
-        trainer=trainer,
-        context=context,
-        target_epochs=target_epochs,
-        rollout_steps=rollout_steps,
-    )
-    if resume and path.exists():
-        existing = _read_json(path)
-        validate_run_manifest_for_resume(existing, current)
-        initial_target_epochs = int(
-            existing.get("initial_target_epochs", existing.get("target_epochs", target_epochs))
-        )
-        merged = dict(existing)
-        merged["initial_target_epochs"] = initial_target_epochs
-        merged["current_target_epochs"] = int(target_epochs)
-        merged["target_epochs"] = int(target_epochs)
-        _write_json(path, merged)
-        return merged
-
-    current["initial_target_epochs"] = int(target_epochs)
-    current["current_target_epochs"] = int(target_epochs)
-    _write_json(path, current)
-    return current
-
-
-def update_run_manifest_teacher_state(path: Path, trainer: Any) -> dict[str, Any]:
-    """持久化仅由训练数据校准的 Cache teacher 与筛选状态。"""
-
-    manifest_path = Path(path)
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"run manifest is missing: {manifest_path}")
-    payload = _read_json(manifest_path)
-    if hasattr(trainer, "cache_credit_metadata"):
-        payload.update(trainer.cache_credit_metadata())
-    if hasattr(trainer, "critic_bootstrap_teacher_metadata"):
-        payload.update(trainer.critic_bootstrap_teacher_metadata())
-    payload.update(
-        {
-            "cache_teacher_scale_calibration": dict(
-                getattr(trainer, "cache_teacher_scale_calibration", {}) or {}
-            ),
-            "cache_surrogate_training_count": int(
-                getattr(trainer, "cache_surrogate_training_count", 0)
-            ),
-            "cache_surrogate_screening_ready": bool(
-                getattr(trainer, "cache_surrogate_screening_ready", False)
-            ),
-            "cache_surrogate_screening_active": bool(
-                getattr(trainer, "cache_surrogate_screening_active", False)
-            ),
-            "cache_surrogate_selected_k": getattr(
-                trainer, "cache_surrogate_selected_k", None
-            ),
-            "cache_surrogate_audit_statistics": getattr(
-                trainer, "cache_surrogate_audit_statistics", None
-            ),
-            "cache_surrogate_fallback_count": int(
-                getattr(trainer, "cache_surrogate_fallback_count", 0)
-            ),
-            "cache_surrogate_fallback_epochs": list(
-                getattr(trainer, "cache_surrogate_fallback_epochs", [])
-            ),
-            "cache_surrogate_recovery_count": int(
-                getattr(trainer, "cache_surrogate_recovery_count", 0)
-            ),
-        }
-    )
-    _write_json(manifest_path, payload)
-    return payload
-
-
 def _episode_records(path: Path) -> tuple[list[dict[str, Any]], bool]:
     raw_records, nan_inf_detected = _read_jsonl(path)
     by_epoch: dict[int, dict[str, Any]] = {}
@@ -1460,146 +724,6 @@ def _rolling_max(
     ]
     best = max(candidates, key=lambda item: item[0])
     return best
-
-
-def update_run_summary(
-    path: Path,
-    *,
-    episode_metrics_path: Path,
-    slot_metrics_path: Path,
-    completed_epochs: int,
-    target_epochs: int,
-    status: str,
-    protocol_metadata: dict[str, Any],
-    lifecycle_metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """根据已写入的指标生成当前 run 汇总。"""
-
-    if status not in {"running", "completed"}:
-        raise ValueError(f"invalid run summary status: {status}")
-    episodes, episode_nan_inf = _episode_records(episode_metrics_path)
-    episode_slots = int(protocol_metadata["episode_slots"])
-    origin_start = int(protocol_metadata["origin_start"])
-    origin_end = int(protocol_metadata["origin_end"])
-    terminal_origin = int(protocol_metadata["terminal_origin"])
-    if origin_end - origin_start + 1 != episode_slots:
-        raise ValueError("run summary protocol has inconsistent episode slot bounds")
-    if terminal_origin != origin_end:
-        raise ValueError("run summary terminal_origin must equal origin_end")
-    slot_records = _read_slot_metrics(
-        slot_metrics_path,
-        episode_slots=episode_slots,
-        origin_start=origin_start,
-    )
-    epochs = [int(record["epoch"]) for record in episodes]
-    returns = [
-        value
-        for value in (_finite_float(record.get("episode_return"), "episode_return") for record in episodes)
-        if value is not None
-    ]
-    if len(returns) != len(episodes):
-        episode_nan_inf = True
-    final_window_count = min(20, len(episodes))
-    final_episodes = episodes[-final_window_count:] if final_window_count else []
-    final_epoch = epochs[-1] if epochs else None
-    final_return = returns[-1] if returns else None
-    best_epoch = 0
-    best_return: float | None = None
-    if returns:
-        best_index = max(range(len(returns)), key=lambda index: returns[index])
-        best_epoch = epochs[best_index]
-        best_return = returns[best_index]
-
-    ma20, _ = _rolling_mean(returns, epochs, 20)
-    ma50, _ = _rolling_mean(returns, epochs, 50)
-    ma20_max, ma20_max_epoch = _rolling_max(returns, epochs, 20)
-    ma50_max, ma50_max_epoch = _rolling_max(returns, epochs, 50)
-
-    critic_ev = _metric_values(final_episodes, "critic_explained_variance")
-    all_critic_ev = _metric_values(episodes, "critic_explained_variance")
-    max_critic_ev = None
-    max_critic_ev_epoch = None
-    if all_critic_ev:
-        max_index = max(
-            (index for index, record in enumerate(episodes)
-             if _finite_float(record.get("critic_explained_variance"), "critic_explained_variance") is not None),
-            key=lambda index: float(episodes[index]["critic_explained_variance"]),
-        )
-        max_critic_ev = float(episodes[max_index]["critic_explained_variance"])
-        max_critic_ev_epoch = int(episodes[max_index]["epoch"])
-
-    final_epoch_set = {int(record["epoch"]) for record in final_episodes}
-    final_slot_records = [
-        record
-        for (epoch, _), record in slot_records.items()
-        if epoch in final_epoch_set
-    ]
-
-    def region_mean(start: int, end: int) -> float | None:
-        values = [
-            float(record["reward"])
-            for record in final_slot_records
-            if start <= int(record["origin"]) <= end
-        ]
-        return _mean(values)
-
-    base_region_size = episode_slots // 4
-    region_lengths = [base_region_size] * 3 + [
-        episode_slots - (base_region_size * 3)
-    ]
-    region_values: dict[str, float | None] = {}
-    region_start = origin_start
-    for region_length in region_lengths:
-        region_end = region_start + region_length - 1
-        if region_length <= 0:
-            value = None
-        else:
-            value = region_mean(region_start, region_end)
-        region_values[
-            f"final20_reward_origin_{region_start}_{region_end}"
-        ] = value
-        region_start = region_end + 1
-
-    summary = {
-        "status": status,
-        "completed_epochs": int(completed_epochs),
-        "target_epochs": int(target_epochs),
-        "data_protocol": str(protocol_metadata["data_protocol"]),
-        "episode_slots": episode_slots,
-        "origin_start": origin_start,
-        "origin_end": origin_end,
-        "terminal_origin": terminal_origin,
-        "rollout_steps": protocol_metadata.get("rollout_steps"),
-        "num_minibatches": protocol_metadata.get("num_minibatches"),
-        "minibatch_size": protocol_metadata.get("minibatch_size"),
-        "best_epoch": int(best_epoch),
-        "best_return": best_return,
-        "final_epoch": final_epoch,
-        "final_return": final_return,
-        "final20_window_count": int(final_window_count),
-        "final20_mean_return": _mean(returns[-final_window_count:]) if final_window_count else None,
-        "ma20": ma20,
-        "ma20_max": ma20_max,
-        "ma20_max_epoch": ma20_max_epoch,
-        "ma50": ma50,
-        "ma50_max": ma50_max,
-        "ma50_max_epoch": ma50_max_epoch,
-        "final20_mean_critic_ev": _mean(critic_ev),
-        "max_critic_ev": max_critic_ev,
-        "max_critic_ev_epoch": max_critic_ev_epoch,
-        "final20_cache_change_rate": _mean(
-            _metric_values(final_episodes, "cache_actual_change_rate")
-        ),
-        "final20_uav_movement_rate": _mean(
-            _metric_values(final_episodes, "uav_actual_movement_rate")
-        ),
-        "nan_inf_detected": bool(episode_nan_inf),
-    }
-    summary.update(region_values)
-    if lifecycle_metadata is not None:
-        summary.update(dict(lifecycle_metadata))
-    _write_json(path, summary)
-    return summary
 
 def _cache_operation_epoch_metrics(
     transitions: Any,
@@ -2011,771 +1135,6 @@ def _uav_episode_diagnostics(
         },
     }
 
-def _binary_action_bitmask(action: Any) -> int:
-    """将二元动作向量编码为紧凑且确定的整数。"""
-
-    values = np.asarray(action, dtype=np.int8).reshape(-1)
-    if not np.all((values == 0) | (values == 1)):
-        raise ValueError("binary action bitmask requires only 0/1 values")
-    bitmask = 0
-    for index, value in enumerate(values.tolist()):
-        if int(value):
-            bitmask |= 1 << int(index)
-    return int(bitmask)
-
-def _branch_update_metric_fields(update: Any) -> dict[str, Any]:
-    """返回有限的分支诊断指标。"""
-
-    values = {
-        "cache_approx_kl": float(update.cache_approx_kl),
-        "uav_approx_kl": float(update.uav_approx_kl),
-        "cache_clip_fraction": float(update.cache_clip_fraction),
-        "CACHE_PER_HEAD_OLD_NEW_KL_MEAN": float(
-            update.cache_per_head_old_new_kl_mean
-        ),
-        "CACHE_PER_HEAD_OLD_NEW_KL_P50": float(
-            update.cache_per_head_old_new_kl_p50
-        ),
-        "CACHE_PER_HEAD_OLD_NEW_KL_P90": float(
-            update.cache_per_head_old_new_kl_p90
-        ),
-        "CACHE_PER_HEAD_OLD_NEW_KL_MAX": float(
-            update.cache_per_head_old_new_kl_max
-        ),
-        "CACHE_PER_HEAD_RATIO_MEAN": float(update.cache_per_head_ratio_mean),
-        "CACHE_PER_HEAD_RATIO_P90": float(update.cache_per_head_ratio_p90),
-        "CACHE_PER_HEAD_RATIO_MAX": float(update.cache_per_head_ratio_max),
-        "CACHE_PER_HEAD_CLIP_FRACTION": float(update.cache_per_head_clip_fraction),
-        "uav_clip_fraction": float(update.uav_clip_fraction),
-        "cache_entropy": float(update.cache_entropy),
-        "uav_entropy": float(update.uav_entropy),
-        "cache_head_gradient_norm": float(update.cache_head_gradient_norm),
-        "uav_head_gradient_norm": float(update.uav_head_gradient_norm),
-            "shared_actor_gradient_norm": float(update.shared_actor_gradient_norm),
-        }
-    fields = values if all(math.isfinite(value) for value in values.values()) else {}
-    fields.update(
-        {
-        }
-    )
-    policy_losses = {
-        "cache_policy_loss": float(update.cache_policy_loss),
-        "cache_trigger_policy_loss": float(update.cache_trigger_policy_loss),
-        "cache_candidate_listwise_loss": float(
-            update.cache_candidate_policy_loss
-        ),
-        "uav_policy_loss": float(update.uav_policy_loss),
-        "uav_operation_policy_loss": float(update.uav_operation_policy_loss),
-        "uav_candidate_listwise_loss": float(update.uav_candidate_policy_loss),
-        "actor_policy_loss": float(update.actor_policy_loss),
-    }
-    if all(math.isfinite(value) for value in policy_losses.values()):
-        fields.update(policy_losses)
-    candidate_metrics = {
-        "candidate_loss": float(update.uav_candidate_policy_loss),
-        "mean_abs_candidate_advantage": float(
-            update.uav_candidate_advantage_mean_abs
-        ),
-        "candidate_adv_weighted_mean_residual": float(
-            update.uav_candidate_advantage_weighted_mean_residual
-        ),
-    }
-    if all(math.isfinite(value) for value in candidate_metrics.values()):
-        fields.update(candidate_metrics)
-        fields["candidate_advantage_normalization"] = str(
-            update.uav_candidate_advantage_normalization
-        )
-        fields["candidate_advantage_source"] = str(
-            update.uav_candidate_advantage_source
-        )
-    candidate_policy_metrics = {
-        "UAV_CANDIDATE_POLICY_ENTROPY_MEAN": float(
-            update.uav_candidate_policy_entropy_mean
-        ),
-        "UAV_CANDIDATE_TEACHER_ENTROPY_MEAN": float(
-            update.uav_candidate_teacher_entropy_mean
-        ),
-        "UAV_CANDIDATE_BEST_POLICY_PROB_MEAN": float(
-            update.uav_candidate_best_policy_prob_mean
-        ),
-        "UAV_CANDIDATE_BEST_POLICY_PROB_MEDIAN": float(
-            update.uav_candidate_best_policy_prob_median
-        ),
-        "UAV_CANDIDATE_BEST_POLICY_RANK_MEAN": float(
-            update.uav_candidate_best_policy_rank_mean
-        ),
-        "UAV_CANDIDATE_BEST_POLICY_TOP1_RATE": float(
-            update.uav_candidate_best_policy_top1_rate
-        ),
-        "UAV_CANDIDATE_BEST_POLICY_TOP3_RATE": float(
-            update.uav_candidate_best_policy_top3_rate
-        ),
-        "UAV_CANDIDATE_LOGIT_STD_MEAN": float(update.uav_candidate_logit_std_mean),
-        "UAV_CANDIDATE_LOGIT_RANGE_MEAN": float(
-            update.uav_candidate_logit_range_mean
-        ),
-    }
-    if all(math.isfinite(value) for value in candidate_policy_metrics.values()):
-        fields.update(candidate_policy_metrics)
-    candidate_confidence_metrics = {
-        "UAV_CANDIDATE_CONFIDENCE_MEAN": float(
-            update.uav_candidate_confidence_mean
-        ),
-        "UAV_CANDIDATE_CONFIDENCE_P10": float(update.uav_candidate_confidence_p10),
-        "UAV_CANDIDATE_CONFIDENCE_P50": float(update.uav_candidate_confidence_p50),
-        "UAV_CANDIDATE_CONFIDENCE_P90": float(update.uav_candidate_confidence_p90),
-        "UAV_CANDIDATE_CONFIDENCE_SATURATION_RATE": float(
-            update.uav_candidate_confidence_saturation_rate
-        ),
-    }
-    if all(math.isfinite(value) for value in candidate_confidence_metrics.values()):
-        fields.update(candidate_confidence_metrics)
-    fields.update(
-        {
-            "CACHE_ACTOR_GRAD_NORM_PRECLIP": [
-                float(value)
-                for value in update.cache_actor_grad_norm_preclip_by_update_epoch
-            ],
-            "CACHE_ACTOR_GRAD_CLIP_COEFFICIENT": [
-                float(value)
-                for value in update.cache_actor_grad_clip_coefficient_by_update_epoch
-            ],
-            "UAV_ACTOR_GRAD_NORM_PRECLIP": [
-                float(value)
-                for value in update.uav_actor_grad_norm_preclip_by_update_epoch
-            ],
-            "UAV_ACTOR_GRAD_CLIP_COEFFICIENT": [
-                float(value)
-                for value in update.uav_actor_grad_clip_coefficient_by_update_epoch
-            ],
-            "COMBINED_ACTOR_GRAD_NORM_POSTCLIP": [
-                float(value)
-                for value in update.combined_actor_grad_norm_postclip_by_update_epoch
-            ],
-            "UAV_CANDIDATE_SCORER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_scorer_gradient_norm_by_update_epoch
-            ],
-            "UAV_CANDIDATE_SCORER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_scorer_parameter_delta_norm_by_update_epoch
-            ],
-            "UAV_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_encoder_gradient_norm_by_update_epoch
-            ],
-            "UAV_OPERATION_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_encoder_gradient_norm_by_update_epoch
-            ],
-            "UAV_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_encoder_parameter_delta_norm_by_update_epoch
-            ],
-            "UAV_OPERATION_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_encoder_parameter_delta_norm_by_update_epoch
-            ],
-            "UAV_CANDIDATE_ENCODER_GRADIENT_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_encoder_gradient_norm_by_update_epoch
-            ],
-            "UAV_CANDIDATE_ENCODER_PARAMETER_DELTA_NORM_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_encoder_parameter_delta_norm_by_update_epoch
-            ],
-            "UAV_CANDIDATE_OLD_NEW_KL_MEAN_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_old_new_kl_mean_by_update_epoch
-            ],
-            "UAV_CANDIDATE_OLD_NEW_KL_P90_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_old_new_kl_p90_by_update_epoch
-            ],
-            "UAV_CANDIDATE_OLD_NEW_KL_MAX_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_old_new_kl_max_by_update_epoch
-            ],
-            "UAV_CANDIDATE_ARGMAX_FLIP_RATE_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_argmax_flip_rate_by_update_epoch
-            ],
-            "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_MEAN_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_best_policy_prob_change_mean_by_update_epoch
-            ],
-            "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_P10_BY_UPDATE_EPOCH": [
-                float(value)
-                for value in update.uav_candidate_best_policy_prob_change_p10_by_update_epoch
-            ],
-        }
-    )
-    combined_postclip = np.asarray(
-        update.combined_actor_grad_norm_postclip_by_update_epoch,
-        dtype=np.float64,
-    )
-    if combined_postclip.size:
-        fields.update(
-            {
-                "COMBINED_POSTCLIP_NORM_MEAN": float(np.mean(combined_postclip)),
-                "COMBINED_POSTCLIP_NORM_MAX": float(np.max(combined_postclip)),
-                "COMBINED_POSTCLIP_GT_0P5_FRACTION": float(
-                    np.mean(combined_postclip > 0.5)
-                ),
-            }
-        )
-    candidate_drift_metrics = {
-        "UAV_CANDIDATE_OLD_NEW_KL_MEAN": float(
-            update.uav_candidate_old_new_kl_mean
-        ),
-        "UAV_CANDIDATE_OLD_NEW_KL_P50": float(update.uav_candidate_old_new_kl_p50),
-        "UAV_CANDIDATE_OLD_NEW_KL_P90": float(update.uav_candidate_old_new_kl_p90),
-        "UAV_CANDIDATE_OLD_NEW_KL_MAX": float(update.uav_candidate_old_new_kl_max),
-        "UAV_CANDIDATE_ARGMAX_FLIP_RATE": float(
-            update.uav_candidate_argmax_flip_rate
-        ),
-        "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_MEAN": float(
-            update.uav_candidate_best_policy_prob_change_mean
-        ),
-        "UAV_CANDIDATE_BEST_POLICY_PROB_CHANGE_P10": float(
-            update.uav_candidate_best_policy_prob_change_p10
-        ),
-    }
-    if all(math.isfinite(value) for value in candidate_drift_metrics.values()):
-        fields.update(candidate_drift_metrics)
-    candidate_gate_metrics = {
-        "UAV_CANDIDATE_TARGET_KL": float(update.uav_candidate_target_kl),
-    }
-    if all(math.isfinite(value) for value in candidate_gate_metrics.values()):
-        fields.update(candidate_gate_metrics)
-    candidate_effective_kl_metrics = {
-        "UAV_CANDIDATE_EFFECTIVE_KL_AT_GATE": float(
-            update.uav_candidate_effective_kl_at_gate
-        ),
-        "UAV_CANDIDATE_EFFECTIVE_KL_IMMEDIATELY_AFTER_GATE": float(
-            update.uav_candidate_effective_kl_immediately_after_gate
-        ),
-        "UAV_CANDIDATE_EFFECTIVE_KL_AFTER_GATE": float(
-            update.uav_candidate_effective_kl_after_gate
-        ),
-        "UAV_CANDIDATE_POST_GATE_DRIFT_FROM_GATE": float(
-            update.uav_candidate_post_gate_drift_from_gate
-        ),
-    }
-    fields.update(
-        {
-            key: value
-            for key, value in candidate_effective_kl_metrics.items()
-            if math.isfinite(value)
-        }
-    )
-    fields.update(
-        {
-            "UAV_CANDIDATE_KL_GATE_STATISTIC": str(
-                update.uav_candidate_kl_gate_statistic
-            ),
-            "UAV_CANDIDATE_KL_GATE_TRIGGER_SOURCE": str(
-                update.uav_candidate_kl_gate_trigger_source
-            ),
-            "UAV_CANDIDATE_KL_STOP_EPOCH": update.uav_candidate_kl_stop_epoch,
-            "UAV_CANDIDATE_ACTIVE_PER_UPDATE_EPOCH": [
-                bool(value) for value in update.uav_candidate_active_per_update_epoch
-            ],
-            "UAV_CANDIDATE_SUPPRESSED_UPDATE_EPOCHS": int(
-                update.uav_candidate_suppressed_update_epochs
-            ),
-        }
-    )
-    scorer_deltas = {
-        "cache_target_scorer_parameter_delta_norm": float(
-            update.cache_target_scorer_parameter_delta_norm
-        ),
-        "uav_target_scorer_parameter_delta_norm": float(
-            update.uav_target_scorer_parameter_delta_norm
-        ),
-    }
-    if all(math.isfinite(value) for value in scorer_deltas.values()):
-        fields.update(scorer_deltas)
-    exact_q_quality = {
-        "uav_top1_exact_q_accuracy_before": float(
-            update.uav_top1_exact_q_accuracy_before
-        ),
-        "uav_top1_exact_q_accuracy_after": float(
-            update.uav_top1_exact_q_accuracy_after
-        ),
-        "uav_mean_exact_q_regret_before": float(
-            update.uav_mean_exact_q_regret_before
-        ),
-        "uav_mean_exact_q_regret_after": float(
-            update.uav_mean_exact_q_regret_after
-        ),
-        "uav_expected_exact_q_before": float(update.uav_expected_exact_q_before),
-        "uav_expected_exact_q_after": float(update.uav_expected_exact_q_after),
-        "uav_expected_exact_q_delta": float(update.uav_expected_exact_q_delta),
-        "uav_target_policy_kl_old_new": float(update.uav_target_policy_kl_old_new),
-    }
-    if all(math.isfinite(value) for value in exact_q_quality.values()):
-        fields.update(exact_q_quality)
-    if update.cache_proposal_diagnostics is not None:
-        fields["cache_proposal_diagnostics"] = dict(update.cache_proposal_diagnostics)
-    if update.uav_proposal_diagnostics is not None:
-        fields["uav_proposal_diagnostics"] = dict(update.uav_proposal_diagnostics)
-    fields.update(
-        {
-            "CACHE_TRIGGER_CREDIT_SOURCE": str(update.cache_trigger_credit_source),
-            "CACHE_CANDIDATE_CREDIT_SOURCE": str(update.cache_candidate_credit_source),
-            "CACHE_VALUE_EVALUATOR": str(update.cache_value_evaluator),
-            "CACHE_DOWNSTREAM_MODE": str(update.cache_downstream_mode),
-            "CACHE_TRIGGER_TEACHER_TEMPERATURE": float(
-                update.cache_trigger_teacher_temperature
-            ),
-            "CACHE_CANDIDATE_TEACHER_TEMPERATURE": float(
-                update.cache_candidate_teacher_temperature
-            ),
-            "CACHE_TRIGGER_VALID_HEAD_COUNT": int(
-                update.cache_trigger_valid_head_count
-            ),
-            "CACHE_CANDIDATE_VALID_HEAD_COUNT": int(
-                update.cache_candidate_valid_head_count
-            ),
-            "CACHE_Q_KEEP_MEAN": float(update.cache_q_keep_mean),
-            "CACHE_Q_BEST_UPDATE_MEAN": float(update.cache_q_best_update_mean),
-            "CACHE_DELTA_BEST_MEAN": float(update.cache_delta_best_mean),
-            "CACHE_LOGICAL_UPDATE_CANDIDATE_COUNT": int(
-                update.cache_logical_candidate_count
-            ),
-            "CACHE_FULL_EXACT_KEEP_BRANCH_COUNT": int(update.cache_keep_exact_count),
-            "CACHE_FULL_EXACT_UPDATE_BRANCH_COUNT": int(
-                update.cache_full_exact_update_branch_count
-            ),
-            "CACHE_DEDUPLICATED_BRANCH_COUNT": int(
-                update.cache_deduplicated_branch_count
-            ),
-            "CACHE_COUNTERFACTUAL_ENV_EXECUTIONS": int(
-                update.cache_credit_counterfactual_env_executions
-            ),
-            "CACHE_TEACHER_EVALUATION_RUNTIME_SECONDS": float(
-                update.cache_credit_runtime_seconds
-            ),
-            "CACHE_EXACT_CANDIDATE_COUNT": int(
-                update.cache_exact_candidate_count
-            ),
-            "CACHE_SURROGATE_CANDIDATE_COUNT": int(
-                update.cache_surrogate_candidate_count
-            ),
-            "CACHE_COUNTERFACTUAL_EXECUTIONS_SAVED": int(
-                update.cache_counterfactual_executions_saved
-            ),
-            "CACHE_COUNTERFACTUAL_EXECUTION_REDUCTION_RATIO": float(
-                update.cache_counterfactual_execution_reduction_fraction
-            ),
-            "CACHE_SURROGATE_SCREENING_ACTIVE": bool(
-                update.cache_surrogate_screening_active
-            ),
-            "CACHE_SURROGATE_SCREENING_READY": bool(
-                update.cache_surrogate_screening_ready
-            ),
-            "CACHE_SURROGATE_SELECTED_K": update.cache_surrogate_selected_k,
-            "CACHE_SURROGATE_DELTA_Q_MAE": float(
-                update.cache_surrogate_delta_q_mae
-            ),
-            "CACHE_SURROGATE_DELTA_Q_RMSE": float(
-                update.cache_surrogate_delta_q_rmse
-            ),
-            "CACHE_SURROGATE_GATE_METRICS": update.cache_surrogate_gate_metrics,
-            "CACHE_TEACHER_SCALE_CALIBRATION": update.cache_teacher_scale_calibration,
-            "CACHE_TRIGGER_DELTA_Q_STATISTICS": (
-                update.cache_trigger_delta_best_statistics
-            ),
-            "CACHE_TRIGGER_TEACHER_STATISTICS": update.cache_trigger_teacher_statistics,
-            "CACHE_CANDIDATE_TEACHER_STATISTICS": update.cache_candidate_teacher_statistics,
-        }
-    )
-    if math.isfinite(float(update.uav_operation_credit_runtime_seconds)):
-        fields["uav_operation_credit_runtime_seconds"] = float(
-            update.uav_operation_credit_runtime_seconds
-        )
-        fields["uav_operation_counterfactual_env_executions"] = int(
-            update.uav_operation_counterfactual_env_executions
-        )
-        fields.update(
-            {
-                "UAV_EXACT_Q_BRANCH_REQUEST_COUNT": int(
-                    update.uav_exact_q_branch_request_count
-                ),
-                "UAV_EXACT_Q_UNIQUE_BRANCH_COUNT": int(
-                    update.uav_exact_q_unique_branch_count
-                ),
-                "UAV_EXACT_Q_DUPLICATE_BRANCH_COUNT": int(
-                    update.uav_exact_q_duplicate_branch_count
-                ),
-                "UAV_EXACT_Q_CACHE_HIT_COUNT": int(
-                    update.uav_exact_q_cache_hit_count
-                ),
-                "EXECUTE_SLOT_CALL_COUNT": int(
-                    update.uav_exact_q_execute_slot_call_count
-                ),
-                "MATCHING_CALL_COUNT": int(update.uav_exact_q_matching_call_count),
-                # 该值来自 Matching/KKT 资源缓存的实际请求次数。
-                "KKT_CALL_COUNT": int(update.uav_exact_q_kkt_call_count),
-                "KKT_CACHE_REQUEST_COUNT": int(
-                    update.uav_exact_q_kkt_cache_request_count
-                ),
-                "KKT_CACHE_HIT_COUNT": int(update.uav_exact_q_kkt_cache_hit_count),
-                "KKT_CACHE_MISS_COUNT": int(update.uav_exact_q_kkt_cache_miss_count),
-                "KKT_SOLVER_CALL_COUNT": int(
-                    update.uav_exact_q_kkt_solver_call_count
-                ),
-                "NODE_EVAL_CACHE_REQUEST_COUNT": int(
-                    update.uav_exact_q_node_eval_cache_request_count
-                ),
-                "NODE_EVAL_CACHE_HIT_COUNT": int(
-                    update.uav_exact_q_node_eval_cache_hit_count
-                ),
-                "NODE_EVAL_CACHE_MISS_COUNT": int(
-                    update.uav_exact_q_node_eval_cache_miss_count
-                ),
-                "NODE_EVAL_CACHE_HIT_RATE": float(
-                    update.uav_exact_q_node_eval_cache_hit_count
-                    / update.uav_exact_q_node_eval_cache_request_count
-                    if update.uav_exact_q_node_eval_cache_request_count > 0
-                    else 0.0
-                ),
-                "NODE_EVAL_FULL_EXECUTION_COUNT": int(
-                    update.uav_exact_q_node_eval_full_execution_count
-                ),
-                "IDEAL_UTILITY_REQUEST_COUNT": int(
-                    update.uav_exact_q_ideal_utility_request_count
-                ),
-                "IDEAL_UTILITY_CACHE_HIT_COUNT": int(
-                    update.uav_exact_q_ideal_utility_cache_hit_count
-                ),
-                "IDEAL_UTILITY_CACHE_MISS_COUNT": int(
-                    update.uav_exact_q_ideal_utility_cache_miss_count
-                ),
-                "IDEAL_UTILITY_CACHE_HIT_RATE": float(
-                    update.uav_exact_q_ideal_utility_cache_hit_count
-                    / update.uav_exact_q_ideal_utility_request_count
-                    if update.uav_exact_q_ideal_utility_request_count > 0
-                    else 0.0
-                ),
-                "IMPACT_SCOPE_REQUEST_COUNT": int(
-                    update.uav_exact_q_impact_scope_request_count
-                ),
-                "IMPACT_SCOPE_COMPUTE_COUNT": int(
-                    update.uav_exact_q_impact_scope_compute_count
-                ),
-                "IMPACT_SCOPE_REUSE_COUNT": int(
-                    update.uav_exact_q_impact_scope_reuse_count
-                ),
-                "IMPACT_SCOPE_REUSE_RATE": float(
-                    update.uav_exact_q_impact_scope_reuse_count
-                    / update.uav_exact_q_impact_scope_request_count
-                    if update.uav_exact_q_impact_scope_request_count > 0
-                    else 0.0
-                ),
-            }
-        )
-        if update.uav_operation_timing is not None:
-            timing_fields = {
-                "EXACT_Q_MATCHING_RUNTIME": "matching_runtime",
-                "MATCHING_PROFILE_TOTAL_RUNTIME": "matching_runtime",
-                "MATCHING_FEASIBLE_TARGET_RUNTIME": "matching_feasible_target_runtime",
-                "MATCHING_CANDIDATE_GENERATION_RUNTIME": "matching_candidate_generation_runtime",
-                "MATCHING_CANDIDATE_BUILD_RUNTIME": "matching_candidate_generation_runtime",
-                "MATCHING_IMPACT_SCOPE_RUNTIME": "matching_impact_scope_runtime",
-                "MATCHING_UPPER_BOUND_RUNTIME": "matching_upper_bound_runtime",
-                "MATCHING_IDEAL_UTILITY_RUNTIME": "matching_ideal_utility_runtime",
-                "MATCHING_CHANNEL_RATE_RUNTIME": "matching_channel_rate_runtime",
-                "MATCHING_EXACT_EVAL_ORCHESTRATION_RUNTIME": "matching_exact_eval_orchestration_runtime",
-                "MATCHING_EXACT_EVAL_CONTROL_RUNTIME": "matching_exact_eval_orchestration_runtime",
-                "MATCHING_REPLAY_TIEBREAK_RUNTIME": "matching_replay_tiebreak_runtime",
-                "MATCHING_OTHER_RUNTIME": "matching_other_runtime",
-                "EXACT_Q_NODE_CACHE_LOOKUP_RUNTIME": "node_cache_lookup_runtime",
-                # Node 求解未命中耗时不包含单独记录的
-                # KKT allocation 耗时，以保证两类统计互不重叠。
-                "EXACT_Q_NODE_EVAL_RUNTIME": "node_eval_miss_runtime",
-                "EXACT_Q_NODE_EVAL_MISS_RUNTIME": "node_eval_miss_runtime",
-                "EXACT_Q_KKT_RUNTIME": "kkt_runtime",
-                "KKT_COEFFICIENT_BUILD_RUNTIME": "kkt_coefficient_build_runtime",
-                "KKT_SOLVER_CORE_RUNTIME": "kkt_solver_core_runtime",
-                "KKT_RESULT_ASSEMBLY_RUNTIME": "kkt_result_assembly_runtime",
-                "REWARD_DELAY_AGGREGATION_RUNTIME": "reward_delay_aggregation_runtime",
-                "REWARD_ENERGY_AGGREGATION_RUNTIME": "reward_energy_aggregation_runtime",
-                "REWARD_COST_AGGREGATION_RUNTIME": "reward_cost_aggregation_runtime",
-                "REWARD_FINAL_COMBINATION_RUNTIME": "reward_final_combination_runtime",
-                "EXACT_Q_BRANCH_STATE_BUILD_RUNTIME": "branch_state_build_runtime",
-                "EXACT_Q_REWARD_ASSEMBLY_RUNTIME": "reward_assembly_runtime",
-                "EXACT_Q_CRITIC_RUNTIME": "critic_runtime",
-                "EXACT_Q_OTHER_RUNTIME": "other_runtime",
-                "PARALLEL_WORKER_STARTUP_RUNTIME": "parallel_worker_startup_runtime",
-                "WORK_ITEM_SERIALIZATION_RUNTIME": "work_item_serialization_runtime",
-                "RESULT_MERGE_RUNTIME": "result_merge_runtime",
-                "EXACT_Q_PARALLEL_WORKERS": "parallel_worker_count",
-            }
-            total_runtime = float(update.uav_operation_credit_runtime_seconds)
-            if math.isfinite(total_runtime) and total_runtime > 0.0:
-                for metric_name, timing_key in timing_fields.items():
-                    value = float(update.uav_operation_timing.get(timing_key, 0.0))
-                    if not math.isfinite(value):
-                        continue
-                    fields[metric_name] = value
-                    fields[f"{metric_name}_FRACTION"] = value / total_runtime
-                exact_eval_subhotspot_fields = {
-                    "EXACT_EVAL_KKT_CONVERSION_RUNTIME": "exact_eval_kkt_conversion_runtime",
-                    "EXACT_EVAL_STATE_COPY_RUNTIME": "exact_eval_state_copy_runtime",
-                    "EXACT_EVAL_AFFECTED_NODE_PREP_RUNTIME": "exact_eval_affected_node_prep_runtime",
-                    "EXACT_EVAL_NODE_CALL_ORCHESTRATION_RUNTIME": "exact_eval_node_call_orchestration_runtime",
-                    "EXACT_EVAL_RESULT_MERGE_RUNTIME": "exact_eval_result_merge_runtime",
-                    "EXACT_EVAL_NON_EDGE_PREP_RUNTIME": "exact_eval_non_edge_prep_runtime",
-                    "EXACT_EVAL_TARGET_COUNT_BUILD_RUNTIME": "exact_eval_target_count_build_runtime",
-                    "EXACT_EVAL_UTILITY_SUM_RUNTIME": "exact_eval_utility_sum_runtime",
-                    "EXACT_EVAL_OTHER_RUNTIME": "exact_eval_other_runtime",
-                }
-                exact_eval_control_runtime = float(
-                    update.uav_operation_timing.get(
-                        "matching_exact_eval_orchestration_runtime", 0.0
-                    )
-                )
-                classified_subhotspot_runtime = 0.0
-                for metric_name, timing_key in exact_eval_subhotspot_fields.items():
-                    value = float(update.uav_operation_timing.get(timing_key, 0.0))
-                    if not math.isfinite(value):
-                        continue
-                    fields[metric_name] = value
-                    if exact_eval_control_runtime > 0.0:
-                        fields[f"{metric_name}_FRACTION"] = (
-                            value / exact_eval_control_runtime
-                        )
-                    classified_subhotspot_runtime += value
-                fields["EXACT_EVAL_RECORD_BOOKKEEPING_RUNTIME"] = float(
-                    update.uav_operation_timing.get(
-                        "exact_eval_record_bookkeeping_runtime", 0.0
-                    )
-                )
-                fields["EXACT_EVAL_SUBHOTSPOT_CLASSIFIED_RUNTIME"] = (
-                    classified_subhotspot_runtime
-                )
-                fields["EXACT_EVAL_UNCLASSIFIED_RUNTIME"] = (
-                    exact_eval_control_runtime - classified_subhotspot_runtime
-                )
-                fields["CURRENT_KKT_CONVERSION_CALL_COUNT"] = int(
-                    round(
-                        float(
-                            update.uav_operation_timing.get(
-                                "current_kkt_conversion_call_count", 0.0
-                            )
-                        )
-                    )
-                )
-                fields["CANDIDATE_KKT_CONVERSION_CALL_COUNT"] = int(
-                    round(
-                        float(
-                            update.uav_operation_timing.get(
-                                "candidate_kkt_conversion_call_count", 0.0
-                            )
-                        )
-                    )
-                )
-                fields["EXACT_EVAL_STATE_COPY_CALL_COUNT"] = int(
-                    round(
-                        float(
-                            update.uav_operation_timing.get(
-                                "exact_eval_state_copy_call_count", 0.0
-                            )
-                        )
-                    )
-                )
-                fields["CURRENT_KKT_CONTEXT_REQUEST_COUNT"] = int(
-                    round(
-                        float(
-                            update.uav_operation_timing.get(
-                                "current_kkt_context_request_count", 0.0
-                            )
-                        )
-                    )
-                )
-                fields["CURRENT_KKT_CONTEXT_REUSE_COUNT"] = int(
-                    round(
-                        float(
-                            update.uav_operation_timing.get(
-                                "current_kkt_context_reuse_count", 0.0
-                            )
-                        )
-                    )
-                )
-                fields["CANDIDATE_KKT_CONTEXT_REQUEST_COUNT"] = int(
-                    round(
-                        float(
-                            update.uav_operation_timing.get(
-                                "candidate_kkt_context_request_count", 0.0
-                            )
-                        )
-                    )
-                )
-                fields["CANDIDATE_KKT_CONTEXT_REUSE_COUNT"] = int(
-                    round(
-                        float(
-                            update.uav_operation_timing.get(
-                                "candidate_kkt_context_reuse_count", 0.0
-                            )
-                        )
-                    )
-                )
-    routing_metrics = {
-        "UAV_OPERATION_FULL_ROLLOUT_KL": float(
-            update.uav_operation_full_rollout_kl
-        ),
-        "uav_operation_head_parameter_delta_norm": float(
-            update.uav_operation_head_parameter_delta_norm
-        ),
-        "uav_operation_encoder_parameter_delta_norm": float(
-            update.uav_encoder_parameter_delta_norm
-        ),
-        "uav_candidate_encoder_parameter_delta_norm": float(
-            update.uav_candidate_encoder_parameter_delta_norm
-        ),
-    }
-    if all(math.isfinite(value) for value in routing_metrics.values()):
-        fields.update(routing_metrics)
-    fields.update(
-        {
-            "UAV_OPERATION_STEPS_EXECUTED": int(update.uav_operation_steps_executed),
-            "UAV_OPERATION_STEPS_SUPPRESSED": int(update.uav_operation_steps_suppressed),
-            "UAV_CANDIDATE_FULL_STEPS": int(update.uav_candidate_full_steps),
-            "UAV_CANDIDATE_ONLY_STEPS_AFTER_OPERATION_STOP": int(
-                update.uav_candidate_only_steps_after_operation_stop
-            ),
-            "UAV_CANDIDATE_OPTIMIZER_STEP_COUNT": int(
-                update.uav_candidate_optimizer_step_count
-            ),
-            "UAV_CANDIDATE_SCORER_OPTIMIZER_STEP_COUNT": int(
-                update.uav_candidate_optimizer_step_count
-            ),
-            "UAV_OPERATION_ENCODER_OPTIMIZER_STEP_COUNT": int(
-                update.uav_operation_encoder_optimizer_step_count
-            ),
-            "UAV_CANDIDATE_ENCODER_OPTIMIZER_STEP_COUNT": int(
-                update.uav_candidate_encoder_optimizer_step_count
-            ),
-            "UAV_CANDIDATE_SCORER_ENCODER_STEP_GAP": int(
-                update.uav_candidate_scorer_encoder_step_gap
-            ),
-        }
-    )
-    if update.uav_operation_teacher_diagnostics is not None:
-        fields.update(dict(update.uav_operation_teacher_diagnostics))
-    if update.uav_operation_diagnostics is not None:
-        fields.update(dict(update.uav_operation_diagnostics))
-    encoder_gradient_norms = {
-        "cache_encoder_gradient_norm": float(update.cache_encoder_gradient_norm),
-        "uav_operation_encoder_gradient_norm": float(update.uav_encoder_gradient_norm),
-        "uav_candidate_encoder_gradient_norm": float(
-            update.uav_candidate_encoder_gradient_norm
-        ),
-    }
-    if all(math.isfinite(value) for value in encoder_gradient_norms.values()):
-        fields.update(encoder_gradient_norms)
-    fields.update(
-        {
-            "MATCHING_NATURAL_STABLE_COUNT": int(
-                update.matching_natural_stable_count
-            ),
-            "MATCHING_MAX_UPDATES_HIT_COUNT": int(
-                update.matching_max_updates_hit_count
-            ),
-            "MATCHING_MAX_UPDATES_HIT_RATE": float(
-                update.matching_max_updates_hit_rate
-            ),
-            "MATCHING_UPDATE_COUNT_MEAN": float(update.matching_update_count_mean),
-            "MATCHING_UPDATE_COUNT_P95": float(update.matching_update_count_p95),
-            "MATCHING_UPDATE_COUNT_MAX": int(update.matching_update_count_max),
-            "MATCHING_CF_NATURAL_STABLE_COUNT": int(
-                update.matching_cf_natural_stable_count
-            ),
-            "MATCHING_CF_MAX_UPDATES_HIT_COUNT": int(
-                update.matching_cf_max_updates_hit_count
-            ),
-            "MATCHING_CF_MAX_UPDATES_HIT_RATE": float(
-                update.matching_cf_max_updates_hit_rate
-            ),
-            "MATCHING_CF_UPDATE_COUNT_MEAN": float(
-                update.matching_cf_update_count_mean
-            ),
-            "MATCHING_CF_UPDATE_COUNT_P95": float(
-                update.matching_cf_update_count_p95
-            ),
-            "MATCHING_CF_UPDATE_COUNT_MAX": int(
-                update.matching_cf_update_count_max
-            ),
-            "KKT_SOLVE_COUNT": int(update.kkt_solve_count),
-            "KKT_CONVERGED_COUNT": int(update.kkt_converged_count),
-            "KKT_CONVERGED_RATE": float(update.kkt_converged_rate),
-            "KKT_MAX_ITER_HIT_COUNT": int(update.kkt_max_iter_hit_count),
-            "KKT_MAX_ITER_HIT_RATE": float(update.kkt_max_iter_hit_rate),
-            "KKT_FINITE_COUNT": int(update.kkt_finite_count),
-            "KKT_FINITE_RATE": float(update.kkt_finite_rate),
-            "KKT_ITERATION_MEAN": float(update.kkt_iteration_mean),
-            "KKT_ITERATION_P95": float(update.kkt_iteration_p95),
-            "KKT_ITERATION_MAX": int(update.kkt_iteration_max),
-            "KKT_RESOURCE_RESIDUAL_MEAN": float(
-                update.kkt_resource_residual_mean
-            ),
-            "KKT_RESOURCE_RESIDUAL_MAX": float(update.kkt_resource_residual_max),
-            "KKT_STATIONARITY_RESIDUAL_MEAN": float(
-                update.kkt_stationarity_residual_mean
-            ),
-            "KKT_STATIONARITY_RESIDUAL_MAX": float(
-                update.kkt_stationarity_residual_max
-            ),
-            "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": float(
-                update.kkt_complementary_slackness_residual_mean
-            ),
-            "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": float(
-                update.kkt_complementary_slackness_residual_max
-            ),
-            "KKT_CF_SOLVE_COUNT": int(update.matching_cf_kkt_solve_count),
-            "KKT_CF_CONVERGED_COUNT": int(
-                update.matching_cf_kkt_converged_count
-            ),
-            "KKT_CF_CONVERGED_RATE": float(
-                update.matching_cf_kkt_converged_rate
-            ),
-            "KKT_CF_MAX_ITER_HIT_COUNT": int(
-                update.matching_cf_kkt_max_iter_hit_count
-            ),
-            "KKT_CF_MAX_ITER_HIT_RATE": float(
-                update.matching_cf_kkt_max_iter_hit_rate
-            ),
-            "KKT_CF_FINITE_COUNT": int(update.matching_cf_kkt_finite_count),
-            "KKT_CF_FINITE_RATE": float(update.matching_cf_kkt_finite_rate),
-            "KKT_CF_ITERATION_MEAN": float(
-                update.matching_cf_kkt_iteration_mean
-            ),
-            "KKT_CF_ITERATION_P95": float(update.matching_cf_kkt_iteration_p95),
-            "KKT_CF_ITERATION_MAX": int(update.matching_cf_kkt_iteration_max),
-            "KKT_CF_RESOURCE_RESIDUAL_MEAN": float(
-                update.matching_cf_kkt_resource_residual_mean
-            ),
-            "KKT_CF_RESOURCE_RESIDUAL_MAX": float(
-                update.matching_cf_kkt_resource_residual_max
-            ),
-            "KKT_CF_STATIONARITY_RESIDUAL_MEAN": float(
-                update.matching_cf_kkt_stationarity_residual_mean
-            ),
-            "KKT_CF_STATIONARITY_RESIDUAL_MAX": float(
-                update.matching_cf_kkt_stationarity_residual_max
-            ),
-            "KKT_CF_COMPLEMENTARY_SLACKNESS_RESIDUAL_MEAN": float(
-                update.matching_cf_kkt_complementary_slackness_residual_mean
-            ),
-            "KKT_CF_COMPLEMENTARY_SLACKNESS_RESIDUAL_MAX": float(
-                update.matching_cf_kkt_complementary_slackness_residual_max
-            ),
-        }
-    )
-    return fields
-
 def _critic_episode_metrics(
     old_values: list[float],
     raw_targets: list[float],
@@ -3004,100 +1363,6 @@ def _append_critic_diagnostics(
             record,
         )
 
-def _branch_kl_update_metric_fields(
-    update: Any, minibatch_early_stop_mode: str
-) -> dict[str, Any]:
-    """返回写入 update JSONL 的分支级 minibatch/epoch KL 诊断。"""
-
-    if not update.kl_epoch_diagnostics:
-        return {}
-    epoch_fields = (
-        "cache_without_uav_kl_trigger_count",
-        "uav_only_kl_trigger_count",
-        "both_kl_trigger_count",
-        "neither_kl_trigger_count",
-    )
-    fields: dict[str, Any] = {
-        "kl_minibatch_diagnostics": [
-            dict(record) for record in update.kl_minibatch_diagnostics
-        ],
-        "kl_epoch_diagnostics": [
-            dict(record) for record in update.kl_epoch_diagnostics
-        ],
-        **{
-            field: int(
-                sum(int(record[field]) for record in update.kl_epoch_diagnostics)
-            )
-            for field in epoch_fields
-        },
-        "cache_trigger_suppressed_uav_update": bool(
-            any(
-                record["cache_trigger_suppressed_uav_update"]
-                for record in update.kl_epoch_diagnostics
-            )
-        ),
-        "uav_trigger_suppressed_cache_update": bool(
-            any(
-                record["uav_trigger_suppressed_cache_update"]
-                for record in update.kl_epoch_diagnostics
-            )
-        ),
-        "CACHE_OPTIMIZER_STEPS_THIS_UPDATE": int(
-            update.cache_optimizer_steps_this_update
-        ),
-        "UAV_OPERATION_OPTIMIZER_STEPS_THIS_UPDATE": int(
-            update.uav_operation_optimizer_steps_this_update
-        ),
-        "UAV_CANDIDATE_OPTIMIZER_STEPS_THIS_UPDATE": int(
-            update.uav_candidate_optimizer_steps_this_update
-        ),
-        "CACHE_MINIBATCHES_SUPPRESSED": int(update.cache_minibatches_suppressed),
-        "UAV_OPERATION_MINIBATCHES_SUPPRESSED": int(
-            update.uav_operation_minibatches_suppressed
-        ),
-        "UAV_CANDIDATE_MINIBATCHES_SUPPRESSED": int(
-            update.uav_candidate_minibatches_suppressed
-        ),
-        "UAV_OPERATION_STOP_MINIBATCH": update.uav_operation_stop_minibatch,
-        "UAV_CANDIDATE_STOP_MINIBATCH": update.uav_candidate_stop_minibatch,
-        "CACHE_KL_MINIBATCH_EARLY_STOP_ACTIVE": bool(
-            update.cache_kl_control == minibatch_early_stop_mode
-        ),
-        "uav_candidate_active_per_update_epoch": [
-            bool(value) for value in update.uav_candidate_active_per_update_epoch
-        ],
-        "UAV_CANDIDATE_ONLY_STEPS_AFTER_OPERATION_STOP": int(
-            update.uav_candidate_only_steps_after_operation_stop
-        ),
-    }
-    if update.cache_active_per_update_epoch or update.uav_active_per_update_epoch:
-        fields.update(
-            {
-                "kl_gate_mode": str(update.kl_gate_mode),
-                "cache_active_per_update_epoch": [
-                    bool(value) for value in update.cache_active_per_update_epoch
-                ],
-                "uav_active_per_update_epoch": [
-                    bool(value) for value in update.uav_active_per_update_epoch
-                ],
-                "cache_stop_epoch": update.cache_stop_epoch,
-                "uav_stop_epoch": update.uav_stop_epoch,
-                "cache_suppressed_update_epochs": int(
-                    update.cache_suppressed_update_epochs
-                ),
-                "uav_suppressed_update_epochs": int(
-                    update.uav_suppressed_update_epochs
-                ),
-                "joint_kl_diagnostic": bool(update.joint_kl_diagnostic),
-                "cache_independent_stop": bool(update.cache_independent_stop),
-                "uav_independent_stop": bool(update.uav_independent_stop),
-                "both_inactive_stop": bool(update.both_inactive_stop),
-                "joint_kl_control_enabled": False,
-            }
-        )
-    return fields
-
-
 def append_dual_timescale_record(path: Path, record: dict[str, Any]) -> None:
     """追加新主线的 episode/update JSONL 记录。"""
 
@@ -3115,11 +1380,9 @@ def _integer_histogram(values: np.ndarray) -> dict[str, int]:
 
 def build_macro_transition_trace_arrays(
     episode_batches: Iterable[dict[str, Any]], *, gamma: float,
-    target_mode: str = "one_step_smdp_td",
-    lambda_return_lambda: float | None = None,
     expected_macro_frame_counts: dict[int, int] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Assemble and validate the minimal per-transition Macro trace."""
+    """组装并校验正式的两步 SMDP Macro trace。"""
 
     batches = list(episode_batches)
     if not batches:
@@ -3127,18 +1390,6 @@ def build_macro_transition_trace_arrays(
     gamma_value = float(gamma)
     if not math.isfinite(gamma_value) or gamma_value < 0.0:
         raise ValueError("Macro transition trace gamma must be finite and non-negative.")
-    target_mode_value = str(target_mode)
-    if target_mode_value not in {
-        "one_step_smdp_td",
-        "two_step_smdp_td",
-        "smdp_lambda_return",
-    }:
-        raise ValueError(f"Unsupported Macro transition trace target mode: {target_mode_value!r}.")
-    lambda_value = None if lambda_return_lambda is None else float(lambda_return_lambda)
-    if target_mode_value == "smdp_lambda_return":
-        if lambda_value is None or not math.isfinite(lambda_value) or not 0.0 <= lambda_value <= 1.0:
-            raise ValueError("SMDP lambda-return trace requires a finite lambda in [0, 1].")
-
     fields = (
         "observation",
         "next_observation",
@@ -3151,21 +1402,11 @@ def build_macro_transition_trace_arrays(
         "critic_training_target",
         "realized_return_to_go",
         "macro_frame_index",
-    )
-    chunks: dict[str, list[np.ndarray]] = {name: [] for name in fields}
-    n2_trace_fields = (
         "n2_target",
         "n2_bootstrap_old_value",
         "n2_bootstrap_frame_index",
     )
-    if target_mode_value == "two_step_smdp_td":
-        chunks.update({name: [] for name in n2_trace_fields})
-    lambda_trace_fields = (
-        "lambda_return_target",
-        "macro_critic_lambda_return_lambda",
-    )
-    if target_mode_value == "smdp_lambda_return":
-        chunks.update({name: [] for name in lambda_trace_fields})
+    chunks: dict[str, list[np.ndarray]] = {name: [] for name in fields}
     chunks["episode_id"] = []
     chunks["episode_seed"] = []
     episode_transition_counts: dict[str, int] = {}
@@ -3196,7 +1437,7 @@ def build_macro_transition_trace_arrays(
             or np.any(requested_raw != np.floor(requested_raw))
             or np.any(duration_raw != np.floor(duration_raw))
         ):
-            raise ValueError(f"Macro transition trace episode {episode} has non-finite/non-integer durations.")
+            raise ValueError(f"Macro transition trace episode {episode} has invalid durations.")
         requested = requested_raw.astype(np.int64)
         duration = duration_raw.astype(np.int64)
         done = np.asarray(raw["done"], dtype=bool).reshape(-1)
@@ -3205,48 +1446,44 @@ def build_macro_transition_trace_arrays(
         critic_target = np.asarray(raw["critic_training_target"], dtype=np.float32).reshape(-1)
         realized_return = np.asarray(raw["realized_return_to_go"], dtype=np.float32).reshape(-1)
         frame_index = np.asarray(raw["macro_frame_index"], dtype=np.int64).reshape(-1)
-        if target_mode_value == "two_step_smdp_td":
-            missing_n2_fields = [name for name in n2_trace_fields if name not in batch]
-            if missing_n2_fields:
-                raise ValueError(
-                    f"Macro transition trace episode {episode} is missing N2 linkage fields: {missing_n2_fields}."
-                )
-            n2_target = np.asarray(batch["n2_target"], dtype=np.float32).reshape(-1)
-            n2_bootstrap_old_value = np.asarray(
-                batch["n2_bootstrap_old_value"], dtype=np.float32
-            ).reshape(-1)
-            n2_bootstrap_frame_index = np.asarray(
-                batch["n2_bootstrap_frame_index"], dtype=np.int64
-            ).reshape(-1)
-        elif target_mode_value == "smdp_lambda_return":
-            missing_lambda_fields = [name for name in lambda_trace_fields if name not in batch]
-            if missing_lambda_fields:
-                raise ValueError(
-                    f"Macro transition trace episode {episode} is missing lambda-return fields: {missing_lambda_fields}."
-                )
-            lambda_return_target = np.asarray(
-                batch["lambda_return_target"], dtype=np.float32
-            ).reshape(-1)
-            recorded_lambda = np.asarray(
-                batch["macro_critic_lambda_return_lambda"], dtype=np.float64
-            ).reshape(-1)
+        n2_target = np.asarray(raw["n2_target"], dtype=np.float32).reshape(-1)
+        n2_bootstrap_old_value = np.asarray(
+            raw["n2_bootstrap_old_value"], dtype=np.float32
+        ).reshape(-1)
+        n2_bootstrap_frame_index = np.asarray(
+            raw["n2_bootstrap_frame_index"], dtype=np.int64
+        ).reshape(-1)
         count = int(reward.size)
         if count <= 0:
             raise ValueError(f"Macro transition trace episode {episode} is empty.")
-        vector_fields = (requested, duration, done, old_value, old_next_value, critic_target, realized_return, frame_index)
-        if target_mode_value == "two_step_smdp_td":
-            vector_fields += (n2_target, n2_bootstrap_old_value, n2_bootstrap_frame_index)
-        elif target_mode_value == "smdp_lambda_return":
-            vector_fields += (lambda_return_target, recorded_lambda)
-        if any(value.shape != (count,) for value in vector_fields):
+        vectors = (
+            requested,
+            duration,
+            done,
+            old_value,
+            old_next_value,
+            critic_target,
+            realized_return,
+            frame_index,
+            n2_target,
+            n2_bootstrap_old_value,
+            n2_bootstrap_frame_index,
+        )
+        if any(value.shape != (count,) for value in vectors):
             raise ValueError(f"Macro transition trace episode {episode} has misaligned fields.")
         if observation.shape != (count, 400) or next_observation.shape != (count, 400):
             raise ValueError(f"Macro transition trace episode {episode} must have 400D observations.")
-        floats = (observation, next_observation, reward, old_value, old_next_value, critic_target, realized_return)
-        if target_mode_value == "two_step_smdp_td":
-            floats += (n2_target, n2_bootstrap_old_value)
-        elif target_mode_value == "smdp_lambda_return":
-            floats += (lambda_return_target, recorded_lambda)
+        floats = (
+            observation,
+            next_observation,
+            reward,
+            old_value,
+            old_next_value,
+            critic_target,
+            realized_return,
+            n2_target,
+            n2_bootstrap_old_value,
+        )
         if any(not np.isfinite(value).all() for value in floats):
             raise ValueError(f"Macro transition trace episode {episode} contains NaN/Inf.")
         if np.any(requested <= 0) or np.any(duration <= 0) or np.any(duration > requested):
@@ -3255,92 +1492,47 @@ def build_macro_transition_trace_arrays(
             raise ValueError(f"Macro frame indexes are not continuous in episode {episode}.")
         if not bool(done[-1]) or bool(np.any(done[:-1])):
             raise ValueError(f"Terminal flag must occur only on the final transition of episode {episode}.")
-        if float(old_next_value[-1]) != 0.0:
-            raise ValueError(f"Terminal old_next_value must be zero in episode {episode}.")
-        if np.any(next_observation[-1] != 0.0):
-            raise ValueError(f"Terminal next_observation must be zero in episode {episode}.")
+        if float(old_next_value[-1]) != 0.0 or np.any(next_observation[-1] != 0.0):
+            raise ValueError(f"Terminal bootstrap state must be zero in episode {episode}.")
         if count > 1 and not np.allclose(
             next_observation[:-1], observation[1:], rtol=0.0, atol=1.0e-6
         ):
             raise ValueError(f"Macro next-observation linkage breaks within episode {episode}.")
 
-        if target_mode_value == "two_step_smdp_td":
-            expected_bootstrap_frame_index = np.full(count, -1, dtype=np.int64)
-            expected_bootstrap_old_value = np.zeros(count, dtype=np.float32)
-            for index in range(count):
-                if done[index] or done[index + 1]:
-                    continue
-                expected_bootstrap_frame_index[index] = frame_index[index + 2]
-                expected_bootstrap_old_value[index] = old_value[index + 2]
-            if not np.array_equal(
-                n2_bootstrap_frame_index, expected_bootstrap_frame_index
-            ) or not np.array_equal(n2_bootstrap_old_value, expected_bootstrap_old_value):
-                raise ValueError(
-                    f"N2 frozen old-value k+2 linkage breaks in episode {episode}."
-                )
-        elif target_mode_value == "smdp_lambda_return":
-            if not np.array_equal(
-                recorded_lambda,
-                np.full(count, lambda_value, dtype=np.float64),
-            ):
-                raise ValueError(
-                    f"Critic lambda-return lambda changes within episode {episode}."
-                )
+        expected_bootstrap_frame_index = np.full(count, -1, dtype=np.int64)
+        expected_bootstrap_old_value = np.zeros(count, dtype=np.float32)
+        for index in range(count):
+            if done[index] or done[index + 1]:
+                continue
+            expected_bootstrap_frame_index[index] = frame_index[index + 2]
+            expected_bootstrap_old_value[index] = old_value[index + 2]
+        if not np.array_equal(
+            n2_bootstrap_frame_index, expected_bootstrap_frame_index
+        ) or not np.array_equal(n2_bootstrap_old_value, expected_bootstrap_old_value):
+            raise ValueError(f"N2 frozen old-value k+2 linkage breaks in episode {episode}.")
 
-        if target_mode_value == "one_step_smdp_td":
-            target_expected = (
-                reward + np.power(gamma_value, duration) * old_next_value * (~done)
-            ).astype(np.float32)
-        elif target_mode_value == "two_step_smdp_td":
-            target_expected = build_macro_n2_target(
-                reward, old_value, duration, done, gamma_value
-            )
-        else:
-            target_expected = build_macro_smdp_lambda_return_target(
-                reward,
-                old_next_value,
-                duration,
-                done,
-                gamma_value,
-                lambda_value,
-            )
-        # The shared builder keeps all arithmetic in float64. Training then
-        # casts the target to the network's float32 dtype, so compare the trace
-        # against that same cast rather than counting dtype quantization as a
-        # target-reconstruction error.
+        target_expected = build_macro_n2_target(
+            reward, old_value, duration, done, gamma_value
+        )
         target_expected_for_training = np.asarray(target_expected, dtype=np.float32)
-        target_outputs = [critic_target]
-        if target_mode_value == "two_step_smdp_td":
-            target_outputs.append(n2_target)
-        elif target_mode_value == "smdp_lambda_return":
-            target_outputs.append(lambda_return_target)
         target_error = max(
             float(
                 np.max(
                     np.abs(
                         target_expected_for_training.astype(np.float64)
-                        - target_output.astype(np.float64)
+                        - target.astype(np.float64)
                     )
                 )
             )
-            for target_output in target_outputs
+            for target in (critic_target, n2_target)
         )
         if target_error > 1.0e-6:
             raise ValueError(
-                f"{target_mode_value} trace reconstruction error {target_error} exceeds 1e-6 in episode {episode}."
+                f"two_step_smdp_td trace reconstruction error {target_error} exceeds 1e-6 in episode {episode}."
             )
-        terminal_target = (
-            n2_target
-            if target_mode_value == "two_step_smdp_td"
-            else lambda_return_target
-            if target_mode_value == "smdp_lambda_return"
-            else critic_target
-        )
-        terminal_target_error = float(np.max(np.abs(terminal_target[done] - reward[done])))
+        terminal_target_error = float(np.max(np.abs(n2_target[done] - reward[done])))
         if terminal_target_error > 1.0e-6:
-            raise ValueError(
-                f"Terminal {target_mode_value} target differs from reward in episode {episode}."
-            )
+            raise ValueError(f"Terminal N2 target differs from reward in episode {episode}.")
 
         return_expected = np.zeros(count, dtype=np.float64)
         running_return = 0.0
@@ -3370,24 +1562,23 @@ def build_macro_transition_trace_arrays(
         episode_transition_counts[f"E{episode}"] = count
         chunks["episode_id"].append(np.full(count, episode, dtype=np.int64))
         chunks["episode_seed"].append(np.full(count, episode_seed, dtype=np.int64))
-        chunks["observation"].append(observation)
-        chunks["next_observation"].append(next_observation)
-        chunks["macro_reward"].append(reward)
-        chunks["requested_duration"].append(requested)
-        chunks["actual_duration"].append(duration)
-        chunks["done"].append(done)
-        chunks["old_value"].append(old_value)
-        chunks["old_next_value"].append(old_next_value)
-        chunks["critic_training_target"].append(critic_target)
-        chunks["realized_return_to_go"].append(realized_return)
-        chunks["macro_frame_index"].append(frame_index)
-        if target_mode_value == "two_step_smdp_td":
-            chunks["n2_target"].append(n2_target)
-            chunks["n2_bootstrap_old_value"].append(n2_bootstrap_old_value)
-            chunks["n2_bootstrap_frame_index"].append(n2_bootstrap_frame_index)
-        elif target_mode_value == "smdp_lambda_return":
-            chunks["lambda_return_target"].append(lambda_return_target)
-            chunks["macro_critic_lambda_return_lambda"].append(recorded_lambda)
+        for name, value in (
+            ("observation", observation),
+            ("next_observation", next_observation),
+            ("macro_reward", reward),
+            ("requested_duration", requested),
+            ("actual_duration", duration),
+            ("done", done),
+            ("old_value", old_value),
+            ("old_next_value", old_next_value),
+            ("critic_training_target", critic_target),
+            ("realized_return_to_go", realized_return),
+            ("macro_frame_index", frame_index),
+            ("n2_target", n2_target),
+            ("n2_bootstrap_old_value", n2_bootstrap_old_value),
+            ("n2_bootstrap_frame_index", n2_bootstrap_frame_index),
+        ):
+            chunks[name].append(value)
 
     if episode_order != sorted(episode_order):
         raise ValueError("Macro transition trace episodes must be ordered and unique.")
@@ -3418,8 +1609,7 @@ def build_macro_transition_trace_arrays(
         "actual_duration_histogram": _integer_histogram(duration),
         "requested_actual_duration_pair_histogram": pair_histogram,
         "tail_truncated_duration_counts": tail_histogram,
-        "critic_training_target_mode": target_mode_value,
-        "macro_critic_lambda_return_lambda": lambda_value,
+        "critic_training_target_mode": "two_step_smdp_td",
         "critic_target_recompute_max_abs_error": target_max_abs_error,
         "realized_return_recompute_max_abs_error": return_max_abs_error,
         "macro_transition_trace_fields": list(arrays),
@@ -3433,8 +1623,6 @@ def write_macro_transition_trace_artifact(
     episode_batches: Iterable[dict[str, Any]],
     *,
     gamma: float,
-    target_mode: str = "one_step_smdp_td",
-    lambda_return_lambda: float | None = None,
 ) -> dict[str, Any]:
     """Write a compressed validated Macro trace and add its index to run reports."""
 
@@ -3448,8 +1636,6 @@ def write_macro_transition_trace_artifact(
     arrays, summary = build_macro_transition_trace_arrays(
         episode_batches,
         gamma=gamma,
-        target_mode=target_mode,
-        lambda_return_lambda=lambda_return_lambda,
         expected_macro_frame_counts=expected_counts,
     )
     trace_path = destination / MACRO_TRANSITION_TRACE_FILENAME
@@ -3462,13 +1648,7 @@ def write_macro_transition_trace_artifact(
         raise
     summary["macro_transition_trace_path"] = str(trace_path.resolve())
     summary["macro_transition_trace_format"] = "npz"
-    summary["trace_format_version"] = (
-        4
-        if target_mode == "smdp_lambda_return"
-        else 3
-        if target_mode == "two_step_smdp_td"
-        else 2
-    )
+    summary["trace_format_version"] = 3
     for filename in (RUN_MANIFEST_FILENAME, RUN_SUMMARY_FILENAME):
         report_path = destination / filename
         payload = _read_json(report_path)
@@ -3491,220 +1671,77 @@ def write_dual_timescale_run_manifest(
     episode_seed_start: int | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
-    """记录双时间尺度 checkpoint、动作和 PPO 配置合同。"""
+    """记录当前 PROPOSED 训练、动作、Critic 和数据协议。"""
 
     manifest = {
         "experiment_label": "PROPOSED",
         "algorithm_id": str(trainer.algorithm_id),
-        "experiment_type": "macro_cache_smdp_micro_uav_ppo",
+        "method": str(trainer.checkpoint_method),
+        "experiment_type": "proposed_macro_cache_smdp_micro_uav_ppo",
         "config_path": str(Path(config_path).resolve()),
         "config_raw_sha256": str(config_raw_sha256),
         "config_semantic_sha256": str(config_semantic_sha256),
         "seed": int(seed),
         "target_episodes": int(target_episodes),
         "episode_pool": None if episode_pool is None else str(Path(episode_pool).resolve()),
-        "episode_seed_start": (
-            None if episode_seed_start is None else int(episode_seed_start)
+        "episode_seed_start": None if episode_seed_start is None else int(episode_seed_start),
+        "episode_seed_end": (
+            None
+            if episode_seed_start is None
+            else int(episode_seed_start) + int(target_episodes) - 1
         ),
-        "policy_schema": trainer.policy.architecture_id,
-        "checkpoint_version": int(trainer.checkpoint_version),
-        "macro_actor_advantage_mode": str(
-            trainer.config_contract["macro_actor_advantage_mode"]
-        ),
-        "macro_critic_target_mode": str(trainer.macro_critic_target_mode),
-        "macro_critic_lambda_return_lambda": trainer.macro_critic_lambda_return_lambda,
-        "num_macro_critics": 1,
-        "macro_critic_architecture": (
-            f"{int(context.observation_spec.observation_dim)}-128-128-1 (SiLU)"
-        ),
-        "ensemble_active": False,
-        "heteroscedastic_active": False,
-        "macro_critic_optimizer": "single scalar Critic Adam optimizer",
-        "macro_critic_optimizer_epsilon": 1.0e-5,
-        "macro_critic_group_objective": "0.01 times raw current and last1 MSE",
-        "target_std_used_for_gradient_scaling": False,
-        "target_scale_normalization_active": False,
-        "macro_critic_last1_length": 1,
-        "macro_critic_gradient_norm_matching": True,
-        "macro_critic_last1_alpha": 1.0,
-        "macro_critic_gradient_conflict_method": "last1 norm matching, current-priority last1-only projection, final norm matching to current",
-        "pcgrad_priority": "CURRENT",
-        "current_gradient_projected": False,
-        "current_loss_v10_equivalence": True,
-        "macro_actor_loss_changed": False,
-        "macro_actor_loss": "UPDATE conditional candidate PPO + Duration PPO (unchanged); independent Trigger PPO optimizer",
-        "trigger_q_active": False,
-        "independent_cache_trigger_actor": True,
-        "cache_trigger_actor_architecture": "400-128-128-2 (SiLU)",
-        "cache_trigger_actor_input": (
-            "Trigger-only normalized Macro observation; Candidate, Duration, Critic, and Micro inputs remain raw"
-            if trainer.policy.trigger_observation_normalization_active
-            else "raw Macro observation; no shared encoder"
-        ),
-        "cache_trigger_actor_final_layer_initialization": "zero weight and bias; P_KEEP=P_UPDATE=0.5 when UPDATE is legal",
-        "cache_trigger_optimizer": "Adam over macro_cache_trigger_actor parameters only",
-        "cache_trigger_learning_rate": float(
-            trainer.learning_rates["macro_cache_trigger_actor"]
-        ),
-        "cache_trigger_updates_during_collection": 0,
-        "cache_trigger_candidate_samples": 4,
-        "cache_trigger_duration_candidates": list(trainer.policy.duration_candidates),
-        "cache_trigger_uncertainty_gate": "active iff abs(A_trigger) > sample_std(K=4 update candidate option returns)/sqrt(4)",
-        "cache_trigger_advantage_scaling": "active-transition MAD; divide by max(MAD, 1e-8), clip [-5, 5]",
-        "cache_trigger_ppo_ratio": (
-            "separate clipped KEEP/UPDATE probability ratios with full-information old-policy action weighting"
-            if trainer.stage1_trigger_only
-            else "exp(new Trigger log probability - old Trigger log probability), independent of Candidate and Duration"
-        ),
-        "cache_trigger_vs_macro_optimizer_parameter_overlap": 0,
-        "trigger_ppo_active": True,
-        "trigger_ppo_full_information_binary": bool(trainer.stage1_trigger_only),
-        "trigger_ppo_epoch_kl_stop": 0.02 if trainer.stage1_trigger_only else None,
-        "trigger_ppo_hard_kl_limit": 0.05 if trainer.stage1_trigger_only else None,
-        "trigger_ppo_transactional_rollback": bool(trainer.stage1_trigger_only),
-        "trigger_ppo_backtracking_step_scales": (
-            [1.0, 0.25, 0.0625, 0.015625]
-            if trainer.stage1_trigger_only
-            else []
-        ),
-        "trigger_grad_clip_active": bool(trainer.stage1_trigger_only),
-        "trigger_max_grad_norm": float(trainer.trigger_max_grad_norm),
-        "trigger_observation_normalization_active": bool(
-            trainer.policy.trigger_observation_normalization_active
-        ),
-        "trigger_observation_normalization_metadata": dict(
-            trainer.policy.trigger_observation_normalization_metadata
-        ),
-        "stage1_trigger_only": bool(trainer.stage1_trigger_only),
-        "formal_non_trigger_optimizer_steps_target": (
-            0 if trainer.stage1_trigger_only else None
-        ),
-        "initialization_metadata": dict(trainer.initialization_metadata),
-        "trigger_critic_bootstrap_used": False,
-        "trigger_teacher": "critic-independent policy-marginalized paired option reward difference",
-        "trigger_teacher_bootstrap": "none",
-        "counterfactual_branches_per_macro_transition": 5,
-        "counterfactual_update_candidate": "K=4 samples with replacement from old conditional UPDATE Candidate policy",
-        "macro_candidate_conditional_ratio_separate": True,
-        "macro_duration_ratio_separate": True,
-        "smdp_gae_changed": False,
-        "actor_uses_last1_data": False,
-        "macro_critic_last1_policy_age_updates": 1,
-        "macro_critic_last1_buffer_transition_fields": [
-            "observation",
-            "next_observation",
-            "macro_reward",
-            "actual_duration",
-            "done",
-        ],
-        "macro_critic_value_loss_coefficient": float(
-            trainer.config["value_loss_coefficient"]
-        ),
-        "macro_critic_optimizer_max_grad_norm": float(
-            trainer.config["max_grad_norm"]
-        ),
-        "long_value_enabled": bool(trainer.long_value_enabled),
-        "long_value_target": str(trainer.long_value_target),
-        "long_value_architecture": "observation_dim->128->128->1 (SiLU)",
-        "long_value_input_transform": "raw_macro_observation",
-        "long_value_optimizer": "Adam",
-        "long_value_learning_rate": float(trainer.learning_rates["long_value"]),
-        "long_value_optimizer_epsilon": 1.0e-5,
-        "long_value_max_grad_norm": float(trainer.long_value_max_grad_norm),
-        "long_value_steps_per_update": int(trainer.long_value_steps_per_update),
-        "architecture_version": int(trainer.policy.architecture_version),
-        "observation_dim": int(context.observation_spec.observation_dim),
-        "macro_cache_candidate_feature_dim": int(trainer.policy.macro_cache_feature_dim),
-        "micro_uav_candidate_feature_dim": int(trainer.policy.micro_uav_feature_dim),
-        "prediction_horizon": int(trainer.policy.prediction_horizon),
-        "macro_duration_candidates": list(trainer.policy.duration_candidates),
-        "actor_learning_rate": float(trainer.learning_rates["macro_actor"]),
-        "macro_actor_learning_rate": float(trainer.learning_rates["macro_actor"]),
-        "micro_actor_learning_rate": float(trainer.learning_rates["micro_actor"]),
-        "macro_critic_learning_rate": float(trainer.learning_rates["macro_critic"]),
-        "micro_critic_learning_rate": float(trainer.learning_rates["micro_critic"]),
-        "critic_input_transform": "2*x-1",
-        "critic_hidden_activation": "SiLU",
-        "macro_cache_action": "(Cache configuration C_k, duration L_k)",
-        "cache_candidate_zero": "current actual Cache configuration (KEEP)",
-        "uav_candidate_zero": "current UAV position (STAY)",
-        "uav_joint_policy": "UAV0 then UAV1 conditional on selected UAV0 position",
-        "mask_rollout_contract": "behavior masks and candidate descriptors are saved per action",
-        "macro_full_batch": True,
-        "macro_actor_update_epochs": int(trainer.config["update_epochs"]),
-        "macro_critic_steps_per_update": int(
-            trainer.config.get("macro_critic_steps_per_update", 50)
-        ),
-        "macro_critic_update_iterations_per_episode": int(
-            trainer.config.get("macro_critic_steps_per_update", 50)
-        ),
-        "macro_critic_optimizer_steps_per_episode": (
-            0
-            if trainer.stage1_trigger_only
-            else int(trainer.config.get("macro_critic_steps_per_update", 50))
-        ),
-        "micro_macro_buffers_separate": True,
-        "exact_q_training_enabled": False,
-        "critic_mc_warmup_required": False,
-        "prediction_model_frozen": True,
-        "matching": "Transfer-Exchange (unchanged)",
-        "kkt": "existing continuous resource allocation (unchanged)",
-        "physical_system_model_changed": False,
-        "configuration_control_mode": context.configuration_control_mode,
+        "data_protocol": str(context.data_protocol),
         "episode_slots": int(context.episode_slots),
         "origin_start": int(context.train_origin_start),
         "origin_end": int(context.train_origin_end),
         "terminal_origin": int(context.terminal_origin),
+        "policy_schema": str(trainer.policy.architecture_id),
+        "architecture_version": int(trainer.policy.architecture_version),
+        "checkpoint_version": int(trainer.checkpoint_version),
+        "checkpoint_method": str(trainer.checkpoint_method),
+        "macro_action": "Cache candidate and Duration",
+        "macro_probability_factorization": "log pi(Cache, Duration) = log pi(Cache) + log pi(Duration | Cache)",
+        "macro_actor_objective": "one joint PPO clipped surrogate using the joint Cache/Duration ratio",
+        "macro_actor_advantage_mode": str(trainer.config_contract["macro_actor_advantage_mode"]),
+        "cache_candidate_zero": "current Cache configuration (KEEP)",
+        "cache_candidate_action_space": "one categorical over KEEP and legal UPDATE candidates with legal-cardinality correction",
+        "macro_duration_candidates": list(trainer.policy.duration_candidates),
+        "micro_action": "UAV0 followed by UAV1 conditioned on selected UAV0 position",
+        "micro_actor_objective": "one joint PPO clipped surrogate over both conditional UAV actions",
+        "macro_critic_target_mode": str(trainer.macro_critic_target_mode),
+        "macro_critic_architecture": (
+            f"{int(context.observation_spec.observation_dim)}-128-128-1 (SiLU)"
+        ),
+        "macro_critic_optimizer": "single scalar Critic Adam optimizer",
+        "macro_critic_last1_length": 1,
+        "macro_critic_gradient_conflict_method": "last1 norm matching, current-priority last1-only projection, final norm matching to current",
+        "long_value_enabled": bool(trainer.long_value_enabled),
+        "long_value_target": str(trainer.long_value_target),
+        "reward_definition": "task utility minus Cache cost and UAV movement cost",
+        "matching": "Transfer-Exchange",
+        "kkt": "continuous resource allocation",
+        "configuration_control_mode": str(context.configuration_control_mode),
+        "observation_dim": int(context.observation_spec.observation_dim),
+        "macro_cache_candidate_feature_dim": int(trainer.policy.macro_cache_feature_dim),
+        "micro_uav_candidate_feature_dim": int(trainer.policy.micro_uav_feature_dim),
+        "prediction_horizon": int(trainer.policy.prediction_horizon),
+        "actor_learning_rate": float(trainer.learning_rates["actor"]),
+        "macro_actor_learning_rate": float(trainer.learning_rates["macro_actor"]),
+        "micro_actor_learning_rate": float(trainer.learning_rates["micro_actor"]),
+        "macro_critic_learning_rate": float(trainer.learning_rates["macro_critic"]),
+        "micro_critic_learning_rate": float(trainer.learning_rates["micro_critic"]),
+        "long_value_learning_rate": float(trainer.learning_rates["long_value"]),
+        "macro_critic_value_loss_coefficient": float(trainer.config["value_loss_coefficient"]),
+        "macro_critic_steps_per_update": int(trainer.config.get("macro_critic_steps_per_update", 50)),
+        "unified_cache_action": bool(trainer.unified_cache_action),
+        "cardinality_corrected_cache_action": bool(trainer.cardinality_corrected_cache_action),
+        "macro_full_batch": True,
+        "macro_actor_update_epochs": int(trainer.config["update_epochs"]),
+        "micro_macro_buffers_separate": True,
+        "prediction_model_frozen": True,
         "training_counters": dict(trainer.training_counters),
         "resume": bool(resume),
     }
-    if bool(getattr(trainer, "unified_cache_action", False)):
-        manifest.update(
-            {
-                "unified_cache_action": True,
-                "cache_action_semantics": "single Cache Candidate categorical over KEEP candidate 0 plus legal UPDATE candidates; Duration conditioned on selected candidate",
-                "macro_actor_loss_changed": True,
-                "macro_actor_loss": "unified full-candidate PPO plus conditional Duration PPO using Macro SMDP GAE",
-                "independent_cache_trigger_actor": False,
-                "trigger_active": False,
-                "trigger_ppo_active": False,
-                "trigger_optimizer_steps_target": 0,
-                "cache_trigger_optimizer": "inactive; optimizer step count must remain zero",
-                "cache_trigger_learning_rate": None,
-                "cache_trigger_updates_during_collection": 0,
-                "cache_trigger_candidate_samples": 0,
-                "cache_trigger_uncertainty_gate": "inactive",
-                "cache_trigger_advantage_scaling": "inactive",
-                "cache_trigger_ppo_ratio": "inactive",
-                "cache_trigger_teacher": "not used",
-                "trigger_teacher_used": False,
-                "counterfactual_branches_per_macro_transition": 0,
-                "counterfactual_update_candidate": "none",
-                "macro_candidate_conditional_ratio_separate": False,
-                "macro_cache_update_rate_definition": "selected_candidate_id != 0",
-                "candidate0_is_exact_keep": True,
-                "candidate_selection_head_warmstart_used": bool(
-                    trainer.initialization_metadata.get(
-                        "candidate_selection_head_warmstart_used", False
-                    )
-                ),
-                "candidate_selection_head_fresh_init_reason": trainer.initialization_metadata.get(
-                    "candidate_selection_head_fresh_init_reason"
-                ),
-            }
-        )
-    if bool(getattr(trainer, "cardinality_corrected_cache_action", False)):
-        manifest.update(
-            {
-                "cardinality_corrected_cache_action": True,
-                "cache_candidate_cardinality_correction": (
-                    "After legal masking, subtract log(K_s) from each legal UPDATE candidate logit; K_s counts legal nonzero candidates."
-                ),
-                "cache_candidate_probability_semantics": (
-                    "one unified masked categorical over KEEP and UPDATE candidates after legal UPDATE cardinality correction"
-                ),
-            }
-        )
     _write_json(Path(path), manifest)
     return manifest
 
@@ -3715,7 +1752,7 @@ def append_dual_timescale_slot_metrics(
     episode: int,
     transitions: Iterable[Any],
 ) -> int:
-    """记录新主线的实际系统 slot 结果，不输出旧 Trigger/Operation 指标。"""
+    """记录当前主线的实际系统 slot 结果。"""
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -3757,133 +1794,3 @@ def append_dual_timescale_slot_metrics(
             stream.write("\n")
             count += 1
     return count
-
-
-def write_multirealization_trigger_probe_artifacts(
-    report: dict[str, Any],
-    *,
-    report_path: str | Path,
-    curves_path: str | Path,
-) -> tuple[Path, Path]:
-    """Write a synchronized Trigger probe report and four-panel figure."""
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    destination = Path(report_path)
-    figure_path = Path(curves_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    figure_path.parent.mkdir(parents=True, exist_ok=True)
-    blocks = list(report.get("blocks", []))
-    heldout = report.get("heldout", {})
-    seen_history = list(report.get("seen_block_evaluation_history", []))
-    if len(blocks) != 4 or not heldout or len(seen_history) != 4:
-        raise ValueError("Trigger probe reporting requires four blocks and held-out metrics.")
-
-    figure, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
-    block_x = np.arange(1, len(blocks) + 1)
-    width = 0.36
-    axes[0, 0].bar(
-        block_x - width / 2,
-        [item["BLOCK_PRE_UPDATE_BA"] for item in blocks],
-        width,
-        color="#D18448",
-        label="Before update",
-    )
-    axes[0, 0].bar(
-        block_x + width / 2,
-        [item["BLOCK_POST_UPDATE_BA"] for item in blocks],
-        width,
-        color="#579D72",
-        label="After update",
-    )
-    axes[0, 0].set(
-        title="Synchronized block training BA",
-        xlabel="8-realization block",
-        ylabel="Balanced accuracy",
-        ylim=(0.0, 1.0),
-        xticks=block_x,
-    )
-    axes[0, 0].legend(frameon=False)
-
-    matrix = np.full((len(blocks), len(blocks)), np.nan, dtype=np.float64)
-    forgetting_by_update = []
-    for history_index, item in enumerate(seen_history):
-        for evaluated in item["evaluated_blocks"]:
-            block_index = int(evaluated["block_index"]) - 1
-            matrix[block_index, history_index] = float(evaluated["balanced_accuracy"])
-        forgetting_by_update.append(float(item["MEAN_SEEN_BLOCK_FORGETTING"]))
-    masked = np.ma.masked_invalid(matrix)
-    heatmap = axes[0, 1].imshow(masked, vmin=0.0, vmax=1.0, cmap="viridis", aspect="auto")
-    axes[0, 1].set(
-        title="Seen-block BA after each update",
-        xlabel="Completed update block",
-        ylabel="Evaluated train block",
-        xticks=np.arange(len(blocks)),
-        xticklabels=[str(index) for index in range(1, len(blocks) + 1)],
-        yticks=np.arange(len(blocks)),
-        yticklabels=[str(index) for index in range(1, len(blocks) + 1)],
-    )
-    for row in range(len(blocks)):
-        for column in range(len(blocks)):
-            if math.isfinite(matrix[row, column]):
-                axes[0, 1].text(
-                    column,
-                    row,
-                    f"{matrix[row, column]:.2f}",
-                    ha="center",
-                    va="center",
-                    color="white" if matrix[row, column] < 0.58 else "black",
-                    fontsize=9,
-                )
-    figure.colorbar(heatmap, ax=axes[0, 1], fraction=0.046, pad=0.04, label="Balanced accuracy")
-    axes[0, 1].text(
-        0.02,
-        -0.25,
-        f"Mean seen-block forgetting after final update: {report['seen_realizations']['MEAN_SEEN_BLOCK_FORGETTING']:.3f}",
-        transform=axes[0, 1].transAxes,
-        fontsize=9,
-    )
-
-    axes[1, 0].bar(
-        ["KEEP", "UPDATE"],
-        [heldout["HELDOUT_KEEP_RECALL"], heldout["HELDOUT_UPDATE_RECALL"]],
-        color=["#5277A3", "#AB79A5"],
-        width=0.55,
-    )
-    axes[1, 0].axhline(0.65, color="#B23A48", linestyle="--", label="Support threshold 0.65")
-    axes[1, 0].set(
-        title="Held-out realization recalls",
-        ylabel="Recall",
-        ylim=(0.0, 1.0),
-    )
-    axes[1, 0].legend(frameon=False)
-
-    baseline = float(report["comparison"]["PREVIOUS_GROUPED_CV_TEST_BA"])
-    heldout_ba = float(heldout["HELDOUT_BALANCED_ACCURACY"])
-    axes[1, 1].bar(
-        ["Previous grouped CV", "Held-out realizations"],
-        [baseline, heldout_ba],
-        color=["#929292", "#2457A7"],
-        width=0.58,
-    )
-    axes[1, 1].axhline(0.70, color="#B23A48", linestyle="--", label="Support threshold 0.70")
-    axes[1, 1].set(
-        title="Held-out BA vs frozen-policy CV baseline",
-        ylabel="Balanced accuracy",
-        ylim=(0.0, 1.0),
-    )
-    axes[1, 1].legend(frameon=False)
-    for index, value in enumerate((baseline, heldout_ba)):
-        axes[1, 1].text(index, value + 0.025, f"{value:.3f}", ha="center")
-
-    figure.suptitle("Multi-realization synchronized Trigger probe", fontsize=15)
-    figure.savefig(figure_path, dpi=180)
-    plt.close(figure)
-
-    with destination.open("w", encoding="utf-8", newline="\n") as stream:
-        json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
-    return destination, figure_path

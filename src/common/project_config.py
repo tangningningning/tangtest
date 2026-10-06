@@ -758,8 +758,8 @@ def validate_config(
     if float(get_config_value(config, "algorithm.matching.objective_tolerance")) < 0.0:
         raise ValueError("algorithm.matching.objective_tolerance 不能为负。")
     ppo_method = str(get_config_value(config, "algorithm.ppo.method", ""))
-    if ppo_method != "ppo_dual_timescale_v1":
-        raise ValueError("algorithm.ppo.method 当前只支持 ppo_dual_timescale_v1。")
+    if ppo_method != "PROPOSED":
+        raise ValueError("algorithm.ppo.method 必须为 PROPOSED。")
     configuration_control_mode = str(
         get_config_value(config, "algorithm.ppo.configuration_control_mode", "")
     )

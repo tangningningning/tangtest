@@ -34,7 +34,7 @@ from .trainer import ALGORITHM_ID, CHECKPOINT_METHOD, CHECKPOINT_VERSION, PPOTra
 
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 DEFAULT_ENVIRONMENT_COUNT = 20
-DEFAULT_POLICY_REPEATS = 5
+DEFAULT_POLICY_REPEATS = 1
 EPISODE_METRIC_NAMES = (
     "total_return",
     "total_q",
@@ -118,10 +118,8 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         )
     if int(payload.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
         raise ValueError("checkpoint format is not supported by PROPOSED")
-    expected_architecture = (
-        DualTimescaleActorCritic.cardinality_corrected_unified_architecture_version
-    )
-    expected_schema = DualTimescaleActorCritic.cardinality_corrected_unified_architecture_id
+    expected_architecture = DualTimescaleActorCritic.architecture_version
+    expected_schema = DualTimescaleActorCritic.architecture_id
     if int(payload.get("architecture_version", -1)) != expected_architecture:
         raise ValueError(
             f"checkpoint architecture_version is not {expected_architecture}"
@@ -149,16 +147,6 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         or contract.get("cardinality_corrected_cache_action") is not True
     ):
         raise ValueError("checkpoint PROPOSED configuration contract mismatch")
-    for field in ("trigger_ppo_active", "trigger_active", "trigger_teacher_used"):
-        if contract.get(field) is not False:
-            raise ValueError(f"checkpoint config_contract {field} must be false")
-    if (
-        type(contract.get("trigger_counterfactual_branches")) is not int
-        or contract["trigger_counterfactual_branches"] != 0
-    ):
-        raise ValueError(
-            "checkpoint config_contract trigger_counterfactual_branches must be zero"
-        )
     return payload
 
 
@@ -349,7 +337,7 @@ def evaluate_pool(
                 checkpoint,
                 config_raw_sha256=raw_config_sha256,
                 config_semantic_sha256=semantic_sha256,
-                episode_pool=str(pool_path),
+                episode_pool=None,
             )
             parameter_snapshot = [
                 parameter.detach().clone() for parameter in trainer.policy.parameters()

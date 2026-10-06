@@ -2,9 +2,9 @@
 
 ## 正式算法
 
-正式算法名称为 `PROPOSED`，训练配置为 `configs/proposed/system_config.toml`。Cache 使用单一合法候选分布，candidate 0 表示 KEEP，其余候选为 UPDATE；UPDATE logits 按合法非零候选数做 cardinality correction。Macro 在 Cache 决策边界联合选择候选配置与持续时长；每个 slot 的 Micro 策略按固定 UAV ID 顺序选择 UAV0 位置，再在 UAV0 条件下选择 UAV1 位置，UAV candidate 0 表示保持当前位置。
+正式算法唯一名称为 `PROPOSED`，训练配置为 `configs/proposed/system_config.toml`。Cache 使用单一合法候选分布，candidate 0 表示 KEEP，其余候选为 UPDATE；UPDATE logits 按合法非零候选数做 cardinality correction。Macro 在 Cache 决策边界联合选择候选配置与持续时长，并以 Cache 与 Duration 的联合概率比率执行一个 PPO clipped surrogate。每个 slot 的 Micro 策略按固定 UAV ID 顺序选择 UAV0 位置，再在 UAV0 条件下选择 UAV1 位置，并以两 UAV 的联合概率比率执行一个 PPO clipped surrogate；UAV candidate 0 表示保持当前位置。
 
-`ppo-train` 默认且唯一运行 PROPOSED；正式流程按完整 episode 收集两份独立 rollout，episode 结束后更新 Micro PPO 和 Macro SMDP PPO。独立 Cache Trigger、Trigger-only Stage-1 和 Trigger teacher 不属于当前训练路径。正式训练不调用 Exact-Q teacher，也不要求 MC warmup；Transfer-Exchange Matching、KKT、预测 artifact 和现有物理模型保持原样。
+正式训练每次使用一个完整 episode realization，主线 LR 实验共使用 300 份 realization，seed 为 20001–20300。episode rollout 完成后更新 Micro PPO 和 Macro SMDP PPO。正式训练使用当前 Matching、KKT、prediction artifacts 和物理模型。
 
 长期数学定义与代码映射见 [`adaptive_dual_timescale_formula_updates.md`](adaptive_dual_timescale_formula_updates.md)。
 
@@ -36,7 +36,7 @@ ppo-train --config configs/proposed/system_config.toml `
 
 ## 评价
 
-`ppo-eval` 校验 checkpoint 格式、架构、动作语义及配置合同，并拒绝 training-return diagnostic checkpoint。评价默认使用 deterministic action selection，并执行真实 Matching/KKT：
+`ppo-eval` 校验 checkpoint 格式、架构、动作语义及配置合同，并拒绝 training-return diagnostic checkpoint。评价使用冻结策略，默认采用 deterministic action selection。Validation 和 Test 使用独立 episode pool，不要求与训练 pool 相同，并执行真实 Matching/KKT：
 
 ```powershell
 ppo-eval --config configs/proposed/system_config.toml `

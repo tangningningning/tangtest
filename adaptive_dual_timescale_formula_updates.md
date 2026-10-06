@@ -2,23 +2,15 @@
 
 本文件是正式算法和实现的长期合同。公式描述策略决策、rollout 与 PPO target；Cache loading、通信、delay、energy 和 utility 的物理计算仍由现有模块负责。本版不迁移训练框架，也没有直接复制第三方代码。
 
-## 1. 原定义与修改原因
+## 1. PROPOSED 正式控制定义
 
-### 原正式控制定义
+唯一正式控制器使用 Macro Cache SMDP 和每 slot Micro UAV PPO。Macro 一次选择 Cache 配置与持续时长；frame 内 Cache 固定。Micro 对 UAV0、UAV1 使用顺序条件式 masked categorical。完整 episode 收集结束后分别更新两套 PPO。
 
-旧主线在每个 slot 分别采样 Cache Trigger 与 Cache Candidate、UAV Operation 与 UAV Candidate，再将触发和候选组合为 slot 配置。策略对各控制 head 分别记录概率/credit；候选评估链还可接入 Exact-Q 反事实 teacher 与 critic MC warmup。
-
-### 新正式定义
-
-新的控制器使用 Macro Cache SMDP 和每 slot Micro UAV PPO。Macro 一次选择 Cache 配置与持续时长；frame 内 Cache 固定。Micro 对 UAV0、UAV1 使用顺序条件式 masked categorical。完整 episode 收集结束后分别更新两套 PPO。
-
-### 修改原因
-
-- Cache 配置是跨 slot 持续的控制量，显式 duration 使决策间隔和折扣与真实经过的 slot 数一致。
-- 当前配置纳入 Macro candidate 集合后，KEEP 与 UPDATE 是一个 Cache 配置动作空间，不再需要 Trigger/Candidate 双层策略。
-- UAV 位置候选把 STAY 和 MOVE 放在同一 masked candidate head 中；先选择 UAV0，再依据其最终位置重建 UAV1 的安全候选集。
-- 分离 Macro/Micro buffer、Critic、optimizer 和 advantage normalization，避免不同决策时间尺度共用 return 统计。
-- 正式训练不依赖 Exact-Q teacher 或强制 MC warmup；Matching、KKT 与真实系统 utility 继续提供训练回报。
+- Cache candidate 0 表示 KEEP，其余合法候选表示 UPDATE；合法 UPDATE logits 按候选数量做 cardinality correction。
+- Macro action 是 Cache candidate 与 Duration 的联合动作，训练时两个动作均从各自当前 categorical 分布采样。
+- Micro 将 STAY 和 MOVE 放在同一 masked candidate head 中；先选择 UAV0，再依据其最终位置重建 UAV1 的安全候选集。
+- Macro/Micro rollout、Critic、optimizer 和 advantage normalization 分离。
+- Macro 使用 SMDP GAE 与 two-step TD Critic target；训练回报由现有 Matching、KKT 和系统 utility 产生。
 
 ## 2. Macro 决策边界和 Cache persistence
 
@@ -129,7 +121,7 @@ Macro frame reward 不除以 `L_k`；两尺度不共享 reward/advantage/value n
 
 ## 6. PPO updates、优化器与 checkpoint
 
-整个 episode rollout 收集期间 Macro 和 Micro policy 都不更新。episode 结束后先执行 Micro PPO phase，再执行 Macro PPO phase。Micro 使用配置 minibatches；Macro 对本 episode 全部 Macro transitions 做 full-batch PPO。Cache candidate 与 duration 使用一个 Macro joint log probability、一个 Macro ratio 和一个 Macro optimizer。
+整个 episode rollout 收集期间 Macro 和 Micro policy 都不更新。episode 结束后先执行 Micro PPO phase，再执行 Macro PPO phase。Micro 使用配置 minibatches；Macro 对本 episode 全部 Macro transitions 做 full-batch PPO。令 `log π_macro = log π_cache + log π_duration`，则 `r_macro = exp(log π_macro,new - log π_macro,old)`，并使用唯一目标 `L_macro = -mean(min(r_macro A, clip(r_macro, 1-ε, 1+ε) A))`。Cache candidate 与 Duration 共用一个 Macro joint log probability、一个 Macro ratio、一个 clipped surrogate 和一个 Macro optimizer。
 
 Macro actor/critic 与 Micro actor/critic 分离，不共享 Critic、optimizer 或 advantage statistics。checkpoint 分开保存 Macro/Micro policy state 与 optimizer state，并保存 checkpoint/schema/architecture 版本、候选/观测合同、training counters 和 normalization state（当前为两个 `None`）。旧结构不做 migration。
 
@@ -152,13 +144,13 @@ Macro actor/critic 与 Micro actor/critic 分离，不共享 Critic、optimizer 
 - slot utility `G(t)`
 - 现有车辆/popularity prediction 模块与 prediction artifacts
 
-策略 observation 和候选特征复用当前 prediction artifact 和 observation builder；prediction 网络不在 PPO rollout 中重新训练。正式每 slot 只执行采样到的真实配置，并调用当前 slot environment 中 Matching/KKT 路径。不调用 Full-information Exact-Q teacher；Exact-Q 诊断模块仍保留为独立未来能力。
+策略 observation 和候选特征复用当前 prediction artifact 和 observation builder；prediction 网络不在 PPO rollout 中重新训练。正式每 slot 只执行采样到的真实配置，并调用当前 slot environment 中 Matching/KKT 路径。
 
 ## 8. 代码映射与状态
 
-### Cache unified candidate group-mass balancing
+### Cache candidate cardinality correction
 
-Cache sampling and evaluate apply the existing `_group_balance_candidate_logits` helper to the single Cache candidate categorical. Candidate index `0` is the KEEP group and indices `> 0` are the UPDATE group; the transform uses valid-candidate counts, so equal raw logits within each group do not give UPDATE extra probability mass solely because it has more candidates. This remains one unified categorical action with one selected candidate, log probability, and PPO ratio; it does not add a separate Trigger policy.
+Cache training samples one candidate from the cardinality-corrected categorical. Candidate index `0` is KEEP and indices `> 0` are UPDATE. Deterministic evaluation first compares KEEP and UPDATE group probability mass, choosing KEEP on a tie; when UPDATE wins, it selects the legal UPDATE candidate with the highest raw score. Both paths use the same corrected categorical probabilities, and training stores the log probability of the sampled candidate.
 
 For the current mask, let `C_valid` be the set of valid candidates, `g(i)` the operation group of candidate `i`, and `N_g = |{j in C_valid : g(j) = g}|`. The logits used by the categorical are:
 
@@ -169,13 +161,13 @@ z_tilde_i = -infinity,          i not in C_valid
 π_C(i | S) = exp(z_tilde_i) / Σ_{j in C_valid} exp(z_tilde_j)
 ```
 
-This removes prior probability bias caused solely by different candidate counts between operation groups. It does not change candidate feasibility, the physical system model, or reward.
+With one KEEP candidate and `K_s` legal UPDATE candidates, subtracting `log(K_s)` from each legal UPDATE logit prevents candidate count alone from inflating UPDATE group mass. This does not change candidate feasibility, the physical system model, or reward.
 
 | 数学/实现合同 | 正式代码位置 | 状态 |
 |---|---|---|
 | Macro duration candidates 校验与预测 horizon 约束 | `src/common/project_config.py::validate_for_formal_experiment`; `src/ppo_simple/interface.py::macro_duration_candidates_from_project` | IMPLEMENTED / VERIFIED：正式 TOML parse 与校验通过 |
 | Cache candidate 0=KEEP 与 proposal 复用 | `src/ppo_simple/rollout.py::_cache_candidates` | IMPLEMENTED / VERIFIED：候选 0 运行时断言及源码检查 |
-| unified Cache KEEP/UPDATE candidate group-mass balancing | `src/ppo_simple/policy.py::_balance_macro_cache_group_mass`; `_group_balance_candidate_logits` | IMPLEMENTED / VERIFIED：1+15、1+351、masked support、单组边界、sample/evaluate 与 UAV 回归 synthetic checks 通过 |
+| Cache KEEP/UPDATE candidate cardinality correction 与确定性组选择 | `src/ppo_simple/policy.py::_cardinality_corrected_cache_logits`; `_group_aware_deterministic_candidate` | IMPLEMENTED：训练采样与评价选择共用当前 Cache categorical 概率 |
 | duration tail clip、Cache persistence、Macro reward | `src/ppo_simple/rollout.py::actual_duration_for_frame`; `collect_dual_timescale_episode` | IMPLEMENTED / VERIFIED：尾帧合成检查及源码检查 |
 | Cache update mask 与 boundary cost | `src/ppo_simple/rollout.py::cache_update_mask`; `src/decision/slot_environment.py::execute_configured_slot` | IMPLEMENTED / VERIFIED：相同/变化配置的成本合成检查 |
 | duration-aware SMDP GAE | `src/ppo_simple/rollout.py::compute_macro_smdp_gae` | IMPLEMENTED / VERIFIED：手算数组与函数结果一致 |

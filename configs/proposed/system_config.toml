@@ -527,7 +527,7 @@ objective_tolerance = 1.0e-9
 # Cache candidate 0=当前配置 KEEP；UAV candidate 0=当前位置 STAY。
 # Exact-Q 仅保留 diagnostic 能力，正式训练关闭；不改变当前物理系统模型。
 enabled = true
-method = "ppo_dual_timescale_v1"
+method = "PROPOSED"
 configuration_control_mode = "macro_cache_smdp_micro_uav_candidate"
 policy_schema = "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo"
 macro_cache_enabled = true
@@ -550,9 +550,6 @@ actor_learning_rate = 3.0e-4
 critic_learning_rate = 1.0e-3
 macro_critic_learning_rate = 1.0e-3
 macro_critic_target_mode = "two_step_smdp_td"
-# Critic-only duration-aware lambda-return parameter. This is an algorithm design
-# choice, independent of the Macro Actor's gae_lambda and not fitted on held-out data.
-macro_critic_lambda_return_lambda = 0.7706141475
 long_value_enabled = true
 long_value_target = "realized_return_to_go"
 long_value_learning_rate = 1.0e-3
@@ -630,7 +627,6 @@ terminal_origin = 299
 "nodes.rsu.xi_ca" = "EXPERIMENT_DESIGN"
 "nodes.uav.xi_ca" = "EXPERIMENT_DESIGN"
 "cache.discount_beta" = "ALGORITHM_DESIGN"
-"algorithm.ppo.macro_critic_lambda_return_lambda" = "ALGORITHM_DESIGN"
 "algorithm.ppo.long_value_enabled" = "ALGORITHM_DESIGN"
 "algorithm.ppo.long_value_target" = "ALGORITHM_DESIGN"
 "algorithm.ppo.long_value_learning_rate" = "ALGORITHM_DESIGN"

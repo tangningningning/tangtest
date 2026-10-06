@@ -146,13 +146,6 @@ class MacroTransition:
     actual_duration: int
     old_macro_log_prob: float
     old_macro_entropy: float
-    old_cache_trigger_log_prob: float
-    old_cache_trigger_p_keep: float
-    old_cache_trigger_p_update: float
-    old_cache_trigger_log_p_keep: float
-    old_cache_trigger_log_p_update: float
-    old_update_conditional_log_prob: float
-    update_conditional_log_prob_valid: bool
     old_duration_log_prob: float
     old_value: float
     old_next_value: float
@@ -161,20 +154,6 @@ class MacroTransition:
     done: bool
     cache_configuration_id: str
     actual_cache_update: bool
-    trigger_learning_valid: bool = False
-    trigger_teacher_valid: bool = False
-    trigger_credit_active: bool = False
-    teacher_q_keep: float | None = None
-    teacher_q_update: float | None = None
-    teacher_delta_update_keep: float | None = None
-    trigger_update_standard_error: float = 0.0
-    trigger_confidence_ratio: float = 0.0
-    trigger_update_candidate_indices: tuple[int, ...] = ()
-    trigger_update_candidate_returns: tuple[float, ...] = ()
-    trigger_advantage_raw: float = 0.0
-    trigger_advantage: float = 0.0
-    counterfactual_branch_runtime_seconds: float = 0.0
-    counterfactual_state_restore_valid: bool = True
 
 @dataclass
 class MicroRolloutBuffer:
@@ -269,7 +248,7 @@ def _check_request_contract(
     result: slot_environment.SlotExecutionResult,
     action_spec: Any,
 ) -> None:
-    """保留历史 Exact-Q diagnostic 对 trigger=0 的状态不变检查。"""
+    """检查未请求 Cache 或 UAV 更新时环境状态保持不变。"""
 
     if result.next_cache_state is None or result.next_uav_positions is None:
         raise AssertionError("可行 environment transition 缺少 next state。")
@@ -501,13 +480,6 @@ def collect_dual_timescale_episode(
     frame_actual_duration = 0
     frame_old_log_prob = 0.0
     frame_old_entropy = 0.0
-    frame_old_trigger_log_prob = 0.0
-    frame_old_trigger_p_keep = 1.0
-    frame_old_trigger_p_update = 0.0
-    frame_old_trigger_log_p_keep = 0.0
-    frame_old_trigger_log_p_update = 0.0
-    frame_old_update_conditional_log_prob = 0.0
-    frame_update_conditional_log_prob_valid = False
     frame_old_duration_log_prob = 0.0
     frame_old_value = 0.0
     frame_cache = cache.copy()
@@ -515,29 +487,11 @@ def collect_dual_timescale_episode(
     frame_reward = 0.0
     elapsed_in_frame = 0
     frame_macro_index = -1
-    frame_trigger_learning_valid = False
-    frame_trigger_teacher_valid = False
-    frame_trigger_credit_active = False
-    frame_teacher_q_keep: float | None = None
-    frame_teacher_q_update: float | None = None
-    frame_teacher_delta: float | None = None
-    frame_trigger_update_se = 0.0
-    frame_trigger_confidence_ratio = 0.0
-    frame_update_candidate_indices: tuple[int, ...] = ()
-    frame_update_candidate_returns: tuple[float, ...] = ()
-    frame_counterfactual_runtime_seconds = 0.0
-    frame_counterfactual_state_restore_valid = True
-    frame_counterfactual_branch_count = 0
-    counterfactual_runtime_seconds = 0.0
-    counterfactual_branch_count = 0
-    counterfactual_environment_execution_count = 0
-    counterfactual_state_restore_valid = True
     keep_probabilities: list[float] = []
     update_group_probabilities: list[float] = []
     raw_candidate0_probabilities: list[float] = []
     legal_update_candidate_counts: list[int] = []
     cache_entropies: list[float] = []
-    trigger_entropies: list[float] = []
     duration_entropies: list[float] = []
     update_candidate_entropies: list[float] = []
     unified_candidate0_probabilities: list[float] = []
@@ -549,7 +503,6 @@ def collect_dual_timescale_episode(
     deterministic_uav_selections: list[dict[str, Any]] = []
     cache_group_rule_violation_count = 0
     cache_update_inner_argmax_violation_count = 0
-    cache_probability_max_difference = 0.0
     cache_probability_sum_error_max = 0.0
     cache_probability_nonfinite_count = 0
     cache_probability_nan_count = 0
@@ -582,13 +535,6 @@ def collect_dual_timescale_episode(
             frame_duration_masks = selected.duration_mask.copy()
             frame_old_log_prob = float(selected.log_prob.detach().cpu())
             frame_old_entropy = float(selected.entropy.detach().cpu())
-            frame_old_trigger_log_prob = 0.0
-            frame_old_trigger_p_keep = 0.0
-            frame_old_trigger_p_update = 0.0
-            frame_old_trigger_log_p_keep = 0.0
-            frame_old_trigger_log_p_update = 0.0
-            frame_old_update_conditional_log_prob = 0.0
-            frame_update_conditional_log_prob_valid = False
             frame_old_duration_log_prob = float(
                 selected.duration_log_prob.detach().cpu()
             )
@@ -621,7 +567,6 @@ def collect_dual_timescale_episode(
                 int(np.count_nonzero(frame_candidate_masks[1:]))
             )
             cache_entropies.append(float(selected.cache_entropy.detach().cpu()))
-            trigger_entropies.append(float(selected.trigger_entropy.detach().cpu()))
             duration_entropies.append(float(selected.duration_entropy.detach().cpu()))
             positive_candidate_probabilities = cache_probabilities[cache_probabilities > 0.0]
             candidate_entropy = float(
@@ -630,12 +575,12 @@ def collect_dual_timescale_episode(
                     * np.log(positive_candidate_probabilities)
                 )
             )
-            best_update_probability = (
+            best_nonzero_candidate_probability = (
                 float(np.max(cache_probabilities[1:]))
                 if bool(np.any(frame_candidate_masks[1:]))
                 else 0.0
             )
-            update_margin = best_update_probability - keep_probability
+            update_margin = update_group_probability - keep_probability
             unified_candidate0_probabilities.append(keep_probability)
             unified_candidate_entropies.append(candidate_entropy)
             unified_update_margins.append(update_margin)
@@ -644,38 +589,16 @@ def collect_dual_timescale_episode(
                     "macro_index": int(len(macro_buffer.transitions)),
                     "selected_candidate_id": int(frame_cache_index),
                     "candidate0_probability": keep_probability,
-                    "best_nonzero_candidate_probability": best_update_probability,
+                    "best_nonzero_candidate_probability": best_nonzero_candidate_probability,
                     "candidate_entropy": candidate_entropy,
                     "update_margin": float(update_margin),
                 }
             )
             update_candidate_probabilities = cache_probabilities[1:]
-            conditional_update_probabilities = np.asarray(
-                selected.conditional_update_probabilities, dtype=np.float64
-            )
-            if (
-                conditional_update_probabilities.shape != cache_probabilities.shape
-                or not np.isfinite(conditional_update_probabilities).all()
-                or np.any(conditional_update_probabilities < 0.0)
-            ):
-                raise AssertionError("Macro conditional Candidate probabilities are invalid.")
             update_candidate_entropies.append(unified_candidate_entropies[-1])
             frame_cache = _candidates[frame_cache_index].copy()
             frame_cache_changed = bool(np.any(frame_cache != cache))
             frame_macro_index = len(macro_buffer.transitions)
-            frame_trigger_learning_valid = False
-            frame_trigger_teacher_valid = False
-            frame_trigger_credit_active = False
-            frame_teacher_q_keep = None
-            frame_teacher_q_update = None
-            frame_teacher_delta = None
-            frame_trigger_update_se = 0.0
-            frame_trigger_confidence_ratio = 0.0
-            frame_update_candidate_indices = ()
-            frame_update_candidate_returns = ()
-            frame_counterfactual_runtime_seconds = 0.0
-            frame_counterfactual_state_restore_valid = True
-            frame_counterfactual_branch_count = 0
             if deterministic:
                 selected_cache_id = hashlib.sha256(
                     np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
@@ -706,19 +629,11 @@ def collect_dual_timescale_episode(
                     protocol_diagnostic["update_inner_argmax_violation"]
                 ):
                     cache_update_inner_argmax_violation_count += 1
-                probability_difference = float(
-                    protocol_diagnostic["probability_max_difference_vs_legacy_formula"]
-                )
                 probability_sum_error = float(protocol_diagnostic["probability_sum_error"])
-                cache_probability_max_difference = max(
-                    cache_probability_max_difference, probability_difference
-                )
                 cache_probability_sum_error_max = max(
                     cache_probability_sum_error_max, probability_sum_error
                 )
-                if not np.isfinite(
-                    [p_keep, p_update_group, probability_difference, probability_sum_error]
-                ).all():
+                if not np.isfinite([p_keep, p_update_group, probability_sum_error]).all():
                     cache_probability_nonfinite_count += 1
                 cache_probability_nan_count += int(
                     np.isnan(cache_probabilities).sum()
@@ -971,9 +886,6 @@ def collect_dual_timescale_episode(
                     frame_old_next_value = float(
                         policy.macro_value(next_macro_state).detach().cpu()
                     )
-            trigger_advantage_raw = (
-                0.0 if frame_teacher_delta is None else float(frame_teacher_delta)
-            )
             macro_buffer.append(
                 MacroTransition(
                     observation=frame_observation.copy(),
@@ -986,13 +898,6 @@ def collect_dual_timescale_episode(
                     actual_duration=elapsed_in_frame,
                     old_macro_log_prob=frame_old_log_prob,
                     old_macro_entropy=frame_old_entropy,
-                    old_cache_trigger_log_prob=frame_old_trigger_log_prob,
-                    old_cache_trigger_p_keep=frame_old_trigger_p_keep,
-                    old_cache_trigger_p_update=frame_old_trigger_p_update,
-                    old_cache_trigger_log_p_keep=frame_old_trigger_log_p_keep,
-                    old_cache_trigger_log_p_update=frame_old_trigger_log_p_update,
-                    old_update_conditional_log_prob=frame_old_update_conditional_log_prob,
-                    update_conditional_log_prob_valid=frame_update_conditional_log_prob_valid,
                     old_duration_log_prob=frame_old_duration_log_prob,
                     old_value=frame_old_value,
                     old_next_value=frame_old_next_value,
@@ -1001,23 +906,6 @@ def collect_dual_timescale_episode(
                     done=done,
                     cache_configuration_id=cache_id,
                     actual_cache_update=frame_cache_changed,
-                    trigger_learning_valid=frame_trigger_learning_valid,
-                    trigger_teacher_valid=frame_trigger_teacher_valid,
-                    trigger_credit_active=frame_trigger_credit_active,
-                    teacher_q_keep=frame_teacher_q_keep,
-                    teacher_q_update=frame_teacher_q_update,
-                    teacher_delta_update_keep=frame_teacher_delta,
-                    trigger_update_standard_error=frame_trigger_update_se,
-                    trigger_confidence_ratio=frame_trigger_confidence_ratio,
-                    trigger_update_candidate_indices=frame_update_candidate_indices,
-                    trigger_update_candidate_returns=frame_update_candidate_returns,
-                    trigger_advantage_raw=trigger_advantage_raw,
-                    counterfactual_branch_runtime_seconds=(
-                        frame_counterfactual_runtime_seconds
-                    ),
-                    counterfactual_state_restore_valid=(
-                        frame_counterfactual_state_restore_valid
-                    ),
                 )
             )
             frame_start = slot_index + 1
@@ -1053,57 +941,6 @@ def collect_dual_timescale_episode(
         if nonzero_candidate_transitions
         else 0.0
     )
-    valid_teacher_transitions = [
-        item for item in macro_buffer.transitions if item.trigger_teacher_valid
-    ]
-    eligible_trigger_transitions = [
-        item for item in valid_teacher_transitions if item.trigger_learning_valid
-    ]
-    active_trigger_transitions = [
-        item for item in eligible_trigger_transitions if item.trigger_credit_active
-    ]
-    raw_trigger_advantages = np.asarray(
-        [float(item.trigger_advantage_raw) for item in eligible_trigger_transitions],
-        dtype=np.float64,
-    )
-    confidence_ratios = np.asarray(
-        [float(item.trigger_confidence_ratio) for item in eligible_trigger_transitions],
-        dtype=np.float64,
-    )
-    raw_median = float(np.median(raw_trigger_advantages)) if len(raw_trigger_advantages) else 0.0
-    raw_mad = (
-        float(np.median(np.abs(raw_trigger_advantages - raw_median)))
-        if len(raw_trigger_advantages)
-        else 0.0
-    )
-    positive_active = sum(
-        float(item.trigger_advantage_raw) > 0.0 for item in active_trigger_transitions
-    )
-    negative_active = sum(
-        float(item.trigger_advantage_raw) < 0.0 for item in active_trigger_transitions
-    )
-    trigger_teacher_transition_details = [
-        {
-            "macro_index": int(index),
-            "trigger_teacher_valid": bool(item.trigger_teacher_valid),
-            "trigger_credit_active": bool(item.trigger_credit_active),
-            "teacher_q_keep": item.teacher_q_keep,
-            "teacher_q_update": item.teacher_q_update,
-            "teacher_delta_update_keep": item.teacher_delta_update_keep,
-            "trigger_update_standard_error": float(item.trigger_update_standard_error),
-            "trigger_confidence_ratio": float(item.trigger_confidence_ratio),
-            "update_candidate_indices": [int(value) for value in item.trigger_update_candidate_indices],
-            "update_candidate_option_returns": [float(value) for value in item.trigger_update_candidate_returns],
-            "trigger_advantage_raw": float(item.trigger_advantage_raw),
-            "counterfactual_branch_runtime_seconds": float(
-                item.counterfactual_branch_runtime_seconds
-            ),
-            "counterfactual_state_restore_valid": bool(
-                item.counterfactual_state_restore_valid
-            ),
-        }
-        for index, item in enumerate(macro_buffer.transitions)
-    ]
     requested_duration_counts = {
         str(value): int(durations.count(value)) for value in policy.duration_candidates
     }
@@ -1161,56 +998,8 @@ def collect_dual_timescale_episode(
         "episode_seed": None if episode_seed is None else int(episode_seed),
         "macro_return": float(sum(item.frame_reward for item in macro_buffer.transitions)),
         "macro_frame_count": macro_count,
-        "trigger_teacher_valid_count": int(len(valid_teacher_transitions)),
-        "trigger_teacher_used": False,
-        "trigger_active": False,
-        "trigger_teacher_invalid_count": 0,
-        "trigger_credit_eligible_count": int(len(eligible_trigger_transitions)),
-        "trigger_credit_active_count": int(len(active_trigger_transitions)),
-        "trigger_credit_active_fraction": float(
-            len(active_trigger_transitions) / max(len(eligible_trigger_transitions), 1)
-        ),
-        "trigger_advantage_raw_mean": (
-            float(np.mean(raw_trigger_advantages))
-            if len(raw_trigger_advantages)
-            else 0.0
-        ),
-        "trigger_advantage_raw_std": (
-            float(np.std(raw_trigger_advantages)) if len(raw_trigger_advantages) else 0.0
-        ),
-        "trigger_advantage_raw_median": raw_median,
-        "trigger_advantage_raw_mad": raw_mad,
-        "trigger_positive_advantage_fraction": float(
-            positive_active / max(len(active_trigger_transitions), 1)
-        ),
-        "trigger_negative_advantage_fraction": float(
-            negative_active / max(len(active_trigger_transitions), 1)
-        ),
-        "trigger_confidence_ratio_median": (
-            float(np.median(confidence_ratios)) if len(confidence_ratios) else 0.0
-        ),
-        "trigger_confidence_ratio_p10": (
-            float(np.percentile(confidence_ratios, 10)) if len(confidence_ratios) else 0.0
-        ),
-        "trigger_confidence_ratio_p90": (
-            float(np.percentile(confidence_ratios, 90)) if len(confidence_ratios) else 0.0
-        ),
-        "counterfactual_branch_runtime_seconds": float(
-            counterfactual_runtime_seconds
-        ),
-        "counterfactual_branch_count": int(counterfactual_branch_count),
-        "counterfactual_environment_execution_count": int(
-            counterfactual_environment_execution_count
-        ),
-        "counterfactual_state_restore_valid": bool(
-            counterfactual_state_restore_valid
-        ),
-        "rollout_rng_unchanged": bool(counterfactual_state_restore_valid),
-        "trigger_teacher_transition_details": trigger_teacher_transition_details,
-        "trigger_counterfactual_branches": int(counterfactual_branch_count),
         "macro_entropy": float(np.mean([item.old_macro_entropy for item in macro_buffer.transitions])),
         "macro_cache_entropy": float(np.mean(cache_entropies)) if cache_entropies else 0.0,
-        "trigger_entropy": float(np.mean(trigger_entropies)) if trigger_entropies else 0.0,
         "macro_duration_entropy": float(np.mean(duration_entropies)) if duration_entropies else 0.0,
         "macro_duration_distribution": duration_distribution,
         "requested_duration_mean": float(np.mean(durations)),
@@ -1396,9 +1185,6 @@ def collect_dual_timescale_episode(
             "group_rule_violation_count": cache_group_rule_violation_count,
             "update_inner_argmax_violation_count": (
                 cache_update_inner_argmax_violation_count
-            ),
-            "probability_max_difference_vs_legacy_formula": (
-                cache_probability_max_difference
             ),
             "probability_sum_error_max": cache_probability_sum_error_max,
             "probability_nonfinite_count": cache_probability_nonfinite_count,

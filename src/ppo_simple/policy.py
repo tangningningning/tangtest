@@ -41,37 +41,25 @@ class MacroActionSample:
     duration_mask: np.ndarray
     cache_probabilities: np.ndarray
     raw_cache_probabilities: np.ndarray
-    conditional_update_probabilities: np.ndarray
     cache_entropy: Any
-    trigger_entropy: Any
     duration_entropy: Any
     cache_selected_group: str
-    trigger_log_prob: Any
-    conditional_update_log_prob: Any
     p_keep: Any
     p_update: Any
-    log_p_keep: Any
-    log_p_update: Any
     duration_log_prob: Any
     deterministic_cache_diagnostics: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class MacroComponentsEvaluation:
-    """Hierarchical Cache-trigger, conditional candidate, and Duration evaluation."""
+    """Macro 联合 Cache/Duration 动作的概率分解与评估结果。"""
 
     cache_log_prob: Any
     duration_log_prob: Any
-    trigger_log_prob: Any
-    conditional_update_log_prob: Any
     p_keep: Any
     p_update: Any
-    log_p_keep: Any
-    log_p_update: Any
     joint_log_prob: Any
     cache_entropy: Any
-    trigger_entropy: Any
-    conditional_update_entropy: Any
     duration_entropy: Any
     value: Any
     joint_logprob_decomposition_error: Any
@@ -205,12 +193,10 @@ def _mlp(
 class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
-    architecture_id = "adaptive_dual_timescale_macro_cache_smdp_micro_uav_ppo"
-    architecture_version = 23
-    cardinality_corrected_unified_architecture_id = (
+    architecture_id = (
         "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo"
     )
-    cardinality_corrected_unified_architecture_version = 25
+    architecture_version = 26
 
     def __init__(
         self,
@@ -239,15 +225,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             raise ValueError(
                 "The PROPOSED policy supports only the unified Cache candidate action with cardinality correction."
             )
-        self.architecture_id = self.cardinality_corrected_unified_architecture_id
-        self.architecture_version = self.cardinality_corrected_unified_architecture_version
-        self.trigger_observation_mean = np.zeros(self.observation_dim, dtype=np.float32)
-        self.trigger_observation_std = np.ones(self.observation_dim, dtype=np.float32)
-        self.trigger_observation_raw_std = np.ones(self.observation_dim, dtype=np.float32)
-        self.trigger_observation_normalization_active = False
-        self.trigger_observation_normalization_metadata: dict[str, Any] = {}
-        self.trigger_observation_input_clip: tuple[float, float] | None = None
-        self.trigger_observation_low_variance_feature_count = 0
         sizes = tuple(int(value) for value in hidden_sizes)
         if min(self.observation_dim, self.macro_cache_feature_dim, self.micro_uav_feature_dim) <= 0:
             raise ValueError("策略 observation/candidate feature dimensions 必须为正数。")
@@ -297,17 +274,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.observation_dim, (128, 128), 1, activation=nn.SiLU
         )
 
-        # 该模块暂时仅为当前 checkpoint 状态结构保留，正式策略不会调用。
-        self.macro_cache_trigger_actor = nn.Sequential(
-            nn.Linear(self.observation_dim, 128),
-            nn.SiLU(),
-            nn.Linear(128, 128),
-            nn.SiLU(),
-            nn.Linear(128, 2),
-        )
-        nn.init.zeros_(self.macro_cache_trigger_actor[-1].weight)
-        nn.init.zeros_(self.macro_cache_trigger_actor[-1].bias)
-
     def _macro_critic_inputs(self, observations: Any) -> Any:
         return 2.0 * observations - 1.0
 
@@ -326,17 +292,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
 
 
 
-
-    def trigger_observation_normalization_payload(self) -> dict[str, Any]:
-        return {
-            "active": bool(self.trigger_observation_normalization_active),
-            "mean": self.trigger_observation_mean.astype(np.float32, copy=True),
-            "std": self.trigger_observation_std.astype(np.float32, copy=True),
-            "raw_mean": self.trigger_observation_mean.astype(np.float32, copy=True),
-            "raw_std": self.trigger_observation_raw_std.astype(np.float32, copy=True),
-            "scale": self.trigger_observation_std.astype(np.float32, copy=True),
-            "metadata": dict(self.trigger_observation_normalization_metadata),
-        }
 
     @staticmethod
     def _candidate_batch(
@@ -387,20 +342,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             raise ValueError("Long-Value Critic observation dimension mismatch.")
         values = self.long_value_critic(obs).squeeze(-1)
         return values.squeeze(0) if single else values
-
-    @staticmethod
-    def _balance_macro_cache_group_mass(raw_scores: Any, candidate_masks: Any) -> Any:
-        scores = torch.as_tensor(raw_scores)
-        candidate_indices = torch.arange(int(scores.shape[-1]), device=scores.device)
-        group_features = torch.stack(
-            (candidate_indices == 0, candidate_indices > 0), dim=-1
-        ).to(dtype=torch.float32)
-        group_features = group_features.reshape(
-            *([1] * (scores.ndim - 1)), int(scores.shape[-1]), 2
-        ).expand(*scores.shape, 2)
-        return _group_balance_candidate_logits(
-            scores, group_features, candidate_masks, slice(0, 2)
-        )
 
     @staticmethod
     def _cardinality_corrected_cache_logits(raw_logits: Any, candidate_masks: Any) -> Any:
@@ -557,18 +498,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                     cache_mask_t[0],
                     group_ids,
                 )
-                legacy_flat_index = int(torch.argmax(cache_dist.logits).item())
-                legacy_reference_logits = self._cardinality_corrected_cache_logits(
-                    raw_candidate_logits, cache_mask_t[0]
-                )
-                legacy_reference_dist = _masked_categorical(
-                    legacy_reference_logits, cache_mask_t[0]
-                )
-                probability_max_difference = float(
-                    torch.max(torch.abs(cache_dist.probs - legacy_reference_dist.probs))
-                    .detach()
-                    .cpu()
-                )
                 probability_sum_error = float(
                     torch.abs(cache_dist.probs.sum() - 1.0).detach().cpu()
                 )
@@ -596,9 +525,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                     "p_update_group": p_update_group_value,
                     "new_selected_group": "KEEP" if selected_cache_group == 0 else "UPDATE",
                     "new_selected_candidate_index": cache_index,
-                    "legacy_flat_selected_candidate_index": legacy_flat_index,
-                    "legacy_flat_selected_group": "KEEP" if legacy_flat_index == 0 else "UPDATE",
-                    "old_new_disagreement": cache_index != legacy_flat_index,
                     "group_tie_break": "KEEP",
                     "legal_update_candidate_count": legal_update_count,
                     "selected_candidate_is_legal": selected_candidate_is_legal,
@@ -606,7 +532,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                     "legal_update_best_raw_score": legal_update_best_score,
                     "update_inner_argmax_violation": update_inner_argmax_violation,
                     "probability_sum_error": probability_sum_error,
-                    "probability_max_difference_vs_legacy_formula": probability_max_difference,
                 }
             else:
                 cache_index = int(cache_dist.sample().item())
@@ -651,11 +576,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             duration_log_prob = duration_dist.log_prob(duration_tensor)
             cache_entropy = cache_dist.entropy()
             duration_entropy = duration_dist.entropy()
-            zero = cache_log_prob.new_zeros(())
             p_keep = cache_probabilities[0]
             p_update = cache_probabilities[1:].sum()
-            log_p_keep = torch.log(p_keep.clamp_min(1.0e-30))
-            log_p_update = torch.log(p_update.clamp_min(1.0e-30))
             return MacroActionSample(
                 cache_index=cache_index,
                 duration_index=duration_index,
@@ -671,17 +593,11 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                     if raw_cache_dist is None
                     else raw_cache_dist.probs.detach().cpu().numpy().copy()
                 ),
-                conditional_update_probabilities=cache_probabilities.detach().cpu().numpy().copy(),
                 cache_entropy=cache_entropy,
-                trigger_entropy=zero,
                 duration_entropy=duration_entropy,
                 cache_selected_group="KEEP" if selected_cache_group == 0 else "UPDATE",
-                trigger_log_prob=zero,
-                conditional_update_log_prob=cache_log_prob,
                 p_keep=p_keep,
                 p_update=p_update,
-                log_p_keep=log_p_keep,
-                log_p_update=log_p_update,
                 duration_log_prob=duration_log_prob,
                 deterministic_cache_diagnostics=deterministic_cache_diagnostics,
             )
@@ -744,9 +660,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         cache_entropy = cache_dist.entropy()
         p_keep = cache_probabilities[:, 0]
         p_update = cache_probabilities[:, 1:].sum(dim=-1)
-        log_p_keep = torch.log(p_keep.clamp_min(1.0e-30))
-        log_p_update = torch.log(p_update.clamp_min(1.0e-30))
-        zero = torch.zeros_like(cache_log_prob)
         joint_log_prob = cache_log_prob + duration_log_prob
         decomposition_error = torch.abs(
             joint_log_prob.to(torch.float64)
@@ -763,16 +676,10 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         return MacroComponentsEvaluation(
             cache_log_prob=cache_log_prob,
             duration_log_prob=duration_log_prob,
-            trigger_log_prob=zero,
-            conditional_update_log_prob=cache_log_prob,
             p_keep=p_keep,
             p_update=p_update,
-            log_p_keep=log_p_keep,
-            log_p_update=log_p_update,
             joint_log_prob=joint_log_prob,
             cache_entropy=cache_entropy,
-            trigger_entropy=zero,
-            conditional_update_entropy=cache_entropy,
             duration_entropy=duration_dist.entropy(),
             value=values,
             joint_logprob_decomposition_error=decomposition_error,
@@ -968,9 +875,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         )
         return tuple(parameter for module in modules for parameter in module.parameters())
 
-    def macro_cache_trigger_actor_parameters(self) -> tuple[Any, ...]:
-        return tuple(self.macro_cache_trigger_actor.parameters())
-
     def macro_critic_parameters(self) -> tuple[Any, ...]:
         return tuple(self.macro_critic.parameters())
 
@@ -1033,15 +937,10 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         macro_state: dict[str, Any],
         micro_state: dict[str, Any],
         long_value_critic_state: dict[str, Any],
-        macro_cache_trigger_actor_state: dict[str, Any],
     ) -> None:
         long_state = {
             f"long_value_critic.{key}": value
             for key, value in long_value_critic_state.items()
         }
-        trigger_state = {
-            f"macro_cache_trigger_actor.{key}": value
-            for key, value in macro_cache_trigger_actor_state.items()
-        }
-        combined = {**macro_state, **micro_state, **long_state, **trigger_state}
+        combined = {**macro_state, **micro_state, **long_state}
         self.load_state_dict(combined, strict=True)
