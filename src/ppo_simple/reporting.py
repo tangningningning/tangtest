@@ -3494,7 +3494,19 @@ def write_dual_timescale_run_manifest(
     """记录双时间尺度 checkpoint、动作和 PPO 配置合同。"""
 
     manifest = {
-        "experiment_label": "V14b",
+        "experiment_label": (
+            "UNIFIED_CACHE_ACTION"
+            if bool(getattr(trainer, "unified_cache_action", False))
+            else
+            "V15-C2"
+            if str(trainer.algorithm_id).startswith("V15-C2")
+            else "V15-C1"
+            if str(trainer.algorithm_id).startswith("V15-C1")
+            else "V15-C"
+            if str(trainer.algorithm_id).startswith("V15-C")
+            else "V15-B"
+        ),
+        "algorithm_id": str(trainer.algorithm_id),
         "experiment_type": "macro_cache_smdp_micro_uav_ppo",
         "config_path": str(Path(config_path).resolve()),
         "config_raw_sha256": str(config_raw_sha256),
@@ -3507,7 +3519,9 @@ def write_dual_timescale_run_manifest(
         ),
         "policy_schema": trainer.policy.architecture_id,
         "checkpoint_version": int(trainer.checkpoint_version),
-        "macro_actor_advantage_mode": "duration_aware_smdp_gae",
+        "macro_actor_advantage_mode": str(
+            trainer.config_contract["macro_actor_advantage_mode"]
+        ),
         "macro_critic_target_mode": str(trainer.macro_critic_target_mode),
         "macro_critic_lambda_return_lambda": trainer.macro_critic_lambda_return_lambda,
         "num_macro_critics": 1,
@@ -3529,6 +3543,61 @@ def write_dual_timescale_run_manifest(
         "current_gradient_projected": False,
         "current_loss_v10_equivalence": True,
         "macro_actor_loss_changed": False,
+        "macro_actor_loss": "UPDATE conditional candidate PPO + Duration PPO (unchanged); independent Trigger PPO optimizer",
+        "trigger_q_active": False,
+        "independent_cache_trigger_actor": True,
+        "cache_trigger_actor_architecture": "400-128-128-2 (SiLU)",
+        "cache_trigger_actor_input": (
+            "Trigger-only normalized Macro observation; Candidate, Duration, Critic, and Micro inputs remain raw"
+            if trainer.policy.trigger_observation_normalization_active
+            else "raw Macro observation; no shared encoder"
+        ),
+        "cache_trigger_actor_final_layer_initialization": "zero weight and bias; P_KEEP=P_UPDATE=0.5 when UPDATE is legal",
+        "cache_trigger_optimizer": "Adam over macro_cache_trigger_actor parameters only",
+        "cache_trigger_learning_rate": float(
+            trainer.learning_rates["macro_cache_trigger_actor"]
+        ),
+        "cache_trigger_updates_during_collection": 0,
+        "cache_trigger_candidate_samples": 4,
+        "cache_trigger_duration_candidates": list(trainer.policy.duration_candidates),
+        "cache_trigger_uncertainty_gate": "active iff abs(A_trigger) > sample_std(K=4 update candidate option returns)/sqrt(4)",
+        "cache_trigger_advantage_scaling": "active-transition MAD; divide by max(MAD, 1e-8), clip [-5, 5]",
+        "cache_trigger_ppo_ratio": (
+            "separate clipped KEEP/UPDATE probability ratios with full-information old-policy action weighting"
+            if trainer.stage1_trigger_only
+            else "exp(new Trigger log probability - old Trigger log probability), independent of Candidate and Duration"
+        ),
+        "cache_trigger_vs_macro_optimizer_parameter_overlap": 0,
+        "trigger_ppo_active": True,
+        "trigger_ppo_full_information_binary": bool(trainer.stage1_trigger_only),
+        "trigger_ppo_epoch_kl_stop": 0.02 if trainer.stage1_trigger_only else None,
+        "trigger_ppo_hard_kl_limit": 0.05 if trainer.stage1_trigger_only else None,
+        "trigger_ppo_transactional_rollback": bool(trainer.stage1_trigger_only),
+        "trigger_ppo_backtracking_step_scales": (
+            [1.0, 0.25, 0.0625, 0.015625]
+            if trainer.stage1_trigger_only
+            else []
+        ),
+        "trigger_grad_clip_active": bool(trainer.stage1_trigger_only),
+        "trigger_max_grad_norm": float(trainer.trigger_max_grad_norm),
+        "trigger_observation_normalization_active": bool(
+            trainer.policy.trigger_observation_normalization_active
+        ),
+        "trigger_observation_normalization_metadata": dict(
+            trainer.policy.trigger_observation_normalization_metadata
+        ),
+        "stage1_trigger_only": bool(trainer.stage1_trigger_only),
+        "formal_non_trigger_optimizer_steps_target": (
+            0 if trainer.stage1_trigger_only else None
+        ),
+        "initialization_metadata": dict(trainer.initialization_metadata),
+        "trigger_critic_bootstrap_used": False,
+        "trigger_teacher": "critic-independent policy-marginalized paired option reward difference",
+        "trigger_teacher_bootstrap": "none",
+        "counterfactual_branches_per_macro_transition": 5,
+        "counterfactual_update_candidate": "K=4 samples with replacement from old conditional UPDATE Candidate policy",
+        "macro_candidate_conditional_ratio_separate": True,
+        "macro_duration_ratio_separate": True,
         "smdp_gae_changed": False,
         "actor_uses_last1_data": False,
         "macro_critic_last1_policy_age_updates": 1,
@@ -3580,8 +3649,10 @@ def write_dual_timescale_run_manifest(
         "macro_critic_update_iterations_per_episode": int(
             trainer.config.get("macro_critic_steps_per_update", 50)
         ),
-        "macro_critic_optimizer_steps_per_episode": int(
-            trainer.config.get("macro_critic_steps_per_update", 50)
+        "macro_critic_optimizer_steps_per_episode": (
+            0
+            if trainer.stage1_trigger_only
+            else int(trainer.config.get("macro_critic_steps_per_update", 50))
         ),
         "micro_macro_buffers_separate": True,
         "exact_q_training_enabled": False,
@@ -3598,6 +3669,53 @@ def write_dual_timescale_run_manifest(
         "training_counters": dict(trainer.training_counters),
         "resume": bool(resume),
     }
+    if bool(getattr(trainer, "unified_cache_action", False)):
+        manifest.update(
+            {
+                "unified_cache_action": True,
+                "cache_action_semantics": "single Cache Candidate categorical over KEEP candidate 0 plus legal UPDATE candidates; Duration conditioned on selected candidate",
+                "macro_actor_loss_changed": True,
+                "macro_actor_loss": "unified full-candidate PPO plus conditional Duration PPO using Macro SMDP GAE",
+                "independent_cache_trigger_actor": False,
+                "trigger_active": False,
+                "trigger_ppo_active": False,
+                "trigger_optimizer_steps_target": 0,
+                "cache_trigger_optimizer": "inactive; optimizer step count must remain zero",
+                "cache_trigger_learning_rate": None,
+                "cache_trigger_updates_during_collection": 0,
+                "cache_trigger_candidate_samples": 0,
+                "cache_trigger_uncertainty_gate": "inactive",
+                "cache_trigger_advantage_scaling": "inactive",
+                "cache_trigger_ppo_ratio": "inactive",
+                "cache_trigger_teacher": "not used",
+                "trigger_teacher_used": False,
+                "counterfactual_branches_per_macro_transition": 0,
+                "counterfactual_update_candidate": "none",
+                "macro_candidate_conditional_ratio_separate": False,
+                "macro_cache_update_rate_definition": "selected_candidate_id != 0",
+                "candidate0_is_exact_keep": True,
+                "candidate_selection_head_warmstart_used": bool(
+                    trainer.initialization_metadata.get(
+                        "candidate_selection_head_warmstart_used", False
+                    )
+                ),
+                "candidate_selection_head_fresh_init_reason": trainer.initialization_metadata.get(
+                    "candidate_selection_head_fresh_init_reason"
+                ),
+            }
+        )
+    if bool(getattr(trainer, "cardinality_corrected_cache_action", False)):
+        manifest.update(
+            {
+                "cardinality_corrected_cache_action": True,
+                "cache_candidate_cardinality_correction": (
+                    "After legal masking, subtract log(K_s) from each legal UPDATE candidate logit; K_s counts legal nonzero candidates."
+                ),
+                "cache_candidate_probability_semantics": (
+                    "one unified masked categorical over KEEP and UPDATE candidates after legal UPDATE cardinality correction"
+                ),
+            }
+        )
     _write_json(Path(path), manifest)
     return manifest
 
@@ -3650,3 +3768,133 @@ def append_dual_timescale_slot_metrics(
             stream.write("\n")
             count += 1
     return count
+
+
+def write_v15a5_multirealization_trigger_probe_artifacts(
+    report: dict[str, Any],
+    *,
+    report_path: str | Path,
+    curves_path: str | Path,
+) -> tuple[Path, Path]:
+    """Write the V15-A5 synchronized Trigger probe report and four-panel figure."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    destination = Path(report_path)
+    figure_path = Path(curves_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    blocks = list(report.get("blocks", []))
+    heldout = report.get("heldout", {})
+    seen_history = list(report.get("seen_block_evaluation_history", []))
+    if len(blocks) != 4 or not heldout or len(seen_history) != 4:
+        raise ValueError("V15-A5 reporting requires four blocks and held-out metrics.")
+
+    figure, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
+    block_x = np.arange(1, len(blocks) + 1)
+    width = 0.36
+    axes[0, 0].bar(
+        block_x - width / 2,
+        [item["BLOCK_PRE_UPDATE_BA"] for item in blocks],
+        width,
+        color="#D18448",
+        label="Before update",
+    )
+    axes[0, 0].bar(
+        block_x + width / 2,
+        [item["BLOCK_POST_UPDATE_BA"] for item in blocks],
+        width,
+        color="#579D72",
+        label="After update",
+    )
+    axes[0, 0].set(
+        title="Synchronized block training BA",
+        xlabel="8-realization block",
+        ylabel="Balanced accuracy",
+        ylim=(0.0, 1.0),
+        xticks=block_x,
+    )
+    axes[0, 0].legend(frameon=False)
+
+    matrix = np.full((len(blocks), len(blocks)), np.nan, dtype=np.float64)
+    forgetting_by_update = []
+    for history_index, item in enumerate(seen_history):
+        for evaluated in item["evaluated_blocks"]:
+            block_index = int(evaluated["block_index"]) - 1
+            matrix[block_index, history_index] = float(evaluated["balanced_accuracy"])
+        forgetting_by_update.append(float(item["MEAN_SEEN_BLOCK_FORGETTING"]))
+    masked = np.ma.masked_invalid(matrix)
+    heatmap = axes[0, 1].imshow(masked, vmin=0.0, vmax=1.0, cmap="viridis", aspect="auto")
+    axes[0, 1].set(
+        title="Seen-block BA after each update",
+        xlabel="Completed update block",
+        ylabel="Evaluated train block",
+        xticks=np.arange(len(blocks)),
+        xticklabels=[str(index) for index in range(1, len(blocks) + 1)],
+        yticks=np.arange(len(blocks)),
+        yticklabels=[str(index) for index in range(1, len(blocks) + 1)],
+    )
+    for row in range(len(blocks)):
+        for column in range(len(blocks)):
+            if math.isfinite(matrix[row, column]):
+                axes[0, 1].text(
+                    column,
+                    row,
+                    f"{matrix[row, column]:.2f}",
+                    ha="center",
+                    va="center",
+                    color="white" if matrix[row, column] < 0.58 else "black",
+                    fontsize=9,
+                )
+    figure.colorbar(heatmap, ax=axes[0, 1], fraction=0.046, pad=0.04, label="Balanced accuracy")
+    axes[0, 1].text(
+        0.02,
+        -0.25,
+        f"Mean seen-block forgetting after final update: {report['seen_realizations']['MEAN_SEEN_BLOCK_FORGETTING']:.3f}",
+        transform=axes[0, 1].transAxes,
+        fontsize=9,
+    )
+
+    axes[1, 0].bar(
+        ["KEEP", "UPDATE"],
+        [heldout["HELDOUT_KEEP_RECALL"], heldout["HELDOUT_UPDATE_RECALL"]],
+        color=["#5277A3", "#AB79A5"],
+        width=0.55,
+    )
+    axes[1, 0].axhline(0.65, color="#B23A48", linestyle="--", label="Support threshold 0.65")
+    axes[1, 0].set(
+        title="Held-out realization recalls",
+        ylabel="Recall",
+        ylim=(0.0, 1.0),
+    )
+    axes[1, 0].legend(frameon=False)
+
+    baseline = float(report["comparison"]["PREVIOUS_GROUPED_CV_TEST_BA"])
+    heldout_ba = float(heldout["HELDOUT_BALANCED_ACCURACY"])
+    axes[1, 1].bar(
+        ["Previous grouped CV", "V15-A5 held-out"],
+        [baseline, heldout_ba],
+        color=["#929292", "#2457A7"],
+        width=0.58,
+    )
+    axes[1, 1].axhline(0.70, color="#B23A48", linestyle="--", label="Support threshold 0.70")
+    axes[1, 1].set(
+        title="Held-out BA vs frozen-policy CV baseline",
+        ylabel="Balanced accuracy",
+        ylim=(0.0, 1.0),
+    )
+    axes[1, 1].legend(frameon=False)
+    for index, value in enumerate((baseline, heldout_ba)):
+        axes[1, 1].text(index, value + 0.025, f"{value:.3f}", ha="center")
+
+    figure.suptitle("V15-A5 multi-realization synchronized Trigger probe", fontsize=15)
+    figure.savefig(figure_path, dpi=180)
+    plt.close(figure)
+
+    with destination.open("w", encoding="utf-8", newline="\n") as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write("\n")
+    return destination, figure_path
