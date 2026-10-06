@@ -833,6 +833,8 @@ def collect_dual_timescale_episode(
     cache_probability_max_difference = 0.0
     cache_probability_sum_error_max = 0.0
     cache_probability_nonfinite_count = 0
+    cache_probability_nan_count = 0
+    cache_probability_inf_count = 0
     start_time = time.perf_counter()
 
     for slot_index, step in enumerate(aligned_steps):
@@ -1105,11 +1107,16 @@ def collect_dual_timescale_episode(
                     np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
                 ).hexdigest()[:16]
                 selection_record = {
+                    "frame_index": int(len(deterministic_cache_selections)),
                     "decision_slot": int(step.slot),
+                    "legal_candidate_count": int(np.count_nonzero(frame_candidate_masks)),
                     "selected_group": str(selected.cache_selected_group),
                     "selected_candidate_index": frame_cache_index,
                     "selected_candidate_id": selected_cache_id,
                     "selected_duration": frame_requested_duration,
+                    "probability_finite": bool(np.isfinite(cache_probabilities).all()),
+                    "probability_nan_count": int(np.isnan(cache_probabilities).sum()),
+                    "probability_inf_count": int(np.isinf(cache_probabilities).sum()),
                 }
                 protocol_diagnostic = selected.deterministic_cache_diagnostics
                 if bool(getattr(policy, "cardinality_corrected_cache_action", False)):
@@ -1140,6 +1147,21 @@ def collect_dual_timescale_episode(
                         [p_keep, p_update_group, probability_difference, probability_sum_error]
                     ).all():
                         cache_probability_nonfinite_count += 1
+                    cache_probability_nan_count += int(
+                        np.isnan(cache_probabilities).sum()
+                    )
+                    cache_probability_inf_count += int(
+                        np.isinf(cache_probabilities).sum()
+                    )
+                    selection_record["selected_update_raw_score_best"] = (
+                        None
+                        if str(protocol_diagnostic["new_selected_group"]) != "UPDATE"
+                        else bool(
+                            protocol_diagnostic["selected_candidate_is_legal"]
+                            and protocol_diagnostic["selected_raw_score"]
+                            == protocol_diagnostic["legal_update_best_raw_score"]
+                        )
+                    )
                     selection_record.update(protocol_diagnostic)
                 deterministic_cache_selections.append(selection_record)
             if frame_cache_index > 0:
@@ -1818,6 +1840,13 @@ def collect_dual_timescale_episode(
             ),
             "probability_sum_error_max": cache_probability_sum_error_max,
             "probability_nonfinite_count": cache_probability_nonfinite_count,
+            "probability_nan_count": cache_probability_nan_count,
+            "probability_inf_count": cache_probability_inf_count,
+            "probability_finite": (
+                cache_probability_nonfinite_count == 0
+                and cache_probability_nan_count == 0
+                and cache_probability_inf_count == 0
+            ),
             "group_tie_break": "KEEP",
         }
     return EpisodeCollection(micro_buffer, macro_buffer, summary)
