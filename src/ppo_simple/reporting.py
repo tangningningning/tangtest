@@ -218,7 +218,7 @@ def format_training_epoch_log(
         f"| CacheChange={_format_rate_percent(record.get('actual_cache_update_rate'))}% "
         f"| UAVMove={_format_rate_percent(uav_move_rate)}% "
         f"| Entropy={_format_metric(record.get('macro_entropy'), 2)} "
-        f"| KL={_format_metric(record.get('macro_approx_kl'), 5)} "
+        f"| KL={_format_metric(record.get('macro_joint_approx_kl'), 5)} "
         f"| Time={_format_metric(record.get('training_epoch_runtime_seconds', record.get('episode_runtime_seconds')), 1)}s"
     )
 
@@ -1394,7 +1394,6 @@ def build_macro_transition_trace_arrays(
         "observation",
         "next_observation",
         "macro_reward",
-        "requested_duration",
         "actual_duration",
         "done",
         "old_value",
@@ -1407,6 +1406,20 @@ def build_macro_transition_trace_arrays(
         "n2_bootstrap_frame_index",
     )
     chunks: dict[str, list[np.ndarray]] = {name: [] for name in fields}
+    termination_fields = (
+        "termination_observations",
+        "termination_elapsed_slots",
+        "termination_actions",
+        "termination_masks",
+        "old_termination_log_probs",
+        "old_termination_entropies",
+    )
+    termination_max_count = max(
+        int(np.asarray(batch["termination_masks"]).shape[-1]) for batch in batches
+    )
+    if termination_max_count > 4:
+        raise ValueError("Adaptive holding trace exceeds four sampled decisions per frame.")
+    chunks.update({name: [] for name in termination_fields})
     chunks["episode_id"] = []
     chunks["episode_seed"] = []
     episode_transition_counts: dict[str, int] = {}
@@ -1429,16 +1442,12 @@ def build_macro_transition_trace_arrays(
         observation = np.asarray(raw["observation"], dtype=np.float32)
         next_observation = np.asarray(raw["next_observation"], dtype=np.float32)
         reward = np.asarray(raw["macro_reward"], dtype=np.float32).reshape(-1)
-        requested_raw = np.asarray(raw["requested_duration"]).reshape(-1)
         duration_raw = np.asarray(raw["actual_duration"]).reshape(-1)
         if (
-            not np.isfinite(requested_raw).all()
-            or not np.isfinite(duration_raw).all()
-            or np.any(requested_raw != np.floor(requested_raw))
+            not np.isfinite(duration_raw).all()
             or np.any(duration_raw != np.floor(duration_raw))
         ):
             raise ValueError(f"Macro transition trace episode {episode} has invalid durations.")
-        requested = requested_raw.astype(np.int64)
         duration = duration_raw.astype(np.int64)
         done = np.asarray(raw["done"], dtype=bool).reshape(-1)
         old_value = np.asarray(raw["old_value"], dtype=np.float32).reshape(-1)
@@ -1454,10 +1463,45 @@ def build_macro_transition_trace_arrays(
             raw["n2_bootstrap_frame_index"], dtype=np.int64
         ).reshape(-1)
         count = int(reward.size)
+        termination_observations = np.asarray(
+            batch["termination_observations"], dtype=np.float32
+        )
+        termination_elapsed_slots = np.asarray(
+            batch["termination_elapsed_slots"], dtype=np.int64
+        )
+        termination_actions = np.asarray(batch["termination_actions"], dtype=np.int64)
+        termination_masks = np.asarray(batch["termination_masks"], dtype=bool)
+        old_termination_log_probs = np.asarray(
+            batch["old_termination_log_probs"], dtype=np.float32
+        )
+        old_termination_entropies = np.asarray(
+            batch["old_termination_entropies"], dtype=np.float32
+        )
+        if (
+            termination_observations.ndim != 3
+            or termination_observations.shape[0] != count
+            or termination_observations.shape[-1] != observation.shape[-1]
+        ):
+            raise ValueError(
+                f"Macro transition trace episode {episode} has invalid termination observations."
+            )
+        decision_shape = (count, int(termination_observations.shape[1]))
+        if any(
+            value.shape != decision_shape
+            for value in (
+                termination_elapsed_slots,
+                termination_actions,
+                termination_masks,
+                old_termination_log_probs,
+                old_termination_entropies,
+            )
+        ):
+            raise ValueError(
+                f"Macro transition trace episode {episode} has misaligned termination fields."
+            )
         if count <= 0:
             raise ValueError(f"Macro transition trace episode {episode} is empty.")
         vectors = (
-            requested,
             duration,
             done,
             old_value,
@@ -1486,7 +1530,7 @@ def build_macro_transition_trace_arrays(
         )
         if any(not np.isfinite(value).all() for value in floats):
             raise ValueError(f"Macro transition trace episode {episode} contains NaN/Inf.")
-        if np.any(requested <= 0) or np.any(duration <= 0) or np.any(duration > requested):
+        if np.any(duration < 1) or np.any(duration > 5):
             raise ValueError(f"Macro transition trace episode {episode} has invalid durations.")
         if not np.array_equal(frame_index, np.arange(count, dtype=np.int64)):
             raise ValueError(f"Macro frame indexes are not continuous in episode {episode}.")
@@ -1498,6 +1542,51 @@ def build_macro_transition_trace_arrays(
             next_observation[:-1], observation[1:], rtol=0.0, atol=1.0e-6
         ):
             raise ValueError(f"Macro next-observation linkage breaks within episode {episode}.")
+
+        for index in range(count):
+            sampled_count = int(np.count_nonzero(termination_masks[index]))
+            expected_mask = np.arange(termination_masks.shape[1]) < sampled_count
+            elapsed = termination_elapsed_slots[index, :sampled_count]
+            actions = termination_actions[index, :sampled_count]
+            if (
+                not np.array_equal(termination_masks[index], expected_mask)
+                or sampled_count > 4
+                or not np.array_equal(
+                    elapsed, np.arange(1, sampled_count + 1, dtype=np.int64)
+                )
+                or np.any((actions < 0) | (actions > 1))
+                or (sampled_count > 1 and np.any(actions[:-1] == 1))
+                or not np.isfinite(
+                    old_termination_log_probs[index, :sampled_count]
+                ).all()
+                or not np.isfinite(
+                    old_termination_entropies[index, :sampled_count]
+                ).all()
+                or not np.isfinite(
+                    termination_observations[index, :sampled_count]
+                ).all()
+            ):
+                raise ValueError(
+                    f"Termination trace contains invalid sampled decisions in episode {episode}."
+                )
+            if done[index] and sampled_count and np.any(actions == 1):
+                raise ValueError(
+                    f"Terminal frame sampled a termination decision in episode {episode}."
+                )
+            if sampled_count == 0:
+                expected_duration = 1
+                if not done[index]:
+                    raise ValueError(
+                        f"Nonterminal one-slot frame lacks an eligible decision in episode {episode}."
+                    )
+            elif int(actions[-1]) == 1:
+                expected_duration = int(elapsed[-1])
+            else:
+                expected_duration = int(elapsed[-1]) + 1
+            if expected_duration != int(duration[index]):
+                raise ValueError(
+                    f"Termination trace does not explain duration in episode {episode}."
+                )
 
         expected_bootstrap_frame_index = np.full(count, -1, dtype=np.int64)
         expected_bootstrap_old_value = np.zeros(count, dtype=np.float32)
@@ -1566,7 +1655,6 @@ def build_macro_transition_trace_arrays(
             ("observation", observation),
             ("next_observation", next_observation),
             ("macro_reward", reward),
-            ("requested_duration", requested),
             ("actual_duration", duration),
             ("done", done),
             ("old_value", old_value),
@@ -1577,6 +1665,33 @@ def build_macro_transition_trace_arrays(
             ("n2_target", n2_target),
             ("n2_bootstrap_old_value", n2_bootstrap_old_value),
             ("n2_bootstrap_frame_index", n2_bootstrap_frame_index),
+        ):
+            chunks[name].append(value)
+        term_pad = termination_max_count - termination_masks.shape[1]
+        if term_pad:
+            termination_observations = np.pad(
+                termination_observations, ((0, 0), (0, term_pad), (0, 0))
+            )
+            termination_elapsed_slots = np.pad(
+                termination_elapsed_slots, ((0, 0), (0, term_pad))
+            )
+            termination_actions = np.pad(
+                termination_actions, ((0, 0), (0, term_pad))
+            )
+            termination_masks = np.pad(termination_masks, ((0, 0), (0, term_pad)))
+            old_termination_log_probs = np.pad(
+                old_termination_log_probs, ((0, 0), (0, term_pad))
+            )
+            old_termination_entropies = np.pad(
+                old_termination_entropies, ((0, 0), (0, term_pad))
+            )
+        for name, value in (
+            ("termination_observations", termination_observations),
+            ("termination_elapsed_slots", termination_elapsed_slots),
+            ("termination_actions", termination_actions),
+            ("termination_masks", termination_masks),
+            ("old_termination_log_probs", old_termination_log_probs),
+            ("old_termination_entropies", old_termination_entropies),
         ):
             chunks[name].append(value)
 
@@ -1592,23 +1707,16 @@ def build_macro_transition_trace_arrays(
 
     arrays = {name: np.concatenate(parts, axis=0) for name, parts in chunks.items()}
     arrays["gamma"] = np.asarray(gamma_value, dtype=np.float64)
-    requested = arrays["requested_duration"]
     duration = arrays["actual_duration"]
-    pair_histogram: dict[str, int] = {}
-    tail_histogram: dict[str, int] = {}
-    for requested_value, actual_value in zip(requested, duration, strict=True):
-        pair_key = f"{int(requested_value)}->{int(actual_value)}"
-        pair_histogram[pair_key] = pair_histogram.get(pair_key, 0) + 1
-        if int(actual_value) < int(requested_value):
-            tail_histogram[pair_key] = tail_histogram.get(pair_key, 0) + 1
     summary = {
         "macro_transition_trace_path": None,
         "transition_count": int(len(arrays["episode_id"])),
         "episode_transition_counts": episode_transition_counts,
-        "requested_duration_histogram": _integer_histogram(requested),
         "actual_duration_histogram": _integer_histogram(duration),
-        "requested_actual_duration_pair_histogram": pair_histogram,
-        "tail_truncated_duration_counts": tail_histogram,
+        "holding_duration_distribution": {
+            str(value): int(np.count_nonzero(duration == value))
+            for value in range(1, 6)
+        },
         "critic_training_target_mode": "two_step_smdp_td",
         "critic_target_recompute_max_abs_error": target_max_abs_error,
         "realized_return_recompute_max_abs_error": return_max_abs_error,
@@ -1648,7 +1756,7 @@ def write_macro_transition_trace_artifact(
         raise
     summary["macro_transition_trace_path"] = str(trace_path.resolve())
     summary["macro_transition_trace_format"] = "npz"
-    summary["trace_format_version"] = 3
+    summary["trace_format_version"] = 4
     for filename in (RUN_MANIFEST_FILENAME, RUN_SUMMARY_FILENAME):
         report_path = destination / filename
         payload = _read_json(report_path)
@@ -1683,6 +1791,13 @@ def write_dual_timescale_run_manifest(
         "config_semantic_sha256": str(config_semantic_sha256),
         "seed": int(seed),
         "target_episodes": int(target_episodes),
+        "realizations_per_policy_update": int(
+            trainer.realizations_per_policy_update
+        ),
+        "policy_update_total": int(trainer.policy_update_total),
+        "expected_episode_metrics_count": int(target_episodes),
+        "expected_update_metrics_count": int(trainer.policy_update_total),
+        "rollout_group_contract": "four independent realizations collected with one frozen old policy; targets are episode-local; advantages are normalized over the combined update group",
         "episode_pool": None if episode_pool is None else str(Path(episode_pool).resolve()),
         "episode_seed_start": None if episode_seed_start is None else int(episode_seed_start),
         "episode_seed_end": (
@@ -1695,25 +1810,51 @@ def write_dual_timescale_run_manifest(
         "origin_start": int(context.train_origin_start),
         "origin_end": int(context.train_origin_end),
         "terminal_origin": int(context.terminal_origin),
-        "policy_schema": str(trainer.policy.architecture_id),
-        "architecture_version": int(trainer.policy.architecture_version),
+        "policy_schema": str(trainer.config_contract["policy_schema"]),
+        "architecture_version": int(trainer.config_contract["architecture_version"]),
         "checkpoint_version": int(trainer.checkpoint_version),
         "checkpoint_method": str(trainer.checkpoint_method),
-        "macro_action": "Cache candidate and Duration",
-        "macro_probability_factorization": "log pi(Cache, Duration) = log pi(Cache) + log pi(Duration | Cache)",
-        "macro_actor_objective": "one joint PPO clipped surrogate using the joint Cache/Duration ratio",
+        "macro_action": "Unified Cache candidate with adaptive learned holding termination",
+        "adaptive_holding_enabled": bool(trainer.config["adaptive_holding_enabled"]),
+        "adaptive_holding_min_slots": int(trainer.config["adaptive_holding_min_slots"]),
+        "adaptive_holding_max_slots": int(trainer.config["adaptive_holding_max_slots"]),
+        "macro_actor_objective": "one joint PPO clipped surrogate over Cache candidate and sampled termination sequence",
         "macro_actor_advantage_mode": str(trainer.config_contract["macro_actor_advantage_mode"]),
+        "macro_actor_learning_rate_schedule": str(
+            trainer.macro_actor_learning_rate_schedule
+        ),
+        "macro_actor_learning_rate_initial": float(
+            trainer.learning_rates["macro_actor_initial"]
+        ),
+        "macro_actor_learning_rate_final": float(
+            trainer.learning_rates["macro_actor_final"]
+        ),
         "cache_candidate_zero": "current Cache configuration (KEEP)",
         "cache_candidate_action_space": "one categorical over KEEP and legal UPDATE candidates with legal-cardinality correction",
-        "macro_duration_candidates": list(trainer.policy.duration_candidates),
         "micro_action": "UAV0 followed by UAV1 conditioned on selected UAV0 position",
-        "micro_actor_objective": "one joint PPO clipped surrogate over both conditional UAV actions",
+        "micro_actor_objective": "single joint UAV0/UAV1 PPO clipped surrogate + STAY/MOVE group entropy-floor regularization",
+        "micro_group_entropy_floor_enabled": True,
+        "micro_group_probability_soft_cap": float(
+            trainer.config["micro_group_probability_soft_cap"]
+        ),
+        "micro_group_entropy_floor": float(
+            -float(trainer.config["micro_group_probability_soft_cap"])
+            * math.log(float(trainer.config["micro_group_probability_soft_cap"]))
+            -(1.0 - float(trainer.config["micro_group_probability_soft_cap"]))
+            * math.log(1.0 - float(trainer.config["micro_group_probability_soft_cap"]))
+        ),
+        "micro_group_entropy_floor_coefficient": float(
+            trainer.config["micro_group_entropy_floor_coefficient"]
+        ),
+        "micro_target_kl": float(trainer.config["micro_target_kl"]),
+        "macro_target_kl": float(trainer.config["macro_target_kl"]),
         "macro_critic_target_mode": str(trainer.macro_critic_target_mode),
         "macro_critic_architecture": (
             f"{int(context.observation_spec.observation_dim)}-128-128-1 (SiLU)"
         ),
         "macro_critic_optimizer": "single scalar Critic Adam optimizer",
         "macro_critic_last1_length": 1,
+        "macro_critic_last1_semantics": "the final realization from the preceding committed policy-update group",
         "macro_critic_gradient_conflict_method": "last1 norm matching, current-priority last1-only projection, final norm matching to current",
         "long_value_enabled": bool(trainer.long_value_enabled),
         "long_value_target": str(trainer.long_value_target),
@@ -1724,7 +1865,7 @@ def write_dual_timescale_run_manifest(
         "observation_dim": int(context.observation_spec.observation_dim),
         "macro_cache_candidate_feature_dim": int(trainer.policy.macro_cache_feature_dim),
         "micro_uav_candidate_feature_dim": int(trainer.policy.micro_uav_feature_dim),
-        "prediction_horizon": int(trainer.policy.prediction_horizon),
+        "prediction_horizon": int(context.observation_spec.prediction_horizon),
         "actor_learning_rate": float(trainer.learning_rates["actor"]),
         "macro_actor_learning_rate": float(trainer.learning_rates["macro_actor"]),
         "micro_actor_learning_rate": float(trainer.learning_rates["micro_actor"]),

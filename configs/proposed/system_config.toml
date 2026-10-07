@@ -521,19 +521,20 @@ max_updates = 100
 objective_tolerance = 1.0e-9
 
 [algorithm.ppo]
-# When：每个 Macro frame 边界决策一次；frame 内每个 slot 决策 UAV 位置。
-# What：Macro 联合选 Cache 配置与 duration；Micro 顺序选择 UAV0/UAV1 统一位置候选。
+# When：Macro 每个 frame 起点选 Cache；slot 执行后可决定结束 holding；Micro 每 slot 决策 UAV 位置。
+# What：Macro 使用 Unified Cache candidate 与 sampled holding termination；Micro 顺序选择 UAV0/UAV1 统一位置候选。
 # Where：动作与 mask 在 src/ppo_simple/{policy,rollout,trainer}.py；真实执行在 slot_environment.py。
 # Cache candidate 0=当前配置 KEEP；UAV candidate 0=当前位置 STAY。
 # Exact-Q 仅保留 diagnostic 能力，正式训练关闭；不改变当前物理系统模型。
 enabled = true
 method = "PROPOSED"
 configuration_control_mode = "macro_cache_smdp_micro_uav_candidate"
-policy_schema = "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo"
+policy_schema = "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
 macro_cache_enabled = true
-# 当前车辆预测 horizon H=5；默认候选为 sorted(unique([1, ceil(H/2), H]))。
-# candidate 0 始终是当前实际 Cache 配置，即 KEEP。
-macro_duration_candidates = [1, 3, 5]
+# 开启自适应 Cache holding；每次至少保持 1 个 slot，最多保持 5 个 slot。
+adaptive_holding_enabled = true
+adaptive_holding_min_slots = 1
+adaptive_holding_max_slots = 5
 macro_full_batch = true
 exact_q_training_enabled = false
 critic_mc_warmup_required = false
@@ -549,6 +550,12 @@ learning_rate = 3.0e-4
 actor_learning_rate = 3.0e-4
 critic_learning_rate = 1.0e-3
 macro_critic_learning_rate = 1.0e-3
+# 每四个独立 realization 在同一冻结策略下采样后，执行一次 PPO policy update。
+realizations_per_policy_update = 4
+# Macro Actor 仅按 policy update 索引执行 cosine 学习率衰减。
+macro_actor_learning_rate = 5.0e-4
+macro_actor_final_learning_rate = 1.0e-4
+macro_actor_learning_rate_schedule = "cosine"
 macro_critic_target_mode = "two_step_smdp_td"
 long_value_enabled = true
 long_value_target = "realized_return_to_go"
@@ -557,13 +564,18 @@ long_value_steps_per_update = 50
 long_value_max_grad_norm = 0.5
 micro_critic_learning_rate = 3.0e-3
 value_loss_coefficient = 0.01
+# Micro STAY/MOVE 二元组熵下限；具体熵值由代码根据软概率上限推导。
+micro_group_probability_soft_cap = 0.90
+micro_group_entropy_floor_coefficient = 0.05
 entropy_coefficient = 0.0
 max_grad_norm = 0.5
 # 每个完整 episode 收集完毕后先更新 Micro，再用全部 Macro frames full-batch 更新。
 update_epochs = 4
 macro_critic_steps_per_update = 50
 macro_critic_replay_history_episodes = 0
-target_kl = 0.10
+# Macro 与 Micro PPO 分别使用独立的 KL early-stop 阈值。
+macro_target_kl = 0.10
+micro_target_kl = 0.02
 num_minibatches = 10
 minibatch_size = 30
 

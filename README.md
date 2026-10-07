@@ -2,9 +2,11 @@
 
 ## 正式算法
 
-正式算法唯一名称为 `PROPOSED`，训练配置为 `configs/proposed/system_config.toml`。Cache 使用单一合法候选分布，candidate 0 表示 KEEP，其余候选为 UPDATE；UPDATE logits 按合法非零候选数做 cardinality correction。Macro 在 Cache 决策边界联合选择候选配置与持续时长，并以 Cache 与 Duration 的联合概率比率执行一个 PPO clipped surrogate。每个 slot 的 Micro 策略按固定 UAV ID 顺序选择 UAV0 位置，再在 UAV0 条件下选择 UAV1 位置，并以两 UAV 的联合概率比率执行一个 PPO clipped surrogate；UAV candidate 0 表示保持当前位置。
+正式算法唯一名称为 `PROPOSED`，训练配置为 `configs/proposed/system_config.toml`。Cache 使用单一合法候选分布，candidate 0 表示 KEEP，其余候选为 UPDATE；UPDATE logits 按合法非零候选数做 cardinality correction。每个 Macro frame 起点只选择一个 Unified Cache candidate；执行每个 slot 后，termination policy 根据真实 post-slot observation 与 elapsed holding fraction 采样 CONTINUE 或 TERMINATE。holding bounds 固定为 1–5 slots，因此实际 duration 可为 1、2、3、4 或 5。Macro PPO 将 Cache candidate log probability 与该 frame 所有已采样 termination log probability 求和，只使用一个 joint ratio 和一个 clipped surrogate；强制 max holding 与 episode terminal 不进入 policy likelihood。这不是独立 Trigger PPO。每个 slot 的 Micro 策略按固定 UAV ID 顺序选择 UAV0 位置，再在 UAV0 条件下选择 UAV1 位置；两 UAV 仍共用一个联合概率比率和一个 PPO clipped surrogate。另加 STAY/MOVE 组熵底限正则，只作用于 Micro Actor；它是软惩罚，不裁剪或硬限制策略概率，也不改变随机训练采样。UAV candidate 0 表示保持当前位置。
 
-正式训练每次使用一个完整 episode realization，主线 LR 实验共使用 300 份 realization，seed 为 20001–20300。episode rollout 完成后更新 Micro PPO 和 Macro SMDP PPO。正式训练使用当前 Matching、KKT、prediction artifacts 和物理模型。
+对每个 UAV，`p_stay` 是 masked categorical 中候选 0 的概率，`p_move` 是所有非零候选概率之和。二元组熵为 `H_group = -p_stay log(p_stay) - p_move log(p_move)`。配置的概率软上限为 0.90，由此推导熵底限 `H_floor = -0.9 log(0.9) - 0.1 log(0.1)`；低于底限时才增加 `0.05 × mean(ReLU(H_floor - H_group))` Actor loss。该组熵描述 STAY 与 MOVE 的选择平衡；现有 `micro_candidate_entropy`/`micro_entropy` 仍表示完整候选分布的熵，两者含义不同。Micro PPO 的 target KL 为 0.02，Macro PPO 的 target KL 为 0.10。
+
+正式训练以 4 个独立 episode realization 为一个 on-policy update group；组内四条 rollout 都由同一冻结策略采样。每条 realization 单独计算 Micro/Macro GAE、Macro N2 target 和 realized return-to-go，再合并 transitions，并在整个 group 上统一标准化 Macro 与 Micro advantage。每组执行一次 Micro/Macro PPO 更新。300 个训练 realization（seed 20001–20300）对应 75 次 policy update。Macro Actor 学习率按 policy update 使用 cosine schedule，从 5e-4 衰减到 1e-4；Micro Actor 保持 3e-4。训练动作保持 stochastic；评价按既有 group-aware deterministic 规则选择动作。
 
 长期数学定义与代码映射见 [`adaptive_dual_timescale_formula_updates.md`](adaptive_dual_timescale_formula_updates.md)。
 
@@ -22,7 +24,7 @@ python scripts/generation/generate_episode_pool.py --help
 
 ## 训练
 
-训练使用 `ppo-train` 和已有 episode pool。每个 PPO episode 对应一个完整 realization：
+训练使用 `ppo-train` 和已有 episode pool。`--epochs` 必须是 4 的倍数；checkpoint 与 resume 只允许在完整 update group 边界：
 
 ```powershell
 ppo-train --config configs/proposed/system_config.toml `
@@ -30,9 +32,9 @@ ppo-train --config configs/proposed/system_config.toml `
   --episode-pool environment_data/<episode-pool>
 ```
 
-可用 `--resume` 从该 run 的最新 checkpoint 继续。缺失 realization 默认会报错；需要按 seed 补生成时，必须显式指定 `--episode-seed-start` 和 `--generate-missing-episodes`。
+可用 `--resume` 从该 run 的最新 checkpoint 继续。正式 300-realization 主线可运行 `python scripts/training/run_proposed_formal.py`（seed=27005，episodes=300）。缺失 realization 默认会报错；本主线要求使用现有训练 realization，不重新生成数据。
 
-`checkpoints/latest_checkpoint.pt` 是主线的恢复与正式评价 checkpoint。`best_train_return_checkpoint.pt` 按单个训练 episode 的 raw return 保存，仅作训练诊断；正式 evaluator 会拒绝该文件，不会把它当作最终模型选择结果。四个 Macro Actor 学习率实验使用 `scripts/training/run_proposed_macro_actor_lr_*.py`，共用 `scripts/training/mainline_runner.py`，读取 episode seed 20001–20300 的 300 份 realization。
+`checkpoints/latest_checkpoint.pt` 是主线的恢复与正式评价 checkpoint。`best_train_return_checkpoint.pt` 按单个训练 episode 的 raw return 保存，仅作训练诊断；正式 evaluator 会拒绝该文件，不会把它当作最终模型选择结果。历史 `scripts/training/run_proposed_macro_actor_lr_*.py` 结果属于固定学习率、每个 realization 一次更新的旧协议，保留作历史比较；新版 checkpoint 不接受旧版本恢复。
 
 ## 评价
 
@@ -50,10 +52,10 @@ ppo-eval --config configs/proposed/system_config.toml `
 
 ```text
 固定 SUMO 网络与 prediction artifacts
-→ Macro Cache candidate + duration SMDP PPO
-→ 在 Cache frame 内保持 Cache 配置
-→ 每 slot 条件式、group-balanced masked UAV PPO
+→ 四个 realization 在同一冻结策略下独立 rollout
 → Transfer-Exchange Matching → KKT → 真实 G(t)
-→ 独立 Micro/Macro rollout 与 episode-end PPO updates
-→ checkpoint → frozen-policy evaluation
+→ episode-local target 与 GAE，再合并和统一 advantage normalization
+→ 一次 Macro joint PPO 与 Micro joint PPO update
+→ 每组一条 update record、每 episode 一条 episode record
+→ group-boundary checkpoint → frozen-policy evaluation
 ```

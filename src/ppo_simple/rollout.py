@@ -139,14 +139,16 @@ class MacroTransition:
     observation: np.ndarray
     cache_candidate_features: np.ndarray
     cache_candidate_masks: np.ndarray
-    duration_masks: np.ndarray
     cache_action: int
-    duration_action: int
-    requested_duration: int
     actual_duration: int
+    old_cache_log_prob: float
     old_macro_log_prob: float
     old_macro_entropy: float
-    old_duration_log_prob: float
+    termination_observations: np.ndarray
+    termination_elapsed_slots: np.ndarray
+    termination_actions: np.ndarray
+    old_termination_log_probs: np.ndarray
+    old_termination_entropies: np.ndarray
     old_value: float
     old_next_value: float
     frame_reward: float
@@ -175,16 +177,75 @@ class MacroRolloutBuffer:
     """每 Cache frame 一条的 Macro 数据；与 Micro buffer 完全分离。"""
 
     transitions: list[MacroTransition] = field(default_factory=list)
+    min_holding_slots: int = 1
+    max_holding_slots: int = 5
 
     def append(self, transition: MacroTransition) -> None:
         if self.transitions and bool(self.transitions[-1].done):
             raise ValueError("不能在 terminal Macro transition 后追加数据。")
-        if int(transition.actual_duration) <= 0:
-            raise ValueError("Macro actual_duration 必须为正数。")
+        if not (
+            int(self.min_holding_slots)
+            <= int(transition.actual_duration)
+            <= int(self.max_holding_slots)
+        ):
+            raise ValueError("Macro actual_duration 超出 adaptive holding bounds。")
         if not np.isfinite(float(transition.old_next_value)):
             raise ValueError("Macro rollout old_next_value must be finite.")
+        if not np.isfinite(float(transition.old_macro_log_prob)) or not np.isfinite(
+            float(transition.old_cache_log_prob)
+        ):
+            raise ValueError("Macro rollout log-probabilities must be finite.")
         if bool(transition.done) and float(transition.old_next_value) != 0.0:
             raise ValueError("Terminal Macro transitions must have zero old_next_value.")
+        trace_lengths = {
+            len(transition.termination_observations),
+            len(transition.termination_elapsed_slots),
+            len(transition.termination_actions),
+            len(transition.old_termination_log_probs),
+            len(transition.old_termination_entropies),
+        }
+        if len(trace_lengths) != 1:
+            raise ValueError("Termination trace arrays must have matching lengths.")
+        trace_count = next(iter(trace_lengths))
+        if trace_count > int(self.max_holding_slots) - 1:
+            raise ValueError("Termination trace exceeds the number of eligible decisions.")
+        if trace_count:
+            if (
+                transition.termination_observations.ndim != 2
+                or np.any(transition.termination_elapsed_slots < 1)
+                or np.any(
+                    transition.termination_elapsed_slots
+                    >= int(self.max_holding_slots)
+                )
+                or not np.array_equal(
+                    transition.termination_elapsed_slots,
+                    np.arange(1, trace_count + 1, dtype=np.int64),
+                )
+                or np.any(transition.termination_actions < 0)
+                or np.any(transition.termination_actions > 1)
+                or not np.isfinite(transition.termination_observations).all()
+                or not np.isfinite(transition.old_termination_log_probs).all()
+                or not np.isfinite(transition.old_termination_entropies).all()
+            ):
+                raise ValueError("Termination trace contains invalid sampled decisions.")
+            if np.any(transition.termination_actions[:-1] == 1):
+                raise ValueError("TERMINATE may appear only on the final sampled decision.")
+        if bool(transition.done) and trace_count and np.any(
+            transition.termination_actions == 1
+        ):
+            raise ValueError("Terminal Macro transitions cannot sample TERMINATE.")
+        expected_duration = (
+            int(transition.termination_elapsed_slots[-1])
+            if trace_count and int(transition.termination_actions[-1]) == 1
+            else trace_count + int(self.min_holding_slots)
+        )
+        if expected_duration != int(transition.actual_duration):
+            raise ValueError("Termination trace does not explain the realized holding duration.")
+        reconstructed_log_prob = float(transition.old_cache_log_prob) + float(
+            np.sum(transition.old_termination_log_probs, dtype=np.float64)
+        )
+        if abs(reconstructed_log_prob - float(transition.old_macro_log_prob)) > 5.0e-6:
+            raise ValueError("Stored Macro log-probability does not decompose into Cache and termination.")
         self.transitions.append(transition)
 
     def __len__(self) -> int:
@@ -200,21 +261,6 @@ class EpisodeCollection:
     summary: dict[str, Any]
 
 
-
-
-def actual_duration_for_frame(
-    requested_duration: int,
-    start_slot: int,
-    episode_slots: int,
-) -> int:
-    """按 episode 尾部裁切请求时长，所有 Macro target 共用该结果。"""
-
-    requested = int(requested_duration)
-    start = int(start_slot)
-    total = int(episode_slots)
-    if requested <= 0 or total <= 0 or start < 0 or start >= total:
-        raise ValueError("Macro frame bounds 或 requested duration 非法。")
-    return min(requested, total - start)
 
 
 def cache_update_mask(old_cache: Any, new_cache: Any) -> np.ndarray:
@@ -440,30 +486,35 @@ def collect_dual_timescale_episode(
     policy: DualTimescaleActorCritic,
     context: Any,
     aligned_steps: list[Any],
-    duration_candidates: tuple[int, ...],
     *,
     deterministic: bool = False,
     episode_seed: int | None = None,
 ) -> EpisodeCollection:
-    """Freeze both policies for a full episode, then return Micro/Macro rollouts.
-
-    Training passes ``deterministic=False`` so Cache, Duration, and UAV actions are
-    sampled. Evaluation can request group-aware deterministic Cache and UAV actions.
-    """
+    """冻结策略完成完整 episode rollout，并返回分离的 Micro/Macro 数据。"""
 
     if not aligned_steps:
         raise ValueError("完整 episode rollout 不能为空。")
     if len(context.action_spec.uav_ids) != 2:
         raise ValueError("第一版 autoregressive Micro PPO 固定要求两个 UAV。")
-    if tuple(duration_candidates) != tuple(policy.duration_candidates):
-        raise ValueError("Rollout 与 Macro policy duration candidates 不一致。")
+    adaptive_holding_enabled = bool(
+        context.cfg["algorithm"]["ppo"].get("adaptive_holding_enabled", False)
+    )
+    min_holding_slots = int(policy.adaptive_holding_min_slots)
+    max_holding_slots = int(policy.adaptive_holding_max_slots)
+    if not adaptive_holding_enabled or min_holding_slots <= 0 or max_holding_slots < min_holding_slots:
+        raise ValueError("Adaptive holding rollout contract is invalid.")
+    if max_holding_slots > int(context.observation_spec.prediction_horizon):
+        raise ValueError("Adaptive holding maximum exceeds prediction horizon.")
     total_slots = len(aligned_steps)
     if total_slots != int(context.episode_slots):
         raise ValueError("双时间尺度正式 rollout 必须覆盖完整 episode。")
     tensor_spec = PrimitiveTensorSpec.create(context)
     max_uav_candidates = int(tensor_spec.uav_max_candidates) + 1
     micro_buffer = MicroRolloutBuffer()
-    macro_buffer = MacroRolloutBuffer()
+    macro_buffer = MacroRolloutBuffer(
+        min_holding_slots=min_holding_slots,
+        max_holding_slots=max_holding_slots,
+    )
     cache = np.asarray(context.initial_cache, dtype=np.int8).copy()
     uav = {
         key: np.asarray(value, dtype=np.float64).copy()
@@ -473,27 +524,33 @@ def collect_dual_timescale_episode(
     frame_observation: np.ndarray | None = None
     frame_candidate_features: np.ndarray | None = None
     frame_candidate_masks: np.ndarray | None = None
-    frame_duration_masks: np.ndarray | None = None
     frame_cache_index = 0
-    frame_duration_index = 0
-    frame_requested_duration = 0
-    frame_actual_duration = 0
-    frame_old_log_prob = 0.0
-    frame_old_entropy = 0.0
-    frame_old_duration_log_prob = 0.0
+    frame_old_cache_log_prob = 0.0
+    frame_old_macro_log_prob = 0.0
+    frame_old_macro_entropy = 0.0
     frame_old_value = 0.0
     frame_cache = cache.copy()
     frame_cache_changed = False
     frame_reward = 0.0
     elapsed_in_frame = 0
+    frame_termination_observations: list[np.ndarray] = []
+    frame_termination_elapsed_slots: list[int] = []
+    frame_termination_actions: list[int] = []
+    frame_old_termination_log_probs: list[float] = []
+    frame_old_termination_entropies: list[float] = []
+    termination_decision_diagnostics: list[dict[str, Any]] = []
+    termination_entropies: list[float] = []
+    termination_stop_probabilities: list[float] = []
+    termination_actions: list[int] = []
+    forced_termination_max_holding_count = 0
+    terminal_frame_count = 0
     frame_macro_index = -1
     keep_probabilities: list[float] = []
     update_group_probabilities: list[float] = []
     raw_candidate0_probabilities: list[float] = []
     legal_update_candidate_counts: list[int] = []
     cache_entropies: list[float] = []
-    duration_entropies: list[float] = []
-    update_candidate_entropies: list[float] = []
+    cache_candidate_entropies: list[float] = []
     unified_candidate0_probabilities: list[float] = []
     unified_candidate_entropies: list[float] = []
     unified_update_margins: list[float] = []
@@ -527,18 +584,17 @@ def collect_dual_timescale_episode(
                 deterministic=deterministic,
             )
             frame_cache_index = int(selected.cache_index)
-            frame_duration_index = int(selected.duration_index)
-            frame_requested_duration = int(selected.requested_duration)
-            frame_actual_duration = actual_duration_for_frame(
-                frame_requested_duration, slot_index, total_slots
-            )
-            frame_duration_masks = selected.duration_mask.copy()
-            frame_old_log_prob = float(selected.log_prob.detach().cpu())
-            frame_old_entropy = float(selected.entropy.detach().cpu())
-            frame_old_duration_log_prob = float(
-                selected.duration_log_prob.detach().cpu()
-            )
+            frame_old_cache_log_prob = float(selected.log_prob.detach().cpu())
+            frame_old_macro_log_prob = frame_old_cache_log_prob
+            frame_old_macro_entropy = float(selected.cache_entropy.detach().cpu())
             frame_old_value = float(selected.value.detach().cpu())
+            frame_termination_observations = []
+            frame_termination_elapsed_slots = []
+            frame_termination_actions = []
+            frame_old_termination_log_probs = []
+            frame_old_termination_entropies = []
+            elapsed_in_frame = 0
+            frame_reward = 0.0
             cache_probabilities = np.asarray(selected.cache_probabilities, dtype=np.float64)
             if cache_probabilities.shape != frame_candidate_masks.shape or not np.all(
                 np.isfinite(cache_probabilities)
@@ -567,7 +623,6 @@ def collect_dual_timescale_episode(
                 int(np.count_nonzero(frame_candidate_masks[1:]))
             )
             cache_entropies.append(float(selected.cache_entropy.detach().cpu()))
-            duration_entropies.append(float(selected.duration_entropy.detach().cpu()))
             positive_candidate_probabilities = cache_probabilities[cache_probabilities > 0.0]
             candidate_entropy = float(
                 -np.sum(
@@ -583,6 +638,7 @@ def collect_dual_timescale_episode(
             update_margin = update_group_probability - keep_probability
             unified_candidate0_probabilities.append(keep_probability)
             unified_candidate_entropies.append(candidate_entropy)
+            cache_candidate_entropies.append(candidate_entropy)
             unified_update_margins.append(update_margin)
             unified_candidate_state_diagnostics.append(
                 {
@@ -594,8 +650,6 @@ def collect_dual_timescale_episode(
                     "update_margin": float(update_margin),
                 }
             )
-            update_candidate_probabilities = cache_probabilities[1:]
-            update_candidate_entropies.append(unified_candidate_entropies[-1])
             frame_cache = _candidates[frame_cache_index].copy()
             frame_cache_changed = bool(np.any(frame_cache != cache))
             frame_macro_index = len(macro_buffer.transitions)
@@ -610,7 +664,6 @@ def collect_dual_timescale_episode(
                     "selected_group": str(selected.cache_selected_group),
                     "selected_candidate_index": frame_cache_index,
                     "selected_candidate_id": selected_cache_id,
-                    "selected_duration": frame_requested_duration,
                     "probability_finite": bool(np.isfinite(cache_probabilities).all()),
                     "probability_nan_count": int(np.isnan(cache_probabilities).sum()),
                     "probability_inf_count": int(np.isinf(cache_probabilities).sum()),
@@ -666,7 +719,6 @@ def collect_dual_timescale_episode(
             frame_observation is None
             or frame_candidate_features is None
             or frame_candidate_masks is None
-            or frame_duration_masks is None
         ):
             raise AssertionError("Macro frame 起点状态未初始化。")
         observation = _observation(frame_cache, uav, step, context)
@@ -871,12 +923,60 @@ def collect_dual_timescale_episode(
         uav = next_uav
         elapsed_in_frame += 1
 
-        if elapsed_in_frame == frame_actual_duration or done:
-            next_macro_state = (
-                np.zeros_like(frame_observation)
-                if done
-                else _observation(cache, uav, aligned_steps[slot_index + 1], context)
+        end_frame = bool(done)
+        if done:
+            terminal_frame_count += 1
+        elif elapsed_in_frame >= max_holding_slots:
+            forced_termination_max_holding_count += 1
+            end_frame = True
+        elif elapsed_in_frame >= min_holding_slots:
+            termination_sample = policy.sample_termination(
+                next_observation,
+                elapsed_in_frame,
+                deterministic=deterministic,
             )
+            termination_action = int(termination_sample.selected_index)
+            termination_log_prob = float(termination_sample.log_prob.detach().cpu())
+            termination_entropy = float(termination_sample.entropy.detach().cpu())
+            sampled_termination_probabilities = np.asarray(
+                termination_sample.probabilities, dtype=np.float64
+            ).reshape(-1)
+            if sampled_termination_probabilities.shape != (2,) or not np.isfinite(
+                sampled_termination_probabilities
+            ).all():
+                raise FloatingPointError("Termination probabilities are invalid.")
+            if not np.isclose(
+                float(sampled_termination_probabilities.sum()), 1.0, rtol=1.0e-6, atol=1.0e-7
+            ):
+                raise AssertionError("Termination probabilities must sum to one.")
+            terminate_probability = float(sampled_termination_probabilities[1])
+            frame_termination_observations.append(next_observation.copy())
+            frame_termination_elapsed_slots.append(int(elapsed_in_frame))
+            frame_termination_actions.append(termination_action)
+            frame_old_termination_log_probs.append(termination_log_prob)
+            frame_old_termination_entropies.append(termination_entropy)
+            frame_old_macro_log_prob += termination_log_prob
+            frame_old_macro_entropy += termination_entropy
+            termination_stop_probabilities.append(terminate_probability)
+            termination_entropies.append(termination_entropy)
+            termination_actions.append(termination_action)
+            termination_decision_diagnostics.append(
+                {
+                    "elapsed_holding_slots": int(elapsed_in_frame),
+                    "elapsed_holding_fraction": float(
+                        elapsed_in_frame / max_holding_slots
+                    ),
+                    "termination_probability": terminate_probability,
+                    "selected_termination_action": (
+                        "TERMINATE" if termination_action == 1 else "CONTINUE"
+                    ),
+                    "selected_termination_action_index": termination_action,
+                }
+            )
+            end_frame = termination_action == 1
+
+        if end_frame:
+            next_macro_state = np.zeros_like(frame_observation) if done else next_observation
             if done:
                 frame_old_next_value = 0.0
             else:
@@ -891,14 +991,28 @@ def collect_dual_timescale_episode(
                     observation=frame_observation.copy(),
                     cache_candidate_features=frame_candidate_features.copy(),
                     cache_candidate_masks=frame_candidate_masks.copy(),
-                    duration_masks=frame_duration_masks.copy(),
                     cache_action=frame_cache_index,
-                    duration_action=frame_duration_index,
-                    requested_duration=frame_requested_duration,
                     actual_duration=elapsed_in_frame,
-                    old_macro_log_prob=frame_old_log_prob,
-                    old_macro_entropy=frame_old_entropy,
-                    old_duration_log_prob=frame_old_duration_log_prob,
+                    old_cache_log_prob=frame_old_cache_log_prob,
+                    old_macro_log_prob=frame_old_macro_log_prob,
+                    old_macro_entropy=frame_old_macro_entropy,
+                    termination_observations=(
+                        np.stack(frame_termination_observations).astype(np.float32)
+                        if frame_termination_observations
+                        else np.empty((0, int(context.observation_spec.observation_dim)), dtype=np.float32)
+                    ),
+                    termination_elapsed_slots=np.asarray(
+                        frame_termination_elapsed_slots, dtype=np.int64
+                    ),
+                    termination_actions=np.asarray(
+                        frame_termination_actions, dtype=np.int64
+                    ),
+                    old_termination_log_probs=np.asarray(
+                        frame_old_termination_log_probs, dtype=np.float32
+                    ),
+                    old_termination_entropies=np.asarray(
+                        frame_old_termination_entropies, dtype=np.float32
+                    ),
                     old_value=frame_old_value,
                     old_next_value=frame_old_next_value,
                     frame_reward=float(frame_reward),
@@ -914,14 +1028,10 @@ def collect_dual_timescale_episode(
     if not macro_buffer.transitions or not macro_buffer.transitions[-1].done:
         raise AssertionError("Macro buffer must end at the true episode terminal")
 
-    durations = [int(item.requested_duration) for item in macro_buffer.transitions]
     actual_durations = [int(item.actual_duration) for item in macro_buffer.transitions]
-    duration_distribution = {
-        str(value): int(durations.count(value)) for value in policy.duration_candidates
-    }
-    actual_duration_distribution = {
+    holding_duration_distribution = {
         str(value): int(actual_durations.count(value))
-        for value in sorted(set(actual_durations))
+        for value in range(min_holding_slots, max_holding_slots + 1)
     }
     macro_count = len(macro_buffer)
     micro_count = len(micro_buffer)
@@ -941,13 +1051,6 @@ def collect_dual_timescale_episode(
         if nonzero_candidate_transitions
         else 0.0
     )
-    requested_duration_counts = {
-        str(value): int(durations.count(value)) for value in policy.duration_candidates
-    }
-    actual_duration_counts = {
-        str(value): int(actual_durations.count(value))
-        for value in policy.duration_candidates
-    }
     update_candidate_unique_selected = len(update_candidate_selection_counts)
     update_candidate_top1_count = max(update_candidate_selection_counts.values(), default=0)
     update_candidate_top1_fraction = (
@@ -958,20 +1061,12 @@ def collect_dual_timescale_episode(
         if update_candidate_top1_fraction >= 0.8
         else "NORMAL"
     )
-    selected_update_duration_counts = {
-        int(value) for value, count in requested_duration_counts.items() if count > 0
-    }
     if keep_count == 0:
         cache_action_pattern = "ALL_UPDATE"
     elif update_count == 0:
         cache_action_pattern = "ALL_KEEP"
     else:
         cache_action_pattern = "NORMAL"
-    cache_duration_pattern = (
-        f"ALL_{next(iter(selected_update_duration_counts))}"
-        if len(selected_update_duration_counts) == 1
-        else "NORMAL"
-    )
     uav_action_patterns = []
     for head_index in range(2):
         stay_count = int(stay_counts[head_index])
@@ -979,13 +1074,36 @@ def collect_dual_timescale_episode(
         uav_action_patterns.append(
             "NORMAL" if stay_count and move_count else "ALL_STAY" if stay_count else "ALL_MOVE"
         )
-    update_candidate_valid_entropies = [
-        entropy
-        for entropy, update_probability in zip(
-            update_candidate_entropies, update_group_probabilities, strict=True
-        )
-        if update_probability > 0.0
-    ]
+    termination_sample_count = len(termination_actions)
+    termination_continue_count = int(sum(action == 0 for action in termination_actions))
+    termination_stop_count = int(sum(action == 1 for action in termination_actions))
+    termination_probability_by_elapsed: dict[str, dict[str, Any]] = {}
+    for elapsed in range(min_holding_slots, max_holding_slots):
+        elapsed_records = [
+            record
+            for record in termination_decision_diagnostics
+            if int(record["elapsed_holding_slots"]) == elapsed
+        ]
+        termination_probability_by_elapsed[str(elapsed)] = {
+            "sample_count": len(elapsed_records),
+            "mean_termination_probability": (
+                float(np.mean([record["termination_probability"] for record in elapsed_records]))
+                if elapsed_records
+                else None
+            ),
+            "selected_termination_rate": (
+                float(
+                    np.mean(
+                        [
+                            int(record["selected_termination_action_index"]) == 1
+                            for record in elapsed_records
+                        ]
+                    )
+                )
+                if elapsed_records
+                else None
+            ),
+        }
     update_candidate_selection_entropy = 0.0
     if update_count:
         for selected_count in update_candidate_selection_counts.values():
@@ -993,6 +1111,40 @@ def collect_dual_timescale_episode(
             update_candidate_selection_entropy -= selection_probability * float(
                 np.log(selection_probability)
             )
+    micro_group_probabilities = np.zeros((micro_count, 2, 2), dtype=np.float64)
+    micro_group_entropies = np.zeros((micro_count, 2), dtype=np.float64)
+    for transition_index, transition in enumerate(micro_buffer.transitions):
+        for head_index in range(2):
+            candidate_count = int(transition.valid_candidate_count[head_index])
+            candidate_probabilities = np.asarray(
+                transition.uav_candidate_probabilities[head_index, :candidate_count],
+                dtype=np.float64,
+            )
+            if candidate_count <= 0 or not np.isfinite(candidate_probabilities).all():
+                raise ValueError("Micro 候选概率快照必须为有限且非空的分布。")
+            p_stay = float(candidate_probabilities[0])
+            p_move = float(np.sum(candidate_probabilities[1:], dtype=np.float64))
+            if not math.isclose(p_stay + p_move, 1.0, rel_tol=0.0, abs_tol=5.0e-6):
+                raise ValueError("Micro STAY/MOVE 概率质量必须和为 1。")
+            micro_group_probabilities[transition_index, head_index] = (
+                p_stay,
+                p_move,
+            )
+            terms = [
+                -probability * math.log(probability)
+                for probability in (p_stay, p_move)
+                if probability > 0.0
+            ]
+            micro_group_entropies[transition_index, head_index] = sum(terms)
+    micro_group_probability_soft_cap = float(
+        context.cfg["algorithm"]["ppo"]["micro_group_probability_soft_cap"]
+    )
+    micro_group_entropy_floor = (
+        -micro_group_probability_soft_cap * math.log(micro_group_probability_soft_cap)
+        - (1.0 - micro_group_probability_soft_cap)
+        * math.log(1.0 - micro_group_probability_soft_cap)
+    )
+    group_probability_max = np.max(micro_group_probabilities, axis=-1)
     summary = {
         "episode_return": episode_return,
         "episode_seed": None if episode_seed is None else int(episode_seed),
@@ -1000,16 +1152,37 @@ def collect_dual_timescale_episode(
         "macro_frame_count": macro_count,
         "macro_entropy": float(np.mean([item.old_macro_entropy for item in macro_buffer.transitions])),
         "macro_cache_entropy": float(np.mean(cache_entropies)) if cache_entropies else 0.0,
-        "macro_duration_entropy": float(np.mean(duration_entropies)) if duration_entropies else 0.0,
-        "macro_duration_distribution": duration_distribution,
-        "requested_duration_mean": float(np.mean(durations)),
-        "actual_duration_mean": float(
-            np.mean([item.actual_duration for item in macro_buffer.transitions])
+        "adaptive_holding_duration_mean": float(np.mean(actual_durations)),
+        "adaptive_holding_duration_std": float(np.std(actual_durations)),
+        "holding_duration_distribution": holding_duration_distribution,
+        "termination_sample_count": termination_sample_count,
+        "termination_eligible_count": termination_sample_count,
+        "termination_continue_count": termination_continue_count,
+        "termination_stop_count": termination_stop_count,
+        "termination_continue_rate": (
+            float(termination_continue_count / termination_sample_count)
+            if termination_sample_count
+            else 0.0
         ),
-        "duration_distribution": duration_distribution,
-        "actual_duration_distribution": actual_duration_distribution,
-        "requested_duration_counts": requested_duration_counts,
-        "actual_duration_counts": actual_duration_counts,
+        "termination_stop_rate": (
+            float(termination_stop_count / termination_sample_count)
+            if termination_sample_count
+            else 0.0
+        ),
+        "termination_entropy_mean": (
+            float(np.mean(termination_entropies)) if termination_entropies else 0.0
+        ),
+        "termination_probability_mean": (
+            float(np.mean(termination_stop_probabilities))
+            if termination_stop_probabilities
+            else 0.0
+        ),
+        "termination_probability_by_elapsed": termination_probability_by_elapsed,
+        "termination_decision_diagnostics": termination_decision_diagnostics,
+        "forced_termination_max_holding_count": int(
+            forced_termination_max_holding_count
+        ),
+        "terminal_frame_count": int(terminal_frame_count),
         "keep_count": keep_count,
         "update_count": update_count,
         "update_selected_candidate_count": update_count,
@@ -1080,16 +1253,15 @@ def collect_dual_timescale_episode(
         ),
         "macro_candidate_state_diagnostics": unified_candidate_state_diagnostics,
         "update_candidate_unique_selected": update_candidate_unique_selected,
-        "update_candidate_entropy": (
-            float(np.mean(update_candidate_valid_entropies))
-            if update_candidate_valid_entropies
+        "cache_candidate_entropy": (
+            float(np.mean(cache_candidate_entropies))
+            if cache_candidate_entropies
             else 0.0
         ),
         "update_candidate_selection_entropy": float(update_candidate_selection_entropy),
         "update_candidate_top1_fraction": update_candidate_top1_fraction,
         "update_candidate_pattern": update_candidate_pattern,
         "cache_action_pattern": cache_action_pattern,
-        "cache_duration_pattern": cache_duration_pattern,
         "actual_cache_update_rate": (
             float(np.mean([item.actual_cache_update for item in macro_buffer.transitions]))
             if macro_count
@@ -1114,6 +1286,33 @@ def collect_dual_timescale_episode(
         "uav0_entropy": float(np.mean([item.old_uav_entropies[0] for item in micro_buffer.transitions])),
         "uav1_entropy": float(np.mean([item.old_uav_entropies[1] for item in micro_buffer.transitions])),
         "micro_candidate_entropy": float(np.mean([item.old_joint_entropy for item in micro_buffer.transitions])),
+        "uav0_group_stay_probability_mean": float(
+            np.mean(micro_group_probabilities[:, 0, 0])
+        ),
+        "uav0_group_move_probability_mean": float(
+            np.mean(micro_group_probabilities[:, 0, 1])
+        ),
+        "uav0_group_entropy_mean": float(np.mean(micro_group_entropies[:, 0])),
+        "uav1_group_stay_probability_mean": float(
+            np.mean(micro_group_probabilities[:, 1, 0])
+        ),
+        "uav1_group_move_probability_mean": float(
+            np.mean(micro_group_probabilities[:, 1, 1])
+        ),
+        "uav1_group_entropy_mean": float(np.mean(micro_group_entropies[:, 1])),
+        "micro_group_entropy_mean": float(np.mean(micro_group_entropies)),
+        "uav0_group_low_entropy_fraction": float(
+            np.mean(micro_group_entropies[:, 0] < micro_group_entropy_floor)
+        ),
+        "uav1_group_low_entropy_fraction": float(
+            np.mean(micro_group_entropies[:, 1] < micro_group_entropy_floor)
+        ),
+        "uav0_group_probability_over_90_fraction": float(
+            np.mean(group_probability_max[:, 0] > micro_group_probability_soft_cap)
+        ),
+        "uav1_group_probability_over_90_fraction": float(
+            np.mean(group_probability_max[:, 1] > micro_group_probability_soft_cap)
+        ),
         "uav_candidate_usage_by_index": [
             [int(sum(int(item.actions[head]) == candidate_index for item in micro_buffer.transitions)) for candidate_index in range(max_uav_candidates)]
             for head in range(2)

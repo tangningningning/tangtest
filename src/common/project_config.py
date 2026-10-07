@@ -768,7 +768,9 @@ def validate_config(
             "configuration_control_mode 必须为 macro_cache_smdp_micro_uav_candidate。"
         )
     policy_schema = str(get_config_value(config, "algorithm.ppo.policy_schema", ""))
-    if policy_schema != "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo":
+    if policy_schema != (
+        "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
+    ):
         raise ValueError("algorithm.ppo.policy_schema 必须为当前 PROPOSED 正式策略 schema。")
     required_flags = {
         "macro_cache_enabled": True,
@@ -784,24 +786,84 @@ def validate_config(
         if actual is not expected:
             raise ValueError(f"algorithm.ppo.{key} 必须为 {expected!r}。")
     prediction_horizon = int(get_config_value(config, "prediction.vehicle.horizon"))
-    raw_durations = get_config_value(config, "algorithm.ppo.macro_duration_candidates")
-    if raw_durations is None:
-        raw_durations = sorted({1, int(math.ceil(prediction_horizon / 2.0)), prediction_horizon})
-    if not isinstance(raw_durations, list) or not raw_durations:
-        raise ValueError("macro_duration_candidates 必须为非空整数数组。")
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or int(value) <= 0
-        for value in raw_durations
-    ):
-        raise ValueError("macro_duration_candidates 必须全部为正整数。")
-    if raw_durations != sorted(set(raw_durations)):
-        raise ValueError("macro_duration_candidates 必须严格升序且不得重复。")
-    if int(raw_durations[-1]) > prediction_horizon:
-        raise ValueError("Macro duration 不得超过当前预测 horizon。")
+    adaptive_holding_enabled = get_config_value(
+        config, "algorithm.ppo.adaptive_holding_enabled", None
+    )
+    if adaptive_holding_enabled is not True:
+        raise ValueError("algorithm.ppo.adaptive_holding_enabled 必须为 true。")
+    adaptive_holding_min_slots = get_config_value(
+        config, "algorithm.ppo.adaptive_holding_min_slots", None
+    )
+    adaptive_holding_max_slots = get_config_value(
+        config, "algorithm.ppo.adaptive_holding_max_slots", None
+    )
+    for key, value in {
+        "adaptive_holding_min_slots": adaptive_holding_min_slots,
+        "adaptive_holding_max_slots": adaptive_holding_max_slots,
+    }.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"algorithm.ppo.{key} 必须为正整数。")
+    if adaptive_holding_min_slots > adaptive_holding_max_slots:
+        raise ValueError(
+            "algorithm.ppo.adaptive_holding_min_slots 不得大于 adaptive_holding_max_slots。"
+        )
+    if adaptive_holding_max_slots > prediction_horizon:
+        raise ValueError("adaptive_holding_max_slots 不得超过当前预测 horizon。")
+    if adaptive_holding_min_slots != 1 or adaptive_holding_max_slots != 5:
+        raise ValueError(
+            "PROPOSED adaptive holding 正式配置必须固定 min_slots=1、max_slots=5。"
+        )
 
-    target_kl = get_config_value(config, "algorithm.ppo.target_kl", None)
-    if target_kl is None or not math.isfinite(float(target_kl)) or float(target_kl) <= 0.0:
-        raise ValueError("algorithm.ppo.target_kl 必须为正的有限数。")
+    if "target_kl" in get_config_value(config, "algorithm.ppo", {}):
+        raise ValueError(
+            "algorithm.ppo.target_kl 已废弃；请分别配置 macro_target_kl 和 micro_target_kl。"
+        )
+    macro_target_kl = get_config_value(config, "algorithm.ppo.macro_target_kl", None)
+    micro_target_kl = get_config_value(config, "algorithm.ppo.micro_target_kl", None)
+    for key, value in {
+        "macro_target_kl": macro_target_kl,
+        "micro_target_kl": micro_target_kl,
+    }.items():
+        if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"algorithm.ppo.{key} 必须为正的有限数。")
+    if not math.isclose(float(macro_target_kl), 0.10, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("PROPOSED algorithm.ppo.macro_target_kl 必须固定为 0.10。")
+    if not math.isclose(float(micro_target_kl), 0.02, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("PROPOSED algorithm.ppo.micro_target_kl 必须固定为 0.02。")
+    group_probability_soft_cap = get_config_value(
+        config, "algorithm.ppo.micro_group_probability_soft_cap", None
+    )
+    if (
+        group_probability_soft_cap is None
+        or not math.isfinite(float(group_probability_soft_cap))
+        or not 0.5 < float(group_probability_soft_cap) < 1.0
+    ):
+        raise ValueError(
+            "algorithm.ppo.micro_group_probability_soft_cap 必须为 (0.5,1) 内的有限数。"
+        )
+    if not math.isclose(
+        float(group_probability_soft_cap), 0.90, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "PROPOSED algorithm.ppo.micro_group_probability_soft_cap 必须固定为 0.90。"
+        )
+    group_entropy_floor_coefficient = get_config_value(
+        config, "algorithm.ppo.micro_group_entropy_floor_coefficient", None
+    )
+    if (
+        group_entropy_floor_coefficient is None
+        or not math.isfinite(float(group_entropy_floor_coefficient))
+        or float(group_entropy_floor_coefficient) < 0.0
+    ):
+        raise ValueError(
+            "algorithm.ppo.micro_group_entropy_floor_coefficient 必须为非负有限数。"
+        )
+    if not math.isclose(
+        float(group_entropy_floor_coefficient), 0.05, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "PROPOSED algorithm.ppo.micro_group_entropy_floor_coefficient 必须固定为 0.05。"
+        )
     ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
     if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
         raise ValueError("algorithm.ppo.hidden_sizes 必须是非空列表。")
@@ -834,8 +896,40 @@ def validate_config(
     }.items():
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"algorithm.ppo.{key} 必须为正的有限数。")
+    realizations_per_policy_update = get_config_value(
+        config, "algorithm.ppo.realizations_per_policy_update", None
+    )
+    if (
+        isinstance(realizations_per_policy_update, bool)
+        or not isinstance(realizations_per_policy_update, int)
+        or int(realizations_per_policy_update) != 4
+    ):
+        raise ValueError("algorithm.ppo.realizations_per_policy_update 必须固定为 4。")
+    macro_actor_learning_rate = float(
+        get_config_value(config, "algorithm.ppo.macro_actor_learning_rate", math.nan)
+    )
+    macro_actor_final_learning_rate = float(
+        get_config_value(config, "algorithm.ppo.macro_actor_final_learning_rate", math.nan)
+    )
+    macro_actor_learning_rate_schedule = str(
+        get_config_value(config, "algorithm.ppo.macro_actor_learning_rate_schedule", "")
+    )
+    if (
+        not math.isfinite(macro_actor_learning_rate)
+        or not math.isfinite(macro_actor_final_learning_rate)
+        or macro_actor_learning_rate <= 0.0
+        or macro_actor_final_learning_rate <= 0.0
+        or macro_actor_final_learning_rate > macro_actor_learning_rate
+        or macro_actor_learning_rate_schedule != "cosine"
+    ):
+        raise ValueError(
+            "PROPOSED Macro Actor LR endpoints must be positive and finite, "
+            "with final <= initial and the cosine schedule."
+        )
     if ppo_value_coef < 0.0 or ppo_entropy_coef < 0.0:
         raise ValueError("value_loss_coefficient 和 entropy_coefficient 不能为负。")
+    if not math.isclose(ppo_entropy_coef, 0.0, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("PROPOSED algorithm.ppo.entropy_coefficient 必须固定为 0。")
     if ppo_update_epochs < 1 or ppo_num_minibatches < 1:
         raise ValueError("update_epochs 和 num_minibatches 必须为正整数。")
     if int(get_config_value(config, "algorithm.ppo.minibatch_size")) <= 0:

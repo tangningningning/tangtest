@@ -20,7 +20,7 @@ from scenario.realization import (
 )
 
 
-PROPOSED_POLICY_SCHEMA = "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo"
+PROPOSED_POLICY_SCHEMA = "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
 PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
 
 
@@ -161,7 +161,6 @@ def load_environment_context(
             "当前训练器仅支持正式双时间尺度策略："
             f"{PROPOSED_POLICY_SCHEMA}"
         )
-    macro_duration_candidates_from_project(cfg)
     ppo_config = cfg["algorithm"]["ppo"]
     required_flags = {
         "macro_cache_enabled": True,
@@ -333,34 +332,6 @@ class ConfigurationActionSpec:
             raise ValueError("正式控制至少需要一个 UAV。")
         return cls(cache_node_ids=cache_node_ids, uav_ids=uav_ids)
 
-
-def macro_duration_candidates_from_project(project_cfg: dict[str, Any]) -> tuple[int, ...]:
-    """校验 Macro 时长候选并限制在真实预测 horizon 内。"""
-
-    horizon = int(project_config.get_config_value(project_cfg, "prediction.vehicle.horizon"))
-    if horizon <= 0:
-        raise ValueError("Macro prediction horizon 必须为正整数。")
-    raw = project_config.get_config_value(
-        project_cfg, "algorithm.ppo.macro_duration_candidates"
-    )
-    if raw is None:
-        raw = sorted({1, int(math.ceil(horizon / 2.0)), horizon})
-    if not isinstance(raw, (list, tuple)) or not raw:
-        raise ValueError("macro_duration_candidates 必须为非空整数数组。")
-    values: list[int] = []
-    for item in raw:
-        if isinstance(item, bool) or not isinstance(item, int) or int(item) <= 0:
-            raise ValueError("macro_duration_candidates 中的 duration 必须为正整数。")
-        values.append(int(item))
-    if len(set(values)) != len(values):
-        raise ValueError("macro_duration_candidates 不允许重复。")
-    if values != sorted(values):
-        raise ValueError("macro_duration_candidates 必须严格升序。")
-    if values[-1] > horizon:
-        raise ValueError(
-            "默认 prediction-driven Macro duration 不能超过车辆预测 horizon。"
-        )
-    return tuple(values)
 
 @dataclass(frozen=True)
 class ConfigurationObservationSpec:

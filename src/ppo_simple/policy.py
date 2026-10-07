@@ -29,40 +29,57 @@ class CategoricalSample:
 
 @dataclass(frozen=True)
 class MacroActionSample:
-    """Cache candidate 与 duration 组成的单个 Macro 联合动作。"""
+    """单个 Macro Cache 动作的采样结果。"""
 
     cache_index: int
-    duration_index: int
-    requested_duration: int
     log_prob: Any
     entropy: Any
     value: Any
     cache_mask: np.ndarray
-    duration_mask: np.ndarray
     cache_probabilities: np.ndarray
     raw_cache_probabilities: np.ndarray
     cache_entropy: Any
-    duration_entropy: Any
     cache_selected_group: str
     p_keep: Any
     p_update: Any
-    duration_log_prob: Any
     deterministic_cache_diagnostics: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class MacroComponentsEvaluation:
-    """Macro 联合 Cache/Duration 动作的概率分解与评估结果。"""
+    """Cache 动作与一帧中所有采样 termination 决策的概率分解。"""
 
     cache_log_prob: Any
-    duration_log_prob: Any
+    termination_log_probs: Any
+    termination_entropies: Any
+    termination_probabilities: Any
+    termination_log_prob_sum: Any
+    termination_entropy_sum: Any
     p_keep: Any
     p_update: Any
     joint_log_prob: Any
     cache_entropy: Any
-    duration_entropy: Any
     value: Any
     joint_logprob_decomposition_error: Any
+
+
+@dataclass(frozen=True)
+class TerminationActionSample:
+    """单个可学习 CONTINUE/TERMINATE 决策的采样结果。"""
+
+    selected_index: int
+    log_prob: Any
+    entropy: Any
+    probabilities: np.ndarray
+
+
+@dataclass(frozen=True)
+class TerminationEvaluation:
+    """批量 termination 决策的概率评估结果。"""
+
+    log_prob: Any
+    entropy: Any
+    probabilities: Any
 
 
 @dataclass(frozen=True)
@@ -74,6 +91,14 @@ class JointMicroEvaluation:
     value: Any
     uav0_log_prob: Any
     uav1_log_prob: Any
+    uav0_stay_probability: Any
+    uav0_move_probability: Any
+    uav0_group_entropy: Any
+    uav1_stay_probability: Any
+    uav1_move_probability: Any
+    uav1_group_entropy: Any
+    joint_group_entropy: Any
+    mean_group_entropy: Any
 
 
 def _require_torch() -> None:
@@ -194,17 +219,17 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
     architecture_id = (
-        "adaptive_dual_timescale_proposed_cache_action_cardinality_corrected_ppo"
+        "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
     )
-    architecture_version = 26
+    architecture_version = 27
 
     def __init__(
         self,
         observation_dim: int,
         macro_cache_feature_dim: int,
         micro_uav_feature_dim: int,
-        duration_candidates: tuple[int, ...],
-        prediction_horizon: int,
+        adaptive_holding_min_slots: int,
+        adaptive_holding_max_slots: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
         *,
         unified_cache_action: bool = True,
@@ -215,8 +240,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         self.observation_dim = int(observation_dim)
         self.macro_cache_feature_dim = int(macro_cache_feature_dim)
         self.micro_uav_feature_dim = int(micro_uav_feature_dim)
-        self.duration_candidates = tuple(int(value) for value in duration_candidates)
-        self.prediction_horizon = int(prediction_horizon)
+        self.adaptive_holding_min_slots = int(adaptive_holding_min_slots)
+        self.adaptive_holding_max_slots = int(adaptive_holding_max_slots)
         self.unified_cache_action = bool(unified_cache_action)
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
@@ -231,13 +256,10 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         if not sizes or any(value <= 0 for value in sizes):
             raise ValueError("hidden_sizes 必须是正整数序列。")
         if (
-            self.prediction_horizon <= 0
-            or not self.duration_candidates
-            or any(value <= 0 for value in self.duration_candidates)
-            or tuple(sorted(set(self.duration_candidates))) != self.duration_candidates
-            or self.duration_candidates[-1] > self.prediction_horizon
+            self.adaptive_holding_min_slots <= 0
+            or self.adaptive_holding_max_slots < self.adaptive_holding_min_slots
         ):
-            raise ValueError("Macro duration candidates 与 prediction horizon 不匹配。")
+            raise ValueError("adaptive holding slot 范围必须满足 1 <= min <= max。")
         hidden = sizes[-1]
 
         self.macro_actor_encoder = _mlp(self.observation_dim, sizes[:-1], hidden)
@@ -251,8 +273,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         self.macro_cache_scorer = nn.Sequential(
             nn.Linear(hidden * 2, hidden), nn.Tanh(), nn.Linear(hidden, 1)
         )
-        self.macro_duration_scorer = nn.Sequential(
-            nn.Linear(hidden * 2 + 1, hidden), nn.Tanh(), nn.Linear(hidden, 1)
+        self.macro_termination_scorer = nn.Sequential(
+            nn.Linear(hidden + 1, hidden), nn.Tanh(), nn.Linear(hidden, 2)
         )
         self.macro_critic = _mlp(
             self.observation_dim, sizes, 1, activation=nn.SiLU
@@ -367,17 +389,16 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         )
         return corrected
 
-    def _macro_logits(
+    def _macro_cache_logits(
         self,
         observations: Any,
         cache_candidate_features: Any,
         cache_candidate_masks: Any,
-        duration_masks: Any,
-        cache_actions: Any | None = None,
-        duration_actions: Any | None = None,
-    ) -> tuple[Any, Any, Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any]:
+        """计算 Cache 候选 logits、critic value 与合法候选 mask。"""
+
         device = next(self.parameters()).device
-        obs, single = self._observation_batch(observations, device)
+        obs, _ = self._observation_batch(observations, device)
         if int(obs.shape[-1]) != self.observation_dim:
             raise ValueError("Macro observation dimension mismatch。")
         features, masks = self._candidate_batch(
@@ -387,83 +408,79 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.macro_cache_feature_dim,
             device,
         )
-        duration_mask = torch.as_tensor(duration_masks, dtype=torch.bool, device=device)
-        if duration_mask.ndim == 1:
-            duration_mask = duration_mask.unsqueeze(0)
-        expected_duration_shape = (int(obs.shape[0]), len(self.duration_candidates))
-        if tuple(duration_mask.shape) != expected_duration_shape:
-            raise ValueError("duration_masks shape mismatch。")
-        if not bool(torch.all(torch.any(duration_mask, dim=-1)).item()):
-            raise ValueError("duration mask 至少要允许一个时长。")
-
         hidden = self.macro_actor_encoder(obs)
         candidate_hidden = self.macro_cache_candidate_encoder(features)
         expanded_hidden = hidden.unsqueeze(1).expand(-1, int(features.shape[1]), -1)
-        cache_logits = self.macro_cache_scorer(
+        raw_logits = self.macro_cache_scorer(
             torch.cat((expanded_hidden, candidate_hidden), dim=-1)
         ).squeeze(-1)
-        cache_logits = self._cardinality_corrected_cache_logits(cache_logits, masks)
-
-        if cache_actions is None:
-            raise ValueError("Macro duration probability requires selected Cache candidates。")
-        cache_action = torch.as_tensor(cache_actions, dtype=torch.long, device=device).reshape(-1)
-        if tuple(cache_action.shape) != (int(obs.shape[0]),):
-            raise ValueError("cache_actions shape mismatch。")
-        if bool(torch.any(cache_action < 0).item()) or bool(
-            torch.any(cache_action >= int(features.shape[1])).item()
-        ):
-            raise ValueError("Macro cache action index 越界。")
-        if not bool(torch.all(masks.gather(1, cache_action[:, None]).squeeze(1)).item()):
-            raise ValueError("Macro cache action 被 rollout mask 屏蔽。")
-        if bool(torch.any((cache_action > 0) & ~torch.any(masks[:, 1:], dim=-1)).item()):
-            raise ValueError("Macro UPDATE action requires at least one legal UPDATE candidate。")
-        selected_candidate = candidate_hidden[
-            torch.arange(int(obs.shape[0]), device=device), cache_action
-        ]
-        duration_values = torch.as_tensor(
-            self.duration_candidates, dtype=torch.float32, device=device
-        ) / float(self.prediction_horizon)
-        duration_values = duration_values.reshape(1, -1, 1).expand(
-            int(obs.shape[0]), -1, -1
-        )
-        duration_hidden = torch.cat(
-            (
-                hidden.unsqueeze(1).expand(-1, len(self.duration_candidates), -1),
-                selected_candidate.unsqueeze(1).expand(-1, len(self.duration_candidates), -1),
-                duration_values,
-            ),
-            dim=-1,
-        )
-        duration_logits = self.macro_duration_scorer(duration_hidden).squeeze(-1)
-        duration_dist = _masked_categorical(duration_logits, duration_mask)
-        if duration_actions is not None:
-            duration_action = torch.as_tensor(
-                duration_actions, dtype=torch.long, device=device
-            ).reshape(-1)
-            if tuple(duration_action.shape) != (int(obs.shape[0]),):
-                raise ValueError("duration_actions shape mismatch。")
-            if bool(torch.any(duration_action < 0).item()) or bool(
-                torch.any(duration_action >= len(self.duration_candidates)).item()
-            ):
-                raise ValueError("Macro duration action index 越界。")
-            if not bool(
-                torch.all(
-                    duration_mask.gather(1, duration_action[:, None]).squeeze(1)
-                ).item()
-            ):
-                raise ValueError("Macro duration action 被 rollout mask 屏蔽。")
+        corrected_logits = self._cardinality_corrected_cache_logits(raw_logits, masks)
         values = self.macro_value(obs)
-        return cache_logits, duration_dist.logits, values, masks, duration_mask, cache_action
+        return corrected_logits, raw_logits, values, masks
+
+    @staticmethod
+    def _integer_elapsed_batch(
+        elapsed_holding_slots: Any,
+        batch_size: int,
+        device: Any,
+    ) -> Any:
+        """检查已持有时隙是有限整数，并返回长整型批量张量。"""
+
+        elapsed_float = torch.as_tensor(
+            elapsed_holding_slots, dtype=torch.float32, device=device
+        )
+        if elapsed_float.ndim == 0 and batch_size == 1:
+            elapsed_float = elapsed_float.unsqueeze(0)
+        if tuple(elapsed_float.shape) != (batch_size,):
+            raise ValueError("elapsed_holding_slots 必须是 [B] 或单样本标量。")
+        if not bool(torch.all(torch.isfinite(elapsed_float)).item()) or not bool(
+            torch.all(elapsed_float == torch.round(elapsed_float)).item()
+        ):
+            raise ValueError("elapsed_holding_slots 必须是有限整数。")
+        return elapsed_float.to(dtype=torch.long)
+
+    def _termination_logits(
+        self,
+        observations: Any,
+        elapsed_holding_slots: Any,
+    ) -> tuple[Any, Any, bool]:
+        """根据状态和归一化持有时间计算 CONTINUE/TERMINATE logits。"""
+
+        device = next(self.parameters()).device
+        obs, single = self._observation_batch(observations, device)
+        if int(obs.shape[-1]) != self.observation_dim:
+            raise ValueError("Termination observation dimension mismatch。")
+        elapsed = self._integer_elapsed_batch(
+            elapsed_holding_slots, int(obs.shape[0]), device
+        )
+        eligible = (
+            (elapsed >= self.adaptive_holding_min_slots)
+            & (elapsed < self.adaptive_holding_max_slots)
+        )
+        if not bool(torch.all(eligible).item()):
+            raise ValueError(
+                "只允许在 min_slots <= elapsed_holding_slots < max_slots 时采样 termination。"
+            )
+        elapsed_fraction = (
+            elapsed.to(dtype=obs.dtype) / float(self.adaptive_holding_max_slots)
+        ).unsqueeze(-1)
+        hidden = self.macro_actor_encoder(obs)
+        logits = self.macro_termination_scorer(
+            torch.cat((hidden, elapsed_fraction), dim=-1)
+        )
+        if not bool(torch.all(torch.isfinite(logits)).item()):
+            raise FloatingPointError("Termination logits 包含 NaN/Inf。")
+        return logits, elapsed, single
 
     def sample_macro(
         self,
         observation: Any,
         cache_candidate_features: Any,
         cache_candidate_mask: Any,
-        *,
         deterministic: bool = False,
     ) -> MacroActionSample:
-        """训练时随机采样 Cache 与 Duration 动作，评价时使用确定性动作选择。"""
+        """只采样统一 Cache 候选动作，并保留基数校正。"""
+
         features = np.asarray(cache_candidate_features, dtype=np.float32)
         cache_mask = np.asarray(cache_candidate_mask, dtype=bool).reshape(-1)
         if features.ndim != 2 or len(features) != len(cache_mask) or not len(cache_mask):
@@ -471,45 +488,49 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         if not bool(cache_mask[0]):
             raise ValueError("Macro candidate 0 must remain the legal KEEP action.")
         device = next(self.parameters()).device
-        durations_mask = np.ones(len(self.duration_candidates), dtype=bool)
         with torch.no_grad():
             obs, _ = self._observation_batch(observation, device)
-            padded_features = torch.as_tensor(features, dtype=torch.float32, device=device).unsqueeze(0)
-            cache_mask_t = torch.as_tensor(cache_mask, dtype=torch.bool, device=device).unsqueeze(0)
-            hidden = self.macro_actor_encoder(obs)
-            embedded = self.macro_cache_candidate_encoder(padded_features)
-            candidate_logits = self.macro_cache_scorer(
-                torch.cat((hidden.unsqueeze(1).expand(-1, len(features), -1), embedded), dim=-1)
-            ).squeeze(-1).squeeze(0)
-
-            raw_candidate_logits = candidate_logits
-            raw_cache_dist = _masked_categorical(candidate_logits, cache_mask_t[0])
-            candidate_logits = self._cardinality_corrected_cache_logits(
-                candidate_logits, cache_mask_t[0]
+            if int(obs.shape[0]) != 1:
+                raise ValueError("sample_macro 每次只接受一个 observation。")
+            cache_mask_t = torch.as_tensor(cache_mask, dtype=torch.bool, device=device)
+            logits, raw_logits, values, _ = self._macro_cache_logits(
+                obs,
+                torch.as_tensor(features, dtype=torch.float32, device=device).unsqueeze(0),
+                cache_mask_t.unsqueeze(0),
             )
-            cache_dist = _masked_categorical(candidate_logits, cache_mask_t[0])
+            candidate_logits = logits.squeeze(0)
+            raw_candidate_logits = raw_logits.squeeze(0)
+            corrected_cache_dist = _masked_categorical(candidate_logits, cache_mask_t)
+            raw_cache_dist = _masked_categorical(raw_candidate_logits, cache_mask_t)
+
             deterministic_cache_diagnostics = None
-            group_ids = torch.ones_like(cache_mask_t[0], dtype=torch.long)
+            group_ids = torch.ones_like(cache_mask_t, dtype=torch.long)
             group_ids[0] = 0
             if deterministic:
                 cache_index, selected_cache_group = _group_aware_deterministic_candidate(
                     raw_candidate_logits,
-                    cache_dist.probs,
-                    cache_mask_t[0],
+                    corrected_cache_dist.probs,
+                    cache_mask_t,
                     group_ids,
                 )
                 probability_sum_error = float(
-                    torch.abs(cache_dist.probs.sum() - 1.0).detach().cpu()
+                    torch.abs(corrected_cache_dist.probs.sum() - 1.0).detach().cpu()
                 )
-                update_mask = cache_mask_t[0] & (group_ids == 1)
+                update_mask = cache_mask_t & (group_ids == 1)
                 legal_update_count = int(update_mask.sum().item())
                 legal_update_best_score = (
-                    float(raw_candidate_logits.masked_fill(~update_mask, -float("inf")).max().cpu())
+                    float(
+                        raw_candidate_logits.masked_fill(
+                            ~update_mask, -float("inf")
+                        ).max().cpu()
+                    )
                     if legal_update_count
                     else None
                 )
-                selected_raw_score = float(raw_candidate_logits[cache_index].detach().cpu())
-                selected_candidate_is_legal = bool(cache_mask_t[0, cache_index].item())
+                selected_raw_score = float(
+                    raw_candidate_logits[cache_index].detach().cpu()
+                )
+                selected_candidate_is_legal = bool(cache_mask_t[cache_index].item())
                 update_inner_argmax_violation = bool(
                     selected_cache_group == 1
                     and (
@@ -518,8 +539,10 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                         or selected_raw_score != legal_update_best_score
                     )
                 )
-                p_keep_value = float(cache_dist.probs[0].detach().cpu())
-                p_update_group_value = float(cache_dist.probs[1:].sum().detach().cpu())
+                p_keep_value = float(corrected_cache_dist.probs[0].detach().cpu())
+                p_update_group_value = float(
+                    corrected_cache_dist.probs[1:].sum().detach().cpu()
+                )
                 deterministic_cache_diagnostics = {
                     "p_keep": p_keep_value,
                     "p_update_group": p_update_group_value,
@@ -534,33 +557,11 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                     "probability_sum_error": probability_sum_error,
                 }
             else:
-                cache_index = int(cache_dist.sample().item())
+                cache_index = int(corrected_cache_dist.sample().item())
                 selected_cache_group = 0 if cache_index == 0 else 1
-            selected_embed = embedded[0, cache_index]
-            duration_values = torch.as_tensor(
-                self.duration_candidates, dtype=torch.float32, device=device
-            ) / float(self.prediction_horizon)
-            duration_input = torch.cat(
-                (
-                    hidden.expand(len(self.duration_candidates), -1),
-                    selected_embed.expand(len(self.duration_candidates), -1),
-                    duration_values.reshape(-1, 1),
-                ),
-                dim=-1,
-            )
-            duration_logits = self.macro_duration_scorer(duration_input).squeeze(-1)
-            duration_dist = _masked_categorical(
-                duration_logits,
-                torch.as_tensor(durations_mask, dtype=torch.bool, device=device),
-            )
-            duration_index = (
-                int(torch.argmax(duration_dist.logits).item())
-                if deterministic
-                else int(duration_dist.sample().item())
-            )
+
             cache_tensor = torch.as_tensor(cache_index, dtype=torch.long, device=device)
-            duration_tensor = torch.as_tensor(duration_index, dtype=torch.long, device=device)
-            cache_probabilities = cache_dist.probs
+            cache_probabilities = corrected_cache_dist.probs
             probability_sum = cache_probabilities.sum()
             if (
                 not bool(torch.isfinite(cache_probabilities).all().item())
@@ -572,61 +573,85 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 )
             ):
                 raise FloatingPointError("Unified Cache Candidate probabilities are invalid.")
-            cache_log_prob = cache_dist.log_prob(cache_tensor)
-            duration_log_prob = duration_dist.log_prob(duration_tensor)
-            cache_entropy = cache_dist.entropy()
-            duration_entropy = duration_dist.entropy()
+            cache_log_prob = corrected_cache_dist.log_prob(cache_tensor)
+            cache_entropy = corrected_cache_dist.entropy()
             p_keep = cache_probabilities[0]
             p_update = cache_probabilities[1:].sum()
             return MacroActionSample(
                 cache_index=cache_index,
-                duration_index=duration_index,
-                requested_duration=self.duration_candidates[duration_index],
-                log_prob=cache_log_prob + duration_log_prob,
-                entropy=cache_entropy + duration_entropy,
-                value=self.macro_value(obs).squeeze(),
+                log_prob=cache_log_prob,
+                entropy=cache_entropy,
+                value=values.squeeze(0),
                 cache_mask=cache_mask.copy(),
-                duration_mask=durations_mask,
                 cache_probabilities=cache_probabilities.detach().cpu().numpy().copy(),
-                raw_cache_probabilities=(
-                    cache_probabilities.detach().cpu().numpy().copy()
-                    if raw_cache_dist is None
-                    else raw_cache_dist.probs.detach().cpu().numpy().copy()
-                ),
+                raw_cache_probabilities=raw_cache_dist.probs.detach().cpu().numpy().copy(),
                 cache_entropy=cache_entropy,
-                duration_entropy=duration_entropy,
                 cache_selected_group="KEEP" if selected_cache_group == 0 else "UPDATE",
                 p_keep=p_keep,
                 p_update=p_update,
-                duration_log_prob=duration_log_prob,
                 deterministic_cache_diagnostics=deterministic_cache_diagnostics,
             )
 
+    def sample_termination(
+        self,
+        observation: Any,
+        elapsed_holding_slots: int,
+        deterministic: bool = False,
+    ) -> TerminationActionSample:
+        """采样可学习的二元终止决策；平局时确定性选择 CONTINUE。"""
 
+        with torch.no_grad():
+            logits, _, single = self._termination_logits(
+                observation, elapsed_holding_slots
+            )
+            if not single:
+                raise ValueError("sample_termination 每次只接受一个 observation。")
+            distribution = torch.distributions.Categorical(logits=logits)
+            action = (
+                int(torch.argmax(distribution.logits, dim=-1).item())
+                if deterministic
+                else int(distribution.sample().item())
+            )
+            action_t = torch.as_tensor(action, dtype=torch.long, device=logits.device)
+            return TerminationActionSample(
+                selected_index=action,
+                log_prob=distribution.log_prob(action_t).squeeze(0),
+                entropy=distribution.entropy().squeeze(0),
+                probabilities=distribution.probs.squeeze(0).detach().cpu().numpy().copy(),
+            )
 
-    def evaluate_macro(
+    def evaluate_termination(
         self,
         observations: Any,
-        cache_candidate_features: Any,
-        cache_candidate_masks: Any,
-        cache_actions: Any,
-        duration_masks: Any,
-        duration_actions: Any,
-    ) -> tuple[Any, Any, Any, Any, Any]:
-        components = self.evaluate_macro_components(
-            observations,
-            cache_candidate_features,
-            cache_candidate_masks,
-            cache_actions,
-            duration_masks,
-            duration_actions,
+        elapsed_holding_slots: Any,
+        actions: Any,
+    ) -> TerminationEvaluation:
+        """评估一批被采样的 termination 决策。"""
+
+        logits, _, single = self._termination_logits(
+            observations, elapsed_holding_slots
         )
-        return (
-            components.joint_log_prob,
-            components.cache_entropy + components.duration_entropy,
-            components.value,
-            components.cache_log_prob,
-            components.duration_log_prob,
+        action_values = torch.as_tensor(actions, dtype=torch.long, device=logits.device)
+        if action_values.ndim == 0 and int(logits.shape[0]) == 1:
+            action_values = action_values.unsqueeze(0)
+        if tuple(action_values.shape) != (int(logits.shape[0]),):
+            raise ValueError("termination actions 必须是 [B] 或单样本标量。")
+        if bool(torch.any((action_values < 0) | (action_values > 1)).item()):
+            raise ValueError("termination action 仅允许 0=CONTINUE 或 1=TERMINATE。")
+        distribution = torch.distributions.Categorical(logits=logits)
+        log_prob = distribution.log_prob(action_values)
+        entropy = distribution.entropy()
+        probabilities = distribution.probs
+        if single:
+            return TerminationEvaluation(
+                log_prob=log_prob.squeeze(0),
+                entropy=entropy.squeeze(0),
+                probabilities=probabilities.squeeze(0),
+            )
+        return TerminationEvaluation(
+            log_prob=log_prob,
+            entropy=entropy,
+            probabilities=probabilities,
         )
 
     def evaluate_macro_components(
@@ -635,36 +660,104 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         cache_candidate_features: Any,
         cache_candidate_masks: Any,
         cache_actions: Any,
-        duration_masks: Any,
-        duration_actions: Any,
+        termination_observations: Any,
+        termination_elapsed_slots: Any,
+        termination_actions: Any,
+        termination_masks: Any,
     ) -> MacroComponentsEvaluation:
-        """Evaluate the formal joint Cache/Duration action and its factors."""
+        """评估 Cache 动作与 mask 内 termination 决策，并按帧求和。"""
 
-        cache_logits, duration_logits, values, masks, d_masks, cache_actions_t = self._macro_logits(
-            observations,
+        device = next(self.parameters()).device
+        obs, _ = self._observation_batch(observations, device)
+        cache_logits, _, values, masks = self._macro_cache_logits(
+            obs,
             cache_candidate_features,
             cache_candidate_masks,
-            duration_masks,
-            cache_actions,
-            duration_actions,
         )
-        device = cache_logits.device
-        observations_t, _ = self._observation_batch(observations, device)
-        duration_actions_t = torch.as_tensor(duration_actions, dtype=torch.long, device=device).reshape(-1)
-        duration_dist = _masked_categorical(duration_logits, d_masks)
-        duration_log_prob = duration_dist.log_prob(duration_actions_t)
+        batch_size = int(obs.shape[0])
+        cache_action_values = torch.as_tensor(
+            cache_actions, dtype=torch.long, device=device
+        ).reshape(-1)
+        if tuple(cache_action_values.shape) != (batch_size,):
+            raise ValueError("cache_actions 必须是 [B]。")
+        if bool(torch.any((cache_action_values < 0) | (cache_action_values >= masks.shape[1])).item()):
+            raise ValueError("Cache action index 越界。")
+        if not bool(
+            torch.all(masks.gather(1, cache_action_values[:, None]).squeeze(1)).item()
+        ):
+            raise ValueError("Cache action 被 rollout 保存的合法动作 mask 屏蔽。")
 
-        cache_dist = _masked_categorical(cache_logits, masks)
-        cache_log_prob = cache_dist.log_prob(cache_actions_t)
-        cache_probabilities = cache_dist.probs
-        cache_entropy = cache_dist.entropy()
+        term_obs = torch.as_tensor(
+            termination_observations, dtype=torch.float32, device=device
+        )
+        elapsed_slots = torch.as_tensor(termination_elapsed_slots, device=device)
+        term_actions = torch.as_tensor(
+            termination_actions, dtype=torch.long, device=device
+        )
+        term_masks = torch.as_tensor(
+            termination_masks, dtype=torch.bool, device=device
+        )
+        if (
+            term_obs.ndim != 3
+            or tuple(term_obs.shape[:1]) != (batch_size,)
+            or int(term_obs.shape[-1]) != self.observation_dim
+        ):
+            raise ValueError("termination_observations 必须是 [B,T,obs_dim]。")
+        term_shape = tuple(term_obs.shape[:2])
+        if (
+            tuple(elapsed_slots.shape) != term_shape
+            or tuple(term_actions.shape) != term_shape
+            or tuple(term_masks.shape) != term_shape
+        ):
+            raise ValueError(
+                "termination_elapsed_slots/actions/masks 必须都是 [B,T]。"
+            )
+
+        cache_distribution = _masked_categorical(cache_logits, masks)
+        cache_log_prob = cache_distribution.log_prob(cache_action_values)
+        cache_entropy = cache_distribution.entropy()
+        cache_probabilities = cache_distribution.probs
+
+        # 只选出 rollout 中真实采样的决策，padding 不进入 scorer 或概率和。
+        selected_mask = term_masks.reshape(-1)
+        flat_term_obs = term_obs.reshape(-1, self.observation_dim)[selected_mask]
+        flat_elapsed = elapsed_slots.reshape(-1)[selected_mask]
+        flat_actions = term_actions.reshape(-1)[selected_mask]
+        if flat_term_obs.shape[0]:
+            evaluated = self.evaluate_termination(
+                flat_term_obs, flat_elapsed, flat_actions
+            )
+            selected_log_probs = evaluated.log_prob.reshape(-1)
+            selected_entropies = evaluated.entropy.reshape(-1)
+            selected_probabilities = evaluated.probabilities.reshape(-1, 2)
+            term_log_probs = torch.zeros(
+                term_shape, dtype=selected_log_probs.dtype, device=device
+            ).masked_scatter(term_masks, selected_log_probs)
+            term_entropies = torch.zeros(
+                term_shape, dtype=selected_entropies.dtype, device=device
+            ).masked_scatter(term_masks, selected_entropies)
+            expanded_masks = term_masks.unsqueeze(-1).expand(-1, -1, 2)
+            term_probabilities = torch.zeros(
+                (*term_shape, 2),
+                dtype=selected_probabilities.dtype,
+                device=device,
+            ).masked_scatter(expanded_masks, selected_probabilities.reshape(-1))
+        else:
+            term_log_probs = torch.zeros(term_shape, dtype=cache_log_prob.dtype, device=device)
+            term_entropies = torch.zeros(term_shape, dtype=cache_entropy.dtype, device=device)
+            term_probabilities = torch.zeros(
+                (*term_shape, 2), dtype=cache_probabilities.dtype, device=device
+            )
+
+        termination_log_prob_sum = term_log_probs.sum(dim=1)
+        termination_entropy_sum = term_entropies.sum(dim=1)
         p_keep = cache_probabilities[:, 0]
         p_update = cache_probabilities[:, 1:].sum(dim=-1)
-        joint_log_prob = cache_log_prob + duration_log_prob
+        joint_log_prob = cache_log_prob + termination_log_prob_sum
         decomposition_error = torch.abs(
             joint_log_prob.to(torch.float64)
             - cache_log_prob.to(torch.float64)
-            - duration_log_prob.to(torch.float64)
+            - termination_log_prob_sum.to(torch.float64)
         )
         if not bool(torch.isfinite(cache_probabilities).all().item()) or not torch.allclose(
             cache_probabilities.sum(dim=-1),
@@ -675,15 +768,42 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             raise FloatingPointError("Unified Cache Candidate probabilities are invalid.")
         return MacroComponentsEvaluation(
             cache_log_prob=cache_log_prob,
-            duration_log_prob=duration_log_prob,
+            termination_log_probs=term_log_probs,
+            termination_entropies=term_entropies,
+            termination_probabilities=term_probabilities,
+            termination_log_prob_sum=termination_log_prob_sum,
+            termination_entropy_sum=termination_entropy_sum,
             p_keep=p_keep,
             p_update=p_update,
             joint_log_prob=joint_log_prob,
             cache_entropy=cache_entropy,
-            duration_entropy=duration_dist.entropy(),
             value=values,
             joint_logprob_decomposition_error=decomposition_error,
         )
+
+    def evaluate_macro_joint(
+        self,
+        observations: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+        cache_actions: Any,
+        termination_observations: Any,
+        termination_elapsed_slots: Any,
+        termination_actions: Any,
+        termination_masks: Any,
+    ) -> Any:
+        """返回 Cache 与所有已采样 termination 决策的联合 log-prob。"""
+
+        return self.evaluate_macro_components(
+            observations,
+            cache_candidate_features,
+            cache_candidate_masks,
+            cache_actions,
+            termination_observations,
+            termination_elapsed_slots,
+            termination_actions,
+            termination_masks,
+        ).joint_log_prob
 
     def _micro_candidate_raw_logits(
         self,
@@ -823,6 +943,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         hidden = self.micro_actor_encoder(obs)
         head_log_probs: list[Any] = []
         head_entropies: list[Any] = []
+        head_group_stay_probabilities: list[Any] = []
+        head_group_move_probabilities: list[Any] = []
+        head_group_entropies: list[Any] = []
         for head in range(2):
             head_features = features[:, head]
             head_masks = masks[:, head]
@@ -855,15 +978,46 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 raise ValueError("PPO action 被 rollout 当时保存的 mask 屏蔽。")
             head_log_probs.append(dist.log_prob(action))
             head_entropies.append(dist.entropy())
+            # 这里沿用 PPO 概率计算使用的 masked、group-balanced 分布。
+            # candidate 0 是 STAY，其余候选的概率质量都属于 MOVE。
+            # 保留梯度连接，使训练器只通过 Micro Actor 更新该正则项。
+            p_stay = dist.probs[:, 0]
+            p_move = dist.probs[:, 1:].sum(dim=-1)
+            tiny = torch.finfo(dist.probs.dtype).tiny
+            group_entropy = -(
+                torch.where(
+                    p_stay > 0,
+                    p_stay * torch.log(p_stay.clamp_min(tiny)),
+                    torch.zeros_like(p_stay),
+                )
+                + torch.where(
+                    p_move > 0,
+                    p_move * torch.log(p_move.clamp_min(tiny)),
+                    torch.zeros_like(p_move),
+                )
+            )
+            head_group_stay_probabilities.append(p_stay)
+            head_group_move_probabilities.append(p_move)
+            head_group_entropies.append(group_entropy)
         values = self.micro_critic(self._micro_critic_inputs(obs)).squeeze(-1)
         log0, log1 = head_log_probs
         entropies = head_entropies[0] + head_entropies[1]
+        group_entropy0, group_entropy1 = head_group_entropies
+        joint_group_entropy = group_entropy0 + group_entropy1
         return JointMicroEvaluation(
             log_prob=log0 + log1,
             entropy=entropies,
             value=values,
             uav0_log_prob=log0,
             uav1_log_prob=log1,
+            uav0_stay_probability=head_group_stay_probabilities[0],
+            uav0_move_probability=head_group_move_probabilities[0],
+            uav0_group_entropy=group_entropy0,
+            uav1_stay_probability=head_group_stay_probabilities[1],
+            uav1_move_probability=head_group_move_probabilities[1],
+            uav1_group_entropy=group_entropy1,
+            joint_group_entropy=joint_group_entropy,
+            mean_group_entropy=joint_group_entropy / 2.0,
         )
 
     def macro_actor_parameters(self) -> tuple[Any, ...]:
@@ -871,7 +1025,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             self.macro_actor_encoder,
             self.macro_cache_candidate_encoder,
             self.macro_cache_scorer,
-            self.macro_duration_scorer,
+            self.macro_termination_scorer,
         )
         return tuple(parameter for module in modules for parameter in module.parameters())
 
@@ -899,7 +1053,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             "macro_actor_encoder.",
             "macro_cache_candidate_encoder.",
             "macro_cache_scorer.",
-            "macro_duration_scorer.",
+            "macro_termination_scorer.",
             "macro_critic.",
         )
         return {

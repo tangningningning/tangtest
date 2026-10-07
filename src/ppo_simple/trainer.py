@@ -34,7 +34,6 @@ from .interface import (
     _assert_realization_context_compatible,
     aligned_train_steps,
     load_environment_context,
-    macro_duration_candidates_from_project,
 )
 from .macro_targets import (
     build_macro_n2_target,
@@ -45,6 +44,7 @@ from .reporting import (
     RUN_MANIFEST_FILENAME,
     RUN_SUMMARY_FILENAME,
     SLOT_METRICS_FILENAME,
+    TRAINING_EPOCH_RETURN_PLOT_FILENAME,
     append_dual_timescale_record,
     append_dual_timescale_slot_metrics,
     build_macro_transition_trace_arrays,
@@ -69,12 +69,13 @@ from .rollout import (
 CHECKPOINT_METHOD = "PROPOSED"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
-CHECKPOINT_VERSION = 50
+CHECKPOINT_VERSION = 53
 ALGORITHM_ID = "PROPOSED"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
-MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and Duration PPO"
+MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and sampled termination PPO"
 MACRO_CRITIC_TARGET_MODE = "two_step_smdp_td"
 MACRO_CRITIC_LAST1_ALPHA = 1.0
+FORMAL_TRAINING_EPISODES = 300
 
 
 def _require_torch() -> None:
@@ -120,21 +121,20 @@ def _reconcile_run_artifacts_with_checkpoint(
     completed_episodes: int,
     *,
     episode_slots: int,
+    group_size: int = 4,
     slot_start: int = 0,
 ) -> dict[str, int]:
-    """以 checkpoint episode 边界清理可识别的未提交 JSONL 尾记录。"""
+    """按提交的 update-group 边界清理至多一组未提交尾记录。"""
 
     boundary = int(completed_episodes)
     slot_count = int(episode_slots)
+    update_group_size = int(group_size)
     first_slot = int(slot_start)
-    if boundary < 0 or slot_count <= 0:
-        raise ValueError("checkpoint episode boundary and slot count must be valid")
+    if boundary < 0 or slot_count <= 0 or update_group_size <= 0:
+        raise ValueError("checkpoint boundary, slot count, and group size must be valid")
+    if boundary % update_group_size != 0:
+        raise ValueError("checkpoint completed_episodes must be on a policy-update group boundary")
     directory = Path(run_path)
-    single_record_files = {
-        "episode_metrics.jsonl": "episode",
-        "update_metrics.jsonl": "update",
-        "critic_diagnostics.jsonl": "critic_diagnostics",
-    }
     prepared: dict[Path, tuple[list[bytes], int]] = {}
 
     def read_records(path: Path) -> list[tuple[bytes, dict[str, Any]]]:
@@ -154,25 +154,75 @@ def _reconcile_run_artifacts_with_checkpoint(
                 records.append((raw_line, record))
         return records
 
-    for filename, record_type in single_record_files.items():
+    episode_path = directory / "episode_metrics.jsonl"
+    episode_records = read_records(episode_path)
+    episode_ids: list[int] = []
+    for line_number, (_, record) in enumerate(episode_records, start=1):
+        if record.get("record_type") != "episode":
+            raise ValueError(f"episode_metrics.jsonl line {line_number} has an invalid record_type")
+        episode = record.get("episode")
+        if isinstance(episode, bool) or not isinstance(episode, int) or episode < 1:
+            raise ValueError(f"episode_metrics.jsonl line {line_number} has an invalid episode")
+        group_id = (episode - 1) // update_group_size + 1
+        group_start = (group_id - 1) * update_group_size + 1
+        expected_metadata = {
+            "policy_update_group_id": group_id,
+            "policy_update_group_start_episode": group_start,
+            "policy_update_group_end_episode": group_start + update_group_size - 1,
+            "policy_update_group_size": update_group_size,
+        }
+        if any(record.get(key) != value for key, value in expected_metadata.items()):
+            raise ValueError(f"episode_metrics.jsonl line {line_number} has invalid group metadata")
+        episode_ids.append(episode)
+    if any(right <= left for left, right in zip(episode_ids, episode_ids[1:])):
+        raise ValueError("episode_metrics.jsonl contains duplicate or out-of-order episodes")
+    committed_episodes = [episode for episode in episode_ids if episode <= boundary]
+    if committed_episodes != list(range(1, boundary + 1)):
+        raise ValueError("episode_metrics.jsonl does not contain every committed episode exactly once")
+    episode_tail = [episode for episode in episode_ids if episode > boundary]
+    if episode_tail and (
+        episode_tail != list(range(boundary + 1, episode_tail[-1] + 1))
+        or episode_tail[-1] > boundary + update_group_size
+    ):
+        raise ValueError("episode_metrics.jsonl has a tail outside one uncommitted group")
+    prepared[episode_path] = (
+        [raw for raw, record in episode_records if int(record["episode"]) <= boundary],
+        len(episode_records) - len(committed_episodes),
+    )
+
+    for filename, record_type in (
+        ("update_metrics.jsonl", "update"),
+        ("critic_diagnostics.jsonl", "critic_diagnostics"),
+    ):
         path = directory / filename
         records = read_records(path)
-        episode_ids: list[int] = []
+        group_ends: list[int] = []
         for line_number, (_, record) in enumerate(records, start=1):
             if record.get("record_type") != record_type:
                 raise ValueError(f"{filename} line {line_number} has an invalid record_type")
-            value = record.get("episode")
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"{filename} line {line_number} has an invalid episode")
-            episode_ids.append(value)
-        if any(right <= left for left, right in zip(episode_ids, episode_ids[1:])):
-            raise ValueError(f"{filename} contains duplicate or out-of-order episodes")
-        committed = [episode for episode in episode_ids if episode <= boundary]
-        if committed != list(range(1, boundary + 1)):
-            raise ValueError(f"{filename} does not contain every committed episode exactly once")
-        tail = [episode for episode in episode_ids if episode > boundary]
-        if tail and tail != list(range(boundary + 1, tail[-1] + 1)):
-            raise ValueError(f"{filename} has a non-contiguous uncommitted tail")
+            episode = record.get("episode")
+            if isinstance(episode, bool) or not isinstance(episode, int) or episode < 1:
+                raise ValueError(f"{filename} line {line_number} has an invalid group end episode")
+            group_id = episode // update_group_size
+            if (
+                episode % update_group_size != 0
+                or record.get("policy_update_group_id") != group_id
+                or record.get("policy_update_group_start_episode")
+                != episode - update_group_size + 1
+                or record.get("policy_update_group_end_episode") != episode
+                or record.get("policy_update_group_size") != update_group_size
+            ):
+                raise ValueError(f"{filename} line {line_number} has invalid group metadata")
+            group_ends.append(episode)
+        if any(right <= left for left, right in zip(group_ends, group_ends[1:])):
+            raise ValueError(f"{filename} contains duplicate or out-of-order update groups")
+        committed_groups = [episode for episode in group_ends if episode <= boundary]
+        expected_groups = list(range(update_group_size, boundary + 1, update_group_size))
+        if committed_groups != expected_groups:
+            raise ValueError(f"{filename} does not contain every committed update group exactly once")
+        group_tail = [episode for episode in group_ends if episode > boundary]
+        if group_tail and group_tail != [boundary + update_group_size]:
+            raise ValueError(f"{filename} has a tail outside one uncommitted update group")
         keep_lines = [raw for raw, record in records if int(record["episode"]) <= boundary]
         prepared[path] = (keep_lines, len(records) - len(keep_lines))
 
@@ -214,8 +264,11 @@ def _reconcile_run_artifacts_with_checkpoint(
         if committed_episodes != list(range(1, boundary + 1)):
             raise ValueError(f"{SLOT_METRICS_FILENAME} does not contain every committed episode")
         tail_episodes = [episode for episode in episode_order if episode > boundary]
-        if tail_episodes and tail_episodes != list(range(boundary + 1, tail_episodes[-1] + 1)):
-            raise ValueError(f"{SLOT_METRICS_FILENAME} has a non-contiguous uncommitted tail")
+        if tail_episodes and (
+            tail_episodes != list(range(boundary + 1, tail_episodes[-1] + 1))
+            or tail_episodes[-1] > boundary + update_group_size
+        ):
+            raise ValueError(f"{SLOT_METRICS_FILENAME} has a tail outside one uncommitted group")
     elif boundary:
         raise ValueError(f"{SLOT_METRICS_FILENAME} is missing committed episode records")
     for episode in range(1, boundary + 1):
@@ -227,6 +280,16 @@ def _reconcile_run_artifacts_with_checkpoint(
             raise ValueError(
                 f"{SLOT_METRICS_FILENAME} episode {episode} has a damaged slot sequence"
             )
+    if episode_order:
+        tail_episode_ids = [episode for episode in episode_order if episode > boundary]
+        for episode in tail_episode_ids:
+            ids = [slot for (slot_episode, slot) in seen_slots if slot_episode == episode]
+            ids.sort()
+            if len(ids) > slot_count or ids != list(range(first_slot, first_slot + len(ids))):
+                raise ValueError(f"{SLOT_METRICS_FILENAME} has a damaged uncommitted slot tail")
+        for episode in tail_episode_ids[:-1]:
+            if len([slot for slot_episode, slot in seen_slots if slot_episode == episode]) != slot_count:
+                raise ValueError(f"{SLOT_METRICS_FILENAME} has an incomplete non-final tail episode")
     keep_slot_lines = [
         raw for raw, record in slot_records if int(record["episode"]) <= boundary
     ]
@@ -549,35 +612,83 @@ def _macro_batch(buffer: MacroRolloutBuffer) -> dict[str, np.ndarray]:
     batch_size = len(items)
     max_candidates = max(len(item.cache_candidate_masks) for item in items)
     feature_dim = int(items[0].cache_candidate_features.shape[-1])
+    observation_dim = int(items[0].observation.shape[-1])
+    max_termination_decisions = max(
+        len(item.termination_elapsed_slots) for item in items
+    )
+    if max_termination_decisions > 4:
+        raise ValueError("Adaptive holding rollout exceeds max_slots - 1 sampled decisions.")
     features = np.zeros((batch_size, max_candidates, feature_dim), dtype=np.float32)
     masks = np.zeros((batch_size, max_candidates), dtype=bool)
+    termination_observations = np.zeros(
+        (batch_size, max_termination_decisions, observation_dim), dtype=np.float32
+    )
+    termination_elapsed_slots = np.zeros(
+        (batch_size, max_termination_decisions), dtype=np.int64
+    )
+    termination_actions = np.zeros(
+        (batch_size, max_termination_decisions), dtype=np.int64
+    )
+    termination_masks = np.zeros(
+        (batch_size, max_termination_decisions), dtype=bool
+    )
+    old_termination_log_probs = np.zeros(
+        (batch_size, max_termination_decisions), dtype=np.float32
+    )
+    old_termination_entropies = np.zeros(
+        (batch_size, max_termination_decisions), dtype=np.float32
+    )
     for index, item in enumerate(items):
         count = len(item.cache_candidate_masks)
         if item.cache_candidate_features.shape != (count, feature_dim):
             raise ValueError("Macro candidate descriptor shape changed within rollout。")
         features[index, :count] = item.cache_candidate_features
         masks[index, :count] = item.cache_candidate_masks
+        termination_count = len(item.termination_elapsed_slots)
+        if termination_count:
+            if item.termination_observations.shape != (
+                termination_count,
+                observation_dim,
+            ):
+                raise ValueError("Termination observation trace shape mismatch.")
+            termination_observations[index, :termination_count] = (
+                item.termination_observations
+            )
+            termination_elapsed_slots[index, :termination_count] = (
+                item.termination_elapsed_slots
+            )
+            termination_actions[index, :termination_count] = item.termination_actions
+            old_termination_log_probs[index, :termination_count] = (
+                item.old_termination_log_probs
+            )
+            old_termination_entropies[index, :termination_count] = (
+                item.old_termination_entropies
+            )
+            termination_masks[index, :termination_count] = True
     return {
         "observations": np.stack([item.observation for item in items]).astype(np.float32),
         "next_observations": np.stack([item.next_observation for item in items]).astype(np.float32),
         "candidate_features": features,
         "candidate_masks": masks,
-        "duration_masks": np.stack([item.duration_masks for item in items]).astype(bool),
         "cache_actions": np.asarray([item.cache_action for item in items], dtype=np.int64),
-        "duration_actions": np.asarray([item.duration_action for item in items], dtype=np.int64),
-        "requested_durations": np.asarray(
-            [item.requested_duration for item in items], dtype=np.int64
+        "termination_observations": termination_observations,
+        "termination_elapsed_slots": termination_elapsed_slots,
+        "termination_actions": termination_actions,
+        "termination_masks": termination_masks,
+        "old_termination_log_probs": old_termination_log_probs,
+        "old_termination_entropies": old_termination_entropies,
+        "old_cache_log_probs": np.asarray(
+            [item.old_cache_log_prob for item in items], dtype=np.float32
         ),
         "old_log_probs": np.asarray([item.old_macro_log_prob for item in items], dtype=np.float32),
-        "old_duration_log_probs": np.asarray(
-            [item.old_duration_log_prob for item in items], dtype=np.float32
-        ),
         "old_values": np.asarray([item.old_value for item in items], dtype=np.float32),
         "old_next_values": np.asarray(
             [item.old_next_value for item in items], dtype=np.float32
         ),
         "rewards": np.asarray([item.frame_reward for item in items], dtype=np.float32),
-        "durations": np.asarray([item.actual_duration for item in items], dtype=np.int64),
+        "actual_durations": np.asarray(
+            [item.actual_duration for item in items], dtype=np.int64
+        ),
         "dones": np.asarray([item.done for item in items], dtype=bool),
         "macro_indices": np.arange(batch_size, dtype=np.int64),
     }
@@ -604,6 +715,101 @@ def _micro_batch(buffer: MicroRolloutBuffer) -> dict[str, np.ndarray]:
     }
 
 
+def _validate_episode_terminal(dones: np.ndarray, label: str) -> None:
+    terminal = np.asarray(dones, dtype=bool).reshape(-1)
+    if terminal.size == 0 or not bool(terminal[-1]) or bool(np.any(terminal[:-1])):
+        raise ValueError(f"{label} rollout must contain exactly one terminal at its end")
+
+
+def _concat_micro_batches(batches: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    if not batches:
+        raise ValueError("Micro update requires at least one episode batch")
+    max_candidates = max(int(batch["candidate_masks"].shape[-1]) for batch in batches)
+    padded: list[dict[str, np.ndarray]] = []
+    for batch in batches:
+        candidate_count = int(batch["candidate_masks"].shape[-1])
+        if candidate_count < max_candidates:
+            feature_pad = [(0, 0)] * batch["candidate_features"].ndim
+            feature_pad[-2] = (0, max_candidates - candidate_count)
+            mask_pad = [(0, 0)] * batch["candidate_masks"].ndim
+            mask_pad[-1] = (0, max_candidates - candidate_count)
+            batch = {
+                **batch,
+                "candidate_features": np.pad(
+                    batch["candidate_features"], feature_pad, mode="constant"
+                ),
+                "candidate_masks": np.pad(
+                    batch["candidate_masks"], mask_pad, mode="constant"
+                ),
+            }
+        padded.append(batch)
+    keys = set(padded[0])
+    if any(set(batch) != keys for batch in padded[1:]):
+        raise ValueError("Micro episode batches have different fields")
+    for key in keys:
+        trailing_shape = padded[0][key].shape[1:]
+        if any(batch[key].shape[1:] != trailing_shape for batch in padded[1:]):
+            raise ValueError(f"Micro episode batch shape mismatch for {key}")
+    return {key: np.concatenate([batch[key] for batch in padded], axis=0) for key in keys}
+
+
+def _concat_macro_batches(batches: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    if not batches:
+        raise ValueError("Macro update requires at least one episode batch")
+    max_candidates = max(int(batch["candidate_masks"].shape[-1]) for batch in batches)
+    max_termination_decisions = max(
+        int(batch["termination_masks"].shape[-1]) for batch in batches
+    )
+    padded: list[dict[str, np.ndarray]] = []
+    for batch in batches:
+        batch = dict(batch)
+        candidate_count = int(batch["candidate_masks"].shape[-1])
+        if candidate_count < max_candidates:
+            feature_pad = [(0, 0)] * batch["candidate_features"].ndim
+            feature_pad[-2] = (0, max_candidates - candidate_count)
+            mask_pad = [(0, 0)] * batch["candidate_masks"].ndim
+            mask_pad[-1] = (0, max_candidates - candidate_count)
+            batch["candidate_features"] = np.pad(
+                batch["candidate_features"], feature_pad, mode="constant"
+            )
+            batch["candidate_masks"] = np.pad(
+                batch["candidate_masks"], mask_pad, mode="constant"
+            )
+        decision_count = int(batch["termination_masks"].shape[-1])
+        if decision_count < max_termination_decisions:
+            decision_pad = (
+                (0, 0),
+                (0, max_termination_decisions - decision_count),
+            )
+            observation_pad = (
+                (0, 0),
+                (0, max_termination_decisions - decision_count),
+                (0, 0),
+            )
+            for key in (
+                "termination_elapsed_slots",
+                "termination_actions",
+                "termination_masks",
+                "old_termination_log_probs",
+                "old_termination_entropies",
+            ):
+                batch[key] = np.pad(batch[key], decision_pad, mode="constant")
+            batch["termination_observations"] = np.pad(
+                batch["termination_observations"], observation_pad, mode="constant"
+            )
+        padded.append(batch)
+    keys = set(padded[0])
+    if any(set(batch) != keys for batch in padded[1:]):
+        raise ValueError("Macro episode batches have different fields")
+    for key in keys:
+        trailing_shape = padded[0][key].shape[1:]
+        if any(batch[key].shape[1:] != trailing_shape for batch in padded[1:]):
+            raise ValueError(f"Macro episode batch shape mismatch for {key}")
+    combined = {key: np.concatenate([batch[key] for batch in padded], axis=0) for key in keys}
+    combined["macro_indices"] = np.arange(len(combined["rewards"]), dtype=np.int64)
+    return combined
+
+
 class PPOTrainer:
     """持有分离 Macro/Micro Actor-Critic、优化器与 episode update。"""
 
@@ -618,6 +824,7 @@ class PPOTrainer:
         actor_learning_rate_override: float | None = None,
         macro_actor_learning_rate_override: float | None = None,
         critic_learning_rate_override: float | None = None,
+        policy_update_total: int = FORMAL_TRAINING_EPISODES // 4,
         capture_macro_transition_trace: bool = False,
         unified_cache_action: bool = True,
         cardinality_corrected_cache_action: bool = True,
@@ -628,6 +835,19 @@ class PPOTrainer:
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable。")
         self.config = context.cfg["algorithm"]["ppo"]
+        self.realizations_per_policy_update = int(
+            self.config.get("realizations_per_policy_update", 4)
+        )
+        if self.realizations_per_policy_update != 4:
+            raise ValueError("PROPOSED formal training requires groups of four realizations.")
+        self.policy_update_total = int(policy_update_total)
+        if self.policy_update_total <= 0:
+            raise ValueError("policy_update_total must be positive")
+        self.macro_actor_learning_rate_schedule = str(
+            self.config.get("macro_actor_learning_rate_schedule", "")
+        )
+        if self.macro_actor_learning_rate_schedule != "cosine":
+            raise ValueError("PROPOSED Macro Actor requires the cosine learning-rate schedule.")
         self.unified_cache_action = bool(unified_cache_action)
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
@@ -641,6 +861,7 @@ class PPOTrainer:
         self.checkpoint_method = CHECKPOINT_METHOD
         self.capture_macro_transition_trace = bool(capture_macro_transition_trace)
         self.last_macro_transition_trace: dict[str, np.ndarray] | None = None
+        self.last_macro_transition_traces: list[dict[str, np.ndarray]] = []
         self.initialization_metadata: dict[str, Any] = {}
         self.macro_critic_target_mode = str(
             self.config.get("macro_critic_target_mode", MACRO_CRITIC_TARGET_MODE)
@@ -672,7 +893,23 @@ class PPOTrainer:
             or self.long_value_max_grad_norm <= 0.0
         ):
             raise ValueError("long_value_max_grad_norm must be finite and positive.")
-        self.duration_candidates = macro_duration_candidates_from_project(context.cfg)
+        self.adaptive_holding_enabled = bool(
+            self.config.get("adaptive_holding_enabled", False)
+        )
+        self.adaptive_holding_min_slots = int(
+            self.config.get("adaptive_holding_min_slots", 0)
+        )
+        self.adaptive_holding_max_slots = int(
+            self.config.get("adaptive_holding_max_slots", 0)
+        )
+        if (
+            not self.adaptive_holding_enabled
+            or self.adaptive_holding_min_slots <= 0
+            or self.adaptive_holding_max_slots < self.adaptive_holding_min_slots
+            or self.adaptive_holding_max_slots
+            > int(context.observation_spec.prediction_horizon)
+        ):
+            raise ValueError("PROPOSED adaptive holding contract is invalid.")
         tensor_spec = PrimitiveTensorSpec.create(context)
         macro_feature_dim = 2 * int(np.asarray(context.initial_cache).size) + 1
         micro_feature_dim = int(tensor_spec.uav_feature_dim) + 2
@@ -681,8 +918,8 @@ class PPOTrainer:
             int(context.observation_spec.observation_dim),
             macro_feature_dim,
             micro_feature_dim,
-            self.duration_candidates,
-            int(context.observation_spec.prediction_horizon),
+            self.adaptive_holding_min_slots,
+            self.adaptive_holding_max_slots,
             self.hidden_sizes,
             unified_cache_action=self.unified_cache_action,
             cardinality_corrected_cache_action=self.cardinality_corrected_cache_action,
@@ -692,11 +929,23 @@ class PPOTrainer:
             if actor_learning_rate_override is not None
             else self.config.get("actor_learning_rate", self.config["learning_rate"])
         )
-        macro_actor_lr = float(
-            macro_actor_learning_rate_override
-            if macro_actor_learning_rate_override is not None
-            else actor_lr
+        macro_actor_lr_initial = float(
+            self.config.get("macro_actor_learning_rate", actor_lr)
         )
+        if macro_actor_learning_rate_override is not None:
+            macro_actor_lr_initial = float(macro_actor_learning_rate_override)
+        macro_actor_lr_final = float(
+            self.config.get("macro_actor_final_learning_rate", 1.0e-4)
+        )
+        if (
+            not math.isfinite(macro_actor_lr_initial)
+            or macro_actor_lr_initial <= 0.0
+            or not math.isfinite(macro_actor_lr_final)
+            or macro_actor_lr_final <= 0.0
+            or macro_actor_lr_initial < macro_actor_lr_final
+        ):
+            raise ValueError("Macro Actor cosine learning-rate endpoints are invalid.")
+        macro_actor_lr = macro_actor_lr_initial
         if not math.isfinite(macro_actor_lr) or macro_actor_lr <= 0.0:
             raise ValueError("macro actor learning rate must be finite and positive.")
         critic_lr = float(
@@ -750,6 +999,8 @@ class PPOTrainer:
         self.learning_rates = {
             "actor": actor_lr,
             "macro_actor": macro_actor_lr,
+            "macro_actor_initial": macro_actor_lr_initial,
+            "macro_actor_final": macro_actor_lr_final,
             "micro_actor": actor_lr,
             "critic": critic_lr,
             "macro_critic": macro_critic_lr,
@@ -758,6 +1009,7 @@ class PPOTrainer:
         }
         self.training_counters = {
             "completed_episodes": 0,
+            "policy_update_count": 0,
             "micro_optimizer_steps": 0,
             "macro_optimizer_steps": 0,
             "micro_actor_optimizer_steps": 0,
@@ -782,13 +1034,24 @@ class PPOTrainer:
             "observation_dim": int(self.policy.observation_dim),
             "macro_cache_feature_dim": int(self.policy.macro_cache_feature_dim),
             "micro_uav_feature_dim": int(self.policy.micro_uav_feature_dim),
-            "duration_candidates": list(self.policy.duration_candidates),
-            "prediction_horizon": int(self.policy.prediction_horizon),
+            "adaptive_holding_enabled": self.adaptive_holding_enabled,
+            "adaptive_holding_min_slots": self.adaptive_holding_min_slots,
+            "adaptive_holding_max_slots": self.adaptive_holding_max_slots,
+            "prediction_horizon": int(self.context.observation_spec.prediction_horizon),
             "hidden_sizes": list(self.hidden_sizes),
             "policy_schema": str(self.policy.architecture_id),
             "architecture_version": int(self.policy.architecture_version),
             "algorithm_id": self.algorithm_id,
             "macro_actor_advantage_mode": MACRO_ACTOR_ADVANTAGE_MODE,
+            "realizations_per_policy_update": self.realizations_per_policy_update,
+            "policy_update_total": self.policy_update_total,
+            "macro_actor_learning_rate_schedule": self.macro_actor_learning_rate_schedule,
+            "macro_actor_learning_rate_initial": self.learning_rates[
+                "macro_actor_initial"
+            ],
+            "macro_actor_learning_rate_final": self.learning_rates[
+                "macro_actor_final"
+            ],
             "macro_critic_target_mode": self.macro_critic_target_mode,
             "macro_critic_value_loss_coefficient": float(
                 self.config["value_loss_coefficient"]
@@ -796,52 +1059,142 @@ class PPOTrainer:
             "macro_critic_architecture": "400-128-128-1 (SiLU)",
             "macro_critic_optimizer": "single Adam",
             "macro_critic_optimizer_epsilon": 1.0e-5,
-            "macro_critic_group_objective": "0.01 times raw current and last1 MSE",
+            "macro_critic_group_objective": "0.01 times raw current-group and previous-group-last1 MSE",
             "macro_critic_conflict_projection": "last1 norm-matched; current-priority projection; final norm matched to current",
             "long_value_enabled": self.long_value_enabled,
             "long_value_target": self.long_value_target,
             "long_value_learning_rate": self.learning_rates["long_value"],
             "long_value_steps_per_update": self.long_value_steps_per_update,
             "long_value_max_grad_norm": self.long_value_max_grad_norm,
-            "cache_action_semantics": "single masked categorical over KEEP candidate 0 and legal UPDATE candidates; Duration conditioned on selected candidate",
+            "cache_action_semantics": "single masked categorical over KEEP candidate 0 and legal UPDATE candidates; holding termination uses post-slot observation and elapsed fraction",
             "cardinality_corrected_cache_action": True,
             "cache_candidate_probability_semantics": "legal UPDATE logits subtract log of the legal nonzero candidate count",
             "unified_cache_action": True,
+            "micro_group_entropy_floor_enabled": True,
+            "micro_group_probability_soft_cap": float(
+                self.config["micro_group_probability_soft_cap"]
+            ),
+            "micro_group_entropy_floor": self._micro_group_entropy_floor(),
+            "micro_group_entropy_floor_coefficient": float(
+                self.config["micro_group_entropy_floor_coefficient"]
+            ),
+            "micro_target_kl": float(self.config["micro_target_kl"]),
+            "macro_target_kl": float(self.config["macro_target_kl"]),
+            "micro_actor_objective": (
+                "single joint UAV0/UAV1 PPO clipped surrogate plus "
+                "STAY/MOVE group entropy-floor regularization"
+            ),
         }
 
-    def update_from_episode(self, collection: EpisodeCollection) -> dict[str, Any]:
-        """Update the PROPOSED Macro and Micro policies from one completed episode."""
+    def _micro_group_entropy_floor(self) -> float:
+        probability_cap = float(self.config["micro_group_probability_soft_cap"])
+        return float(
+            -probability_cap * math.log(probability_cap)
+            - (1.0 - probability_cap) * math.log(1.0 - probability_cap)
+        )
 
-        micro_metrics = self._update_micro(collection.micro)
-        macro_metrics = self._update_macro(collection.macro)
-        self.training_counters["completed_episodes"] += 1
-        self.training_counters["environment_executions"] += int(
-            collection.summary["environment_execution_count"]
+    def _macro_actor_learning_rate_for_update(self, update_index: int) -> float:
+        last_index = max(self.policy_update_total - 1, 1)
+        progress = min(max(int(update_index), 0), last_index) / last_index
+        initial = float(self.learning_rates["macro_actor_initial"])
+        final = float(self.learning_rates["macro_actor_final"])
+        return final + 0.5 * (initial - final) * (1.0 + math.cos(math.pi * progress))
+
+    def _apply_macro_actor_learning_rate(self, update_index: int) -> float:
+        rate = self._macro_actor_learning_rate_for_update(update_index)
+        for parameter_group in self.macro_optimizer.param_groups:
+            parameter_group["lr"] = rate
+        self.learning_rates["macro_actor"] = rate
+        return rate
+
+    def update_from_episodes(
+        self, collections: list[EpisodeCollection]
+    ) -> dict[str, Any]:
+        """用同一冻结策略采样的四条 rollout 执行一次 PROPOSED 更新。"""
+
+        group_size = self.realizations_per_policy_update
+        if len(collections) != group_size:
+            raise ValueError(f"policy update requires exactly {group_size} realizations")
+        episode_start = int(self.training_counters["completed_episodes"]) + 1
+        if (episode_start - 1) % group_size != 0:
+            raise RuntimeError("training state is not on a policy-update group boundary")
+        for collection in collections:
+            _validate_episode_terminal(
+                np.asarray([item.done for item in collection.micro.transitions], dtype=bool),
+                "Micro",
+            )
+            _validate_episode_terminal(
+                np.asarray([item.done for item in collection.macro.transitions], dtype=bool),
+                "Macro",
+            )
+
+        applied_learning_rate = self._apply_macro_actor_learning_rate(
+            int(self.training_counters["policy_update_count"])
         )
-        self.training_counters["matching_calls"] += int(
-            collection.summary["matching_call_count"]
+        micro_metrics = self._update_micro([collection.micro for collection in collections])
+        macro_metrics = self._update_macro(
+            [collection.macro for collection in collections],
+            episode_start_index=episode_start,
         )
-        self.training_counters["kkt_calls"] += int(collection.summary["kkt_call_count"])
+        self.training_counters["completed_episodes"] += group_size
+        self.training_counters["policy_update_count"] += 1
+        for collection in collections:
+            self.training_counters["environment_executions"] += int(
+                collection.summary["environment_execution_count"]
+            )
+            self.training_counters["matching_calls"] += int(
+                collection.summary["matching_call_count"]
+            )
+            self.training_counters["kkt_calls"] += int(
+                collection.summary["kkt_call_count"]
+            )
+        update_index = int(self.training_counters["policy_update_count"])
+        episode_end = episode_start + group_size - 1
         return {
             **micro_metrics,
             **macro_metrics,
+            "policy_update_group_id": update_index,
+            "policy_update_index": update_index,
+            "policy_update_total": self.policy_update_total,
+            "policy_update_group_start_episode": episode_start,
+            "policy_update_group_end_episode": episode_end,
+            "policy_update_group_size": group_size,
+            "policy_update_group_episode_indices": list(range(episode_start, episode_end + 1)),
+            "policy_update_group_seeds": [
+                collection.summary.get("episode_seed") for collection in collections
+            ],
+            "macro_actor_learning_rate_applied": applied_learning_rate,
+            "macro_actor_learning_rate_schedule": self.macro_actor_learning_rate_schedule,
+            "combined_macro_advantage_mean": float(macro_metrics["macro_adv_mean"]),
+            "combined_macro_advantage_std": float(macro_metrics["macro_adv_std"]),
+            "combined_micro_advantage_mean": float(micro_metrics["micro_adv_mean"]),
+            "combined_micro_advantage_std": float(micro_metrics["micro_adv_std"]),
+            **self.training_counters,
         }
 
 
 
 
-    def _update_micro(self, buffer: MicroRolloutBuffer) -> dict[str, Any]:
-        batch = _micro_batch(buffer)
+    def _update_micro(self, buffers: list[MicroRolloutBuffer]) -> dict[str, Any]:
+        episode_batches = [_micro_batch(buffer) for buffer in buffers]
+        episode_advantages: list[np.ndarray] = []
+        episode_returns: list[np.ndarray] = []
+        for episode_batch in episode_batches:
+            _validate_episode_terminal(episode_batch["dones"], "Micro")
+            advantages, returns = compute_gae(
+                episode_batch["rewards"],
+                episode_batch["old_values"].astype(np.float64),
+                episode_batch["dones"],
+                0.0,
+                float(self.config["gamma"]),
+                float(self.config["gae_lambda"]),
+            )
+            episode_advantages.append(advantages)
+            episode_returns.append(returns)
+        batch = _concat_micro_batches(episode_batches)
         count = len(batch["rewards"])
-        values = batch["old_values"].astype(np.float64)
-        advantages, returns = compute_gae(
-            batch["rewards"],
-            values,
-            batch["dones"],
-            0.0,
-            float(self.config["gamma"]),
-            float(self.config["gae_lambda"]),
-        )
+        advantages = np.concatenate(episode_advantages).astype(np.float32, copy=False)
+        returns = np.concatenate(episode_returns).astype(np.float32, copy=False)
         normalized, adv_mean, adv_std = _normalize_advantages(advantages)
         batch["advantages"] = normalized
         batch["returns"] = returns
@@ -854,10 +1207,40 @@ class PPOTrainer:
         clip = float(self.config["clip_epsilon"])
         value_coefficient = float(self.config["value_loss_coefficient"])
         entropy_coefficient = float(self.config["entropy_coefficient"])
-        target_kl = float(self.config["target_kl"])
+        target_kl = float(self.config["micro_target_kl"])
+        group_entropy_floor = self._micro_group_entropy_floor()
+        group_entropy_floor_coefficient = float(
+            self.config["micro_group_entropy_floor_coefficient"]
+        )
         max_grad_norm = float(self.config["max_grad_norm"])
         records: list[dict[str, float]] = []
         stopped = False
+        before_tensors = self._tensor_batch(batch, np.arange(count, dtype=np.int64))
+        with torch.no_grad():
+            before_evaluation = self.policy.evaluate_micro_joint(
+                before_tensors["observations"],
+                before_tensors["candidate_features"],
+                before_tensors["candidate_masks"],
+                before_tensors["actions"],
+                before_tensors["conditions"],
+            )
+            uav0_group_entropy_before = float(
+                before_evaluation.uav0_group_entropy.mean().detach().cpu()
+            )
+            uav1_group_entropy_before = float(
+                before_evaluation.uav1_group_entropy.mean().detach().cpu()
+            )
+            group_probability_max_before = float(
+                torch.stack(
+                    (
+                        before_evaluation.uav0_stay_probability,
+                        before_evaluation.uav0_move_probability,
+                        before_evaluation.uav1_stay_probability,
+                        before_evaluation.uav1_move_probability,
+                    ),
+                    dim=-1,
+                ).max().detach().cpu()
+            )
         for _epoch in range(epochs):
             indices = np.random.permutation(count)
             for index_group in np.array_split(indices, minibatches):
@@ -880,7 +1263,22 @@ class PPOTrainer:
                 ).mean()
                 value_loss = torch.mean((evaluated.value - tensors["returns"]) ** 2)
                 entropy = evaluated.entropy.mean()
-                loss = actor_loss + value_coefficient * value_loss - entropy_coefficient * entropy
+                group_entropies = torch.stack(
+                    (evaluated.uav0_group_entropy, evaluated.uav1_group_entropy),
+                    dim=-1,
+                )
+                group_entropy_floor_loss = group_entropy_floor_coefficient * torch.relu(
+                    group_entropy_floor - group_entropies
+                ).mean()
+                group_entropy_floor_active_fraction = torch.mean(
+                    (group_entropies < group_entropy_floor).to(group_entropies.dtype)
+                )
+                loss = (
+                    actor_loss
+                    + value_coefficient * value_loss
+                    + group_entropy_floor_loss
+                    - entropy_coefficient * entropy
+                )
                 self.micro_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 micro_actor_parameters = self.policy.micro_actor_parameters()
@@ -909,6 +1307,12 @@ class PPOTrainer:
                         "actor_loss": float(actor_loss.detach().cpu()),
                         "value_loss": float(value_loss.detach().cpu()),
                         "entropy": float(entropy.detach().cpu()),
+                        "group_entropy_floor_loss_mean": float(
+                            group_entropy_floor_loss.detach().cpu()
+                        ),
+                        "group_entropy_floor_active_fraction": float(
+                            group_entropy_floor_active_fraction.detach().cpu()
+                        ),
                         "approx_kl": float(approx_kl.detach().cpu()),
                         "clip_fraction": float(clip_fraction.detach().cpu()),
                         "actor_grad_norm_before_clip": micro_actor_before_clip,
@@ -925,6 +1329,30 @@ class PPOTrainer:
         self.training_counters["micro_update_count"] += 1
         result = self._aggregate_update_metrics("micro", records)
         with torch.no_grad():
+            after_evaluation = self.policy.evaluate_micro_joint(
+                before_tensors["observations"],
+                before_tensors["candidate_features"],
+                before_tensors["candidate_masks"],
+                before_tensors["actions"],
+                before_tensors["conditions"],
+            )
+            uav0_group_entropy_after = float(
+                after_evaluation.uav0_group_entropy.mean().detach().cpu()
+            )
+            uav1_group_entropy_after = float(
+                after_evaluation.uav1_group_entropy.mean().detach().cpu()
+            )
+            group_probability_max_after = float(
+                torch.stack(
+                    (
+                        after_evaluation.uav0_stay_probability,
+                        after_evaluation.uav0_move_probability,
+                        after_evaluation.uav1_stay_probability,
+                        after_evaluation.uav1_move_probability,
+                    ),
+                    dim=-1,
+                ).max().detach().cpu()
+            )
             predictions = (
                 self.policy.micro_value(
                     torch.as_tensor(
@@ -957,27 +1385,69 @@ class PPOTrainer:
                     returns, predictions
                 ),
                 "micro_early_stop": bool(stopped),
+                "micro_target_kl": float(target_kl),
+                "micro_group_entropy_floor": float(group_entropy_floor),
+                "micro_group_entropy_floor_coefficient": float(
+                    group_entropy_floor_coefficient
+                ),
+                "micro_uav0_group_entropy_before_update": uav0_group_entropy_before,
+                "micro_uav1_group_entropy_before_update": uav1_group_entropy_before,
+                "micro_uav0_group_entropy_after_update": uav0_group_entropy_after,
+                "micro_uav1_group_entropy_after_update": uav1_group_entropy_after,
+                "micro_group_probability_max_before_update": group_probability_max_before,
+                "micro_group_probability_max_after_update": group_probability_max_after,
             }
         )
         return result
 
-    def _update_macro(self, buffer: MacroRolloutBuffer) -> dict[str, Any]:
-        batch = _macro_batch(buffer)
+    def _update_macro(
+        self,
+        buffers: list[MacroRolloutBuffer],
+        *,
+        episode_start_index: int,
+    ) -> dict[str, Any]:
+        episode_batches = [_macro_batch(buffer) for buffer in buffers]
+        episode_advantages: list[np.ndarray] = []
+        episode_critic_targets: list[np.ndarray] = []
+        episode_return_to_go: list[np.ndarray] = []
+        for episode_batch in episode_batches:
+            _validate_episode_terminal(episode_batch["dones"], "Macro")
+            raw_advantage, _ = compute_macro_smdp_gae(
+                episode_batch["rewards"],
+                episode_batch["old_values"].astype(np.float64),
+                episode_batch["old_next_values"],
+                episode_batch["actual_durations"],
+                episode_batch["dones"],
+                float(self.config["gamma"]),
+                float(self.config["gae_lambda"]),
+            )
+            episode_advantages.append(raw_advantage)
+            episode_critic_targets.append(
+                build_macro_n2_target(
+                    episode_batch["rewards"],
+                    episode_batch["old_values"],
+                    episode_batch["actual_durations"],
+                    episode_batch["dones"],
+                    float(self.config["gamma"]),
+                ).astype(np.float32)
+            )
+            episode_return_to_go.append(
+                _realized_smdp_return_to_go(
+                    episode_batch["rewards"],
+                    episode_batch["actual_durations"],
+                    episode_batch["dones"],
+                    float(self.config["gamma"]),
+                )
+            )
+        batch = _concat_macro_batches(episode_batches)
         count = len(batch["rewards"])
-        episode_index = int(self.training_counters["completed_episodes"]) + 1
+        episode_end_index = int(episode_start_index) + len(buffers) - 1
         last1_buffer = self.last1_macro_transition_buffer
-        if last1_buffer is not None and int(last1_buffer["episode_index"]) != episode_index - 1:
+        if last1_buffer is not None and int(last1_buffer["episode_index"]) != int(episode_start_index) - 1:
             raise RuntimeError("Last1 buffer must contain exactly the preceding episode.")
         next_values = batch["old_next_values"].astype(np.float32, copy=True)
-        values = batch["old_values"].astype(np.float64)
-        macro_actor_advantage, _gae_value_targets = compute_macro_smdp_gae(
-            batch["rewards"],
-            values,
-            next_values,
-            batch["durations"],
-            batch["dones"],
-            float(self.config["gamma"]),
-            float(self.config["gae_lambda"]),
+        macro_actor_advantage = np.concatenate(episode_advantages).astype(
+            np.float32, copy=False
         )
         normalized_actor_advantage, adv_mean, adv_std = _normalize_advantages(
             macro_actor_advantage
@@ -1005,13 +1475,9 @@ class PPOTrainer:
                 .numpy()
                 .astype(np.float32, copy=True)
             )
-        macro_critic_target = build_macro_n2_target(
-            batch["rewards"],
-            frozen_current_values,
-            batch["durations"],
-            batch["dones"],
-            float(self.config["gamma"]),
-        ).astype(np.float32)
+        macro_critic_target = np.concatenate(episode_critic_targets).astype(
+            np.float32, copy=False
+        )
         last1_target = None
         if last1_buffer is not None:
             assert frozen_last1_values is not None
@@ -1022,45 +1488,82 @@ class PPOTrainer:
                 last1_buffer["dones"],
                 float(self.config["gamma"]),
             ).astype(np.float32)
-        realized_return_to_go = _realized_smdp_return_to_go(
-            batch["rewards"],
-            batch["durations"],
-            batch["dones"],
-            float(self.config["gamma"]),
+        realized_return_to_go = np.concatenate(episode_return_to_go).astype(
+            np.float32, copy=False
         )
         self.last_macro_transition_trace = None
+        self.last_macro_transition_traces = []
         if self.capture_macro_transition_trace:
-            self.last_macro_transition_trace = {
-                "observation": batch["observations"].astype(np.float32, copy=True),
-                "next_observation": batch["next_observations"].astype(np.float32, copy=True),
-                "macro_reward": batch["rewards"].astype(np.float32, copy=True),
-                "requested_duration": batch["requested_durations"].astype(np.int64, copy=True),
-                "actual_duration": batch["durations"].astype(np.int64, copy=True),
-                "done": batch["dones"].astype(bool, copy=True),
-                "old_value": frozen_current_values.copy(),
-                "old_next_value": next_values.astype(np.float32, copy=True),
-                "critic_training_target": macro_critic_target.astype(np.float32, copy=True),
-                "realized_return_to_go": realized_return_to_go.astype(np.float32, copy=True),
-            }
-            n2_bootstrap_old_value = np.zeros(count, dtype=np.float32)
-            n2_bootstrap_frame_index = np.full(count, -1, dtype=np.int64)
-            for index in range(count):
-                if batch["dones"][index] or batch["dones"][index + 1]:
-                    continue
-                n2_bootstrap_old_value[index] = frozen_current_values[index + 2]
-                n2_bootstrap_frame_index[index] = index + 2
-            self.last_macro_transition_trace.update(
-                {
-                    "n2_target": macro_critic_target.astype(np.float32, copy=True),
-                    "n2_bootstrap_old_value": n2_bootstrap_old_value,
-                    "n2_bootstrap_frame_index": n2_bootstrap_frame_index,
-                }
-            )
+            for episode_batch, episode_target, episode_rtg in zip(
+                episode_batches,
+                episode_critic_targets,
+                episode_return_to_go,
+                strict=True,
+            ):
+                episode_count = len(episode_batch["rewards"])
+                episode_old_values = episode_batch["old_values"].astype(
+                    np.float32, copy=True
+                )
+                bootstrap_old_value = np.zeros(episode_count, dtype=np.float32)
+                bootstrap_frame_index = np.full(episode_count, -1, dtype=np.int64)
+                for index in range(episode_count):
+                    if (
+                        episode_batch["dones"][index]
+                        or index + 1 >= episode_count
+                        or episode_batch["dones"][index + 1]
+                    ):
+                        continue
+                    bootstrap_old_value[index] = episode_old_values[index + 2]
+                    bootstrap_frame_index[index] = index + 2
+                self.last_macro_transition_traces.append(
+                    {
+                        "observation": episode_batch["observations"].astype(
+                            np.float32, copy=True
+                        ),
+                        "next_observation": episode_batch["next_observations"].astype(
+                            np.float32, copy=True
+                        ),
+                        "macro_reward": episode_batch["rewards"].astype(
+                            np.float32, copy=True
+                        ),
+                        "actual_duration": episode_batch["actual_durations"].astype(
+                            np.int64, copy=True
+                        ),
+                        "termination_observations": episode_batch[
+                            "termination_observations"
+                        ].astype(np.float32, copy=True),
+                        "termination_elapsed_slots": episode_batch[
+                            "termination_elapsed_slots"
+                        ].astype(np.int64, copy=True),
+                        "termination_actions": episode_batch[
+                            "termination_actions"
+                        ].astype(np.int64, copy=True),
+                        "termination_masks": episode_batch[
+                            "termination_masks"
+                        ].astype(bool, copy=True),
+                        "old_termination_log_probs": episode_batch[
+                            "old_termination_log_probs"
+                        ].astype(np.float32, copy=True),
+                        "old_termination_entropies": episode_batch[
+                            "old_termination_entropies"
+                        ].astype(np.float32, copy=True),
+                        "done": episode_batch["dones"].astype(bool, copy=True),
+                        "old_value": episode_old_values,
+                        "old_next_value": episode_batch["old_next_values"].astype(
+                            np.float32, copy=True
+                        ),
+                        "critic_training_target": episode_target.copy(),
+                        "realized_return_to_go": episode_rtg.copy(),
+                        "n2_target": episode_target.copy(),
+                        "n2_bootstrap_old_value": bootstrap_old_value,
+                        "n2_bootstrap_frame_index": bootstrap_frame_index,
+                    }
+                )
         batch["macro_critic_targets"] = macro_critic_target.copy()
         selected_groups = batch["cache_actions"] > 0
         clip = float(self.config["clip_epsilon"])
         entropy_coefficient = float(self.config["entropy_coefficient"])
-        target_kl = float(self.config["target_kl"])
+        target_kl = float(self.config["macro_target_kl"])
         max_grad_norm = float(self.config["max_grad_norm"])
         critic_steps = int(self.config.get("macro_critic_steps_per_update", 50))
         if critic_steps != 50:
@@ -1090,8 +1593,10 @@ class PPOTrainer:
                 tensors["candidate_features"],
                 tensors["candidate_masks"],
                 tensors["cache_actions"],
-                tensors["duration_masks"],
-                tensors["duration_actions"],
+                tensors["termination_observations"],
+                tensors["termination_elapsed_slots"],
+                tensors["termination_actions"],
+                tensors["termination_masks"],
             )
             decomposition_error = float(
                 components.joint_logprob_decomposition_error.max().detach().cpu()
@@ -1108,26 +1613,38 @@ class PPOTrainer:
                         "Unified sampled Macro log-probability does not match the stored rollout value: "
                         f"{rollout_logprob_max_error:.9g}."
                     )
-            old_candidate_log_probs = (
-                tensors["old_log_probs"] - tensors["old_duration_log_probs"]
+            cache_log_ratio = (
+                components.cache_log_prob - tensors["old_cache_log_probs"]
             )
-            candidate_log_ratio = components.cache_log_prob - old_candidate_log_probs
-            candidate_ratio = torch.exp(candidate_log_ratio)
-            candidate_kl = torch.mean(
-                (candidate_ratio - 1.0) - candidate_log_ratio
+            cache_ratio = torch.exp(cache_log_ratio)
+            cache_kl = torch.mean((cache_ratio - 1.0) - cache_log_ratio)
+            cache_clip_fraction = torch.mean(
+                (torch.abs(cache_ratio - 1.0) > clip).float()
             )
-            candidate_clip_fraction = torch.mean(
-                (torch.abs(candidate_ratio - 1.0) > clip).float()
+            decision_mask = tensors["termination_masks"]
+            termination_log_ratio = (
+                components.termination_log_probs
+                - tensors["old_termination_log_probs"]
             )
+            if bool(torch.any(decision_mask).item()):
+                selected_termination_log_ratio = termination_log_ratio[decision_mask]
+                selected_termination_ratio = torch.exp(
+                    selected_termination_log_ratio
+                )
+                termination_kl = torch.mean(
+                    (selected_termination_ratio - 1.0)
+                    - selected_termination_log_ratio
+                )
+                termination_clip_fraction = torch.mean(
+                    (torch.abs(selected_termination_ratio - 1.0) > clip).float()
+                )
+            else:
+                termination_kl = torch.zeros((), dtype=cache_kl.dtype, device=self.device)
+                termination_clip_fraction = torch.zeros(
+                    (), dtype=cache_kl.dtype, device=self.device
+                )
 
-            duration_log_ratio = (
-                components.duration_log_prob - tensors["old_duration_log_probs"]
-            )
-            duration_ratio = torch.exp(duration_log_ratio)
-
-            macro_policy_log_prob = components.cache_log_prob + components.duration_log_prob
-            old_macro_policy_log_prob = tensors["old_log_probs"]
-            joint_log_ratio = macro_policy_log_prob - old_macro_policy_log_prob
+            joint_log_ratio = components.joint_log_prob - tensors["old_log_probs"]
             joint_ratio = torch.exp(joint_log_ratio)
             actor_loss = _clipped_ppo_surrogate_loss(
                 joint_ratio, tensors["macro_actor_advantage"], clip
@@ -1139,13 +1656,9 @@ class PPOTrainer:
             value_loss = torch.mean(
                 (components.value - tensors["macro_critic_targets"]) ** 2
             )
-            duration_kl = torch.mean(
-                (duration_ratio - 1.0) - duration_log_ratio
-            )
-            duration_clip_fraction = torch.mean(
-                (torch.abs(duration_ratio - 1.0) > clip).float()
-            )
-            entropy_mean = (components.cache_entropy + components.duration_entropy).mean()
+            entropy_mean = (
+                components.cache_entropy + components.termination_entropy_sum
+            ).mean()
             loss = actor_loss - entropy_coefficient * entropy_mean
             self.macro_optimizer.zero_grad(set_to_none=True)
             self.macro_critic_optimizer.zero_grad(set_to_none=True)
@@ -1168,33 +1681,71 @@ class PPOTrainer:
                     "actor_loss": float(actor_loss.detach().cpu()),
                     "value_loss": float(value_loss.detach().cpu()),
                     "entropy": float(entropy_mean.detach().cpu()),
-                    "approx_kl": float(joint_kl.detach().cpu()),
-                    "clip_fraction": float(joint_clip_fraction.detach().cpu()),
-                    "candidate_ratio_approx_kl": float(candidate_kl.detach().cpu()),
-                    "candidate_ratio_clip_fraction": float(candidate_clip_fraction.detach().cpu()),
-                    "duration_ratio_approx_kl": float(duration_kl.detach().cpu()),
-                    "duration_ratio_clip_fraction": float(duration_clip_fraction.detach().cpu()),
+                    "joint_approx_kl": float(joint_kl.detach().cpu()),
+                    "joint_clip_fraction": float(joint_clip_fraction.detach().cpu()),
+                    "cache_ratio_approx_kl": float(cache_kl.detach().cpu()),
+                    "cache_ratio_clip_fraction": float(cache_clip_fraction.detach().cpu()),
+                    "termination_ratio_approx_kl": float(termination_kl.detach().cpu()),
+                    "termination_ratio_clip_fraction": float(
+                        termination_clip_fraction.detach().cpu()
+                    ),
                     "actor_grad_norm_before_clip": macro_actor_before_clip,
                     "actor_grad_norm_after_clip": macro_actor_after_clip,
                     "critic_grad_norm_before_clip": 0.0,
                     "critic_grad_norm_after_clip": 0.0,
                 }
             )
-            if target_kl > 0.0 and records[-1]["approx_kl"] > 1.5 * target_kl:
+            if target_kl > 0.0 and records[-1]["joint_approx_kl"] > 1.5 * target_kl:
                 stopped = True
                 break
 
+        diagnostic_tensors = self._tensor_batch(batch, all_indices)
+        with torch.no_grad():
+            diagnostic_components = self.policy.evaluate_macro_components(
+                diagnostic_tensors["observations"],
+                diagnostic_tensors["candidate_features"],
+                diagnostic_tensors["candidate_masks"],
+                diagnostic_tensors["cache_actions"],
+                diagnostic_tensors["termination_observations"],
+                diagnostic_tensors["termination_elapsed_slots"],
+                diagnostic_tensors["termination_actions"],
+                diagnostic_tensors["termination_masks"],
+            )
+            joint_log_ratio_abs = torch.abs(
+                diagnostic_components.joint_log_prob
+                - diagnostic_tensors["old_log_probs"]
+            ).detach().cpu().numpy()
+        duration_values = np.asarray(batch["actual_durations"], dtype=np.int64)
+        macro_joint_log_ratio_abs_mean_by_duration = {
+            f"D={duration}": (
+                float(np.mean(joint_log_ratio_abs[duration_values == duration]))
+                if bool(np.any(duration_values == duration))
+                else None
+            )
+            for duration in range(1, 6)
+        }
+        sampled_termination_decisions = np.sum(
+            np.asarray(batch["termination_masks"], dtype=bool), axis=1
+        ).astype(np.int64)
+
         self.training_counters["macro_update_count"] += 1
         result = self._aggregate_update_metrics("macro", records)
+        last_episode_batch = episode_batches[-1]
         self.last1_macro_transition_buffer = {
-            "episode_index": episode_index,
-            "observations": current_observations.copy(),
-            "next_observations": batch["next_observations"].astype(
+            "episode_index": episode_end_index,
+            "observations": last_episode_batch["observations"].astype(
                 np.float32, copy=True
             ),
-            "macro_rewards": batch["rewards"].astype(np.float32, copy=True),
-            "actual_durations": batch["durations"].astype(np.int64, copy=True),
-            "dones": batch["dones"].astype(bool, copy=True),
+            "next_observations": last_episode_batch["next_observations"].astype(
+                np.float32, copy=True
+            ),
+            "macro_rewards": last_episode_batch["rewards"].astype(
+                np.float32, copy=True
+            ),
+            "actual_durations": last_episode_batch["actual_durations"].astype(
+                np.int64, copy=True
+            ),
+            "dones": last_episode_batch["dones"].astype(bool, copy=True),
         }
         long_value_fit = self._update_long_value_critic_only(
             batch["observations"],
@@ -1227,11 +1778,21 @@ class PPOTrainer:
             )
         forced_keep_no_update_count = sum(
             not bool(np.any(item.cache_candidate_masks[1:]))
+            for buffer in buffers
             for item in buffer.transitions
         )
         result.update(
             {
                 "macro_actor_optimizer_steps_this_update": len(records),
+                "macro_sampled_termination_decisions_per_frame_mean": float(
+                    np.mean(sampled_termination_decisions)
+                ),
+                "macro_sampled_termination_decisions_per_frame_max": int(
+                    np.max(sampled_termination_decisions)
+                ),
+                "macro_joint_log_ratio_abs_mean_by_duration": (
+                    macro_joint_log_ratio_abs_mean_by_duration
+                ),
                 "macro_critic_optimizer_steps_this_update": critic_fit["optimizer_steps"],
                 "macro_critic_update_iterations_this_update": critic_fit[
                     "update_iterations"
@@ -1243,18 +1804,18 @@ class PPOTrainer:
                 "macro_critic_target_mode": self.macro_critic_target_mode,
                 "macro_actor_advantage_mean": float(adv_mean),
                 "macro_actor_advantage_std": float(adv_std),
-                "macro_candidate_advantage_mean": float(
+                "macro_update_selected_shared_advantage_mean": float(
                     np.mean(normalized_actor_advantage[selected_groups])
                     if np.any(selected_groups)
                     else 0.0
                 ),
-                "macro_candidate_advantage_std": float(
+                "macro_update_selected_shared_advantage_std": float(
                     np.std(normalized_actor_advantage[selected_groups])
                     if np.any(selected_groups)
                     else 0.0
                 ),
-                "macro_duration_advantage_mean": float(np.mean(normalized_actor_advantage)),
-                "macro_duration_advantage_std": float(np.std(normalized_actor_advantage)),
+                "macro_shared_advantage_mean": float(np.mean(normalized_actor_advantage)),
+                "macro_shared_advantage_std": float(np.std(normalized_actor_advantage)),
                 "joint_logprob_decomposition_max_error": max_decomposition_error,
                 "rollout_logprob_max_error": rollout_logprob_max_error,
                 "macro_early_stop": bool(stopped),
@@ -1340,9 +1901,8 @@ class PPOTrainer:
                 "raw_mse_current": critic_fit["raw_mse_current_mean"],
                 "raw_mse_last1": critic_fit["raw_mse_last1_mean"],
                 "critic_group_episode_indices": (
-                    [episode_index]
-                    if last1_buffer is None
-                    else [episode_index, int(last1_buffer["episode_index"])]
+                    list(range(int(episode_start_index), episode_end_index + 1))
+                    + ([] if last1_buffer is None else [int(last1_buffer["episode_index"])])
                 ),
                 "macro_critic_grad_norm_before_clip": critic_fit[
                     "combined_grad_norm_before_clip_mean"
@@ -1459,7 +2019,7 @@ class PPOTrainer:
                 "current_to_last1_grad_norm_ratio": critic_fit[
                     "current_to_last1_grad_norm_ratio"
                 ],
-                "macro_actor_objective": "joint_cache_duration_ppo_clipped_surrogate",
+                "macro_actor_objective": "one joint PPO clipped surrogate over Cache candidate and sampled termination sequence",
                 "smdp_gae_changed": False,
                 "actor_uses_last1_data": False,
                 "macro_critic_value_loss_coefficient": value_loss_coefficient,
@@ -2074,12 +2634,11 @@ class PPOTrainer:
             for key, value in batch.items()
             if key
             not in {
-                "durations",
+                "actual_durations",
                 "rewards",
                 "old_values",
                 "old_next_values",
                 "next_observations",
-                "requested_durations",
                 "dones",
             }
         }
@@ -2096,6 +2655,12 @@ class PPOTrainer:
     ) -> dict[str, Any]:
         """构造只包含当前 PROPOSED identity 的可恢复 checkpoint。"""
 
+        completed = int(self.training_counters["completed_episodes"])
+        update_count = int(self.training_counters["policy_update_count"])
+        if completed % self.realizations_per_policy_update != 0:
+            raise ValueError("checkpoint completed_episodes is not on a complete group boundary")
+        if update_count != completed // self.realizations_per_policy_update:
+            raise ValueError("checkpoint policy_update_count disagrees with completed_episodes")
         last1 = self.last1_macro_transition_buffer
         return {
             "checkpoint_version": self.checkpoint_version,
@@ -2304,6 +2869,18 @@ class PPOTrainer:
         }
         raw_last1 = payload.get("last1_macro_transition_buffer")
         completed_episodes = int(self.training_counters["completed_episodes"])
+        expected_update_count = completed_episodes // self.realizations_per_policy_update
+        if completed_episodes % self.realizations_per_policy_update != 0:
+            raise ValueError(
+                "checkpoint completed_episodes is not on a policy-update group boundary"
+            )
+        if (
+            int(self.training_counters["policy_update_count"]) != expected_update_count
+            or int(self.training_counters["macro_update_count"]) != expected_update_count
+            or int(self.training_counters["micro_update_count"]) != expected_update_count
+            or int(self.training_counters["long_value_update_count"]) != expected_update_count
+        ):
+            raise ValueError("checkpoint update counters disagree with completed_episodes")
         if raw_last1 is None:
             if completed_episodes != 0:
                 raise ValueError("PROPOSED checkpoint is missing its last1 Macro transition buffer.")
@@ -2351,6 +2928,9 @@ class PPOTrainer:
                 "actual_durations": durations.copy(),
                 "dones": dones.copy(),
             }
+        self._apply_macro_actor_learning_rate(
+            int(self.training_counters["policy_update_count"])
+        )
         if restore_rng:
             if "python_rng_state" not in payload or "numpy_rng_state" not in payload:
                 raise ValueError("checkpoint is missing recoverable RNG state.")
@@ -2416,6 +2996,10 @@ def run_training(
     config_file = Path(config_path).expanduser().resolve(strict=True)
     cfg = project_config.load_config(str(config_file))
     project_config.validate_for_formal_experiment(cfg)
+    group_size = int(cfg["algorithm"]["ppo"]["realizations_per_policy_update"])
+    if int(target_episodes) % group_size != 0:
+        raise ValueError("--epochs must be divisible by realizations_per_policy_update")
+    policy_update_total = int(target_episodes) // group_size
     project_root = Path(cfg["_meta"]["project_root"])
     episode_paths = _resolve_training_episodes(
         project_root=project_root,
@@ -2439,6 +3023,7 @@ def run_training(
         actor_learning_rate_override=actor_learning_rate_override,
         macro_actor_learning_rate_override=macro_actor_learning_rate_override,
         critic_learning_rate_override=critic_learning_rate_override,
+        policy_update_total=policy_update_total,
         capture_macro_transition_trace=save_macro_transition_trace,
     )
     completed = 0
@@ -2452,6 +3037,9 @@ def run_training(
             ("config_raw_sha256", raw_hash),
             ("config_semantic_sha256", semantic_hash),
             ("episode_pool", str(pool_path)),
+            ("target_episodes", int(target_episodes)),
+            ("realizations_per_policy_update", group_size),
+            ("policy_update_total", policy_update_total),
         ):
             if manifest.get(field) != expected:
                 raise ValueError(f"run manifest {field} mismatch。")
@@ -2468,10 +3056,13 @@ def run_training(
         best_return = payload.get("best_episode_return")
         if completed > int(target_episodes):
             raise ValueError("checkpoint completed episodes exceed --epochs。")
+        if completed % group_size != 0:
+            raise ValueError("checkpoint completed_episodes is not on a group boundary")
         _reconcile_run_artifacts_with_checkpoint(
             run_path,
             completed,
             episode_slots=trainer.context.episode_slots,
+            group_size=group_size,
             slot_start=trainer.context.train_origin_start,
         )
     else:
@@ -2517,6 +3108,13 @@ def run_training(
             "architecture_version": int(trainer.policy.architecture_version),
             "checkpoint_version": trainer.checkpoint_version,
             "completed_episodes": int(completed),
+            "policy_update_count": int(
+                trainer.training_counters["policy_update_count"]
+            ),
+            "policy_update_total": int(trainer.policy_update_total),
+            "realizations_per_policy_update": int(
+                trainer.realizations_per_policy_update
+            ),
             "target_episodes": int(target_episodes),
             "best_episode_return": best_return,
             "early_stop_reason": early_stop_reason,
@@ -2534,38 +3132,108 @@ def run_training(
             json.dump(summary, stream, ensure_ascii=False, sort_keys=True, indent=2)
             stream.write("\n")
 
-    for episode_index in range(completed, int(target_episodes)):
-        epoch_started_at = time.perf_counter()
-        realization_path = episode_paths[episode_index]
-        next_context = load_environment_context(
-            str(config_file), realization_dir=realization_path
+    def read_last_record(path: Path) -> dict[str, Any] | None:
+        if not path.is_file():
+            return None
+        last_line = ""
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    last_line = line
+        if not last_line:
+            return None
+        record = json.loads(last_line)
+        if not isinstance(record, dict):
+            raise ValueError(f"{path.name} final record is not an object")
+        return record
+
+    if resume:
+        last_episode_record = read_last_record(episode_metrics_path)
+        last_update_record = read_last_record(update_metrics_path)
+        if completed:
+            update_training_epoch_return_plot(run_path)
+        else:
+            stale_plot = run_path / "plots" / TRAINING_EPOCH_RETURN_PLOT_FILENAME
+            stale_plot.unlink(missing_ok=True)
+
+    save_run_summary()
+    if not resume:
+        trainer.save_checkpoint(
+            checkpoint_path,
+            config_raw_sha256=raw_hash,
+            config_semantic_sha256=semantic_hash,
+            episode_pool=str(pool_path),
+            seed=seed,
+            best_episode_return=None,
         )
-        _assert_realization_context_compatible(context, next_context)
-        trainer.context = context = next_context
-        try:
-            collection = collect_dual_timescale_episode(
-                trainer.policy,
-                context,
-                aligned_train_steps(context),
-                trainer.duration_candidates,
-                deterministic=False,
-                episode_seed=(
-                    int(episode_seed_start if episode_seed_start is not None else seed)
-                    + episode_index
-                ),
+
+    for group_zero_start in range(completed, int(target_episodes), group_size):
+        group_started_at = time.perf_counter()
+        collections: list[EpisodeCollection] = []
+        collection_runtimes: list[float] = []
+        collection_paths: list[Path] = []
+        collection_failure = False
+        frozen_policy_sha256 = _module_state_sha256(trainer.policy)
+        optimizer_step_keys = (
+            "micro_optimizer_steps",
+            "macro_optimizer_steps",
+            "micro_actor_optimizer_steps",
+            "micro_critic_optimizer_steps",
+            "macro_actor_optimizer_steps",
+            "macro_critic_optimizer_steps",
+            "long_value_optimizer_steps",
+        )
+        optimizer_steps_before = tuple(
+            int(trainer.training_counters[key]) for key in optimizer_step_keys
+        )
+        for episode_index in range(group_zero_start, group_zero_start + group_size):
+            collection_started_at = time.perf_counter()
+            realization_path = episode_paths[episode_index]
+            next_context = load_environment_context(
+                str(config_file), realization_dir=realization_path
             )
-        except FloatingPointError as exc:
-            early_stop_reason = "NAN_INF"
-            early_stop_detail = str(exc)
+            _assert_realization_context_compatible(context, next_context)
+            trainer.context = context = next_context
+            episode_seed = int(
+                episode_seed_start if episode_seed_start is not None else seed
+            ) + episode_index
+            try:
+                collection = collect_dual_timescale_episode(
+                    trainer.policy,
+                    context,
+                    aligned_train_steps(context),
+                    deterministic=False,
+                    episode_seed=episode_seed,
+                )
+            except FloatingPointError as exc:
+                early_stop_reason = "NAN_INF"
+                early_stop_detail = str(exc)
+                collection_failure = True
+                break
+            if _contains_nonfinite(collection.summary):
+                early_stop_reason = "NAN_INF"
+                early_stop_detail = "Rollout summary contains NaN/Inf."
+                collection_failure = True
+                break
+            if _module_state_sha256(trainer.policy) != frozen_policy_sha256:
+                raise RuntimeError("Policy parameters changed during a frozen collection group.")
+            optimizer_steps_after = tuple(
+                int(trainer.training_counters[key]) for key in optimizer_step_keys
+            )
+            if optimizer_steps_after != optimizer_steps_before:
+                raise RuntimeError("An optimizer stepped during a frozen collection group.")
+            collections.append(collection)
+            collection_runtimes.append(time.perf_counter() - collection_started_at)
+            collection_paths.append(realization_path)
+        if collection_failure:
             save_run_summary()
             break
-        if _contains_nonfinite(collection.summary):
-            early_stop_reason = "NAN_INF"
-            early_stop_detail = "Rollout summary contains NaN/Inf."
-            save_run_summary()
-            break
+        if len(collections) != group_size:
+            raise RuntimeError("policy-update group collection ended before all realizations completed")
+
+        update_started_at = time.perf_counter()
         try:
-            update_metrics = trainer.update_from_episode(collection)
+            update_metrics = trainer.update_from_episodes(collections)
         except FloatingPointError as exc:
             early_stop_reason = "NAN_INF"
             early_stop_detail = str(exc)
@@ -2576,106 +3244,52 @@ def run_training(
             early_stop_detail = "PPO update metrics contain NaN/Inf."
             save_run_summary()
             break
-        training_epoch_runtime = time.perf_counter() - epoch_started_at
-        completed = episode_index + 1
+        update_runtime = time.perf_counter() - update_started_at
+        group_collection_runtime = float(sum(collection_runtimes))
+        group_training_runtime = time.perf_counter() - group_started_at
+        completed = int(trainer.training_counters["completed_episodes"])
+        group_start = int(update_metrics["policy_update_group_start_episode"])
+        group_end = int(update_metrics["policy_update_group_end_episode"])
+        group_id = int(update_metrics["policy_update_group_id"])
+        group_seeds = list(update_metrics["policy_update_group_seeds"])
+
         if save_macro_transition_trace:
-            trace = trainer.last_macro_transition_trace
-            if trace is None:
-                raise RuntimeError("Macro transition trace capture was enabled but no trace was produced.")
-            trace_count = int(len(trace["macro_reward"]))
-            trace_episode = {
-                "episode_id": completed,
-                "episode_seed": int(episode_seed_start) + episode_index,
-                "macro_frame_index": np.arange(trace_count, dtype=np.int64),
-                **trace,
-            }
-            expected_count = int(collection.summary["macro_frame_count"])
-            if trace_count != expected_count:
-                raise RuntimeError(
-                    f"Macro trace E{completed} has {trace_count} transitions; "
-                    f"episode summary reports {expected_count}."
-                )
-            _, episode_trace_check = build_macro_transition_trace_arrays(
-                [trace_episode],
-                gamma=float(cfg["algorithm"]["ppo"]["gamma"]),
-                expected_macro_frame_counts={completed: expected_count},
-            )
-            if episode_trace_check["transition_count"] <= 0:
-                raise RuntimeError(f"Macro trace E{completed} contains no transitions.")
-            trace_episode_batches.append(trace_episode)
-        episode_return = float(collection.summary["episode_return"])
-        if best_return is None or episode_return > float(best_return):
-            best_return = episode_return
-            trainer.save_checkpoint(
-                checkpoint_path_for_write(run_path, BEST_TRAIN_RETURN_CHECKPOINT_FILENAME),
-                config_raw_sha256=raw_hash,
-                config_semantic_sha256=semantic_hash,
-                episode_pool=str(pool_path),
-                seed=seed,
-                best_episode_return=best_return,
-                checkpoint_role="TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION",
-            )
-        episode_record = {
-            "record_type": "episode",
-            "episode": completed,
-            "episode_seed": (
-                int(episode_seed_start) + episode_index
-                if episode_seed_start is not None
-                else realization_path.name
-            ),
-            "training_epoch_runtime_seconds": float(training_epoch_runtime),
-            **collection.summary,
-        }
-        episode_record.update(
-            {
-                key: value
-                for key, value in update_metrics.items()
-                if key.startswith(
-                    (
-                        "macro_actor_advantage",
-                        "macro_cache_advantage",
-                        "macro_candidate_advantage",
-                        "macro_duration_advantage",
-                        "macro_candidate_",
-                        "macro_critic_",
-                        "macro_critic_target",
-                        "n2_",
-                        "long_value_",
-                        "old_value_",
-                        "old_next_value_",
-                        "td_error_",
-                        "pre_update_target_",
-                        "post_update_target_",
-                        "pre_update_return_",
-                        "post_update_return_",
-                        "critic_target_",
-                    )
-                )
-                or key in {
-                    "macro_actor_advantage_mode",
-                    "macro_critic_target_mode",
-                    "macro_critic_fit_snapshots",
-                    "long_value_fit_snapshots",
-                    "long_value_target",
-                    "long_value_target_detached",
-                    "long_value_target_frozen_during_update",
-                    "long_value_target_sha256_before",
-                    "long_value_target_sha256_after",
-                    "macro_approx_kl",
-                    "macro_clip_fraction",
-                    "joint_logprob_decomposition_max_error",
-                    "macro_early_stop",
-                    "macro_entropy",
-                    "micro_explained_variance",
-                    "micro_approx_kl",
-                    "micro_clip_fraction",
-                    "micro_entropy",
-                    "micro_value_rmse",
-                    "micro_early_stop",
+            if len(trainer.last_macro_transition_traces) != group_size:
+                raise RuntimeError("Macro trace capture did not return one trace per realization.")
+            for offset, (collection, trace) in enumerate(
+                zip(collections, trainer.last_macro_transition_traces, strict=True)
+            ):
+                episode_number = group_start + offset
+                trace_count = int(len(trace["macro_reward"]))
+                expected_count = int(collection.summary["macro_frame_count"])
+                trace_episode = {
+                    "episode_id": episode_number,
+                    "episode_seed": int(group_seeds[offset]),
+                    "macro_frame_index": np.arange(trace_count, dtype=np.int64),
+                    **trace,
                 }
-            }
-        )
-        optimizer_steps_this_episode = {
+                if trace_count != expected_count:
+                    raise RuntimeError(
+                        f"Macro trace E{episode_number} has {trace_count} transitions; "
+                        f"episode summary reports {expected_count}."
+                    )
+                _, episode_trace_check = build_macro_transition_trace_arrays(
+                    [trace_episode],
+                    gamma=float(cfg["algorithm"]["ppo"]["gamma"]),
+                    expected_macro_frame_counts={episode_number: expected_count},
+                )
+                if episode_trace_check["transition_count"] <= 0:
+                    raise RuntimeError(f"Macro trace E{episode_number} contains no transitions.")
+                trace_episode_batches.append(trace_episode)
+
+        episode_returns = [float(item.summary["episode_return"]) for item in collections]
+        group_best_return = max(episode_returns)
+        save_best_train_return_checkpoint = False
+        if best_return is None or group_best_return > float(best_return):
+            best_return = group_best_return
+            save_best_train_return_checkpoint = True
+
+        optimizer_steps_this_update = {
             key: int(update_metrics[key])
             for key in (
                 "macro_actor_optimizer_steps_this_update",
@@ -2685,49 +3299,134 @@ def run_training(
                 "micro_critic_optimizer_steps_this_update",
             )
         }
-        episode_record.update(optimizer_steps_this_episode)
+        grouped_metric_prefixes = (
+            "macro_actor_advantage",
+            "macro_shared_advantage",
+            "macro_update_selected_shared_advantage",
+            "macro_critic_",
+            "macro_critic_target",
+            "n2_",
+            "long_value_",
+            "old_value_",
+            "old_next_value_",
+            "td_error_",
+            "pre_update_target_",
+            "post_update_target_",
+            "pre_update_return_",
+            "post_update_return_",
+            "critic_target_",
+        )
+        grouped_metric_names = {
+            "macro_actor_advantage_mode",
+            "macro_critic_target_mode",
+            "macro_critic_fit_snapshots",
+            "long_value_fit_snapshots",
+            "long_value_target",
+            "long_value_target_detached",
+            "long_value_target_frozen_during_update",
+            "long_value_target_sha256_before",
+            "long_value_target_sha256_after",
+            "macro_joint_approx_kl",
+            "macro_joint_clip_fraction",
+            "macro_sampled_termination_decisions_per_frame_mean",
+            "macro_sampled_termination_decisions_per_frame_max",
+            "macro_joint_log_ratio_abs_mean_by_duration",
+            "macro_cache_ratio_approx_kl",
+            "macro_cache_ratio_clip_fraction",
+            "macro_termination_ratio_approx_kl",
+            "macro_termination_ratio_clip_fraction",
+            "macro_actor_learning_rate_applied",
+            "joint_logprob_decomposition_max_error",
+            "macro_early_stop",
+            "macro_entropy",
+            "micro_explained_variance",
+            "micro_approx_kl",
+            "micro_clip_fraction",
+            "micro_entropy",
+            "micro_value_rmse",
+            "micro_early_stop",
+        }
+        group_metric_copy = {
+            key: value
+            for key, value in update_metrics.items()
+            if key.startswith(grouped_metric_prefixes) or key in grouped_metric_names
+        }
+        episode_records: list[dict[str, Any]] = []
+        for offset, (collection, realization_path) in enumerate(
+            zip(collections, collection_paths, strict=True)
+        ):
+            episode_number = group_start + offset
+            collection_runtime = float(collection_runtimes[offset])
+            episode_record = {
+                "record_type": "episode",
+                "episode": episode_number,
+                "episode_seed": (
+                    int(episode_seed_start) + episode_number - 1
+                    if episode_seed_start is not None
+                    else realization_path.name
+                ),
+                "training_epoch_runtime_seconds": collection_runtime,
+                "episode_collection_runtime_seconds": collection_runtime,
+                "policy_update_group_id": group_id,
+                "policy_update_group_start_episode": group_start,
+                "policy_update_group_end_episode": group_end,
+                "policy_update_group_size": group_size,
+                "update_metric_scope": "policy_update_group",
+                **collection.summary,
+                **group_metric_copy,
+                **optimizer_steps_this_update,
+            }
+            episode_records.append(episode_record)
+
         update_record = {
             "record_type": "update",
-            "episode": completed,
+            "episode": group_end,
+            "group_episode_indices": list(range(group_start, group_end + 1)),
+            "group_seeds": group_seeds,
+            "group_collection_runtime_seconds": group_collection_runtime,
+            "group_training_runtime_seconds": float(group_training_runtime),
+            "policy_update_runtime_seconds": float(update_runtime),
             **update_metrics,
-            **optimizer_steps_this_episode,
+            **optimizer_steps_this_update,
             **trainer.training_counters,
         }
-        last_episode_record = episode_record
-        last_update_record = update_record
-        append_dual_timescale_record(episode_metrics_path, episode_record)
-        append_dual_timescale_record(update_metrics_path, update_record)
         critic_diagnostics_record = {
             "record_type": "critic_diagnostics",
-            "episode": completed,
+            "episode": group_end,
+            "policy_update_group_id": group_id,
+            "policy_update_group_start_episode": group_start,
+            "policy_update_group_end_episode": group_end,
+            "policy_update_group_size": group_size,
             **{
                 key: value
                 for key, value in update_metrics.items()
                 if "critic" in key.lower() or key.startswith("n2_")
             },
         }
-        append_dual_timescale_record(
-            critic_diagnostics_path, critic_diagnostics_record
-        )
-        print(
-            format_training_epoch_log(
-                episode_record,
-                target_epochs=int(target_episodes),
-                macro_actor_learning_rate=trainer.learning_rates["macro_actor"],
-            ),
-            flush=True,
-        )
-        append_dual_timescale_slot_metrics(
-            slot_metrics_path, episode=completed, transitions=collection.micro.transitions
-        )
-        trainer.save_checkpoint(
-            checkpoint_path,
-            config_raw_sha256=raw_hash,
-            config_semantic_sha256=semantic_hash,
-            episode_pool=str(pool_path),
-            seed=seed,
-            best_episode_return=best_return,
-        )
+        last_episode_record = episode_records[-1]
+        last_update_record = update_record
+
+        for episode_record in episode_records:
+            append_dual_timescale_record(episode_metrics_path, episode_record)
+        append_dual_timescale_record(update_metrics_path, update_record)
+        append_dual_timescale_record(critic_diagnostics_path, critic_diagnostics_record)
+        for episode_record, collection in zip(episode_records, collections, strict=True):
+            append_dual_timescale_slot_metrics(
+                slot_metrics_path,
+                episode=int(episode_record["episode"]),
+                transitions=collection.micro.transitions,
+            )
+            print(
+                format_training_epoch_log(
+                    episode_record,
+                    target_epochs=int(target_episodes),
+                    macro_actor_learning_rate=float(
+                        update_metrics["macro_actor_learning_rate_applied"]
+                    ),
+                ),
+                flush=True,
+            )
+
         write_dual_timescale_run_manifest(
             manifest_path,
             config_path=config_file,
@@ -2744,8 +3443,6 @@ def run_training(
         save_run_summary()
         update_training_epoch_return_plot(run_path)
         if save_macro_transition_trace:
-            # Persist each validated cumulative trace before starting the next
-            # episode so a later report/finalization failure cannot lose raw rows.
             trace_summary = write_macro_transition_trace_artifact(
                 run_path,
                 trace_episode_batches,
@@ -2753,8 +3450,24 @@ def run_training(
             )
         if verbose:
             print(json.dumps(update_record, ensure_ascii=False, sort_keys=True))
-        if early_stop_reason is not None:
-            break
+        if save_best_train_return_checkpoint:
+            trainer.save_checkpoint(
+                checkpoint_path_for_write(run_path, BEST_TRAIN_RETURN_CHECKPOINT_FILENAME),
+                config_raw_sha256=raw_hash,
+                config_semantic_sha256=semantic_hash,
+                episode_pool=str(pool_path),
+                seed=seed,
+                best_episode_return=best_return,
+                checkpoint_role="TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION",
+            )
+        trainer.save_checkpoint(
+            checkpoint_path,
+            config_raw_sha256=raw_hash,
+            config_semantic_sha256=semantic_hash,
+            episode_pool=str(pool_path),
+            seed=seed,
+            best_episode_return=best_return,
+        )
     return {
         "run_dir": str(run_path),
         "completed_episodes": completed,

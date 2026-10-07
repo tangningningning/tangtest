@@ -47,6 +47,17 @@ EPISODE_METRIC_NAMES = (
     "total_tasks",
     "mean_task_delay_s",
     "mean_vehicle_energy_j",
+    "uav0_group_stay_probability_mean",
+    "uav0_group_move_probability_mean",
+    "uav0_group_entropy_mean",
+    "uav1_group_stay_probability_mean",
+    "uav1_group_move_probability_mean",
+    "uav1_group_entropy_mean",
+    "micro_group_entropy_mean",
+    "uav0_group_low_entropy_fraction",
+    "uav1_group_low_entropy_fraction",
+    "uav0_group_probability_over_90_fraction",
+    "uav1_group_probability_over_90_fraction",
 )
 
 
@@ -188,12 +199,35 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "mean_task_delay_s": None if task_count == 0 else total_delay / task_count,
         "mean_vehicle_energy_j": None if task_count == 0 else total_energy / task_count,
         "macro_frame_count": int(len(collection.macro)),
-        "requested_duration_mean": float(collection.summary["requested_duration_mean"]),
-        "actual_duration_mean": float(collection.summary["actual_duration_mean"]),
-        "duration_distribution": dict(collection.summary["duration_distribution"]),
-        "actual_duration_distribution": dict(
-            collection.summary["actual_duration_distribution"]
+        "adaptive_holding_duration_mean": float(
+            collection.summary["adaptive_holding_duration_mean"]
         ),
+        "adaptive_holding_duration_std": float(
+            collection.summary["adaptive_holding_duration_std"]
+        ),
+        "holding_duration_distribution": dict(
+            collection.summary["holding_duration_distribution"]
+        ),
+        "termination_sample_count": int(collection.summary["termination_sample_count"]),
+        "termination_eligible_count": int(collection.summary["termination_eligible_count"]),
+        "termination_continue_count": int(collection.summary["termination_continue_count"]),
+        "termination_stop_count": int(collection.summary["termination_stop_count"]),
+        "termination_continue_rate": float(collection.summary["termination_continue_rate"]),
+        "termination_stop_rate": float(collection.summary["termination_stop_rate"]),
+        "termination_entropy_mean": float(collection.summary["termination_entropy_mean"]),
+        "termination_probability_mean": float(
+            collection.summary["termination_probability_mean"]
+        ),
+        "termination_probability_by_elapsed": dict(
+            collection.summary["termination_probability_by_elapsed"]
+        ),
+        "termination_decision_diagnostics": list(
+            collection.summary["termination_decision_diagnostics"]
+        ),
+        "forced_termination_max_holding_count": int(
+            collection.summary["forced_termination_max_holding_count"]
+        ),
+        "terminal_frame_count": int(collection.summary["terminal_frame_count"]),
         "keep_rate": float(collection.summary["keep_rate"]),
         "actual_cache_update_rate": float(collection.summary["actual_cache_update_rate"]),
         "uav0_stay_rate": float(collection.summary["uav0_stay_rate"]),
@@ -204,6 +238,20 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "kkt_call_count": int(collection.summary["kkt_call_count"]),
         "episode_runtime_seconds": float(collection.summary["episode_runtime_seconds"]),
     }
+    for metric_name in (
+        "uav0_group_stay_probability_mean",
+        "uav0_group_move_probability_mean",
+        "uav0_group_entropy_mean",
+        "uav1_group_stay_probability_mean",
+        "uav1_group_move_probability_mean",
+        "uav1_group_entropy_mean",
+        "micro_group_entropy_mean",
+        "uav0_group_low_entropy_fraction",
+        "uav1_group_low_entropy_fraction",
+        "uav0_group_probability_over_90_fraction",
+        "uav1_group_probability_over_90_fraction",
+    ):
+        record[metric_name] = float(collection.summary[metric_name])
     deterministic_actions = collection.summary.get("deterministic_action_selection")
     if deterministic_actions is not None:
         record["deterministic_action_selection"] = deterministic_actions
@@ -261,14 +309,35 @@ def _mean_environment_summary(
         "total_tasks",
         "mean_task_delay_s",
         "mean_vehicle_energy_j",
-        "requested_duration_mean",
-        "actual_duration_mean",
+        "adaptive_holding_duration_mean",
+        "adaptive_holding_duration_std",
+        "termination_sample_count",
+        "termination_eligible_count",
+        "termination_continue_count",
+        "termination_stop_count",
+        "termination_continue_rate",
+        "termination_stop_rate",
+        "termination_entropy_mean",
+        "termination_probability_mean",
+        "forced_termination_max_holding_count",
+        "terminal_frame_count",
         "keep_rate",
         "actual_cache_update_rate",
         "uav0_stay_rate",
         "uav1_stay_rate",
         "uav0_move_rate",
         "uav1_move_rate",
+        "uav0_group_stay_probability_mean",
+        "uav0_group_move_probability_mean",
+        "uav0_group_entropy_mean",
+        "uav1_group_stay_probability_mean",
+        "uav1_group_move_probability_mean",
+        "uav1_group_entropy_mean",
+        "micro_group_entropy_mean",
+        "uav0_group_low_entropy_fraction",
+        "uav1_group_low_entropy_fraction",
+        "uav0_group_probability_over_90_fraction",
+        "uav1_group_probability_over_90_fraction",
         "matching_call_count",
         "kkt_call_count",
     )
@@ -277,14 +346,63 @@ def _mean_environment_summary(
         values = [float(item[key]) for item in repeat_summaries if item.get(key) is not None]
         means[key] = None if not values else float(np.mean(values))
     means["repeat_count"] = len(repeat_summaries)
-    means["duration_distribution"] = {
+    means["holding_duration_distribution"] = {
         key: float(
-            np.mean([float(item["duration_distribution"].get(key, 0)) for item in repeat_summaries])
+            np.mean(
+                [
+                    float(item["holding_duration_distribution"].get(key, 0))
+                    for item in repeat_summaries
+                ]
+            )
         )
         for key in sorted(
-            {duration for item in repeat_summaries for duration in item["duration_distribution"]}
+            {
+                duration
+                for item in repeat_summaries
+                for duration in item["holding_duration_distribution"]
+            }
         )
     }
+    means["termination_probability_by_elapsed"] = {}
+    for elapsed in range(1, 5):
+        rows = [
+            item["termination_probability_by_elapsed"].get(str(elapsed), {})
+            for item in repeat_summaries
+        ]
+        observed = [row for row in rows if int(row.get("sample_count", 0)) > 0]
+        sample_count = sum(int(row["sample_count"]) for row in observed)
+        means["termination_probability_by_elapsed"][str(elapsed)] = {
+            "sample_count": sample_count,
+            "mean_termination_probability": (
+                float(
+                    sum(
+                        float(row["mean_termination_probability"])
+                        * int(row["sample_count"])
+                        for row in observed
+                    )
+                    / sample_count
+                )
+                if sample_count
+                else None
+            ),
+            "selected_termination_rate": (
+                float(
+                    sum(
+                        float(row["selected_termination_rate"])
+                        * int(row["sample_count"])
+                        for row in observed
+                    )
+                    / sample_count
+                )
+                if sample_count
+                else None
+            ),
+        }
+    means["termination_decision_diagnostics"] = [
+        diagnostic
+        for item in repeat_summaries
+        for diagnostic in item["termination_decision_diagnostics"]
+    ]
     return means
 
 
@@ -370,7 +488,6 @@ def evaluate_pool(
                     trainer.policy,
                     context,
                     aligned_train_steps(context),
-                    trainer.duration_candidates,
                     deterministic=policy_action_mode == "deterministic",
                 )
             summary = _episode_summary(collection, episode_seed, repeat_index)
