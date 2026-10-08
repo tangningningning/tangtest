@@ -30,13 +30,13 @@
 
 [experiment]
 # 实验名称。用于后续结果 metadata 和配置快照引用；修改它不需要重新生成数据。
-name = "proposed_joint"
+name = "PROPOSED_CACHE_ECONOMIC_FEATURES_FIXED_LR"
 # 主实验随机种子。当前沿用已有正式数据中的主 seed；修改后若用于生成任务/预测场景，需要重跑对应上游模块。
 seed = 4401
 # 重复实验编号。只用于后续批量实验标识，不改变系统物理模型。
 repeat_index = 0
 # 输出标签。用于后续 result 文件命名；修改它不需要重新生成上游数据。
-output_tag = "proposed_joint_20260919"
+output_tag = "proposed_cache_economic_features_fixed_lr_v1"
 
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
@@ -529,7 +529,7 @@ objective_tolerance = 1.0e-9
 enabled = true
 method = "PROPOSED"
 configuration_control_mode = "macro_cache_smdp_micro_uav_candidate"
-policy_schema = "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
+policy_schema = "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_v1"
 macro_cache_enabled = true
 # 开启自适应 Cache holding；每次至少保持 1 个 slot，最多保持 5 个 slot。
 adaptive_holding_enabled = true
@@ -552,10 +552,11 @@ critic_learning_rate = 1.0e-3
 macro_critic_learning_rate = 1.0e-3
 # 每四个独立 realization 在同一冻结策略下采样后，执行一次 PPO policy update。
 realizations_per_policy_update = 4
-# Macro Actor 仅按 policy update 索引执行 cosine 学习率衰减。
+# 所有优化器在300 Episode / 75 Policy Update内保持固定学习率。
 macro_actor_learning_rate = 5.0e-4
-macro_actor_final_learning_rate = 1.0e-4
-macro_actor_learning_rate_schedule = "cosine"
+macro_actor_final_learning_rate = 5.0e-4
+optimizer_learning_rate_schedule = "constant"
+macro_actor_learning_rate_schedule = "constant"
 macro_critic_target_mode = "two_step_smdp_td"
 long_value_enabled = true
 long_value_target = "realized_return_to_go"

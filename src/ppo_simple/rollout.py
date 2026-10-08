@@ -22,8 +22,11 @@ from . import interface
 from .interface import _copy_uav_positions
 from .policy import DualTimescaleActorCritic
 from .primitive_control import (
+    CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM,
+    CACHE_ECONOMIC_FEATURE_DIM,
     PrimitiveTensorSpec,
     _normalized_xy,
+    cache_economic_candidate_features,
     _target_cache_proposals_with_features,
     _uav_target_position_feature,
 )
@@ -354,11 +357,14 @@ def _cache_candidates(
         {key: np.asarray(value, dtype=np.float64) for key, value in uav.items()},
     )
     candidates = [current.copy()]
+    primitive_features = [
+        np.zeros(int(tensor_spec.cache_feature_dim), dtype=np.float32)
+    ]
     seen = {current.tobytes()}
     for node_index, _node_id in enumerate(context.action_spec.cache_node_ids):
         triggers = np.zeros(current.shape[0], dtype=np.int8)
         triggers[node_index] = 1
-        node_candidates, _node_features = _target_cache_proposals_with_features(
+        node_candidates, node_features = _target_cache_proposals_with_features(
             current,
             current,
             triggers,
@@ -368,13 +374,19 @@ def _cache_candidates(
             context,
             proposal_nodes,
         )
-        for item in node_candidates:
+        if node_features.shape != (
+            len(node_candidates),
+            int(tensor_spec.cache_feature_dim),
+        ):
+            raise AssertionError("selected Cache candidates and primitive features are misaligned")
+        for item, node_feature in zip(node_candidates, node_features, strict=True):
             target = current.copy()
             target[node_index] = np.asarray(item.target_node_cache, dtype=np.int8)
             key = target.tobytes()
             if key not in seen:
                 seen.add(key)
                 candidates.append(target)
+                primitive_features.append(np.asarray(node_feature, dtype=np.float32).copy())
     if not candidates or not np.array_equal(candidates[0], current):
         raise AssertionError("Macro cache candidate 0 必须等于当前实际 Cache。")
     flat_current = current.reshape(-1).astype(np.float32)
@@ -396,6 +408,23 @@ def _cache_candidates(
             for candidate in candidates
         ]
     ).astype(np.float32)
+    if context.policy_schema != interface.PROPOSED_POLICY_SCHEMA:
+        raise ValueError(f"unsupported formal Macro Cache schema: {context.policy_schema}")
+    if features.shape[1] != CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM:
+        raise ValueError("formal economic Macro features require an unchanged 181-D base")
+    economic_features = cache_economic_candidate_features(
+        current,
+        candidates,
+        np.stack(primitive_features).astype(np.float32, copy=False),
+        step,
+        context,
+        proposal_nodes,
+    )
+    if economic_features.shape != (len(candidates), CACHE_ECONOMIC_FEATURE_DIM):
+        raise AssertionError("Cache economic features must align with candidate order")
+    features = np.concatenate((features, economic_features), axis=1).astype(
+        np.float32, copy=False
+    )
     return candidates, features
 
 

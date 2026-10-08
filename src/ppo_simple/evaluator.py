@@ -156,8 +156,40 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         contract.get("architecture_version") != expected_architecture
         or contract.get("unified_cache_action") is not True
         or contract.get("cardinality_corrected_cache_action") is not True
+        or contract.get("macro_cache_feature_dim") != 200
     ):
         raise ValueError("checkpoint PROPOSED configuration contract mismatch")
+    expected_rates = {
+        "macro_actor": 5.0e-4,
+        "micro_actor": 3.0e-4,
+        "macro_critic": 1.0e-3,
+        "micro_critic": 3.0e-3,
+        "long_value_critic": 1.0e-3,
+    }
+    contract_rates = contract.get("learning_rates")
+    payload_rates = payload.get("learning_rates")
+    if (
+        payload.get("macro_actor_learning_rate_schedule") != "constant"
+        or payload.get("optimizer_learning_rate_schedule") != "constant"
+        or contract.get("macro_actor_learning_rate_schedule") != "constant"
+        or contract.get("optimizer_learning_rate_schedule") != "constant"
+        or not isinstance(contract_rates, dict)
+        or not isinstance(payload_rates, dict)
+        or any(contract_rates.get(key) != value for key, value in expected_rates.items())
+        or any(
+            payload_rates.get(key) != value
+            for key, value in {
+                "macro_actor": 5.0e-4,
+                "micro_actor": 3.0e-4,
+                "macro_critic": 1.0e-3,
+                "micro_critic": 3.0e-3,
+                "long_value": 1.0e-3,
+            }.items()
+        )
+        or contract.get("macro_actor_learning_rate_initial") != 5.0e-4
+        or contract.get("macro_actor_learning_rate_final") != 5.0e-4
+    ):
+        raise ValueError("checkpoint fixed-learning-rate contract mismatch")
     return payload
 
 
@@ -428,6 +460,8 @@ def evaluate_pool(
     checkpoint = resolve_checkpoint_reference(Path(checkpoint_path)).resolve(strict=True)
     checkpoint_metadata = _load_checkpoint_metadata(checkpoint)
     reference_context = load_environment_context(str(config_file))
+    if checkpoint_metadata["policy_schema"] != reference_context.policy_schema:
+        raise ValueError("checkpoint policy_schema does not match the selected formal config")
     project_root = reference_context.root
     pool_path = _resolve_path(project_root, episode_pool)
     output_path = _resolve_path(project_root, run_dir)

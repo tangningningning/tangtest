@@ -1823,6 +1823,9 @@ def write_dual_timescale_run_manifest(
         "macro_actor_learning_rate_schedule": str(
             trainer.macro_actor_learning_rate_schedule
         ),
+        "optimizer_learning_rate_schedule": str(
+            trainer.optimizer_learning_rate_schedule
+        ),
         "macro_actor_learning_rate_initial": float(
             trainer.learning_rates["macro_actor_initial"]
         ),

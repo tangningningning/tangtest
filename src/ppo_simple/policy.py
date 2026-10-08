@@ -219,9 +219,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
     architecture_id = (
-        "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
+        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_v1"
     )
-    architecture_version = 27
+    architecture_version = 31
 
     def __init__(
         self,

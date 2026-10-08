@@ -14,6 +14,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+
+PROPOSED_POLICY_SCHEMA = (
+    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_v1"
+)
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - only for Python < 3.11
@@ -768,9 +773,7 @@ def validate_config(
             "configuration_control_mode 必须为 macro_cache_smdp_micro_uav_candidate。"
         )
     policy_schema = str(get_config_value(config, "algorithm.ppo.policy_schema", ""))
-    if policy_schema != (
-        "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
-    ):
+    if policy_schema != PROPOSED_POLICY_SCHEMA:
         raise ValueError("algorithm.ppo.policy_schema 必须为当前 PROPOSED 正式策略 schema。")
     required_flags = {
         "macro_cache_enabled": True,
@@ -914,17 +917,31 @@ def validate_config(
     macro_actor_learning_rate_schedule = str(
         get_config_value(config, "algorithm.ppo.macro_actor_learning_rate_schedule", "")
     )
+    macro_actor_learning_rate = float(
+        get_config_value(config, "algorithm.ppo.macro_actor_learning_rate", math.nan)
+    )
+    macro_actor_final_learning_rate = float(
+        get_config_value(config, "algorithm.ppo.macro_actor_final_learning_rate", math.nan)
+    )
+    optimizer_learning_rate_schedule = str(
+        get_config_value(config, "algorithm.ppo.optimizer_learning_rate_schedule", "")
+    )
     if (
         not math.isfinite(macro_actor_learning_rate)
         or not math.isfinite(macro_actor_final_learning_rate)
         or macro_actor_learning_rate <= 0.0
         or macro_actor_final_learning_rate <= 0.0
-        or macro_actor_final_learning_rate > macro_actor_learning_rate
-        or macro_actor_learning_rate_schedule != "cosine"
+        or not math.isclose(
+            macro_actor_final_learning_rate,
+            macro_actor_learning_rate,
+            rel_tol=0.0,
+            abs_tol=1.0e-15,
+        )
+        or macro_actor_learning_rate_schedule != "constant"
+        or optimizer_learning_rate_schedule != "constant"
     ):
         raise ValueError(
-            "PROPOSED Macro Actor LR endpoints must be positive and finite, "
-            "with final <= initial and the cosine schedule."
+            "PROPOSED Macro Actor endpoints and all optimizer schedules must be constant."
         )
     if ppo_value_coef < 0.0 or ppo_entropy_coef < 0.0:
         raise ValueError("value_loss_coefficient 和 entropy_coefficient 不能为负。")

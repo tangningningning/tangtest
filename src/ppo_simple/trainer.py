@@ -39,7 +39,11 @@ from .macro_targets import (
     build_macro_n2_target,
 )
 from .policy import DualTimescaleActorCritic
-from .primitive_control import PrimitiveTensorSpec
+from .primitive_control import (
+    CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM,
+    CACHE_ECONOMIC_FEATURE_DIM,
+    PrimitiveTensorSpec,
+)
 from .reporting import (
     RUN_MANIFEST_FILENAME,
     RUN_SUMMARY_FILENAME,
@@ -69,7 +73,7 @@ from .rollout import (
 CHECKPOINT_METHOD = "PROPOSED"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
-CHECKPOINT_VERSION = 53
+CHECKPOINT_VERSION = 57
 ALGORITHM_ID = "PROPOSED"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and sampled termination PPO"
@@ -846,8 +850,14 @@ class PPOTrainer:
         self.macro_actor_learning_rate_schedule = str(
             self.config.get("macro_actor_learning_rate_schedule", "")
         )
-        if self.macro_actor_learning_rate_schedule != "cosine":
-            raise ValueError("PROPOSED Macro Actor requires the cosine learning-rate schedule.")
+        self.optimizer_learning_rate_schedule = str(
+            self.config.get("optimizer_learning_rate_schedule", "")
+        )
+        if (
+            self.macro_actor_learning_rate_schedule != "constant"
+            or self.optimizer_learning_rate_schedule != "constant"
+        ):
+            raise ValueError("Current PROPOSED requires constant learning rates for every optimizer.")
         self.unified_cache_action = bool(unified_cache_action)
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
@@ -856,6 +866,9 @@ class PPOTrainer:
             raise ValueError(
                 "The PROPOSED trainer supports only the unified Cache candidate action with cardinality correction."
             )
+        policy_schema = str(context.policy_schema)
+        if policy_schema != PROPOSED_POLICY_SCHEMA:
+            raise ValueError(f"unsupported current PROPOSED policy_schema: {policy_schema}")
         self.checkpoint_version = CHECKPOINT_VERSION
         self.algorithm_id = ALGORITHM_ID
         self.checkpoint_method = CHECKPOINT_METHOD
@@ -911,7 +924,10 @@ class PPOTrainer:
         ):
             raise ValueError("PROPOSED adaptive holding contract is invalid.")
         tensor_spec = PrimitiveTensorSpec.create(context)
-        macro_feature_dim = 2 * int(np.asarray(context.initial_cache).size) + 1
+        original_macro_feature_dim = 2 * int(np.asarray(context.initial_cache).size) + 1
+        if original_macro_feature_dim != CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM:
+            raise ValueError("current PROPOSED requires the unchanged 181-D Macro feature base")
+        macro_feature_dim = original_macro_feature_dim + CACHE_ECONOMIC_FEATURE_DIM
         micro_feature_dim = int(tensor_spec.uav_feature_dim) + 2
         self.hidden_sizes = tuple(int(value) for value in self.config["hidden_sizes"])
         self.policy = DualTimescaleActorCritic(
@@ -944,7 +960,14 @@ class PPOTrainer:
             or macro_actor_lr_final <= 0.0
             or macro_actor_lr_initial < macro_actor_lr_final
         ):
-            raise ValueError("Macro Actor cosine learning-rate endpoints are invalid.")
+            raise ValueError("Macro Actor learning-rate endpoints are invalid.")
+        if not math.isclose(
+            macro_actor_lr_initial,
+            macro_actor_lr_final,
+            rel_tol=0.0,
+            abs_tol=1.0e-15,
+        ):
+            raise ValueError("constant Macro Actor learning rate requires equal endpoints.")
         macro_actor_lr = macro_actor_lr_initial
         if not math.isfinite(macro_actor_lr) or macro_actor_lr <= 0.0:
             raise ValueError("macro actor learning rate must be finite and positive.")
@@ -1007,6 +1030,21 @@ class PPOTrainer:
             "micro_critic": micro_critic_lr,
             "long_value": long_value_lr,
         }
+        required_learning_rates = {
+            "macro_actor": 5.0e-4,
+            "micro_actor": 3.0e-4,
+            "macro_critic": 1.0e-3,
+            "micro_critic": 3.0e-3,
+            "long_value": 1.0e-3,
+        }
+        for name, expected_rate in required_learning_rates.items():
+            if not math.isclose(
+                self.learning_rates[name],
+                expected_rate,
+                rel_tol=0.0,
+                abs_tol=1.0e-15,
+            ):
+                raise ValueError(f"PROPOSED fixed LR requires {name}={expected_rate:g}.")
         self.training_counters = {
             "completed_episodes": 0,
             "policy_update_count": 0,
@@ -1046,6 +1084,7 @@ class PPOTrainer:
             "realizations_per_policy_update": self.realizations_per_policy_update,
             "policy_update_total": self.policy_update_total,
             "macro_actor_learning_rate_schedule": self.macro_actor_learning_rate_schedule,
+            "optimizer_learning_rate_schedule": self.optimizer_learning_rate_schedule,
             "macro_actor_learning_rate_initial": self.learning_rates[
                 "macro_actor_initial"
             ],
@@ -1064,6 +1103,16 @@ class PPOTrainer:
             "long_value_enabled": self.long_value_enabled,
             "long_value_target": self.long_value_target,
             "long_value_learning_rate": self.learning_rates["long_value"],
+            "micro_actor_learning_rate": self.learning_rates["micro_actor"],
+            "macro_critic_learning_rate": self.learning_rates["macro_critic"],
+            "micro_critic_learning_rate": self.learning_rates["micro_critic"],
+            "learning_rates": {
+                "macro_actor": self.learning_rates["macro_actor"],
+                "micro_actor": self.learning_rates["micro_actor"],
+                "macro_critic": self.learning_rates["macro_critic"],
+                "micro_critic": self.learning_rates["micro_critic"],
+                "long_value_critic": self.learning_rates["long_value"],
+            },
             "long_value_steps_per_update": self.long_value_steps_per_update,
             "long_value_max_grad_norm": self.long_value_max_grad_norm,
             "cache_action_semantics": "single masked categorical over KEEP candidate 0 and legal UPDATE candidates; holding termination uses post-slot observation and elapsed fraction",
@@ -1094,6 +1143,8 @@ class PPOTrainer:
         )
 
     def _macro_actor_learning_rate_for_update(self, update_index: int) -> float:
+        if self.macro_actor_learning_rate_schedule == "constant":
+            return float(self.learning_rates["macro_actor_initial"])
         last_index = max(self.policy_update_total - 1, 1)
         progress = min(max(int(update_index), 0), last_index) / last_index
         initial = float(self.learning_rates["macro_actor_initial"])
@@ -1165,6 +1216,18 @@ class PPOTrainer:
             ],
             "macro_actor_learning_rate_applied": applied_learning_rate,
             "macro_actor_learning_rate_schedule": self.macro_actor_learning_rate_schedule,
+            "optimizer_learning_rate_schedule": self.optimizer_learning_rate_schedule,
+            "micro_actor_learning_rate": self.learning_rates["micro_actor"],
+            "macro_critic_learning_rate": self.learning_rates["macro_critic"],
+            "micro_critic_learning_rate": self.learning_rates["micro_critic"],
+            "long_value_learning_rate": self.learning_rates["long_value"],
+            "learning_rates": {
+                "macro_actor": self.learning_rates["macro_actor"],
+                "micro_actor": self.learning_rates["micro_actor"],
+                "macro_critic": self.learning_rates["macro_critic"],
+                "micro_critic": self.learning_rates["micro_critic"],
+                "long_value_critic": self.learning_rates["long_value"],
+            },
             "combined_macro_advantage_mean": float(macro_metrics["macro_adv_mean"]),
             "combined_macro_advantage_std": float(macro_metrics["macro_adv_std"]),
             "combined_micro_advantage_mean": float(micro_metrics["micro_adv_mean"]),
@@ -2672,6 +2735,9 @@ class PPOTrainer:
             "method": self.checkpoint_method,
             "policy_schema": self.policy.architecture_id,
             "architecture_version": int(self.policy.architecture_version),
+            "macro_actor_learning_rate_schedule": self.macro_actor_learning_rate_schedule,
+            "optimizer_learning_rate_schedule": self.optimizer_learning_rate_schedule,
+            "learning_rates": dict(self.learning_rates),
             "config_contract": self.config_contract,
             "unified_cache_action": bool(self.unified_cache_action),
             "cardinality_corrected_cache_action": bool(
@@ -3107,6 +3173,10 @@ def run_training(
             "algorithm_id": trainer.algorithm_id,
             "architecture_version": int(trainer.policy.architecture_version),
             "checkpoint_version": trainer.checkpoint_version,
+            "policy_schema": trainer.policy.architecture_id,
+            "macro_actor_learning_rate_schedule": trainer.macro_actor_learning_rate_schedule,
+            "optimizer_learning_rate_schedule": trainer.optimizer_learning_rate_schedule,
+            "learning_rates": dict(trainer.learning_rates),
             "completed_episodes": int(completed),
             "policy_update_count": int(
                 trainer.training_counters["policy_update_count"]
@@ -3336,6 +3406,13 @@ def run_training(
             "macro_termination_ratio_approx_kl",
             "macro_termination_ratio_clip_fraction",
             "macro_actor_learning_rate_applied",
+            "macro_actor_learning_rate_schedule",
+            "optimizer_learning_rate_schedule",
+            "micro_actor_learning_rate",
+            "macro_critic_learning_rate",
+            "micro_critic_learning_rate",
+            "long_value_learning_rate",
+            "learning_rates",
             "joint_logprob_decomposition_max_error",
             "macro_early_stop",
             "macro_entropy",

@@ -16,6 +16,31 @@ TARGET_UAV_PROPOSAL_SOURCES = (
     "geometry_exploration",
 )
 
+CACHE_ECONOMIC_FEATURE_DIM = 19
+CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM = 181
+CACHE_ECONOMIC_DEMAND_HORIZONS = 5
+CACHE_ECONOMIC_FEATURE_NAMES = (
+    "is_keep",
+    "node_index",
+    "node_role_sv",
+    "node_role_rsu",
+    "node_role_uav",
+    "log_cache_cost",
+    "loaded_fraction",
+    "released_fraction",
+    "replica_diversity_delta",
+    "demand_added_h0",
+    "demand_added_h1",
+    "demand_added_h2",
+    "demand_added_h3",
+    "demand_added_h4",
+    "demand_removed_h0",
+    "demand_removed_h1",
+    "demand_removed_h2",
+    "demand_removed_h3",
+    "demand_removed_h4",
+)
+
 
 def _intermediate_observation(
     cache_state: np.ndarray,
@@ -169,6 +194,126 @@ def _cache_target_configuration_feature(
     if values.shape != (expected_dim,) or not np.all(np.isfinite(values)):
         raise AssertionError("target cache configuration feature shape/finite check failed")
     return values.astype(np.float32)
+
+
+def cache_economic_candidate_features(
+    current_cache: np.ndarray,
+    candidates: list[np.ndarray],
+    primitive_features: np.ndarray,
+    step: Any,
+    context: Any,
+    proposal_cache_nodes: dict[str, Any],
+) -> np.ndarray:
+    """Build the 19 economic features appended to the unchanged Macro features.
+
+    Demand values are prediction-only proxies averaged over prediction
+    scenarios and normalized by the fixed number of predicted task vehicles.
+    No realized tasks or future realized positions are consulted.
+    """
+
+    current = np.asarray(current_cache, dtype=np.int8)
+    primitive = np.asarray(primitive_features, dtype=np.float32)
+    service_count = int(context.service_catalog["num_services"])
+    node_count = len(context.cache_nodes["node_ids"])
+    expected_primitive_dim = 21 + 6 * service_count
+    if current.ndim != 2 or current.shape[0] != node_count:
+        raise ValueError("Cache economic feature current state shape mismatch")
+    if not candidates or not np.array_equal(np.asarray(candidates[0]), current):
+        raise ValueError("Cache economic candidate 0 must be KEEP/current Cache")
+    if primitive.shape != (len(candidates), expected_primitive_dim):
+        raise ValueError(
+            "Cache economic primitive features must align with candidates and the existing 81-D schema"
+        )
+
+    result = np.zeros((len(candidates), CACHE_ECONOMIC_FEATURE_DIM), dtype=np.float32)
+    result[0, 0] = 1.0
+    if len(candidates) == 1:
+        return result
+
+    scenario = step.scenario_slice
+    arrivals = np.asarray(scenario.get("arrival"), dtype=np.float64)
+    service_ids = np.asarray(scenario.get("service_id"), dtype=np.int64)
+    if arrivals.ndim != 3 or service_ids.shape != arrivals.shape:
+        raise ValueError(
+            "prediction arrival/service_id must share [scenario,horizon,task_vehicle]"
+        )
+    task_vehicle_ids = scenario.get("task_vehicle_ids")
+    task_vehicle_count = 0 if task_vehicle_ids is None else len(task_vehicle_ids)
+    if task_vehicle_count <= 0 or arrivals.shape[2] != task_vehicle_count:
+        raise ValueError("predicted task vehicle count must align with scenario requests")
+    horizon_count = int(arrivals.shape[1])
+    horizon_mask_raw = getattr(step, "prediction_horizon_mask", None)
+    if horizon_mask_raw is None:
+        raise ValueError("Cache economic features require prediction_horizon_mask")
+    horizon_mask = np.asarray(horizon_mask_raw, dtype=bool).reshape(-1)
+    if horizon_mask.shape != (horizon_count,):
+        raise ValueError("prediction_horizon_mask must align with scenario horizons")
+
+    vehicle_demand = cache_configuration.predicted_vehicle_service_demand_by_horizon(
+        scenario,
+        service_count,
+        beta_discount=1.0,
+    )
+    if vehicle_demand.shape[:2] != (horizon_count, len(scenario["vehicle_ids"])):
+        raise ValueError("predicted per-vehicle demand does not align with scenario positions")
+    available_horizons = min(
+        CACHE_ECONOMIC_DEMAND_HORIZONS,
+        horizon_count,
+        int(vehicle_demand.shape[0]),
+    )
+    demand_by_node = np.zeros(
+        (node_count, CACHE_ECONOMIC_DEMAND_HORIZONS, service_count),
+        dtype=np.float64,
+    )
+    for node_index in range(node_count):
+        serviceability = cache_configuration._node_predicted_serviceability_weights(
+            scenario,
+            node_index,
+            proposal_cache_nodes,
+            context.cache_cfg,
+        )
+        if serviceability.shape != vehicle_demand.shape[:2]:
+            raise ValueError("predicted serviceability and demand shapes do not align")
+        per_horizon = np.einsum("hv,hvf->hf", serviceability, vehicle_demand)
+        for horizon_index in range(available_horizons):
+            if horizon_mask[horizon_index]:
+                demand_by_node[node_index, horizon_index] = (
+                    per_horizon[horizon_index] / float(task_vehicle_count)
+                )
+
+    scalar_start = 4 + 6 * service_count
+    cost_index = scalar_start + 11
+    loaded_index = scalar_start + 3
+    released_index = scalar_start + 4
+    diversity_index = scalar_start + 14
+    for candidate_index, target_raw in enumerate(candidates[1:], start=1):
+        target = np.asarray(target_raw, dtype=np.int8)
+        if target.shape != current.shape:
+            raise ValueError("Cache economic target shape mismatch")
+        changed_nodes = np.flatnonzero(np.any(target != current, axis=1))
+        if changed_nodes.shape != (1,):
+            raise ValueError("Cache economic UPDATE candidates must change exactly one node")
+        node_index = int(changed_nodes[0])
+        row = primitive[candidate_index]
+        if not np.isfinite(row).all():
+            raise FloatingPointError("existing 81-D Cache node features are non-finite")
+
+        result[candidate_index, 1] = row[0]
+        result[candidate_index, 2:5] = row[1:4]
+        result[candidate_index, 5] = row[cost_index]
+        result[candidate_index, 6] = row[loaded_index]
+        result[candidate_index, 7] = row[released_index]
+        result[candidate_index, 8] = row[diversity_index]
+
+        added_services = np.maximum(target[node_index] - current[node_index], 0.0)
+        removed_services = np.maximum(current[node_index] - target[node_index], 0.0)
+        demand = demand_by_node[node_index]
+        result[candidate_index, 9:14] = demand @ added_services
+        result[candidate_index, 14:19] = demand @ removed_services
+
+    if not np.isfinite(result).all():
+        raise FloatingPointError("Cache economic candidate features contain NaN/Inf")
+    return result
 
 
 def _all_cache_target_configurations_with_features(

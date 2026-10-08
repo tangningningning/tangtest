@@ -20,7 +20,7 @@ from scenario.realization import (
 )
 
 
-PROPOSED_POLICY_SCHEMA = "adaptive_dual_timescale_proposed_cache_adaptive_holding_cardinality_corrected_ppo"
+PROPOSED_POLICY_SCHEMA = project_config.PROPOSED_POLICY_SCHEMA
 PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
 
 
