@@ -80,6 +80,7 @@ MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and sampled ter
 MACRO_CRITIC_TARGET_MODE = "two_step_smdp_td"
 MACRO_CRITIC_LAST1_ALPHA = 1.0
 FORMAL_TRAINING_EPISODES = 300
+SUPPORTED_MACRO_ACTOR_LEARNING_RATES = (1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3)
 
 
 def _require_torch() -> None:
@@ -948,11 +949,25 @@ class PPOTrainer:
         macro_actor_lr_initial = float(
             self.config.get("macro_actor_learning_rate", actor_lr)
         )
-        if macro_actor_learning_rate_override is not None:
-            macro_actor_lr_initial = float(macro_actor_learning_rate_override)
         macro_actor_lr_final = float(
             self.config.get("macro_actor_final_learning_rate", 1.0e-4)
         )
+        if macro_actor_learning_rate_override is not None:
+            requested_rate = float(macro_actor_learning_rate_override)
+            supported_rate = next(
+                (
+                    value
+                    for value in SUPPORTED_MACRO_ACTOR_LEARNING_RATES
+                    if math.isclose(requested_rate, value, rel_tol=0.0, abs_tol=1.0e-15)
+                ),
+                None,
+            )
+            if supported_rate is None:
+                raise ValueError(
+                    "Macro Actor override must use one of the four supported fixed rates."
+                )
+            macro_actor_lr_initial = supported_rate
+            macro_actor_lr_final = supported_rate
         if (
             not math.isfinite(macro_actor_lr_initial)
             or macro_actor_lr_initial <= 0.0
@@ -1031,7 +1046,6 @@ class PPOTrainer:
             "long_value": long_value_lr,
         }
         required_learning_rates = {
-            "macro_actor": 5.0e-4,
             "micro_actor": 3.0e-4,
             "macro_critic": 1.0e-3,
             "micro_critic": 3.0e-3,
@@ -1045,6 +1059,16 @@ class PPOTrainer:
                 abs_tol=1.0e-15,
             ):
                 raise ValueError(f"PROPOSED fixed LR requires {name}={expected_rate:g}.")
+        if not any(
+            math.isclose(
+                self.learning_rates["macro_actor"],
+                supported_rate,
+                rel_tol=0.0,
+                abs_tol=1.0e-15,
+            )
+            for supported_rate in SUPPORTED_MACRO_ACTOR_LEARNING_RATES
+        ):
+            raise ValueError("PROPOSED Macro Actor LR is not an approved fixed rate.")
         self.training_counters = {
             "completed_episodes": 0,
             "policy_update_count": 0,

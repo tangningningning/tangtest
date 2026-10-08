@@ -16,6 +16,7 @@ EPISODE_POOL = "environment_data/proposed_joint_training"
 EPISODE_COUNT = 300
 EPISODE_SEED_START = 20001
 TRAINING_SEED = 27005
+SUPPORTED_MACRO_ACTOR_LEARNING_RATES = (1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3)
 
 
 def main_for_run_spec(spec: Mapping[str, Any]) -> int:
@@ -23,14 +24,33 @@ def main_for_run_spec(spec: Mapping[str, Any]) -> int:
         "macro_actor_learning_rate",
         "run_name",
     }
-    if set(spec) != required:
-        raise ValueError(f"PROPOSED LR launcher spec must contain exactly {sorted(required)}")
+    if set(spec) not in (required, required | {"ppo_seed"}):
+        raise ValueError(
+            "PROPOSED LR launcher spec must contain exactly "
+            f"{sorted(required)} or {sorted(required | {'ppo_seed'})}"
+        )
     rate = float(spec["macro_actor_learning_rate"])
-    if rate <= 0.0:
-        raise ValueError("macro_actor_learning_rate must be positive")
+    supported_rate = next(
+        (
+            value
+            for value in SUPPORTED_MACRO_ACTOR_LEARNING_RATES
+            if abs(rate - value) <= 1.0e-15
+        ),
+        None,
+    )
+    if supported_rate is None:
+        raise ValueError(
+            "macro_actor_learning_rate must be one of the four supported fixed rates"
+        )
     run_name = str(spec["run_name"])
     if not run_name or Path(run_name).name != run_name:
         raise ValueError("run_name must be one path component")
+    run_dir = PROJECT_ROOT / "runs" / run_name
+    if run_dir.exists():
+        raise FileExistsError(
+            f"experiment output already exists; refusing to overwrite: {run_dir}"
+        )
+    ppo_seed = int(spec.get("ppo_seed", TRAINING_SEED))
 
     from ppo_simple.trainer import main as trainer_main
 
@@ -47,8 +67,8 @@ def main_for_run_spec(spec: Mapping[str, Any]) -> int:
             "--episode-seed-start",
             str(EPISODE_SEED_START),
             "--macro-actor-learning-rate",
-            str(rate),
+            str(supported_rate),
             "--seed",
-            str(TRAINING_SEED),
+            str(ppo_seed),
         ]
     )

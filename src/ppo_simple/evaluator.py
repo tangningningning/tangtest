@@ -29,7 +29,13 @@ from .interface import (
 from .reporting import resolve_checkpoint_reference
 from .rollout import collect_dual_timescale_episode
 from .policy import DualTimescaleActorCritic
-from .trainer import ALGORITHM_ID, CHECKPOINT_METHOD, CHECKPOINT_VERSION, PPOTrainer
+from .trainer import (
+    ALGORITHM_ID,
+    CHECKPOINT_METHOD,
+    CHECKPOINT_VERSION,
+    PPOTrainer,
+    SUPPORTED_MACRO_ACTOR_LEARNING_RATES,
+)
 
 
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
@@ -160,7 +166,6 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
     ):
         raise ValueError("checkpoint PROPOSED configuration contract mismatch")
     expected_rates = {
-        "macro_actor": 5.0e-4,
         "micro_actor": 3.0e-4,
         "macro_critic": 1.0e-3,
         "micro_critic": 3.0e-3,
@@ -168,6 +173,28 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
     }
     contract_rates = contract.get("learning_rates")
     payload_rates = payload.get("learning_rates")
+    macro_actor_rate = (
+        contract_rates.get("macro_actor")
+        if isinstance(contract_rates, dict)
+        else None
+    )
+    payload_macro_actor_rate = (
+        payload_rates.get("macro_actor")
+        if isinstance(payload_rates, dict)
+        else None
+    )
+    supported_macro_actor_rate = next(
+        (
+            value
+            for value in SUPPORTED_MACRO_ACTOR_LEARNING_RATES
+            if isinstance(macro_actor_rate, (int, float))
+            and math.isfinite(float(macro_actor_rate))
+            and math.isclose(
+                float(macro_actor_rate), value, rel_tol=0.0, abs_tol=1.0e-15
+            )
+        ),
+        None,
+    )
     if (
         payload.get("macro_actor_learning_rate_schedule") != "constant"
         or payload.get("optimizer_learning_rate_schedule") != "constant"
@@ -175,19 +202,22 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         or contract.get("optimizer_learning_rate_schedule") != "constant"
         or not isinstance(contract_rates, dict)
         or not isinstance(payload_rates, dict)
+        or supported_macro_actor_rate is None
+        or payload_macro_actor_rate != supported_macro_actor_rate
         or any(contract_rates.get(key) != value for key, value in expected_rates.items())
         or any(
             payload_rates.get(key) != value
             for key, value in {
-                "macro_actor": 5.0e-4,
                 "micro_actor": 3.0e-4,
                 "macro_critic": 1.0e-3,
                 "micro_critic": 3.0e-3,
                 "long_value": 1.0e-3,
             }.items()
         )
-        or contract.get("macro_actor_learning_rate_initial") != 5.0e-4
-        or contract.get("macro_actor_learning_rate_final") != 5.0e-4
+        or contract.get("macro_actor_learning_rate_initial")
+        != supported_macro_actor_rate
+        or contract.get("macro_actor_learning_rate_final")
+        != supported_macro_actor_rate
     ):
         raise ValueError("checkpoint fixed-learning-rate contract mismatch")
     return payload
@@ -482,6 +512,9 @@ def evaluate_pool(
             trainer = PPOTrainer(
                 context,
                 device=device,
+                macro_actor_learning_rate_override=float(
+                    checkpoint_metadata["learning_rates"]["macro_actor"]
+                ),
                 unified_cache_action=True,
                 cardinality_corrected_cache_action=True,
             )
