@@ -361,6 +361,7 @@ def _cache_candidates(
         np.zeros(int(tensor_spec.cache_feature_dim), dtype=np.float32)
     ]
     seen = {current.tobytes()}
+    prediction_horizon_mask = getattr(step, "prediction_horizon_mask", None)
     for node_index, _node_id in enumerate(context.action_spec.cache_node_ids):
         triggers = np.zeros(current.shape[0], dtype=np.int8)
         triggers[node_index] = 1
@@ -373,6 +374,7 @@ def _cache_candidates(
             step,
             context,
             proposal_nodes,
+            prediction_horizon_mask=prediction_horizon_mask,
         )
         if node_features.shape != (
             len(node_candidates),
@@ -419,6 +421,7 @@ def _cache_candidates(
         step,
         context,
         proposal_nodes,
+        prediction_horizon_mask=prediction_horizon_mask,
     )
     if economic_features.shape != (len(candidates), CACHE_ECONOMIC_FEATURE_DIM):
         raise AssertionError("Cache economic features must align with candidate order")

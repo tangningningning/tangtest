@@ -73,7 +73,7 @@ from .rollout import (
 CHECKPOINT_METHOD = "PROPOSED"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
-CHECKPOINT_VERSION = 57
+CHECKPOINT_VERSION = 58
 ALGORITHM_ID = "PROPOSED"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and sampled termination PPO"

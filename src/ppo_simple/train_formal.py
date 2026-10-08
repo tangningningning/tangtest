@@ -10,14 +10,15 @@ from .trainer import run_training
 
 
 FORMAL_TRAINING_EPISODES = 300
-FORMAL_RUN_DIRECTORY = "runs/formal_proposed_cache_economic_features_v1"
+FORMAL_RUN_DIRECTORY = "runs/formal_proposed_cache_economic_features_horizon_mask_v2"
+FORMAL_TRAINING_EPISODE_POOL = "environment_data/proposed_joint_training"
+FORMAL_TRAINING_EPISODE_SEED_START = 20001
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train the current 200-D fixed-learning-rate formal PROPOSED PPO."
     )
-    parser.add_argument("--episode-pool", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -32,7 +33,8 @@ def run_formal_training(args: Any) -> dict[str, Any]:
         config_path,
         FORMAL_TRAINING_EPISODES,
         run_directory,
-        episode_pool=args.episode_pool,
+        episode_pool=FORMAL_TRAINING_EPISODE_POOL,
+        episode_seed_start=FORMAL_TRAINING_EPISODE_SEED_START,
         generate_missing_episodes=False,
         seed=int(args.seed),
         resume=bool(args.resume),

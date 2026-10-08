@@ -474,10 +474,30 @@ def _serviceability_weight(
     return float(max(0.0, 1.0 - distance_m / max(radius, 1.0e-12)))
 
 
+def normalize_prediction_horizon_mask(
+    prediction_horizon_mask: Any,
+    horizon_count: int,
+) -> np.ndarray:
+    """Validate and normalize the rollout's existing prediction horizon mask."""
+
+    count = int(horizon_count)
+    if count < 0:
+        raise ValueError("prediction horizon count must be nonnegative")
+    if prediction_horizon_mask is None:
+        return np.ones(count, dtype=bool)
+    raw = np.asarray(prediction_horizon_mask).reshape(-1)
+    if raw.shape != (count,) or not np.all(np.isin(raw, [0, 1])):
+        raise ValueError(
+            "prediction_horizon_mask must be a binary array aligned with scenario horizons"
+        )
+    return raw.astype(bool, copy=False)
+
+
 def predicted_vehicle_service_demand_by_horizon(
     origin_scenario: dict[str, Any],
     num_services: int,
     beta_discount: float = 1.0,
+    prediction_horizon_mask: Any = None,
 ) -> np.ndarray:
     """Build a vehicle-specific demand tensor from prediction scenarios only.
 
@@ -493,6 +513,9 @@ def predicted_vehicle_service_demand_by_horizon(
     if arrival.ndim != 3 or service_id.shape != arrival.shape:
         raise ValueError("prediction scenario arrival/service_id must be [S,H,V]")
     scenarios, horizons, task_vehicle_count = [int(value) for value in arrival.shape]
+    valid_horizon_mask = normalize_prediction_horizon_mask(
+        prediction_horizon_mask, horizons
+    )
     if positions.ndim != 4 or positions.shape[:2] != (scenarios, horizons):
         raise ValueError("prediction scenario positions_xy must align with [S,H,V,2]")
     vehicles = int(positions.shape[2])
@@ -512,6 +535,8 @@ def predicted_vehicle_service_demand_by_horizon(
     demand = np.zeros((scenarios, horizons, vehicles, int(num_services)), dtype=np.float64)
     for scenario_index in range(scenarios):
         for horizon in range(horizons):
+            if not valid_horizon_mask[horizon]:
+                continue
             discount = float(beta_discount) ** int(horizon)
             for task_index, full_vehicle_index in enumerate(task_to_vehicle):
                 if arrival[scenario_index, horizon, task_index] <= 0.0:
@@ -524,16 +549,32 @@ def predicted_vehicle_service_demand_by_horizon(
     if not float(np.sum(demand)) > 1.0e-12:
         rho_hat = np.asarray(origin_scenario.get("rho_hat"), dtype=np.float64)
         if rho_hat.ndim == 2 and rho_hat.shape[-1] == int(num_services):
-            popularity = np.mean(rho_hat, axis=0)
+            if rho_hat.shape[0] == horizons:
+                valid_rho_hat = rho_hat[valid_horizon_mask]
+                popularity = (
+                    np.mean(valid_rho_hat, axis=0)
+                    if len(valid_rho_hat)
+                    else np.zeros(int(num_services), dtype=np.float64)
+                )
+            else:
+                popularity = np.mean(rho_hat, axis=0)
         elif rho_hat.ndim == 3 and rho_hat.shape[-1] == int(num_services):
-            popularity = np.mean(rho_hat, axis=tuple(range(rho_hat.ndim - 1)))
+            if rho_hat.shape[1] == horizons:
+                valid_rho_hat = rho_hat[:, valid_horizon_mask, :]
+                popularity = (
+                    np.mean(valid_rho_hat, axis=(0, 1))
+                    if valid_rho_hat.shape[1]
+                    else np.zeros(int(num_services), dtype=np.float64)
+                )
+            else:
+                popularity = np.mean(rho_hat, axis=tuple(range(rho_hat.ndim - 1)))
         else:
             popularity = np.full(int(num_services), 1.0 / max(int(num_services), 1))
         demand[:] = 0.0
         fallback_indices = task_to_vehicle or list(range(vehicles))
-        demand[:, :, fallback_indices, :] = popularity.reshape(1, 1, 1, -1) / max(
-            len(fallback_indices), 1
-        )
+        fallback_share = popularity.reshape(1, 1, -1) / max(len(fallback_indices), 1)
+        for horizon in np.flatnonzero(valid_horizon_mask):
+            demand[:, int(horizon), fallback_indices, :] = fallback_share
     return np.mean(demand, axis=0)
 
 
@@ -541,6 +582,7 @@ def predicted_vehicle_service_demand(
     origin_scenario: dict[str, Any],
     num_services: int,
     beta_discount: float = 1.0,
+    prediction_horizon_mask: Any = None,
 ) -> np.ndarray:
     """Return discounted predicted demand per vehicle/service, averaged over S."""
 
@@ -548,6 +590,7 @@ def predicted_vehicle_service_demand(
         origin_scenario,
         num_services,
         beta_discount=beta_discount,
+        prediction_horizon_mask=prediction_horizon_mask,
     )
     return np.sum(by_horizon, axis=0)
 
@@ -592,6 +635,8 @@ def node_specific_predicted_demand(
     node_index: int,
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
+    *,
+    prediction_horizon_mask: Any = None,
 ) -> np.ndarray:
     """Estimate ``D_pred[m,f]`` using predicted vehicles serviceable by node m."""
 
@@ -601,6 +646,7 @@ def node_specific_predicted_demand(
         origin_scenario,
         num_services,
         beta_discount=config.beta_discount,
+        prediction_horizon_mask=prediction_horizon_mask,
     )
     weights = _node_predicted_serviceability_weights(
         origin_scenario, node_index, cache_nodes, config
@@ -621,6 +667,7 @@ def node_local_predicted_service_workload(
     *,
     input_relative_jitter: float = 0.0,
     load_relative_jitter: float = 0.0,
+    prediction_horizon_mask: Any = None,
 ) -> np.ndarray:
     """Build normalized ``[cache_head, service, (request,bits,cycles)]`` data.
 
@@ -654,6 +701,9 @@ def node_local_predicted_service_workload(
         raise ValueError("load_relative_jitter must be in [0,1)")
 
     scenario_count, horizon_count, task_vehicle_count = arrival.shape
+    valid_horizon_mask = normalize_prediction_horizon_mask(
+        prediction_horizon_mask, horizon_count
+    )
     service_count = int(service_catalog["num_services"])
     vehicle_ids = [str(value) for value in origin_scenario["vehicle_ids"].tolist()]
     task_vehicle_ids_raw = origin_scenario.get("task_vehicle_ids")
@@ -710,6 +760,8 @@ def node_local_predicted_service_workload(
     )
     for scenario_index in range(scenario_count):
         for horizon in range(horizon_count):
+            if not valid_horizon_mask[horizon]:
+                continue
             discount = horizon_discount[horizon]
             for task_index, full_vehicle_index in enumerate(task_to_vehicle):
                 if arrival[scenario_index, horizon, task_index] <= 0.0:
@@ -730,7 +782,11 @@ def node_local_predicted_service_workload(
     for node_index in range(len(cache_nodes["node_ids"])):
         # Reuse the formal candidate demand helper for the count channel.
         result[node_index, :, 0] = node_specific_predicted_demand(
-            origin_scenario, node_index, cache_nodes, config
+            origin_scenario,
+            node_index,
+            cache_nodes,
+            config,
+            prediction_horizon_mask=valid_horizon_mask,
         ) / fixed_scales[0]
         weights = _node_predicted_serviceability_weights(
             origin_scenario, node_index, cache_nodes, config
@@ -856,6 +912,8 @@ def enumerate_all_cache_target_configurations(
     origin_scenario: dict[str, Any],
     local_cache_state: dict[str, set[int]],
     config: CacheOptimizationConfig,
+    *,
+    prediction_horizon_mask: Any = None,
 ) -> list[CacheTargetCandidate]:
     """Enumerate every non-KEEP capacity-feasible binary target configuration.
 
@@ -871,7 +929,13 @@ def enumerate_all_cache_target_configurations(
     sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
     before = current_cache[index].copy()
     capacity = float(cache_nodes["capacities_mb"][index])
-    demand = node_specific_predicted_demand(origin_scenario, index, cache_nodes, config)
+    demand = node_specific_predicted_demand(
+        origin_scenario,
+        index,
+        cache_nodes,
+        config,
+        prediction_horizon_mask=prediction_horizon_mask,
+    )
     service_count = int(service_catalog["num_services"])
     if service_count > 20:
         raise ValueError("exhaustive Cache proposal enumeration is capped at 20 services")

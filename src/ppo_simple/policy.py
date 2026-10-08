@@ -219,7 +219,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
     architecture_id = (
-        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_v1"
+        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v2"
     )
     architecture_version = 31
 

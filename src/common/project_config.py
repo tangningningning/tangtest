@@ -16,7 +16,7 @@ from typing import Any
 
 
 PROPOSED_POLICY_SCHEMA = (
-    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_v1"
+    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v2"
 )
 
 try:

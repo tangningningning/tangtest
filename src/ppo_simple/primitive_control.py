@@ -203,6 +203,8 @@ def cache_economic_candidate_features(
     step: Any,
     context: Any,
     proposal_cache_nodes: dict[str, Any],
+    *,
+    prediction_horizon_mask: Any = None,
 ) -> np.ndarray:
     """Build the 19 economic features appended to the unchanged Macro features.
 
@@ -242,17 +244,22 @@ def cache_economic_candidate_features(
     if task_vehicle_count <= 0 or arrivals.shape[2] != task_vehicle_count:
         raise ValueError("predicted task vehicle count must align with scenario requests")
     horizon_count = int(arrivals.shape[1])
-    horizon_mask_raw = getattr(step, "prediction_horizon_mask", None)
+    horizon_mask_raw = (
+        getattr(step, "prediction_horizon_mask", None)
+        if prediction_horizon_mask is None
+        else prediction_horizon_mask
+    )
     if horizon_mask_raw is None:
         raise ValueError("Cache economic features require prediction_horizon_mask")
-    horizon_mask = np.asarray(horizon_mask_raw, dtype=bool).reshape(-1)
-    if horizon_mask.shape != (horizon_count,):
-        raise ValueError("prediction_horizon_mask must align with scenario horizons")
+    horizon_mask = cache_configuration.normalize_prediction_horizon_mask(
+        horizon_mask_raw, horizon_count
+    )
 
     vehicle_demand = cache_configuration.predicted_vehicle_service_demand_by_horizon(
         scenario,
         service_count,
         beta_discount=1.0,
+        prediction_horizon_mask=horizon_mask,
     )
     if vehicle_demand.shape[:2] != (horizon_count, len(scenario["vehicle_ids"])):
         raise ValueError("predicted per-vehicle demand does not align with scenario positions")
@@ -324,6 +331,7 @@ def _all_cache_target_configurations_with_features(
     step: Any,
     context: Any,
     proposal_cache_nodes: dict[str, Any],
+    prediction_horizon_mask: Any = None,
 ) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
     """枚举全部可行配置，并只计算低成本特征。"""
 
@@ -335,6 +343,7 @@ def _all_cache_target_configurations_with_features(
         step.scenario_slice,
         context.local_cache,
         context.cache_cfg,
+        prediction_horizon_mask=prediction_horizon_mask,
     )
     if not all_candidates:
         return [], np.zeros(
@@ -346,6 +355,7 @@ def _all_cache_target_configurations_with_features(
         int(node_index),
         proposal_cache_nodes,
         context.cache_cfg,
+        prediction_horizon_mask=prediction_horizon_mask,
     )
     observed_usage = cache_configuration.observed_local_service_usage(
         context.local_cache,
@@ -380,6 +390,7 @@ def _target_cache_proposals_with_features(
     *,
     surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
     surrogate_ready: bool = False,
+    prediction_horizon_mask: Any = None,
 ) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
     """根据全部可行配置构造 rollout 候选集合。"""
 
@@ -391,6 +402,7 @@ def _target_cache_proposals_with_features(
         step,
         context,
         proposal_cache_nodes,
+        prediction_horizon_mask,
     )
     if not all_candidates:
         return all_candidates, all_features
