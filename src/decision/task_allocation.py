@@ -2530,18 +2530,18 @@ def evaluate_matching_with_kkt(
             )
         if not node_evaluation.resource_feasible:
             return KKTMatchingEvaluation(
-                False,
-                node_evaluation.infeasible_reason,
-                node_evaluation.cpu_allocations,
-                node_evaluation.bandwidth_allocations,
-                float("-inf"),
-                {},
-                {},
-                {},
-                {},
-                {},
-                node_evaluation.cpu_resource_sums,
-                node_evaluation.bandwidth_resource_sums,
+                resource_feasible=False,
+                infeasible_reason=node_evaluation.infeasible_reason,
+                task_utility_sum=float("-inf"),
+                cpu_allocations=node_evaluation.cpu_allocations,
+                bandwidth_allocations=node_evaluation.bandwidth_allocations,
+                per_task_delay_s={},
+                per_task_vehicle_energy_j={},
+                per_task_utility={},
+                per_task_execution_target={},
+                per_node_task_counts={},
+                cpu_resource_sums=node_evaluation.cpu_resource_sums,
+                bandwidth_resource_sums=node_evaluation.bandwidth_resource_sums,
             )
         edge_evaluations[node_id] = node_evaluation
 
