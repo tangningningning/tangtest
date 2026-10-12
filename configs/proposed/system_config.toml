@@ -43,7 +43,7 @@ output_tag = "stage6_candidate_cloud40_psi15_cache25_20_12_input500_2000"
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
 # 不在本 TOML 中复制具体服务，避免两份 service catalog 不一致。
-service_catalog = "environment_data/stage6_candidate_feasibility_25_20_12_reduced/service_catalog_500_2000.json"
+service_catalog = "environment_data/proposed_joint_training/service_catalog_500_2000.json"
 # 车辆角色文件。SV/TV 真实 ID 从这里读取，system_config 不写死 46/29/80。
 vehicle_roles = "data/generated/vehicle_roles.json"
 # 正式 SUMO 轨迹与任务/流行度输入的固定 artifact 路径。

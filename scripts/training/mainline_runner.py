@@ -18,7 +18,7 @@ for candidate in (SOURCE_ROOT, SCRIPTS_ROOT):
         sys.path.insert(0, str(candidate))
 
 CONFIG_RELATIVE = Path("configs/proposed/system_config.toml")
-POOL_RELATIVE = Path("environment_data/stage6_candidate_resource_reduced_training")
+POOL_RELATIVE = Path("environment_data/proposed_joint_training")
 POOL_MANIFEST_NAME = "stage6_training_pool_manifest.json"
 EPISODE_COUNT = 300
 EPISODE_SEED_START = 20001
