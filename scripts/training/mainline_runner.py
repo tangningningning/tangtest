@@ -26,10 +26,10 @@ EPISODE_SEED_END = EPISODE_SEED_START + EPISODE_COUNT - 1
 PPO_INITIALIZATION_SEED = 27005
 
 RUNS_BY_RATE = {
-    1.0e-4: "stage6_lr_1e_minus_4",
-    5.0e-4: "stage6_lr_5e_minus_4",
-    1.0e-3: "stage6_lr_1e_minus_3",
-    5.0e-3: "stage6_lr_5e_minus_3",
+    1.0e-4: "stage6_klguard_lr_1e_minus_4",
+    5.0e-4: "stage6_klguard_lr_5e_minus_4",
+    1.0e-3: "stage6_klguard_lr_1e_minus_3",
+    5.0e-3: "stage6_klguard_lr_5e_minus_3",
 }
 
 

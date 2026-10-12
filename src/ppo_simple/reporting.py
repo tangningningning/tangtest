@@ -1784,6 +1784,9 @@ def write_dual_timescale_run_manifest(
     manifest = {
         "experiment_label": "PROPOSED",
         "algorithm_id": str(trainer.algorithm_id),
+        "macro_actor_update_control_version": str(
+            trainer.macro_actor_update_control_version
+        ),
         "method": str(trainer.checkpoint_method),
         "experiment_type": "proposed_macro_cache_smdp_micro_uav_ppo",
         "config_path": str(Path(config_path).resolve()),

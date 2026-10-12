@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -75,6 +76,7 @@ CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 CHECKPOINT_VERSION = 58
 ALGORITHM_ID = "PROPOSED"
+MACRO_ACTOR_UPDATE_CONTROL_VERSION = "macro_actor_post_step_joint_kl_backtracking_v1"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and sampled termination PPO"
 MACRO_CRITIC_TARGET_MODE = "two_step_smdp_td"
@@ -872,6 +874,7 @@ class PPOTrainer:
             raise ValueError(f"unsupported current PROPOSED policy_schema: {policy_schema}")
         self.checkpoint_version = CHECKPOINT_VERSION
         self.algorithm_id = ALGORITHM_ID
+        self.macro_actor_update_control_version = MACRO_ACTOR_UPDATE_CONTROL_VERSION
         self.checkpoint_method = CHECKPOINT_METHOD
         self.capture_macro_transition_trace = bool(capture_macro_transition_trace)
         self.last_macro_transition_trace: dict[str, np.ndarray] | None = None
@@ -1669,10 +1672,118 @@ class PPOTrainer:
         )
         batch["macro_actor_advantage"] = normalized_actor_advantage
         records: list[dict[str, float]] = []
+        step_diagnostics: list[dict[str, Any]] = []
         stopped = False
+        early_stop_reason: str | None = None
+        actor_steps_executed = 0
+        attempted_step_count = 0
+        rejected_candidate_count = 0
+        accepted_step_count = 0
+        single_step_kl_overshoot = False
+        kl_stop_threshold = 1.5 * target_kl if target_kl > 0.0 else None
+        kl_guard_lr_scales = (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625)
         all_indices = np.arange(count, dtype=np.int64)
         max_decomposition_error = 0.0
         rollout_logprob_max_error = 0.0
+
+        def evaluate_macro_kl(
+            evaluated_components: Any, evaluated_tensors: dict[str, Any]
+        ) -> dict[str, Any]:
+            cache_log_ratio_value = (
+                evaluated_components.cache_log_prob
+                - evaluated_tensors["old_cache_log_probs"]
+            )
+            cache_ratio_value = torch.exp(cache_log_ratio_value)
+            cache_kl_value = torch.mean(
+                (cache_ratio_value - 1.0) - cache_log_ratio_value
+            )
+
+            termination_log_ratio_value = (
+                evaluated_components.termination_log_probs
+                - evaluated_tensors["old_termination_log_probs"]
+            )
+            termination_mask_value = evaluated_tensors["termination_masks"]
+            if bool(torch.any(termination_mask_value).item()):
+                selected_termination_log_ratio_value = termination_log_ratio_value[
+                    termination_mask_value
+                ]
+                selected_termination_ratio_value = torch.exp(
+                    selected_termination_log_ratio_value
+                )
+                termination_kl_value = torch.mean(
+                    (selected_termination_ratio_value - 1.0)
+                    - selected_termination_log_ratio_value
+                )
+            else:
+                termination_kl_value = torch.zeros(
+                    (), dtype=cache_kl_value.dtype, device=self.device
+                )
+
+            joint_log_ratio_value = (
+                evaluated_components.joint_log_prob
+                - evaluated_tensors["old_log_probs"]
+            )
+            joint_ratio_value = torch.exp(joint_log_ratio_value)
+            joint_kl_value = torch.mean(
+                (joint_ratio_value - 1.0) - joint_log_ratio_value
+            )
+            return {
+                "joint": joint_kl_value,
+                "cache": cache_kl_value,
+                "termination": termination_kl_value,
+            }
+
+        def capture_rng_state() -> dict[str, Any]:
+            return {
+                "python": random.getstate(),
+                "numpy": copy.deepcopy(np.random.get_state()),
+                "torch_cpu": torch.get_rng_state().clone(),
+                "torch_cuda": (
+                    [state.clone() for state in torch.cuda.get_rng_state_all()]
+                    if self.device.type == "cuda"
+                    else None
+                ),
+            }
+
+        def restore_rng_state(state: dict[str, Any]) -> None:
+            random.setstate(state["python"])
+            np.random.set_state(state["numpy"])
+            torch.set_rng_state(state["torch_cpu"])
+            if state["torch_cuda"] is not None:
+                torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+        def restore_macro_actor_and_optimizer(
+            actor_parameters: tuple[Any, ...],
+            actor_state: tuple[Any, ...],
+            optimizer_state: dict[str, Any],
+        ) -> None:
+            with torch.no_grad():
+                for parameter, saved_parameter in zip(
+                    actor_parameters, actor_state, strict=True
+                ):
+                    parameter.copy_(saved_parameter)
+            self.macro_optimizer.load_state_dict(copy.deepcopy(optimizer_state))
+
+        def safe_kl_values(kl_values: dict[str, Any]) -> dict[str, float | None]:
+            safe_values: dict[str, float | None] = {}
+            for name, value in kl_values.items():
+                numeric = float(value.detach().cpu())
+                safe_values[name] = numeric if math.isfinite(numeric) else None
+            return safe_values
+
+        def macro_optimizer_state_is_finite() -> bool:
+            for state in self.macro_optimizer.state.values():
+                for value in state.values():
+                    if torch.is_tensor(value) and not bool(
+                        torch.all(torch.isfinite(value)).item()
+                    ):
+                        return False
+                    if isinstance(value, (int, float)) and not math.isfinite(
+                        float(value)
+                    ):
+                        return False
+            return True
+
         for _epoch in range(int(self.config["update_epochs"])):
             tensors = self._tensor_batch(batch, all_indices)
             components = self.policy.evaluate_macro_components(
@@ -1731,12 +1842,61 @@ class PPOTrainer:
                     (), dtype=cache_kl.dtype, device=self.device
                 )
 
+            pre_step_kl_tensors = evaluate_macro_kl(components, tensors)
+            pre_step_kl = safe_kl_values(pre_step_kl_tensors)
+            pre_step_kl_finite = all(
+                value is not None for value in pre_step_kl.values()
+            )
+            if (
+                not pre_step_kl_finite
+                or (
+                    kl_stop_threshold is not None
+                    and pre_step_kl["joint"] is not None
+                    and pre_step_kl["joint"] > kl_stop_threshold
+                )
+            ):
+                stopped = True
+                early_stop_reason = (
+                    "non_finite_pre_step_kl"
+                    if not pre_step_kl_finite
+                    else "joint_kl_threshold_exceeded_before_step"
+                )
+                pre_step_diag = {
+                    f"pre_step_{name}_kl": value
+                    for name, value in pre_step_kl.items()
+                }
+                step_diagnostics.append(
+                    {
+                        "epoch_index": int(_epoch + 1),
+                        "actor_optimizer_step_executed": False,
+                        "actor_optimizer_steps_this_update": int(
+                            actor_steps_executed
+                        ),
+                        "pre_step_kl": pre_step_kl,
+                        "post_step_kl": None,
+                        "skip_reason": early_stop_reason,
+                        **pre_step_diag,
+                        "post_step_joint_kl": None,
+                        "post_step_cache_kl": None,
+                        "post_step_termination_kl": None,
+                        "attempted_step_count": 0,
+                        "rejected_candidate_count": 0,
+                        "accepted_step_count": 0,
+                        "accepted_lr_scale": None,
+                        "accepted_effective_lr": None,
+                        "kl_guard_status": "pre_step_early_stop",
+                        "final_stop_reason": early_stop_reason,
+                        "candidate_attempts": [],
+                    }
+                )
+                break
+
             joint_log_ratio = components.joint_log_prob - tensors["old_log_probs"]
             joint_ratio = torch.exp(joint_log_ratio)
+            joint_kl = pre_step_kl_tensors["joint"]
             actor_loss = _clipped_ppo_surrogate_loss(
                 joint_ratio, tensors["macro_actor_advantage"], clip
             )
-            joint_kl = torch.mean((joint_ratio - 1.0) - joint_log_ratio)
             joint_clip_fraction = torch.mean(
                 (torch.abs(joint_ratio - 1.0) > clip).float()
             )
@@ -1760,19 +1920,219 @@ class PPOTrainer:
                 .cpu()
             )
             macro_actor_after_clip = _gradient_norm(macro_actor_parameters)
-            self.macro_optimizer.step()
-            self.training_counters["macro_optimizer_steps"] += 1
-            self.training_counters["macro_actor_optimizer_steps"] += 1
+            actor_parameters = tuple(self.policy.macro_actor_parameters())
+            actor_state_before = tuple(
+                parameter.detach().clone() for parameter in actor_parameters
+            )
+            optimizer_state_before = copy.deepcopy(self.macro_optimizer.state_dict())
+            original_learning_rates = tuple(
+                float(group["lr"]) for group in self.macro_optimizer.param_groups
+            )
+            rng_before_candidate_evaluation = capture_rng_state()
+            rng_after_candidate_evaluation: dict[str, Any] | None = None
+            candidate_attempts: list[dict[str, Any]] = []
+            step_attempt_count = 0
+            step_rejected_count = 0
+            accepted_lr_scale: float | None = None
+            accepted_effective_lr: float | None = None
+            post_step_kl: dict[str, float | None] | None = None
+            kl_guard_status = "all_candidates_rejected"
+
+            # One backward pass supplies the same clipped gradient to each LR
+            # candidate. Adam's full state and Actor parameters are reset before
+            # every candidate, so rejected moments and step counters cannot leak.
+            for lr_scale in kl_guard_lr_scales:
+                restore_macro_actor_and_optimizer(
+                    actor_parameters,
+                    actor_state_before,
+                    optimizer_state_before,
+                )
+                for group, original_lr in zip(
+                    self.macro_optimizer.param_groups,
+                    original_learning_rates,
+                    strict=True,
+                ):
+                    group["lr"] = original_lr * float(lr_scale)
+                self.macro_optimizer.step()
+                step_attempt_count += 1
+                attempted_step_count += 1
+
+                restore_rng_state(rng_before_candidate_evaluation)
+                evaluation_error: str | None = None
+                try:
+                    with torch.no_grad():
+                        candidate_components = self.policy.evaluate_macro_components(
+                            tensors["observations"],
+                            tensors["candidate_features"],
+                            tensors["candidate_masks"],
+                            tensors["cache_actions"],
+                            tensors["termination_observations"],
+                            tensors["termination_elapsed_slots"],
+                            tensors["termination_actions"],
+                            tensors["termination_masks"],
+                        )
+                        candidate_kl_tensors = evaluate_macro_kl(
+                            candidate_components, tensors
+                        )
+                    candidate_kl = safe_kl_values(candidate_kl_tensors)
+                except FloatingPointError as error:
+                    evaluation_error = str(error)
+                    candidate_kl = {
+                        "joint": None,
+                        "cache": None,
+                        "termination": None,
+                    }
+                rng_after_candidate_evaluation = capture_rng_state()
+                actor_parameters_finite = all(
+                    bool(torch.all(torch.isfinite(parameter)).item())
+                    for parameter in actor_parameters
+                )
+                optimizer_state_finite = macro_optimizer_state_is_finite()
+                kl_values_finite = all(value is not None for value in candidate_kl.values())
+                within_threshold = (
+                    kl_stop_threshold is None
+                    or (
+                        candidate_kl["joint"] is not None
+                        and candidate_kl["joint"] <= kl_stop_threshold
+                    )
+                )
+                accepted = (
+                    actor_parameters_finite
+                    and optimizer_state_finite
+                    and kl_values_finite
+                    and within_threshold
+                )
+                trial = {
+                    "lr_scale": float(lr_scale),
+                    "effective_lr": float(original_learning_rates[0] * lr_scale),
+                    "post_step_kl": candidate_kl,
+                    "actor_parameters_finite": actor_parameters_finite,
+                    "optimizer_state_finite": optimizer_state_finite,
+                    "kl_values_finite": kl_values_finite,
+                    "evaluation_error": evaluation_error,
+                    "within_joint_kl_threshold": within_threshold,
+                    "accepted": accepted,
+                    "rejection_reason": (
+                        None
+                        if accepted
+                        else (
+                            "non_finite_actor_parameters"
+                            if not actor_parameters_finite
+                            else (
+                                "non_finite_optimizer_state"
+                                if not optimizer_state_finite
+                                else (
+                                    "non_finite_post_step_evaluation"
+                                    if evaluation_error is not None
+                                    else (
+                                        "non_finite_post_step_kl"
+                                        if not kl_values_finite
+                                        else "joint_kl_threshold_exceeded"
+                                    )
+                                )
+                            )
+                        )
+                    ),
+                }
+                candidate_attempts.append(trial)
+                if accepted:
+                    accepted_lr_scale = float(lr_scale)
+                    accepted_effective_lr = float(
+                        original_learning_rates[0] * lr_scale
+                    )
+                    post_step_kl = candidate_kl
+                    kl_guard_status = "accepted"
+                    break
+
+                step_rejected_count += 1
+                rejected_candidate_count += 1
+
+            if rng_after_candidate_evaluation is not None:
+                restore_rng_state(rng_after_candidate_evaluation)
+            for group, original_lr in zip(
+                self.macro_optimizer.param_groups,
+                original_learning_rates,
+                strict=True,
+            ):
+                group["lr"] = original_lr
+
+            if accepted_lr_scale is None:
+                restore_macro_actor_and_optimizer(
+                    actor_parameters,
+                    actor_state_before,
+                    optimizer_state_before,
+                )
+                self.macro_optimizer.zero_grad(set_to_none=True)
+                stopped = True
+                early_stop_reason = "all_post_step_kl_guard_candidates_rejected"
+                kl_guard_status = "all_candidates_rejected"
+                final_step_kl = candidate_attempts[-1]["post_step_kl"]
+            else:
+                accepted_step_count += 1
+                actor_steps_executed += 1
+                self.training_counters["macro_optimizer_steps"] += 1
+                self.training_counters["macro_actor_optimizer_steps"] += 1
+                final_step_kl = post_step_kl
+
+            assert final_step_kl is not None
+            post_step_kl = final_step_kl
+            pre_step_diag = {
+                f"pre_step_{name}_kl": value for name, value in pre_step_kl.items()
+            }
+            step_diagnostics.append(
+                {
+                    "epoch_index": int(_epoch + 1),
+                    "actor_optimizer_step_executed": accepted_lr_scale is not None,
+                    "actor_optimizer_steps_this_update": int(actor_steps_executed),
+                    "pre_step_kl": pre_step_kl,
+                    "post_step_kl": post_step_kl,
+                    "skip_reason": (
+                        None if accepted_lr_scale is not None else early_stop_reason
+                    ),
+                    **pre_step_diag,
+                    "post_step_joint_kl": post_step_kl["joint"],
+                    "post_step_cache_kl": post_step_kl["cache"],
+                    "post_step_termination_kl": post_step_kl["termination"],
+                    "attempted_step_count": step_attempt_count,
+                    "rejected_candidate_count": step_rejected_count,
+                    "accepted_step_count": int(accepted_lr_scale is not None),
+                    "accepted_lr_scale": accepted_lr_scale,
+                    "accepted_effective_lr": accepted_effective_lr,
+                    "kl_guard_status": kl_guard_status,
+                    "final_stop_reason": (
+                        early_stop_reason if accepted_lr_scale is None else None
+                    ),
+                    "candidate_attempts": candidate_attempts,
+                }
+            )
+            if (
+                accepted_lr_scale is not None
+                and kl_stop_threshold is not None
+                and pre_step_kl["joint"] <= kl_stop_threshold
+                and post_step_kl["joint"] is not None
+                and post_step_kl["joint"] > kl_stop_threshold
+            ):
+                single_step_kl_overshoot = True
+            if accepted_lr_scale is None:
+                break
+            # Preserve legacy *_approx_kl keys as pre-step estimates; the
+            # explicitly named fields and step diagnostics carry post-step KL.
             records.append(
                 {
                     "actor_loss": float(actor_loss.detach().cpu()),
                     "value_loss": float(value_loss.detach().cpu()),
                     "entropy": float(entropy_mean.detach().cpu()),
                     "joint_approx_kl": float(joint_kl.detach().cpu()),
+                    "joint_kl_pre_step": pre_step_kl["joint"],
+                    "joint_kl_post_step": post_step_kl["joint"],
                     "joint_clip_fraction": float(joint_clip_fraction.detach().cpu()),
                     "cache_ratio_approx_kl": float(cache_kl.detach().cpu()),
+                    "cache_kl_pre_step": pre_step_kl["cache"],
+                    "cache_kl_post_step": post_step_kl["cache"],
                     "cache_ratio_clip_fraction": float(cache_clip_fraction.detach().cpu()),
                     "termination_ratio_approx_kl": float(termination_kl.detach().cpu()),
+                    "termination_kl_pre_step": pre_step_kl["termination"],
+                    "termination_kl_post_step": post_step_kl["termination"],
                     "termination_ratio_clip_fraction": float(
                         termination_clip_fraction.detach().cpu()
                     ),
@@ -1782,10 +2142,6 @@ class PPOTrainer:
                     "critic_grad_norm_after_clip": 0.0,
                 }
             )
-            if target_kl > 0.0 and records[-1]["joint_approx_kl"] > 1.5 * target_kl:
-                stopped = True
-                break
-
         diagnostic_tensors = self._tensor_batch(batch, all_indices)
         with torch.no_grad():
             diagnostic_components = self.policy.evaluate_macro_components(
@@ -1816,7 +2172,37 @@ class PPOTrainer:
         ).astype(np.int64)
 
         self.training_counters["macro_update_count"] += 1
-        result = self._aggregate_update_metrics("macro", records)
+        if records:
+            result = self._aggregate_update_metrics("macro", records)
+        else:
+            # Keep the established numeric metric schema when the first
+            # prospective Actor step is skipped by the pre-step KL guard.
+            final_pre_step_kl = (
+                step_diagnostics[-1]["pre_step_kl"]
+                if step_diagnostics
+                else {"joint": 0.0, "cache": 0.0, "termination": 0.0}
+            )
+            result = {
+                "macro_actor_loss": 0.0,
+                "macro_value_loss": 0.0,
+                "macro_entropy": 0.0,
+                "macro_joint_approx_kl": final_pre_step_kl["joint"],
+                "macro_joint_clip_fraction": 0.0,
+                "macro_joint_kl_pre_step": final_pre_step_kl["joint"],
+                "macro_joint_kl_post_step": None,
+                "macro_cache_ratio_approx_kl": final_pre_step_kl["cache"],
+                "macro_cache_ratio_clip_fraction": 0.0,
+                "macro_cache_kl_pre_step": final_pre_step_kl["cache"],
+                "macro_cache_kl_post_step": None,
+                "macro_termination_ratio_approx_kl": final_pre_step_kl["termination"],
+                "macro_termination_ratio_clip_fraction": 0.0,
+                "macro_termination_kl_pre_step": final_pre_step_kl["termination"],
+                "macro_termination_kl_post_step": None,
+                "macro_actor_grad_norm_before_clip": 0.0,
+                "macro_actor_grad_norm_after_clip": 0.0,
+                "macro_critic_grad_norm_before_clip": 0.0,
+                "macro_critic_grad_norm_after_clip": 0.0,
+            }
         last_episode_batch = episode_batches[-1]
         self.last1_macro_transition_buffer = {
             "episode_index": episode_end_index,
@@ -1870,7 +2256,58 @@ class PPOTrainer:
         )
         result.update(
             {
-                "macro_actor_optimizer_steps_this_update": len(records),
+                "macro_actor_optimizer_steps_this_update": actor_steps_executed,
+                "macro_actor_update_control_version": self.macro_actor_update_control_version,
+                "attempted_step_count": attempted_step_count,
+                "rejected_candidate_count": rejected_candidate_count,
+                "accepted_step_count": accepted_step_count,
+                "accepted_lr_scale": (
+                    next(
+                        (
+                            item["accepted_lr_scale"]
+                            for item in reversed(step_diagnostics)
+                            if item["accepted_lr_scale"] is not None
+                        ),
+                        None,
+                    )
+                ),
+                "accepted_effective_lr": (
+                    next(
+                        (
+                            item["accepted_effective_lr"]
+                            for item in reversed(step_diagnostics)
+                            if item["accepted_effective_lr"] is not None
+                        ),
+                        None,
+                    )
+                ),
+                "kl_guard_status": (
+                    step_diagnostics[-1]["kl_guard_status"]
+                    if step_diagnostics
+                    else "no_actor_step"
+                ),
+                "final_stop_reason": early_stop_reason,
+                "macro_actor_optimizer_step_executed": actor_steps_executed > 0,
+                "macro_actor_optimizer_steps_after_update": int(
+                    self.training_counters["macro_actor_optimizer_steps"]
+                ),
+                "macro_kl_stop_threshold": kl_stop_threshold,
+                "macro_kl_step_diagnostics": step_diagnostics,
+                "macro_final_pre_step_kl": (
+                    step_diagnostics[-1]["pre_step_kl"]
+                    if step_diagnostics
+                    else None
+                ),
+                "macro_final_post_step_kl": next(
+                    (
+                        item["post_step_kl"]
+                        for item in reversed(step_diagnostics)
+                        if item["post_step_kl"] is not None
+                    ),
+                    None,
+                ),
+                "macro_kl_single_step_overshoot": single_step_kl_overshoot,
+                "macro_early_stop_reason": early_stop_reason,
                 "macro_sampled_termination_decisions_per_frame_mean": float(
                     np.mean(sampled_termination_decisions)
                 ),
@@ -2753,6 +3190,7 @@ class PPOTrainer:
             "checkpoint_version": self.checkpoint_version,
             "checkpoint_role": str(checkpoint_role),
             "algorithm_id": self.algorithm_id,
+            "macro_actor_update_control_version": self.macro_actor_update_control_version,
             "macro_critic_target_mode": self.macro_critic_target_mode,
             "long_value_enabled": self.long_value_enabled,
             "long_value_target": self.long_value_target,
@@ -3195,6 +3633,7 @@ def run_training(
         summary = {
             "experiment_type": "macro_cache_smdp_micro_uav_ppo",
             "algorithm_id": trainer.algorithm_id,
+            "macro_actor_update_control_version": trainer.macro_actor_update_control_version,
             "architecture_version": int(trainer.policy.architecture_version),
             "checkpoint_version": trainer.checkpoint_version,
             "policy_schema": trainer.policy.architecture_id,
@@ -3421,14 +3860,36 @@ def run_training(
             "long_value_target_sha256_before",
             "long_value_target_sha256_after",
             "macro_joint_approx_kl",
+            "macro_joint_kl_pre_step",
+            "macro_joint_kl_post_step",
             "macro_joint_clip_fraction",
+            "macro_cache_kl_pre_step",
+            "macro_cache_kl_post_step",
             "macro_sampled_termination_decisions_per_frame_mean",
             "macro_sampled_termination_decisions_per_frame_max",
             "macro_joint_log_ratio_abs_mean_by_duration",
             "macro_cache_ratio_approx_kl",
             "macro_cache_ratio_clip_fraction",
             "macro_termination_ratio_approx_kl",
+            "macro_termination_kl_pre_step",
+            "macro_termination_kl_post_step",
             "macro_termination_ratio_clip_fraction",
+            "macro_actor_optimizer_step_executed",
+            "macro_actor_optimizer_steps_after_update",
+            "macro_actor_update_control_version",
+            "macro_kl_stop_threshold",
+            "macro_kl_step_diagnostics",
+            "macro_final_pre_step_kl",
+            "macro_final_post_step_kl",
+            "macro_kl_single_step_overshoot",
+            "macro_early_stop_reason",
+            "attempted_step_count",
+            "rejected_candidate_count",
+            "accepted_step_count",
+            "accepted_lr_scale",
+            "accepted_effective_lr",
+            "kl_guard_status",
+            "final_stop_reason",
             "macro_actor_learning_rate_applied",
             "macro_actor_learning_rate_schedule",
             "optimizer_learning_rate_schedule",
