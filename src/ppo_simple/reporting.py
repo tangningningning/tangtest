@@ -1917,6 +1917,9 @@ def append_dual_timescale_slot_metrics(
                 "episode": int(episode),
                 "origin": int(transition.origin_index),
                 "slot": int(transition.slot),
+                "node_task_count": dict(
+                    transition.matching_summary.get("node_task_count", {})
+                ),
                 "G": float(transition.reward),
                 "task_utility": float(transition.actual_task_utility),
                 "delay": float(transition.total_task_delay_s),

@@ -135,6 +135,50 @@ class MicroTransition:
     slot_runtime_seconds: float
     matching_summary: dict[str, Any]
 
+
+def _aggregate_node_task_counts(
+    transitions: list[MicroTransition],
+) -> dict[str, Any]:
+    """Aggregate final Matching execution counts without rerunning allocation."""
+
+    totals: dict[str, Any] = {
+        "Local": 0,
+        "SV": 0,
+        "SV_by_node": {},
+        "RSU": 0,
+        "RSU_by_node": {},
+        "UAV": 0,
+        "UAV0": 0,
+        "UAV1": 0,
+        "UAV_by_node": {},
+        "Cloud": 0,
+    }
+    scalar_fields = ("Local", "SV", "RSU", "UAV", "UAV0", "UAV1", "Cloud")
+    node_fields = ("SV_by_node", "RSU_by_node", "UAV_by_node")
+    for transition in transitions:
+        counts = transition.matching_summary.get("node_task_count")
+        if not isinstance(counts, Mapping):
+            raise ValueError("Matching summary lacks final per-node task counts.")
+        for field in scalar_fields:
+            totals[field] += int(counts.get(field, 0))
+        for field in node_fields:
+            by_node = counts.get(field, {})
+            if not isinstance(by_node, Mapping):
+                raise ValueError(f"Matching {field} must be a mapping.")
+            for node_id, count in by_node.items():
+                key = str(node_id)
+                totals[field][key] = totals[field].get(key, 0) + int(count)
+        slot_total = sum(
+            int(counts.get(field, 0))
+            for field in ("Local", "SV", "RSU", "UAV", "Cloud")
+        )
+        if slot_total != int(transition.task_count):
+            raise ValueError(
+                "Per-node Matching counts do not sum to the realized task count."
+            )
+    return totals
+
+
 @dataclass(frozen=True)
 class MacroTransition:
     """一个完整 Cache frame 的 Macro SMDP transition。"""
@@ -1071,6 +1115,7 @@ def collect_dual_timescale_episode(
         np.stack([item.actions == 0 for item in micro_buffer.transitions]), axis=0
     )
     matching_summaries = [item.matching_summary for item in micro_buffer.transitions]
+    episode_node_task_counts = _aggregate_node_task_counts(micro_buffer.transitions)
     episode_return = float(sum(item.reward for item in micro_buffer.transitions))
     keep_count = int(sum(item.cache_action == 0 for item in macro_buffer.transitions))
     update_count = int(macro_count - keep_count)
@@ -1394,6 +1439,7 @@ def collect_dual_timescale_episode(
         ),
         "episode_runtime_seconds": float(time.perf_counter() - start_time),
         "total_tasks": int(sum(item.task_count for item in micro_buffer.transitions)),
+        "node_task_count": episode_node_task_counts,
         "exact_q_branch_requests": 0,
         "exact_q_environment_executions": 0,
     }

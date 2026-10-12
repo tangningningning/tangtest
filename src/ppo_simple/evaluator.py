@@ -64,6 +64,10 @@ EPISODE_METRIC_NAMES = (
     "uav1_group_low_entropy_fraction",
     "uav0_group_probability_over_90_fraction",
     "uav1_group_probability_over_90_fraction",
+    "uav_joint_stay_stay_rate",
+    "uav_joint_stay_move_rate",
+    "uav_joint_move_stay_rate",
+    "uav_joint_move_move_rate",
 )
 
 
@@ -150,6 +154,15 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         raise ValueError("checkpoint policy_schema mismatch")
     if not isinstance(contract, dict):
         raise ValueError("checkpoint PROPOSED configuration contract is missing")
+    policy_update_total = contract.get("policy_update_total")
+    if (
+        isinstance(policy_update_total, bool)
+        or not isinstance(policy_update_total, int)
+        or policy_update_total <= 0
+    ):
+        raise ValueError(
+            "checkpoint config_contract policy_update_total must be a positive integer"
+        )
     if contract.get("algorithm_id") != ALGORITHM_ID:
         raise ValueError("checkpoint config_contract algorithm_id mismatch")
     if contract.get("policy_schema") != expected_schema:
@@ -235,6 +248,22 @@ def _seed_policy_sampling(seed: int) -> None:
 def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> dict[str, Any]:
     micro = collection.micro.transitions
     slots = max(len(micro), 1)
+    joint_action_counts = {
+        "stay_stay": 0,
+        "stay_move": 0,
+        "move_stay": 0,
+        "move_move": 0,
+    }
+    for transition in micro:
+        uav0_moved = bool(transition.actions[0] != 0)
+        uav1_moved = bool(transition.actions[1] != 0)
+        joint_key = (
+            "move_" if uav0_moved else "stay_"
+        ) + ("move" if uav1_moved else "stay")
+        joint_action_counts[joint_key] += 1
+    joint_action_rates = {
+        key: value / slots for key, value in joint_action_counts.items()
+    }
     task_count = int(sum(item.task_count for item in micro))
     total_delay = float(sum(item.total_task_delay_s for item in micro))
     total_energy = float(sum(item.total_vehicle_energy_j for item in micro))
@@ -257,6 +286,12 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "uav_move_rate": float(
             sum(item.uav_movement_count for item in micro) / (2.0 * slots)
         ),
+        "joint_action_counts": joint_action_counts,
+        "joint_action_rates": joint_action_rates,
+        "uav_joint_stay_stay_rate": joint_action_rates["stay_stay"],
+        "uav_joint_stay_move_rate": joint_action_rates["stay_move"],
+        "uav_joint_move_stay_rate": joint_action_rates["move_stay"],
+        "uav_joint_move_move_rate": joint_action_rates["move_move"],
         "total_tasks": task_count,
         "mean_task_delay_s": None if task_count == 0 else total_delay / task_count,
         "mean_vehicle_energy_j": None if task_count == 0 else total_energy / task_count,
@@ -389,6 +424,10 @@ def _mean_environment_summary(
         "uav1_stay_rate",
         "uav0_move_rate",
         "uav1_move_rate",
+        "uav_joint_stay_stay_rate",
+        "uav_joint_stay_move_rate",
+        "uav_joint_move_stay_rate",
+        "uav_joint_move_move_rate",
         "uav0_group_stay_probability_mean",
         "uav0_group_move_probability_mean",
         "uav0_group_entropy_mean",
@@ -514,6 +553,9 @@ def evaluate_pool(
                 device=device,
                 macro_actor_learning_rate_override=float(
                     checkpoint_metadata["learning_rates"]["macro_actor"]
+                ),
+                policy_update_total=int(
+                    checkpoint_metadata["config_contract"]["policy_update_total"]
                 ),
                 unified_cache_action=True,
                 cardinality_corrected_cache_action=True,

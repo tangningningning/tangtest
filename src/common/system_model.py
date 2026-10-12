@@ -136,7 +136,11 @@ def cloud_execution(
     cloud_delay_factor: float,
     transmit_power_w: float,
 ) -> dict[str, float]:
-    """Evaluate one task with fixed per-task Cloud resources."""
+    """Evaluate one task using the CPU and uplink rates supplied by the caller.
+
+    Callers provide either the legacy fixed per-task CPU rate or a rate allocated
+    from a finite shared pool.  The uplink rate remains task-specific.
+    """
     bits = _require_finite("input_bits", input_bits)
     cycles = _require_finite("cpu_cycles", cpu_cycles)
     rate = _require_finite("cloud_rate_bps", cloud_rate_bps)

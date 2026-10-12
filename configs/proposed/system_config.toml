@@ -1,3 +1,5 @@
+# Stage6 isolated candidate derived from Stage3B; source file left unchanged.
+# Capacities use decimal GB-to-MB conversion (1 GB = 1000 MB).
 # adaptive_cache_mec 统一系统配置入口
 #
 # 本文件是后续所有模块的唯一系统参数入口。场景生成、任务生成、车辆预测、
@@ -30,18 +32,18 @@
 
 [experiment]
 # 实验名称。用于后续结果 metadata 和配置快照引用；修改它不需要重新生成数据。
-name = "PROPOSED_CACHE_ECONOMIC_FEATURES_FIXED_LR_HORIZON_MASK_V2"
+name = "STAGE6_CANDIDATE_CLOUD40_PSI15_CACHE25_20_12_INPUT500_2000"
 # 主实验随机种子。当前沿用已有正式数据中的主 seed；修改后若用于生成任务/预测场景，需要重跑对应上游模块。
 seed = 4401
 # 重复实验编号。只用于后续批量实验标识，不改变系统物理模型。
 repeat_index = 0
 # 输出标签。用于后续 result 文件命名；修改它不需要重新生成上游数据。
-output_tag = "proposed_cache_economic_features_fixed_lr_horizon_mask_v2"
+output_tag = "stage6_candidate_cloud40_psi15_cache25_20_12_input500_2000"
 
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
 # 不在本 TOML 中复制具体服务，避免两份 service catalog 不一致。
-service_catalog = "data/generated/service_catalog.json"
+service_catalog = "environment_data/stage6_candidate_feasibility_25_20_12_reduced/service_catalog_500_2000.json"
 # 车辆角色文件。SV/TV 真实 ID 从这里读取，system_config 不写死 46/29/80。
 vehicle_roles = "data/generated/vehicle_roles.json"
 # 正式 SUMO 轨迹与任务/流行度输入的固定 artifact 路径。
@@ -111,7 +113,7 @@ service_size_min_gb = 2.0
 service_size_max_gb = 20.0
 # Table I 校准的任务输入基准范围，单位 KB；任务行仍以 bit 保存。
 input_size_min_kb = 500.0
-input_size_max_kb = 5000.0
+input_size_max_kb = 2000.0
 # Table I 校准的计算密度范围，单位 cycle/bit。
 cycles_per_bit_min = 400.0
 cycles_per_bit_max = 1000.0
@@ -157,7 +159,7 @@ transmit_power_w = 0.1995262315
 
 [nodes.sv]
 # SV 公共缓存容量，单位 MB；由 cache.capacity_policy.sv_ratio 自动生成。
-cache_capacity_mb = 16744.750324713
+cache_capacity_mb = 12000
 # SV 总 CPU 能力，单位 cycle/s。
 # 正式固定值：SV 总 CPU 能力为 1GHz，单位 cycle/s。
 # 这是文献校准实验基线，不代表硬件实测数据。
@@ -165,7 +167,7 @@ cpu_cycles_per_s = 1.0e9
 # SV 链路带宽，单位 Hz。
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
-bandwidth_hz = 10.0e6
+bandwidth_hz = 20.0e6
 # 参数状态：EXPERIMENT_DESIGN。
 # SV 触发固定配置成本 eta_ca；不是文献直接物理常数或实测能耗。
 # 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
@@ -183,14 +185,14 @@ count = 2
 # RSU 初始部署高度，单位 m；节点部署脚本从此参数生成位置文件。
 deployment_altitude_m = 10.0
 # RSU 公共缓存容量，单位 MB；由 cache.capacity_policy.rsu_ratio 自动生成。
-cache_capacity_mb = 44652.6675325681
+cache_capacity_mb = 25000
 # RSU 总 CPU 能力，单位 cycle/s。
 # 正式固定值：RSU MEC server computation rate 为 5GHz。
-cpu_cycles_per_s = 5.0e9
+cpu_cycles_per_s = 10.0e9
 # RSU 带宽，单位 Hz。
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
-bandwidth_hz = 10.0e6
+bandwidth_hz = 20.0e6
 # 参数状态：EXPERIMENT_DESIGN。
 # RSU 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数或实测能耗。
 # 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
@@ -220,7 +222,7 @@ initialization_mode = "topology_aware"
 # 本文只优化 UAV 二维水平位置，不优化高度；该值是仿真基线，不代表唯一硬件/法规参数。
 altitude_m = 100.0
 # UAV 公共缓存容量，单位 MB；由 cache.capacity_policy.uav_ratio 自动生成。
-cache_capacity_mb = 33489.5006494261
+cache_capacity_mb = 20000
 # UAV 总 CPU 能力，单位 cycle/s。
 # 正式固定值：UAV MEC computation rate 为 5GHz。
 cpu_cycles_per_s = 5.0e9
@@ -273,34 +275,38 @@ movement_fixed_cost = 0.00176
 
 [nodes.cloud]
 # Cloud 数量固定为 1 个逻辑节点；本项目不展开 Cloud 实例列表。
-# Cloud 对每个任务提供固定等效资源，不按同一 slot 的 Cloud 任务数均分。
+# 本实验 Cloud CPU 使用有限共享池；上行保持每任务独立等效速率。
 # 正式系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c。
-# Cloud 仅在没有可用边缘缓存节点时作为后备执行节点。
+# 资源感知卸载模式保留全部合法 Edge 与 Cloud 候选，按实际 KKT 后效用选择；
+# Edge 仅在效用数值平局时优先。
 # 文献来源：Al-Shareeda et al., Novel DT-assisted Vehicular Task Offloading for Cloud,
 # Edge, and Hybrid Deployments, IEEE Transactions on Vehicular Technology 75(4):6565-6581, 2026,
 # DOI 10.1109/TVT.2025.3620810。
-# Cloud 每任务固定计算能力 F_c，单位 cycle/s；参考 IEEE 论文取 5GHz。
-cpu_cycles_per_s = 5.0e9
-# 兼容字段与唯一固定每任务计算能力保持一致。
-total_cpu_cycles_per_s = 5.0e9
-# Cloud 每任务固定等效上行速率 R_c，单位 bit/s；参考 IEEE 论文取 200Mbps。
+# legacy_unlimited 模式使用的兼容每任务计算能力 F_c，单位 cycle/s。
+cpu_cycles_per_s = 40.0e9
+# legacy_unlimited 模式的兼容总 CPU 字段；finite_pool 改用 cpu_capacity_cycles_per_s。
+total_cpu_cycles_per_s = 40.0e9
+# 阶段3B实验合同：Cloud 总 CPU 池；60 GHz 为实验锚点，尚非物理标定值。
+resource_mode = "finite_pool"
+cpu_capacity_cycles_per_s = 40.0e9
+# 每个 Cloud 任务车辆均使用固定等效上行速率 R_c=200 Mbps，作为仿真假设。
+# 速率不按同槽 Cloud 任务数分摊；这不表示现实网络提供物理独占保障速率。
 uplink_rate_bps = 200.0e6
-# 兼容字段与唯一固定每任务上行速率保持一致。
+# 兼容现有接口的重复字段，必须与 uplink_rate_bps 相等；字段名中的 total 不表示共享池。
 total_bandwidth_bps = 200.0e6
-# 显式 Cloud 资源合同：false 表示不按同槽 Cloud 任务数共享。
-# 缺失或 true 均不得静默回退到共享资源模型。
+# 当前接口要求 resource_sharing=false：不建模 Cloud 接入用户间的带宽竞争。
+# Cloud CPU 是否共享由 resource_mode 独立控制；本配置使用有限共享 CPU 池。
 resource_sharing = false
 # 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c，
 # E_vc_vehicle = p_v * D_v / R_c；psi_c 不进入能耗。
-# 文献来源同上，Table IV 给出 T_up_iC = 200 Mbps，语义为 Avg. uplink rate to cloud。
-# 该语义与当前 D_v/R_cloud_i 的 vehicle-to-cloud 上传链路相容；
-# 200 Mbps 作为单 Cloud 节点总 uplink，直接换算为 200.0e6 bit/s。
-# 这是文献校准实验基线，不代表硬件实测值。
+# 引用论文 Table IV 的 Avg. uplink rate to cloud=200 Mbps 仅作数值先例，不定义共享容量合同。
+# 本仿真假设将该固定等效速率用于每个 Cloud 任务车辆，不作为单 Cloud 节点总吞吐池。
+# 该值不是目标现实网络对每辆车的物理保障速率。
 # Cloud 传输扩展系数 psi_c，配置键 cloud_delay_factor，当前系统公式中作为 D_v/R_c 的乘法因子。
 # 系统模型要求 psi_c >= 1；当前固定值为 11.0。
 # 该固定系数将远程 Cloud 的回传、核心网及跨域附加时延统一吸收到
 # psi_c * D/R_c 中，不读取未来任务或运行时请求统计动态重算。
-cloud_delay_factor = 11.0
+cloud_delay_factor = 15.0
 
 [communication]
 # 本 section 集中通信模型参数，后续 Cache surrogate、Matching、KKT 必须共用。
@@ -317,7 +323,7 @@ pathloss_exponent = 2.75
 # 地面链路带宽，单位 Hz，用于 SV/RSU surrogate。
 # 当前第一版地面 V2V/V2I 统一采用 10MHz 系统带宽。
 # 这是文献校准实验基线，不代表硬件实测数据。
-bandwidth_hz = 10.0e6
+bandwidth_hz = 20.0e6
 
 [communication.air]
 # 空地链路参数。最终物理通信质量由 LoS/NLoS 平均信道增益 + Shannon 速率计算。
@@ -364,9 +370,9 @@ knapsack_initialization = "uniform_feasible"
 # cache 容量由统一 artifact 入口根据 service_catalog 总大小自动换算为 MB；
 # 以下比例是正式配置的唯一容量规则，不在配置中复制服务大小。
 tv_ratio = 0.05
-sv_ratio = 0.15
-rsu_ratio = 0.40
-uav_ratio = 0.30
+sv_ratio = 0.1074963773776571
+rsu_ratio = 0.22395078620345232
+uav_ratio = 0.17916062896276186
 
 [objective]
 # 主实验采用时延权重 0.6、车辆能耗权重 0.4。
@@ -519,6 +525,8 @@ enabled = true
 method = "transfer_exchange"
 max_updates = 100
 objective_tolerance = 1.0e-9
+# 保留所有合法 Edge 候选与 Cloud 后备候选，并依据完整 KKT 后的 Task Utility 选择。
+cloud_fallback_mode = "RESOURCE_AWARE_FALLBACK"
 
 [algorithm.ppo]
 # When：Macro 每个 frame 起点选 Cache；slot 执行后可决定结束 holding；Micro 每 slot 决策 UAV 位置。
@@ -654,6 +662,8 @@ terminal_origin = 299
 "nodes.uav.cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.cloud.cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.cloud.total_cpu_cycles_per_s" = "CONFIRMED_DATA"
+"nodes.cloud.resource_mode" = "EXPERIMENT_DESIGN"
+"nodes.cloud.cpu_capacity_cycles_per_s" = "EXPERIMENT_DESIGN"
 "nodes.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
 "nodes.cloud.total_bandwidth_bps" = "CONFIRMED_DATA"
 "nodes.cloud.resource_sharing" = "CONFIRMED_DATA"

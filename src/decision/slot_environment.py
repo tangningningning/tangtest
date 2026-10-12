@@ -65,8 +65,67 @@ def _position_tuples(positions: dict[str, Any]) -> dict[str, tuple[float, float]
     }
 
 
-def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) -> dict[str, Any]:
-    return {
+def _matching_summary(
+    result: task_allocation.TransferExchangeMatchingResult,
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+) -> dict[str, Any]:
+    node_ids = [str(value) for value in cache_nodes["node_ids"]]
+    node_roles = {
+        node_id: str(role)
+        for node_id, role in zip(node_ids, cache_nodes["node_roles"], strict=True)
+    }
+    counts_by_node = {node_id: 0 for node_id in node_ids}
+    local_count = 0
+    cloud_count = 0
+    for target in result.matching.values():
+        if target == task_allocation.CLOUD:
+            cloud_count += 1
+        elif target == task_allocation.LOCAL or target.startswith(
+            task_allocation.LOCAL_PREFIX
+        ):
+            local_count += 1
+        elif target in counts_by_node:
+            counts_by_node[target] += 1
+        else:
+            raise ValueError(f"matching summary 遇到未知执行节点：{target}")
+
+    counts_by_role = {
+        role: {
+            node_id: int(counts_by_node[node_id])
+            for node_id in node_ids
+            if node_roles[node_id] == role
+        }
+        for role in ("SV", "RSU", "UAV")
+    }
+    uav_ids = list(counts_by_role["UAV"])
+    edge_cpu_by_node: dict[str, float] = {}
+    for node_id, fraction_by_task in result.cpu_allocations.items():
+        role = node_roles.get(node_id)
+        if role is None:
+            continue
+        edge_cpu_by_node[node_id] = float(
+            math.fsum(fraction_by_task.values())
+            * task_allocation._node_cpu(role, cache_config)
+        )
+    edge_cpu_total = float(math.fsum(edge_cpu_by_node.values()))
+    task_count = len(result.matching)
+    mean_delay = (
+        float(math.fsum(result.per_task_delay_s.values()) / task_count)
+        if task_count
+        else None
+    )
+    mean_energy = (
+        float(math.fsum(result.per_task_vehicle_energy_j.values()) / task_count)
+        if task_count
+        else None
+    )
+    mean_utility = (
+        float(math.fsum(result.per_task_utility.values()) / task_count)
+        if task_count
+        else None
+    )
+    summary = {
         "updates": result.updates,
         "transfer_updates": result.transfer_updates,
         "exchange_updates": result.exchange_updates,
@@ -124,7 +183,53 @@ def _matching_summary(result: task_allocation.TransferExchangeMatchingResult) ->
         "stable_check_passed": result.stable_check_passed,
         "max_remaining_delta": result.max_remaining_delta,
         "history": result.history,
+        "tie_break_count": result.tie_break_count,
+        "cloud_resource_mode": cache_config.cloud_resource_mode,
+        "cloud_fallback_mode": cache_config.cloud_fallback_mode,
+        "node_task_count": {
+            "Local": int(local_count),
+            "SV": int(sum(counts_by_role["SV"].values())),
+            "SV_by_node": counts_by_role["SV"],
+            "RSU": int(sum(counts_by_role["RSU"].values())),
+            "RSU_by_node": counts_by_role["RSU"],
+            "UAV": int(sum(counts_by_role["UAV"].values())),
+            "UAV0": int(counts_by_node[uav_ids[0]]) if len(uav_ids) > 0 else 0,
+            "UAV1": int(counts_by_node[uav_ids[1]]) if len(uav_ids) > 1 else 0,
+            "UAV_by_node": counts_by_role["UAV"],
+            "Cloud": int(cloud_count),
+        },
+        "resource": {
+            "cloud_cpu_usage_cycles_per_s": float(
+                result.cloud_cpu_used_cycles_per_s
+            ),
+            "cloud_cpu_capacity_cycles_per_s": (
+                None
+                if result.cloud_cpu_capacity_cycles_per_s is None
+                else float(result.cloud_cpu_capacity_cycles_per_s)
+            ),
+            "cloud_cpu_remaining_cycles_per_s": (
+                None
+                if result.cloud_cpu_capacity_cycles_per_s is None
+                else max(
+                    float(result.cloud_cpu_capacity_cycles_per_s)
+                    - float(result.cloud_cpu_used_cycles_per_s),
+                    0.0,
+                )
+            ),
+            "cloud_cpu_allocations_cycles_per_s": dict(
+                result.cloud_cpu_allocations_cycles_per_s
+            ),
+            "edge_cpu_usage_cycles_per_s": edge_cpu_total,
+            "edge_cpu_usage_by_node_cycles_per_s": edge_cpu_by_node,
+        },
+        "performance": {
+            "mean_delay_s": mean_delay,
+            "mean_energy_j": mean_energy,
+            "task_utility_sum": float(result.task_utility_sum),
+            "mean_task_utility": mean_utility,
+        },
     }
+    return summary
 
 
 def _configuration_summary(
@@ -414,6 +519,7 @@ def execute_slot(
         kkt_cache=matching_kkt_cache,
         node_evaluation_cache=node_evaluation_cache,
         timing_profile=exact_q_timing_profile,
+        cloud_fallback_mode=cache_config.cloud_fallback_mode,
     )
     if exact_q_timing_profile is not None:
         exact_q_matching_elapsed = time.perf_counter() - exact_q_matching_started_at
@@ -472,7 +578,11 @@ def execute_slot(
                     1.0e-6,
                 )),
             ),
-            matching_summary=_matching_summary(matching),
+            matching_summary=_matching_summary(
+                matching,
+                cache_nodes,
+                cache_config,
+            ),
             next_cache_state=None,
             next_uav_positions=None,
         )
@@ -548,7 +658,11 @@ def execute_slot(
                 1.0e-6,
             )),
         ),
-        matching_summary=_matching_summary(matching),
+        matching_summary=_matching_summary(
+            matching,
+            cache_nodes,
+            cache_config,
+        ),
         next_cache_state=final_cache.copy(),
         next_uav_positions=final_uav,
     )

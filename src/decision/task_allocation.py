@@ -33,6 +33,13 @@ from common import project_config, system_model
 from decision import cache_configuration
 
 LOCAL_PREFIX = "LOCAL:"
+LEGACY_EDGE_GATE = "LEGACY_EDGE_GATE"
+RESOURCE_AWARE_FALLBACK = "RESOURCE_AWARE_FALLBACK"
+LEGACY_CLOUD_RESOURCE_MODE = "legacy_unlimited"
+FINITE_CLOUD_RESOURCE_MODE = "finite_pool"
+_CLOUD_FALLBACK_MODES = frozenset(
+    {LEGACY_EDGE_GATE, RESOURCE_AWARE_FALLBACK}
+)
 
 
 def _profile_add(
@@ -119,6 +126,10 @@ class TransferExchangeMatchingResult:
     kkt_complementary_slackness_residual_mean: float = math.nan
     kkt_complementary_slackness_residual_max: float = math.nan
     kkt_solve_diagnostics: tuple[dict[str, Any], ...] = ()
+    cloud_cpu_allocations_cycles_per_s: dict[str, float] = field(default_factory=dict)
+    cloud_cpu_capacity_cycles_per_s: float | None = None
+    cloud_cpu_used_cycles_per_s: float = 0.0
+    tie_break_count: int = 0
 
 
 def _kkt_diagnostics_summary(
@@ -230,15 +241,19 @@ def build_feasible_targets(
     service_node_positions: dict[str, np.ndarray] | None = None,
     cache_config: cache_configuration.CacheOptimizationConfig | None = None,
     timing_profile: dict[str, float] | None = None,
+    cloud_fallback_mode: str = LEGACY_EDGE_GATE,
 ) -> dict[str, list[str]]:
     """按缓存可用性和当前物理路径构造 N_v^fea。
 
     正式实际/预测调用必须提供 vehicle_positions、service_node_positions 和
     cache_config；若某个缓存边缘节点缺少当前位置、角色、正带宽/CPU 或正信道
-    速率，则该节点不进入 M_edge，Cloud 作为后备节点保留。省略物理上下文时，
-    此函数只检查 cache node 的结构存在性。
+    速率，则该节点不进入 M_edge。LEGACY_EDGE_GATE 仅在没有合法 Edge 时保留
+    Cloud；RESOURCE_AWARE_FALLBACK 始终保留 Cloud 与全部合法 Edge 候选。省略
+    物理上下文时，此函数只检查 cache node 的结构存在性。
     """
 
+    if cloud_fallback_mode not in _CLOUD_FALLBACK_MODES:
+        raise ValueError(f"未知 Cloud 候选模式：{cloud_fallback_mode}")
     edge_cache = np.asarray(edge_cache_state, dtype=np.int8)
     node_ids = [str(value) for value in cache_nodes["node_ids"]]
     if edge_cache.shape[0] != len(node_ids):
@@ -284,7 +299,10 @@ def build_feasible_targets(
                 if not path_is_feasible:
                     continue
             edge_targets.append(node_id)
-        if edge_targets:
+        if cloud_fallback_mode == RESOURCE_AWARE_FALLBACK:
+            targets.extend(edge_targets)
+            targets.append(CLOUD)
+        elif edge_targets:
             targets.extend(edge_targets)
         else:
             targets.append(CLOUD)
@@ -370,12 +388,26 @@ def _better_candidate(
     current_best: dict[str, Any] | None,
     candidate: dict[str, Any],
     tie_tolerance: float,
+    prefer_edge_on_tie: bool = False,
 ) -> dict[str, Any]:
     if current_best is None:
         return candidate
     if candidate["delta_J"] > current_best["delta_J"] + tie_tolerance:
         return candidate
     if abs(candidate["delta_J"] - current_best["delta_J"]) <= tie_tolerance:
+        if prefer_edge_on_tie:
+            candidate_cloud_targets = sum(
+                target == CLOUD for target in candidate["matching"].values()
+            )
+            current_cloud_targets = sum(
+                target == CLOUD for target in current_best["matching"].values()
+            )
+            if candidate_cloud_targets != current_cloud_targets:
+                return (
+                    candidate
+                    if candidate_cloud_targets < current_cloud_targets
+                    else current_best
+                )
         if _operation_key(candidate) < _operation_key(current_best):
             return candidate
     return current_best
@@ -387,12 +419,14 @@ def _candidate_impact_scope(
     candidate_kkt: dict[str, str],
     affected_task_ids: list[str],
     cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig | None = None,
     timing_profile: dict[str, float] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Return the exact affected edge nodes and impacted task IDs.
 
     This is shared by strict candidate screening and the incremental evaluator;
-    the scope must include every task sharing a current or candidate edge node.
+    the scope must include every task sharing a current/candidate Edge node and,
+    for a finite Cloud pool, every task in the old or new Cloud allocation set.
     """
 
     started_at = time.perf_counter() if timing_profile is not None else 0.0
@@ -400,14 +434,30 @@ def _candidate_impact_scope(
     for task_id in affected_task_ids:
         for target in (current_kkt[task_id], candidate_kkt[task_id]):
             if target == CLOUD:
-                # Cloud resources are fixed per task and do not couple unrelated
-                # Cloud tasks in the formal model.
+                # Cloud task coupling, when enabled, is added as a complete pool
+                # set below; Cloud is not an Edge node in this node scope.
                 continue
             if target != LOCAL:
                 _edge_node_role(target, cache_nodes)
                 affected_edge_nodes.add(target)
 
     impacted_task_ids = set(affected_task_ids)
+    if (
+        cache_config is not None
+        and cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+    ):
+        current_cloud_tasks = {
+            task.task_id
+            for task in tasks
+            if current_kkt[task.task_id] == CLOUD
+        }
+        candidate_cloud_tasks = {
+            task.task_id
+            for task in tasks
+            if candidate_kkt[task.task_id] == CLOUD
+        }
+        if current_cloud_tasks != candidate_cloud_tasks:
+            impacted_task_ids.update(current_cloud_tasks | candidate_cloud_tasks)
     for task in tasks:
         if (
             current_kkt[task.task_id] in affected_edge_nodes
@@ -441,6 +491,7 @@ def enumerate_best_operation(
     ideal_utility_cache: dict[tuple[str, str], float] | None = None,
     ideal_utility_cache_stats: dict[str, int] | None = None,
     impact_scope_stats: dict[str, int] | None = None,
+    prefer_edge_on_tie: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
     """枚举全部合法 transfer/exchange，返回本轮最大增益候选。
 
@@ -570,7 +621,7 @@ def enumerate_best_operation(
         else transfer_generation_runtime + exchange_generation_runtime,
     )
 
-    tie_tolerance = tolerance * 0.1
+    tie_tolerance = tolerance if prefer_edge_on_tie else tolerance * 0.1
     if evaluation_mode == "incremental":
         if current_kkt is None:
             raise AssertionError("incremental candidate screening requires current KKT matching")
@@ -595,6 +646,7 @@ def enumerate_best_operation(
                 candidate_kkt,
                 metadata["affected_tasks"],
                 cache_nodes,
+                cache_config=cache_config,
                 timing_profile=timing_profile,
             )
             metadata["impact_scope"] = impact_scope
@@ -798,6 +850,9 @@ def enumerate_best_operation(
     # evaluated a second time here.
     replay_started_at = time.perf_counter() if timing_profile is not None else 0.0
     best: dict[str, Any] | None = None
+    current_cloud_count = sum(
+        target == CLOUD for target in current_matching.values()
+    )
     for metadata in candidate_metadata:
         index = int(metadata["original_index"])
         evaluation = exact_records.get(index)
@@ -813,8 +868,23 @@ def enumerate_best_operation(
             "J_after": float(evaluation.task_utility_sum),
             "matching": metadata["matching"],
             "evaluation": evaluation,
+            "final_cloud_count": sum(
+                target == CLOUD for target in metadata["matching"].values()
+            ),
         }
-        best = _better_candidate(best, candidate, tie_tolerance)
+        if prefer_edge_on_tie and delta <= tolerance:
+            edge_tie_move = (
+                abs(delta) <= tolerance
+                and candidate["final_cloud_count"] < current_cloud_count
+            )
+            if not edge_tie_move:
+                continue
+        best = _better_candidate(
+            best,
+            candidate,
+            tie_tolerance,
+            prefer_edge_on_tie=prefer_edge_on_tie,
+        )
     _profile_add(
         timing_profile,
         "matching_replay_tiebreak_runtime",
@@ -826,7 +896,13 @@ def enumerate_best_operation(
     if max_delta == float("-inf"):
         max_delta = 0.0
     if evaluate_only and best is not None and best["delta_J"] <= tolerance:
-        best = None
+        edge_tie_move = (
+            prefer_edge_on_tie
+            and abs(best["delta_J"]) <= tolerance
+            and best["final_cloud_count"] < current_cloud_count
+        )
+        if not edge_tie_move:
+            best = None
     return best, stats, float(max_delta)
 
 
@@ -846,6 +922,30 @@ def _resource_constraints_ok(
     eps_w = float(project_config.get_config_value(project_cfg, "algorithm.kkt.min_cpu_fraction"))
     eps_b = float(project_config.get_config_value(project_cfg, "algorithm.kkt.min_bandwidth_fraction"))
     tol = 1e-8
+    if evaluation.cloud_cpu_capacity_cycles_per_s is not None:
+        capacity = float(evaluation.cloud_cpu_capacity_cycles_per_s)
+        allocated = float(
+            math.fsum(evaluation.cloud_cpu_allocations_cycles_per_s.values())
+        )
+        absolute_tol = max(capacity * tol, 1.0e-6)
+        if (
+            not math.isfinite(capacity)
+            or capacity <= 0.0
+            or not math.isfinite(allocated)
+            or allocated > capacity
+            or not math.isclose(
+                allocated,
+                float(evaluation.cloud_cpu_used_cycles_per_s),
+                rel_tol=1.0e-12,
+                abs_tol=absolute_tol,
+            )
+        ):
+            return False
+        if any(
+            not math.isfinite(value) or value <= 0.0
+            for value in evaluation.cloud_cpu_allocations_cycles_per_s.values()
+        ):
+            return False
     for node_id, values in evaluation.cpu_allocations.items():
         if node_id == CLOUD:
             continue
@@ -876,11 +976,14 @@ def optimize_task_matching(
     kkt_cache: KKTResourceAllocationCache | None = None,
     node_evaluation_cache: NodeEvaluationCache | None = None,
     timing_profile: dict[str, float] | None = None,
+    cloud_fallback_mode: str = LEGACY_EDGE_GATE,
 ) -> TransferExchangeMatchingResult:
     """在当前 slot 的缓存和无线状态下执行稳定匹配。"""
 
     if evaluation_mode not in {"full", "incremental"}:
         raise ValueError(f"未知 Matching candidate evaluation mode：{evaluation_mode}")
+    if cloud_fallback_mode not in _CLOUD_FALLBACK_MODES:
+        raise ValueError(f"未知 Cloud 候选模式：{cloud_fallback_mode}")
     requests_before = 0 if kkt_cache is None else int(kkt_cache.requests)
     hits_before = 0 if kkt_cache is None else int(kkt_cache.hits)
     misses_before = 0 if kkt_cache is None else int(kkt_cache.misses)
@@ -1013,6 +1116,7 @@ def optimize_task_matching(
         service_node_positions=service_node_positions,
         cache_config=cache_config,
         timing_profile=timing_profile,
+        cloud_fallback_mode=cloud_fallback_mode,
     )
     current_matching = {
         task.task_id: feasible_targets[task.task_id][0]
@@ -1082,6 +1186,7 @@ def optimize_task_matching(
     history: list[dict[str, Any]] = []
     transfer_updates = 0
     exchange_updates = 0
+    tie_break_count = 0
     stop_reason = "stopped_by_max_updates"
     j_history = [float(current_eval.task_utility_sum)]
 
@@ -1104,10 +1209,26 @@ def optimize_task_matching(
             ideal_utility_cache=ideal_utility_cache,
             ideal_utility_cache_stats=ideal_utility_cache_stats,
             impact_scope_stats=impact_scope_stats,
+            prefer_edge_on_tie=(
+                cloud_fallback_mode == RESOURCE_AWARE_FALLBACK
+            ),
         )
         for key, value in stats.items():
             counters[key] += value
-        if best is None or best["delta_J"] <= tolerance:
+        current_cloud_count = sum(
+            target == CLOUD for target in current_matching.values()
+        )
+        edge_tie_update = (
+            best is not None
+            and cloud_fallback_mode == RESOURCE_AWARE_FALLBACK
+            and abs(float(best["delta_J"])) <= tolerance
+            and sum(
+                target == CLOUD for target in best["matching"].values()
+            ) < current_cloud_count
+        )
+        if best is None or (
+            best["delta_J"] <= tolerance and not edge_tie_update
+        ):
             stop_reason = "converged_by_no_improvement"
             break
         current_matching = best["matching"]
@@ -1121,8 +1242,14 @@ def optimize_task_matching(
                 "new_targets": best["new_targets"],
                 "delta_J": best["delta_J"],
                 "J_after": best["J_after"],
+                "tie_break": bool(edge_tie_update),
+                "cloud_count_before": int(current_cloud_count),
+                "cloud_count_after": int(
+                    sum(target == CLOUD for target in best["matching"].values())
+                ),
             }
         )
+        tie_break_count += int(edge_tie_update)
         j_history.append(float(current_eval.task_utility_sum))
         if best["operation_type"] == "transfer":
             transfer_updates += 1
@@ -1133,7 +1260,7 @@ def optimize_task_matching(
     stable_check_passed = False
     max_remaining_delta = 0.0
     if transfer_exchange_stable:
-        _, check_stats, max_remaining_delta = enumerate_best_operation(
+        check_best, check_stats, max_remaining_delta = enumerate_best_operation(
             tasks,
             current_matching,
             current_eval,
@@ -1152,13 +1279,31 @@ def optimize_task_matching(
             ideal_utility_cache=ideal_utility_cache,
             ideal_utility_cache_stats=ideal_utility_cache_stats,
             impact_scope_stats=impact_scope_stats,
+            prefer_edge_on_tie=(
+                cloud_fallback_mode == RESOURCE_AWARE_FALLBACK
+            ),
         )
         # 复检也是候选评价的一部分，便于复杂度记录。
         for key, value in check_stats.items():
             counters[key] += value
-        stable_check_passed = max_remaining_delta <= tolerance
+        stable_check_passed = check_best is None
 
-    if any(j_history[index + 1] <= j_history[index] + tolerance for index in range(len(j_history) - 1)):
+    if cloud_fallback_mode == RESOURCE_AWARE_FALLBACK:
+        for item in history:
+            delta = float(item["delta_J"])
+            if item["tie_break"]:
+                if (
+                    abs(delta) > tolerance
+                    or int(item["cloud_count_after"])
+                    >= int(item["cloud_count_before"])
+                ):
+                    raise AssertionError("非法Edge平局优先更新。")
+            elif delta <= tolerance:
+                raise AssertionError("非平局Matching更新未超过目标容差。")
+    elif any(
+        j_history[index + 1] <= j_history[index] + tolerance
+        for index in range(len(j_history) - 1)
+    ):
         raise AssertionError("accepted update 未使J严格增加。")
     tasks_by_id = {task.task_id: task for task in tasks}
     if not _cache_feasible(tasks_by_id, current_matching, feasible_targets):
@@ -1296,6 +1441,12 @@ def optimize_task_matching(
         max_remaining_delta=float(max_remaining_delta),
         history=history,
         feasible_targets=feasible_targets,
+        cloud_cpu_allocations_cycles_per_s=(
+            current_eval.cloud_cpu_allocations_cycles_per_s
+        ),
+        cloud_cpu_capacity_cycles_per_s=current_eval.cloud_cpu_capacity_cycles_per_s,
+        cloud_cpu_used_cycles_per_s=current_eval.cloud_cpu_used_cycles_per_s,
+        tie_break_count=tie_break_count,
     )
 
 
@@ -1507,6 +1658,9 @@ class KKTMatchingEvaluation:
     per_node_task_counts: dict[str, int]
     cpu_resource_sums: dict[str, float]
     bandwidth_resource_sums: dict[str, float]
+    cloud_cpu_allocations_cycles_per_s: dict[str, float] = field(default_factory=dict)
+    cloud_cpu_capacity_cycles_per_s: float | None = None
+    cloud_cpu_used_cycles_per_s: float = 0.0
 
 
 @dataclass
@@ -1726,11 +1880,16 @@ def _ideal_task_utility(
         delay = float(result["delay_s"])
         energy = float(result["vehicle_energy_j"])
     elif target == CLOUD:
+        cloud_cpu_upper_bound = (
+            cache_config.cloud_cpu_capacity_cycles_per_s
+            if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+            else cache_config.cloud_total_cpu_cycles_per_s
+        )
         result = system_model.cloud_execution(
             task.input_bits,
             task.cpu_cycles,
             cache_config.cloud_total_bandwidth_bps,
-            cache_config.cloud_total_cpu_cycles_per_s,
+            cloud_cpu_upper_bound,
             cache_config.cloud_delay_factor,
             cache_config.tx_power_w,
         )
@@ -2375,6 +2534,151 @@ def allocate_resources_kkt(
     )
 
 
+def _allocate_cloud_cpu_kkt(
+    cloud_tasks: list[Task],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    project_cfg: dict[str, Any],
+    kkt_cache: KKTResourceAllocationCache | None,
+    timing_profile: dict[str, float] | None = None,
+) -> KKTResourceAllocationResult:
+    """Allocate the complete Cloud task set under the configured CPU contract.
+
+    Legacy mode returns the old independent 5 GHz/task contract.  Finite-pool
+    mode solves the same normalized convex CPU allocation used by Edge KKT,
+    while keeping Cloud uplink rates independent and task-specific.
+    """
+
+    if not cloud_tasks:
+        return KKTResourceAllocationResult(True, "", {}, {}, {}, {}, {}, {})
+
+    if cache_config.cloud_resource_mode == LEGACY_CLOUD_RESOURCE_MODE:
+        allocations = {
+            task.task_id: float(cache_config.cloud_total_cpu_cycles_per_s)
+            for task in cloud_tasks
+        }
+        return KKTResourceAllocationResult(
+            True,
+            "",
+            {CLOUD: allocations},
+            {},
+            {CLOUD: float(len(cloud_tasks))},
+            {},
+            {},
+            {},
+        )
+
+    capacity = float(cache_config.cloud_cpu_capacity_cycles_per_s)
+    kkt_cfg = kkt_config_from_project(project_cfg)
+    if kkt_cfg.min_cpu_fraction * len(cloud_tasks) > 1.0:
+        return KKTResourceAllocationResult(
+            False,
+            "Cloud CPU epsilon infeasible",
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+        )
+
+    def compute_pool() -> KKTResourceAllocationResult:
+        coefficients = [
+            cache_config.omega_t
+            * task.cpu_cycles
+            / (cache_config.time_ref_s * capacity)
+            for task in cloud_tasks
+        ]
+        if kkt_cache is not None:
+            kkt_cache.solver_calls += 1
+        solver_started = (
+            time.perf_counter() if timing_profile is not None else 0.0
+        )
+        fractions, multiplier, ok, reason, diagnostics = (
+            solve_kkt_fraction_allocation(
+                coefficients,
+                kkt_cfg.min_cpu_fraction,
+                kkt_cfg.bisection_tolerance,
+                kkt_cfg.max_bisection_iterations,
+                return_diagnostics=True,
+            )
+        )
+        if timing_profile is not None:
+            timing_profile["kkt_solver_core_runtime"] += (
+                time.perf_counter() - solver_started
+            )
+        if kkt_cache is not None:
+            kkt_cache.record_diagnostics(diagnostics)
+        if not ok:
+            return KKTResourceAllocationResult(
+                False,
+                f"Cloud CPU KKT infeasible: {reason}",
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                (diagnostics,),
+            )
+        fraction_values = np.asarray(fractions, dtype=np.float64)
+        fraction_total = float(math.fsum(float(value) for value in fraction_values))
+        if fraction_total > 1.0:
+            fraction_values = fraction_values / fraction_total
+        allocation_map = {
+            task.task_id: float(fraction) * capacity
+            for task, fraction in zip(cloud_tasks, fraction_values, strict=True)
+        }
+        allocated_total = float(math.fsum(allocation_map.values()))
+        if allocated_total > capacity:
+            largest_task_id = max(allocation_map, key=allocation_map.__getitem__)
+            allocation_map[largest_task_id] -= allocated_total - capacity
+            allocated_total = float(math.fsum(allocation_map.values()))
+            if allocated_total > capacity:
+                allocation_map[largest_task_id] = math.nextafter(
+                    allocation_map[largest_task_id], 0.0
+                )
+                allocated_total = float(math.fsum(allocation_map.values()))
+            if allocated_total > capacity:
+                return KKTResourceAllocationResult(
+                    False,
+                    "Cloud CPU allocation rounding exceeded capacity",
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    {},
+                    (diagnostics,),
+                )
+        return KKTResourceAllocationResult(
+            True,
+            "",
+            {CLOUD: allocation_map},
+            {},
+            {CLOUD: float(math.fsum(float(value) for value in fraction_values))},
+            {},
+            {CLOUD: float(multiplier)},
+            {},
+            (diagnostics,),
+        )
+
+    kkt_started = time.perf_counter() if timing_profile is not None else 0.0
+    if kkt_cache is None:
+        result = compute_pool()
+    else:
+        # The Cloud pool cache is keyed by the full sorted Cloud task set.  Its
+        # capacity is fixed for the lifetime of this Matching call.
+        result = kkt_cache.get_or_compute(
+            CLOUD,
+            cloud_tasks,
+            np.zeros(2, dtype=np.float64),
+            compute_pool,
+        )
+    if timing_profile is not None:
+        timing_profile["kkt_runtime"] += time.perf_counter() - kkt_started
+    return result
+
+
 def _evaluate_edge_node(
     node_id: str,
     node_tasks: list[Task],
@@ -2489,7 +2793,25 @@ def evaluate_matching_with_kkt(
     """评价当前 slot 的 matching、KKT 资源、完成时延和车辆能耗。"""
 
     if not tasks:
-        return KKTMatchingEvaluation(True, "", 0.0, {}, {}, {}, {}, {}, {}, {}, {}, {})
+        return KKTMatchingEvaluation(
+            True,
+            "",
+            0.0,
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            cloud_cpu_capacity_cycles_per_s=(
+                cache_config.cloud_cpu_capacity_cycles_per_s
+                if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+                else None
+            ),
+        )
 
     timing_profile = (
         node_evaluation_cache.timing_profile
@@ -2555,6 +2877,39 @@ def evaluate_matching_with_kkt(
         cpu_resource_sums.update(node_evaluation.cpu_resource_sums)
         bandwidth_resource_sums.update(node_evaluation.bandwidth_resource_sums)
 
+    cloud_tasks = [task for task in tasks if matching[task.task_id] == CLOUD]
+    cloud_allocation = _allocate_cloud_cpu_kkt(
+        cloud_tasks,
+        cache_config,
+        project_cfg,
+        kkt_cache,
+        timing_profile,
+    )
+    if not cloud_allocation.feasible:
+        return KKTMatchingEvaluation(
+            resource_feasible=False,
+            infeasible_reason=cloud_allocation.infeasible_reason,
+            task_utility_sum=float("-inf"),
+            cpu_allocations=cpu_allocations,
+            bandwidth_allocations=bandwidth_allocations,
+            per_task_delay_s={},
+            per_task_vehicle_energy_j={},
+            per_task_utility={},
+            per_task_execution_target={},
+            per_node_task_counts={},
+            cpu_resource_sums=cpu_resource_sums,
+            bandwidth_resource_sums=bandwidth_resource_sums,
+        )
+    cloud_cpu_allocations = dict(
+        cloud_allocation.cpu_allocations.get(CLOUD, {})
+    )
+    cloud_cpu_capacity = (
+        float(cache_config.cloud_cpu_capacity_cycles_per_s)
+        if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+        else None
+    )
+    cloud_cpu_used = float(math.fsum(cloud_cpu_allocations.values()))
+
     per_delay: dict[str, float] = {}
     per_energy: dict[str, float] = {}
     per_utility: dict[str, float] = {}
@@ -2593,7 +2948,7 @@ def evaluate_matching_with_kkt(
                 task.input_bits,
                 task.cpu_cycles,
                 cache_config.cloud_total_bandwidth_bps,
-                cache_config.cloud_total_cpu_cycles_per_s,
+                cloud_cpu_allocations[task.task_id],
                 cache_config.cloud_delay_factor,
                 cache_config.tx_power_w,
             )
@@ -2629,6 +2984,9 @@ def evaluate_matching_with_kkt(
         counts,
         cpu_resource_sums,
         bandwidth_resource_sums,
+        cloud_cpu_allocations,
+        cloud_cpu_capacity,
+        cloud_cpu_used,
     )
 
 
@@ -2694,6 +3052,16 @@ def evaluate_matching_candidate_incremental(
     task_ids = {task.task_id for task in tasks}
     if set(current_kkt) != task_ids or set(candidate_kkt) != task_ids:
         raise ValueError("current/candidate matching 的任务集合不一致。")
+    current_cloud_task_ids = {
+        task_id for task_id, target in current_kkt.items() if target == CLOUD
+    }
+    candidate_cloud_task_ids = {
+        task_id for task_id, target in candidate_kkt.items() if target == CLOUD
+    }
+    finite_cloud_pool_changed = (
+        cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+        and current_cloud_task_ids != candidate_cloud_task_ids
+    )
 
     affected_ids = [str(task_id) for task_id in affected_task_ids]
     if not set(affected_ids).issubset(task_ids):
@@ -2709,6 +3077,7 @@ def evaluate_matching_candidate_incremental(
             candidate_kkt,
             affected_ids,
             cache_nodes,
+            cache_config=cache_config,
             timing_profile=timing_profile,
         )
     else:
@@ -2727,6 +3096,18 @@ def evaluate_matching_candidate_incremental(
     per_task_delay = dict(current_evaluation.per_task_delay_s)
     per_task_energy = dict(current_evaluation.per_task_vehicle_energy_j)
     per_task_utility = dict(current_evaluation.per_task_utility)
+    cloud_cpu_allocations = dict(
+        current_evaluation.cloud_cpu_allocations_cycles_per_s
+    )
+    cloud_cpu_capacity = current_evaluation.cloud_cpu_capacity_cycles_per_s
+    cloud_cpu_used = float(current_evaluation.cloud_cpu_used_cycles_per_s)
+    if finite_cloud_pool_changed:
+        # The entire pool allocation is coupled: discard the old set so the
+        # candidate evaluator replaces it with a fresh allocation over every
+        # Cloud task in candidate_matching.
+        cloud_cpu_allocations.clear()
+        cloud_cpu_capacity = float(cache_config.cloud_cpu_capacity_cycles_per_s)
+        cloud_cpu_used = 0.0
     if timing_profile is not None:
         _profile_add(
             timing_profile,
@@ -2906,13 +3287,20 @@ def evaluate_matching_candidate_incremental(
         per_task_delay.update(non_edge_evaluation.per_task_delay_s)
         per_task_energy.update(non_edge_evaluation.per_task_vehicle_energy_j)
         per_task_utility.update(non_edge_evaluation.per_task_utility)
-        if CLOUD in non_edge_evaluation.cpu_allocations:
-            cpu_allocations[CLOUD] = dict(non_edge_evaluation.cpu_allocations[CLOUD])
-            bandwidth_allocations[CLOUD] = dict(
-                non_edge_evaluation.bandwidth_allocations[CLOUD]
+        if finite_cloud_pool_changed:
+            cloud_cpu_allocations = dict(
+                non_edge_evaluation.cloud_cpu_allocations_cycles_per_s
             )
-            cpu_resource_sums[CLOUD] = non_edge_evaluation.cpu_resource_sums[CLOUD]
-            bandwidth_resource_sums[CLOUD] = non_edge_evaluation.bandwidth_resource_sums[CLOUD]
+            cloud_cpu_capacity = (
+                non_edge_evaluation.cloud_cpu_capacity_cycles_per_s
+            )
+        elif cache_config.cloud_resource_mode == LEGACY_CLOUD_RESOURCE_MODE:
+            for task_id in impacted_task_ids:
+                cloud_cpu_allocations.pop(task_id, None)
+            cloud_cpu_allocations.update(
+                non_edge_evaluation.cloud_cpu_allocations_cycles_per_s
+            )
+        cloud_cpu_used = float(math.fsum(cloud_cpu_allocations.values()))
         recomputed_task_ids.update(task.task_id for task in non_edge_tasks)
         _profile_add(
             timing_profile,
@@ -2967,6 +3355,9 @@ def evaluate_matching_candidate_incremental(
         per_node_task_counts=per_node_task_counts,
         cpu_resource_sums=cpu_resource_sums,
         bandwidth_resource_sums=bandwidth_resource_sums,
+        cloud_cpu_allocations_cycles_per_s=cloud_cpu_allocations,
+        cloud_cpu_capacity_cycles_per_s=cloud_cpu_capacity,
+        cloud_cpu_used_cycles_per_s=cloud_cpu_used,
     )
 
 

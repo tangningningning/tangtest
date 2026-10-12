@@ -3,7 +3,7 @@
 """Trigger-conditioned cache configuration optimization.
 
 本阶段只解决：给定上一时隙缓存状态、cache trigger 和预测场景后，选择新的
-动态缓存配置。预测候选复用实际执行侧的 Matching/KKT 和固定每任务 Cloud 模型，
+动态缓存配置。预测候选复用实际执行侧的 Matching/KKT 和所配置的 Cloud 资源合同，
 但不训练 PPO，也不读取任何未来真实 trajectory/tasks/popularity 标签；正式
 episode 初始缓存只使用 service catalog 中的 service size、节点容量和显式 seed。
 """
@@ -52,9 +52,11 @@ class CacheOptimizationConfig:
     sv_cpu_cycles_per_s: float
     rsu_cpu_cycles_per_s: float
     uav_cpu_cycles_per_s: float
-    # Cloud 两组字段保持兼容，但正式语义是每任务固定资源。
+    # Legacy Cloud CPU aliases remain available for frozen run configs.
     cloud_cpu_cycles_per_s: float
     cloud_total_cpu_cycles_per_s: float
+    cloud_resource_mode: str
+    cloud_cpu_capacity_cycles_per_s: float
     local_energy_per_cycle_j: float
     tx_power_w: float
     sv_bandwidth_hz: float
@@ -70,11 +72,12 @@ class CacheOptimizationConfig:
     air_beta_nlos: float
     air_alpha_los: float
     air_alpha_nlos: float
-    # Cloud 两组字段保持兼容，但正式语义是每任务固定等效上行速率。
+    # Cloud uplink remains an independent per-task equivalent link in both modes.
     cloud_uplink_rate_bps: float
     cloud_total_bandwidth_bps: float
     cloud_delay_factor: float
     cloud_resource_sharing: bool
+    cloud_fallback_mode: str
     sv_range_m: float
     rsu_range_m: float
     uav_range_m: float
@@ -143,9 +146,25 @@ class CacheOptimizationConfig:
             raise ValueError("cloud_resource_sharing 必须是显式 bool。")
         if self.cloud_resource_sharing:
             raise ValueError(
-                "当前正式模型要求 Cloud 固定每任务资源，"
+                "Cloud 上行链路当前保持每任务独立，"
                 "cloud_resource_sharing 必须为 false。"
             )
+        if self.cloud_resource_mode not in {"legacy_unlimited", "finite_pool"}:
+            raise ValueError(
+                "cloud_resource_mode 必须是 legacy_unlimited 或 finite_pool。"
+            )
+        if self.cloud_resource_mode == "finite_pool" and (
+            not math.isfinite(self.cloud_cpu_capacity_cycles_per_s)
+            or self.cloud_cpu_capacity_cycles_per_s <= 0.0
+        ):
+            raise ValueError(
+                "finite_pool 模式要求正的 cloud_cpu_capacity_cycles_per_s。"
+            )
+        if self.cloud_fallback_mode not in {
+            "LEGACY_EDGE_GATE",
+            "RESOURCE_AWARE_FALLBACK",
+        }:
+            raise ValueError("cloud_fallback_mode 无效。")
 
 
 DEFAULT_CONFIG: CacheOptimizationConfig | None = None
@@ -202,6 +221,12 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         uav_cpu_cycles_per_s=float(get(config, "nodes.uav.cpu_cycles_per_s")),
         cloud_cpu_cycles_per_s=float(get(config, "nodes.cloud.cpu_cycles_per_s")),
         cloud_total_cpu_cycles_per_s=float(get(config, "nodes.cloud.total_cpu_cycles_per_s")),
+        cloud_resource_mode=str(
+            get(config, "nodes.cloud.resource_mode", "legacy_unlimited")
+        ),
+        cloud_cpu_capacity_cycles_per_s=float(
+            get(config, "nodes.cloud.cpu_capacity_cycles_per_s", 0.0)
+        ),
         local_energy_per_cycle_j=float(get(config, "nodes.vehicle.kappa")),
         tx_power_w=float(get(config, "nodes.vehicle.transmit_power_w")),
         sv_bandwidth_hz=float(get(config, "nodes.sv.bandwidth_hz")),
@@ -221,6 +246,13 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         cloud_total_bandwidth_bps=float(get(config, "nodes.cloud.total_bandwidth_bps")),
         cloud_delay_factor=float(get(config, "nodes.cloud.cloud_delay_factor")),
         cloud_resource_sharing=cloud_resource_sharing,
+        cloud_fallback_mode=str(
+            get(
+                config,
+                "algorithm.matching.cloud_fallback_mode",
+                "LEGACY_EDGE_GATE",
+            )
+        ),
         sv_range_m=float(get(config, "nodes.sv.range_m")),
         rsu_range_m=float(get(config, "nodes.rsu.range_m")),
         uav_range_m=float(get(config, "nodes.uav.range_m")),

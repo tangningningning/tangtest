@@ -24,17 +24,22 @@ python scripts/generation/generate_episode_pool.py --help
 
 ## 训练
 
-训练使用 `ppo-train` 和已有 episode pool。`--epochs` 必须是 4 的倍数；checkpoint 与 resume 只允许在完整 update group 边界：
+训练使用 `ppo-train` 和完整 episode pool。`--epochs` 必须是 4 的倍数；checkpoint 与 resume 只允许在完整 update group 边界。Stage6正式对照使用独立配置和训练池；该池复用既有 Training episode 的轨迹、角色、预测、流行度、到达与服务ID，只将任务输入、CPU cycles 和场景负载预测按Stage6服务目录同步到500–2000 KB基准范围：
+
+其配置为 `configs/proposed/system_config.toml`，数据池为 `environment_data/stage6_candidate_resource_reduced_training`；数据准备复用既有池，不重新运行300次完整环境生成。
+
+数据池准备后，四个入口使用相同配置、Training Episode、PPO随机种子和其他算法参数，仅Macro Actor学习率不同：
 
 ```powershell
-ppo-train --config configs/proposed/system_config.toml `
-  --epochs <episodes> --run-dir runs/<new-run> `
-  --episode-pool environment_data/<episode-pool>
+python scripts/training/run_stage6_lr_1e_minus_4.py
+python scripts/training/run_stage6_lr_5e_minus_4.py
+python scripts/training/run_stage6_lr_1e_minus_3.py
+python scripts/training/run_stage6_lr_5e_minus_3.py
 ```
 
-可用 `--resume` 从该 run 的最新 checkpoint 继续。正式 300-realization 主线可运行 `python scripts/training/run_proposed_formal.py`（seed=27005，episodes=300）。缺失 realization 默认会报错；本主线要求使用现有训练 realization，不重新生成数据。
+四个入口通过 `mainline_runner.py` 调用同一个 `ppo_simple.trainer`，分别写入对应的 `runs/stage6_lr_*`。共享Runner拒绝覆盖已有Run，并在启动前核验Stage6配置、训练池及20001–20300的Train划分。Macro Actor学习率通过Trainer的CLI覆盖参数设置；Stage6采用constant调度，Trainer会将覆盖值同时用于初始和最终学习率，因此每次更新都应用同一个指定值。其他优化器仍使用Stage6配置中的学习率。
 
-`checkpoints/latest_checkpoint.pt` 是主线的恢复与正式评价 checkpoint。`best_train_return_checkpoint.pt` 按单个训练 episode 的 raw return 保存，仅作训练诊断；正式 evaluator 会拒绝该文件，不会把它当作最终模型选择结果。历史 `scripts/training/run_proposed_macro_actor_lr_*.py` 结果属于固定学习率、每个 realization 一次更新的旧协议，保留作历史比较；新版 checkpoint 不接受旧版本恢复。
+`checkpoints/latest_checkpoint.pt` 是主线的恢复与正式评价 checkpoint。`best_train_return_checkpoint.pt` 按单个训练 episode 的 raw return 保存，仅作训练诊断；正式 evaluator 会拒绝该文件，不会把它当作最终模型选择结果。历史旧协议结果保留在既有 Run 与报告中；当前 `scripts/training/` 只保留Stage6四个正式入口和共享Runner。
 
 ## 评价
 

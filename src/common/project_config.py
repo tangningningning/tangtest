@@ -465,6 +465,8 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "nodes.uav.cpu_cycles_per_s",
     "nodes.cloud.cpu_cycles_per_s",
     "nodes.cloud.total_cpu_cycles_per_s",
+    "nodes.cloud.resource_mode",
+    "nodes.cloud.cpu_capacity_cycles_per_s",
     "nodes.cloud.uplink_rate_bps",
     "nodes.cloud.total_bandwidth_bps",
     "nodes.cloud.resource_sharing",
@@ -1096,8 +1098,38 @@ def validate_config(
         )
     if cloud_resource_sharing:
         raise ValueError(
-            "当前正式模型要求 nodes.cloud.resource_sharing=false；"
-            "Cloud 使用固定每任务资源，不按同槽任务数均分。"
+            "nodes.cloud.resource_sharing 必须为 false；"
+            "Cloud 上行保持每任务独立等效链路，CPU共享由 resource_mode 单独控制。"
+        )
+    cloud_resource_mode = str(
+        get_config_value(config, "nodes.cloud.resource_mode", "legacy_unlimited")
+    )
+    if cloud_resource_mode not in {"legacy_unlimited", "finite_pool"}:
+        raise ValueError(
+            "nodes.cloud.resource_mode 必须是 legacy_unlimited 或 finite_pool。"
+        )
+    cloud_cpu_capacity = get_config_value(
+        config, "nodes.cloud.cpu_capacity_cycles_per_s"
+    )
+    if cloud_resource_mode == "finite_pool":
+        if cloud_cpu_capacity is None or float(cloud_cpu_capacity) <= 0.0:
+            raise ValueError(
+                "finite_pool 模式要求 nodes.cloud.cpu_capacity_cycles_per_s 为正数。"
+            )
+    cloud_fallback_mode = str(
+        get_config_value(
+            config,
+            "algorithm.matching.cloud_fallback_mode",
+            "LEGACY_EDGE_GATE",
+        )
+    )
+    if cloud_fallback_mode not in {
+        "LEGACY_EDGE_GATE",
+        "RESOURCE_AWARE_FALLBACK",
+    }:
+        raise ValueError(
+            "algorithm.matching.cloud_fallback_mode 必须是 LEGACY_EDGE_GATE "
+            "或 RESOURCE_AWARE_FALLBACK。"
         )
     uav_deployment_altitude = float(
         get_config_value(config, "nodes.uav.deployment_altitude_m")
@@ -1134,7 +1166,10 @@ def validate_config(
     if float(get_config_value(config, "nodes.cloud.uplink_rate_bps")) != float(
         get_config_value(config, "nodes.cloud.total_bandwidth_bps")
     ):
-        raise ValueError("Cloud 重复 uplink 字段必须与唯一总带宽容量一致。")
+        raise ValueError(
+            "nodes.cloud.total_bandwidth_bps 是兼容字段，必须与每任务固定等效上行速率 "
+            "nodes.cloud.uplink_rate_bps 一致；它不表示Cloud共享总带宽池。"
+        )
 
     for key, status in config.get("parameter_status", {}).items():
         if status not in {
