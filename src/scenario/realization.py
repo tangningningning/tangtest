@@ -22,7 +22,6 @@ REALIZATION_ARTIFACT_FILENAMES = {
     "vehicle_predictions": "vehicle_predictions.csv",
     "popularity_predictions": "popularity_predictions.csv",
     "prediction_scenarios": "prediction_scenarios.npz",
-    "tv_local_cache": "tv_local_cache.json",
 }
 # 单条 episode 生成器还会输出以下来源记录文件；完整性校验会同时检查这些文件。
 GENERATOR_EXTRA_ARTIFACT_FILENAMES = (
@@ -44,7 +43,6 @@ class RealizationArtifacts:
     vehicle_predictions: Path
     popularity_predictions: Path
     prediction_scenarios: Path
-    tv_local_cache: Path
 
 
 def configured_realization_artifacts(
@@ -68,7 +66,6 @@ def configured_realization_artifacts(
         vehicle_predictions=paths["vehicle_predictions"],
         popularity_predictions=paths["popularity_predictions"],
         prediction_scenarios=paths["prediction_scenarios"],
-        tv_local_cache=paths["tv_local_cache"],
     )
 
 
@@ -104,7 +101,6 @@ def _realization_artifacts_from_directory(directory: Path) -> RealizationArtifac
         vehicle_predictions=paths["vehicle_predictions"],
         popularity_predictions=paths["popularity_predictions"],
         prediction_scenarios=paths["prediction_scenarios"],
-        tv_local_cache=paths["tv_local_cache"],
     )
 
 
@@ -117,7 +113,6 @@ EPISODE_SEED_STREAMS = (
     "task_arrival_seed",
     "service_request_seed",
     "workload_seed",
-    "tv_cache_seed",
     "vehicle_observation_seed",
     "scenario_seed",
 )

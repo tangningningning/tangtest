@@ -32,13 +32,13 @@
 
 [experiment]
 # 实验名称。用于后续结果 metadata 和配置快照引用；修改它不需要重新生成数据。
-name = "STAGE6_CANDIDATE_CLOUD40_PSI15_CACHE25_20_12_INPUT500_2000"
+name = "STAGEB3_3_MULTI_NODE_FACTORIZED_CACHE"
 # 主实验随机种子。当前沿用已有正式数据中的主 seed；修改后若用于生成任务/预测场景，需要重跑对应上游模块。
 seed = 4401
 # 重复实验编号。只用于后续批量实验标识，不改变系统物理模型。
 repeat_index = 0
 # 输出标签。用于后续 result 文件命名；修改它不需要重新生成上游数据。
-output_tag = "stage6_candidate_cloud40_psi15_cache25_20_12_input500_2000"
+output_tag = "stageB3_3_multi_node_factorized_cache"
 
 [paths]
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
@@ -69,9 +69,6 @@ vehicle_residual_bank = "data/calibration/residual_blocks.npz"
 popularity_history = "data/generated/popularity_history.csv"
 # GRU checkpoint。修改 popularity 预测训练参数后需要重新训练。
 popularity_gru = "data/generated/popularity_gru.pt"
-# TV 固定本地缓存初始状态。Matching 只能读取该 artifact，
-# 不得在slot内动态生成或更新TV本地缓存。
-tv_local_cache = "data/generated/tv_local_cache.json"
 
 [simulation]
 # SUMO 基础时间步，同时也是 MEC 基础 slot，单位 s。当前实际值来自已生成数据。
@@ -135,22 +132,6 @@ load_relative_jitter = 0.10
 master_seed = 4401
 
 [nodes.vehicle]
-# TV 本地 CPU 总计算能力，单位 cycle/s。
-# VEC 仿真中车辆本地 CPU 常设置在 0.5~1GHz 量级，当前主实验取 1GHz。
-# 这是文献校准实验基线，不代表硬件实测数据。
-local_cpu_cycles_per_s = 1.0e9
-# TV 固定本地缓存容量，单位 MB；由 cache.capacity_policy.tv_ratio 和
-# service_catalog 总大小通过统一 artifact 入口自动生成。
-local_cache_capacity_mb = 5581.58344157102
-# 文献校准基线。
-# 本地计算能耗模型：E = kappa * L * F^2。
-# L 单位 cycle，F 单位 cycle/s，E 单位 J。
-# 参考 VEC 文献 Energy-Efficient Task Offloading for Vehicular Edge Computing:
-# Joint Optimization of Offloading and Bit Allocation 中相同模型采用的
-# effective switched capacitance 1e-28。
-# 后续敏感性实验可以改变，但主实验基线采用 1e-28；
-# 这是文献校准实验基线，不代表硬件实测值。
-kappa = 1.0e-28
 # 车辆上传发射功率，单位 W。
 # VEC 地面通信基线采用 23 dBm，换算为 0.1995262315 W。
 # 注意：system_model.py 的 Shannon 公式只使用 W 线性单位，不直接使用 dBm。
@@ -167,7 +148,7 @@ cpu_cycles_per_s = 1.0e9
 # SV 链路带宽，单位 Hz。
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
-bandwidth_hz = 20.0e6
+bandwidth_hz = 10.0e6
 # 参数状态：EXPERIMENT_DESIGN。
 # SV 触发固定配置成本 eta_ca；不是文献直接物理常数或实测能耗。
 # 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
@@ -192,7 +173,7 @@ cpu_cycles_per_s = 10.0e9
 # RSU 带宽，单位 Hz。
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
-bandwidth_hz = 20.0e6
+bandwidth_hz = 10.0e6
 # 参数状态：EXPERIMENT_DESIGN。
 # RSU 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数或实测能耗。
 # 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
@@ -286,27 +267,25 @@ movement_fixed_cost = 0.00176
 cpu_cycles_per_s = 40.0e9
 # legacy_unlimited 模式的兼容总 CPU 字段；finite_pool 改用 cpu_capacity_cycles_per_s。
 total_cpu_cycles_per_s = 40.0e9
-# 阶段3B实验合同：Cloud 总 CPU 池；60 GHz 为实验锚点，尚非物理标定值。
+# Cloud有限共享CPU总池为40 GHz；这是仿真假设，不是部署测量。
 resource_mode = "finite_pool"
 cpu_capacity_cycles_per_s = 40.0e9
-# 每个 Cloud 任务车辆均使用固定等效上行速率 R_c=200 Mbps，作为仿真假设。
-# 速率不按同槽 Cloud 任务数分摊；这不表示现实网络提供物理独占保障速率。
-uplink_rate_bps = 200.0e6
+# B3-10E EQUAL_SHARE参考场景拟合的每任务固定等效速率为 1633066.7164444982 bit/s。
+# Matching运行时每个Cloud任务使用此固定等效值，不按任务数再次分摊。
+# 该训练数据条件拟合值不代表实际网络保证吞吐或物理可靠接入。
+uplink_rate_bps = 1633066.7164444982
 # 兼容现有接口的重复字段，必须与 uplink_rate_bps 相等；字段名中的 total 不表示共享池。
-total_bandwidth_bps = 200.0e6
+total_bandwidth_bps = 1633066.7164444982
 # 当前接口要求 resource_sharing=false：不建模 Cloud 接入用户间的带宽竞争。
 # Cloud CPU 是否共享由 resource_mode 独立控制；本配置使用有限共享 CPU 池。
 resource_sharing = false
 # 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c，
 # E_vc_vehicle = p_v * D_v / R_c；psi_c 不进入能耗。
-# 引用论文 Table IV 的 Avg. uplink rate to cloud=200 Mbps 仅作数值先例，不定义共享容量合同。
-# 本仿真假设将该固定等效速率用于每个 Cloud 任务车辆，不作为单 Cloud 节点总吞吐池。
-# 该值不是目标现实网络对每辆车的物理保障速率。
-# Cloud 传输扩展系数 psi_c，配置键 cloud_delay_factor，当前系统公式中作为 D_v/R_c 的乘法因子。
-# 系统模型要求 psi_c >= 1；当前固定值为 11.0。
-# 该固定系数将远程 Cloud 的回传、核心网及跨域附加时延统一吸收到
-# psi_c * D/R_c 中，不读取未来任务或运行时请求统计动态重算。
-cloud_delay_factor = 15.0
+# B3-10E TRAIN-only EQUAL_SHARE拟合基于指定的等份RSU接入和每RSU共享回传参考假设。
+# R_cloud与psi_cloud为全池等效拟合值；不表示实际无线覆盖、吞吐保证或显式回传链路。
+# Cloud传输时延仍按 psi_cloud * D_bits / R_cloud 计算；车辆发送能耗不乘psi_cloud。
+# psi_cloud=1.0681932194051897 是训练数据条件拟合值，不按未来任务动态重算。
+cloud_delay_factor = 1.0681932194051897
 
 [communication]
 # 本 section 集中通信模型参数，后续 Cache surrogate、Matching、KKT 必须共用。
@@ -323,7 +302,10 @@ pathloss_exponent = 2.75
 # 地面链路带宽，单位 Hz，用于 SV/RSU surrogate。
 # 当前第一版地面 V2V/V2I 统一采用 10MHz 系统带宽。
 # 这是文献校准实验基线，不代表硬件实测数据。
-bandwidth_hz = 20.0e6
+bandwidth_hz = 10.0e6
+# Ground carrier is explicit for the V2X reference, but beta_g already includes
+# its 5.9 GHz free-space reference loss. Do not add a second carrier correction.
+carrier_frequency_hz = 5.9e9
 
 [communication.air]
 # 空地链路参数。最终物理通信质量由 LoS/NLoS 平均信道增益 + Shannon 速率计算。
@@ -349,15 +331,25 @@ alpha_los = 2.0
 alpha_nlos = 2.0
 
 [communication.noise]
-# 接收噪声总功率，单位 W。
-# VEC 地面通信基线采用 -95 dBm，换算为 10^((-95-30)/10)=3.16227766e-13 W。
-# 注意：system_model.py 的 Shannon 公式只使用 W 线性单位，不直接使用 dBm。
-# 这是文献校准实验基线，不代表硬件实测数据。
+# Explicit version selector: unlike legacy configs, this mode integrates
+# thermal noise over each task's KKT-allocated frequency bandwidth.
+model = "BANDWIDTH_DEPENDENT_NOISE_V1"
+# Retained only as the required legacy contract value; V1 does not use it.
 noise_power_w = 3.16227766e-13
+# Thermal noise density and effective receiver NF. NF is a literature-aligned
+# simulation baseline that reproduces -95 dBm over 10 MHz, not measured hardware.
+psd_dbm_per_hz = -174.0
+receiver_noise_figure_db = 9.0
+
+[communication.resource_model]
+# Each node has an ideal independent orthogonal frequency pool; no inter-node
+# co-channel interference is modeled in this first-stage contract.
+inter_node_spectrum = "ORTHOGONAL_INDEPENDENT"
+interference = "NONE"
 
 [communication.cloud]
-# Cloud 每任务固定等效上行速率，须与 nodes.cloud.uplink_rate_bps 相同。
-uplink_rate_bps = 200.0e6
+# Cloud每任务固定等效上行速率，须与nodes.cloud重复字段相同；数值来源为B3-10E TRAIN-only EQUAL_SHARE拟合。
+uplink_rate_bps = 1633066.7164444982
 
 [cache]
 # Cache/UAV prediction/configuration surrogate 的 horizon 折扣 beta；
@@ -414,16 +406,12 @@ cache_cost_weight = 0.1
 # Test: environment_data/proposed_joint_test，seeds 40001–40100，
 # 100 complete realizations。
 # 三个 split 的 seed 区间互不重叠，每个 realization 均完整覆盖 300 slots。
-# 这样参考值主要由训练校准任务工作负载和车辆本地计算能力决定，
-# 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
-# 因此适合作为不同算法统一使用的归一化基准。
+# 此参考值继续沿用移除 TV Local 前的 Stage6 Training 冻结校准，不因本次模型切换重标定。
 # 历史训练校准样本共 3343 个到达任务；cpu_cycles P95=30,628,985,166.15863 cycle；
-# 在 1.0e9 cycle/s 的 TV CPU 上对应 30.6289851662 s。
+# 历史上按 1.0e9 cycle/s 的 TV CPU 换算为 30.6289851662 s。
 T_ref = 30.6289851662
-# 这样参考值主要由任务工作负载和车辆本地计算能力决定，
-# 不依赖某个 offloading 算法、节点关联结果或 Matching/KKT 策略。
-# 因此适合作为不同算法统一使用的归一化基准。
-# 使用同一训练校准 P95 工作负载和 kappa=1.0e-28，Local energy P95=3.06289851662 J。
+# 历史 E_ref 按同一 P95 工作负载与 kappa=1.0e-28 的 TV Local 模型标定；
+# 本次保留该冻结归一化常数，不代表整改后 TV 本地执行。
 E_ref = 3.06289851662
 
 [prediction.vehicle]
@@ -537,7 +525,9 @@ cloud_fallback_mode = "RESOURCE_AWARE_FALLBACK"
 enabled = true
 method = "PROPOSED"
 configuration_control_mode = "macro_cache_smdp_micro_uav_candidate"
-policy_schema = "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v2"
+policy_schema = "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1"
+cache_action_mode = "MULTI_NODE_FACTORIZED"
+cache_reconfiguration_model = "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION"
 macro_cache_enabled = true
 # 开启自适应 Cache holding；每次至少保持 1 个 slot，最多保持 5 个 slot。
 adaptive_holding_enabled = true
@@ -653,9 +643,6 @@ terminal_origin = 299
 "algorithm.ppo.long_value_learning_rate" = "ALGORITHM_DESIGN"
 "algorithm.ppo.long_value_steps_per_update" = "ALGORITHM_DESIGN"
 "algorithm.ppo.long_value_max_grad_norm" = "ALGORITHM_DESIGN"
-"nodes.vehicle.local_cpu_cycles_per_s" = "CONFIRMED_DATA"
-"nodes.vehicle.local_cache_capacity_mb" = "CONFIRMED_DATA"
-"nodes.vehicle.kappa" = "CONFIRMED_DATA"
 "nodes.vehicle.transmit_power_w" = "CONFIRMED_DATA"
 "nodes.sv.cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.rsu.cpu_cycles_per_s" = "CONFIRMED_DATA"
@@ -664,10 +651,10 @@ terminal_origin = 299
 "nodes.cloud.total_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.cloud.resource_mode" = "EXPERIMENT_DESIGN"
 "nodes.cloud.cpu_capacity_cycles_per_s" = "EXPERIMENT_DESIGN"
-"nodes.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
-"nodes.cloud.total_bandwidth_bps" = "CONFIRMED_DATA"
+"nodes.cloud.uplink_rate_bps" = "TRAIN_ONLY_CALIBRATION"
+"nodes.cloud.total_bandwidth_bps" = "TRAIN_ONLY_CALIBRATION"
 "nodes.cloud.resource_sharing" = "CONFIRMED_DATA"
-"nodes.cloud.cloud_delay_factor" = "CONFIRMED_DATA"
+"nodes.cloud.cloud_delay_factor" = "TRAIN_ONLY_CALIBRATION"
 "nodes.sv.bandwidth_hz" = "CONFIRMED_DATA"
 "nodes.rsu.bandwidth_hz" = "CONFIRMED_DATA"
 "nodes.uav.bandwidth_hz" = "CONFIRMED_DATA"
@@ -684,6 +671,12 @@ terminal_origin = 299
 "communication.ground.pathloss_exponent" = "CONFIRMED_DATA"
 "communication.ground.bandwidth_hz" = "CONFIRMED_DATA"
 "communication.noise.noise_power_w" = "CONFIRMED_DATA"
+"communication.ground.carrier_frequency_hz" = "LITERATURE_DERIVED"
+"communication.noise.model" = "EXPERIMENT_DESIGN"
+"communication.noise.psd_dbm_per_hz" = "LITERATURE_DERIVED"
+"communication.noise.receiver_noise_figure_db" = "LITERATURE_DERIVED"
+"communication.resource_model.inter_node_spectrum" = "EXPERIMENT_DESIGN"
+"communication.resource_model.interference" = "EXPERIMENT_DESIGN"
 "communication.air.eta1" = "CONFIRMED_DATA"
 "communication.air.eta2" = "CONFIRMED_DATA"
 "communication.air.carrier_frequency_hz" = "CONFIRMED_DATA"
@@ -691,7 +684,7 @@ terminal_origin = 299
 "communication.air.beta_nlos" = "CONFIRMED_DATA"
 "communication.air.alpha_los" = "CONFIRMED_DATA"
 "communication.air.alpha_nlos" = "CONFIRMED_DATA"
-"communication.cloud.uplink_rate_bps" = "CONFIRMED_DATA"
+"communication.cloud.uplink_rate_bps" = "TRAIN_ONLY_CALIBRATION"
 "objective.omega_delay" = "EXPERIMENT_DESIGN"
 "objective.omega_energy" = "EXPERIMENT_DESIGN"
 "objective.lambda_cache" = "EXPERIMENT_DESIGN"

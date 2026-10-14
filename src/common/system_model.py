@@ -22,32 +22,15 @@ from typing import Any
 import numpy as np
 
 
+FIXED_TOTAL_NOISE_V0 = "FIXED_TOTAL_NOISE_V0"
+BANDWIDTH_DEPENDENT_NOISE_V1 = "BANDWIDTH_DEPENDENT_NOISE_V1"
+
+
 def _require_finite(name: str, value: float) -> float:
     value = float(value)
     if not math.isfinite(value):
         raise ValueError(f"{name} 不能是 NaN/Inf。")
     return value
-
-
-def local_execution(
-    cpu_cycles: float,
-    local_cpu_cycles_per_s: float,
-    kappa: float,
-) -> dict[str, float]:
-    """Local: T=L/F_v, E=kappa*L*F_v^2。"""
-    cycles = _require_finite("cpu_cycles", cpu_cycles)
-    cpu = _require_finite("local_cpu_cycles_per_s", local_cpu_cycles_per_s)
-    kappa_value = _require_finite("kappa", kappa)
-    if cycles < 0.0:
-        raise ValueError("cpu_cycles 不能为负数。")
-    if cpu <= 0.0:
-        raise ValueError("local_cpu_cycles_per_s 必须大于 0。")
-    if kappa_value < 0.0:
-        raise ValueError("kappa 不能为负数。")
-    return {
-        "delay_s": cycles / cpu,
-        "vehicle_energy_j": kappa_value * cycles * cpu * cpu,
-    }
 
 
 def ground_channel_gain(distance_m: float, beta_g: float, alpha_g: float) -> float:
@@ -63,28 +46,128 @@ def ground_channel_gain(distance_m: float, beta_g: float, alpha_g: float) -> flo
     return beta * distance ** (-alpha)
 
 
+def dbm_per_hz_to_w_per_hz(value_dbm_per_hz: float) -> float:
+    value = _require_finite("noise_psd_dbm_per_hz", value_dbm_per_hz)
+    result = 10.0 ** ((value - 30.0) / 10.0)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError("noise PSD conversion must produce a positive finite W/Hz value")
+    return result
+
+
+def uplink_rate_and_derivative(
+    bandwidth_hz: float,
+    bandwidth_fraction: float | np.ndarray,
+    transmit_power_w: float | np.ndarray,
+    channel_gain: float | np.ndarray,
+    noise_power_w: float,
+    *,
+    noise_model: str = FIXED_TOTAL_NOISE_V0,
+    noise_psd_w_per_hz: float | None = None,
+    receiver_noise_figure_db: float | None = None,
+) -> tuple[float | np.ndarray, float | np.ndarray, float | np.ndarray]:
+    """Return allocated-bandwidth rate, dR/db, and integrated receiver noise.
+
+    ``bandwidth_fraction`` is a frequency-resource fraction.  In the explicit
+    V1 model, noise is integrated over ``b * B`` while the task's total transmit
+    power remains fixed.  The legacy branch deliberately retains its former
+    fixed-total-noise semantics.
+    """
+
+    bandwidth = _require_finite("bandwidth_hz", bandwidth_hz)
+    fixed_noise = _require_finite("noise_power_w", noise_power_w)
+    if bandwidth <= 0.0:
+        raise ValueError("bandwidth_hz 必须大于 0。")
+    fractions, powers, gains = np.broadcast_arrays(
+        np.asarray(bandwidth_fraction, dtype=np.float64),
+        np.asarray(transmit_power_w, dtype=np.float64),
+        np.asarray(channel_gain, dtype=np.float64),
+    )
+    if (
+        np.any(~np.isfinite(fractions))
+        or np.any(~np.isfinite(powers))
+        or np.any(~np.isfinite(gains))
+    ):
+        raise ValueError("bandwidth fraction, power and gain must be finite")
+    if np.any(fractions < 0.0) or np.any(fractions > 1.0):
+        raise ValueError("bandwidth_fraction 必须位于 [0,1]。")
+    if np.any(powers < 0.0) or np.any(gains < 0.0):
+        raise ValueError("transmit_power_w/channel_gain 不能为负数。")
+
+    allocated_bandwidth = fractions * bandwidth
+    if noise_model == FIXED_TOTAL_NOISE_V0:
+        if np.any(fractions <= 0.0):
+            raise ValueError("旧固定噪声模型的 bandwidth_fraction 必须位于 (0,1]。")
+        if fixed_noise <= 0.0:
+            raise ValueError("noise_power_w 必须大于 0。")
+        noise = np.full(fractions.shape, fixed_noise, dtype=np.float64)
+        snr = powers * gains / noise
+        spectral_efficiency = np.log1p(snr) / math.log(2.0)
+        rate = allocated_bandwidth * spectral_efficiency
+        derivative = bandwidth * spectral_efficiency
+    elif noise_model == BANDWIDTH_DEPENDENT_NOISE_V1:
+        if noise_psd_w_per_hz is None or receiver_noise_figure_db is None:
+            raise ValueError(
+                "BANDWIDTH_DEPENDENT_NOISE_V1 requires explicit noise PSD and receiver NF"
+            )
+        psd = _require_finite("noise_psd_w_per_hz", noise_psd_w_per_hz)
+        nf_db = _require_finite("receiver_noise_figure_db", receiver_noise_figure_db)
+        if psd <= 0.0:
+            raise ValueError("noise_psd_w_per_hz 必须大于 0。")
+        if nf_db < 0.0:
+            raise ValueError("receiver_noise_figure_db 不能为负数。")
+        nf_linear = 10.0 ** (nf_db / 10.0)
+        if not math.isfinite(nf_linear):
+            raise ValueError("receiver noise figure conversion overflow")
+        noise = psd * allocated_bandwidth * nf_linear
+        positive = allocated_bandwidth > 0.0
+        rate = np.zeros(fractions.shape, dtype=np.float64)
+        derivative = np.zeros(fractions.shape, dtype=np.float64)
+        if np.any(positive):
+            effective_psd = psd * nf_linear
+            a = powers[positive] * gains[positive] / effective_psd
+            w = allocated_bandwidth[positive]
+            ratio = a / w
+            log_term = np.log1p(ratio)
+            rate[positive] = w * log_term / math.log(2.0)
+            derivative[positive] = bandwidth / math.log(2.0) * (
+                log_term - a / (w + a)
+            )
+    else:
+        raise ValueError(f"unsupported communication noise model: {noise_model!r}")
+
+    if (
+        np.any(~np.isfinite(rate))
+        or np.any(~np.isfinite(noise))
+        or np.any(np.isnan(derivative))
+    ):
+        raise ValueError("uplink rate/noise calculation produced NaN/Inf")
+    if rate.ndim == 0:
+        return float(rate), float(derivative), float(noise)
+    return rate, derivative, noise
+
+
 def uplink_rate(
     bandwidth_hz: float,
     bandwidth_fraction: float,
     transmit_power_w: float,
     channel_gain: float,
     noise_power_w: float,
+    *,
+    noise_model: str = FIXED_TOTAL_NOISE_V0,
+    noise_psd_w_per_hz: float | None = None,
+    receiver_noise_figure_db: float | None = None,
 ) -> float:
-    bandwidth = _require_finite("bandwidth_hz", bandwidth_hz)
-    fraction = _require_finite("bandwidth_fraction", bandwidth_fraction)
-    power = _require_finite("transmit_power_w", transmit_power_w)
-    gain = _require_finite("channel_gain", channel_gain)
-    noise = _require_finite("noise_power_w", noise_power_w)
-    if bandwidth <= 0.0:
-        raise ValueError("bandwidth_hz 必须大于 0。")
-    if not 0.0 < fraction <= 1.0:
-        raise ValueError("bandwidth_fraction 必须位于 (0,1]。")
-    if power < 0.0 or gain < 0.0:
-        raise ValueError("transmit_power_w/channel_gain 不能为负数。")
-    if noise <= 0.0:
-        raise ValueError("noise_power_w 必须大于 0。")
-    snr = power * gain / noise
-    return fraction * bandwidth * math.log2(1.0 + snr)
+    rate, _, _ = uplink_rate_and_derivative(
+        bandwidth_hz,
+        bandwidth_fraction,
+        transmit_power_w,
+        channel_gain,
+        noise_power_w,
+        noise_model=noise_model,
+        noise_psd_w_per_hz=noise_psd_w_per_hz,
+        receiver_noise_figure_db=receiver_noise_figure_db,
+    )
+    return float(rate)
 
 
 def edge_execution(
@@ -97,6 +180,10 @@ def edge_execution(
     noise_power_w: float,
     node_cpu_cycles_per_s: float,
     cpu_fraction: float,
+    *,
+    noise_model: str = FIXED_TOTAL_NOISE_V0,
+    noise_psd_w_per_hz: float | None = None,
+    receiver_noise_figure_db: float | None = None,
 ) -> dict[str, float]:
     bits = _require_finite("input_bits", input_bits)
     cycles = _require_finite("cpu_cycles", cpu_cycles)
@@ -114,6 +201,9 @@ def edge_execution(
         transmit_power_w,
         channel_gain,
         noise_power_w,
+        noise_model=noise_model,
+        noise_psd_w_per_hz=noise_psd_w_per_hz,
+        receiver_noise_figure_db=receiver_noise_figure_db,
     )
     if rate <= 0.0:
         raise ValueError("uplink rate 必须大于 0。")
@@ -168,6 +258,7 @@ def cloud_execution(
         "total_delay_s": upload_delay + compute_delay,
         "vehicle_energy_j": power * bits / allocated_rate,
     }
+
 
 
 def air_channel_gain(

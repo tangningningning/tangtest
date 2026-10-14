@@ -76,15 +76,10 @@ def _matching_summary(
         for node_id, role in zip(node_ids, cache_nodes["node_roles"], strict=True)
     }
     counts_by_node = {node_id: 0 for node_id in node_ids}
-    local_count = 0
     cloud_count = 0
     for target in result.matching.values():
         if target == task_allocation.CLOUD:
             cloud_count += 1
-        elif target == task_allocation.LOCAL or target.startswith(
-            task_allocation.LOCAL_PREFIX
-        ):
-            local_count += 1
         elif target in counts_by_node:
             counts_by_node[target] += 1
         else:
@@ -126,6 +121,7 @@ def _matching_summary(
         else None
     )
     summary = {
+        "resource_feasible": bool(result.resource_feasible),
         "updates": result.updates,
         "transfer_updates": result.transfer_updates,
         "exchange_updates": result.exchange_updates,
@@ -187,7 +183,6 @@ def _matching_summary(
         "cloud_resource_mode": cache_config.cloud_resource_mode,
         "cloud_fallback_mode": cache_config.cloud_fallback_mode,
         "node_task_count": {
-            "Local": int(local_count),
             "SV": int(sum(counts_by_role["SV"].values())),
             "SV_by_node": counts_by_role["SV"],
             "RSU": int(sum(counts_by_role["RSU"].values())),
@@ -219,6 +214,11 @@ def _matching_summary(
             "cloud_cpu_allocations_cycles_per_s": dict(
                 result.cloud_cpu_allocations_cycles_per_s
             ),
+            "rsu_radio_bandwidth_fraction_sum_by_node": {
+                node_id: float(math.fsum(result.bandwidth_allocations.get(node_id, {}).values()))
+                for node_id in node_ids
+                if node_roles[node_id] == "RSU"
+            },
             "edge_cpu_usage_cycles_per_s": edge_cpu_total,
             "edge_cpu_usage_by_node_cycles_per_s": edge_cpu_by_node,
         },
@@ -266,6 +266,9 @@ def _configuration_summary(
         "predictive_utility": None if prediction_skipped else result.predictive_utility,
         "predictive_objective": None if prediction_skipped else result.objective_value,
         "cache_cost": result.cache_cost,
+        "cache_cost_by_node": dict(
+            result.cache_result_summary.get("cache_cost_by_node", {})
+        ),
         "movement_energy": result.movement_energy,
         "movement_cost": result.movement_cost,
         "outer_rounds": result.outer_rounds,
@@ -337,7 +340,6 @@ def execute_slot(
     scenario_slice: dict[str, Any],
     actual_tasks: list[task_allocation.Task],
     actual_vehicle_positions: dict[str, np.ndarray],
-    local_cache_state: dict[str, set[int]],
     service_catalog: dict[str, Any],
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
@@ -511,7 +513,6 @@ def execute_slot(
         actual_tasks,
         actual_vehicle_positions,
         service_positions,
-        local_cache_state,
         final_cache,
         project_cfg,
         cache_nodes,
@@ -718,16 +719,21 @@ def _cache_cost(
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray]:
     """Cache cost 始终由 C_prev -> C_candidate 一次性计算。"""
 
-    return cache_configuration.cache_update_cost(
+    result = cache_configuration.cache_update_cost_details(
         previous_cache_state,
         cache_state,
         cache_triggers,
         service_catalog["service_sizes_mb"],
         cache_nodes,
         cache_config,
+    )
+    return (
+        float(result["total_cost"]),
+        np.asarray(result["loading_energy"], dtype=np.float64),
+        np.asarray(result["cost_by_node"], dtype=np.float64),
     )
 
 
@@ -775,7 +781,7 @@ def build_policy_target_configuration(
         project_cfg,
         flight_boundary,
     )
-    cache_cost, _ = _cache_cost(
+    cache_cost, _, cache_cost_by_node = _cache_cost(
         previous_cache,
         final_cache,
         cache_trigger,
@@ -817,7 +823,13 @@ def build_policy_target_configuration(
         accepted_cache_updates=int(actual_cache.sum()),
         accepted_uav_updates=int(actual_uav),
         stop_reason="policy_target_prediction_skipped",
-        cache_result_summary={"target_actions": [dict(value) for value in cache_actions]},
+        cache_result_summary={
+            "target_actions": [dict(value) for value in cache_actions],
+            "cache_cost_by_node": {
+                str(node_id): float(cache_cost_by_node[index])
+                for index, node_id in enumerate(cache_nodes["node_ids"])
+            },
+        },
         uav_result_summary={"target_actions": [dict(value) for value in uav_actions]},
     )
 
@@ -830,7 +842,6 @@ def execute_configured_slot(
     scenario_slice: dict[str, Any],
     actual_tasks: list[task_allocation.Task],
     actual_vehicle_positions: dict[str, np.ndarray],
-    local_cache_state: dict[str, set[int]],
     service_catalog: dict[str, Any],
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
@@ -890,7 +901,6 @@ def execute_configured_slot(
         scenario_slice,
         actual_tasks,
         actual_vehicle_positions,
-        local_cache_state,
         service_catalog,
         project_cfg,
         cache_nodes,

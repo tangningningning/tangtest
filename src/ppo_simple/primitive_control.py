@@ -85,7 +85,7 @@ class PrimitiveTensorSpec:
             num_cache_heads=len(context.action_spec.cache_node_ids),
             num_uav_heads=uav_count,
             observation_dim=int(context.observation_spec.observation_dim),
-            cache_feature_dim=21 + 6 * service_count,
+            cache_feature_dim=18 + 6 * service_count,
             uav_feature_dim=17 + uav_count + 2 * service_count,
             cache_max_candidates=int(context.cache_cfg.target_candidate_capacity),
             uav_max_candidates=int(search.target_candidate_capacity),
@@ -99,7 +99,6 @@ def _cache_target_configuration_feature(
     previous_cache: np.ndarray,
     cache_triggers: np.ndarray,
     node_specific_demand: np.ndarray,
-    observed_service_usage: np.ndarray,
     context: Any,
 ) -> np.ndarray:
     """编码完整 Cache 目标配置及其状态特征。"""
@@ -109,10 +108,9 @@ def _cache_target_configuration_feature(
     before = np.asarray(candidate.before_node_cache, dtype=np.float64).reshape(-1)
     target = np.asarray(candidate.target_node_cache, dtype=np.float64).reshape(-1)
     demand = np.asarray(node_specific_demand, dtype=np.float64).reshape(-1)
-    observed = np.asarray(observed_service_usage, dtype=np.float64).reshape(-1)
     if before.shape != (service_count,) or target.shape != before.shape:
         raise ValueError("target cache feature state shape mismatch")
-    if demand.shape != before.shape or observed.shape != before.shape:
+    if demand.shape != before.shape:
         raise ValueError("target cache feature demand shape mismatch")
     if not np.all(np.isin(before, [0.0, 1.0])) or not np.all(
         np.isin(target, [0.0, 1.0])
@@ -138,9 +136,6 @@ def _cache_target_configuration_feature(
     demand_before = demand * before
     demand_after = demand * target
     demand_gain = demand_after - demand_before
-    observed_before = observed * before
-    observed_after = observed * target
-    observed_gain = observed_after - observed_before
     current_replica_counts = np.sum(np.asarray(current_cache, dtype=np.float64), axis=0)
     target_replica_counts = np.sum(np.asarray(trial, dtype=np.float64), axis=0)
     current_diversity = float(np.count_nonzero(current_replica_counts > 0.0))
@@ -162,9 +157,6 @@ def _cache_target_configuration_feature(
             float(np.sum(demand_before)),
             float(np.sum(demand_after)),
             float(np.sum(demand_gain)),
-            float(np.sum(observed_before)),
-            float(np.sum(observed_after)),
-            float(np.sum(observed_gain)),
             math.log1p(max(float(total_cost), 0.0)),
             math.log1p(max(float(loading_energy[candidate.node_index]), 0.0)),
             float(np.mean(np.abs(delta))),
@@ -190,7 +182,7 @@ def _cache_target_configuration_feature(
             scalar_features,
         ]
     )
-    expected_dim = 21 + 6 * service_count
+    expected_dim = 18 + 6 * service_count
     if values.shape != (expected_dim,) or not np.all(np.isfinite(values)):
         raise AssertionError("target cache configuration feature shape/finite check failed")
     return values.astype(np.float32)
@@ -217,14 +209,14 @@ def cache_economic_candidate_features(
     primitive = np.asarray(primitive_features, dtype=np.float32)
     service_count = int(context.service_catalog["num_services"])
     node_count = len(context.cache_nodes["node_ids"])
-    expected_primitive_dim = 21 + 6 * service_count
+    expected_primitive_dim = 18 + 6 * service_count
     if current.ndim != 2 or current.shape[0] != node_count:
         raise ValueError("Cache economic feature current state shape mismatch")
     if not candidates or not np.array_equal(np.asarray(candidates[0]), current):
         raise ValueError("Cache economic candidate 0 must be KEEP/current Cache")
     if primitive.shape != (len(candidates), expected_primitive_dim):
         raise ValueError(
-            "Cache economic primitive features must align with candidates and the existing 81-D schema"
+            "Cache economic primitive features must align with candidates and the current schema"
         )
 
     result = np.zeros((len(candidates), CACHE_ECONOMIC_FEATURE_DIM), dtype=np.float32)
@@ -289,10 +281,10 @@ def cache_economic_candidate_features(
                 )
 
     scalar_start = 4 + 6 * service_count
-    cost_index = scalar_start + 11
+    cost_index = scalar_start + 8
     loaded_index = scalar_start + 3
     released_index = scalar_start + 4
-    diversity_index = scalar_start + 14
+    diversity_index = scalar_start + 11
     for candidate_index, target_raw in enumerate(candidates[1:], start=1):
         target = np.asarray(target_raw, dtype=np.int8)
         if target.shape != current.shape:
@@ -303,7 +295,7 @@ def cache_economic_candidate_features(
         node_index = int(changed_nodes[0])
         row = primitive[candidate_index]
         if not np.isfinite(row).all():
-            raise FloatingPointError("existing 81-D Cache node features are non-finite")
+            raise FloatingPointError("Cache node features are non-finite")
 
         result[candidate_index, 1] = row[0]
         result[candidate_index, 2:5] = row[1:4]
@@ -341,13 +333,12 @@ def _all_cache_target_configurations_with_features(
         context.service_catalog,
         proposal_cache_nodes,
         step.scenario_slice,
-        context.local_cache,
         context.cache_cfg,
         prediction_horizon_mask=prediction_horizon_mask,
     )
     if not all_candidates:
         return [], np.zeros(
-            (0, 21 + 6 * int(context.service_catalog["num_services"])),
+            (0, 18 + 6 * int(context.service_catalog["num_services"])),
             dtype=np.float32,
         )
     node_demand = cache_configuration.node_specific_predicted_demand(
@@ -357,10 +348,6 @@ def _all_cache_target_configurations_with_features(
         context.cache_cfg,
         prediction_horizon_mask=prediction_horizon_mask,
     )
-    observed_usage = cache_configuration.observed_local_service_usage(
-        context.local_cache,
-        int(context.service_catalog["num_services"]),
-    )
     all_features = np.stack(
         [
             _cache_target_configuration_feature(
@@ -369,7 +356,6 @@ def _all_cache_target_configurations_with_features(
                 previous_cache,
                 sequential_triggers,
                 node_demand,
-                observed_usage,
                 context,
             )
             for candidate in all_candidates

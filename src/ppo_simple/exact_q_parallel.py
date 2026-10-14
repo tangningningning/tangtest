@@ -395,7 +395,6 @@ def evaluate_transition(plan: ExactQTransitionPlan, context: Any | None = None) 
                 plan.step.scenario_slice,
                 plan.step.actual_tasks,
                 plan.step.actual_vehicle_positions,
-                active_context.local_cache,
                 active_context.service_catalog,
                 active_context.cfg,
                 active_context.cache_nodes,

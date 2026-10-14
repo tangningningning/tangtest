@@ -39,7 +39,7 @@ from .interface import (
 from .macro_targets import (
     build_macro_n2_target,
 )
-from .policy import DualTimescaleActorCritic
+from .policy import DualTimescaleActorCritic, MultiNodeFactorizedActorCritic
 from .primitive_control import (
     CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM,
     CACHE_ECONOMIC_FEATURE_DIM,
@@ -52,6 +52,7 @@ from .reporting import (
     TRAINING_EPOCH_RETURN_PLOT_FILENAME,
     append_dual_timescale_record,
     append_dual_timescale_slot_metrics,
+    build_episode_pool_provenance,
     build_macro_transition_trace_arrays,
     checkpoint_path_for_resume,
     checkpoint_path_for_write,
@@ -74,7 +75,8 @@ from .rollout import (
 CHECKPOINT_METHOD = "PROPOSED"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
-CHECKPOINT_VERSION = 58
+CHECKPOINT_VERSION = 59
+MULTI_NODE_CHECKPOINT_VERSION = 60
 ALGORITHM_ID = "PROPOSED"
 MACRO_ACTOR_UPDATE_CONTROL_VERSION = "macro_actor_post_step_joint_kl_backtracking_v1"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
@@ -88,6 +90,21 @@ SUPPORTED_MACRO_ACTOR_LEARNING_RATES = (1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3)
 def _require_torch() -> None:
     if torch is None:
         raise ImportError("正式双时间尺度 PPO 需要 PyTorch。")
+
+
+def _update_training_epoch_return_plot_optional(run_dir: Path) -> Path | None:
+    """可选训练图出错时不阻断已经落盘的正式训练结果。"""
+
+    try:
+        return update_training_epoch_return_plot(run_dir)
+    except Exception as exc:
+        print(
+            "WARNING: optional training-return plot failed and was skipped "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
 
 
 def _module_state_sha256(module: Any) -> str:
@@ -617,16 +634,26 @@ def _macro_batch(buffer: MacroRolloutBuffer) -> dict[str, np.ndarray]:
     if not items:
         raise ValueError("Macro rollout buffer 不能为空。")
     batch_size = len(items)
-    max_candidates = max(len(item.cache_candidate_masks) for item in items)
+    factorized = np.asarray(items[0].cache_candidate_masks).ndim == 2
+    max_candidates = max(int(np.asarray(item.cache_candidate_masks).shape[-1]) for item in items)
     feature_dim = int(items[0].cache_candidate_features.shape[-1])
     observation_dim = int(items[0].observation.shape[-1])
+    node_count = (
+        int(np.asarray(items[0].cache_candidate_masks).shape[0]) if factorized else 0
+    )
+    if factorized:
+        features = np.zeros(
+            (batch_size, node_count, max_candidates, feature_dim), dtype=np.float32
+        )
+        masks = np.zeros((batch_size, node_count, max_candidates), dtype=bool)
+    else:
+        features = np.zeros((batch_size, max_candidates, feature_dim), dtype=np.float32)
+        masks = np.zeros((batch_size, max_candidates), dtype=bool)
     max_termination_decisions = max(
         len(item.termination_elapsed_slots) for item in items
     )
     if max_termination_decisions > 4:
         raise ValueError("Adaptive holding rollout exceeds max_slots - 1 sampled decisions.")
-    features = np.zeros((batch_size, max_candidates, feature_dim), dtype=np.float32)
-    masks = np.zeros((batch_size, max_candidates), dtype=bool)
     termination_observations = np.zeros(
         (batch_size, max_termination_decisions, observation_dim), dtype=np.float32
     )
@@ -646,11 +673,22 @@ def _macro_batch(buffer: MacroRolloutBuffer) -> dict[str, np.ndarray]:
         (batch_size, max_termination_decisions), dtype=np.float32
     )
     for index, item in enumerate(items):
-        count = len(item.cache_candidate_masks)
-        if item.cache_candidate_features.shape != (count, feature_dim):
-            raise ValueError("Macro candidate descriptor shape changed within rollout。")
-        features[index, :count] = item.cache_candidate_features
-        masks[index, :count] = item.cache_candidate_masks
+        item_masks = np.asarray(item.cache_candidate_masks, dtype=bool)
+        item_features = np.asarray(item.cache_candidate_features, dtype=np.float32)
+        if factorized:
+            if item_masks.ndim != 2 or item_masks.shape[0] != node_count:
+                raise ValueError("factorized Macro node count changed within rollout")
+            if item_features.shape != (*item_masks.shape, feature_dim):
+                raise ValueError("factorized Macro candidate descriptor shape mismatch")
+            count = int(item_masks.shape[-1])
+            features[index, :, :count] = item_features
+            masks[index, :, :count] = item_masks
+        else:
+            if item_masks.ndim != 1 or item_features.shape != (len(item_masks), feature_dim):
+                raise ValueError("Macro candidate descriptor shape changed within rollout。")
+            count = len(item_masks)
+            features[index, :count] = item_features
+            masks[index, :count] = item_masks
         termination_count = len(item.termination_elapsed_slots)
         if termination_count:
             if item.termination_observations.shape != (
@@ -677,7 +715,20 @@ def _macro_batch(buffer: MacroRolloutBuffer) -> dict[str, np.ndarray]:
         "next_observations": np.stack([item.next_observation for item in items]).astype(np.float32),
         "candidate_features": features,
         "candidate_masks": masks,
-        "cache_actions": np.asarray([item.cache_action for item in items], dtype=np.int64),
+        "cache_actions": np.stack(
+            [np.asarray(item.cache_action, dtype=np.int64) for item in items]
+        ),
+        "old_node_cache_log_probs": np.stack(
+            [
+                np.asarray(
+                    item.old_node_cache_log_probs
+                    if item.old_node_cache_log_probs is not None
+                    else [item.old_cache_log_prob],
+                    dtype=np.float32,
+                )
+                for item in items
+            ]
+        ),
         "termination_observations": termination_observations,
         "termination_elapsed_slots": termination_elapsed_slots,
         "termination_actions": termination_actions,
@@ -833,7 +884,7 @@ class PPOTrainer:
         critic_learning_rate_override: float | None = None,
         policy_update_total: int = FORMAL_TRAINING_EPISODES // 4,
         capture_macro_transition_trace: bool = False,
-        unified_cache_action: bool = True,
+        unified_cache_action: bool | None = None,
         cardinality_corrected_cache_action: bool = True,
     ) -> None:
         _require_torch()
@@ -861,18 +912,33 @@ class PPOTrainer:
             or self.optimizer_learning_rate_schedule != "constant"
         ):
             raise ValueError("Current PROPOSED requires constant learning rates for every optimizer.")
-        self.unified_cache_action = bool(unified_cache_action)
+        self.cache_action_mode = str(context.cache_action_mode)
+        expected_unified = (
+            self.cache_action_mode == project_config.CACHE_ACTION_MODE_SINGLE_NODE
+        )
+        self.unified_cache_action = (
+            expected_unified
+            if unified_cache_action is None
+            else bool(unified_cache_action)
+        )
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
         )
-        if not self.unified_cache_action or not self.cardinality_corrected_cache_action:
+        if self.unified_cache_action != expected_unified or not self.cardinality_corrected_cache_action:
             raise ValueError(
-                "The PROPOSED trainer supports only the unified Cache candidate action with cardinality correction."
+                "Cache action mode and trainer distribution semantics do not match."
             )
         policy_schema = str(context.policy_schema)
-        if policy_schema != PROPOSED_POLICY_SCHEMA:
+        expected_schema = (
+            PROPOSED_POLICY_SCHEMA
+            if expected_unified
+            else project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA
+        )
+        if policy_schema != expected_schema:
             raise ValueError(f"unsupported current PROPOSED policy_schema: {policy_schema}")
-        self.checkpoint_version = CHECKPOINT_VERSION
+        self.checkpoint_version = (
+            CHECKPOINT_VERSION if expected_unified else MULTI_NODE_CHECKPOINT_VERSION
+        )
         self.algorithm_id = ALGORITHM_ID
         self.macro_actor_update_control_version = MACRO_ACTOR_UPDATE_CONTROL_VERSION
         self.checkpoint_method = CHECKPOINT_METHOD
@@ -934,15 +1000,25 @@ class PPOTrainer:
         macro_feature_dim = original_macro_feature_dim + CACHE_ECONOMIC_FEATURE_DIM
         micro_feature_dim = int(tensor_spec.uav_feature_dim) + 2
         self.hidden_sizes = tuple(int(value) for value in self.config["hidden_sizes"])
-        self.policy = DualTimescaleActorCritic(
+        policy_type = (
+            DualTimescaleActorCritic if expected_unified else MultiNodeFactorizedActorCritic
+        )
+        policy_kwargs = (
+            {
+                "unified_cache_action": True,
+                "cardinality_corrected_cache_action": self.cardinality_corrected_cache_action,
+            }
+            if expected_unified
+            else {}
+        )
+        self.policy = policy_type(
             int(context.observation_spec.observation_dim),
             macro_feature_dim,
             micro_feature_dim,
             self.adaptive_holding_min_slots,
             self.adaptive_holding_max_slots,
             self.hidden_sizes,
-            unified_cache_action=self.unified_cache_action,
-            cardinality_corrected_cache_action=self.cardinality_corrected_cache_action,
+            **policy_kwargs,
         ).to(self.device)
         actor_lr = float(
             actor_learning_rate_override
@@ -1099,6 +1175,21 @@ class PPOTrainer:
             "observation_dim": int(self.policy.observation_dim),
             "macro_cache_feature_dim": int(self.policy.macro_cache_feature_dim),
             "micro_uav_feature_dim": int(self.policy.micro_uav_feature_dim),
+            "cache_action_mode": self.cache_action_mode,
+            "cache_reconfiguration_model": self.context.cache_reconfiguration_model,
+            "cache_node_ids": [str(value) for value in self.context.action_spec.cache_node_ids],
+            "cache_node_count": len(self.context.action_spec.cache_node_ids),
+            "cache_candidate_tensor_shape": (
+                "[B,N,K,200]" if not self.unified_cache_action else "[B,K,200]"
+            ),
+            "cache_action_tensor_shape": (
+                "[B,N]" if not self.unified_cache_action else "[B]"
+            ),
+            "cache_joint_logprob": (
+                "sum of independent node categorical log-probabilities"
+                if not self.unified_cache_action
+                else "single unified Cache categorical log-probability"
+            ),
             "adaptive_holding_enabled": self.adaptive_holding_enabled,
             "adaptive_holding_min_slots": self.adaptive_holding_min_slots,
             "adaptive_holding_max_slots": self.adaptive_holding_max_slots,
@@ -1142,10 +1233,14 @@ class PPOTrainer:
             },
             "long_value_steps_per_update": self.long_value_steps_per_update,
             "long_value_max_grad_norm": self.long_value_max_grad_norm,
-            "cache_action_semantics": "single masked categorical over KEEP candidate 0 and legal UPDATE candidates; holding termination uses post-slot observation and elapsed fraction",
+            "cache_action_semantics": (
+                "nine shared-parameter masked node categoricals; each node candidate 0 is KEEP and legal UPDATE proposals are cardinality corrected; all use the same pre-action global observation"
+                if not self.unified_cache_action
+                else "single masked categorical over KEEP candidate 0 and legal UPDATE candidates; holding termination uses post-slot observation and elapsed fraction"
+            ),
             "cardinality_corrected_cache_action": True,
             "cache_candidate_probability_semantics": "legal UPDATE logits subtract log of the legal nonzero candidate count",
-            "unified_cache_action": True,
+            "unified_cache_action": bool(self.unified_cache_action),
             "micro_group_entropy_floor_enabled": True,
             "micro_group_probability_soft_cap": float(
                 self.config["micro_group_probability_soft_cap"]
@@ -1650,7 +1745,9 @@ class PPOTrainer:
                     }
                 )
         batch["macro_critic_targets"] = macro_critic_target.copy()
-        selected_groups = batch["cache_actions"] > 0
+        selected_groups = np.asarray(batch["cache_actions"]) > 0
+        if selected_groups.ndim > 1:
+            selected_groups = np.any(selected_groups, axis=-1)
         clip = float(self.config["clip_epsilon"])
         entropy_coefficient = float(self.config["entropy_coefficient"])
         target_kl = float(self.config["macro_target_kl"])
@@ -2158,6 +2255,24 @@ class PPOTrainer:
                 diagnostic_components.joint_log_prob
                 - diagnostic_tensors["old_log_probs"]
             ).detach().cpu().numpy()
+            node_cache_logprob_replay_error_by_node = None
+            node_cache_entropy_mean_by_node = None
+            if diagnostic_components.node_cache_log_probs is not None:
+                node_error = torch.abs(
+                    diagnostic_components.node_cache_log_probs
+                    - diagnostic_tensors["old_node_cache_log_probs"]
+                )
+                node_cache_logprob_replay_error_by_node = (
+                    node_error.max(dim=0).values.detach().cpu().numpy().astype(float).tolist()
+                )
+                node_cache_entropy_mean_by_node = (
+                    diagnostic_components.node_cache_entropies.mean(dim=0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(float)
+                    .tolist()
+                )
         duration_values = np.asarray(batch["actual_durations"], dtype=np.int64)
         macro_joint_log_ratio_abs_mean_by_duration = {
             f"D={duration}": (
@@ -2250,7 +2365,7 @@ class PPOTrainer:
                 .numpy()
             )
         forced_keep_no_update_count = sum(
-            not bool(np.any(item.cache_candidate_masks[1:]))
+            not bool(np.any(np.asarray(item.cache_candidate_masks)[..., 1:]))
             for buffer in buffers
             for item in buffer.transitions
         )
@@ -2314,6 +2429,13 @@ class PPOTrainer:
                 "macro_sampled_termination_decisions_per_frame_max": int(
                     np.max(sampled_termination_decisions)
                 ),
+                "macro_cache_entropy_aggregation": (
+                    "joint entropy is sum of independent node categorical entropies"
+                    if not self.unified_cache_action
+                    else "single unified Cache categorical entropy"
+                ),
+                "macro_cache_node_logprob_replay_error_max_by_node": node_cache_logprob_replay_error_by_node,
+                "macro_cache_node_entropy_mean_by_node": node_cache_entropy_mean_by_node,
                 "macro_joint_log_ratio_abs_mean_by_duration": (
                     macro_joint_log_ratio_abs_mean_by_duration
                 ),
@@ -3339,7 +3461,68 @@ class PPOTrainer:
         ):
             if expected is not None and payload.get(field) != expected:
                 raise ValueError(f"checkpoint {field} mismatch.")
-        if saved_contract != self.config_contract:
+        current_contract = self.config_contract
+        comparable_saved_contract = dict(saved_contract)
+        if self.cache_action_mode == project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED:
+            saved_node_ids = saved_contract.get("cache_node_ids")
+            current_node_ids = current_contract.get("cache_node_ids")
+            expected_static_suffix = ["RSU_0", "RSU_1", "UAV_0", "UAV_1"]
+
+            def is_valid_node_order(value: Any) -> bool:
+                if (
+                    not isinstance(value, list)
+                    or len(value) != 9
+                    or any(not isinstance(item, str) or not item.strip() for item in value)
+                    or len(set(value)) != 9
+                    or value[5:] != expected_static_suffix
+                ):
+                    return False
+                return all(
+                    not item.upper().startswith(("RSU_", "UAV_"))
+                    for item in value[:5]
+                )
+
+            current_roles = tuple(
+                str(value).upper() for value in self.context.cache_nodes["node_roles"]
+            )
+            expected_roles = ("SV",) * 5 + ("RSU",) * 2 + ("UAV",) * 2
+            if (
+                not is_valid_node_order(saved_node_ids)
+                or not is_valid_node_order(current_node_ids)
+                or current_roles != expected_roles
+            ):
+                raise ValueError(
+                    "checkpoint multi-node Cache role/order contract is invalid."
+                )
+            # Service-vehicle IDs identify the current realization's five SVs.
+            # Their ordered slots are part of the stable tensor contract; the IDs
+            # themselves are episode data, while RSU/UAV IDs remain fixed.
+            comparable_saved_contract["cache_node_ids"] = current_node_ids
+
+            # The planned number of future update groups may grow on a resumed
+            # run. This is behavior-preserving only for the constant LR schedule
+            # required by this trainer; never permit shortening the horizon.
+            saved_update_total = saved_contract.get("policy_update_total")
+            current_update_total = current_contract.get("policy_update_total")
+            same_constant_lr_schedule = (
+                saved_contract.get("macro_actor_learning_rate_schedule") == "constant"
+                and current_contract.get("macro_actor_learning_rate_schedule") == "constant"
+                and saved_contract.get("optimizer_learning_rate_schedule") == "constant"
+                and current_contract.get("optimizer_learning_rate_schedule") == "constant"
+                and saved_contract.get("macro_actor_learning_rate_initial")
+                == current_contract.get("macro_actor_learning_rate_initial")
+                and saved_contract.get("macro_actor_learning_rate_final")
+                == current_contract.get("macro_actor_learning_rate_final")
+            )
+            if (
+                isinstance(saved_update_total, int)
+                and isinstance(current_update_total, int)
+                and 0 < saved_update_total <= current_update_total
+                and same_constant_lr_schedule
+            ):
+                comparable_saved_contract["policy_update_total"] = current_update_total
+
+        if comparable_saved_contract != current_contract:
             raise ValueError("checkpoint policy tensor/configuration contract mismatch.")
         if bool(payload.get("unified_cache_action", False)) != self.unified_cache_action:
             raise ValueError("checkpoint unified Cache action mode mismatch.")
@@ -3503,6 +3686,7 @@ def run_training(
     run_dir: str | Path,
     *,
     episode_pool: str | Path,
+    validated_integrity_baseline_sha256: str | None = None,
     episode_seed_start: int | None = None,
     generate_missing_episodes: bool = False,
     episode_generation_device: str = "cpu",
@@ -3539,6 +3723,10 @@ def run_training(
         generation_device=episode_generation_device,
     )
     pool_path = _resolve_path(project_root, episode_pool)
+    pool_provenance = build_episode_pool_provenance(
+        pool_path,
+        validated_integrity_baseline_sha256=validated_integrity_baseline_sha256,
+    )
     context = load_environment_context(str(config_file), realization_dir=episode_paths[0])
     raw_hash = project_config.raw_config_sha256(config_file)
     semantic_hash = project_config.semantic_config_hash(context.cfg)
@@ -3565,6 +3753,7 @@ def run_training(
             ("config_raw_sha256", raw_hash),
             ("config_semantic_sha256", semantic_hash),
             ("episode_pool", str(pool_path)),
+            ("episode_pool_provenance", pool_provenance),
             ("target_episodes", int(target_episodes)),
             ("realizations_per_policy_update", group_size),
             ("policy_update_total", policy_update_total),
@@ -3613,6 +3802,7 @@ def run_training(
         context=context,
         target_episodes=target_episodes,
         episode_pool=str(pool_path),
+        episode_pool_provenance=pool_provenance,
         episode_seed_start=episode_seed_start,
         resume=resume,
     )
@@ -3684,7 +3874,7 @@ def run_training(
         last_episode_record = read_last_record(episode_metrics_path)
         last_update_record = read_last_record(update_metrics_path)
         if completed:
-            update_training_epoch_return_plot(run_path)
+            _update_training_epoch_return_plot_optional(run_path)
         else:
             stale_plot = run_path / "plots" / TRAINING_EPOCH_RETURN_PLOT_FILENAME
             stale_plot.unlink(missing_ok=True)
@@ -3999,19 +4189,21 @@ def run_training(
             context=context,
             target_episodes=target_episodes,
             episode_pool=str(pool_path),
+            episode_pool_provenance=pool_provenance,
             episode_seed_start=episode_seed_start,
             resume=resume,
         )
         save_run_summary()
-        update_training_epoch_return_plot(run_path)
-        if save_macro_transition_trace:
-            trace_summary = write_macro_transition_trace_artifact(
-                run_path,
-                trace_episode_batches,
-                gamma=float(cfg["algorithm"]["ppo"]["gamma"]),
-            )
-        if verbose:
-            print(json.dumps(update_record, ensure_ascii=False, sort_keys=True))
+        # Persist the post-update model and optimizer state before optional
+        # artifacts such as plots or transition-trace reports are produced.
+        trainer.save_checkpoint(
+            checkpoint_path,
+            config_raw_sha256=raw_hash,
+            config_semantic_sha256=semantic_hash,
+            episode_pool=str(pool_path),
+            seed=seed,
+            best_episode_return=best_return,
+        )
         if save_best_train_return_checkpoint:
             trainer.save_checkpoint(
                 checkpoint_path_for_write(run_path, BEST_TRAIN_RETURN_CHECKPOINT_FILENAME),
@@ -4022,14 +4214,15 @@ def run_training(
                 best_episode_return=best_return,
                 checkpoint_role="TRAINING_DIAGNOSTIC_ONLY_NOT_FINAL_SELECTION",
             )
-        trainer.save_checkpoint(
-            checkpoint_path,
-            config_raw_sha256=raw_hash,
-            config_semantic_sha256=semantic_hash,
-            episode_pool=str(pool_path),
-            seed=seed,
-            best_episode_return=best_return,
-        )
+        _update_training_epoch_return_plot_optional(run_path)
+        if save_macro_transition_trace:
+            trace_summary = write_macro_transition_trace_artifact(
+                run_path,
+                trace_episode_batches,
+                gamma=float(cfg["algorithm"]["ppo"]["gamma"]),
+            )
+        if verbose:
+            print(json.dumps(update_record, ensure_ascii=False, sort_keys=True))
     return {
         "run_dir": str(run_path),
         "completed_episodes": completed,
@@ -4049,6 +4242,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--episode-pool", required=True)
+    parser.add_argument(
+        "--validated-integrity-baseline-sha256",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--episode-seed-start", type=int, default=None)
     parser.add_argument("--generate-missing-episodes", action="store_true")
     parser.add_argument("--episode-generation-device", choices=("cpu", "cuda"), default="cpu")
@@ -4069,6 +4267,7 @@ def main(argv: list[str] | None = None) -> int:
         args.epochs,
         args.run_dir,
         episode_pool=args.episode_pool,
+        validated_integrity_baseline_sha256=args.validated_integrity_baseline_sha256,
         episode_seed_start=args.episode_seed_start,
         generate_missing_episodes=bool(args.generate_missing_episodes),
         episode_generation_device=args.episode_generation_device,

@@ -48,7 +48,6 @@ class CacheOptimizationConfig:
     omega_e: float
     time_ref_s: float
     energy_ref_j: float
-    local_cpu_cycles_per_s: float
     sv_cpu_cycles_per_s: float
     rsu_cpu_cycles_per_s: float
     uav_cpu_cycles_per_s: float
@@ -57,7 +56,6 @@ class CacheOptimizationConfig:
     cloud_total_cpu_cycles_per_s: float
     cloud_resource_mode: str
     cloud_cpu_capacity_cycles_per_s: float
-    local_energy_per_cycle_j: float
     tx_power_w: float
     sv_bandwidth_hz: float
     rsu_bandwidth_hz: float
@@ -95,6 +93,9 @@ class CacheOptimizationConfig:
     # engineering bounds/coverage knobs, not physical system parameters.
     target_candidate_capacity: int = 64
     target_intermediate_fractions: tuple[float, ...] = (0.25, 0.5, 0.75)
+    noise_model: str = system_model.FIXED_TOTAL_NOISE_V0
+    noise_psd_w_per_hz: float | None = None
+    receiver_noise_figure_db: float | None = None
 
     def validate(self) -> None:
         values = [
@@ -107,7 +108,6 @@ class CacheOptimizationConfig:
             self.uav_capacity_mb,
             self.time_ref_s,
             self.energy_ref_j,
-            self.local_cpu_cycles_per_s,
             self.cloud_total_cpu_cycles_per_s,
             self.cloud_total_bandwidth_bps,
             self.sv_bandwidth_hz,
@@ -165,6 +165,28 @@ class CacheOptimizationConfig:
             "RESOURCE_AWARE_FALLBACK",
         }:
             raise ValueError("cloud_fallback_mode 无效。")
+        if self.noise_model not in {
+            system_model.FIXED_TOTAL_NOISE_V0,
+            system_model.BANDWIDTH_DEPENDENT_NOISE_V1,
+        }:
+            raise ValueError(f"noise_model 无效：{self.noise_model!r}")
+        if self.noise_model == system_model.BANDWIDTH_DEPENDENT_NOISE_V1:
+            if (
+                self.noise_psd_w_per_hz is None
+                or not math.isfinite(float(self.noise_psd_w_per_hz))
+                or float(self.noise_psd_w_per_hz) <= 0.0
+            ):
+                raise ValueError(
+                    "BANDWIDTH_DEPENDENT_NOISE_V1 requires a positive finite noise PSD"
+                )
+            if (
+                self.receiver_noise_figure_db is None
+                or not math.isfinite(float(self.receiver_noise_figure_db))
+                or float(self.receiver_noise_figure_db) < 0.0
+            ):
+                raise ValueError(
+                    "BANDWIDTH_DEPENDENT_NOISE_V1 requires a finite nonnegative receiver NF"
+                )
 
 
 DEFAULT_CONFIG: CacheOptimizationConfig | None = None
@@ -215,7 +237,6 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         omega_e=float(get(config, "objective.omega_energy")),
         time_ref_s=float(get(config, "objective.T_ref")),
         energy_ref_j=float(get(config, "objective.E_ref")),
-        local_cpu_cycles_per_s=float(get(config, "nodes.vehicle.local_cpu_cycles_per_s")),
         sv_cpu_cycles_per_s=float(get(config, "nodes.sv.cpu_cycles_per_s")),
         rsu_cpu_cycles_per_s=float(get(config, "nodes.rsu.cpu_cycles_per_s")),
         uav_cpu_cycles_per_s=float(get(config, "nodes.uav.cpu_cycles_per_s")),
@@ -227,12 +248,30 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         cloud_cpu_capacity_cycles_per_s=float(
             get(config, "nodes.cloud.cpu_capacity_cycles_per_s", 0.0)
         ),
-        local_energy_per_cycle_j=float(get(config, "nodes.vehicle.kappa")),
         tx_power_w=float(get(config, "nodes.vehicle.transmit_power_w")),
         sv_bandwidth_hz=float(get(config, "nodes.sv.bandwidth_hz")),
         rsu_bandwidth_hz=float(get(config, "nodes.rsu.bandwidth_hz")),
         uav_bandwidth_hz=float(get(config, "nodes.uav.bandwidth_hz")),
         noise_power_w=float(get(config, "communication.noise.noise_power_w")),
+        noise_model=str(
+            get(
+                config,
+                "communication.noise.model",
+                system_model.FIXED_TOTAL_NOISE_V0,
+            )
+        ),
+        noise_psd_w_per_hz=(
+            None
+            if get(config, "communication.noise.psd_dbm_per_hz") is None
+            else system_model.dbm_per_hz_to_w_per_hz(
+                float(get(config, "communication.noise.psd_dbm_per_hz"))
+            )
+        ),
+        receiver_noise_figure_db=(
+            None
+            if get(config, "communication.noise.receiver_noise_figure_db") is None
+            else float(get(config, "communication.noise.receiver_noise_figure_db"))
+        ),
         channel_gain_at_1m=float(get(config, "communication.ground.channel_gain_at_1m")),
         pathloss_exponent=float(get(config, "communication.ground.pathloss_exponent")),
         uav_altitude_m=float(get(config, "nodes.uav.altitude_m")),
@@ -444,7 +483,28 @@ def cache_update_cost(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> tuple[float, np.ndarray]:
-    result = system_model.cache_update_cost(
+    result = cache_update_cost_details(
+        previous_cache,
+        new_cache,
+        cache_trigger,
+        service_sizes_mb,
+        cache_nodes,
+        config,
+    )
+    return float(result["total_cost"]), np.asarray(result["loading_energy"], dtype=np.float64)
+
+
+def cache_update_cost_details(
+    previous_cache: np.ndarray,
+    new_cache: np.ndarray,
+    cache_trigger: np.ndarray,
+    service_sizes_mb: np.ndarray,
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+) -> dict[str, Any]:
+    """Expose the formal additive per-node cost breakdown without a second formula."""
+
+    return system_model.cache_update_cost(
         previous_cache,
         new_cache,
         cache_trigger,
@@ -454,7 +514,6 @@ def cache_update_cost(
         config.lambda_cache,
         cache_cost_weight=config.cache_cost_weight,
     )
-    return float(result["total_cost"]), np.asarray(result["loading_energy"], dtype=np.float64)
 
 
 
@@ -842,28 +901,6 @@ def node_local_predicted_service_workload(
     return np.maximum(result, 0.0).astype(np.float32)
 
 
-def observed_local_service_usage(
-    local_cache_state: dict[str, set[int]],
-    num_services: int,
-) -> np.ndarray:
-    """Return a transparent observed local-replica usage proxy.
-
-    The current environment does not expose a historical edge-node utility
-    decomposition before proposal time.  This statistic therefore uses only
-    observed vehicle-local replicas; it is a usage/availability proxy, not an
-    exact counterfactual gain and is never used in the reward or Exact-Q.
-    """
-
-    vehicle_count = max(len(local_cache_state), 1)
-    values = np.zeros(int(num_services), dtype=np.float64)
-    for services in local_cache_state.values():
-        for service in services:
-            service_index = int(service)
-            if 0 <= service_index < int(num_services):
-                values[service_index] += 1.0
-    return values / float(vehicle_count)
-
-
 @dataclass(frozen=True)
 class CacheTargetCandidate:
     """One deterministic, feasible target cache configuration for one node."""
@@ -942,7 +979,6 @@ def enumerate_all_cache_target_configurations(
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
     origin_scenario: dict[str, Any],
-    local_cache_state: dict[str, set[int]],
     config: CacheOptimizationConfig,
     *,
     prediction_horizon_mask: Any = None,
@@ -971,7 +1007,6 @@ def enumerate_all_cache_target_configurations(
     service_count = int(service_catalog["num_services"])
     if service_count > 20:
         raise ValueError("exhaustive Cache proposal enumeration is capped at 20 services")
-    observed_usage = observed_local_service_usage(local_cache_state, service_count)
     replica_counts = np.sum(current_cache, axis=0).astype(np.float64)
     mean_demand = float(np.mean(demand)) if len(demand) else 0.0
     prediction_target = _greedy_target_configuration(demand, sizes, capacity)

@@ -364,7 +364,6 @@ def _execute_one_slot(
         step.scenario_slice,
         step.actual_tasks,
         step.actual_vehicle_positions,
-        context.local_cache,
         context.service_catalog,
         context.cfg,
         context.cache_nodes,

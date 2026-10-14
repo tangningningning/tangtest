@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,6 +26,95 @@ MACRO_TRANSITION_TRACE_FILENAME = "macro_transition_trace.npz"
 EPISODE_METRICS_FILENAME = "episode_metrics.jsonl"
 
 TRAINING_EPOCH_RETURN_PLOT_FILENAME = "training_epoch_return.png"
+
+
+def build_episode_pool_provenance(
+    episode_pool: str | Path | None,
+    *,
+    validated_integrity_baseline_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    """Separate historical data-source identity from the current run config."""
+
+    if episode_pool is None:
+        return None
+    pool_path = Path(episode_pool).expanduser().resolve(strict=False)
+    manifest_path = pool_path / "stage6_training_pool_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    raw_manifest = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(raw_manifest.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid training pool manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Training pool manifest root must be an object: {manifest_path}")
+    fields = (
+        "schema_version",
+        "split",
+        "seed_start",
+        "seed_end",
+        "episode_count",
+        "config_sha256",
+        "semantic_config_sha256",
+        "generation_config_fingerprint",
+        "generation_and_semantic_fingerprint",
+        "source_config_path",
+        "source_config_sha256",
+        "source_semantic_config_sha256",
+        "source_data_split_manifest_sha256",
+        "source_training_pool",
+        "source_service_catalog_sha256",
+        "stage6_service_catalog_path",
+        "stage6_service_catalog_sha256",
+        "transformation_formula",
+        "transformed_fields",
+    )
+    provenance = {
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
+        **{field: manifest.get(field) for field in fields},
+    }
+    baseline_path = pool_path / "stage6_training_pool_integrity_baseline.json"
+    if validated_integrity_baseline_sha256 is not None and not baseline_path.is_file():
+        raise FileNotFoundError(
+            f"Validated Training Pool integrity baseline is missing: {baseline_path}"
+        )
+    if baseline_path.is_file():
+        raw_baseline = baseline_path.read_bytes()
+        baseline_hash = hashlib.sha256(raw_baseline).hexdigest()
+        if (
+            validated_integrity_baseline_sha256 is not None
+            and baseline_hash != validated_integrity_baseline_sha256
+        ):
+            raise ValueError("Training Pool integrity baseline changed after Runner validation.")
+        try:
+            baseline = json.loads(raw_baseline.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid Training Pool integrity baseline: {baseline_path}") from exc
+        if not isinstance(baseline, dict):
+            raise ValueError("Training Pool integrity baseline root must be an object.")
+        if baseline.get("pool_manifest_sha256") != provenance["manifest_sha256"]:
+            raise ValueError("Training Pool integrity baseline does not identify this Pool Manifest.")
+        provenance.update(
+            {
+                "integrity_baseline_path": str(baseline_path),
+                "integrity_baseline_sha256": baseline_hash,
+                "generation_config_fingerprint": baseline.get(
+                    "generation_config_fingerprint"
+                ),
+                "data_validation_level": (
+                    "CURRENT_SNAPSHOT_VERIFIED"
+                    if validated_integrity_baseline_sha256 is not None
+                    else "CURRENT_SNAPSHOT_NOT_RUNNER_VERIFIED"
+                ),
+                "historical_source_status": baseline.get(
+                    "historical_source_status", "UNKNOWN"
+                ),
+            }
+        )
+    elif validated_integrity_baseline_sha256 is not None:
+        raise FileNotFoundError("Runner supplied a baseline identity but no baseline file exists.")
+    return provenance
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1776,10 +1866,14 @@ def write_dual_timescale_run_manifest(
     context: Any,
     target_episodes: int,
     episode_pool: str | Path | None = None,
+    episode_pool_provenance: dict[str, Any] | None = None,
     episode_seed_start: int | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     """记录当前 PROPOSED 训练、动作、Critic 和数据协议。"""
+
+    if episode_pool_provenance is None:
+        episode_pool_provenance = build_episode_pool_provenance(episode_pool)
 
     manifest = {
         "experiment_label": "PROPOSED",
@@ -1792,6 +1886,11 @@ def write_dual_timescale_run_manifest(
         "config_path": str(Path(config_path).resolve()),
         "config_raw_sha256": str(config_raw_sha256),
         "config_semantic_sha256": str(config_semantic_sha256),
+        "runtime_config_identity": {
+            "path": str(Path(config_path).resolve()),
+            "raw_sha256": str(config_raw_sha256),
+            "semantic_sha256": str(config_semantic_sha256),
+        },
         "seed": int(seed),
         "target_episodes": int(target_episodes),
         "realizations_per_policy_update": int(
@@ -1802,6 +1901,32 @@ def write_dual_timescale_run_manifest(
         "expected_update_metrics_count": int(trainer.policy_update_total),
         "rollout_group_contract": "four independent realizations collected with one frozen old policy; targets are episode-local; advantages are normalized over the combined update group",
         "episode_pool": None if episode_pool is None else str(Path(episode_pool).resolve()),
+        "episode_pool_provenance": episode_pool_provenance,
+        "training_pool_manifest_sha256": (
+            None
+            if episode_pool_provenance is None
+            else episode_pool_provenance.get("manifest_sha256")
+        ),
+        "integrity_baseline_sha256": (
+            None
+            if episode_pool_provenance is None
+            else episode_pool_provenance.get("integrity_baseline_sha256")
+        ),
+        "generation_config_fingerprint": (
+            None
+            if episode_pool_provenance is None
+            else episode_pool_provenance.get("generation_config_fingerprint")
+        ),
+        "data_validation_level": (
+            None
+            if episode_pool_provenance is None
+            else episode_pool_provenance.get("data_validation_level")
+        ),
+        "historical_source_status": (
+            None
+            if episode_pool_provenance is None
+            else episode_pool_provenance.get("historical_source_status")
+        ),
         "episode_seed_start": None if episode_seed_start is None else int(episode_seed_start),
         "episode_seed_end": (
             None
@@ -1817,7 +1942,11 @@ def write_dual_timescale_run_manifest(
         "architecture_version": int(trainer.config_contract["architecture_version"]),
         "checkpoint_version": int(trainer.checkpoint_version),
         "checkpoint_method": str(trainer.checkpoint_method),
-        "macro_action": "Unified Cache candidate with adaptive learned holding termination",
+        "macro_action": (
+            "nine factorized Cache node candidates with adaptive learned holding termination"
+            if not trainer.unified_cache_action
+            else "Unified Cache candidate with adaptive learned holding termination"
+        ),
         "adaptive_holding_enabled": bool(trainer.config["adaptive_holding_enabled"]),
         "adaptive_holding_min_slots": int(trainer.config["adaptive_holding_min_slots"]),
         "adaptive_holding_max_slots": int(trainer.config["adaptive_holding_max_slots"]),
@@ -1836,7 +1965,11 @@ def write_dual_timescale_run_manifest(
             trainer.learning_rates["macro_actor_final"]
         ),
         "cache_candidate_zero": "current Cache configuration (KEEP)",
-        "cache_candidate_action_space": "one categorical over KEEP and legal UPDATE candidates with legal-cardinality correction",
+        "cache_candidate_action_space": (
+            "one shared-parameter masked categorical per cache node over KEEP and that node's legal UPDATE candidates; each UPDATE group uses legal-cardinality correction"
+            if not trainer.unified_cache_action
+            else "one categorical over KEEP and legal UPDATE candidates with legal-cardinality correction"
+        ),
         "micro_action": "UAV0 followed by UAV1 conditioned on selected UAV0 position",
         "micro_actor_objective": "single joint UAV0/UAV1 PPO clipped surrogate + STAY/MOVE group entropy-floor regularization",
         "micro_group_entropy_floor_enabled": True,
@@ -1881,6 +2014,15 @@ def write_dual_timescale_run_manifest(
         "macro_critic_value_loss_coefficient": float(trainer.config["value_loss_coefficient"]),
         "macro_critic_steps_per_update": int(trainer.config.get("macro_critic_steps_per_update", 50)),
         "unified_cache_action": bool(trainer.unified_cache_action),
+        "cache_action_mode": str(context.cache_action_mode),
+        "cache_reconfiguration_model": str(context.cache_reconfiguration_model),
+        "cache_node_ids": [str(value) for value in context.action_spec.cache_node_ids],
+        "cache_joint_logprob": trainer.config_contract["cache_joint_logprob"],
+        "cache_entropy_aggregation": (
+            "sum of per-node categorical entropies for the factorized joint cache policy"
+            if not trainer.unified_cache_action
+            else "single unified categorical entropy"
+        ),
         "cardinality_corrected_cache_action": bool(trainer.cardinality_corrected_cache_action),
         "macro_full_batch": True,
         "macro_actor_update_epochs": int(trainer.config["update_epochs"]),

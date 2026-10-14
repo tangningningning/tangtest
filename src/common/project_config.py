@@ -16,8 +16,14 @@ from typing import Any
 
 
 PROPOSED_POLICY_SCHEMA = (
-    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v2"
+    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v3_no_tv_local"
 )
+MULTI_NODE_FACTORIZED_POLICY_SCHEMA = (
+    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1"
+)
+CACHE_ACTION_MODE_SINGLE_NODE = "SINGLE_NODE_UNIFIED"
+CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED = "MULTI_NODE_FACTORIZED"
+CACHE_RECONFIGURATION_MODEL_ABSTRACT = "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION"
 
 try:
     import tomllib
@@ -456,9 +462,6 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "nodes.sv.xi_ca",
     "nodes.rsu.xi_ca",
     "nodes.uav.xi_ca",
-    "nodes.vehicle.local_cpu_cycles_per_s",
-    "nodes.vehicle.local_cache_capacity_mb",
-    "nodes.vehicle.kappa",
     "nodes.vehicle.transmit_power_w",
     "nodes.sv.cpu_cycles_per_s",
     "nodes.rsu.cpu_cycles_per_s",
@@ -483,7 +486,13 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "communication.ground.channel_gain_at_1m",
     "communication.ground.pathloss_exponent",
     "communication.ground.bandwidth_hz",
+    "communication.ground.carrier_frequency_hz",
     "communication.noise.noise_power_w",
+    "communication.noise.model",
+    "communication.noise.psd_dbm_per_hz",
+    "communication.noise.receiver_noise_figure_db",
+    "communication.resource_model.inter_node_spectrum",
+    "communication.resource_model.interference",
     "communication.air.eta1",
     "communication.air.eta2",
     "communication.air.carrier_frequency_hz",
@@ -574,6 +583,81 @@ def validate_config(
     if require_artifacts:
         _materialise_node_instances(config)
     _walk_numbers(config)
+
+    # Missing version selector means the frozen legacy fixed-total-noise model.
+    # The V1 selector is strict: incomplete or contradictory new contracts fail
+    # closed instead of silently using legacy noise semantics.
+    noise_model = str(
+        get_config_value(
+            config,
+            "communication.noise.model",
+            "FIXED_TOTAL_NOISE_V0",
+        )
+    )
+    if noise_model not in {
+        "FIXED_TOTAL_NOISE_V0",
+        "BANDWIDTH_DEPENDENT_NOISE_V1",
+    }:
+        raise ValueError(f"unsupported communication.noise.model: {noise_model!r}")
+    if noise_model == "BANDWIDTH_DEPENDENT_NOISE_V1":
+        psd_dbm = get_config_value(config, "communication.noise.psd_dbm_per_hz")
+        noise_figure_db = get_config_value(
+            config, "communication.noise.receiver_noise_figure_db"
+        )
+        ground_carrier_hz = get_config_value(
+            config, "communication.ground.carrier_frequency_hz"
+        )
+        if psd_dbm is None or not math.isfinite(float(psd_dbm)):
+            raise ValueError(
+                "BANDWIDTH_DEPENDENT_NOISE_V1 requires finite "
+                "communication.noise.psd_dbm_per_hz"
+            )
+        if (
+            noise_figure_db is None
+            or not math.isfinite(float(noise_figure_db))
+            or float(noise_figure_db) < 0.0
+        ):
+            raise ValueError(
+                "BANDWIDTH_DEPENDENT_NOISE_V1 requires finite nonnegative "
+                "communication.noise.receiver_noise_figure_db"
+            )
+        if (
+            ground_carrier_hz is None
+            or not math.isfinite(float(ground_carrier_hz))
+            or float(ground_carrier_hz) <= 0.0
+        ):
+            raise ValueError(
+                "BANDWIDTH_DEPENDENT_NOISE_V1 requires positive "
+                "communication.ground.carrier_frequency_hz"
+            )
+        inter_node_spectrum = get_config_value(
+            config, "communication.resource_model.inter_node_spectrum"
+        )
+        interference = get_config_value(
+            config, "communication.resource_model.interference"
+        )
+        if inter_node_spectrum != "ORTHOGONAL_INDEPENDENT" or interference != "NONE":
+            raise ValueError(
+                "BANDWIDTH_DEPENDENT_NOISE_V1 requires explicit independent "
+                "orthogonal node pools and interference=NONE"
+            )
+        expected_bandwidth = 10.0e6
+        for key in (
+            "nodes.sv.bandwidth_hz",
+            "nodes.rsu.bandwidth_hz",
+            "nodes.uav.bandwidth_hz",
+            "communication.ground.bandwidth_hz",
+        ):
+            if not math.isclose(
+                float(get_config_value(config, key)),
+                expected_bandwidth,
+                rel_tol=0.0,
+                abs_tol=1.0e-6,
+            ):
+                raise ValueError(
+                    "BANDWIDTH_DEPENDENT_NOISE_V1 v1 contract requires "
+                    f"{key}=10 MHz"
+                )
 
     service_count_value = get_config_value(config, "service.count")
     if (
@@ -774,9 +858,48 @@ def validate_config(
         raise ValueError(
             "configuration_control_mode 必须为 macro_cache_smdp_micro_uav_candidate。"
         )
+    cache_action_mode = str(
+        get_config_value(
+            config,
+            "algorithm.ppo.cache_action_mode",
+            CACHE_ACTION_MODE_SINGLE_NODE,
+        )
+    )
+    if cache_action_mode not in {
+        CACHE_ACTION_MODE_SINGLE_NODE,
+        CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
+    }:
+        raise ValueError("algorithm.ppo.cache_action_mode 不受支持。")
     policy_schema = str(get_config_value(config, "algorithm.ppo.policy_schema", ""))
-    if policy_schema != PROPOSED_POLICY_SCHEMA:
-        raise ValueError("algorithm.ppo.policy_schema 必须为当前 PROPOSED 正式策略 schema。")
+    if cache_action_mode == CACHE_ACTION_MODE_SINGLE_NODE:
+        if policy_schema != PROPOSED_POLICY_SCHEMA:
+            raise ValueError(
+                "SINGLE_NODE_UNIFIED 必须使用当前单节点正式策略 schema。"
+            )
+        reconfiguration_model = str(
+            get_config_value(
+                config,
+                "algorithm.ppo.cache_reconfiguration_model",
+                "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION",
+            )
+        )
+        if reconfiguration_model != "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION":
+            raise ValueError(
+                "SINGLE_NODE_UNIFIED 的 cache_reconfiguration_model 不受支持。"
+            )
+    else:
+        if policy_schema != MULTI_NODE_FACTORIZED_POLICY_SCHEMA:
+            raise ValueError(
+                "MULTI_NODE_FACTORIZED 必须使用独立的多节点策略 schema。"
+            )
+        reconfiguration_model = str(
+            get_config_value(config, "algorithm.ppo.cache_reconfiguration_model", "")
+        )
+        if reconfiguration_model != CACHE_RECONFIGURATION_MODEL_ABSTRACT:
+            raise ValueError(
+                "MULTI_NODE_FACTORIZED 必须显式启用 "
+                "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION。"
+            )
     required_flags = {
         "macro_cache_enabled": True,
         "macro_full_batch": True,
@@ -1016,8 +1139,6 @@ def validate_config(
         "nodes.sv.cache_capacity_mb",
         "nodes.rsu.cache_capacity_mb",
         "nodes.uav.cache_capacity_mb",
-        "nodes.vehicle.local_cache_capacity_mb",
-        "nodes.vehicle.local_cpu_cycles_per_s",
         "nodes.sv.cpu_cycles_per_s",
         "nodes.rsu.cpu_cycles_per_s",
         "nodes.uav.cpu_cycles_per_s",
@@ -1191,6 +1312,5 @@ def validate_config(
             "paths.sumo_net",
             "paths.node_positions",
             "paths.popularity_gru",
-            "paths.tv_local_cache",
         ):
             _require_path_exists(config, key)

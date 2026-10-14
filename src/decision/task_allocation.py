@@ -8,9 +8,8 @@
 KKT 连续资源分配和 ``J(mu)=sum_v Q_v``。本模块不实现 PPO、不扣 Cache/UAV configuration cost、
 不读取 prediction_scenarios 作为调度输入；每个 slot 的任务独立完成评价。
 
-Local 在 Matching 层用 ``LOCAL:<vehicle_id>`` 表示任务车辆自身本地执行，
-避免把 Local 错误建模成多个任务共享的公共节点。调用 KKT evaluator 前，
-只有 ``LOCAL:<same task_id>`` 会被安全转换为 KKT 内部 sentinel ``LOCAL``。
+TV 不执行任务。正式 Matching 目标仅包含满足缓存与链路约束的 Edge 节点以及
+Cloud 后备路径。
 """
 
 from __future__ import annotations
@@ -32,7 +31,6 @@ except ModuleNotFoundError:  # pragma: no cover - server fallback without Numba
 from common import project_config, system_model
 from decision import cache_configuration
 
-LOCAL_PREFIX = "LOCAL:"
 LEGACY_EDGE_GATE = "LEGACY_EDGE_GATE"
 RESOURCE_AWARE_FALLBACK = "RESOURCE_AWARE_FALLBACK"
 LEGACY_CLOUD_RESOURCE_MODE = "legacy_unlimited"
@@ -40,6 +38,7 @@ FINITE_CLOUD_RESOURCE_MODE = "finite_pool"
 _CLOUD_FALLBACK_MODES = frozenset(
     {LEGACY_EDGE_GATE, RESOURCE_AWARE_FALLBACK}
 )
+
 
 
 def _profile_add(
@@ -212,10 +211,6 @@ def _kkt_diagnostics_summary(
     }
 
 
-def local_target(task_id: str) -> str:
-    return f"{LOCAL_PREFIX}{task_id}"
-
-
 def _stable_id_key(value: str) -> tuple[int, int | str]:
     text = str(value)
     return (0, int(text)) if text.isdigit() else (1, text)
@@ -232,9 +227,9 @@ def _matching_config(project_cfg: dict[str, Any]) -> tuple[int, float]:
     )
 
 
+
 def build_feasible_targets(
     tasks: list[Task],
-    local_cache_state: dict[str, set[int]],
     edge_cache_state: np.ndarray,
     cache_nodes: dict[str, Any],
     vehicle_positions: dict[str, np.ndarray] | None = None,
@@ -276,8 +271,6 @@ def build_feasible_targets(
     channel_rate_runtime = 0.0
     for task in sorted(tasks, key=lambda item: _stable_id_key(item.task_id)):
         targets: list[str] = []
-        if task.service_id in local_cache_state.get(task.vehicle_id, set()):
-            targets.append(local_target(task.task_id))
         edge_targets: list[str] = []
         for node_index, node_id in enumerate(node_ids):
             if int(edge_cache[node_index, task.service_id]) != 1:
@@ -322,19 +315,6 @@ def build_feasible_targets(
     return feasible
 
 
-def _to_kkt_matching(matching: dict[str, str]) -> dict[str, str]:
-    converted: dict[str, str] = {}
-    for task_id, target in matching.items():
-        if target.startswith(LOCAL_PREFIX):
-            owner = target[len(LOCAL_PREFIX) :]
-            if owner != task_id:
-                raise ValueError(f"非法Local target：task {task_id} 不能使用 {target}")
-            converted[task_id] = LOCAL
-        else:
-            converted[task_id] = target
-    return converted
-
-
 def evaluate_matching_candidate(
     tasks: list[Task],
     matching: dict[str, str],
@@ -347,11 +327,11 @@ def evaluate_matching_candidate(
     node_evaluation_cache: NodeEvaluationCache | None = None,
     timing_profile: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
-    """薄 adapter：Matching层 LOCAL:v -> KKT层 LOCAL。"""
+    """Full-recompute reference for a legal Edge/Cloud matching."""
 
     return evaluate_matching_with_kkt(
         tasks,
-        _to_kkt_matching(matching),
+        matching,
         vehicle_positions,
         service_node_positions,
         project_cfg,
@@ -365,13 +345,12 @@ def evaluate_matching_candidate(
 def matching_to_execution_variables(
     matching: dict[str, str],
 ) -> dict[str, dict[str, int]]:
-    """导出 x_{v,n}=1。Local target LOCAL:v 在数学语义上对应 x_{v,v}=1。"""
+    """导出每个任务对应的 x_{v,n}=1。"""
 
     result: dict[str, dict[str, int]] = {}
     for task_id in _sorted_ids(matching):
         target = matching[task_id]
-        execution_node = task_id if target == local_target(task_id) else target
-        result[task_id] = {execution_node: 1}
+        result[task_id] = {target: 1}
     return result
 
 
@@ -437,9 +416,8 @@ def _candidate_impact_scope(
                 # Cloud task coupling, when enabled, is added as a complete pool
                 # set below; Cloud is not an Edge node in this node scope.
                 continue
-            if target != LOCAL:
-                _edge_node_role(target, cache_nodes)
-                affected_edge_nodes.add(target)
+            _edge_node_role(target, cache_nodes)
+            affected_edge_nodes.add(target)
 
     impacted_task_ids = set(affected_task_ids)
     if (
@@ -521,7 +499,9 @@ def enumerate_best_operation(
         "full_evaluator_calls": 0,
     }
     if evaluation_mode == "incremental":
-        current_kkt = _to_kkt_matching(current_matching)
+        # Matching and KKT now use the same legal Edge/Cloud target IDs.
+        # Keep a separate mapping snapshot for incremental evaluation state.
+        current_kkt = dict(current_matching)
         if timing_profile is not None:
             timing_profile["current_kkt_conversion_call_count"] = (
                 float(timing_profile.get("current_kkt_conversion_call_count", 0.0))
@@ -630,7 +610,7 @@ def enumerate_best_operation(
         for metadata in candidate_metadata:
             stats["upper_bound_screen_calls"] += 1
             candidate_matching = metadata["matching"]
-            candidate_kkt = _to_kkt_matching(candidate_matching)
+            candidate_kkt = dict(candidate_matching)
             if timing_profile is not None:
                 timing_profile["candidate_kkt_conversion_call_count"] = (
                     float(timing_profile.get("candidate_kkt_conversion_call_count", 0.0))
@@ -967,7 +947,6 @@ def optimize_task_matching(
     tasks: list[Task],
     vehicle_positions: dict[str, np.ndarray],
     service_node_positions: dict[str, np.ndarray],
-    local_cache_state: dict[str, set[int]],
     edge_cache_state: np.ndarray,
     project_cfg: dict[str, Any],
     cache_nodes: dict[str, Any],
@@ -1109,7 +1088,6 @@ def optimize_task_matching(
 
     feasible_targets = build_feasible_targets(
         tasks,
-        local_cache_state,
         edge_cache_state,
         cache_nodes,
         vehicle_positions=vehicle_positions,
@@ -1461,7 +1439,7 @@ def optimize_task_matching(
 
 # ---- KKT actual-state resource allocation ----
 # KKT actual-state resource allocation implementation；数学求解保持不变。
-LOCAL = "LOCAL"
+
 CLOUD = "CLOUD"
 
 
@@ -1727,7 +1705,7 @@ def kkt_config_from_project(config: dict[str, Any]) -> KKTConfig:
 
 
 def _edge_node_role(node_id: str, cache_nodes: dict[str, Any]) -> str | None:
-    if node_id in (LOCAL, CLOUD):
+    if node_id == CLOUD:
         return None
     node_ids = [str(value) for value in cache_nodes["node_ids"]]
     if node_id not in node_ids:
@@ -1802,6 +1780,9 @@ def _base_rate(
             cache_config.tx_power_w,
             gain,
             cache_config.noise_power_w,
+            noise_model=cache_config.noise_model,
+            noise_psd_w_per_hz=cache_config.noise_psd_w_per_hz,
+            receiver_noise_figure_db=cache_config.receiver_noise_figure_db,
         )
     )
 
@@ -1839,6 +1820,9 @@ def _edge_path_is_feasible(
             cache_config.tx_power_w,
             gain,
             cache_config.noise_power_w,
+            noise_model=cache_config.noise_model,
+            noise_psd_w_per_hz=cache_config.noise_psd_w_per_hz,
+            receiver_noise_figure_db=cache_config.receiver_noise_figure_db,
         )
         return (
             math.isfinite(cpu)
@@ -1865,21 +1849,13 @@ def _ideal_task_utility(
 ) -> float:
     """Evaluate one task at the no-sharing ideal resource point.
 
-    Local and Cloud use their exact formal per-task model.  Edge targets use
-    CPU/BW fractions of one only for an upper bound; this helper never calls
-    the KKT allocator.
+    Cloud uses its exact formal per-task model. Edge targets use CPU/BW
+    fractions of one only for an upper bound; this helper never calls the KKT
+    allocator.
     """
 
     started_at = time.perf_counter() if timing_profile is not None else 0.0
-    if target == LOCAL or target == local_target(task.task_id):
-        result = system_model.local_execution(
-            task.cpu_cycles,
-            cache_config.local_cpu_cycles_per_s,
-            cache_config.local_energy_per_cycle_j,
-        )
-        delay = float(result["delay_s"])
-        energy = float(result["vehicle_energy_j"])
-    elif target == CLOUD:
+    if target == CLOUD:
         cloud_cpu_upper_bound = (
             cache_config.cloud_cpu_capacity_cycles_per_s
             if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
@@ -1914,6 +1890,9 @@ def _ideal_task_utility(
             cache_config.noise_power_w,
             _node_cpu(role, cache_config),
             1.0,
+            noise_model=cache_config.noise_model,
+            noise_psd_w_per_hz=cache_config.noise_psd_w_per_hz,
+            receiver_noise_figure_db=cache_config.receiver_noise_figure_db,
         )
         delay = float(edge["total_delay_s"])
         energy = float(edge["vehicle_energy_j"])
@@ -2322,6 +2301,262 @@ def solve_kkt_fraction_allocation(
     )
 
 
+def solve_kkt_bandwidth_dependent_noise_allocation(
+    coefficients: list[float],
+    bandwidth_hz: float,
+    transmit_power_w: float,
+    channel_gains: list[float],
+    noise_psd_w_per_hz: float,
+    receiver_noise_figure_db: float,
+    epsilon: float,
+    tolerance: float,
+    max_iterations: int,
+    *,
+    return_diagnostics: bool = False,
+) -> Any:
+    """Solve the V1 bandwidth KKT using the exact rate derivative.
+
+    For task ``i`` the bandwidth-dependent part of the normalized system loss
+    is ``c_i / R_i(b_i)``.  Its KKT stationarity is
+    ``c_i R_i'(b_i) / R_i(b_i)^2 = lambda`` for interior allocations, where
+    ``R_i`` and ``R_i'`` come from the shared system-model implementation.
+    """
+
+    coeff = np.asarray(coefficients, dtype=np.float64).reshape(-1)
+    gains = np.asarray(channel_gains, dtype=np.float64).reshape(-1)
+    bandwidth = float(bandwidth_hz)
+    power = float(transmit_power_w)
+    psd = float(noise_psd_w_per_hz)
+    nf_db = float(receiver_noise_figure_db)
+    epsilon = float(epsilon)
+    tolerance = float(tolerance)
+    max_iterations = int(max_iterations)
+    n = int(coeff.size)
+
+    def finish(
+        allocation: np.ndarray | list[float],
+        multiplier: float,
+        ok: bool,
+        reason: str,
+        iterations: int,
+        converged: bool,
+        hit_max: bool,
+        total: float,
+        stationarity: float = math.nan,
+        complementary: float = math.nan,
+    ) -> Any:
+        values = np.asarray(allocation, dtype=np.float64).reshape(-1)
+        finite = bool(
+            math.isfinite(float(multiplier))
+            and math.isfinite(float(total))
+            and np.all(np.isfinite(values))
+            and math.isfinite(float(stationarity))
+            and math.isfinite(float(complementary))
+        )
+        result = (
+            [float(value) for value in values],
+            float(multiplier),
+            bool(ok),
+            str(reason),
+        )
+        if not return_diagnostics:
+            return result
+        diagnostics = KKTAllocationDiagnostics(
+            iterations=int(iterations),
+            converged_by_tolerance=bool(converged),
+            hit_max_bisection_iterations=bool(hit_max),
+            final_resource_sum=float(total),
+            resource_sum_residual=float(total - 1.0) if n else 0.0,
+            finite=finite,
+            stationarity_residual=float(stationarity),
+            complementary_slackness_residual=float(complementary),
+        )
+        return result + (diagnostics,)
+
+    if n == 0:
+        return finish([], 0.0, True, "", 0, True, False, 0.0, 0.0, 0.0)
+    if (
+        not math.isfinite(bandwidth)
+        or bandwidth <= 0.0
+        or not math.isfinite(power)
+        or power < 0.0
+        or not math.isfinite(psd)
+        or psd <= 0.0
+        or not math.isfinite(nf_db)
+        or nf_db < 0.0
+        or not math.isfinite(epsilon)
+        or not 0.0 < epsilon <= 1.0
+        or not math.isfinite(tolerance)
+        or tolerance <= 0.0
+        or max_iterations < 1
+        or gains.shape != coeff.shape
+        or np.any(~np.isfinite(coeff))
+        or np.any(coeff < 0.0)
+        or np.any(~np.isfinite(gains))
+        or np.any(gains < 0.0)
+    ):
+        return finish([], math.nan, False, "invalid V1 bandwidth-KKT input", 0, False, False, math.nan)
+    if epsilon * n > 1.0 + tolerance:
+        return finish(
+            [], math.nan, False, f"epsilon * N = {epsilon * n} > 1",
+            0, False, False, 0.0,
+        )
+    if n == 1:
+        return finish([1.0], 0.0, True, "", 0, True, False, 1.0, 0.0, 0.0)
+    if not bool(np.any(coeff > 0.0)):
+        allocation = np.full(n, 1.0 / n, dtype=np.float64)
+        return finish(allocation, 0.0, True, "", 0, True, False, 1.0, 0.0, 0.0)
+
+    def marginal(allocation: np.ndarray) -> np.ndarray:
+        rates, derivatives, _ = system_model.uplink_rate_and_derivative(
+            bandwidth,
+            allocation,
+            power,
+            gains,
+            1.0,
+            noise_model=system_model.BANDWIDTH_DEPENDENT_NOISE_V1,
+            noise_psd_w_per_hz=psd,
+            receiver_noise_figure_db=nf_db,
+        )
+        rates_array = np.asarray(rates, dtype=np.float64)
+        derivative_array = np.asarray(derivatives, dtype=np.float64)
+        if np.any(rates_array <= 0.0):
+            raise ValueError("V1 bandwidth KKT encountered a zero allocated rate")
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            values = coeff * derivative_array / np.square(rates_array)
+        if np.any(~np.isfinite(values)):
+            raise ValueError("V1 bandwidth KKT marginal utility is non-finite")
+        return values
+
+    try:
+        lower_allocation = np.full(n, epsilon, dtype=np.float64)
+        upper_allocation = np.ones(n, dtype=np.float64)
+        lower_marginal = marginal(lower_allocation)
+        upper_marginal = marginal(upper_allocation)
+    except (ValueError, OverflowError, FloatingPointError) as exc:
+        return finish([], math.nan, False, str(exc), 0, False, False, 0.0)
+    if not np.all(np.isfinite(lower_marginal)):
+        return finish([], math.nan, False, "V1 KKT upper multiplier is non-finite", 0, False, False, 0.0)
+
+    if epsilon * n >= 1.0 - tolerance:
+        allocation = lower_allocation
+        total = float(np.sum(allocation))
+        multiplier = float(np.max(lower_marginal))
+        stationarity = float(np.max(np.maximum(lower_marginal - multiplier, 0.0)))
+        return finish(
+            allocation,
+            multiplier,
+            total <= 1.0 + tolerance,
+            "" if total <= 1.0 + tolerance else f"allocation sum {total} > 1",
+            0,
+            abs(total - 1.0) <= tolerance,
+            False,
+            total,
+            stationarity,
+            abs(multiplier * (1.0 - total)),
+        )
+
+    def allocation_for(multiplier: float) -> np.ndarray:
+        result = np.empty(n, dtype=np.float64)
+        at_lower = multiplier >= lower_marginal
+        at_upper = multiplier <= upper_marginal
+        result[at_lower] = epsilon
+        result[at_upper & ~at_lower] = 1.0
+        interior = ~(at_lower | at_upper)
+        if not np.any(interior):
+            return result
+        lo = np.full(int(np.count_nonzero(interior)), epsilon, dtype=np.float64)
+        hi = np.ones_like(lo)
+        target = np.full_like(lo, multiplier)
+        interior_coeff = coeff[interior]
+        interior_gains = gains[interior]
+        for _ in range(64):
+            mid = 0.5 * (lo + hi)
+            rates, derivatives, _ = system_model.uplink_rate_and_derivative(
+                bandwidth,
+                mid,
+                power,
+                interior_gains,
+                1.0,
+                noise_model=system_model.BANDWIDTH_DEPENDENT_NOISE_V1,
+                noise_psd_w_per_hz=psd,
+                receiver_noise_figure_db=nf_db,
+            )
+            rates_array = np.asarray(rates, dtype=np.float64)
+            derivatives_array = np.asarray(derivatives, dtype=np.float64)
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                current = interior_coeff * derivatives_array / np.square(rates_array)
+            needs_more = current > target
+            lo = np.where(needs_more, mid, lo)
+            hi = np.where(needs_more, hi, mid)
+        result[interior] = 0.5 * (lo + hi)
+        return result
+
+    low_lambda = 0.0
+    high_lambda = float(np.max(lower_marginal))
+    if not math.isfinite(high_lambda):
+        return finish([], math.nan, False, "V1 KKT multiplier overflow", 0, False, False, 0.0)
+    allocation = lower_allocation
+    multiplier = high_lambda
+    total = float(np.sum(allocation))
+    iterations = 0
+    converged = False
+    for iterations in range(1, max_iterations + 1):
+        multiplier = 0.5 * (low_lambda + high_lambda)
+        allocation = allocation_for(multiplier)
+        total = float(np.sum(allocation))
+        if abs(total - 1.0) <= tolerance:
+            converged = True
+            break
+        if total > 1.0:
+            low_lambda = multiplier
+        else:
+            high_lambda = multiplier
+    hit_max = iterations >= max_iterations and not converged
+    if total > 1.0 + max(tolerance * 10.0, 1.0e-10):
+        return finish(
+            allocation, multiplier, False, f"V1 KKT allocation sum {total} > 1",
+            iterations, converged, hit_max, total,
+        )
+    try:
+        final_marginal = marginal(allocation)
+    except (ValueError, OverflowError, FloatingPointError) as exc:
+        return finish(allocation, multiplier, False, str(exc), iterations, converged, hit_max, total)
+    bound_tolerance = max(tolerance * 10.0, 1.0e-12)
+    at_lower = allocation <= epsilon + bound_tolerance
+    at_upper = allocation >= 1.0 - bound_tolerance
+    interior = ~(at_lower | at_upper)
+    stationarity_terms = np.zeros(n, dtype=np.float64)
+    stationarity_terms[at_lower] = np.maximum(
+        final_marginal[at_lower] - multiplier, 0.0
+    )
+    stationarity_terms[at_upper] = np.maximum(
+        multiplier - final_marginal[at_upper], 0.0
+    )
+    stationarity_terms[interior] = np.abs(
+        final_marginal[interior] - multiplier
+    )
+    lower_dual = np.where(at_lower, np.maximum(multiplier - final_marginal, 0.0), 0.0)
+    upper_dual = np.where(at_upper, np.maximum(final_marginal - multiplier, 0.0), 0.0)
+    complementary = max(
+        abs(multiplier * (1.0 - total)),
+        float(np.max(np.abs(lower_dual * (allocation - epsilon)))),
+        float(np.max(np.abs(upper_dual * (1.0 - allocation)))),
+    )
+    return finish(
+        allocation,
+        multiplier,
+        True,
+        "",
+        iterations,
+        converged,
+        hit_max,
+        total,
+        float(np.max(stationarity_terms)),
+        complementary,
+    )
+
+
 def _group_edge_tasks(
     tasks: list[Task],
     matching: dict[str, str],
@@ -2416,26 +2651,52 @@ def allocate_resources_kkt(
             coefficient_started_at = (
                 time.perf_counter() if timing_profile is not None else 0.0
             )
-            bw_coeff = []
-            for task in node_tasks:
-                tv_xy = vehicle_positions[task.vehicle_id]
-                node_xy = service_node_positions[node_id]
-                base_rate = _base_rate(role, tv_xy, node_xy, cache_config)
-                if base_rate <= 0.0:
+            if cache_config.noise_model == system_model.BANDWIDTH_DEPENDENT_NOISE_V1:
+                upload_weight = (
+                    cache_config.omega_t / cache_config.time_ref_s
+                    + cache_config.omega_e
+                    * cache_config.tx_power_w
+                    / cache_config.energy_ref_j
+                )
+                bw_coeff = [task.input_bits * upload_weight for task in node_tasks]
+                channel_gains = [
+                    _channel_gain(
+                        role,
+                        vehicle_positions[task.vehicle_id],
+                        service_node_positions[node_id],
+                        cache_config,
+                    )
+                    for task in node_tasks
+                ]
+                if any(not math.isfinite(value) or value <= 0.0 for value in channel_gains):
                     if timing_profile is not None:
                         timing_profile["kkt_coefficient_build_runtime"] += (
                             time.perf_counter() - coefficient_started_at
                         )
-                    return KKTResourceAllocationResult(False, f"{node_id} base rate <= 0", {}, {}, {}, {}, {}, {})
-                # bandwidth_loss_coefficient = D/Rbar * (omega_T/T_ref + omega_E*p/E_ref)
-                bw_coeff.append(
-                    task.input_bits
-                    / base_rate
-                    * (
-                        cache_config.omega_t / cache_config.time_ref_s
-                        + cache_config.omega_e * cache_config.tx_power_w / cache_config.energy_ref_j
+                    return KKTResourceAllocationResult(
+                        False, f"{node_id} channel gain <= 0", {}, {}, {}, {}, {}, {}
                     )
-                )
+            else:
+                bw_coeff = []
+                for task in node_tasks:
+                    tv_xy = vehicle_positions[task.vehicle_id]
+                    node_xy = service_node_positions[node_id]
+                    base_rate = _base_rate(role, tv_xy, node_xy, cache_config)
+                    if base_rate <= 0.0:
+                        if timing_profile is not None:
+                            timing_profile["kkt_coefficient_build_runtime"] += (
+                                time.perf_counter() - coefficient_started_at
+                            )
+                        return KKTResourceAllocationResult(False, f"{node_id} base rate <= 0", {}, {}, {}, {}, {}, {})
+                    # In V0, R(b)=b*R(1), so the upload loss is coefficient/b.
+                    bw_coeff.append(
+                        task.input_bits
+                        / base_rate
+                        * (
+                            cache_config.omega_t / cache_config.time_ref_s
+                            + cache_config.omega_e * cache_config.tx_power_w / cache_config.energy_ref_j
+                        )
+                    )
             if timing_profile is not None:
                 timing_profile["kkt_coefficient_build_runtime"] += (
                     time.perf_counter() - coefficient_started_at
@@ -2445,13 +2706,35 @@ def allocate_resources_kkt(
             solver_started_at = (
                 time.perf_counter() if timing_profile is not None else 0.0
             )
-            bw_values, nu, ok, reason, bw_diagnostics = solve_kkt_fraction_allocation(
-                bw_coeff,
-                kkt_cfg.min_bandwidth_fraction,
-                kkt_cfg.bisection_tolerance,
-                kkt_cfg.max_bisection_iterations,
-                return_diagnostics=True,
-            )
+            if cache_config.noise_model == system_model.BANDWIDTH_DEPENDENT_NOISE_V1:
+                if cache_config.noise_psd_w_per_hz is None or cache_config.receiver_noise_figure_db is None:
+                    return KKTResourceAllocationResult(
+                        False,
+                        "V1 noise configuration disappeared before KKT allocation",
+                        {}, {}, {}, {}, {}, {},
+                    )
+                bw_values, nu, ok, reason, bw_diagnostics = (
+                    solve_kkt_bandwidth_dependent_noise_allocation(
+                        bw_coeff,
+                        _node_bandwidth(role, cache_config),
+                        cache_config.tx_power_w,
+                        channel_gains,
+                        cache_config.noise_psd_w_per_hz,
+                        cache_config.receiver_noise_figure_db,
+                        kkt_cfg.min_bandwidth_fraction,
+                        kkt_cfg.bisection_tolerance,
+                        kkt_cfg.max_bisection_iterations,
+                        return_diagnostics=True,
+                    )
+                )
+            else:
+                bw_values, nu, ok, reason, bw_diagnostics = solve_kkt_fraction_allocation(
+                    bw_coeff,
+                    kkt_cfg.min_bandwidth_fraction,
+                    kkt_cfg.bisection_tolerance,
+                    kkt_cfg.max_bisection_iterations,
+                    return_diagnostics=True,
+                )
             if kkt_cache is not None:
                 kkt_cache.record_diagnostics(bw_diagnostics)
             if timing_profile is not None:
@@ -2745,6 +3028,9 @@ def _evaluate_edge_node(
             cache_config.noise_power_w,
             _node_cpu(role, cache_config),
             allocation.cpu_allocations[node_id][task.task_id],
+            noise_model=cache_config.noise_model,
+            noise_psd_w_per_hz=cache_config.noise_psd_w_per_hz,
+            receiver_noise_figure_db=cache_config.receiver_noise_figure_db,
         )
         delay = float(edge["total_delay_s"])
         energy = float(edge["vehicle_energy_j"])
@@ -2777,6 +3063,7 @@ def _evaluate_edge_node(
         allocation.per_node_cpu_sum,
         allocation.per_node_bandwidth_sum,
     )
+
 
 
 def evaluate_matching_with_kkt(
@@ -2925,24 +3212,6 @@ def evaluate_matching_with_kkt(
             delay = cached_node_evaluation.per_task_delay_s[task.task_id]
             energy = cached_node_evaluation.per_task_vehicle_energy_j[task.task_id]
             utility = cached_node_evaluation.per_task_utility[task.task_id]
-        elif target == LOCAL:
-            result = system_model.local_execution(
-                task.cpu_cycles,
-                cache_config.local_cpu_cycles_per_s,
-                cache_config.local_energy_per_cycle_j,
-            )
-            delay = float(result["delay_s"])
-            energy = float(result["vehicle_energy_j"])
-            utility = float(
-                system_model.task_utility(
-                    delay,
-                    energy,
-                    cache_config.time_ref_s,
-                    cache_config.energy_ref_j,
-                    cache_config.omega_t,
-                    cache_config.omega_e,
-                )
-            )
         elif target == CLOUD:
             result = system_model.cloud_execution(
                 task.input_bits,
@@ -3018,7 +3287,7 @@ def evaluate_matching_candidate_incremental(
         kkt_conversion_started_at = (
             time.perf_counter() if timing_profile is not None else 0.0
         )
-        current_kkt = _to_kkt_matching(current_matching)
+        current_kkt = dict(current_matching)
         if timing_profile is not None:
             _profile_add(
                 timing_profile,
@@ -3036,7 +3305,7 @@ def evaluate_matching_candidate_incremental(
         kkt_conversion_started_at = (
             time.perf_counter() if timing_profile is not None else 0.0
         )
-        candidate_kkt = _to_kkt_matching(candidate_matching)
+        candidate_kkt = dict(candidate_matching)
         if timing_profile is not None:
             _profile_add(
                 timing_profile,
@@ -3252,7 +3521,7 @@ def evaluate_matching_candidate_incremental(
         task
         for task in tasks
         if task.task_id in impacted_task_ids
-        and candidate_kkt[task.task_id] in (LOCAL, CLOUD)
+        and candidate_kkt[task.task_id] == CLOUD
     ]
     non_edge_matching = {
         task.task_id: candidate_kkt[task.task_id] for task in non_edge_tasks

@@ -12,7 +12,6 @@ import numpy as np
 
 from common import project_config
 from decision import cache_configuration, task_allocation, uav_configuration
-from scenario import task_scenario
 from scenario.realization import (
     RealizationArtifacts,
     _realization_artifacts_from_directory,
@@ -21,6 +20,7 @@ from scenario.realization import (
 
 
 PROPOSED_POLICY_SCHEMA = project_config.PROPOSED_POLICY_SCHEMA
+MULTI_NODE_FACTORIZED_POLICY_SCHEMA = project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA
 PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
 
 
@@ -32,7 +32,6 @@ class EnvironmentContext:
     scenarios: dict[str, Any]
     service_catalog: dict[str, Any]
     cache_nodes: dict[str, Any]
-    local_cache: dict[str, set[int]]
     flight_boundary: tuple[float, float, float, float]
     action_spec: ConfigurationActionSpec
     observation_spec: ConfigurationObservationSpec
@@ -47,6 +46,8 @@ class EnvironmentContext:
     minibatch_size: int
     configuration_control_mode: str
     policy_schema: str
+    cache_action_mode: str
+    cache_reconfiguration_model: str
     realization: "RealizationArtifacts | None" = None
     observation_time_to_go: Callable[[int], float] | None = None
 
@@ -66,6 +67,8 @@ def _assert_realization_context_compatible(
         "minibatch_size",
         "configuration_control_mode",
         "policy_schema",
+        "cache_action_mode",
+        "cache_reconfiguration_model",
     )
     for field in scalar_fields:
         if getattr(reference, field) != getattr(candidate, field):
@@ -145,9 +148,6 @@ def load_environment_context(
         raise ValueError("训练起点范围超出 prediction_scenarios。")
     first_origin = cache_configuration.scenario_at_origin(scenarios, train_start)
     cache_nodes = cache_configuration.build_cache_nodes(first_origin, cache_cfg)
-    local_cache = task_scenario.load_tv_local_cache(
-        realization.tv_local_cache
-    )
     action_spec = ConfigurationActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
     policy_schema = str(
         project_config.get_config_value(
@@ -156,11 +156,48 @@ def load_environment_context(
             PROPOSED_POLICY_SCHEMA,
         )
     )
-    if policy_schema != PROPOSED_POLICY_SCHEMA:
-        raise ValueError(
-            "当前训练器仅支持正式双时间尺度策略："
-            f"{PROPOSED_POLICY_SCHEMA}"
+    cache_action_mode = str(
+        project_config.get_config_value(
+            cfg,
+            "algorithm.ppo.cache_action_mode",
+            project_config.CACHE_ACTION_MODE_SINGLE_NODE,
         )
+    )
+    cache_reconfiguration_model = str(
+        project_config.get_config_value(
+            cfg,
+            "algorithm.ppo.cache_reconfiguration_model",
+            "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION",
+        )
+    )
+    expected_schema = (
+        MULTI_NODE_FACTORIZED_POLICY_SCHEMA
+        if cache_action_mode == project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED
+        else PROPOSED_POLICY_SCHEMA
+    )
+    if policy_schema != expected_schema:
+        raise ValueError(
+            "Cache action mode 与 policy schema 不匹配："
+            f"mode={cache_action_mode}, expected_schema={expected_schema}, "
+            f"actual_schema={policy_schema}"
+        )
+    if cache_action_mode not in {
+        project_config.CACHE_ACTION_MODE_SINGLE_NODE,
+        project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
+    }:
+        raise ValueError(f"unsupported Cache action mode: {cache_action_mode}")
+    if cache_action_mode == project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED:
+        if cache_reconfiguration_model != project_config.CACHE_RECONFIGURATION_MODEL_ABSTRACT:
+            raise ValueError("multi-node mode requires the explicit abstract reconfiguration model")
+        roles = [str(value).upper() for value in cache_nodes["node_roles"]]
+        if len(action_spec.cache_node_ids) != 9 or {
+            role: roles.count(role) for role in ("SV", "RSU", "UAV")
+        } != {"SV": 5, "RSU": 2, "UAV": 2}:
+            raise ValueError(
+                "MULTI_NODE_FACTORIZED requires stable 5-SV/2-RSU/2-UAV cache node order"
+            )
+    elif cache_reconfiguration_model != "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION":
+        raise ValueError("single-node mode has an unsupported cache reconfiguration model")
     ppo_config = cfg["algorithm"]["ppo"]
     required_flags = {
         "macro_cache_enabled": True,
@@ -211,7 +248,6 @@ def load_environment_context(
         scenarios=scenarios,
         service_catalog=service_catalog,
         cache_nodes=cache_nodes,
-        local_cache=local_cache,
         flight_boundary=uav_configuration.boundary_from_project(cfg),
         action_spec=action_spec,
         observation_spec=observation_spec,
@@ -230,6 +266,8 @@ def load_environment_context(
         minibatch_size=int(data_protocol["minibatch_size"]),
         configuration_control_mode=configuration_control_mode,
         policy_schema=policy_schema,
+        cache_action_mode=cache_action_mode,
+        cache_reconfiguration_model=cache_reconfiguration_model,
         realization=realization,
     )
 

@@ -338,10 +338,8 @@ def validate_episode_provenance(
     directory: Path,
     config: dict[str, Any],
     episode_seed: int,
-    *,
-    check_source_identity: bool = True,
 ) -> dict[str, Any]:
-    """现有 realization 未通过来源核验时，禁止继续使用。"""
+    """Validate historical data identity without comparing it to the current Git checkout."""
 
     manifest_path = Path(directory) / EPISODE_MANIFEST_FILENAME
     prefix = "REALIZATION_PROVENANCE_MISMATCH"
@@ -353,6 +351,10 @@ def validate_episode_provenance(
         raise RuntimeError(f"{prefix}: invalid JSON in {manifest_path}") from exc
     if not isinstance(manifest, dict):
         raise RuntimeError(f"{prefix}: manifest root must be an object")
+    if manifest.get("schema_version") != EPISODE_MANIFEST_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{prefix}: unsupported schema_version={manifest.get('schema_version')!r}"
+        )
     if int(manifest.get("episode_seed", -1)) != int(episode_seed):
         raise RuntimeError(
             f"{prefix}: episode_seed={manifest.get('episode_seed')!r} "
@@ -365,6 +367,8 @@ def validate_episode_provenance(
             f"stored={manifest.get('generation_config_fingerprint')!r} "
             f"expected={expected_fingerprint!r}"
         )
+    if manifest.get("generation_config_fields") != _generation_config_payload(config):
+        raise RuntimeError(f"{prefix}: generation_config_fields mismatch")
     expected_hashes = _source_artifact_hashes(config)
     for field, expected_hash in expected_hashes.items():
         if manifest.get(field) != expected_hash:
@@ -372,16 +376,24 @@ def validate_episode_provenance(
                 f"{prefix}: {field} mismatch; stored={manifest.get(field)!r} "
                 f"expected={expected_hash!r}"
             )
-    if check_source_identity:
-        source_sha, source_dirty = _git_identity()
-        if manifest.get("source_git_sha") != source_sha or bool(
-            manifest.get("source_git_dirty")
-        ) != bool(source_dirty):
+    source_sha = manifest.get("source_git_sha")
+    source_dirty = manifest.get("source_git_dirty")
+    if (
+        not isinstance(source_sha, str)
+        or len(source_sha) != 40
+        or any(character not in "0123456789abcdef" for character in source_sha)
+        or not isinstance(source_dirty, bool)
+    ):
+        raise RuntimeError(f"{prefix}: historical source Git identity is missing or invalid")
+    stored_seeds = manifest.get("derived_episode_seed_streams")
+    if not isinstance(stored_seeds, dict):
+        raise RuntimeError(f"{prefix}: derived episode seed streams are missing")
+    expected_seeds = derive_episode_seeds(int(episode_seed))
+    for stream_name, expected_seed in expected_seeds.items():
+        if stored_seeds.get(stream_name) != expected_seed:
             raise RuntimeError(
-                f"{prefix}: source git identity mismatch; "
-                f"stored=({manifest.get('source_git_sha')!r}, "
-                f"{manifest.get('source_git_dirty')!r}) "
-                f"expected=({source_sha!r}, {source_dirty!r})"
+                f"{prefix}: derived seed mismatch for {stream_name}; "
+                f"stored={stored_seeds.get(stream_name)!r} expected={expected_seed!r}"
             )
     actual_paths = sorted(
         path
@@ -678,22 +690,6 @@ def run_episode(
         artifacts["popularity_rows"],
         artifacts["task_rows"],
     )
-    local_cache_capacity = float(
-        get(config, "nodes.vehicle.local_cache_capacity_mb")
-    )
-    tv_cache = task.generate_tv_local_cache(
-        tv_ids,
-        catalog,
-        local_cache_capacity,
-        int(seeds["tv_cache_seed"]),
-    )
-    task.validate_tv_local_cache(
-        tv_cache,
-        tv_ids,
-        catalog,
-        local_cache_capacity,
-    )
-    task.write_json_atomic(output_dir / "tv_local_cache.json", tv_cache)
     task_runtime = time.perf_counter() - task_start
 
     prediction_start = time.perf_counter()

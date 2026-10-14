@@ -42,7 +42,6 @@ REQUIRED_FILES = (
     "tasks.csv",
     "popularity.csv",
     "popularity_history.csv",
-    "tv_local_cache.json",
     "vehicle_predictions.csv",
     "popularity_predictions.csv",
     "prediction_scenarios.npz",
@@ -55,7 +54,6 @@ HASH_FILES = {
     "roles": "vehicle_roles.json",
     "tasks": "tasks.csv",
     "popularity": "popularity.csv",
-    "tv_cache": "tv_local_cache.json",
     "vehicle_predictions": "vehicle_predictions.csv",
     "popularity_predictions": "popularity_predictions.csv",
     "prediction_scenarios": "prediction_scenarios.npz",
@@ -66,7 +64,6 @@ SIGNATURE_COMPONENTS = (
     "tasks",
     "popularity",
     "roles",
-    "tv_cache",
 )
 
 # A diagnostic definition of "near-identical" service distributions, in bits.
@@ -832,7 +829,7 @@ def render_markdown(
             "",
             "## 3. 重复与 SHA256 检查",
             "",
-            "表中计数的分母为 300；缺失文件没有 hash。Realization signature 是 trajectory、tasks、popularity、vehicle_roles、tv_local_cache 五个文件名及其 SHA256 按固定顺序拼接后再做 SHA256。",
+            "表中计数的分母为 300；缺失文件没有 hash。Realization signature 是 trajectory、tasks、popularity、vehicle_roles 四个文件名及其 SHA256 按固定顺序拼接后再做 SHA256。",
             "",
             "| Artifact | Unique hashes | 重复 episode seed 组 |",
             "|---|---:|---|",
@@ -1170,13 +1167,6 @@ def main() -> None:
             research_ids = set()
         if roles is None:
             research_ids = set()
-
-        cache_path = episode_dir / "tv_local_cache.json"
-        if cache_path.is_file():
-            try:
-                episode_hashes["tv_cache"] = hash_file_streaming(cache_path)
-            except OSError as exc:
-                contract_issues.append(f"episode_{seed}: tv_local_cache.json read error: {exc}")
 
         scenarios_path = episode_dir / "prediction_scenarios.npz"
         if scenarios_path.is_file():

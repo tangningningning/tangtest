@@ -61,6 +61,25 @@ class MacroComponentsEvaluation:
     cache_entropy: Any
     value: Any
     joint_logprob_decomposition_error: Any
+    node_cache_log_probs: Any = None
+    node_cache_entropies: Any = None
+    node_cache_probabilities: Any = None
+
+
+@dataclass(frozen=True)
+class MultiNodeMacroActionSample:
+    """Nine independently sampled Cache heads sharing one state encoder."""
+
+    cache_actions: np.ndarray
+    node_log_probs: Any
+    node_entropies: Any
+    value: Any
+    cache_masks: np.ndarray
+    node_probabilities: np.ndarray
+    raw_node_probabilities: np.ndarray
+    node_p_keep: Any
+    node_p_update: Any
+    deterministic_diagnostics: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -219,9 +238,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
     architecture_id = (
-        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v2"
+        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v3_no_tv_local"
     )
-    architecture_version = 31
+    architecture_version = 32
 
     def __init__(
         self,
@@ -246,9 +265,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
         )
-        if not self.unified_cache_action or not self.cardinality_corrected_cache_action:
+        if not self.cardinality_corrected_cache_action:
             raise ValueError(
-                "The PROPOSED policy supports only the unified Cache candidate action with cardinality correction."
+                "The PROPOSED policy requires Cache candidate cardinality correction."
             )
         sizes = tuple(int(value) for value in hidden_sizes)
         if min(self.observation_dim, self.macro_cache_feature_dim, self.micro_uav_feature_dim) <= 0:
@@ -417,6 +436,138 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         corrected_logits = self._cardinality_corrected_cache_logits(raw_logits, masks)
         values = self.macro_value(obs)
         return corrected_logits, raw_logits, values, masks
+
+    def _macro_cache_node_logits(
+        self,
+        observations: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+    ) -> tuple[Any, Any, Any, Any]:
+        """Score node heads with shared parameters and the same global state."""
+
+        device = next(self.parameters()).device
+        obs, _ = self._observation_batch(observations, device)
+        if int(obs.shape[-1]) != self.observation_dim:
+            raise ValueError("Macro observation dimension mismatch.")
+        features = torch.as_tensor(
+            cache_candidate_features, dtype=torch.float32, device=device
+        )
+        masks = torch.as_tensor(cache_candidate_masks, dtype=torch.bool, device=device)
+        if features.ndim == 3:
+            features = features.unsqueeze(0)
+        if masks.ndim == 2:
+            masks = masks.unsqueeze(0)
+        if (
+            features.ndim != 4
+            or tuple(features.shape[:1]) != (int(obs.shape[0]),)
+            or tuple(features.shape[:-1]) != tuple(masks.shape)
+            or int(features.shape[-1]) != self.macro_cache_feature_dim
+            or not int(features.shape[1])
+            or int(features.shape[2]) < 1
+        ):
+            raise ValueError(
+                "factorized Cache tensors must be [B,N,K,D] with aligned [B,N,K] masks"
+            )
+        if not bool(torch.all(masks[..., 0]).item()) or not bool(
+            torch.all(torch.any(masks, dim=-1)).item()
+        ):
+            raise ValueError("each factorized Cache head needs a legal KEEP at index zero")
+        if not bool(torch.isfinite(features[masks]).all().item()):
+            raise FloatingPointError("legal factorized Cache features contain NaN/Inf")
+        hidden = self.macro_actor_encoder(obs)
+        candidate_hidden = self.macro_cache_candidate_encoder(features)
+        expanded_hidden = hidden[:, None, None, :].expand(
+            -1, int(features.shape[1]), int(features.shape[2]), -1
+        )
+        raw_logits = self.macro_cache_scorer(
+            torch.cat((expanded_hidden, candidate_hidden), dim=-1)
+        ).squeeze(-1)
+        corrected_logits = self._cardinality_corrected_cache_logits(raw_logits, masks)
+        values = self.macro_value(obs)
+        return corrected_logits, raw_logits, values, masks
+
+    def sample_macro_nodes(
+        self,
+        observation: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+        deterministic: bool = False,
+    ) -> MultiNodeMacroActionSample:
+        """Sample one cardinality-corrected categorical action per cache node."""
+
+        if self.unified_cache_action:
+            raise ValueError("sample_macro_nodes requires factorized Cache action semantics")
+        device = next(self.parameters()).device
+        features = torch.as_tensor(
+            cache_candidate_features, dtype=torch.float32, device=device
+        )
+        masks = torch.as_tensor(cache_candidate_masks, dtype=torch.bool, device=device)
+        if features.ndim != 3 or masks.ndim != 2:
+            raise ValueError("single-state factorized Cache inputs must be [N,K,D]/[N,K]")
+        with torch.no_grad():
+            obs, _ = self._observation_batch(observation, device)
+            if int(obs.shape[0]) != 1:
+                raise ValueError("sample_macro_nodes accepts one observation")
+            logits, raw_logits, values, legal_masks = self._macro_cache_node_logits(
+                obs, features, masks
+            )
+            node_logits = logits[0]
+            node_raw_logits = raw_logits[0]
+            node_masks = legal_masks[0]
+            corrected = _masked_categorical(node_logits, node_masks)
+            raw = _masked_categorical(node_raw_logits, node_masks)
+            if not bool(torch.isfinite(corrected.probs).all().item()) or not torch.allclose(
+                corrected.probs.sum(dim=-1),
+                torch.ones(corrected.probs.shape[0], dtype=corrected.probs.dtype, device=device),
+                atol=1.0e-6,
+                rtol=0.0,
+            ):
+                raise FloatingPointError("factorized Cache probabilities are invalid")
+            if deterministic:
+                actions: list[int] = []
+                diagnostics: list[dict[str, Any]] = []
+                for node_index in range(int(node_logits.shape[0])):
+                    group_ids = torch.ones_like(node_masks[node_index], dtype=torch.long)
+                    group_ids[0] = 0
+                    selected, selected_group = _group_aware_deterministic_candidate(
+                        node_raw_logits[node_index],
+                        corrected.probs[node_index],
+                        node_masks[node_index],
+                        group_ids,
+                    )
+                    update_mask = node_masks[node_index] & (group_ids == 1)
+                    update_count = int(update_mask.sum().item())
+                    diagnostics.append(
+                        {
+                            "node_index": node_index,
+                            "selected_candidate_index": selected,
+                            "selected_group": "KEEP" if selected_group == 0 else "UPDATE",
+                            "p_keep": float(corrected.probs[node_index, 0].cpu()),
+                            "p_update": float(corrected.probs[node_index, 1:].sum().cpu()),
+                            "legal_update_candidate_count": update_count,
+                            "selected_candidate_is_legal": bool(node_masks[node_index, selected].item()),
+                        }
+                    )
+                    actions.append(selected)
+                action_values = torch.as_tensor(actions, dtype=torch.long, device=device)
+                deterministic_diagnostics = tuple(diagnostics)
+            else:
+                action_values = corrected.sample()
+                deterministic_diagnostics = None
+            node_log_probs = corrected.log_prob(action_values)
+            node_entropies = corrected.entropy()
+            return MultiNodeMacroActionSample(
+                cache_actions=action_values.detach().cpu().numpy().astype(np.int64, copy=True),
+                node_log_probs=node_log_probs,
+                node_entropies=node_entropies,
+                value=values.squeeze(0),
+                cache_masks=node_masks.detach().cpu().numpy().copy(),
+                node_probabilities=corrected.probs.detach().cpu().numpy().copy(),
+                raw_node_probabilities=raw.probs.detach().cpu().numpy().copy(),
+                node_p_keep=corrected.probs[:, 0],
+                node_p_update=corrected.probs[:, 1:].sum(dim=-1),
+                deterministic_diagnostics=deterministic_diagnostics,
+            )
 
     @staticmethod
     def _integer_elapsed_batch(
@@ -669,23 +820,62 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
 
         device = next(self.parameters()).device
         obs, _ = self._observation_batch(observations, device)
-        cache_logits, _, values, masks = self._macro_cache_logits(
-            obs,
-            cache_candidate_features,
-            cache_candidate_masks,
-        )
         batch_size = int(obs.shape[0])
-        cache_action_values = torch.as_tensor(
-            cache_actions, dtype=torch.long, device=device
-        ).reshape(-1)
-        if tuple(cache_action_values.shape) != (batch_size,):
-            raise ValueError("cache_actions 必须是 [B]。")
-        if bool(torch.any((cache_action_values < 0) | (cache_action_values >= masks.shape[1])).item()):
-            raise ValueError("Cache action index 越界。")
-        if not bool(
-            torch.all(masks.gather(1, cache_action_values[:, None]).squeeze(1)).item()
-        ):
-            raise ValueError("Cache action 被 rollout 保存的合法动作 mask 屏蔽。")
+        raw_features = torch.as_tensor(cache_candidate_features, device=device)
+        node_cache_log_probs = None
+        node_cache_entropies = None
+        node_cache_probabilities = None
+        if raw_features.ndim == 4:
+            if self.unified_cache_action:
+                raise ValueError("factorized Cache rollout cannot be evaluated by a unified policy")
+            cache_logits, _, values, masks = self._macro_cache_node_logits(
+                obs,
+                cache_candidate_features,
+                cache_candidate_masks,
+            )
+            cache_action_values = torch.as_tensor(
+                cache_actions, dtype=torch.long, device=device
+            )
+            expected_action_shape = (batch_size, int(masks.shape[1]))
+            if tuple(cache_action_values.shape) != expected_action_shape:
+                raise ValueError(f"factorized cache_actions must be {expected_action_shape}")
+            if bool(torch.any((cache_action_values < 0) | (cache_action_values >= masks.shape[2])).item()):
+                raise ValueError("factorized Cache action index out of range")
+            selected_legal = masks.gather(2, cache_action_values.unsqueeze(-1)).squeeze(-1)
+            if not bool(torch.all(selected_legal).item()):
+                raise ValueError("factorized Cache action is masked by its saved legal mask")
+            cache_distribution = _masked_categorical(cache_logits, masks)
+            node_cache_log_probs = cache_distribution.log_prob(cache_action_values)
+            node_cache_entropies = cache_distribution.entropy()
+            node_cache_probabilities = cache_distribution.probs
+            cache_log_prob = node_cache_log_probs.sum(dim=-1)
+            cache_entropy = node_cache_entropies.sum(dim=-1)
+            cache_probabilities = node_cache_probabilities
+            p_keep = cache_probabilities[:, :, 0]
+            p_update = cache_probabilities[:, :, 1:].sum(dim=-1)
+        else:
+            cache_logits, _, values, masks = self._macro_cache_logits(
+                obs,
+                cache_candidate_features,
+                cache_candidate_masks,
+            )
+            cache_action_values = torch.as_tensor(
+                cache_actions, dtype=torch.long, device=device
+            ).reshape(-1)
+            if tuple(cache_action_values.shape) != (batch_size,):
+                raise ValueError("cache_actions 必须是 [B]。")
+            if bool(torch.any((cache_action_values < 0) | (cache_action_values >= masks.shape[1])).item()):
+                raise ValueError("Cache action index 越界。")
+            if not bool(
+                torch.all(masks.gather(1, cache_action_values[:, None]).squeeze(1)).item()
+            ):
+                raise ValueError("Cache action 被 rollout 保存的合法动作 mask 屏蔽。")
+            cache_distribution = _masked_categorical(cache_logits, masks)
+            cache_log_prob = cache_distribution.log_prob(cache_action_values)
+            cache_entropy = cache_distribution.entropy()
+            cache_probabilities = cache_distribution.probs
+            p_keep = cache_probabilities[:, 0]
+            p_update = cache_probabilities[:, 1:].sum(dim=-1)
 
         term_obs = torch.as_tensor(
             termination_observations, dtype=torch.float32, device=device
@@ -712,11 +902,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             raise ValueError(
                 "termination_elapsed_slots/actions/masks 必须都是 [B,T]。"
             )
-
-        cache_distribution = _masked_categorical(cache_logits, masks)
-        cache_log_prob = cache_distribution.log_prob(cache_action_values)
-        cache_entropy = cache_distribution.entropy()
-        cache_probabilities = cache_distribution.probs
 
         # 只选出 rollout 中真实采样的决策，padding 不进入 scorer 或概率和。
         selected_mask = term_masks.reshape(-1)
@@ -751,8 +936,6 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
 
         termination_log_prob_sum = term_log_probs.sum(dim=1)
         termination_entropy_sum = term_entropies.sum(dim=1)
-        p_keep = cache_probabilities[:, 0]
-        p_update = cache_probabilities[:, 1:].sum(dim=-1)
         joint_log_prob = cache_log_prob + termination_log_prob_sum
         decomposition_error = torch.abs(
             joint_log_prob.to(torch.float64)
@@ -779,6 +962,9 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             cache_entropy=cache_entropy,
             value=values,
             joint_logprob_decomposition_error=decomposition_error,
+            node_cache_log_probs=node_cache_log_probs,
+            node_cache_entropies=node_cache_entropies,
+            node_cache_probabilities=node_cache_probabilities,
         )
 
     def evaluate_macro_joint(
@@ -1098,3 +1284,33 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         }
         combined = {**macro_state, **micro_state, **long_state}
         self.load_state_dict(combined, strict=True)
+
+
+class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
+    """Versioned nine-head Cache policy sharing the established actor/scorer."""
+
+    architecture_id = (
+        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
+        "v4_multi_node_cache_factorized_v1"
+    )
+    architecture_version = 33
+
+    def __init__(
+        self,
+        observation_dim: int,
+        macro_cache_feature_dim: int,
+        micro_uav_feature_dim: int,
+        adaptive_holding_min_slots: int,
+        adaptive_holding_max_slots: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(
+            observation_dim,
+            macro_cache_feature_dim,
+            micro_uav_feature_dim,
+            adaptive_holding_min_slots,
+            adaptive_holding_max_slots,
+            hidden_sizes,
+            unified_cache_action=False,
+            cardinality_corrected_cache_action=True,
+        )
