@@ -1,0 +1,2980 @@
+{
+  "stage": "B3-10G",
+  "status": "COMPLETE",
+  "environment": {
+    "conda_environment": "adaptive_cache_mec",
+    "python_executable": "C:\\software\\Anaconda_envs\\envs\\adaptive_cache_mec\\python.exe",
+    "python_prefix": "C:\\software\\Anaconda_envs\\envs\\adaptive_cache_mec",
+    "base_environment_used": false
+  },
+  "baseline_config": "configs/proposed/system_config_comm_v2_stageB3_10c.toml",
+  "baseline_config_sha256": "1a9dfdf8ecee9a838a0a9a5fcde519cc7580c8ffa2d60e6526bfa0451dea6e78",
+  "training_data_scope": "environment_data/proposed_joint_training only",
+  "fixed_episodes": [
+    20001,
+    20100,
+    20200,
+    20300
+  ],
+  "fixed_slots": [
+    0,
+    100,
+    200
+  ],
+  "episode_manifests": {
+    "20001": {
+      "path": "environment_data/proposed_joint_training/episode_20001/episode_manifest.json",
+      "episode_seed": 20001,
+      "source_training_split": "train",
+      "config_sha256": "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77",
+      "semantic_config_sha256": "10f893fc549c4016bedb1a5389ad996f9a3ff646aa012596a7230c284b13f542",
+      "service_catalog_sha256": "3963eaa1c4cb116563fbbb9de0329dcc8c256c64fd849d5e0b75e9e51ca4c3ed"
+    },
+    "20100": {
+      "path": "environment_data/proposed_joint_training/episode_20100/episode_manifest.json",
+      "episode_seed": 20100,
+      "source_training_split": "train",
+      "config_sha256": "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77",
+      "semantic_config_sha256": "10f893fc549c4016bedb1a5389ad996f9a3ff646aa012596a7230c284b13f542",
+      "service_catalog_sha256": "3963eaa1c4cb116563fbbb9de0329dcc8c256c64fd849d5e0b75e9e51ca4c3ed"
+    },
+    "20200": {
+      "path": "environment_data/proposed_joint_training/episode_20200/episode_manifest.json",
+      "episode_seed": 20200,
+      "source_training_split": "train",
+      "config_sha256": "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77",
+      "semantic_config_sha256": "10f893fc549c4016bedb1a5389ad996f9a3ff646aa012596a7230c284b13f542",
+      "service_catalog_sha256": "3963eaa1c4cb116563fbbb9de0329dcc8c256c64fd849d5e0b75e9e51ca4c3ed"
+    },
+    "20300": {
+      "path": "environment_data/proposed_joint_training/episode_20300/episode_manifest.json",
+      "episode_seed": 20300,
+      "source_training_split": "train",
+      "config_sha256": "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77",
+      "semantic_config_sha256": "10f893fc549c4016bedb1a5389ad996f9a3ff646aa012596a7230c284b13f542",
+      "service_catalog_sha256": "3963eaa1c4cb116563fbbb9de0329dcc8c256c64fd849d5e0b75e9e51ca4c3ed"
+    }
+  },
+  "comparison_contract": {
+    "cache_uav": "KEEP / STAY",
+    "cloud_cpu_capacity_ghz": 40.0,
+    "cloud_policy": "RESOURCE_AWARE_FALLBACK free competition",
+    "cloud_rate_per_task_fixed_no_sharing": true,
+    "rsu_backhaul_added": false,
+    "edge_mode": "BANDWIDTH_DEPENDENT_NOISE_V1",
+    "ground_bandwidth_hz": 10000000.0,
+    "uav_bandwidth_hz": 10000000.0,
+    "noise_psd_dbm_per_hz": -174.0,
+    "receiver_nf_db": 9.0
+  },
+  "branches": {
+    "A_HISTORICAL": {
+      "name": "A_HISTORICAL",
+      "rate_bps": 200000000.0,
+      "psi": 15.0
+    },
+    "B_EQUAL_SHARE": {
+      "name": "B_EQUAL_SHARE",
+      "rate_bps": 1633066.7164444982,
+      "psi": 1.0681932194051897
+    }
+  },
+  "summary_interface_fixed": true,
+  "in_memory_adapter_required": false,
+  "summary_interface_fix": {
+    "cloud_target": "exact equality to task_allocation.CLOUD",
+    "edge_target_classification": "current cache node IDs and roles",
+    "removed_stale_references": [
+      "is_cloud_target",
+      "cloud_access_rsu_id",
+      "cloud_access_model",
+      "Cloud RSU access/backhaul result fields"
+    ],
+    "matching_or_kkt_changed": false,
+    "resource_feasible_exposed": true
+  },
+  "planned_state_count": 12,
+  "planned_slot_execution_count": 24,
+  "states": [
+    {
+      "episode_id": 20001,
+      "slot": 0,
+      "origin_index": 0,
+      "time_s": 100.0,
+      "task_count": 12,
+      "vehicles_with_positions": 17,
+      "initial_cache_uav_sha256": "8a392cc3ffa0f5dd77c548fe69806572954e15554ae6c5b8e619f9ef5b152507",
+      "source_tasks_vehicle_positions_sha256": "08771058af6cad3fbeb2a1165d4cf0f33c071a8ca93dc73cbb4a7b02f41a0a8c",
+      "state_input_sha256": null,
+      "same_input_state_both_branches": true,
+      "status": "PASS",
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_ghz": 40.0,
+            "cloud_resource_mode": "finite_pool",
+            "cloud_competition_mode": "RESOURCE_AWARE_FALLBACK"
+          },
+          "elapsed_seconds": 8.796572299994295,
+          "profile_seconds": {
+            "config_seconds": 0.00029739999445155263,
+            "matching_kkt_seconds": 8.794836299988674
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 1,
+            "UAV": 2,
+            "Cloud": 9
+          },
+          "cloud_fraction": 0.75,
+          "target_mapping": {
+            "1": "CLOUD",
+            "7": "UAV_0",
+            "15": "CLOUD",
+            "25": "CLOUD",
+            "31": "CLOUD",
+            "33": "UAV_1",
+            "36": "CLOUD",
+            "37": "CLOUD",
+            "44": "CLOUD",
+            "45": "RSU_0",
+            "50": "CLOUD",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_0": 1.0,
+              "UAV_1": 1.0,
+              "CLOUD": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 179,
+            "kkt_converged_count": 179,
+            "kkt_finite_count": 179,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.954259638789154e-13,
+            "kkt_stationarity_residual_max": 4.440892098500626e-16,
+            "kkt_complementary_slackness_residual_max": 1.5267954802581296e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": null,
+            "max_updates_reached": false,
+            "candidate_evaluations": 175
+          },
+          "metrics": {
+            "task_utility_q": 11.510739280108526,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 11.510739280108526,
+            "total_task_delay_s": 22.014800005870107,
+            "mean_task_delay_s": 1.834566667155842,
+            "max_task_delay_s": 2.4982238228735203,
+            "total_vehicle_energy_j": 0.4441698321095574,
+            "mean_vehicle_energy_j": 0.03701415267579645,
+            "tasks_delay_above_1s": 12,
+            "fraction_delay_above_1s": 1.0,
+            "negative_task_utility_count": 0,
+            "min_task_utility": 0.9298038226969755,
+            "max_task_utility": 0.9764899205023414,
+            "cloud_task_count": 9,
+            "cloud_mean_communication_delay_s": 0.6610295307580543,
+            "cloud_total_communication_delay_s": 5.949265776822489,
+            "cloud_mean_vehicle_tx_energy_j": 0.008792848745491195,
+            "cloud_total_vehicle_tx_energy_j": 0.07913563870942075,
+            "cloud_formula_max_delay_error_s": 0.0,
+            "cloud_formula_max_energy_error_j": 0.0,
+            "reward_identity_pass": true,
+            "finite": true,
+            "mean_per_task_utility": 0.9592282733423771,
+            "mean_per_task_reward": 0.9592282733423771
+          },
+          "source_detail": "B3-10F official Matching/KKT result; current summary-path rerun separately reproduced Q, Cloud fraction, and vehicle energy"
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_ghz": 40.0,
+            "cloud_resource_mode": "finite_pool",
+            "cloud_competition_mode": "RESOURCE_AWARE_FALLBACK"
+          },
+          "elapsed_seconds": 6.32811479998054,
+          "profile_seconds": {
+            "config_seconds": 0.0002719000040087849,
+            "matching_kkt_seconds": 6.326737700001104
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 2,
+            "RSU": 2,
+            "UAV": 6,
+            "Cloud": 2
+          },
+          "cloud_fraction": 0.16666666666666666,
+          "target_mapping": {
+            "1": "10",
+            "7": "RSU_0",
+            "15": "UAV_0",
+            "25": "CLOUD",
+            "31": "UAV_0",
+            "33": "UAV_1",
+            "36": "59",
+            "37": "UAV_1",
+            "44": "UAV_1",
+            "45": "RSU_0",
+            "50": "UAV_0",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_0": 1.0000000000009306,
+              "10": 1.0,
+              "59": 1.0,
+              "RSU_0": 0.9999999999995761,
+              "UAV_1": 1.0000000000003038,
+              "CLOUD": 0.9999999999995667
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_0": 1.0000000000003966,
+              "10": 1.0,
+              "59": 1.0,
+              "RSU_0": 0.9999999999991013,
+              "UAV_1": 1.0000000000005662
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.982666,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 105,
+            "kkt_converged_count": 105,
+            "kkt_finite_count": 105,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.78106484694763e-13,
+            "kkt_stationarity_residual_max": 4.440892098500626e-16,
+            "kkt_complementary_slackness_residual_max": 1.5267954802581296e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": null,
+            "max_updates_reached": false,
+            "candidate_evaluations": 111
+          },
+          "metrics": {
+            "task_utility_q": 10.498036908636571,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 10.498036908636571,
+            "total_task_delay_s": 52.27160106919858,
+            "mean_task_delay_s": 4.355966755766549,
+            "max_task_delay_s": 7.586203536429503,
+            "total_vehicle_energy_j": 3.6601611510078,
+            "mean_vehicle_energy_j": 0.30501342925064995,
+            "tasks_delay_above_1s": 12,
+            "fraction_delay_above_1s": 1.0,
+            "negative_task_utility_count": 0,
+            "min_task_utility": 0.6721161706030249,
+            "max_task_utility": 0.9298958591303239,
+            "cloud_task_count": 2,
+            "cloud_mean_communication_delay_s": 5.024110956490757,
+            "cloud_total_communication_delay_s": 10.048221912981514,
+            "cloud_mean_vehicle_tx_energy_j": 0.9384462544563416,
+            "cloud_total_vehicle_tx_energy_j": 1.876892508912683,
+            "cloud_formula_max_delay_error_s": 0.0,
+            "cloud_formula_max_energy_error_j": 0.0,
+            "reward_identity_pass": true,
+            "finite": true,
+            "mean_per_task_utility": 0.8748364090530476,
+            "mean_per_task_reward": 0.8748364090530476
+          },
+          "source_detail": "B3-10F official Matching/KKT result; current summary-path rerun separately reproduced Q, Cloud fraction, and vehicle energy"
+        }
+      ],
+      "new_summary_path_probe": {
+        "completed": true,
+        "step_result_returned": true,
+        "A_Q": 11.510739280108526,
+        "A_cloud_fraction": 0.75,
+        "A_vehicle_energy_j": 0.4441698321095574,
+        "B_Q": 10.498036908636571,
+        "B_cloud_fraction": 0.16666666666666666,
+        "B_vehicle_energy_j": 3.6601611510078
+      },
+      "delta": {
+        "delta_Q": -1.0127023714719545,
+        "delta_G": -1.0127023714719545,
+        "delta_total_delay_s": 30.256801063328474,
+        "delta_total_vehicle_energy_j": 3.2159913188982427,
+        "delta_cloud_fraction": -0.5833333333333334,
+        "changed_target_count": 8,
+        "mean_delta_Q_per_task": -0.08439186428932954,
+        "mean_delta_G_per_task": -0.08439186428932954,
+        "mean_delta_delay_s_per_task": 2.521400088610707,
+        "mean_delta_energy_j_per_task": 0.2679992765748535
+      }
+    },
+    {
+      "episode_id": 20001,
+      "slot": 100,
+      "origin_index": 100,
+      "time_s": 200.0,
+      "task_count": 15,
+      "vehicles_with_positions": 20,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "8f7b3acafe48952762c3ccca42b3b0e92bf87dc81c339642380d2038b33da9c8",
+      "cache_node_ids": [
+        "46",
+        "10",
+        "0",
+        "23",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 5.723240000021178,
+          "profile_seconds": {
+            "config_seconds": 0.00028559999191202223,
+            "matching_kkt_seconds": 5.72188830000232
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 0,
+            "UAV": 2,
+            "Cloud": 13
+          },
+          "cloud_fraction": 0.8666666666666667,
+          "target_mapping": {
+            "1": "CLOUD",
+            "7": "CLOUD",
+            "12": "CLOUD",
+            "15": "CLOUD",
+            "16": "CLOUD",
+            "22": "UAV_1",
+            "27": "CLOUD",
+            "30": "UAV_0",
+            "33": "CLOUD",
+            "34": "CLOUD",
+            "36": "CLOUD",
+            "42": "CLOUD",
+            "45": "CLOUD",
+            "50": "CLOUD",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.99268,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 103,
+            "kkt_converged_count": 103,
+            "kkt_finite_count": 103,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.512390874988341e-13,
+            "kkt_stationarity_residual_max": 1.6653345369377348e-16,
+            "kkt_complementary_slackness_residual_max": 4.425482335923444e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 9,
+            "max_updates_reached": false,
+            "candidate_evaluations": 86
+          },
+          "metrics": {
+            "task_utility_q": 14.240766292976671,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 14.240766292976671,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 36.31020430081718,
+            "mean_task_delay_s": 2.4206802867211454,
+            "max_task_delay_s": 3.731512782759846,
+            "total_vehicle_energy_j": 0.36710884240155434,
+            "mean_vehicle_energy_j": 0.02447392282677029,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 15,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.9493844195317782,
+            "mean_per_task_reward": 0.9493844195317781,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 3.0262109999894165,
+          "profile_seconds": {
+            "config_seconds": 0.00026649999199435115,
+            "matching_kkt_seconds": 3.0250629000074696
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 2,
+            "RSU": 0,
+            "UAV": 5,
+            "Cloud": 8
+          },
+          "cloud_fraction": 0.5333333333333333,
+          "target_mapping": {
+            "1": "CLOUD",
+            "7": "CLOUD",
+            "12": "CLOUD",
+            "15": "23",
+            "16": "UAV_0",
+            "22": "UAV_1",
+            "27": "CLOUD",
+            "30": "UAV_0",
+            "33": "CLOUD",
+            "34": "UAV_1",
+            "36": "UAV_1",
+            "42": "CLOUD",
+            "45": "59",
+            "50": "CLOUD",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 0.9999999999996718,
+              "UAV_0": 1.00000000000053,
+              "59": 1.0,
+              "23": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 1.000000000000258,
+              "UAV_0": 0.9999999999997711,
+              "59": 1.0,
+              "23": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 77,
+            "kkt_converged_count": 77,
+            "kkt_finite_count": 77,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.92761428619815e-13,
+            "kkt_stationarity_residual_max": 1.5265566588595902e-16,
+            "kkt_complementary_slackness_residual_max": 4.659282039660887e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 9,
+            "max_updates_reached": false,
+            "candidate_evaluations": 76
+          },
+          "metrics": {
+            "task_utility_q": 12.195076616343572,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 12.195076616343572,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 84.0166092875109,
+            "mean_task_delay_s": 5.60110728583406,
+            "max_task_delay_s": 11.036122700831072,
+            "total_vehicle_energy_j": 8.87549778445842,
+            "mean_vehicle_energy_j": 0.591699852297228,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 15,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.8130051077562381,
+            "mean_per_task_reward": 0.8130051077562381,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -2.045689676633099,
+        "delta_G": -2.045689676633099,
+        "delta_total_delay_s": 47.70640498669372,
+        "delta_total_vehicle_energy_j": 8.508388942056865,
+        "delta_cloud_fraction": -0.33333333333333337,
+        "changed_target_count": 5,
+        "mean_delta_Q_per_task": -0.13637931177553994,
+        "mean_delta_G_per_task": -0.13637931177553994,
+        "mean_delta_delay_s_per_task": 3.180426999112915,
+        "mean_delta_energy_j_per_task": 0.5672259294704577
+      }
+    },
+    {
+      "episode_id": 20001,
+      "slot": 200,
+      "origin_index": 200,
+      "time_s": 300.0,
+      "task_count": 12,
+      "vehicles_with_positions": 17,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "4427d4878f68ebf02d664c6fc080c93516db462b6a5ce1f0737b2133d57c42d0",
+      "cache_node_ids": [
+        "46",
+        "10",
+        "0",
+        "23",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 1.0428888000024017,
+          "profile_seconds": {
+            "config_seconds": 0.0002626000205054879,
+            "matching_kkt_seconds": 1.0417772000073455
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 1,
+            "UAV": 2,
+            "Cloud": 9
+          },
+          "cloud_fraction": 0.75,
+          "target_mapping": {
+            "12": "RSU_0",
+            "16": "UAV_0",
+            "25": "CLOUD",
+            "27": "CLOUD",
+            "31": "CLOUD",
+            "34": "CLOUD",
+            "36": "CLOUD",
+            "37": "CLOUD",
+            "42": "CLOUD",
+            "44": "CLOUD",
+            "50": "UAV_1",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.97556,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 49,
+            "kkt_converged_count": 49,
+            "kkt_finite_count": 49,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.731104810839497e-13,
+            "kkt_stationarity_residual_max": 5.551115123125783e-17,
+            "kkt_complementary_slackness_residual_max": 1.5943501742149536e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 5,
+            "max_updates_reached": false,
+            "candidate_evaluations": 46
+          },
+          "metrics": {
+            "task_utility_q": 11.602562317301384,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 11.602562317301384,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 18.662544202090302,
+            "mean_task_delay_s": 1.5552120168408585,
+            "max_task_delay_s": 2.8064723334297126,
+            "total_vehicle_energy_j": 0.2438965916526628,
+            "mean_vehicle_energy_j": 0.020324715971055233,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 9,
+            "fraction_delay_above_1s": 0.75,
+            "mean_per_task_utility": 0.9668801931084486,
+            "mean_per_task_reward": 0.9668801931084486,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 0.8389040999754798,
+          "profile_seconds": {
+            "config_seconds": 0.0003819999983534217,
+            "matching_kkt_seconds": 0.8377723000012338
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 1,
+            "RSU": 1,
+            "UAV": 4,
+            "Cloud": 6
+          },
+          "cloud_fraction": 0.5,
+          "target_mapping": {
+            "12": "RSU_0",
+            "16": "UAV_0",
+            "25": "CLOUD",
+            "27": "CLOUD",
+            "31": "CLOUD",
+            "34": "UAV_1",
+            "36": "46",
+            "37": "UAV_1",
+            "42": "CLOUD",
+            "44": "CLOUD",
+            "50": "UAV_0",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "46": 1.0,
+              "UAV_1": 0.9999999999997293,
+              "UAV_0": 0.9999999999992673
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "46": 1.0,
+              "UAV_1": 0.9999999999999141,
+              "UAV_0": 1.0000000000003841
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.976234,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 26,
+            "kkt_converged_count": 26,
+            "kkt_finite_count": 26,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.376943665984072e-13,
+            "kkt_stationarity_residual_max": 5.551115123125783e-17,
+            "kkt_complementary_slackness_residual_max": 2.709674495878485e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 3,
+            "max_updates_reached": false,
+            "candidate_evaluations": 15
+          },
+          "metrics": {
+            "task_utility_q": 10.223122892584033,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 10.223122892584033,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 50.95201226463206,
+            "mean_task_delay_s": 4.246001022052671,
+            "max_task_delay_s": 7.805495980341636,
+            "total_vehicle_energy_j": 5.963183801606198,
+            "mean_vehicle_energy_j": 0.4969319834671832,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 11,
+            "fraction_delay_above_1s": 0.9166666666666666,
+            "mean_per_task_utility": 0.8519269077153361,
+            "mean_per_task_reward": 0.8519269077153361,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.3794394247173507,
+        "delta_G": -1.3794394247173507,
+        "delta_total_delay_s": 32.28946806254176,
+        "delta_total_vehicle_energy_j": 5.719287209953535,
+        "delta_cloud_fraction": -0.25,
+        "changed_target_count": 4,
+        "mean_delta_Q_per_task": -0.11495328539311256,
+        "mean_delta_G_per_task": -0.11495328539311256,
+        "mean_delta_delay_s_per_task": 2.690789005211813,
+        "mean_delta_energy_j_per_task": 0.476607267496128
+      }
+    },
+    {
+      "episode_id": 20100,
+      "slot": 0,
+      "origin_index": 0,
+      "time_s": 100.0,
+      "task_count": 12,
+      "vehicles_with_positions": 17,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "1cd21cbd65f22d095e9b4dc78e802816fcf9cab48b97a67a81c90ef69416515c",
+      "cache_node_ids": [
+        "22",
+        "54",
+        "17",
+        "45",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 0.6277040999848396,
+          "profile_seconds": {
+            "config_seconds": 0.00025069998810067773,
+            "matching_kkt_seconds": 0.626632100000279
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 0,
+            "UAV": 2,
+            "Cloud": 10
+          },
+          "cloud_fraction": 0.8333333333333334,
+          "target_mapping": {
+            "1": "UAV_0",
+            "11": "CLOUD",
+            "12": "CLOUD",
+            "14": "CLOUD",
+            "15": "CLOUD",
+            "20": "CLOUD",
+            "34": "CLOUD",
+            "38": "CLOUD",
+            "39": "UAV_1",
+            "41": "CLOUD",
+            "44": "CLOUD",
+            "52": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 1.0,
+              "UAV_0": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 1.0,
+              "UAV_0": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.989395,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 30,
+            "kkt_converged_count": 30,
+            "kkt_finite_count": 30,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 7.915890165577366e-13,
+            "kkt_stationarity_residual_max": 1.1102230246251565e-16,
+            "kkt_complementary_slackness_residual_max": 2.992852733973486e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 3,
+            "max_updates_reached": false,
+            "candidate_evaluations": 33
+          },
+          "metrics": {
+            "task_utility_q": 11.56195857993255,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 11.56195857993255,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 21.135114267819382,
+            "mean_task_delay_s": 1.7612595223182819,
+            "max_task_delay_s": 2.5011725360385846,
+            "total_vehicle_energy_j": 0.18392389918386834,
+            "mean_vehicle_energy_j": 0.015326991598655694,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 12,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.9634965483277126,
+            "mean_per_task_reward": 0.9634965483277126,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 0.8183296000061091,
+          "profile_seconds": {
+            "config_seconds": 0.0002491999766789377,
+            "matching_kkt_seconds": 0.8173416999925394
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 1,
+            "RSU": 0,
+            "UAV": 3,
+            "Cloud": 8
+          },
+          "cloud_fraction": 0.6666666666666666,
+          "target_mapping": {
+            "1": "UAV_0",
+            "11": "CLOUD",
+            "12": "UAV_1",
+            "14": "CLOUD",
+            "15": "CLOUD",
+            "20": "CLOUD",
+            "34": "CLOUD",
+            "38": "CLOUD",
+            "39": "UAV_1",
+            "41": "22",
+            "44": "CLOUD",
+            "52": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "22": 1.0,
+              "UAV_1": 1.000000000000007,
+              "UAV_0": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "22": 1.0,
+              "UAV_1": 0.9999999999992504,
+              "UAV_0": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 20,
+            "kkt_converged_count": 20,
+            "kkt_finite_count": 20,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 6.680211939169567e-13,
+            "kkt_stationarity_residual_max": 6.938893903907228e-17,
+            "kkt_complementary_slackness_residual_max": 2.992852733973486e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 2,
+            "max_updates_reached": false,
+            "candidate_evaluations": 9
+          },
+          "metrics": {
+            "task_utility_q": 10.002439921276608,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 10.002439921276608,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 56.422260867762105,
+            "mean_task_delay_s": 4.701855072313509,
+            "max_task_delay_s": 7.421629352567642,
+            "total_vehicle_energy_j": 6.832470374788701,
+            "mean_vehicle_energy_j": 0.5693725312323917,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 12,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.8335366601063839,
+            "mean_per_task_reward": 0.8335366601063839,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.5595186586559429,
+        "delta_G": -1.5595186586559429,
+        "delta_total_delay_s": 35.28714659994272,
+        "delta_total_vehicle_energy_j": 6.6485464756048325,
+        "delta_cloud_fraction": -0.16666666666666674,
+        "changed_target_count": 2,
+        "mean_delta_Q_per_task": -0.12995988822132856,
+        "mean_delta_G_per_task": -0.12995988822132856,
+        "mean_delta_delay_s_per_task": 2.940595549995227,
+        "mean_delta_energy_j_per_task": 0.554045539633736
+      }
+    },
+    {
+      "episode_id": 20100,
+      "slot": 100,
+      "origin_index": 100,
+      "time_s": 200.0,
+      "task_count": 12,
+      "vehicles_with_positions": 17,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "cca2ac8fbd47888b28325e4440b72e934c1fd01ef1e03f04fe69ce228e15e8a6",
+      "cache_node_ids": [
+        "22",
+        "54",
+        "17",
+        "45",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 1.215023700002348,
+          "profile_seconds": {
+            "config_seconds": 0.0002496000088285655,
+            "matching_kkt_seconds": 1.2139560999930836
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 1,
+            "UAV": 2,
+            "Cloud": 9
+          },
+          "cloud_fraction": 0.75,
+          "target_mapping": {
+            "1": "CLOUD",
+            "7": "RSU_0",
+            "11": "CLOUD",
+            "12": "CLOUD",
+            "14": "UAV_0",
+            "34": "CLOUD",
+            "36": "CLOUD",
+            "37": "CLOUD",
+            "39": "CLOUD",
+            "41": "CLOUD",
+            "46": "UAV_1",
+            "52": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_1": 1.0,
+              "UAV_0": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_1": 1.0,
+              "UAV_0": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.972015,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 62,
+            "kkt_converged_count": 62,
+            "kkt_finite_count": 62,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.976464099281657e-13,
+            "kkt_stationarity_residual_max": 1.249000902703301e-16,
+            "kkt_complementary_slackness_residual_max": 8.549496541253362e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 6,
+            "max_updates_reached": false,
+            "candidate_evaluations": 52
+          },
+          "metrics": {
+            "task_utility_q": 11.54990537309947,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 11.54990537309947,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 21.303272391351843,
+            "mean_task_delay_s": 1.7752726992793202,
+            "max_task_delay_s": 2.4652593643876983,
+            "total_vehicle_energy_j": 0.2509945539778976,
+            "mean_vehicle_energy_j": 0.020916212831491466,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 11,
+            "fraction_delay_above_1s": 0.9166666666666666,
+            "mean_per_task_utility": 0.9624921144249557,
+            "mean_per_task_reward": 0.9624921144249559,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 1.6192559000046458,
+          "profile_seconds": {
+            "config_seconds": 0.0002480999974068254,
+            "matching_kkt_seconds": 1.618174800009001
+          },
+          "task_count": 12,
+          "assigned_task_count": 12,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 1,
+            "RSU": 2,
+            "UAV": 4,
+            "Cloud": 5
+          },
+          "cloud_fraction": 0.4166666666666667,
+          "target_mapping": {
+            "1": "UAV_1",
+            "7": "RSU_0",
+            "11": "22",
+            "12": "CLOUD",
+            "14": "UAV_0",
+            "34": "CLOUD",
+            "36": "CLOUD",
+            "37": "UAV_0",
+            "39": "CLOUD",
+            "41": "RSU_1",
+            "46": "UAV_1",
+            "52": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "22": 1.0,
+              "UAV_1": 1.0000000000006795,
+              "UAV_0": 0.9999999999995886,
+              "RSU_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "22": 1.0,
+              "UAV_1": 1.0000000000000209,
+              "UAV_0": 0.9999999999991662,
+              "RSU_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.98767,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 38,
+            "kkt_converged_count": 38,
+            "kkt_finite_count": 38,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.976464099281657e-13,
+            "kkt_stationarity_residual_max": 1.249000902703301e-16,
+            "kkt_complementary_slackness_residual_max": 8.549496541253362e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 5,
+            "max_updates_reached": false,
+            "candidate_evaluations": 22
+          },
+          "metrics": {
+            "task_utility_q": 10.336516329229113,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 10.336516329229113,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 48.65075120369553,
+            "mean_task_delay_s": 4.054229266974628,
+            "max_task_delay_s": 6.260505634842549,
+            "total_vehicle_energy_j": 5.440091488510023,
+            "mean_vehicle_energy_j": 0.4533409573758353,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 11,
+            "fraction_delay_above_1s": 0.9166666666666666,
+            "mean_per_task_utility": 0.8613763607690927,
+            "mean_per_task_reward": 0.8613763607690927,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.2133890438703574,
+        "delta_G": -1.2133890438703574,
+        "delta_total_delay_s": 27.347478812343684,
+        "delta_total_vehicle_energy_j": 5.189096934532126,
+        "delta_cloud_fraction": -0.3333333333333333,
+        "changed_target_count": 4,
+        "mean_delta_Q_per_task": -0.10111575365586312,
+        "mean_delta_G_per_task": -0.10111575365586312,
+        "mean_delta_delay_s_per_task": 2.2789565676953076,
+        "mean_delta_energy_j_per_task": 0.4324247445443438
+      }
+    },
+    {
+      "episode_id": 20100,
+      "slot": 200,
+      "origin_index": 200,
+      "time_s": 300.0,
+      "task_count": 13,
+      "vehicles_with_positions": 18,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "bd62ff1a68a78245fb9408705a1dcb6585a2e4f1143c471ae3689b3097068004",
+      "cache_node_ids": [
+        "22",
+        "54",
+        "17",
+        "45",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 1.3981505999981891,
+          "profile_seconds": {
+            "config_seconds": 0.0002488000027369708,
+            "matching_kkt_seconds": 1.397057499998482
+          },
+          "task_count": 13,
+          "assigned_task_count": 13,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 0,
+            "UAV": 1,
+            "Cloud": 12
+          },
+          "cloud_fraction": 0.9230769230769231,
+          "target_mapping": {
+            "1": "CLOUD",
+            "7": "CLOUD",
+            "11": "CLOUD",
+            "12": "CLOUD",
+            "14": "CLOUD",
+            "15": "CLOUD",
+            "20": "CLOUD",
+            "34": "CLOUD",
+            "36": "CLOUD",
+            "40": "CLOUD",
+            "41": "CLOUD",
+            "46": "UAV_1",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 44,
+            "kkt_converged_count": 44,
+            "kkt_finite_count": 44,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.083844787483031e-13,
+            "kkt_stationarity_residual_max": 4.996003610813204e-16,
+            "kkt_complementary_slackness_residual_max": 7.515228653282578e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 6,
+            "max_updates_reached": false,
+            "candidate_evaluations": 33
+          },
+          "metrics": {
+            "task_utility_q": 12.38248888410167,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 12.38248888410167,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 30.086746917578786,
+            "mean_task_delay_s": 2.3143651475060603,
+            "max_task_delay_s": 3.3294900856631617,
+            "total_vehicle_energy_j": 0.21542266456655884,
+            "mean_vehicle_energy_j": 0.016570974197427604,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 13,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.9524991449308978,
+            "mean_per_task_reward": 0.9524991449308977,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 1.3963749000104144,
+          "profile_seconds": {
+            "config_seconds": 0.00024980001035146415,
+            "matching_kkt_seconds": 1.3953952000010759
+          },
+          "task_count": 13,
+          "assigned_task_count": 13,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 1,
+            "RSU": 0,
+            "UAV": 2,
+            "Cloud": 10
+          },
+          "cloud_fraction": 0.7692307692307693,
+          "target_mapping": {
+            "1": "CLOUD",
+            "7": "CLOUD",
+            "11": "CLOUD",
+            "12": "CLOUD",
+            "14": "CLOUD",
+            "15": "UAV_1",
+            "20": "CLOUD",
+            "34": "CLOUD",
+            "36": "CLOUD",
+            "40": "CLOUD",
+            "41": "22",
+            "46": "UAV_1",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 0.9999999999991833,
+              "22": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 1.0000000000004492,
+              "22": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.995384,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 37,
+            "kkt_converged_count": 37,
+            "kkt_finite_count": 37,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 8.411049634560186e-13,
+            "kkt_stationarity_residual_max": 4.996003610813204e-16,
+            "kkt_complementary_slackness_residual_max": 7.515228653282578e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 5,
+            "max_updates_reached": false,
+            "candidate_evaluations": 24
+          },
+          "metrics": {
+            "task_utility_q": 9.94550455690015,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 9.94550455690015,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 82.6489919017105,
+            "mean_task_delay_s": 6.357614761670039,
+            "max_task_delay_s": 9.7462464963772,
+            "total_vehicle_energy_j": 10.991675118976124,
+            "mean_vehicle_energy_j": 0.8455134706904711,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 13,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.7650388120692424,
+            "mean_per_task_reward": 0.7650388120692424,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -2.43698432720152,
+        "delta_G": -2.43698432720152,
+        "delta_total_delay_s": 52.562244984131716,
+        "delta_total_vehicle_energy_j": 10.776252454409565,
+        "delta_cloud_fraction": -0.15384615384615385,
+        "changed_target_count": 2,
+        "mean_delta_Q_per_task": -0.18746033286165537,
+        "mean_delta_G_per_task": -0.18746033286165537,
+        "mean_delta_delay_s_per_task": 4.043249614163979,
+        "mean_delta_energy_j_per_task": 0.8289424964930435
+      }
+    },
+    {
+      "episode_id": 20200,
+      "slot": 0,
+      "origin_index": 0,
+      "time_s": 100.0,
+      "task_count": 15,
+      "vehicles_with_positions": 20,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "f6736d20bb53bbbc88b5c304340fe4d564df9dffedae0fc71cfcc9036ef159be",
+      "cache_node_ids": [
+        "57",
+        "43",
+        "48",
+        "58",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 12.33728350000456,
+          "profile_seconds": {
+            "config_seconds": 0.00023800000781193376,
+            "matching_kkt_seconds": 12.336033799976576
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 0,
+            "UAV": 2,
+            "Cloud": 13
+          },
+          "cloud_fraction": 0.8666666666666667,
+          "target_mapping": {
+            "2": "UAV_1",
+            "8": "CLOUD",
+            "11": "CLOUD",
+            "14": "UAV_0",
+            "18": "CLOUD",
+            "20": "CLOUD",
+            "32": "CLOUD",
+            "36": "CLOUD",
+            "37": "CLOUD",
+            "38": "CLOUD",
+            "40": "CLOUD",
+            "41": "CLOUD",
+            "45": "CLOUD",
+            "49": "CLOUD",
+            "56": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 254,
+            "kkt_converged_count": 254,
+            "kkt_finite_count": 254,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.963141422986155e-13,
+            "kkt_stationarity_residual_max": 1.3322676295501878e-15,
+            "kkt_complementary_slackness_residual_max": 4.425582531563923e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 11,
+            "max_updates_reached": false,
+            "candidate_evaluations": 197
+          },
+          "metrics": {
+            "task_utility_q": 14.368527802301239,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 14.368527802301239,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 30.95412984682316,
+            "mean_task_delay_s": 2.0636086564548775,
+            "max_task_delay_s": 3.027629142311683,
+            "total_vehicle_energy_j": 0.1922186670223046,
+            "mean_vehicle_energy_j": 0.012814577801486975,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 14,
+            "fraction_delay_above_1s": 0.9333333333333333,
+            "mean_per_task_utility": 0.9579018534867492,
+            "mean_per_task_reward": 0.9579018534867493,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 13.97038819998852,
+          "profile_seconds": {
+            "config_seconds": 0.0002410999732092023,
+            "matching_kkt_seconds": 13.969387799996184
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 1,
+            "RSU": 0,
+            "UAV": 4,
+            "Cloud": 10
+          },
+          "cloud_fraction": 0.6666666666666666,
+          "target_mapping": {
+            "2": "UAV_1",
+            "8": "CLOUD",
+            "11": "CLOUD",
+            "14": "UAV_0",
+            "18": "UAV_1",
+            "20": "CLOUD",
+            "32": "UAV_1",
+            "36": "CLOUD",
+            "37": "CLOUD",
+            "38": "CLOUD",
+            "40": "CLOUD",
+            "41": "CLOUD",
+            "45": "CLOUD",
+            "49": "58",
+            "56": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 0.9999999999990352,
+              "UAV_0": 1.0,
+              "58": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 0.9999999999999716,
+              "UAV_0": 1.0,
+              "58": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 257,
+            "kkt_converged_count": 257,
+            "kkt_finite_count": 257,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.954259638789154e-13,
+            "kkt_stationarity_residual_max": 1.3322676295501878e-15,
+            "kkt_complementary_slackness_residual_max": 4.425582531563923e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 10,
+            "max_updates_reached": false,
+            "candidate_evaluations": 200
+          },
+          "metrics": {
+            "task_utility_q": 12.467254953880873,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 12.467254953880873,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 74.13686007729873,
+            "mean_task_delay_s": 4.942457338486582,
+            "max_task_delay_s": 8.524253068731861,
+            "total_vehicle_energy_j": 8.273323600242504,
+            "mean_vehicle_energy_j": 0.5515549066828336,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 14,
+            "fraction_delay_above_1s": 0.9333333333333333,
+            "mean_per_task_utility": 0.8311503302587249,
+            "mean_per_task_reward": 0.8311503302587249,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.9012728484203656,
+        "delta_G": -1.9012728484203656,
+        "delta_total_delay_s": 43.18273023047557,
+        "delta_total_vehicle_energy_j": 8.0811049332202,
+        "delta_cloud_fraction": -0.20000000000000007,
+        "changed_target_count": 3,
+        "mean_delta_Q_per_task": -0.12675152322802438,
+        "mean_delta_G_per_task": -0.12675152322802438,
+        "mean_delta_delay_s_per_task": 2.8788486820317045,
+        "mean_delta_energy_j_per_task": 0.5387403288813466
+      }
+    },
+    {
+      "episode_id": 20200,
+      "slot": 100,
+      "origin_index": 100,
+      "time_s": 200.0,
+      "task_count": 15,
+      "vehicles_with_positions": 20,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "76aedbb1a45d3425f9b55c719d9300751677858172328e9d46b319c862a9027a",
+      "cache_node_ids": [
+        "57",
+        "43",
+        "48",
+        "58",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 4.811811099993065,
+          "profile_seconds": {
+            "config_seconds": 0.0002445999998599291,
+            "matching_kkt_seconds": 4.810694399988279
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 1,
+            "UAV": 2,
+            "Cloud": 12
+          },
+          "cloud_fraction": 0.8,
+          "target_mapping": {
+            "2": "CLOUD",
+            "8": "UAV_1",
+            "11": "CLOUD",
+            "14": "CLOUD",
+            "18": "CLOUD",
+            "20": "CLOUD",
+            "28": "CLOUD",
+            "32": "CLOUD",
+            "36": "CLOUD",
+            "37": "CLOUD",
+            "38": "CLOUD",
+            "45": "RSU_0",
+            "49": "CLOUD",
+            "50": "CLOUD",
+            "56": "UAV_0"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0,
+              "RSU_0": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0,
+              "RSU_0": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.98334,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 170,
+            "kkt_converged_count": 170,
+            "kkt_finite_count": 170,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.990896998601784e-13,
+            "kkt_stationarity_residual_max": 4.440892098500626e-16,
+            "kkt_complementary_slackness_residual_max": 1.5927410868690346e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 10,
+            "max_updates_reached": false,
+            "candidate_evaluations": 163
+          },
+          "metrics": {
+            "task_utility_q": 14.293123400683301,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 14.293123400683301,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 34.080235441999065,
+            "mean_task_delay_s": 2.272015696133271,
+            "max_task_delay_s": 3.2631413659189685,
+            "total_vehicle_energy_j": 0.30069290240142765,
+            "mean_vehicle_energy_j": 0.02004619349342851,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 15,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.9528748933788866,
+            "mean_per_task_reward": 0.9528748933788868,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 5.991001799993683,
+          "profile_seconds": {
+            "config_seconds": 0.0002429000160191208,
+            "matching_kkt_seconds": 5.990002200007439
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 3,
+            "RSU": 3,
+            "UAV": 5,
+            "Cloud": 4
+          },
+          "cloud_fraction": 0.26666666666666666,
+          "target_mapping": {
+            "2": "UAV_1",
+            "8": "RSU_1",
+            "11": "CLOUD",
+            "14": "58",
+            "18": "CLOUD",
+            "20": "RSU_0",
+            "28": "CLOUD",
+            "32": "48",
+            "36": "UAV_1",
+            "37": "CLOUD",
+            "38": "UAV_1",
+            "45": "RSU_0",
+            "49": "UAV_0",
+            "50": "57",
+            "56": "UAV_0"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "RSU_0": 1.0000000000002196,
+              "48": 1.0,
+              "58": 1.0,
+              "57": 1.0,
+              "UAV_0": 0.999999999999662,
+              "RSU_1": 1.0,
+              "UAV_1": 0.9999999999997502
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "RSU_0": 1.0000000000007956,
+              "48": 1.0,
+              "58": 1.0,
+              "57": 1.0,
+              "UAV_0": 0.9999999999995309,
+              "RSU_1": 1.0,
+              "UAV_1": 1.0000000000001412
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 91,
+            "kkt_converged_count": 91,
+            "kkt_finite_count": 91,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.990896998601784e-13,
+            "kkt_stationarity_residual_max": 4.440892098500626e-16,
+            "kkt_complementary_slackness_residual_max": 1.5927410868690346e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 7,
+            "max_updates_reached": false,
+            "candidate_evaluations": 76
+          },
+          "metrics": {
+            "task_utility_q": 12.655029825661705,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 12.655029825661705,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 76.1714966678633,
+            "mean_task_delay_s": 5.078099777857553,
+            "max_task_delay_s": 8.315693987509542,
+            "total_vehicle_energy_j": 6.530289671067776,
+            "mean_vehicle_energy_j": 0.43535264473785174,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 15,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.8436686550441136,
+            "mean_per_task_reward": 0.8436686550441137,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.6380935750215961,
+        "delta_G": -1.6380935750215961,
+        "delta_total_delay_s": 42.09126122586423,
+        "delta_total_vehicle_energy_j": 6.229596768666348,
+        "delta_cloud_fraction": -0.5333333333333334,
+        "changed_target_count": 9,
+        "mean_delta_Q_per_task": -0.10920623833477308,
+        "mean_delta_G_per_task": -0.10920623833477308,
+        "mean_delta_delay_s_per_task": 2.8060840817242823,
+        "mean_delta_energy_j_per_task": 0.4153064512444232
+      }
+    },
+    {
+      "episode_id": 20200,
+      "slot": 200,
+      "origin_index": 200,
+      "time_s": 300.0,
+      "task_count": 14,
+      "vehicles_with_positions": 19,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "ce20c83cbfc4a0924b0effaaccc833ed9ea7ec9e5cbc841761b0597bfc10d176",
+      "cache_node_ids": [
+        "57",
+        "43",
+        "48",
+        "58",
+        "59",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 6.808756900019944,
+          "profile_seconds": {
+            "config_seconds": 0.00024279998615384102,
+            "matching_kkt_seconds": 6.807694899995113
+          },
+          "task_count": 14,
+          "assigned_task_count": 14,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 1,
+            "UAV": 1,
+            "Cloud": 12
+          },
+          "cloud_fraction": 0.8571428571428571,
+          "target_mapping": {
+            "2": "CLOUD",
+            "11": "RSU_1",
+            "14": "UAV_1",
+            "18": "CLOUD",
+            "20": "CLOUD",
+            "28": "CLOUD",
+            "32": "CLOUD",
+            "37": "CLOUD",
+            "41": "CLOUD",
+            "44": "CLOUD",
+            "45": "CLOUD",
+            "50": "CLOUD",
+            "53": "CLOUD",
+            "55": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 1.0,
+              "RSU_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 1.0,
+              "RSU_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.993225,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 175,
+            "kkt_converged_count": 175,
+            "kkt_finite_count": 175,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.969802761133906e-13,
+            "kkt_stationarity_residual_max": 2.4424906541753444e-15,
+            "kkt_complementary_slackness_residual_max": 2.341446360714976e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 10,
+            "max_updates_reached": false,
+            "candidate_evaluations": 153
+          },
+          "metrics": {
+            "task_utility_q": 13.34712426993163,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 13.34712426993163,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 31.006596656795345,
+            "mean_task_delay_s": 2.2147569040568102,
+            "max_task_delay_s": 3.109898279096926,
+            "total_vehicle_energy_j": 0.3482407643897155,
+            "mean_vehicle_energy_j": 0.024874340313551107,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 14,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.9533660192808309,
+            "mean_per_task_reward": 0.9533660192808308,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 9.188529499981087,
+          "profile_seconds": {
+            "config_seconds": 0.00024029999622143805,
+            "matching_kkt_seconds": 9.187544699991122
+          },
+          "task_count": 14,
+          "assigned_task_count": 14,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 3,
+            "RSU": 2,
+            "UAV": 3,
+            "Cloud": 6
+          },
+          "cloud_fraction": 0.42857142857142855,
+          "target_mapping": {
+            "2": "CLOUD",
+            "11": "UAV_0",
+            "14": "RSU_1",
+            "18": "CLOUD",
+            "20": "CLOUD",
+            "28": "CLOUD",
+            "32": "RSU_1",
+            "37": "CLOUD",
+            "41": "CLOUD",
+            "44": "UAV_1",
+            "45": "58",
+            "50": "UAV_1",
+            "53": "57",
+            "55": "48"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "48": 1.0,
+              "57": 1.0,
+              "58": 1.0,
+              "RSU_1": 0.9999999999990501,
+              "UAV_1": 0.9999999999999625
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "48": 1.0,
+              "57": 1.0,
+              "58": 1.0,
+              "RSU_1": 1.0000000000005638,
+              "UAV_1": 1.0000000000002482
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.99816,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 139,
+            "kkt_converged_count": 139,
+            "kkt_finite_count": 139,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.974243653232406e-13,
+            "kkt_stationarity_residual_max": 2.4424906541753444e-15,
+            "kkt_complementary_slackness_residual_max": 2.341446360714976e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 9,
+            "max_updates_reached": false,
+            "candidate_evaluations": 107
+          },
+          "metrics": {
+            "task_utility_q": 11.696770312352056,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 11.696770312352056,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 70.17726149040266,
+            "mean_task_delay_s": 5.012661535028761,
+            "max_task_delay_s": 8.80953342403037,
+            "total_vehicle_energy_j": 7.109807760769682,
+            "mean_vehicle_energy_j": 0.5078434114835487,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 14,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.8354835937394326,
+            "mean_per_task_reward": 0.8354835937394326,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.6503539575795738,
+        "delta_G": -1.6503539575795738,
+        "delta_total_delay_s": 39.17066483360731,
+        "delta_total_vehicle_energy_j": 6.761566996379966,
+        "delta_cloud_fraction": -0.42857142857142855,
+        "changed_target_count": 8,
+        "mean_delta_Q_per_task": -0.11788242554139813,
+        "mean_delta_G_per_task": -0.11788242554139813,
+        "mean_delta_delay_s_per_task": 2.797904630971951,
+        "mean_delta_energy_j_per_task": 0.4829690711699976
+      }
+    },
+    {
+      "episode_id": 20300,
+      "slot": 0,
+      "origin_index": 0,
+      "time_s": 100.0,
+      "task_count": 15,
+      "vehicles_with_positions": 20,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "891e8b56ea3c6f172dff69928d0c4b2f6277907f5f8ba5b0975788d13bebd8f0",
+      "cache_node_ids": [
+        "8",
+        "13",
+        "34",
+        "24",
+        "18",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 7.581590200017672,
+          "profile_seconds": {
+            "config_seconds": 0.00024449999909847975,
+            "matching_kkt_seconds": 7.580522000003839
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 1,
+            "UAV": 1,
+            "Cloud": 13
+          },
+          "cloud_fraction": 0.8666666666666667,
+          "target_mapping": {
+            "1": "CLOUD",
+            "2": "CLOUD",
+            "6": "CLOUD",
+            "7": "CLOUD",
+            "15": "CLOUD",
+            "16": "UAV_0",
+            "25": "CLOUD",
+            "28": "CLOUD",
+            "30": "CLOUD",
+            "35": "RSU_0",
+            "40": "CLOUD",
+            "45": "CLOUD",
+            "47": "CLOUD",
+            "56": "CLOUD",
+            "58": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_0": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "RSU_0": 1.0,
+              "UAV_0": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.996025,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 234,
+            "kkt_converged_count": 234,
+            "kkt_finite_count": 234,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.756639940405876e-13,
+            "kkt_stationarity_residual_max": 4.440892098500626e-16,
+            "kkt_complementary_slackness_residual_max": 1.5110002567230886e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 11,
+            "max_updates_reached": false,
+            "candidate_evaluations": 273
+          },
+          "metrics": {
+            "task_utility_q": 14.301581090861118,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 14.301581090861118,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 33.535985588568074,
+            "mean_task_delay_s": 2.235732372571205,
+            "max_task_delay_s": 2.7963799874496487,
+            "total_vehicle_energy_j": 0.31756776366688566,
+            "mean_vehicle_energy_j": 0.021171184244459042,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 15,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.9534387393907412,
+            "mean_per_task_reward": 0.9534387393907412,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 12.925451199989766,
+          "profile_seconds": {
+            "config_seconds": 0.00023720000172033906,
+            "matching_kkt_seconds": 12.924470600002678
+          },
+          "task_count": 15,
+          "assigned_task_count": 15,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 2,
+            "RSU": 2,
+            "UAV": 4,
+            "Cloud": 7
+          },
+          "cloud_fraction": 0.4666666666666667,
+          "target_mapping": {
+            "1": "CLOUD",
+            "2": "CLOUD",
+            "6": "UAV_0",
+            "7": "CLOUD",
+            "15": "CLOUD",
+            "16": "UAV_1",
+            "25": "13",
+            "28": "UAV_0",
+            "30": "CLOUD",
+            "35": "RSU_0",
+            "40": "18",
+            "45": "CLOUD",
+            "47": "UAV_0",
+            "56": "RSU_0",
+            "58": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 1.0,
+              "RSU_0": 0.9999999999995688,
+              "13": 1.0,
+              "18": 1.0,
+              "UAV_0": 1.0000000000004317
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 1.0,
+              "RSU_0": 1.0000000000001799,
+              "13": 1.0,
+              "18": 1.0,
+              "UAV_0": 0.9999999999990613
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 197,
+            "kkt_converged_count": 197,
+            "kkt_finite_count": 197,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.965361869035405e-13,
+            "kkt_stationarity_residual_max": 4.440892098500626e-16,
+            "kkt_complementary_slackness_residual_max": 1.5110002567230886e-12,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 10,
+            "max_updates_reached": false,
+            "candidate_evaluations": 205
+          },
+          "metrics": {
+            "task_utility_q": 12.476510611998535,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 12.476510611998535,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 74.31998591260877,
+            "mean_task_delay_s": 4.954665727507251,
+            "max_task_delay_s": 9.628421433972479,
+            "total_vehicle_energy_j": 8.174981871148681,
+            "mean_vehicle_energy_j": 0.544998791409912,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 15,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.8317673741332356,
+            "mean_per_task_reward": 0.8317673741332356,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.8250704788625836,
+        "delta_G": -1.8250704788625836,
+        "delta_total_delay_s": 40.7840003240407,
+        "delta_total_vehicle_energy_j": 7.857414107481795,
+        "delta_cloud_fraction": -0.4,
+        "changed_target_count": 7,
+        "mean_delta_Q_per_task": -0.12167136525750558,
+        "mean_delta_G_per_task": -0.12167136525750558,
+        "mean_delta_delay_s_per_task": 2.718933354936046,
+        "mean_delta_energy_j_per_task": 0.523827607165453
+      }
+    },
+    {
+      "episode_id": 20300,
+      "slot": 100,
+      "origin_index": 100,
+      "time_s": 200.0,
+      "task_count": 13,
+      "vehicles_with_positions": 18,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "a6d1e124d15f09a644189710b7638b2def32bb1130f4e47480d53b26ad74adec",
+      "cache_node_ids": [
+        "8",
+        "13",
+        "34",
+        "24",
+        "18",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 2.5553915000054985,
+          "profile_seconds": {
+            "config_seconds": 0.0002504000149201602,
+            "matching_kkt_seconds": 2.5543189000163693
+          },
+          "task_count": 13,
+          "assigned_task_count": 13,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 0,
+            "UAV": 2,
+            "Cloud": 11
+          },
+          "cloud_fraction": 0.8461538461538461,
+          "target_mapping": {
+            "2": "CLOUD",
+            "4": "CLOUD",
+            "6": "CLOUD",
+            "7": "CLOUD",
+            "15": "CLOUD",
+            "16": "CLOUD",
+            "25": "CLOUD",
+            "28": "UAV_1",
+            "30": "CLOUD",
+            "40": "CLOUD",
+            "44": "UAV_0",
+            "45": "CLOUD",
+            "51": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.96119,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 100,
+            "kkt_converged_count": 100,
+            "kkt_finite_count": 100,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.987566329527908e-13,
+            "kkt_stationarity_residual_max": 2.220446049250313e-16,
+            "kkt_complementary_slackness_residual_max": 5.612295860278223e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 8,
+            "max_updates_reached": false,
+            "candidate_evaluations": 99
+          },
+          "metrics": {
+            "task_utility_q": 12.417735017763263,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 12.417735017763263,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 28.108485442731514,
+            "mean_task_delay_s": 2.1621911879024243,
+            "max_task_delay_s": 2.9743669160240502,
+            "total_vehicle_energy_j": 0.24227355952194873,
+            "mean_vehicle_energy_j": 0.01863642765553452,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 13,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.9552103859817895,
+            "mean_per_task_reward": 0.9552103859817895,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 1.5536803000140935,
+          "profile_seconds": {
+            "config_seconds": 0.00023520001559518278,
+            "matching_kkt_seconds": 1.5527224000252318
+          },
+          "task_count": 13,
+          "assigned_task_count": 13,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 3,
+            "RSU": 1,
+            "UAV": 4,
+            "Cloud": 5
+          },
+          "cloud_fraction": 0.38461538461538464,
+          "target_mapping": {
+            "2": "UAV_1",
+            "4": "UAV_1",
+            "6": "CLOUD",
+            "7": "CLOUD",
+            "15": "CLOUD",
+            "16": "UAV_1",
+            "25": "CLOUD",
+            "28": "8",
+            "30": "24",
+            "40": "CLOUD",
+            "44": "UAV_0",
+            "45": "34",
+            "51": "RSU_1"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 1.0000000000008917,
+              "34": 1.0,
+              "RSU_1": 1.0,
+              "UAV_0": 1.0,
+              "24": 1.0,
+              "8": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 0.9999999999996217,
+              "34": 1.0,
+              "RSU_1": 1.0,
+              "UAV_0": 1.0,
+              "24": 1.0,
+              "8": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.976906,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 36,
+            "kkt_converged_count": 36,
+            "kkt_finite_count": 36,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.885425811262394e-13,
+            "kkt_stationarity_residual_max": 2.220446049250313e-16,
+            "kkt_complementary_slackness_residual_max": 5.612295860278223e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 3,
+            "max_updates_reached": false,
+            "candidate_evaluations": 21
+          },
+          "metrics": {
+            "task_utility_q": 10.638820760503153,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 10.638820760503153,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 73.9193151867476,
+            "mean_task_delay_s": 5.686101168211353,
+            "max_task_delay_s": 10.817075035454428,
+            "total_vehicle_energy_j": 6.9922336973099295,
+            "mean_vehicle_energy_j": 0.5378641305623023,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 13,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.8183708277310119,
+            "mean_per_task_reward": 0.8183708277310118,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -1.7789142572601104,
+        "delta_G": -1.7789142572601104,
+        "delta_total_delay_s": 45.81082974401608,
+        "delta_total_vehicle_energy_j": 6.749960137787981,
+        "delta_cloud_fraction": -0.4615384615384615,
+        "changed_target_count": 7,
+        "mean_delta_Q_per_task": -0.13683955825077773,
+        "mean_delta_G_per_task": -0.13683955825077773,
+        "mean_delta_delay_s_per_task": 3.523909980308929,
+        "mean_delta_energy_j_per_task": 0.5192277029067678
+      }
+    },
+    {
+      "episode_id": 20300,
+      "slot": 200,
+      "origin_index": 200,
+      "time_s": 300.0,
+      "task_count": 16,
+      "vehicles_with_positions": 21,
+      "initial_cache_sha256": "2ec5e77e758ff7634c59c71b79de45495787165091a02746f0ffc58430a1094c",
+      "state_input_sha256": "99ad086fe550ed6a1ed68d316f79c4067bca08adc2005d1f92e74a42ad20b58d",
+      "cache_node_ids": [
+        "8",
+        "13",
+        "34",
+        "24",
+        "18",
+        "RSU_0",
+        "RSU_1",
+        "UAV_0",
+        "UAV_1"
+      ],
+      "cache_node_roles": [
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "SV",
+        "RSU",
+        "RSU",
+        "UAV",
+        "UAV"
+      ],
+      "status": "PASS",
+      "same_input_state_both_branches": true,
+      "branches": [
+        {
+          "name": "A_HISTORICAL",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 200000000.0,
+            "cloud_rate_mbps": 200.0,
+            "cloud_delay_factor": 15.0
+          },
+          "elapsed_seconds": 3.873761900002137,
+          "profile_seconds": {
+            "config_seconds": 0.00023969999165274203,
+            "matching_kkt_seconds": 3.8726107999973465
+          },
+          "task_count": 16,
+          "assigned_task_count": 16,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 0,
+            "UAV": 2,
+            "Cloud": 14
+          },
+          "cloud_fraction": 0.875,
+          "target_mapping": {
+            "1": "CLOUD",
+            "2": "CLOUD",
+            "4": "CLOUD",
+            "6": "CLOUD",
+            "7": "CLOUD",
+            "16": "UAV_1",
+            "30": "CLOUD",
+            "40": "CLOUD",
+            "44": "CLOUD",
+            "45": "UAV_0",
+            "46": "CLOUD",
+            "47": "CLOUD",
+            "50": "CLOUD",
+            "51": "CLOUD",
+            "56": "CLOUD",
+            "58": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_0": 1.0,
+              "UAV_1": 1.0
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 103,
+            "kkt_converged_count": 103,
+            "kkt_finite_count": 103,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.561240688071848e-13,
+            "kkt_stationarity_residual_max": 2.220446049250313e-16,
+            "kkt_complementary_slackness_residual_max": 5.148869313259343e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 7,
+            "max_updates_reached": false,
+            "candidate_evaluations": 99
+          },
+          "metrics": {
+            "task_utility_q": 15.188850630587634,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 15.188850630587634,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 39.94569423640023,
+            "mean_task_delay_s": 2.4966058897750143,
+            "max_task_delay_s": 3.778847151797713,
+            "total_vehicle_energy_j": 0.21931636536593527,
+            "mean_vehicle_energy_j": 0.013707272835370954,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 16,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.949303164411727,
+            "mean_per_task_reward": 0.9493031644117271,
+            "finite": true
+          }
+        },
+        {
+          "name": "B_EQUAL_SHARE",
+          "status": "PASS",
+          "parameters": {
+            "cloud_rate_bps": 1633066.7164444982,
+            "cloud_rate_mbps": 1.633066716444498,
+            "cloud_delay_factor": 1.0681932194051897
+          },
+          "elapsed_seconds": 3.823992299992824,
+          "profile_seconds": {
+            "config_seconds": 0.0005179000145290047,
+            "matching_kkt_seconds": 3.822118899988709
+          },
+          "task_count": 16,
+          "assigned_task_count": 16,
+          "unserviceable_task_count": 0,
+          "task_counts_by_role": {
+            "SV": 0,
+            "RSU": 1,
+            "UAV": 6,
+            "Cloud": 9
+          },
+          "cloud_fraction": 0.5625,
+          "target_mapping": {
+            "1": "UAV_1",
+            "2": "UAV_0",
+            "4": "CLOUD",
+            "6": "UAV_1",
+            "7": "UAV_0",
+            "16": "UAV_1",
+            "30": "UAV_1",
+            "40": "CLOUD",
+            "44": "CLOUD",
+            "45": "RSU_0",
+            "46": "CLOUD",
+            "47": "CLOUD",
+            "50": "CLOUD",
+            "51": "CLOUD",
+            "56": "CLOUD",
+            "58": "CLOUD"
+          },
+          "matching": {
+            "resource_feasible": true,
+            "cpu_fraction_sums_by_target": {
+              "UAV_1": 0.9999999999999294,
+              "RSU_0": 1.0,
+              "UAV_0": 1.0000000000009224
+            },
+            "bandwidth_fraction_sums_by_target": {
+              "UAV_1": 0.9999999999994695,
+              "RSU_0": 1.0,
+              "UAV_0": 0.9999999999995507
+            },
+            "cpu_fraction_constraints_feasible": true,
+            "bandwidth_fraction_constraints_feasible": true,
+            "cloud_cpu_used_cycles_per_s": 39999999999.99585,
+            "cloud_cpu_capacity_cycles_per_s": 40000000000.0,
+            "cloud_cpu_capacity_feasible": true,
+            "kkt_solver_calls": 51,
+            "kkt_converged_count": 51,
+            "kkt_finite_count": 51,
+            "kkt_max_iterations_hit_count": 0,
+            "kkt_complete": true,
+            "kkt_resource_residual_max": 9.2237328885858e-13,
+            "kkt_stationarity_residual_max": 2.220446049250313e-16,
+            "kkt_complementary_slackness_residual_max": 2.1894495331240266e-13,
+            "matching_stop_reason": "converged_by_no_improvement",
+            "matching_stable": true,
+            "matching_updates": 6,
+            "max_updates_reached": false,
+            "candidate_evaluations": 63
+          },
+          "metrics": {
+            "task_utility_q": 12.892054243600134,
+            "cache_cost": 0.0,
+            "uav_movement_cost": 0.0,
+            "system_utility_g": 12.892054243600134,
+            "reward_identity_pass": true,
+            "total_task_delay_s": 92.08170596959111,
+            "mean_task_delay_s": 5.7551066230994445,
+            "max_task_delay_s": 9.413088977405268,
+            "total_vehicle_energy_j": 9.986050222092768,
+            "mean_vehicle_energy_j": 0.624128138880798,
+            "negative_task_utility_count": 0,
+            "tasks_delay_above_1s": 16,
+            "fraction_delay_above_1s": 1.0,
+            "mean_per_task_utility": 0.8057533902250084,
+            "mean_per_task_reward": 0.8057533902250084,
+            "finite": true
+          }
+        }
+      ],
+      "delta": {
+        "delta_Q": -2.2967963869875003,
+        "delta_G": -2.2967963869875003,
+        "delta_total_delay_s": 52.136011733190884,
+        "delta_total_vehicle_energy_j": 9.766733856726832,
+        "delta_cloud_fraction": -0.3125,
+        "changed_target_count": 6,
+        "mean_delta_Q_per_task": -0.14354977418671877,
+        "mean_delta_G_per_task": -0.14354977418671877,
+        "mean_delta_delay_s_per_task": 3.2585007333244302,
+        "mean_delta_energy_j_per_task": 0.610420866045427
+      }
+    }
+  ],
+  "completed_paired_states": 12,
+  "total_unique_state_tasks": 164,
+  "total_task_branch_observations": 328,
+  "aggregate": {
+    "A_HISTORICAL": {
+      "states_completed": 12,
+      "unique_state_tasks": 164,
+      "task_branch_observations": 164,
+      "task_weighted": {
+        "cloud_fraction": 0.8353658536585366,
+        "mean_task_utility_q": 0.9558863593881004,
+        "mean_task_reward_g": 0.9558863593881004,
+        "mean_task_delay_s": 2.1167305445051525,
+        "mean_vehicle_energy_j": 0.020279429306465344,
+        "delay_above_1s_fraction": 0.9695121951219512,
+        "tasks_delay_above_1s": 159,
+        "assigned_task_observations": 164
+      },
+      "equal_state": {
+        "mean_cloud_fraction": 0.8320589133089134,
+        "mean_task_utility_q": 0.9563396457997412,
+        "mean_task_reward_g": 0.9563396457997412,
+        "mean_task_delay_s": 2.0921889205595927,
+        "mean_vehicle_energy_j": 0.02048974720375232,
+        "delay_above_1s_fraction": 0.9666666666666667
+      },
+      "matching_kkt_feasible_states": 12,
+      "matching_stop_reasons": {
+        "converged_by_no_improvement": 12
+      },
+      "total_kkt_solver_calls": 1503,
+      "total_kkt_converged": 1503,
+      "total_kkt_finite": 1503,
+      "total_kkt_max_iterations_hit": 0
+    },
+    "B_EQUAL_SHARE": {
+      "states_completed": 12,
+      "unique_state_tasks": 164,
+      "task_branch_observations": 164,
+      "task_weighted": {
+        "cloud_fraction": 0.4878048780487805,
+        "mean_task_utility_q": 0.8294337678839421,
+        "mean_task_reward_g": 0.8294337678839421,
+        "mean_task_delay_s": 5.096151535969645,
+        "mean_vehicle_energy_j": 0.5416449179388939,
+        "delay_above_1s_fraction": 0.9817073170731707,
+        "tasks_delay_above_1s": 161,
+        "assigned_task_observations": 164
+      },
+      "equal_state": {
+        "mean_cloud_fraction": 0.4856875763125763,
+        "mean_task_utility_q": 0.8304928690500724,
+        "mean_task_reward_g": 0.8304928690500724,
+        "mean_task_delay_s": 5.0621555279002,
+        "mean_vehicle_energy_j": 0.5386345206725838,
+        "delay_above_1s_fraction": 0.9805555555555555
+      },
+      "matching_kkt_feasible_states": 12,
+      "matching_stop_reasons": {
+        "converged_by_no_improvement": 12
+      },
+      "total_kkt_solver_calls": 1074,
+      "total_kkt_converged": 1074,
+      "total_kkt_finite": 1074,
+      "total_kkt_max_iterations_hit": 0
+    },
+    "paired_delta_equal_state": {
+      "count": 12,
+      "mean_delta_Q": -1.7281854172234963,
+      "mean_delta_G": -1.7281854172234963,
+      "median_delta_G": -1.7146341074198421,
+      "min_delta_G": -2.43698432720152,
+      "max_delta_G": -1.0127023714719545,
+      "delta_G_positive_states": 0,
+      "delta_G_negative_states": 12,
+      "delta_G_near_zero_states": 0,
+      "mean_delta_total_delay_s": 40.71875355001474,
+      "mean_delta_total_vehicle_energy_j": 7.125328344643191,
+      "mean_delta_cloud_fraction": -0.34637133699633704,
+      "total_changed_target_count": 65
+    }
+  },
+  "b3_10f_regression": {
+    "pass": true,
+    "branches": {
+      "A_HISTORICAL": {
+        "expected": {
+          "q": 11.51073928010853,
+          "g": 11.51073928010853,
+          "cloud": 0.75,
+          "energy": 0.4441698321095574
+        },
+        "actual": {
+          "q": 11.510739280108526,
+          "g": 11.510739280108526,
+          "cloud": 0.75,
+          "energy": 0.4441698321095574
+        },
+        "difference": {
+          "q": -3.552713678800501e-15,
+          "g": -3.552713678800501e-15,
+          "cloud": 0.0,
+          "energy": 0.0
+        },
+        "pass": true
+      },
+      "B_EQUAL_SHARE": {
+        "expected": {
+          "q": 10.49803690863657,
+          "g": 10.49803690863657,
+          "cloud": 0.16666666666666666,
+          "energy": 3.6601611510078
+        },
+        "actual": {
+          "q": 10.498036908636571,
+          "g": 10.498036908636571,
+          "cloud": 0.16666666666666666,
+          "energy": 3.6601611510078
+        },
+        "difference": {
+          "q": 1.7763568394002505e-15,
+          "g": 1.7763568394002505e-15,
+          "cloud": 0.0,
+          "energy": 0.0
+        },
+        "pass": true
+      }
+    },
+    "tolerances": {
+      "q": 1e-06,
+      "g": 1e-06,
+      "cloud": 1e-12,
+      "energy": 1e-07
+    }
+  },
+  "parameter_freeze_ready": "CONDITIONAL",
+  "physical_reliability_validated": false,
+  "ppo_training_executed": false,
+  "formal_config_changed": false,
+  "validation_test_read": false,
+  "recommended_next_step": "将EQUAL_SHARE保留为独立、版本化仿真配置候选，不替换历史基线；另行完成无线可靠性校准，并明确超过1秒任务时延与单Slot执行语义的关系。"
+}
