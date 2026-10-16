@@ -339,6 +339,7 @@ def evaluate_matching_candidate(
         cache_config,
         kkt_cache=kkt_cache,
         node_evaluation_cache=node_evaluation_cache,
+        timing_profile=timing_profile,
     )
 
 
@@ -2301,7 +2302,150 @@ def solve_kkt_fraction_allocation(
     )
 
 
-def solve_kkt_bandwidth_dependent_noise_allocation(
+def _solve_bandwidth_v1_kkt_python_core(
+    coefficients: np.ndarray,
+    channel_gains: np.ndarray,
+    bandwidth_hz: float,
+    transmit_power_w: float,
+    noise_psd_w_per_hz: float,
+    receiver_noise_figure_db: float,
+    lower_marginal: np.ndarray,
+    upper_marginal: np.ndarray,
+    epsilon: float,
+    tolerance: float,
+    max_iterations: int,
+) -> tuple[np.ndarray, float, float, int, bool]:
+    """Original NumPy bisection path used as reference and Numba fallback."""
+
+    def allocation_for(multiplier: float) -> np.ndarray:
+        result = np.empty(coefficients.size, dtype=np.float64)
+        at_lower = multiplier >= lower_marginal
+        at_upper = multiplier <= upper_marginal
+        result[at_lower] = epsilon
+        result[at_upper & ~at_lower] = 1.0
+        interior = ~(at_lower | at_upper)
+        if not np.any(interior):
+            return result
+        lo = np.full(int(np.count_nonzero(interior)), epsilon, dtype=np.float64)
+        hi = np.ones_like(lo)
+        target = np.full_like(lo, multiplier)
+        interior_coeff = coefficients[interior]
+        interior_gains = channel_gains[interior]
+        for _ in range(64):
+            mid = 0.5 * (lo + hi)
+            rates, derivatives, _ = system_model.uplink_rate_and_derivative(
+                bandwidth_hz,
+                mid,
+                transmit_power_w,
+                interior_gains,
+                1.0,
+                noise_model=system_model.BANDWIDTH_DEPENDENT_NOISE_V1,
+                noise_psd_w_per_hz=noise_psd_w_per_hz,
+                receiver_noise_figure_db=receiver_noise_figure_db,
+            )
+            rates_array = np.asarray(rates, dtype=np.float64)
+            derivatives_array = np.asarray(derivatives, dtype=np.float64)
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                current = interior_coeff * derivatives_array / np.square(rates_array)
+            needs_more = current > target
+            lo = np.where(needs_more, mid, lo)
+            hi = np.where(needs_more, hi, mid)
+        result[interior] = 0.5 * (lo + hi)
+        return result
+
+    low_lambda = 0.0
+    high_lambda = float(np.max(lower_marginal))
+    allocation = np.full(coefficients.size, epsilon, dtype=np.float64)
+    multiplier = high_lambda
+    total = float(np.sum(allocation))
+    iterations = 0
+    converged = False
+    for iterations in range(1, max_iterations + 1):
+        multiplier = 0.5 * (low_lambda + high_lambda)
+        allocation = allocation_for(multiplier)
+        total = float(np.sum(allocation))
+        if abs(total - 1.0) <= tolerance:
+            converged = True
+            break
+        if total > 1.0:
+            low_lambda = multiplier
+        else:
+            high_lambda = multiplier
+    return allocation, multiplier, total, iterations, converged
+
+
+def _bandwidth_v1_kkt_numba_core_impl(
+    coefficients: np.ndarray,
+    a_values: np.ndarray,
+    lower_marginal: np.ndarray,
+    upper_marginal: np.ndarray,
+    bandwidth_hz: float,
+    epsilon: float,
+    tolerance: float,
+    max_iterations: int,
+) -> tuple[np.ndarray, float, float, int, bool]:
+    """Pure scalar implementation of the existing V1 bandwidth bisections."""
+
+    task_count = coefficients.size
+    allocation = np.empty(task_count, dtype=np.float64)
+    low_lambda = 0.0
+    high_lambda = float(np.max(lower_marginal))
+    multiplier = high_lambda
+    total = float(task_count) * epsilon
+    iterations = 0
+    converged = False
+    log_two = math.log(2.0)
+
+    for iterations in range(1, max_iterations + 1):
+        multiplier = 0.5 * (low_lambda + high_lambda)
+        for task_index in range(task_count):
+            if multiplier >= lower_marginal[task_index]:
+                task_allocation = epsilon
+            elif multiplier <= upper_marginal[task_index]:
+                task_allocation = 1.0
+            else:
+                low_allocation = epsilon
+                high_allocation = 1.0
+                a_value = a_values[task_index]
+                coefficient = coefficients[task_index]
+                for _ in range(64):
+                    mid = 0.5 * (low_allocation + high_allocation)
+                    allocated_bandwidth = bandwidth_hz * mid
+                    ratio = a_value / allocated_bandwidth
+                    log_term = np.log1p(ratio)
+                    rate = allocated_bandwidth * log_term / log_two
+                    derivative = bandwidth_hz / log_two * (
+                        log_term - a_value / (allocated_bandwidth + a_value)
+                    )
+                    current = coefficient * derivative / (rate * rate)
+                    if current > multiplier:
+                        low_allocation = mid
+                    else:
+                        high_allocation = mid
+                task_allocation = 0.5 * (low_allocation + high_allocation)
+            allocation[task_index] = task_allocation
+        total = float(np.sum(allocation))
+
+        if abs(total - 1.0) <= tolerance:
+            converged = True
+            break
+        if total > 1.0:
+            low_lambda = multiplier
+        else:
+            high_lambda = multiplier
+    return allocation, multiplier, total, iterations, converged
+
+
+if numba is not None:
+    _solve_bandwidth_v1_kkt_numba_core = numba.njit(
+        cache=False,
+        fastmath=False,
+    )(_bandwidth_v1_kkt_numba_core_impl)
+else:  # pragma: no cover - optional dependency fallback
+    _solve_bandwidth_v1_kkt_numba_core = None
+
+
+def _solve_kkt_bandwidth_dependent_noise_allocation_impl(
     coefficients: list[float],
     bandwidth_hz: float,
     transmit_power_w: float,
@@ -2313,6 +2457,7 @@ def solve_kkt_bandwidth_dependent_noise_allocation(
     max_iterations: int,
     *,
     return_diagnostics: bool = False,
+    _use_numba: bool = True,
 ) -> Any:
     """Solve the V1 bandwidth KKT using the exact rate derivative.
 
@@ -2456,62 +2601,58 @@ def solve_kkt_bandwidth_dependent_noise_allocation(
             abs(multiplier * (1.0 - total)),
         )
 
-    def allocation_for(multiplier: float) -> np.ndarray:
-        result = np.empty(n, dtype=np.float64)
-        at_lower = multiplier >= lower_marginal
-        at_upper = multiplier <= upper_marginal
-        result[at_lower] = epsilon
-        result[at_upper & ~at_lower] = 1.0
-        interior = ~(at_lower | at_upper)
-        if not np.any(interior):
-            return result
-        lo = np.full(int(np.count_nonzero(interior)), epsilon, dtype=np.float64)
-        hi = np.ones_like(lo)
-        target = np.full_like(lo, multiplier)
-        interior_coeff = coeff[interior]
-        interior_gains = gains[interior]
-        for _ in range(64):
-            mid = 0.5 * (lo + hi)
-            rates, derivatives, _ = system_model.uplink_rate_and_derivative(
-                bandwidth,
-                mid,
-                power,
-                interior_gains,
-                1.0,
-                noise_model=system_model.BANDWIDTH_DEPENDENT_NOISE_V1,
-                noise_psd_w_per_hz=psd,
-                receiver_noise_figure_db=nf_db,
-            )
-            rates_array = np.asarray(rates, dtype=np.float64)
-            derivatives_array = np.asarray(derivatives, dtype=np.float64)
-            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-                current = interior_coeff * derivatives_array / np.square(rates_array)
-            needs_more = current > target
-            lo = np.where(needs_more, mid, lo)
-            hi = np.where(needs_more, hi, mid)
-        result[interior] = 0.5 * (lo + hi)
-        return result
-
-    low_lambda = 0.0
     high_lambda = float(np.max(lower_marginal))
     if not math.isfinite(high_lambda):
         return finish([], math.nan, False, "V1 KKT multiplier overflow", 0, False, False, 0.0)
-    allocation = lower_allocation
-    multiplier = high_lambda
-    total = float(np.sum(allocation))
-    iterations = 0
-    converged = False
-    for iterations in range(1, max_iterations + 1):
-        multiplier = 0.5 * (low_lambda + high_lambda)
-        allocation = allocation_for(multiplier)
-        total = float(np.sum(allocation))
-        if abs(total - 1.0) <= tolerance:
-            converged = True
-            break
-        if total > 1.0:
-            low_lambda = multiplier
-        else:
-            high_lambda = multiplier
+    if _use_numba and _solve_bandwidth_v1_kkt_numba_core is not None:
+        nf_linear = 10.0 ** (nf_db / 10.0)
+        effective_psd = psd * nf_linear
+        a_values = power * gains / effective_psd
+        try:
+            allocation, multiplier, total, iterations, converged = (
+                _solve_bandwidth_v1_kkt_numba_core(
+                    coeff,
+                    a_values,
+                    lower_marginal,
+                    upper_marginal,
+                    bandwidth,
+                    epsilon,
+                    tolerance,
+                    max_iterations,
+                )
+            )
+        except numba.core.errors.NumbaError:
+            allocation, multiplier, total, iterations, converged = (
+                _solve_bandwidth_v1_kkt_python_core(
+                    coeff,
+                    gains,
+                    bandwidth,
+                    power,
+                    psd,
+                    nf_db,
+                    lower_marginal,
+                    upper_marginal,
+                    epsilon,
+                    tolerance,
+                    max_iterations,
+                )
+            )
+    else:
+        allocation, multiplier, total, iterations, converged = (
+            _solve_bandwidth_v1_kkt_python_core(
+                coeff,
+                gains,
+                bandwidth,
+                power,
+                psd,
+                nf_db,
+                lower_marginal,
+                upper_marginal,
+                epsilon,
+                tolerance,
+                max_iterations,
+            )
+        )
     hit_max = iterations >= max_iterations and not converged
     if total > 1.0 + max(tolerance * 10.0, 1.0e-10):
         return finish(
@@ -2554,6 +2695,36 @@ def solve_kkt_bandwidth_dependent_noise_allocation(
         total,
         float(np.max(stationarity_terms)),
         complementary,
+    )
+
+
+def solve_kkt_bandwidth_dependent_noise_allocation(
+    coefficients: list[float],
+    bandwidth_hz: float,
+    transmit_power_w: float,
+    channel_gains: list[float],
+    noise_psd_w_per_hz: float,
+    receiver_noise_figure_db: float,
+    epsilon: float,
+    tolerance: float,
+    max_iterations: int,
+    *,
+    return_diagnostics: bool = False,
+) -> Any:
+    """Solve the V1 bandwidth KKT with an optional Numba numerical core."""
+
+    return _solve_kkt_bandwidth_dependent_noise_allocation_impl(
+        coefficients,
+        bandwidth_hz,
+        transmit_power_w,
+        channel_gains,
+        noise_psd_w_per_hz,
+        receiver_noise_figure_db,
+        epsilon,
+        tolerance,
+        max_iterations,
+        return_diagnostics=return_diagnostics,
+        _use_numba=True,
     )
 
 
@@ -2632,8 +2803,16 @@ def allocate_resources_kkt(
             if kkt_cache is not None:
                 kkt_cache.record_diagnostics(cpu_diagnostics)
             if timing_profile is not None:
-                timing_profile["kkt_solver_core_runtime"] += (
-                    time.perf_counter() - solver_started_at
+                solver_runtime = time.perf_counter() - solver_started_at
+                _profile_add(
+                    timing_profile,
+                    "kkt_edge_cpu_solver_core_runtime",
+                    solver_runtime,
+                )
+                _profile_add(
+                    timing_profile,
+                    "kkt_solver_core_runtime",
+                    solver_runtime,
                 )
             if not ok:
                 return KKTResourceAllocationResult(
@@ -2738,8 +2917,16 @@ def allocate_resources_kkt(
             if kkt_cache is not None:
                 kkt_cache.record_diagnostics(bw_diagnostics)
             if timing_profile is not None:
-                timing_profile["kkt_solver_core_runtime"] += (
-                    time.perf_counter() - solver_started_at
+                solver_runtime = time.perf_counter() - solver_started_at
+                _profile_add(
+                    timing_profile,
+                    "kkt_edge_bandwidth_solver_core_runtime",
+                    solver_runtime,
+                )
+                _profile_add(
+                    timing_profile,
+                    "kkt_solver_core_runtime",
+                    solver_runtime,
                 )
             if not ok:
                 return KKTResourceAllocationResult(
@@ -2886,8 +3073,16 @@ def _allocate_cloud_cpu_kkt(
             )
         )
         if timing_profile is not None:
-            timing_profile["kkt_solver_core_runtime"] += (
-                time.perf_counter() - solver_started
+            solver_runtime = time.perf_counter() - solver_started
+            _profile_add(
+                timing_profile,
+                "kkt_cloud_cpu_solver_core_runtime",
+                solver_runtime,
+            )
+            _profile_add(
+                timing_profile,
+                "kkt_solver_core_runtime",
+                solver_runtime,
             )
         if kkt_cache is not None:
             kkt_cache.record_diagnostics(diagnostics)
@@ -3076,6 +3271,7 @@ def evaluate_matching_with_kkt(
     cache_config: cache_configuration.CacheOptimizationConfig,
     kkt_cache: KKTResourceAllocationCache | None = None,
     node_evaluation_cache: NodeEvaluationCache | None = None,
+    timing_profile: dict[str, float] | None = None,
 ) -> KKTMatchingEvaluation:
     """评价当前 slot 的 matching、KKT 资源、完成时延和车辆能耗。"""
 
@@ -3100,15 +3296,23 @@ def evaluate_matching_with_kkt(
             ),
         )
 
-    timing_profile = (
-        node_evaluation_cache.timing_profile
-        if node_evaluation_cache is not None
-        else None
-    )
+    if node_evaluation_cache is not None:
+        if timing_profile is None:
+            timing_profile = node_evaluation_cache.timing_profile
+        else:
+            node_evaluation_cache.timing_profile = timing_profile
     grouped_edge_tasks = _group_edge_tasks(tasks, matching, cache_nodes)
     edge_evaluations: dict[str, KKTMatchingEvaluation] = {}
     for node_id, node_tasks in grouped_edge_tasks.items():
         if node_evaluation_cache is None:
+            node_evaluation_started_at = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
+            kkt_runtime_before = (
+                float(timing_profile.get("kkt_runtime", 0.0))
+                if timing_profile is not None
+                else 0.0
+            )
             node_evaluation = _evaluate_edge_node(
                 node_id,
                 node_tasks,
@@ -3120,6 +3324,17 @@ def evaluate_matching_with_kkt(
                 kkt_cache,
                 timing_profile,
             )
+            if timing_profile is not None:
+                _profile_add(
+                    timing_profile,
+                    "node_eval_miss_runtime",
+                    time.perf_counter()
+                    - node_evaluation_started_at
+                    - (
+                        float(timing_profile.get("kkt_runtime", 0.0))
+                        - kkt_runtime_before
+                    ),
+                )
         else:
             node_evaluation = node_evaluation_cache.get_or_compute(
                 node_id,
@@ -3165,6 +3380,9 @@ def evaluate_matching_with_kkt(
         bandwidth_resource_sums.update(node_evaluation.bandwidth_resource_sums)
 
     cloud_tasks = [task for task in tasks if matching[task.task_id] == CLOUD]
+    cloud_kkt_started_at = (
+        time.perf_counter() if timing_profile is not None else 0.0
+    )
     cloud_allocation = _allocate_cloud_cpu_kkt(
         cloud_tasks,
         cache_config,
@@ -3172,6 +3390,12 @@ def evaluate_matching_with_kkt(
         kkt_cache,
         timing_profile,
     )
+    if timing_profile is not None:
+        _profile_add(
+            timing_profile,
+            "kkt_runtime",
+            time.perf_counter() - cloud_kkt_started_at,
+        )
     if not cloud_allocation.feasible:
         return KKTMatchingEvaluation(
             resource_feasible=False,
@@ -3459,6 +3683,7 @@ def evaluate_matching_candidate_incremental(
             cache_config,
             kkt_cache=kkt_cache,
             node_evaluation_cache=node_evaluation_cache,
+            timing_profile=timing_profile,
         )
         if not node_evaluation.resource_feasible:
             if timing_profile is not None:
@@ -3544,6 +3769,7 @@ def evaluate_matching_candidate_incremental(
             cache_config,
             kkt_cache=kkt_cache,
             node_evaluation_cache=node_evaluation_cache,
+            timing_profile=timing_profile,
         )
         if not non_edge_evaluation.resource_feasible:
             return infeasible(

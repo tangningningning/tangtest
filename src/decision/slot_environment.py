@@ -360,6 +360,21 @@ def execute_slot(
     uses actual Matching/KKT output, not predictive configuration utility.
     """
 
+    if exact_q_timing_profile is not None:
+        for key in (
+            "matching_runtime",
+            "matching_total_runtime",
+            "node_cache_lookup_runtime",
+            "node_eval_miss_runtime",
+            "kkt_runtime",
+            "kkt_coefficient_build_runtime",
+            "kkt_solver_core_runtime",
+            "kkt_result_assembly_runtime",
+            "reward_cost_aggregation_runtime",
+            "reward_final_combination_runtime",
+        ):
+            exact_q_timing_profile.setdefault(key, 0.0)
+
     previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     previous_uav = _position_tuples(previous_uav_positions)
     cache_trigger = np.asarray(cache_triggers, dtype=np.int8).copy()
@@ -524,6 +539,7 @@ def execute_slot(
     )
     if exact_q_timing_profile is not None:
         exact_q_matching_elapsed = time.perf_counter() - exact_q_matching_started_at
+        exact_q_timing_profile["matching_total_runtime"] += exact_q_matching_elapsed
         exact_q_node_elapsed = sum(
             float(exact_q_timing_profile.get(key, 0.0))
             for key in (
@@ -853,6 +869,7 @@ def execute_configured_slot(
     performance_profile: dict[str, Any] | None = None,
     matching_kkt_cache: task_allocation.KKTResourceAllocationCache | None = None,
     node_evaluation_cache: task_allocation.NodeEvaluationCache | None = None,
+    exact_q_timing_profile: dict[str, float] | None = None,
 ) -> SlotExecutionResult:
     """执行控制器已确定的最终 Cache/UAV 配置及真实 Matching/KKT。"""
 
@@ -912,6 +929,7 @@ def execute_configured_slot(
         configuration_override=configuration,
         matching_kkt_cache=matching_kkt_cache,
         node_evaluation_cache=node_evaluation_cache,
+        exact_q_timing_profile=exact_q_timing_profile,
     )
 
 def _validated_configuration_override(

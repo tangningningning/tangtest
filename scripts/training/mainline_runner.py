@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -23,6 +24,7 @@ for candidate in (SOURCE_ROOT, SCRIPTS_ROOT):
 
 CONFIG_RELATIVE = Path("configs/proposed/system_config.toml")
 POOL_RELATIVE = Path("environment_data/proposed_joint_training")
+VALIDATION_POOL_RELATIVE = Path("environment_data/proposed_joint_validation")
 RUN_DIRECTORY_RELATIVE = Path("runs/stageB3_10j_multi_node_v4_mainline")
 POOL_MANIFEST_NAME = "stage6_training_pool_manifest.json"
 POOL_BASELINE_NAME = "stage6_training_pool_integrity_baseline.json"
@@ -31,6 +33,15 @@ EPISODE_COUNT = 300
 EPISODE_SEED_START = 20001
 EPISODE_SEED_END = EPISODE_SEED_START + EPISODE_COUNT - 1
 PPO_INITIALIZATION_SEED = 27005
+VALIDATION_SEED_START = 30001
+VALIDATION_EPISODE_COUNT = 30
+VALIDATION_DIRECTORY_NAME = "validation"
+MACRO_ACTOR_LEARNING_RATE_RUNS = {
+    1.0e-4: Path("runs/stageB3_14h_fresh_macro_actor_lr_1e_minus_4"),
+    5.0e-4: Path("runs/stageB3_14h_fresh_macro_actor_lr_5e_minus_4"),
+    1.0e-3: Path("runs/stageB3_14h_fresh_macro_actor_lr_1e_minus_3"),
+    5.0e-3: Path("runs/stageB3_14h_fresh_macro_actor_lr_5e_minus_3"),
+}
 HISTORICAL_STAGE6_CONFIG_SHA256 = (
     "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77"
 )
@@ -98,15 +109,15 @@ def _load_main_experiment_contract() -> tuple[dict[str, Any], str, str, str]:
         ),
         "nodes.cloud.cloud_delay_factor": (
             cfg["nodes"]["cloud"]["cloud_delay_factor"],
-            1.0681932194051897,
+            13.0,
         ),
         "nodes.cloud.uplink_rate_bps": (
             cfg["nodes"]["cloud"]["uplink_rate_bps"],
-            1633066.7164444982,
+            20.0e6,
         ),
         "nodes.cloud.total_bandwidth_bps": (
             cfg["nodes"]["cloud"]["total_bandwidth_bps"],
-            1633066.7164444982,
+            20.0e6,
         ),
         "nodes.rsu.cpu_cycles_per_s": (cfg["nodes"]["rsu"]["cpu_cycles_per_s"], 10.0e9),
         "nodes.rsu.bandwidth_hz": (cfg["nodes"]["rsu"]["bandwidth_hz"], 10.0e6),
@@ -135,7 +146,7 @@ def _load_main_experiment_contract() -> tuple[dict[str, Any], str, str, str]:
         ),
         "communication.cloud.uplink_rate_bps": (
             cfg["communication"]["cloud"]["uplink_rate_bps"],
-            1633066.7164444982,
+            20.0e6,
         ),
         "service.generation.input_size_min_kb": (
             cfg["service"]["generation"]["input_size_min_kb"],
@@ -781,6 +792,162 @@ def _validate_training_pool(
     return pool_path
 
 
+def _validate_validation_pool() -> Path:
+    """Check the fixed Validation split and its realization files without running Episodes."""
+
+    from scenario.realization import REALIZATION_ARTIFACT_FILENAMES
+
+    pool_path = PROJECT_ROOT / VALIDATION_POOL_RELATIVE
+    split_path = PROJECT_ROOT / "environment_data/data_split_manifest.json"
+    split = json.loads(split_path.read_text(encoding="utf-8"))
+    validation_split = split.get("validation", {})
+    expected_end = VALIDATION_SEED_START + VALIDATION_EPISODE_COUNT - 1
+    if (
+        int(validation_split.get("seed_start", -1)) != VALIDATION_SEED_START
+        or int(validation_split.get("seed_end", -1)) != expected_end
+    ):
+        raise ValueError("Validation seed range does not match the formal 30001–30030 contract.")
+
+    required_artifacts = tuple(REALIZATION_ARTIFACT_FILENAMES.values())
+    for seed in range(VALIDATION_SEED_START, expected_end + 1):
+        episode_dir = pool_path / f"episode_{seed}"
+        if not episode_dir.is_dir():
+            raise FileNotFoundError(f"Validation Episode directory missing: {episode_dir}")
+        manifest_path = episode_dir / "episode_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Validation Episode manifest missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if int(manifest.get("episode_seed", -1)) != seed:
+            raise ValueError(f"Validation Episode manifest seed mismatch for {seed}.")
+        if int(manifest.get("simulation", {}).get("episode_slots", -1)) != 300:
+            raise ValueError(f"Validation Episode {seed} does not declare 300 slots.")
+        missing = [name for name in required_artifacts if not (episode_dir / name).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"Validation Episode {seed} is missing required artifacts: {missing}."
+            )
+    return pool_path
+
+
+def _build_macro_actor_mode_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run or validate one formal PROPOSED Macro Actor learning-rate experiment."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("check", "train", "resume", "validate", "train-validate"),
+        default="train",
+        help=(
+            "check static inputs, start a fresh training run, explicitly resume a checkpoint, "
+            "validate a checkpoint, or train then validate."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint",
+        help=(
+            "Checkpoint filename under this run's checkpoints directory, or a path inside "
+            "that directory; required by resume and defaults to latest_checkpoint.pt in "
+            "validate mode."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-run-idle",
+        action="store_true",
+        help="Acknowledge that the target Run was checked and has no active training job.",
+    )
+    parser.add_argument(
+        "--validation-episodes",
+        type=int,
+        default=VALIDATION_EPISODE_COUNT,
+        help="Validation prefix length from seeds 30001–30030 (2–30; default 30).",
+    )
+    parser.add_argument(
+        "--validation-name",
+        help="Optional new output directory name under this run's validation directory.",
+    )
+    return parser
+
+
+def _resolve_macro_validation_checkpoint(
+    run_path: Path, checkpoint_reference: str | None
+) -> Path:
+    from ppo_simple.reporting import resolve_checkpoint_reference
+
+    candidate = Path(checkpoint_reference or "latest_checkpoint.pt").expanduser()
+    if not candidate.is_absolute():
+        if candidate.parts and candidate.parts[0].casefold() == "checkpoints":
+            candidate = run_path / candidate
+        else:
+            candidate = run_path / "checkpoints" / candidate
+    checkpoint_path = resolve_checkpoint_reference(candidate).resolve(strict=True)
+    checkpoint_root = (run_path / "checkpoints").resolve(strict=True)
+    try:
+        checkpoint_path.relative_to(checkpoint_root)
+    except ValueError as exc:
+        raise ValueError(
+            "Checkpoints must belong to this learning-rate run."
+        ) from exc
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Validation checkpoint is not a file: {checkpoint_path}")
+    return checkpoint_path
+
+
+def _macro_validation_output_path(
+    run_path: Path,
+    checkpoint_path: Path,
+    episodes: int,
+    validation_name: str | None,
+) -> Path:
+    name = (
+        f"{checkpoint_path.stem}_{int(episodes)}ep"
+        if validation_name is None
+        else validation_name
+    )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+        raise ValueError(
+            "Validation name must be a single safe directory name of at most 64 characters."
+        )
+    output_path = run_path / VALIDATION_DIRECTORY_NAME / name
+    if output_path.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite existing Validation output: {output_path}"
+        )
+    return output_path
+
+
+def _evaluate_macro_actor_checkpoint(
+    *,
+    checkpoint_path: Path,
+    output_path: Path,
+    episodes: int,
+) -> int:
+    from ppo_simple.evaluator import evaluate_pool
+
+    print(f"Validation checkpoint: {checkpoint_path}", flush=True)
+    print(
+        f"Validation protocol: deterministic | seeds {VALIDATION_SEED_START}–"
+        f"{VALIDATION_SEED_START + int(episodes) - 1} | Episodes={int(episodes)}",
+        flush=True,
+    )
+    result = evaluate_pool(
+        checkpoint_path=checkpoint_path,
+        run_dir=output_path,
+        config_path=PROJECT_ROOT / CONFIG_RELATIVE,
+        episode_pool=PROJECT_ROOT / VALIDATION_POOL_RELATIVE,
+        seed_start=VALIDATION_SEED_START,
+        episodes=int(episodes),
+        repeats=1,
+        device="cpu",
+        policy_action_mode="deterministic",
+    )
+    print(
+        f"[VALIDATION] Completed | Episodes={result['episode_count']} | "
+        f"Output={output_path.relative_to(PROJECT_ROOT).as_posix()}",
+        flush=True,
+    )
+    return 0
+
+
 def _create_training_pool_integrity_baseline() -> Path:
     """Explicit one-time baseline creation; the formal runner only reads it."""
 
@@ -937,21 +1104,56 @@ def _create_training_pool_integrity_baseline() -> Path:
         raise
 
 
-def main(argv: list[str] | None = None) -> int:
-    import argparse
+def build_parser() -> argparse.ArgumentParser:
+    """Build the formal runner CLI without starting validation or training."""
 
-    argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Run the 300-Episode multi-node v4 formal PPO main experiment."
-    ).parse_args(argv)
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Strictly resume the existing formal run from latest_checkpoint.pt.",
+    )
+    return parser
+
+
+def _validate_formal_run_mode(run_path: Path, *, resume: bool) -> None:
+    """Reject unsafe fresh-run reuse or incomplete resume directories."""
+
+    run_path = Path(run_path)
+    if not resume:
+        if run_path.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite existing formal main-experiment run: {run_path}"
+            )
+        return
+
+    if not run_path.is_dir():
+        raise FileNotFoundError(
+            f"Cannot resume: formal run directory does not exist: {run_path}"
+        )
+
+    from ppo_simple.reporting import RUN_MANIFEST_FILENAME, checkpoint_path_for_resume
+    from ppo_simple.trainer import CHECKPOINT_FILENAME
+
+    manifest_path = run_path / RUN_MANIFEST_FILENAME
+    checkpoint_path = checkpoint_path_for_resume(run_path, CHECKPOINT_FILENAME)
+    if not manifest_path.is_file() or not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "Cannot resume: formal run requires run_manifest.json and "
+            "checkpoints/latest_checkpoint.pt."
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    run_path = PROJECT_ROOT / RUN_DIRECTORY_RELATIVE
+    _validate_formal_run_mode(run_path, resume=bool(args.resume))
 
     cfg, raw_config_hash, semantic_hash, generation_fingerprint = _load_main_experiment_contract()
     pool_path = _validate_training_pool(cfg, generation_fingerprint)
     baseline_sha256 = _stable_file_sha256(pool_path / POOL_BASELINE_NAME)
-    run_path = PROJECT_ROOT / RUN_DIRECTORY_RELATIVE
-    if run_path.exists():
-        raise FileExistsError(
-            f"Refusing to overwrite existing formal main-experiment run: {run_path}"
-        )
 
     os.chdir(PROJECT_ROOT)
     from ppo_simple.trainer import main as trainer_main
@@ -962,6 +1164,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Episode generation fingerprint: {generation_fingerprint}", flush=True)
     print(f"Training Pool integrity baseline SHA-256: {baseline_sha256}", flush=True)
     print(f"Training Pool: {POOL_RELATIVE.as_posix()} (20001–20300)", flush=True)
+    print(f"Run mode: {'resume' if args.resume else 'fresh'}", flush=True)
     print(
         "Macro Actor learning rate: "
         f"{cfg['algorithm']['ppo']['macro_actor_learning_rate']:.1e}",
@@ -969,23 +1172,192 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"PPO initialization seed: {PPO_INITIALIZATION_SEED}", flush=True)
     print(f"Output run: {RUN_DIRECTORY_RELATIVE.as_posix()}", flush=True)
-    return trainer_main(
-        [
-            "--config",
-            CONFIG_RELATIVE.as_posix(),
-            "--epochs",
-            str(EPISODE_COUNT),
-            "--run-dir",
-            RUN_DIRECTORY_RELATIVE.as_posix(),
-            "--episode-pool",
-            POOL_RELATIVE.as_posix(),
-            "--validated-integrity-baseline-sha256",
-            baseline_sha256,
-            "--episode-seed-start",
-            str(EPISODE_SEED_START),
-            "--seed",
-            str(PPO_INITIALIZATION_SEED),
-        ]
+    trainer_args = [
+        "--config",
+        CONFIG_RELATIVE.as_posix(),
+        "--epochs",
+        str(EPISODE_COUNT),
+        "--run-dir",
+        RUN_DIRECTORY_RELATIVE.as_posix(),
+        "--episode-pool",
+        POOL_RELATIVE.as_posix(),
+        "--validated-integrity-baseline-sha256",
+        baseline_sha256,
+        "--episode-seed-start",
+        str(EPISODE_SEED_START),
+        "--seed",
+        str(PPO_INITIALIZATION_SEED),
+    ]
+    if args.resume:
+        trainer_args.append("--resume")
+    return trainer_main(trainer_args)
+
+
+def main_for_macro_actor_learning_rate(
+    rate: float, argv: list[str] | None = None
+) -> int:
+    """Dispatch one approved Macro Actor LR run through shared modes."""
+
+    requested_rate = float(rate)
+    matched_rate = next(
+        (
+            value
+            for value in MACRO_ACTOR_LEARNING_RATE_RUNS
+            if math.isclose(requested_rate, value, rel_tol=0.0, abs_tol=1.0e-15)
+        ),
+        None,
+    )
+    if matched_rate is None:
+        raise ValueError(f"Unsupported formal Macro Actor learning rate: {rate!r}")
+
+    parser = _build_macro_actor_mode_parser()
+    args = parser.parse_args(argv)
+    if not 2 <= int(args.validation_episodes) <= VALIDATION_EPISODE_COUNT:
+        parser.error("--validation-episodes must be between 2 and 30.")
+    if args.mode not in {"validate", "resume", "train-validate"}:
+        if args.checkpoint is not None:
+            parser.error("--checkpoint is only valid with --mode resume or validate.")
+        if args.validation_name is not None:
+            parser.error("--validation-name is only valid with a Validation mode.")
+        if int(args.validation_episodes) != VALIDATION_EPISODE_COUNT:
+            parser.error("--validation-episodes is only valid with a Validation mode.")
+    if args.mode == "train-validate" and args.checkpoint is not None:
+        parser.error("train-validate always evaluates the newly saved latest checkpoint.")
+    if args.mode == "resume" and args.checkpoint is None:
+        parser.error("--mode resume requires an explicit --checkpoint path.")
+    if args.mode == "resume" and not args.confirm_run_idle:
+        parser.error(
+            "Before resume, verify the target Run has no active job and pass --confirm-run-idle."
+        )
+    if args.mode != "resume" and args.confirm_run_idle:
+        parser.error("--confirm-run-idle is only valid with --mode resume.")
+    if args.mode == "resume" and (
+        args.validation_name is not None
+        or int(args.validation_episodes) != VALIDATION_EPISODE_COUNT
+    ):
+        parser.error("Validation options are not valid with --mode resume.")
+
+    run_directory = MACRO_ACTOR_LEARNING_RATE_RUNS[matched_rate]
+    run_path = PROJECT_ROOT / run_directory
+    (
+        cfg,
+        raw_config_hash,
+        semantic_hash,
+        generation_fingerprint,
+    ) = _load_main_experiment_contract()
+    needs_training = args.mode in {"check", "train", "resume", "train-validate"}
+    needs_validation = args.mode in {"check", "validate", "train-validate"}
+    pool_path = (
+        _validate_training_pool(cfg, generation_fingerprint)
+        if needs_training
+        else None
+    )
+    validation_pool = _validate_validation_pool() if needs_validation else None
+
+    checkpoint_path: Path | None = None
+    if args.mode in {"check", "train", "train-validate"}:
+        _validate_formal_run_mode(run_path, resume=False)
+    elif args.mode == "resume":
+        _validate_formal_run_mode(run_path, resume=True)
+        checkpoint_path = _resolve_macro_validation_checkpoint(run_path, args.checkpoint)
+    elif not run_path.is_dir():
+        raise FileNotFoundError(
+            f"Cannot validate: learning-rate run directory does not exist: {run_path}"
+        )
+
+    validation_output: Path | None = None
+    if args.mode == "validate":
+        checkpoint_path = _resolve_macro_validation_checkpoint(run_path, args.checkpoint)
+        validation_output = _macro_validation_output_path(
+            run_path,
+            checkpoint_path,
+            int(args.validation_episodes),
+            args.validation_name,
+        )
+    elif args.mode == "train-validate":
+        planned_checkpoint = run_path / "checkpoints" / "latest_checkpoint.pt"
+        validation_output = _macro_validation_output_path(
+            run_path,
+            planned_checkpoint,
+            int(args.validation_episodes),
+            args.validation_name,
+        )
+
+    if args.mode == "check":
+        print(
+            f"[CHECK] Passed | Config={CONFIG_RELATIVE.as_posix()} | "
+            f"TrainingPool={POOL_RELATIVE.as_posix()} | "
+            f"ValidationPool={VALIDATION_POOL_RELATIVE.as_posix()} | "
+            f"Run={run_directory.as_posix()} | MacroActorLR={matched_rate:.1e}",
+            flush=True,
+        )
+        return 0
+
+    if args.mode == "validate":
+        if checkpoint_path is None or validation_output is None:
+            raise RuntimeError("Validation dispatch did not resolve its Checkpoint and output.")
+        return _evaluate_macro_actor_checkpoint(
+            checkpoint_path=checkpoint_path,
+            output_path=validation_output,
+            episodes=int(args.validation_episodes),
+        )
+
+    if args.mode == "resume" and checkpoint_path is None:
+        raise RuntimeError("Resume dispatch did not resolve its Checkpoint.")
+    if args.mode == "resume":
+        print(f"Resume checkpoint: {checkpoint_path}", flush=True)
+
+    if pool_path is None:
+        raise RuntimeError("Training dispatch did not validate the formal Training Pool.")
+    baseline_sha256 = _stable_file_sha256(pool_path / POOL_BASELINE_NAME)
+    os.chdir(PROJECT_ROOT)
+    from ppo_simple.trainer import main as trainer_main
+
+    print(f"Formal config: {CONFIG_RELATIVE.as_posix()}", flush=True)
+    print(f"Formal config SHA-256: {raw_config_hash}", flush=True)
+    print(f"Formal semantic config SHA-256: {semantic_hash}", flush=True)
+    print(f"Episode generation fingerprint: {generation_fingerprint}", flush=True)
+    print(f"Training Pool integrity baseline SHA-256: {baseline_sha256}", flush=True)
+    print(f"Training Pool: {POOL_RELATIVE.as_posix()} (20001–20300)", flush=True)
+    print(f"Run mode: {args.mode} | Macro Actor LR override: {matched_rate:.1e}", flush=True)
+    print(f"PPO initialization seed: {PPO_INITIALIZATION_SEED}", flush=True)
+    print(f"Output run: {run_directory.as_posix()}", flush=True)
+    trainer_args = [
+        "--config",
+        CONFIG_RELATIVE.as_posix(),
+        "--epochs",
+        str(EPISODE_COUNT),
+        "--run-dir",
+        run_directory.as_posix(),
+        "--episode-pool",
+        POOL_RELATIVE.as_posix(),
+        "--validated-integrity-baseline-sha256",
+        baseline_sha256,
+        "--episode-seed-start",
+        str(EPISODE_SEED_START),
+        "--macro-actor-learning-rate",
+        f"{matched_rate:.1e}",
+        "--seed",
+        str(PPO_INITIALIZATION_SEED),
+    ]
+    if args.mode == "resume":
+        trainer_args.extend(["--resume", "--resume-checkpoint", str(checkpoint_path)])
+    training_status = int(trainer_main(trainer_args))
+    if args.mode in {"train", "resume"} or training_status != 0:
+        if args.mode == "train-validate" and training_status != 0:
+            print(
+                f"[VALIDATION] Skipped | Training exited with status={training_status}",
+                flush=True,
+            )
+        return training_status
+
+    if validation_pool is None or validation_output is None:
+        raise RuntimeError("train-validate did not complete Validation preflight.")
+    checkpoint_path = _resolve_macro_validation_checkpoint(run_path, None)
+    return _evaluate_macro_actor_checkpoint(
+        checkpoint_path=checkpoint_path,
+        output_path=validation_output,
+        episodes=int(args.validation_episodes),
     )
 
 

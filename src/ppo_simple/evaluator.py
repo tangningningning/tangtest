@@ -45,12 +45,19 @@ DEFAULT_POLICY_REPEATS = 1
 EPISODE_METRIC_NAMES = (
     "total_return",
     "total_q",
+    "task_utility",
     "total_cache_cost",
     "total_movement_cost",
     "cache_change_rate",
     "uav_movement_rate",
     "uav_stay_rate",
     "uav_move_rate",
+    "uav0_move_candidate_rate",
+    "uav1_move_candidate_rate",
+    "cloud_task_count",
+    "edge_task_count",
+    "cloud_offload_rate",
+    "edge_offload_rate",
     "total_tasks",
     "mean_task_delay_s",
     "mean_vehicle_energy_j",
@@ -285,11 +292,28 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
     task_count = int(sum(item.task_count for item in micro))
     total_delay = float(sum(item.total_task_delay_s for item in micro))
     total_energy = float(sum(item.total_vehicle_energy_j for item in micro))
+    execution_counts = {"SV": 0, "RSU": 0, "UAV": 0, "CLOUD": 0}
+    for transition in micro:
+        slot_counts = transition.execution_target_counts
+        for execution_class in execution_counts:
+            execution_counts[execution_class] += int(slot_counts.get(execution_class, 0))
+        if sum(int(slot_counts.get(name, 0)) for name in execution_counts) != int(
+            transition.task_count
+        ):
+            raise ValueError("Validation execution counts do not match the task count.")
+    cloud_task_count = execution_counts["CLOUD"]
+    edge_task_count = sum(execution_counts[name] for name in ("SV", "RSU", "UAV"))
+    if cloud_task_count + edge_task_count != task_count:
+        raise ValueError("Validation Cloud/Edge counts do not sum to the task count.")
+    task_utility = float(sum(item.actual_task_utility for item in micro))
+    uav0_move_candidate_rate = float(collection.summary["uav0_move_rate"])
+    uav1_move_candidate_rate = float(collection.summary["uav1_move_rate"])
     record = {
         "episode_seed": int(episode_seed),
         "repeat_index": int(repeat_index),
         "total_return": float(sum(item.reward for item in micro)),
-        "total_q": float(sum(item.actual_task_utility for item in micro)),
+        "total_q": task_utility,
+        "task_utility": task_utility,
         "total_cache_cost": float(sum(item.cache_cost for item in micro)),
         "total_movement_cost": float(sum(item.movement_cost for item in micro)),
         "cache_change_rate": float(
@@ -304,6 +328,12 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "uav_move_rate": float(
             sum(item.uav_movement_count for item in micro) / (2.0 * slots)
         ),
+        "uav0_move_candidate_rate": uav0_move_candidate_rate,
+        "uav1_move_candidate_rate": uav1_move_candidate_rate,
+        "cloud_task_count": cloud_task_count,
+        "edge_task_count": edge_task_count,
+        "cloud_offload_rate": None if task_count == 0 else cloud_task_count / task_count,
+        "edge_offload_rate": None if task_count == 0 else edge_task_count / task_count,
         "joint_action_counts": joint_action_counts,
         "joint_action_rates": joint_action_rates,
         "uav_joint_stay_stay_rate": joint_action_rates["stay_stay"],
@@ -415,12 +445,19 @@ def _mean_environment_summary(
     numeric_names = (
         "total_return",
         "total_q",
+        "task_utility",
         "total_cache_cost",
         "total_movement_cost",
         "cache_change_rate",
         "uav_movement_rate",
         "uav_stay_rate",
         "uav_move_rate",
+        "uav0_move_candidate_rate",
+        "uav1_move_candidate_rate",
+        "cloud_task_count",
+        "edge_task_count",
+        "cloud_offload_rate",
+        "edge_offload_rate",
         "total_tasks",
         "mean_task_delay_s",
         "mean_vehicle_energy_j",

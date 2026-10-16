@@ -74,7 +74,9 @@ from .rollout import (
 
 CHECKPOINT_METHOD = "PROPOSED"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
+INITIAL_CHECKPOINT_FILENAME = "initial_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
+INTERMEDIATE_CHECKPOINT_INTERVAL_UPDATES = 10
 CHECKPOINT_VERSION = 59
 MULTI_NODE_CHECKPOINT_VERSION = 60
 ALGORITHM_ID = "PROPOSED"
@@ -148,7 +150,7 @@ def _reconcile_run_artifacts_with_checkpoint(
     group_size: int = 4,
     slot_start: int = 0,
 ) -> dict[str, int]:
-    """按提交的 update-group 边界清理至多一组未提交尾记录。"""
+    """Validate that persisted run artifacts end exactly at a committed checkpoint."""
 
     boundary = int(completed_episodes)
     slot_count = int(episode_slots)
@@ -319,21 +321,18 @@ def _reconcile_run_artifacts_with_checkpoint(
     ]
     prepared[slot_path] = (keep_slot_lines, len(slot_records) - len(keep_slot_lines))
 
-    removed_counts: dict[str, int] = {}
-    for path, (keep_lines, removed_count) in prepared.items():
-        removed_counts[path.name] = removed_count
-        if removed_count == 0:
-            continue
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    ahead = {
+        path.name: removed_count
+        for path, (_, removed_count) in prepared.items()
+        if removed_count
+    }
+    if ahead:
+        details = ", ".join(f"{name}={count}" for name, count in sorted(ahead.items()))
+        raise ValueError(
+            "Run history is ahead of the selected complete-update checkpoint; "
+            f"refusing to truncate or duplicate records ({details})."
         )
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.writelines(keep_lines)
-            os.replace(temporary_name, path)
-        finally:
-            Path(temporary_name).unlink(missing_ok=True)
-    return removed_counts
+    return {path.name: 0 for path in prepared}
 
 
 def _pool_children(pool_path: Path) -> list[Path]:
@@ -3445,6 +3444,7 @@ class PPOTrainer:
         required = {
             "checkpoint_version": self.checkpoint_version,
             "architecture_version": int(self.policy.architecture_version),
+            "macro_actor_update_control_version": self.macro_actor_update_control_version,
             "unified_cache_action": self.unified_cache_action,
         }
         if self.cardinality_corrected_cache_action:
@@ -3695,12 +3695,15 @@ def run_training(
     critic_learning_rate_override: float | None = None,
     seed: int = 0,
     resume: bool = False,
+    resume_checkpoint_path: str | Path | None = None,
     verbose: bool = False,
     save_macro_transition_trace: bool = False,
 ) -> dict[str, Any]:
     """按完整 episode 收集 on-policy 数据并更新 PROPOSED 主线策略。"""
 
     _require_torch()
+    if resume_checkpoint_path is not None and not resume:
+        raise ValueError("--resume-checkpoint requires --resume.")
     if int(target_episodes) <= 0:
         raise ValueError("--epochs 必须为正整数。")
     if save_macro_transition_trace and (resume or episode_seed_start is None):
@@ -3732,7 +3735,28 @@ def run_training(
     semantic_hash = project_config.semantic_config_hash(context.cfg)
     run_path = _resolve_path(project_root, run_dir)
     manifest_path = run_path / RUN_MANIFEST_FILENAME
-    checkpoint_path = checkpoint_path_for_resume(run_path, CHECKPOINT_FILENAME)
+    if resume_checkpoint_path is None:
+        checkpoint_path = checkpoint_path_for_resume(run_path, CHECKPOINT_FILENAME)
+    else:
+        checkpoint_reference = Path(resume_checkpoint_path).expanduser()
+        checkpoint_root = run_path / "checkpoints"
+        if not checkpoint_reference.is_absolute():
+            if (
+                checkpoint_reference.parts
+                and checkpoint_reference.parts[0].casefold() == "checkpoints"
+            ):
+                checkpoint_reference = run_path / checkpoint_reference
+            else:
+                checkpoint_reference = checkpoint_root / checkpoint_reference
+        checkpoint_path = checkpoint_reference.resolve(strict=True)
+        try:
+            checkpoint_path.relative_to(checkpoint_root.resolve(strict=True))
+        except ValueError as exc:
+            raise ValueError(
+                "Resume checkpoint must belong to the selected run's checkpoints directory."
+            ) from exc
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint is not a file: {checkpoint_path}")
     _seed_everything(seed)
     trainer = PPOTrainer(
         context,
@@ -3746,30 +3770,96 @@ def run_training(
     best_return: float | None = None
     if resume:
         if not checkpoint_path.is_file() or not manifest_path.is_file():
-            raise FileNotFoundError("resume 需要现有 run manifest 与 latest checkpoint。")
+            raise FileNotFoundError(
+                "resume 需要现有 run manifest 与指定的完整 Checkpoint。"
+            )
         with manifest_path.open("r", encoding="utf-8") as stream:
             manifest = json.load(stream)
         for field, expected in (
             ("config_raw_sha256", raw_hash),
             ("config_semantic_sha256", semantic_hash),
-            ("episode_pool", str(pool_path)),
-            ("episode_pool_provenance", pool_provenance),
             ("target_episodes", int(target_episodes)),
             ("realizations_per_policy_update", group_size),
             ("policy_update_total", policy_update_total),
+            (
+                "episode_seed_start",
+                None if episode_seed_start is None else int(episode_seed_start),
+            ),
+            (
+                "episode_seed_end",
+                None
+                if episode_seed_start is None
+                else int(episode_seed_start) + int(target_episodes) - 1,
+            ),
         ):
             if manifest.get(field) != expected:
                 raise ValueError(f"run manifest {field} mismatch。")
         if not isinstance(manifest.get("policy_schema"), str):
             raise ValueError("run manifest policy_schema is missing。")
+        checkpoint_pool_identity = manifest.get("episode_pool")
+        if not isinstance(checkpoint_pool_identity, str) or not checkpoint_pool_identity:
+            raise ValueError("run manifest episode_pool identity is missing。")
+        saved_pool_provenance = manifest.get("episode_pool_provenance")
+        path_fields = {"manifest_path", "integrity_baseline_path"}
+        if (
+            not isinstance(saved_pool_provenance, dict)
+            or {
+                key: value
+                for key, value in saved_pool_provenance.items()
+                if key not in path_fields
+            }
+            != {
+                key: value
+                for key, value in pool_provenance.items()
+                if key not in path_fields
+            }
+        ):
+            raise ValueError("run manifest Training Pool identity/provenance mismatch。")
+        if int(manifest.get("seed", -1)) != int(seed):
+            raise ValueError("run manifest initialization seed mismatch。")
+        expected_manifest_contract = {
+            "policy_schema": trainer.policy.architecture_id,
+            "architecture_version": int(trainer.policy.architecture_version),
+            "checkpoint_version": int(trainer.checkpoint_version),
+            "macro_actor_update_control_version": trainer.macro_actor_update_control_version,
+            "macro_actor_learning_rate_schedule": trainer.macro_actor_learning_rate_schedule,
+            "optimizer_learning_rate_schedule": trainer.optimizer_learning_rate_schedule,
+            "macro_actor_learning_rate_initial": trainer.learning_rates[
+                "macro_actor_initial"
+            ],
+            "macro_actor_learning_rate_final": trainer.learning_rates[
+                "macro_actor_final"
+            ],
+            "actor_learning_rate": trainer.learning_rates["actor"],
+            "macro_actor_learning_rate": trainer.learning_rates["macro_actor"],
+            "micro_actor_learning_rate": trainer.learning_rates["micro_actor"],
+            "macro_critic_learning_rate": trainer.learning_rates["macro_critic"],
+            "micro_critic_learning_rate": trainer.learning_rates["micro_critic"],
+            "long_value_learning_rate": trainer.learning_rates["long_value"],
+        }
+        for field, expected in expected_manifest_contract.items():
+            if manifest.get(field) != expected:
+                raise ValueError(f"run manifest {field} mismatch。")
         payload = trainer.load_checkpoint(
             checkpoint_path,
             config_raw_sha256=raw_hash,
             config_semantic_sha256=semantic_hash,
-            episode_pool=str(pool_path),
+            episode_pool=checkpoint_pool_identity,
             restore_rng=True,
         )
         completed = int(trainer.training_counters["completed_episodes"])
+        checkpoint_counters = dict(trainer.training_counters)
+        if payload.get("checkpoint_role") != "RESUMABLE_MAINLINE_CHECKPOINT":
+            raise ValueError("Selected Checkpoint is not a resumable committed checkpoint.")
+        if int(payload.get("seed", -1)) != int(seed):
+            raise ValueError("Checkpoint initialization seed mismatch.")
+        saved_learning_rates = payload.get("learning_rates")
+        if not isinstance(saved_learning_rates, dict) or saved_learning_rates != dict(
+            trainer.learning_rates
+        ):
+            raise ValueError("Checkpoint effective learning rates mismatch.")
+        if manifest.get("training_counters") != checkpoint_counters:
+            raise ValueError("run manifest counters do not match the selected Checkpoint.")
         best_return = payload.get("best_episode_return")
         if completed > int(target_episodes):
             raise ValueError("checkpoint completed episodes exceed --epochs。")
@@ -3782,6 +3872,23 @@ def run_training(
             group_size=group_size,
             slot_start=trainer.context.train_origin_start,
         )
+        summary_path = run_path / RUN_SUMMARY_FILENAME
+        if not summary_path.is_file():
+            raise FileNotFoundError("Cannot resume: run_summary.json is missing.")
+        with summary_path.open("r", encoding="utf-8") as stream:
+            summary = json.load(stream)
+        if (
+            summary.get("completed_episodes") != completed
+            or summary.get("policy_update_count")
+            != int(checkpoint_counters["policy_update_count"])
+            or summary.get("training_counters") != checkpoint_counters
+            or summary.get("learning_rates") != dict(trainer.learning_rates)
+            or not isinstance(summary.get("last_episode"), dict)
+            or summary["last_episode"].get("episode") != completed
+            or not isinstance(summary.get("last_update"), dict)
+            or summary["last_update"].get("episode") != completed
+        ):
+            raise ValueError("run_summary.json does not match the selected Checkpoint.")
     else:
         ensure_fresh_run_dir_is_clean(run_path)
         run_path.mkdir(parents=True, exist_ok=True)
@@ -3789,23 +3896,26 @@ def run_training(
     if run_config_path.is_file():
         if project_config.raw_config_sha256(run_config_path) != raw_hash:
             raise ValueError("run_config.toml does not match the canonical config.")
+    elif resume:
+        raise FileNotFoundError("Cannot resume: run_config.toml is missing.")
     else:
         shutil.copyfile(config_file, run_config_path)
     ensure_run_artifact_directories(run_path)
-    write_dual_timescale_run_manifest(
-        manifest_path,
-        config_path=config_file,
-        config_raw_sha256=raw_hash,
-        config_semantic_sha256=semantic_hash,
-        seed=seed,
-        trainer=trainer,
-        context=context,
-        target_episodes=target_episodes,
-        episode_pool=str(pool_path),
-        episode_pool_provenance=pool_provenance,
-        episode_seed_start=episode_seed_start,
-        resume=resume,
-    )
+    if not resume:
+        write_dual_timescale_run_manifest(
+            manifest_path,
+            config_path=config_file,
+            config_raw_sha256=raw_hash,
+            config_semantic_sha256=semantic_hash,
+            seed=seed,
+            trainer=trainer,
+            context=context,
+            target_episodes=target_episodes,
+            episode_pool=str(pool_path),
+            episode_pool_provenance=pool_provenance,
+            episode_seed_start=episode_seed_start,
+            resume=resume,
+        )
 
     episode_metrics_path = run_path / "episode_metrics.jsonl"
     update_metrics_path = run_path / "update_metrics.jsonl"
@@ -3882,12 +3992,30 @@ def run_training(
     save_run_summary()
     if not resume:
         trainer.save_checkpoint(
+            checkpoint_path_for_write(run_path, INITIAL_CHECKPOINT_FILENAME),
+            config_raw_sha256=raw_hash,
+            config_semantic_sha256=semantic_hash,
+            episode_pool=str(pool_path),
+            seed=seed,
+            best_episode_return=None,
+            checkpoint_role="INITIAL_POLICY_REFERENCE",
+        )
+        print(
+            "[CHECKPOINT] Saved Initialization | Completed Episodes=0",
+            flush=True,
+        )
+        trainer.save_checkpoint(
             checkpoint_path,
             config_raw_sha256=raw_hash,
             config_semantic_sha256=semantic_hash,
             episode_pool=str(pool_path),
             seed=seed,
             best_episode_return=None,
+        )
+        print(
+            "[CHECKPOINT] Saved | Completed Episodes="
+            f"{int(trainer.training_counters['completed_episodes'])}",
+            flush=True,
         )
 
     for group_zero_start in range(completed, int(target_episodes), group_size):
@@ -3909,17 +4037,44 @@ def run_training(
         optimizer_steps_before = tuple(
             int(trainer.training_counters[key]) for key in optimizer_step_keys
         )
+        optimizer_steps_before_by_key = dict(
+            zip(optimizer_step_keys, optimizer_steps_before, strict=True)
+        )
         for episode_index in range(group_zero_start, group_zero_start + group_size):
             collection_started_at = time.perf_counter()
+            episode_number = episode_index + 1
+            episode_seed = int(
+                episode_seed_start if episode_seed_start is not None else seed
+            ) + episode_index
+            episode_start_time = time.strftime(
+                "%Y-%m-%dT%H:%M:%S%z", time.localtime()
+            )
+            print(
+                f"[TRAIN] Episode {episode_number}/{target_episodes} | Collecting | "
+                f"Seed={episode_seed} | Started={episode_start_time}",
+                flush=True,
+            )
             realization_path = episode_paths[episode_index]
             next_context = load_environment_context(
                 str(config_file), realization_dir=realization_path
             )
             _assert_realization_context_compatible(context, next_context)
             trainer.context = context = next_context
-            episode_seed = int(
-                episode_seed_start if episode_seed_start is not None else seed
-            ) + episode_index
+
+            def report_rollout_progress(
+                slots_completed: int,
+                total_slots: int,
+                elapsed_seconds: float,
+                matching_kkt_elapsed_seconds: float,
+            ) -> None:
+                print(
+                    f"[ROLLOUT] Episode {episode_number}/{target_episodes} | "
+                    f"Slot {slots_completed}/{total_slots} | "
+                    f"Elapsed={elapsed_seconds:.1f}s | "
+                    f"MatchingKKT={matching_kkt_elapsed_seconds:.1f}s",
+                    flush=True,
+                )
+
             try:
                 collection = collect_dual_timescale_episode(
                     trainer.policy,
@@ -3927,6 +4082,14 @@ def run_training(
                     aligned_train_steps(context),
                     deterministic=False,
                     episode_seed=episode_seed,
+                    progress_callback=report_rollout_progress,
+                )
+                print(
+                    f"[TRAIN] Episode {episode_number}/{target_episodes} | "
+                    "Collection Completed | "
+                    f"Return={float(collection.summary['episode_return']):.6f} | "
+                    f"Time={time.perf_counter() - collection_started_at:.1f}s",
+                    flush=True,
                 )
             except FloatingPointError as exc:
                 early_stop_reason = "NAN_INF"
@@ -3954,20 +4117,131 @@ def run_training(
         if len(collections) != group_size:
             raise RuntimeError("policy-update group collection ended before all realizations completed")
 
+        update_group_number = int(trainer.training_counters["policy_update_count"]) + 1
+        update_group_total = int(trainer.policy_update_total)
+        print(
+            f"[PPO] Update Group {update_group_number}/{update_group_total} | "
+            f"Episodes={group_size} | Starting",
+            flush=True,
+        )
         update_started_at = time.perf_counter()
         try:
             update_metrics = trainer.update_from_episodes(collections)
         except FloatingPointError as exc:
+            update_runtime = time.perf_counter() - update_started_at
+            macro_actor_steps = (
+                int(trainer.training_counters["macro_actor_optimizer_steps"])
+                - optimizer_steps_before_by_key["macro_actor_optimizer_steps"]
+            )
+            micro_actor_steps = (
+                int(trainer.training_counters["micro_actor_optimizer_steps"])
+                - optimizer_steps_before_by_key["micro_actor_optimizer_steps"]
+            )
+            update_executed = macro_actor_steps + micro_actor_steps > 0
+            print(
+                f"[PPO-UPDATE] Group={update_group_number} | "
+                f"UPDATE_EXECUTED={'YES' if update_executed else 'NO'} | "
+                f"MacroActorSteps={macro_actor_steps} | "
+                f"MicroActorSteps={micro_actor_steps} | "
+                "ActorParameterDelta=NOT_MEASURED | "
+                "UPDATE_NUMERICALLY_SAFE=FAIL | NaNInf=YES | "
+                f"EarlyStop=NAN_INF ({exc}) | "
+                "POLICY_REWARD_IMPROVED=NOT_EVALUATED",
+                flush=True,
+            )
+            print(
+                f"[PPO] Update Group {update_group_number}/{update_group_total} | "
+                f"Stopped | Time={update_runtime:.1f}s | EarlyStop=NAN_INF",
+                flush=True,
+            )
             early_stop_reason = "NAN_INF"
             early_stop_detail = str(exc)
             save_run_summary()
             break
+        update_runtime = time.perf_counter() - update_started_at
         if _contains_nonfinite(update_metrics):
+            macro_actor_steps = int(
+                update_metrics.get("macro_actor_optimizer_steps_this_update", 0)
+            )
+            micro_actor_steps = int(
+                update_metrics.get("micro_actor_optimizer_steps_this_update", 0)
+            )
+            update_executed = macro_actor_steps + micro_actor_steps > 0
+            print(
+                f"[PPO-UPDATE] Group={update_group_number} | "
+                f"UPDATE_EXECUTED={'YES' if update_executed else 'NO'} | "
+                f"MacroActorSteps={macro_actor_steps} | "
+                f"MicroActorSteps={micro_actor_steps} | "
+                "ActorParameterDelta=NOT_MEASURED | "
+                "UPDATE_NUMERICALLY_SAFE=FAIL | NaNInf=YES | "
+                "EarlyStop=NAN_INF (PPO update metrics contain NaN/Inf) | "
+                "POLICY_REWARD_IMPROVED=NOT_EVALUATED",
+                flush=True,
+            )
+            print(
+                f"[PPO] Update Group {update_group_number}/{update_group_total} | "
+                f"Stopped | Time={update_runtime:.1f}s | EarlyStop=NAN_INF",
+                flush=True,
+            )
             early_stop_reason = "NAN_INF"
             early_stop_detail = "PPO update metrics contain NaN/Inf."
             save_run_summary()
             break
-        update_runtime = time.perf_counter() - update_started_at
+        print(
+            f"[PPO] Update Group "
+            f"{int(update_metrics['policy_update_group_id'])}/{update_group_total} | "
+            f"Completed | Time={update_runtime:.1f}s",
+            flush=True,
+        )
+        macro_actor_steps = int(
+            update_metrics["macro_actor_optimizer_steps_this_update"]
+        )
+        micro_actor_steps = int(
+            update_metrics["micro_actor_optimizer_steps_this_update"]
+        )
+        actor_optimizer_steps = macro_actor_steps + micro_actor_steps
+
+        def diagnostic_metric(name: str) -> str:
+            value = update_metrics.get(name)
+            return "NA" if value is None else f"{float(value):.4g}"
+
+        kl_guard_status = str(update_metrics.get("kl_guard_status", "NOT_REPORTED"))
+        macro_stop_reason = str(
+            update_metrics.get("macro_early_stop_reason") or "NONE"
+        )
+        final_stop_reason = str(update_metrics.get("final_stop_reason") or "NONE")
+        micro_early_stop = bool(update_metrics.get("micro_early_stop", False))
+        print(
+            f"[PPO-UPDATE] Group={int(update_metrics['policy_update_group_id'])} | "
+            f"UPDATE_EXECUTED={'YES' if actor_optimizer_steps > 0 else 'NO'} | "
+            f"MacroActorSteps={macro_actor_steps} | MicroActorSteps={micro_actor_steps} | "
+            "ActorParameterDelta=NOT_MEASURED | "
+            "UPDATE_NUMERICALLY_SAFE=PASS | NaNInf=NO | "
+            f"KLGuard={kl_guard_status} | "
+            f"MacroKL={diagnostic_metric('macro_joint_approx_kl')} | "
+            f"MicroKL={diagnostic_metric('micro_approx_kl')} | "
+            f"MacroClip={diagnostic_metric('macro_joint_clip_fraction')} | "
+            f"MicroClip={diagnostic_metric('micro_clip_fraction')} | "
+            f"MacroEntropy={diagnostic_metric('macro_entropy')} | "
+            f"MicroEntropy={diagnostic_metric('micro_entropy')} | "
+            "CriticSteps="
+            f"Macro:{int(update_metrics['macro_critic_optimizer_steps_this_update']):d},"
+            f"Micro:{int(update_metrics['micro_critic_optimizer_steps_this_update']):d},"
+            f"LongValue:{int(update_metrics['long_value_optimizer_steps_this_update']):d} | "
+            "CriticRMSE="
+            f"Macro:{diagnostic_metric('macro_value_rmse')},"
+            f"Micro:{diagnostic_metric('micro_value_rmse')},"
+            f"LongValue:{diagnostic_metric('long_value_rmse')} | "
+            "CriticEV="
+            f"Macro:{diagnostic_metric('macro_explained_variance')},"
+            f"Micro:{diagnostic_metric('micro_explained_variance')},"
+            f"LongValue:{diagnostic_metric('long_value_post_ev')} | "
+            f"EarlyStop={final_stop_reason} | "
+            f"MacroEarlyStop={macro_stop_reason} | "
+            f"MicroEarlyStop={'YES' if micro_early_stop else 'NO'} | "
+            "POLICY_REWARD_IMPROVED=NOT_EVALUATED",
+            flush=True,
+        )
         group_collection_runtime = float(sum(collection_runtimes))
         group_training_runtime = time.perf_counter() - group_started_at
         completed = int(trainer.training_counters["completed_episodes"])
@@ -4204,6 +4478,23 @@ def run_training(
             seed=seed,
             best_episode_return=best_return,
         )
+        print(f"[CHECKPOINT] Saved | Completed Episodes={completed}", flush=True)
+        update_count = int(trainer.training_counters["policy_update_count"])
+        if update_count % INTERMEDIATE_CHECKPOINT_INTERVAL_UPDATES == 0:
+            intermediate_name = f"update_{update_count:03d}_checkpoint.pt"
+            trainer.save_checkpoint(
+                checkpoint_path_for_write(run_path, intermediate_name),
+                config_raw_sha256=raw_hash,
+                config_semantic_sha256=semantic_hash,
+                episode_pool=str(pool_path),
+                seed=seed,
+                best_episode_return=best_return,
+            )
+            print(
+                f"[CHECKPOINT] Saved Intermediate | Update Group={update_count} | "
+                f"Completed Episodes={completed} | File={intermediate_name}",
+                flush=True,
+            )
         if save_best_train_return_checkpoint:
             trainer.save_checkpoint(
                 checkpoint_path_for_write(run_path, BEST_TRAIN_RETURN_CHECKPOINT_FILENAME),
@@ -4255,6 +4546,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--critic-learning-rate", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help="Explicit Checkpoint path inside the existing run's checkpoints directory.",
+    )
     parser.add_argument("--save-macro-transition-trace", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -4276,6 +4572,7 @@ def main(argv: list[str] | None = None) -> int:
         critic_learning_rate_override=args.critic_learning_rate,
         seed=args.seed,
         resume=bool(args.resume),
+        resume_checkpoint_path=args.resume_checkpoint,
         verbose=bool(args.verbose),
         save_macro_transition_trace=bool(args.save_macro_transition_trace),
     )

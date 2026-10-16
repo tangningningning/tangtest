@@ -138,6 +138,27 @@ def _masked_categorical(logits: Any, mask: Any) -> Any:
     )
 
 
+def _sum_log_probabilities(log_probabilities: Any, *, dim: int) -> Any:
+    """Accumulate float32 action log-probabilities in float64, then restore dtype."""
+
+    if not log_probabilities.is_floating_point():
+        raise TypeError("action log-probabilities must use a floating-point dtype")
+    return log_probabilities.to(dtype=torch.float64).sum(dim=dim).to(
+        dtype=log_probabilities.dtype
+    )
+
+
+def _macro_log_prob_from_components(
+    cache_log_prob: Any, termination_log_probabilities: Any, *, dim: int
+) -> tuple[Any, Any]:
+    """Use the same rounded component sum and joint addition in rollout and PPO."""
+
+    termination_log_prob_sum = _sum_log_probabilities(
+        termination_log_probabilities, dim=dim
+    )
+    return termination_log_prob_sum, cache_log_prob + termination_log_prob_sum
+
+
 def _group_aware_deterministic_candidate(
     raw_scores: Any,
     probabilities: Any,
@@ -848,7 +869,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             node_cache_log_probs = cache_distribution.log_prob(cache_action_values)
             node_cache_entropies = cache_distribution.entropy()
             node_cache_probabilities = cache_distribution.probs
-            cache_log_prob = node_cache_log_probs.sum(dim=-1)
+            cache_log_prob = _sum_log_probabilities(node_cache_log_probs, dim=-1)
             cache_entropy = node_cache_entropies.sum(dim=-1)
             cache_probabilities = node_cache_probabilities
             p_keep = cache_probabilities[:, :, 0]
@@ -934,9 +955,10 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 (*term_shape, 2), dtype=cache_probabilities.dtype, device=device
             )
 
-        termination_log_prob_sum = term_log_probs.sum(dim=1)
+        termination_log_prob_sum, joint_log_prob = _macro_log_prob_from_components(
+            cache_log_prob, term_log_probs, dim=1
+        )
         termination_entropy_sum = term_entropies.sum(dim=1)
-        joint_log_prob = cache_log_prob + termination_log_prob_sum
         decomposition_error = torch.abs(
             joint_log_prob.to(torch.float64)
             - cache_log_prob.to(torch.float64)

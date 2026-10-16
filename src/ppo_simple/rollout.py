@@ -7,7 +7,7 @@ import hashlib
 import math
 import random
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -20,7 +20,12 @@ from decision import cache_configuration, slot_environment, uav_configuration
 
 from . import interface
 from .interface import _copy_uav_positions
-from .policy import DualTimescaleActorCritic, MultiNodeFactorizedActorCritic
+from .policy import (
+    DualTimescaleActorCritic,
+    MultiNodeFactorizedActorCritic,
+    _macro_log_prob_from_components,
+    _sum_log_probabilities,
+)
 from .primitive_control import (
     CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM,
     CACHE_ECONOMIC_FEATURE_DIM,
@@ -268,10 +273,15 @@ class MacroRolloutBuffer:
                 or np.asarray(transition.actual_cache_update_by_node).shape != (node_count,)
             ):
                 raise ValueError("factorized Cache node probability/update trace is incomplete")
-            if abs(
-                float(np.sum(transition.old_node_cache_log_probs, dtype=np.float64))
-                - float(transition.old_cache_log_prob)
-            ) > 5.0e-6:
+            expected_cache_log_prob = np.float32(
+                np.sum(
+                    np.asarray(transition.old_node_cache_log_probs, dtype=np.float32),
+                    dtype=np.float64,
+                )
+            )
+            if float(expected_cache_log_prob) != float(
+                np.float32(transition.old_cache_log_prob)
+            ):
                 raise ValueError("node Cache log-probabilities do not sum to the joint Cache log-probability")
         elif candidate_masks.ndim != 1 or action_values.ndim != 0:
             raise ValueError("unified Cache actions and masks must retain scalar/indexed semantics")
@@ -321,10 +331,18 @@ class MacroRolloutBuffer:
         )
         if expected_duration != int(transition.actual_duration):
             raise ValueError("Termination trace does not explain the realized holding duration.")
-        reconstructed_log_prob = float(transition.old_cache_log_prob) + float(
-            np.sum(transition.old_termination_log_probs, dtype=np.float64)
+        termination_log_prob_sum = np.float32(
+            np.sum(
+                np.asarray(transition.old_termination_log_probs, dtype=np.float32),
+                dtype=np.float64,
+            )
         )
-        if abs(reconstructed_log_prob - float(transition.old_macro_log_prob)) > 5.0e-6:
+        reconstructed_log_prob = np.float32(
+            np.float32(transition.old_cache_log_prob) + termination_log_prob_sum
+        )
+        if float(reconstructed_log_prob) != float(
+            np.float32(transition.old_macro_log_prob)
+        ):
             raise ValueError("Stored Macro log-probability does not decompose into Cache and termination.")
         self.transitions.append(transition)
 
@@ -716,8 +734,14 @@ def collect_dual_timescale_episode(
     *,
     deterministic: bool = False,
     episode_seed: int | None = None,
+    progress_callback: Callable[[int, int, float, float], None] | None = None,
+    performance_sample_slots: set[int] | frozenset[int] | None = None,
+    performance_sample_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> EpisodeCollection:
-    """冻结策略完成完整 episode rollout，并返回分离的 Micro/Macro 数据。"""
+    """冻结策略完成完整 episode rollout，并返回分离的 Micro/Macro 数据。
+
+    内部性能计时仅在同时提供采样回调和 ``aligned_steps`` 零基索引时启用。
+    """
 
     if not aligned_steps:
         raise ValueError("完整 episode rollout 不能为空。")
@@ -735,6 +759,20 @@ def collect_dual_timescale_episode(
     total_slots = len(aligned_steps)
     if total_slots != int(context.episode_slots):
         raise ValueError("双时间尺度正式 rollout 必须覆盖完整 episode。")
+    sampled_slot_indices = (
+        frozenset(int(slot) for slot in performance_sample_slots)
+        if performance_sample_slots is not None
+        else None
+    )
+    if (sampled_slot_indices is None) != (performance_sample_callback is None):
+        raise ValueError(
+            "性能采样Slot与结果回调必须同时提供或同时省略。"
+        )
+    if sampled_slot_indices is not None and (
+        not sampled_slot_indices
+        or any(slot < 0 or slot >= total_slots for slot in sampled_slot_indices)
+    ):
+        raise ValueError("性能采样Slot索引必须非空且位于Episode范围内。")
     tensor_spec = PrimitiveTensorSpec.create(context)
     max_uav_candidates = int(tensor_spec.uav_max_candidates) + 1
     micro_buffer = MicroRolloutBuffer()
@@ -756,7 +794,6 @@ def collect_dual_timescale_episode(
     frame_old_cache_log_prob = 0.0
     frame_old_node_cache_log_probs: np.ndarray | None = None
     frame_old_node_cache_entropies: np.ndarray | None = None
-    frame_old_macro_log_prob = 0.0
     frame_old_macro_entropy = 0.0
     frame_old_value = 0.0
     frame_cache = cache.copy()
@@ -803,6 +840,7 @@ def collect_dual_timescale_episode(
     node_actual_update_records: list[np.ndarray] = []
     update_nodes_per_macro: list[int] = []
     start_time = time.perf_counter()
+    matching_kkt_elapsed_seconds = 0.0
 
     for slot_index, step in enumerate(aligned_steps):
         slot_started = time.perf_counter()
@@ -833,10 +871,10 @@ def collect_dual_timescale_episode(
                 frame_old_node_cache_entropies = np.asarray(
                     selected_nodes.node_entropies.detach().cpu(), dtype=np.float32
                 ).copy()
-                frame_old_cache_log_prob = float(
-                    np.sum(frame_old_node_cache_log_probs, dtype=np.float64)
-                )
-                frame_old_macro_log_prob = frame_old_cache_log_prob
+                cache_log_prob = _sum_log_probabilities(
+                    selected_nodes.node_log_probs.unsqueeze(0), dim=1
+                )[0]
+                frame_old_cache_log_prob = float(cache_log_prob.detach().cpu())
                 frame_old_macro_entropy = float(
                     np.sum(frame_old_node_cache_entropies, dtype=np.float64)
                 )
@@ -966,7 +1004,6 @@ def collect_dual_timescale_episode(
                 frame_old_node_cache_log_probs = None
                 frame_old_node_cache_entropies = None
                 frame_old_cache_log_prob = float(selected.log_prob.detach().cpu())
-                frame_old_macro_log_prob = frame_old_cache_log_prob
                 frame_old_macro_entropy = float(selected.cache_entropy.detach().cpu())
                 frame_old_value = float(selected.value.detach().cpu())
                 cache_probabilities = np.asarray(selected.cache_probabilities, dtype=np.float64)
@@ -1210,6 +1247,11 @@ def collect_dual_timescale_episode(
         ).hexdigest()[:16]
         actual_cache_update_count = int(np.count_nonzero(cache_update_mask(cache, frame_cache)))
         performance_profile: dict[str, Any] = {}
+        exact_q_timing_profile = (
+            {}
+            if sampled_slot_indices is not None and slot_index in sampled_slot_indices
+            else None
+        )
         environment_started = time.perf_counter()
         result = slot_environment.execute_configured_slot(
             cache,
@@ -1227,6 +1269,7 @@ def collect_dual_timescale_episode(
             slot_id=int(step.slot),
             time_s=float(step.time_s),
             performance_profile=performance_profile,
+            exact_q_timing_profile=exact_q_timing_profile,
         )
         environment_seconds = time.perf_counter() - environment_started
         if not result.step_feasible or result.system_utility is None:
@@ -1237,6 +1280,70 @@ def collect_dual_timescale_episode(
         _check_request_contract(cache, previous_uav, result, context.action_spec)
         reward = _check_reward(result)
         metrics = task_metrics_from_result(result, context.cache_nodes)
+        if exact_q_timing_profile is not None and performance_sample_callback is not None:
+            matching_summary = result.matching_summary
+            performance_sample_callback(
+                {
+                    "slot_index": int(slot_index),
+                    "slot_id": int(step.slot),
+                    "task_count": int(metrics.task_count),
+                    "task_utility": float(result.actual_task_utility),
+                    "system_utility": float(result.system_utility),
+                    "cache_cost": float(result.cache_cost),
+                    "movement_cost": float(result.movement_cost),
+                    "matching": dict(result.matching),
+                    "matching_seconds": float(
+                        performance_profile.get("matching_kkt_seconds", 0.0)
+                    ),
+                    "matching_diagnostics": {
+                        key: matching_summary.get(key)
+                        for key in (
+                            "resource_feasible",
+                            "resource",
+                            "node_task_count",
+                            "updates",
+                            "transfer_updates",
+                            "exchange_updates",
+                            "candidate_definitions_total",
+                            "candidate_evaluations_total",
+                            "upper_bound_screen_calls",
+                            "upper_bound_pruned_candidates",
+                            "full_evaluator_calls",
+                            "KKT_SOLVER_CALL_COUNT",
+                            "KKT_CACHE_REQUEST_COUNT",
+                            "KKT_CACHE_HIT_COUNT",
+                            "NODE_EVAL_CACHE_REQUEST_COUNT",
+                            "NODE_EVAL_CACHE_HIT_COUNT",
+                            "KKT_SOLVE_COUNT",
+                            "KKT_CONVERGED_COUNT",
+                            "KKT_MAX_ITER_HIT_COUNT",
+                            "KKT_FINITE_COUNT",
+                            "KKT_ITERATION_MEAN",
+                            "KKT_ITERATION_P95",
+                            "KKT_ITERATION_MAX",
+                            "stop_reason",
+                            "transfer_exchange_stable",
+                        )
+                    },
+                    "timing_profile_s": {
+                        key: float(exact_q_timing_profile.get(key, 0.0))
+                        for key in (
+                            "matching_total_runtime",
+                            "matching_other_runtime",
+                            "matching_candidate_generation_runtime",
+                            "matching_upper_bound_runtime",
+                            "matching_ideal_utility_runtime",
+                            "matching_exact_eval_orchestration_runtime",
+                            "kkt_runtime",
+                            "kkt_solver_core_runtime",
+                            "kkt_edge_cpu_solver_core_runtime",
+                            "kkt_edge_bandwidth_solver_core_runtime",
+                            "kkt_cloud_cpu_solver_core_runtime",
+                            "node_eval_miss_runtime",
+                        )
+                    },
+                }
+            )
         done = slot_index == total_slots - 1
         next_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
         next_uav = {
@@ -1336,7 +1443,6 @@ def collect_dual_timescale_episode(
             frame_termination_actions.append(termination_action)
             frame_old_termination_log_probs.append(termination_log_prob)
             frame_old_termination_entropies.append(termination_entropy)
-            frame_old_macro_log_prob += termination_log_prob
             frame_old_macro_entropy += termination_entropy
             termination_stop_probabilities.append(terminate_probability)
             termination_entropies.append(termination_entropy)
@@ -1357,6 +1463,21 @@ def collect_dual_timescale_episode(
             end_frame = termination_action == 1
 
         if end_frame:
+            policy_device = next(policy.parameters()).device
+            cache_log_prob_tensor = torch.as_tensor(
+                [frame_old_cache_log_prob], dtype=torch.float32, device=policy_device
+            )
+            termination_log_prob_tensor = torch.as_tensor(
+                frame_old_termination_log_probs,
+                dtype=cache_log_prob_tensor.dtype,
+                device=policy_device,
+            ).unsqueeze(0)
+            _, joint_macro_log_prob = _macro_log_prob_from_components(
+                cache_log_prob_tensor,
+                termination_log_prob_tensor,
+                dim=1,
+            )
+            frame_old_macro_log_prob = float(joint_macro_log_prob[0].detach().cpu())
             next_macro_state = np.zeros_like(frame_observation) if done else next_observation
             if done:
                 frame_old_next_value = 0.0
@@ -1415,6 +1536,18 @@ def collect_dual_timescale_episode(
                 )
             )
             frame_start = slot_index + 1
+        if progress_callback is not None:
+            matching_kkt_elapsed_seconds += float(
+                performance_profile.get("matching_kkt_seconds", 0.0)
+            )
+            slots_completed = slot_index + 1
+            if slots_completed % 30 == 0 or slots_completed == total_slots:
+                progress_callback(
+                    slots_completed,
+                    total_slots,
+                    time.perf_counter() - start_time,
+                    matching_kkt_elapsed_seconds,
+                )
     if not micro_buffer.transitions or not micro_buffer.transitions[-1].done:
         raise AssertionError("formal rollout must end at the true episode terminal")
     if not macro_buffer.transitions or not macro_buffer.transitions[-1].done:

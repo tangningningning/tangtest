@@ -270,22 +270,21 @@ total_cpu_cycles_per_s = 40.0e9
 # Cloud有限共享CPU总池为40 GHz；这是仿真假设，不是部署测量。
 resource_mode = "finite_pool"
 cpu_capacity_cycles_per_s = 40.0e9
-# B3-10E EQUAL_SHARE参考场景拟合的每任务固定等效速率为 1633066.7164444982 bit/s。
+# 本次实验设计指定 Cloud 每任务固定等效上行速率为 20 Mbps。
 # Matching运行时每个Cloud任务使用此固定等效值，不按任务数再次分摊。
-# 该训练数据条件拟合值不代表实际网络保证吞吐或物理可靠接入。
-uplink_rate_bps = 1633066.7164444982
+# 这是抽象实验参数，不代表实际网络保证吞吐或物理可靠接入。
+uplink_rate_bps = 20.0e6
 # 兼容现有接口的重复字段，必须与 uplink_rate_bps 相等；字段名中的 total 不表示共享池。
-total_bandwidth_bps = 1633066.7164444982
+total_bandwidth_bps = 20.0e6
 # 当前接口要求 resource_sharing=false：不建模 Cloud 接入用户间的带宽竞争。
 # Cloud CPU 是否共享由 resource_mode 独立控制；本配置使用有限共享 CPU 池。
 resource_sharing = false
 # 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c，
 # E_vc_vehicle = p_v * D_v / R_c；psi_c 不进入能耗。
-# B3-10E TRAIN-only EQUAL_SHARE拟合基于指定的等份RSU接入和每RSU共享回传参考假设。
-# R_cloud与psi_cloud为全池等效拟合值；不表示实际无线覆盖、吞吐保证或显式回传链路。
+# 本次实验设计指定 Cloud 等效上行速率与时延系数；不表示实际无线覆盖、吞吐保证或显式回传链路。
 # Cloud传输时延仍按 psi_cloud * D_bits / R_cloud 计算；车辆发送能耗不乘psi_cloud。
-# psi_cloud=1.0681932194051897 是训练数据条件拟合值，不按未来任务动态重算。
-cloud_delay_factor = 1.0681932194051897
+# psi_cloud=13.0 为本次指定的抽象实验参数。
+cloud_delay_factor = 13.0
 
 [communication]
 # 本 section 集中通信模型参数，后续 Cache surrogate、Matching、KKT 必须共用。
@@ -348,8 +347,8 @@ inter_node_spectrum = "ORTHOGONAL_INDEPENDENT"
 interference = "NONE"
 
 [communication.cloud]
-# Cloud每任务固定等效上行速率，须与nodes.cloud重复字段相同；数值来源为B3-10E TRAIN-only EQUAL_SHARE拟合。
-uplink_rate_bps = 1633066.7164444982
+# Cloud每任务固定等效上行速率，须与nodes.cloud重复字段相同；本次实验设计值为20 Mbps。
+uplink_rate_bps = 20.0e6
 
 [cache]
 # Cache/UAV prediction/configuration surrogate 的 horizon 折扣 beta；
@@ -651,10 +650,10 @@ terminal_origin = 299
 "nodes.cloud.total_cpu_cycles_per_s" = "CONFIRMED_DATA"
 "nodes.cloud.resource_mode" = "EXPERIMENT_DESIGN"
 "nodes.cloud.cpu_capacity_cycles_per_s" = "EXPERIMENT_DESIGN"
-"nodes.cloud.uplink_rate_bps" = "TRAIN_ONLY_CALIBRATION"
-"nodes.cloud.total_bandwidth_bps" = "TRAIN_ONLY_CALIBRATION"
+"nodes.cloud.uplink_rate_bps" = "EXPERIMENT_DESIGN"
+"nodes.cloud.total_bandwidth_bps" = "EXPERIMENT_DESIGN"
 "nodes.cloud.resource_sharing" = "CONFIRMED_DATA"
-"nodes.cloud.cloud_delay_factor" = "TRAIN_ONLY_CALIBRATION"
+"nodes.cloud.cloud_delay_factor" = "EXPERIMENT_DESIGN"
 "nodes.sv.bandwidth_hz" = "CONFIRMED_DATA"
 "nodes.rsu.bandwidth_hz" = "CONFIRMED_DATA"
 "nodes.uav.bandwidth_hz" = "CONFIRMED_DATA"
@@ -684,7 +683,7 @@ terminal_origin = 299
 "communication.air.beta_nlos" = "CONFIRMED_DATA"
 "communication.air.alpha_los" = "CONFIRMED_DATA"
 "communication.air.alpha_nlos" = "CONFIRMED_DATA"
-"communication.cloud.uplink_rate_bps" = "TRAIN_ONLY_CALIBRATION"
+"communication.cloud.uplink_rate_bps" = "EXPERIMENT_DESIGN"
 "objective.omega_delay" = "EXPERIMENT_DESIGN"
 "objective.omega_energy" = "EXPERIMENT_DESIGN"
 "objective.lambda_cache" = "EXPERIMENT_DESIGN"

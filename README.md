@@ -1,66 +1,61 @@
 # adaptive_cache_mec
 
-## 正式算法
+## 正式主线
 
-正式算法唯一名称为 `PROPOSED`，训练配置为 `configs/proposed/system_config.toml`。Cache 使用单一合法候选分布，candidate 0 表示 KEEP，其余候选为 UPDATE；UPDATE logits 按合法非零候选数做 cardinality correction。每个 Macro frame 起点只选择一个 Unified Cache candidate；执行每个 slot 后，termination policy 根据真实 post-slot observation 与 elapsed holding fraction 采样 CONTINUE 或 TERMINATE。holding bounds 固定为 1–5 slots，因此实际 duration 可为 1、2、3、4 或 5。Macro PPO 将 Cache candidate log probability 与该 frame 所有已采样 termination log probability 求和，只使用一个 joint ratio 和一个 clipped surrogate；强制 max holding 与 episode terminal 不进入 policy likelihood。这不是独立 Trigger PPO。每个 slot 的 Micro 策略按固定 UAV ID 顺序选择 UAV0 位置，再在 UAV0 条件下选择 UAV1 位置；两 UAV 仍共用一个联合概率比率和一个 PPO clipped surrogate。另加 STAY/MOVE 组熵底限正则，只作用于 Micro Actor；它是软惩罚，不裁剪或硬限制策略概率，也不改变随机训练采样。UAV candidate 0 表示保持当前位置。
+当前唯一正式算法为 `PROPOSED`，使用 Architecture 33、Checkpoint 60 和策略 Schema `adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1`。正式配置是 `configs/proposed/system_config.toml`：`MULTI_NODE_FACTORIZED` Cache 控制 9 个节点（5 个 SV、2 个 RSU、2 架 UAV），其中两架 UAV 也由 Micro 策略控制位置。
 
-对每个 UAV，`p_stay` 是 masked categorical 中候选 0 的概率，`p_move` 是所有非零候选概率之和。二元组熵为 `H_group = -p_stay log(p_stay) - p_move log(p_move)`。配置的概率软上限为 0.90，由此推导熵底限 `H_floor = -0.9 log(0.9) - 0.1 log(0.1)`；低于底限时才增加 `0.05 × mean(ReLU(H_floor - H_group))` Actor loss。该组熵描述 STAY 与 MOVE 的选择平衡；现有 `micro_candidate_entropy`/`micro_entropy` 仍表示完整候选分布的熵，两者含义不同。Micro PPO 的 target KL 为 0.02，Macro PPO 的 target KL 为 0.10。
+Macro Cache SMDP PPO 在每个 frame 起点为每个 Cache 节点各采样一个 masked categorical 候选动作。每个节点的候选 0 是 KEEP，其余合法候选是 UPDATE；UPDATE logits 按该节点合法 UPDATE 候选数进行 cardinality correction。给定 observation 和候选特征后，九个节点的 Cache 动作按分解分布采样，联合 Cache log-prob 是九个节点 log-prob 之和。Macro 联合策略还包含 frame 内实际采样的 holding termination 决策：Cache 联合 log-prob 与 termination log-prob 之和构成单一 PPO ratio；强制最大持有时间和 Episode 终点不计入 termination likelihood。Holding 范围为 1–5 slots。
 
-正式训练以 4 个独立 episode realization 为一个 on-policy update group；组内四条 rollout 都由同一冻结策略采样。每条 realization 单独计算 Micro/Macro GAE、Macro N2 target 和 realized return-to-go，再合并 transitions，并在整个 group 上统一标准化 Macro 与 Micro advantage。每组执行一次 Micro/Macro PPO 更新。300 个训练 realization（seed 20001–20300）对应 75 次 policy update。Macro Actor 学习率按 policy update 使用 cosine schedule，从 5e-4 衰减到 1e-4；Micro Actor 保持 3e-4。训练动作保持 stochastic；评价按既有 group-aware deterministic 规则选择动作。
+Micro UAV PPO 每个 slot 按固定顺序先采样 UAV0 位置，再基于 UAV0 的位置条件采样 UAV1 位置；两项条件 log-prob 相加形成 UAV 联合 log-prob，并使用一个 PPO ratio。UAV 候选 0 表示 STAY，其余候选表示 MOVE。训练保留当前 Micro Actor 的 STAY/MOVE 组熵软正则及现有 PPO 更新机制。
 
-长期数学定义与代码映射见 [`adaptive_dual_timescale_formula_updates.md`](adaptive_dual_timescale_formula_updates.md)。
+## 通信合同
 
-## 数据生成
+- SV、RSU、UAV 的链路系统带宽各为 10 MHz。
+- Edge 使用 `BANDWIDTH_DEPENDENT_NOISE_V1`；热噪声按 KKT 分配给任务的带宽计算。
+- Cloud 使用每任务固定等效速率 1633066.7164444982 bit/s、时延系数 1.0681932194051897，以及总量 40 GHz 的有限共享 CPU 池。
+- Cloud 速率和时延系数是基于 Training 数据条件拟合的抽象等效参数，不表示真实无线覆盖、吞吐保证或物理可靠性验证。
 
-正式 episode 生成入口为：
+## 正式训练
 
-- `scripts/generation/generate_episode_realization.py`：生成一个完整 episode realization。
-- `scripts/generation/generate_episode_pool.py`：按指定 seed 范围生成 episode pool。
+正式 Training Pool 为 `environment_data/proposed_joint_training/`，包含 300 个 Training Episode（seed 20001–20300），每个 Episode 有 300 个 slot。正式 Runner 固定 PPO 初始化 seed 27005；每 4 个 Episode 执行一次 Policy Update，共 75 组更新。Macro Actor 学习率为 5e-4，所有优化器采用 constant 学习率合同。
+
+在 `adaptive_cache_mec` Conda 环境中，从头训练和严格恢复训练均使用同一个正式 Runner、配置、Training Pool 和输出目录：
+
+```powershell
+conda activate adaptive_cache_mec
+python scripts/training/mainline_runner.py
+python scripts/training/mainline_runner.py --resume
+```
+
+Run 输出固定为 `runs/stageB3_10j_multi_node_v4_mainline/`。默认命令从头初始化策略和优化器；只要该 Run 目录已存在就会拒绝启动。`--resume` 要求该目录中已有 `run_manifest.json` 和 `checkpoints/latest_checkpoint.pt`，随后由 Trainer 执行既有严格恢复校验，恢复模型、优化器、计数器和随机数状态，并从完整 PPO 更新组边界继续。配置哈希、策略/架构、Checkpoint 版本、Training Pool provenance、Episode 数量、更新组边界和 Run 日志不匹配时会停止。新的通信配置不能严格恢复旧通信合同的 Checkpoint；此时应使用从头训练命令。
+
+## Checkpoint
+
+- `runs/stageB3_10j_multi_node_v4_mainline/checkpoints/latest_checkpoint.pt`：正式恢复训练和后续评价所用的 Checkpoint。
+- `runs/stageB3_10j_multi_node_v4_mainline/checkpoints/best_train_return_checkpoint.pt`：按单个 Training Episode return 保存的训练诊断产物，不用于最终模型选择。
+
+## 数据与评价入口
+
+Episode 数据生成入口：
+
+- `scripts/generation/generate_episode_realization.py`：生成单个 Episode realization。
+- `scripts/generation/generate_episode_pool.py`：按 seed 范围生成 Episode Pool。
 
 ```powershell
 python scripts/generation/generate_episode_realization.py --help
 python scripts/generation/generate_episode_pool.py --help
+ppo-eval --help
 ```
 
-## 训练
-
-训练使用 `ppo-train` 和完整 episode pool。`--epochs` 必须是 4 的倍数；checkpoint 与 resume 只允许在完整 update group 边界。Stage6正式对照使用独立配置和训练池；该池复用既有 Training episode 的轨迹、角色、预测、流行度、到达与服务ID，只将任务输入、CPU cycles 和场景负载预测按Stage6服务目录同步到500–2000 KB基准范围：
-
-其配置为 `configs/proposed/system_config.toml`，数据池为 `environment_data/stage6_candidate_resource_reduced_training`；数据准备复用既有池，不重新运行300次完整环境生成。
-
-数据池准备后，四个入口使用相同配置、Training Episode、PPO随机种子和其他算法参数，仅Macro Actor学习率不同：
-
-```powershell
-python scripts/training/run_stage6_lr_1e_minus_4.py
-python scripts/training/run_stage6_lr_5e_minus_4.py
-python scripts/training/run_stage6_lr_1e_minus_3.py
-python scripts/training/run_stage6_lr_5e_minus_3.py
-```
-
-四个入口通过 `mainline_runner.py` 调用同一个 `ppo_simple.trainer`，分别写入对应的 `runs/stage6_lr_*`。共享Runner拒绝覆盖已有Run，并在启动前核验Stage6配置、训练池及20001–20300的Train划分。Macro Actor学习率通过Trainer的CLI覆盖参数设置；Stage6采用constant调度，Trainer会将覆盖值同时用于初始和最终学习率，因此每次更新都应用同一个指定值。其他优化器仍使用Stage6配置中的学习率。
-
-`checkpoints/latest_checkpoint.pt` 是主线的恢复与正式评价 checkpoint。`best_train_return_checkpoint.pt` 按单个训练 episode 的 raw return 保存，仅作训练诊断；正式 evaluator 会拒绝该文件，不会把它当作最终模型选择结果。历史旧协议结果保留在既有 Run 与报告中；当前 `scripts/training/` 只保留Stage6四个正式入口和共享Runner。
-
-## 评价
-
-`ppo-eval` 校验 checkpoint 格式、架构、动作语义及配置合同，并拒绝 training-return diagnostic checkpoint。评价使用冻结策略，默认采用 deterministic action selection。Validation 和 Test 使用独立 episode pool，不要求与训练 pool 相同，并执行真实 Matching/KKT：
-
-```powershell
-ppo-eval --config configs/proposed/system_config.toml `
-  --checkpoint runs/<training-run>/checkpoints/latest_checkpoint.pt `
-  --run-dir runs/<evaluation-run> `
-  --episode-pool environment_data/<episode-pool> `
-  --seed-start <first-seed> --episodes <count>
-```
+评价入口 `ppo-eval` 使用冻结策略并校验 Checkpoint 合同；正式评价和模型选择使用 `latest_checkpoint.pt`。Training、Validation 与 Test 使用各自对应的数据划分。
 
 ## 主流程
 
 ```text
-固定 SUMO 网络与 prediction artifacts
-→ 四个 realization 在同一冻结策略下独立 rollout
-→ Transfer-Exchange Matching → KKT → 真实 G(t)
-→ episode-local target 与 GAE，再合并和统一 advantage normalization
-→ 一次 Macro joint PPO 与 Micro joint PPO update
-→ 每组一条 update record、每 episode 一条 episode record
-→ group-boundary checkpoint → frozen-policy evaluation
+Episode observation
+→ 九节点因子化 Cache 动作与两 UAV 自回归位置动作
+→ Cache/UAV 执行
+→ Transfer–Exchange Matching → KKT → slot reward
+→ 每四个独立 Episode realization 合并并进行一次 Macro/Micro PPO 更新
+→ 在完整更新组边界保存 latest checkpoint
 ```
