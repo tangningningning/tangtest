@@ -1,0 +1,51 @@
+name: Build UA2F APK for Xiaomi R3A
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: UA2F - OpenWrt 25.12.2 - mipsel_24kc
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Fetch official UA2F source
+        uses: actions/checkout@v4
+        with:
+          repository: Zxilly/UA2F
+          ref: 462e5bffb38a9682095b6c9fc7eb8367460a302e
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build using official OpenWrt 25.12.2 SDK
+        uses: openwrt/gh-action-sdk@v11
+        env:
+          ARCH: mipsel_24kc-25.12.2
+          FEEDNAME: packages_ci
+          PACKAGES: openwrt
+          V: sc
+
+      - name: Collect UA2F APK and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find bin/packages -type f -iname 'ua2f*.apk' -exec cp -v '{}' artifacts/ \;
+          test -n "$(find artifacts -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          (
+            cd artifacts
+            sha256sum -- *.apk > SHA256SUMS
+            ls -lh
+          )
+
+      - name: Upload build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ua2f-r3a-openwrt-25.12.2-mipsel_24kc
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
