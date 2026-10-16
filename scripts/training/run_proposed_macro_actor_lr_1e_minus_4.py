@@ -1,0 +1,7 @@
+"""Run the formal PROPOSED main experiment with Macro Actor LR 1e-4."""
+
+from mainline_runner import main_for_macro_actor_learning_rate
+
+
+if __name__ == "__main__":
+    raise SystemExit(main_for_macro_actor_learning_rate(1.0e-4))
