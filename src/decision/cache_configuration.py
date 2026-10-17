@@ -917,14 +917,14 @@ def has_legal_cache_target_configuration(
     node_index: int,
     service_catalog: dict[str, Any],
     cache_nodes: dict[str, Any],
+    *,
+    locked_services: Any = None,
 ) -> bool:
-    """Return whether one different capacity-feasible binary target exists.
+    """Return whether a different capacity-feasible target preserves locks.
 
-    This is the cheap online Trigger mask check.  It is linear in the number
-    of services and deliberately does not enumerate targets, inspect demand,
-    call the surrogate, or evaluate the environment.  For a non-empty
-    feasible row, removing any cached service is legal.  For an empty row, a
-    different target exists exactly when at least one service fits.
+    This cheap trigger check does not inspect demand or evaluate the
+    environment. Removing any cached unlocked service is legal; if all cached
+    services are locked, an absent service must fit in remaining capacity.
     """
 
     raw_cache = np.asarray(current_cache_state)
@@ -938,15 +938,33 @@ def has_legal_cache_target_configuration(
     before = np.asarray(raw_cache[index])
     if not np.all(np.isin(before, [0, 1])):
         raise ValueError("cache target row must be binary")
-    if bool(np.any(before)):
-        return True
     sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
     if sizes.shape != before.shape or not np.all(np.isfinite(sizes)):
         raise ValueError("service sizes are not finite or shape-aligned")
     capacity = float(cache_nodes["capacities_mb"][index])
     if not math.isfinite(capacity) or capacity < 0.0:
         raise ValueError("cache capacity must be finite and non-negative")
-    return bool(np.any(sizes <= capacity + 1.0e-9))
+    if not is_node_feasible(before, sizes, capacity):
+        raise ValueError("current Cache row violates node capacity")
+    if locked_services is None:
+        locked = np.zeros(before.shape, dtype=bool)
+    else:
+        raw_locked = np.asarray(locked_services)
+        if raw_locked.shape != before.shape or not np.all(np.isin(raw_locked, [0, 1, False, True])):
+            raise ValueError("locked services must be a binary vector aligned with catalog order")
+        locked = raw_locked.astype(bool, copy=False)
+    if np.any(locked & (before != 1)):
+        raise ValueError("an active service lock is absent from the current Cache row")
+    if bool(np.any((before == 1) & ~locked)):
+        return True
+    used = node_used_capacity_mb(before, sizes)
+    remaining = capacity - used
+    return bool(
+        np.any(
+            (before == 0)
+            & (sizes <= remaining + 1.0e-9)
+        )
+    )
 
 
 def _greedy_target_configuration(
@@ -982,6 +1000,7 @@ def enumerate_all_cache_target_configurations(
     config: CacheOptimizationConfig,
     *,
     prediction_horizon_mask: Any = None,
+    locked_services: Any = None,
 ) -> list[CacheTargetCandidate]:
     """Enumerate every non-KEEP capacity-feasible binary target configuration.
 
@@ -997,6 +1016,38 @@ def enumerate_all_cache_target_configurations(
     sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
     before = current_cache[index].copy()
     capacity = float(cache_nodes["capacities_mb"][index])
+    service_count = int(service_catalog["num_services"])
+    if service_count > 20:
+        raise ValueError("exhaustive Cache proposal enumeration is capped at 20 services")
+    if locked_services is None:
+        locked = np.zeros(before.shape, dtype=bool)
+    else:
+        raw_locked = np.asarray(locked_services)
+        if raw_locked.shape != before.shape or not np.all(np.isin(raw_locked, [0, 1, False, True])):
+            raise ValueError("locked services must be a binary vector aligned with catalog order")
+        locked = raw_locked.astype(bool, copy=False)
+    if np.any(locked & (before != 1)):
+        raise ValueError("an active service lock is absent from the current Cache row")
+
+    # Establish the complete legal target set before demand features, candidate
+    # scoring, sorting, or bounded candidate selection are performed.
+    legal_targets: dict[bytes, np.ndarray] = {}
+    for bitset in range(1 << service_count):
+        target = np.fromiter(
+            (((bitset >> service) & 1) for service in range(service_count)),
+            dtype=np.int8,
+            count=service_count,
+        )
+        if (
+            np.array_equal(target, before)
+            or np.any(locked & (target != 1))
+            or not is_node_feasible(target, sizes, capacity)
+        ):
+            continue
+        legal_targets[np.ascontiguousarray(target).tobytes()] = target
+    if not legal_targets:
+        return []
+
     demand = node_specific_predicted_demand(
         origin_scenario,
         index,
@@ -1004,9 +1055,6 @@ def enumerate_all_cache_target_configurations(
         config,
         prediction_horizon_mask=prediction_horizon_mask,
     )
-    service_count = int(service_catalog["num_services"])
-    if service_count > 20:
-        raise ValueError("exhaustive Cache proposal enumeration is capped at 20 services")
     replica_counts = np.sum(current_cache, axis=0).astype(np.float64)
     mean_demand = float(np.mean(demand)) if len(demand) else 0.0
     prediction_target = _greedy_target_configuration(demand, sizes, capacity)
@@ -1018,9 +1066,10 @@ def enumerate_all_cache_target_configurations(
         candidate = np.asarray(target, dtype=np.int8).reshape(-1)
         if candidate.shape != before.shape or not np.all(np.isin(candidate, [0, 1])):
             raise ValueError("target cache proposal must be binary and shape-aligned")
-        if np.array_equal(candidate, before) or not is_node_feasible(candidate, sizes, capacity):
+        key = np.ascontiguousarray(candidate).tobytes()
+        if key not in legal_targets:
             return
-        anchor_sources.setdefault(np.ascontiguousarray(candidate).tobytes(), source)
+        anchor_sources.setdefault(key, source)
 
     add_anchor("prediction", prediction_target)
     add_anchor("coverage_anchor", replica_target)
@@ -1037,15 +1086,7 @@ def enumerate_all_cache_target_configurations(
         add_anchor("low_reconfiguration", np.asarray(target, dtype=np.int8))
 
     candidates: list[CacheTargetCandidate] = []
-    for bitset in range(1 << service_count):
-        target = np.fromiter(
-            (((bitset >> service) & 1) for service in range(service_count)),
-            dtype=np.int8,
-            count=service_count,
-        )
-        if np.array_equal(target, before) or not is_node_feasible(target, sizes, capacity):
-            continue
-        key = np.ascontiguousarray(target).tobytes()
+    for key, target in legal_targets.items():
         candidates.append(
             CacheTargetCandidate(
                 node_index=index,

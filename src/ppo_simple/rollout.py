@@ -461,10 +461,18 @@ def _cache_candidates(
     step: Any,
     context: Any,
     tensor_spec: PrimitiveTensorSpec,
+    active_service_locks: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """candidate 0 是当前 Cache，其余候选复用现有节点 Cache proposal。"""
 
     current = np.asarray(cache, dtype=np.int8).copy()
+    locks = (
+        np.zeros(current.shape, dtype=bool)
+        if active_service_locks is None
+        else np.asarray(active_service_locks, dtype=bool)
+    )
+    if locks.shape != current.shape:
+        raise ValueError("active Cache service locks do not align with node/service order")
     proposal_nodes = uav_configuration.cache_nodes_with_uav_positions(
         context.cache_nodes,
         {key: np.asarray(value, dtype=np.float64) for key, value in uav.items()},
@@ -488,6 +496,7 @@ def _cache_candidates(
             context,
             proposal_nodes,
             prediction_horizon_mask=prediction_horizon_mask,
+            locked_services=locks[node_index],
         )
         if node_features.shape != (
             len(node_candidates),
@@ -554,6 +563,7 @@ def _cache_node_candidates(
     step: Any,
     context: Any,
     tensor_spec: PrimitiveTensorSpec,
+    active_service_locks: np.ndarray | None = None,
 ) -> tuple[list[list[np.ndarray]], np.ndarray, np.ndarray]:
     """Build one KEEP-plus-legal-UPDATE head per node from the same old cache."""
 
@@ -561,6 +571,13 @@ def _cache_node_candidates(
     node_ids = tuple(str(value) for value in context.action_spec.cache_node_ids)
     if current.ndim != 2 or current.shape[0] != len(node_ids):
         raise ValueError("multi-node Cache candidate state does not match stable node order")
+    locks = (
+        np.zeros(current.shape, dtype=bool)
+        if active_service_locks is None
+        else np.asarray(active_service_locks, dtype=bool)
+    )
+    if locks.shape != current.shape:
+        raise ValueError("active Cache service locks do not align with node/service order")
     proposal_nodes = uav_configuration.cache_nodes_with_uav_positions(
         context.cache_nodes,
         {key: np.asarray(value, dtype=np.float64) for key, value in uav.items()},
@@ -583,6 +600,7 @@ def _cache_node_candidates(
             context,
             proposal_nodes,
             prediction_horizon_mask=prediction_horizon_mask,
+            locked_services=locks[node_index],
         )
         if primitive.shape != (
             len(proposals),
@@ -882,8 +900,23 @@ def collect_dual_timescale_episode(
                 == interface.project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
             )
             if multi_node:
+                frame_active_service_locks = slot_environment.active_cache_service_locks(
+                    task_ledger,
+                    cache,
+                    context.service_catalog,
+                    context.cache_nodes,
+                    expected_node_ids=tuple(context.action_spec.cache_node_ids),
+                    expected_service_ids=tuple(context.observation_spec.service_ids),
+                )
                 node_candidates, frame_candidate_features, frame_candidate_masks = (
-                    _cache_node_candidates(cache, uav, step, context, tensor_spec)
+                    _cache_node_candidates(
+                        cache,
+                        uav,
+                        step,
+                        context,
+                        tensor_spec,
+                        frame_active_service_locks,
+                    )
                 )
                 if sparse_cache:
                     if not isinstance(policy, SparseCoordinatedCacheActorCritic):
@@ -993,6 +1026,10 @@ def collect_dual_timescale_episode(
                     target_cache[node_index] = chosen[node_index]
                 frame_cache = target_cache
                 frame_actual_update_by_node = cache_update_mask(cache, frame_cache)
+                if np.any(frame_cache[frame_active_service_locks] != 1):
+                    raise AssertionError(
+                        "selected Cache action evicted an active task service"
+                    )
                 if np.any(frame_actual_update_by_node & ~node_selected_updates):
                     raise AssertionError("Cache changed on a node whose sampled action was KEEP")
                 if sparse_cache:
@@ -1100,8 +1137,21 @@ def collect_dual_timescale_episode(
                         update_candidate_selection_counts.get(candidate_signature, 0) + 1
                     )
             else:
+                frame_active_service_locks = slot_environment.active_cache_service_locks(
+                    task_ledger,
+                    cache,
+                    context.service_catalog,
+                    context.cache_nodes,
+                    expected_node_ids=tuple(context.action_spec.cache_node_ids),
+                    expected_service_ids=tuple(context.observation_spec.service_ids),
+                )
                 _candidates, frame_candidate_features = _cache_candidates(
-                    cache, uav, step, context, tensor_spec
+                    cache,
+                    uav,
+                    step,
+                    context,
+                    tensor_spec,
+                    frame_active_service_locks,
                 )
                 frame_candidate_masks = np.ones(len(_candidates), dtype=bool)
                 if not bool(frame_candidate_masks[0]) or not np.array_equal(_candidates[0], cache):
@@ -1173,6 +1223,10 @@ def collect_dual_timescale_episode(
                 )
                 frame_cache = _candidates[frame_cache_index].copy()
                 frame_actual_update_by_node = cache_update_mask(cache, frame_cache)
+                if np.any(frame_cache[frame_active_service_locks] != 1):
+                    raise AssertionError(
+                        "selected Cache action evicted an active task service"
+                    )
                 frame_cache_changed = bool(np.any(frame_actual_update_by_node))
                 frame_macro_index = len(macro_buffer.transitions)
                 if deterministic:

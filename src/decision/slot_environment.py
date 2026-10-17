@@ -128,6 +128,82 @@ class CrossSlotTaskLedger:
         return created
 
 
+def active_cache_service_locks(
+    ledger: CrossSlotTaskLedger,
+    cache_state: np.ndarray,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    *,
+    expected_node_ids: tuple[str, ...] | None = None,
+    expected_service_ids: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    """Return the per-node services used by unfinished, assigned Edge tasks.
+
+    The ledger is the sole task-state source. The function also checks that its
+    service indices and node identities use the current formal catalog/order,
+    and that every active Edge dependency is present in the current Cache.
+    """
+
+    cache = np.asarray(cache_state)
+    node_ids = tuple(str(value) for value in cache_nodes["node_ids"])
+    service_ids = tuple(
+        int(value) for value in np.asarray(service_catalog["service_ids"]).tolist()
+    )
+    service_count = int(service_catalog["num_services"])
+    if len(service_ids) != service_count or service_ids != tuple(range(service_count)):
+        raise ValueError("formal service catalog IDs must match contiguous Cache service order")
+    if expected_node_ids is not None and tuple(expected_node_ids) != node_ids:
+        raise ValueError("Cache node order differs from the formal action specification")
+    if expected_service_ids is not None and tuple(expected_service_ids) != service_ids:
+        raise ValueError("service catalog order differs from the formal observation specification")
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError("Cache node IDs must be unique")
+    if cache.shape != (len(node_ids), service_count):
+        raise ValueError("Cache state shape differs from current node/service order")
+    cache_configuration.validate_cache_shape_and_capacity(
+        cache, service_catalog, cache_nodes
+    )
+    node_index_by_id = {node_id: index for index, node_id in enumerate(node_ids)}
+    locks = np.zeros(cache.shape, dtype=bool)
+    for task_id, state in ledger.active.items():
+        if str(task_id) != str(state.task_id):
+            raise ValueError(f"active task ledger key mismatch: {task_id}")
+        if state.execution_stage == "COMPLETED":
+            raise ValueError(f"completed task remains in active ledger: {task_id}")
+        service_id = int(state.service_id)
+        if service_id < 0 or service_id >= service_count:
+            raise ValueError(
+                f"active task {task_id} references unknown service ID {service_id}"
+            )
+        assigned_node = str(state.assigned_node)
+        if not assigned_node:
+            raise ValueError(f"active task {task_id} has no assigned execution node")
+        if assigned_node == task_allocation.CLOUD:
+            continue
+        if assigned_node not in node_index_by_id:
+            raise ValueError(
+                f"active task {task_id} references unknown Cache node {assigned_node}"
+            )
+        locks[node_index_by_id[assigned_node], service_id] = True
+
+    missing = np.argwhere(locks & (cache != 1))
+    if len(missing):
+        node_index, service_id = (int(value) for value in missing[0])
+        task_ids = sorted(
+            str(task_id)
+            for task_id, state in ledger.active.items()
+            if str(state.assigned_node) == node_ids[node_index]
+            and int(state.service_id) == service_id
+            and str(state.assigned_node) != task_allocation.CLOUD
+        )
+        raise CacheLockConflict(
+            "active-task/cache state is inconsistent: required service is absent "
+            f"from its assigned node (node={node_ids[node_index]}, service={service_id}, "
+            f"tasks={task_ids})"
+        )
+    return locks
+
+
 def _task_from_execution_state(
     state: TaskExecutionState,
     transmit_time_share: float,
@@ -1453,6 +1529,33 @@ def execute_configured_slot(
     final_uav = _position_tuples(final_uav_positions)
     if previous_cache.shape != final_cache.shape:
         raise ValueError("最终 Cache 配置 shape 必须与当前 Cache 一致。")
+    cache_configuration.validate_cache_shape_and_capacity(
+        previous_cache, service_catalog, cache_nodes
+    )
+    cache_configuration.validate_cache_shape_and_capacity(
+        final_cache, service_catalog, cache_nodes
+    )
+    if task_ledger is not None:
+        locks = active_cache_service_locks(
+            task_ledger,
+            previous_cache,
+            service_catalog,
+            cache_nodes,
+        )
+        evicted = np.argwhere(locks & (final_cache != 1))
+        if len(evicted):
+            node_index, service_id = (int(value) for value in evicted[0])
+            task_ids = sorted(
+                str(task_id)
+                for task_id, state in task_ledger.active.items()
+                if str(state.assigned_node) == str(cache_nodes["node_ids"][node_index])
+                and int(state.service_id) == service_id
+            )
+            raise CacheLockConflict(
+                "selected Cache target is illegal for the current active-task ledger: "
+                f"node={cache_nodes['node_ids'][node_index]}, service={service_id}, "
+                f"tasks={task_ids}"
+            )
     cache_updates = np.any(final_cache != previous_cache, axis=1).astype(np.int8)
     tolerance = float(
         project_config.get_config_value(

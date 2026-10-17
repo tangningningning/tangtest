@@ -324,6 +324,7 @@ def _all_cache_target_configurations_with_features(
     context: Any,
     proposal_cache_nodes: dict[str, Any],
     prediction_horizon_mask: Any = None,
+    locked_services: Any = None,
 ) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
     """枚举全部可行配置，并只计算低成本特征。"""
 
@@ -335,6 +336,7 @@ def _all_cache_target_configurations_with_features(
         step.scenario_slice,
         context.cache_cfg,
         prediction_horizon_mask=prediction_horizon_mask,
+        locked_services=locked_services,
     )
     if not all_candidates:
         return [], np.zeros(
@@ -377,6 +379,7 @@ def _target_cache_proposals_with_features(
     surrogate_predictor: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
     surrogate_ready: bool = False,
     prediction_horizon_mask: Any = None,
+    locked_services: Any = None,
 ) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
     """根据全部可行配置构造 rollout 候选集合。"""
 
@@ -389,6 +392,7 @@ def _target_cache_proposals_with_features(
         context,
         proposal_cache_nodes,
         prediction_horizon_mask,
+        locked_services,
     )
     if not all_candidates:
         return all_candidates, all_features
