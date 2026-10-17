@@ -55,6 +55,7 @@ def optimize_joint_held_action(
     screen_assignment_budget: int = 8,
     full_assignment_budget: int = 24,
     objective_tolerance: float = 1.0e-9,
+    horizon_mask: Sequence[bool] | None = None,
 ) -> JointHeldActionResult:
     """Screen joint actions with common forecasts; full-score finalists.
 
@@ -147,6 +148,7 @@ def optimize_joint_held_action(
             origin_scenario, cache_state, positions, project_cfg,
             cache_nodes, cache_config,
             scenario_indices=scenario_ids,
+            horizon_mask=horizon_mask,
             discount_beta=beta,
             assignment_budget_per_slot=budget,
             assignment_exact_task_limit=4,
