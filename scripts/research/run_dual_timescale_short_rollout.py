@@ -38,7 +38,7 @@ def run() -> None:
         default="environment_data/proposed_joint_training/episode_20001",
     )
     parser.add_argument("--start-slot", type=int, default=0)
-    parser.add_argument("--slots", type=int, default=3)
+    parser.add_argument("--slots", type=int, default=2)
     parser.add_argument(
         "--mode",
         choices=("joint", "cache_only", "uav_only", "keep_stay"),
@@ -46,6 +46,8 @@ def run() -> None:
     )
     parser.add_argument("--cache-hold-slots", type=int, default=3)
     parser.add_argument("--horizon", type=int, default=2)
+    parser.add_argument("--max-cache-proposals", type=int, default=2)
+    parser.add_argument("--max-uav-proposals", type=int, default=2)
     parser.add_argument("--actual-assignment-budget", type=int, default=32)
     args = parser.parse_args()
     if not 1 <= args.slots <= 5:
@@ -98,10 +100,12 @@ def run() -> None:
             cache_hold_slots=args.cache_hold_slots,
             planning_horizon=args.horizon,
             max_cache_proposals=(
-                0 if args.mode in {"uav_only", "keep_stay"} else 4
+                0 if args.mode in {"uav_only", "keep_stay"}
+                else args.max_cache_proposals
             ),
             max_uav_proposals=(
-                0 if args.mode in {"cache_only", "keep_stay"} else 4
+                0 if args.mode in {"cache_only", "keep_stay"}
+                else args.max_uav_proposals
             ),
             screen_scenarios=1, full_scenarios=2,
             screen_assignment_budget=8, full_assignment_budget=24,
@@ -199,6 +203,8 @@ def run() -> None:
         "slots": args.slots,
         "cache_hold_slots": args.cache_hold_slots,
         "planning_horizon": args.horizon,
+        "max_cache_proposals": args.max_cache_proposals,
+        "max_uav_proposals": args.max_uav_proposals,
         "total_matching_realized_net": total_matching_net,
         "total_independent_realized_net": total_new_net,
         "prediction_assignment_oracle_calls": total_prediction_oracles,
