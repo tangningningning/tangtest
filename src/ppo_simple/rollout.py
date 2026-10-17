@@ -703,6 +703,7 @@ def _uav_candidates(
         cache_state=cache,
         cache_nodes=context.cache_nodes,
         predicted_vehicle_positions=step.predicted_vehicle_positions,
+        prediction_horizon_mask=step.prediction_horizon_mask,
     )
     stay_position = np.asarray(current_uav[uav_id], dtype=np.float64).copy()
     stay = uav_configuration.UavTargetCandidate(
@@ -716,6 +717,7 @@ def _uav_candidates(
         step.scenario_slice,
         int(context.service_catalog["num_services"]),
         beta_discount=context.cache_cfg.beta_discount,
+        prediction_horizon_mask=step.prediction_horizon_mask,
     )
     features: list[np.ndarray] = []
     for index, candidate in enumerate(candidates):

@@ -301,6 +301,7 @@ def _service_aware_uav_demand_weights(
     cache_nodes: dict[str, Any],
     uav_id: str,
     beta_discount: float = 1.0,
+    prediction_horizon_mask: Any = None,
 ) -> tuple[tuple[str, ...], np.ndarray]:
     service_count = int(np.asarray(cache_state).shape[1])
     vehicle_ids = tuple(str(value) for value in scenario_slice["vehicle_ids"].tolist())
@@ -308,6 +309,7 @@ def _service_aware_uav_demand_weights(
         scenario_slice,
         service_count,
         beta_discount=float(beta_discount),
+        prediction_horizon_mask=prediction_horizon_mask,
     )
     node_ids = [str(value) for value in cache_nodes["node_ids"]]
     if str(uav_id) not in node_ids:
@@ -332,12 +334,15 @@ def enumerate_uav_target_candidates(
     cache_state: np.ndarray,
     cache_nodes: dict[str, Any],
     predicted_vehicle_positions: dict[str, Any],
+    prediction_horizon_mask: Any = None,
 ) -> list[UavTargetCandidate]:
     """Return demand-aware MOVE targets plus a small deterministic geometry set.
 
     The candidate set excludes STAY; STAY remains exclusively the high-level
     operation head.  Every returned point is checked against the existing
     boundary, one-slot displacement, and sequential multi-UAV safety rules.
+    ``prediction_horizon_mask`` limits demand weights when supplied; ``None``
+    preserves the original all-horizon semantics for other callers.
     """
 
     uav_ids = uav_ids_from_project(project_cfg)
@@ -359,6 +364,7 @@ def enumerate_uav_target_candidates(
         beta_discount=float(
             project_config.get_config_value(project_cfg, "cache.discount_beta", 1.0)
         ),
+        prediction_horizon_mask=prediction_horizon_mask,
     )
     ordered_positions = np.asarray(
         [predicted_vehicle_positions[vehicle_id] for vehicle_id in vehicle_ids],

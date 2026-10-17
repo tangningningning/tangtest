@@ -1225,6 +1225,7 @@ class PPOTrainer:
             "adaptive_holding_min_slots": self.adaptive_holding_min_slots,
             "adaptive_holding_max_slots": self.adaptive_holding_max_slots,
             "prediction_horizon": int(self.context.observation_spec.prediction_horizon),
+            "uav_candidate_demand_horizon_contract": "valid_prediction_horizons_only_v1",
             "hidden_sizes": list(self.hidden_sizes),
             "policy_schema": str(self.policy.architecture_id),
             "architecture_version": int(self.policy.architecture_version),
