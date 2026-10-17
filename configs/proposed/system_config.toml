@@ -375,16 +375,30 @@ omega_delay = 0.6
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_energy = 0.4
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
-# Cache 配置成本权重 lambda_cache，是系统目标函数中唯一的 lambda^ca 入口。
-# 它只把 cache loading energy 映射为 objective cost，
-# 用于人为控制 reconfiguration energy 相对于 task utility 的惩罚尺度。
+# lambda_cache 只把 Cache 新增装载能耗映射为目标成本；cache_cost_weight 是整个 C_ca 的外层权重。
+# 两者分别是能耗映射参数和整项成本权重，不能互相替代，也不能把外层权重重复乘入公式。
+# lambda_cache 用于人为控制 reconfiguration energy 相对于 task utility 的惩罚尺度。
 # 当前 0.1 是固定的目标权衡参数，不声称为物理量或文献校准值。
 # 既有配置说明曾把典型单节点配置动作约占 normal-slot utility 约 10% 作为设计假设；
 # 本轮将其明确为 experiment-design interpretation，不使用 accepted action 反向选择它。
 # 后续正式实验只做 one-factor-at-a-time 的 0.5x/1x/2x sensitivity；本轮不运行。
-# 正成本口径：C_ca = eta_ca*z_actual + lambda_cache*xi_ca*loaded_mb；
-# C_q = eta_q*z_q_actual + lambda_movement*xi_mov*distance；
-# G = Q - C_ca - C_q；负号只出现在 G 中，不写入 C_ca/C_q。
+# 系统 Slot 目标：G(t) = Q(t) - C_ca(t) - C_q(t)，C_ca/C_q 为正成本且只在 G 中各扣除一次。
+# Q(t) 已通过任务效用计入时延与车辆上传能耗惩罚；Cache/UAV 配置成本由 C_ca/C_q 单独核算。
+# loaded_mb_m(t) = sum_f service_size_mb_f * max(cache_new_mf(t) - cache_old_mf(t), 0)
+# C_ca(t) = cache_cost_weight * sum_m [
+#     eta_ca_m * z_ca_actual_m(t)
+#     + lambda_cache * xi_ca_m * loaded_mb_m(t)
+# ]
+# C_q(t) = uav_movement_cost_weight * sum_u [
+#     movement_fixed_cost_u * z_q_actual_u(t)
+#     + lambda_movement * movement_energy_coefficient_j_per_m * distance_u(t)
+# ]
+# z_ca_actual_m=1 仅当节点缓存实际变化；只计新增装载量，删除服务不产生负成本。
+# z_q_actual_u=1 仅当 UAV 实际移动；固定成本只在实际移动时收取，distance_u 是实际位移。
+# lambda_cache/lambda_movement 映射相应能耗，cache_cost_weight/uav_movement_cost_weight 分别缩放整个成本项。
+# 因此两个 lambda 不替代外层权重，外层权重也不重复相乘；配置成本不是物理焦耳的直接合计。
+# movement_energy_j 是系数乘实际位移得到的物理能耗统计，不等于 Reward 直接扣除的 movement_cost。
+# Cache/UAV 固定时 C_ca/C_q 对 Matching/KKT 为常数，该子问题优化 Q(t)；最终 G(t) 只扣除成本一次。
 lambda_cache = 0.1
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
 # 它只把 UAV movement energy 映射为 objective cost，
