@@ -119,7 +119,8 @@ def _cache_proposals(
         changes = int(np.count_nonzero(next_cache != previous))
         proposals.append((gain, changes, node_index, next_cache))
     proposals.sort(key=lambda x: (-x[0], x[1], x[2]))
-    selected = [row[3] for row in proposals[:limit]]
+    single_budget = limit - 1 if limit >= 2 and len(proposals) >= 2 else limit
+    selected = [row[3] for row in proposals[:single_budget]]
     # A coordinated proposal can reveal Cache complementarity that a
     # single-node move misses (e.g. replace complementary service replicas).
     if len(proposals) >= 2 and len(selected) < limit:
@@ -179,6 +180,7 @@ def _uav_proposals(
             for uid in uav_ids
         }
 
+    per_node_budget = limit - 1 if len(uav_ids) >= 2 and limit >= 2 else limit
     for uid in uav_ids:
         proposed_triggers = {u: int(u == uid) for u in uav_ids}
         suggested = uav_configuration.enumerate_uav_target_candidates(
@@ -196,7 +198,7 @@ def _uav_proposals(
             )
             if uid not in first_target:
                 first_target[uid] = trial[uid].copy()
-            if len(proposals) < limit:
+            if len(proposals) < per_node_budget:
                 proposals.append(trial)
     if len(first_target) >= 2 and len(proposals) < limit:
         trial = {u: old.copy() for u, old in previous.items()}
@@ -259,16 +261,19 @@ def decide_dual_timescale_action(
     mask = np.zeros(h, dtype=bool)
     mask[:min(planning_horizon, h)] = True
     macro_boundary = state.cache_frame_slots_remaining == 0
+    proposal_cache_nodes = uav_configuration.cache_nodes_with_uav_positions(
+        cache_nodes, old_uav
+    )
     cache_candidates = (
         _cache_proposals(
-            old_cache, origin_scenario, service_catalog, cache_nodes, cache_config,
+            old_cache, origin_scenario, service_catalog, proposal_cache_nodes, cache_config,
             limit=max_cache_proposals, horizon_mask=mask,
         )
         if macro_boundary
         else []
     )
     uav_candidates = _uav_proposals(
-        old_uav, old_cache, origin_scenario, project_cfg, cache_nodes,
+        old_uav, old_cache, origin_scenario, project_cfg, proposal_cache_nodes,
         flight_boundary, limit=max_uav_proposals, horizon_mask=mask,
     )
     count = (1 + len(cache_candidates)) * (1 + len(uav_candidates))
