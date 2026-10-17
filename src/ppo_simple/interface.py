@@ -21,6 +21,7 @@ from scenario.realization import (
 
 PROPOSED_POLICY_SCHEMA = project_config.PROPOSED_POLICY_SCHEMA
 MULTI_NODE_FACTORIZED_POLICY_SCHEMA = project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA
+SPARSE_COORDINATED_CACHE_POLICY_SCHEMA = project_config.SPARSE_COORDINATED_CACHE_POLICY_SCHEMA
 PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
 
 
@@ -170,11 +171,13 @@ def load_environment_context(
             "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION",
         )
     )
-    expected_schema = (
-        MULTI_NODE_FACTORIZED_POLICY_SCHEMA
-        if cache_action_mode == project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED
-        else PROPOSED_POLICY_SCHEMA
-    )
+    expected_schema = {
+        project_config.CACHE_ACTION_MODE_SINGLE_NODE: PROPOSED_POLICY_SCHEMA,
+        project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED: MULTI_NODE_FACTORIZED_POLICY_SCHEMA,
+        project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED: SPARSE_COORDINATED_CACHE_POLICY_SCHEMA,
+    }.get(cache_action_mode)
+    if expected_schema is None:
+        raise ValueError(f"unsupported Cache action mode: {cache_action_mode}")
     if policy_schema != expected_schema:
         raise ValueError(
             "Cache action mode 与 policy schema 不匹配："
@@ -184,9 +187,13 @@ def load_environment_context(
     if cache_action_mode not in {
         project_config.CACHE_ACTION_MODE_SINGLE_NODE,
         project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
+        project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED,
     }:
         raise ValueError(f"unsupported Cache action mode: {cache_action_mode}")
-    if cache_action_mode == project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED:
+    if cache_action_mode in {
+        project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
+        project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED,
+    }:
         if cache_reconfiguration_model != project_config.CACHE_RECONFIGURATION_MODEL_ABSTRACT:
             raise ValueError("multi-node mode requires the explicit abstract reconfiguration model")
         roles = [str(value).upper() for value in cache_nodes["node_roles"]]
@@ -196,6 +203,18 @@ def load_environment_context(
             raise ValueError(
                 "MULTI_NODE_FACTORIZED requires stable 5-SV/2-RSU/2-UAV cache node order"
             )
+        if cache_action_mode == project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED:
+            max_updates = project_config.get_config_value(
+                cfg, "algorithm.ppo.max_cache_updates_per_frame", None
+            )
+            if (
+                isinstance(max_updates, bool)
+                or not isinstance(max_updates, int)
+                or max_updates != 1
+            ):
+                raise ValueError(
+                    "sparse coordinated mode requires max_cache_updates_per_frame=1"
+                )
     elif cache_reconfiguration_model != "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION":
         raise ValueError("single-node mode has an unsupported cache reconfiguration model")
     ppo_config = cfg["algorithm"]["ppo"]
@@ -1223,12 +1242,24 @@ def prepare_aligned_rollout_steps(
 
         actual_tasks = task_allocation.load_actual_tasks(tasks_file, slot)
         sv_ids = {str(value) for value in scenario["service_vehicle_ids"].tolist()}
-        tv_ids = {task.vehicle_id for task in actual_tasks}
+        # Cross-slot tasks can outlive their arrival slot, so current positions
+        # are loaded for every TV that is still present in this trajectory slice.
+        # Missing historical-task positions are rejected by the execution ledger;
+        # unrelated departed TVs do not invalidate the whole aligned step.
+        tv_ids = {str(value) for value in scenario["vehicle_ids"].tolist()}
         actual_positions = task_allocation.load_vehicle_positions(
             trajectory_file,
             time_s,
             sv_ids | tv_ids,
+            require_all=False,
         )
+        required_current = sv_ids | {task.vehicle_id for task in actual_tasks}
+        missing_required = required_current - set(actual_positions)
+        if missing_required:
+            raise ValueError(
+                f"trajectory.csv 缺少当前 time_s={time_s} 的服务车辆/到达任务位置："
+                f"{sorted(missing_required)}"
+            )
         steps.append(
             AlignedRolloutStep(
                 origin_index=origin_index,

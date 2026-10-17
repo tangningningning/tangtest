@@ -28,12 +28,17 @@ from .interface import (
 )
 from .reporting import resolve_checkpoint_reference
 from .rollout import collect_dual_timescale_episode
-from .policy import DualTimescaleActorCritic, MultiNodeFactorizedActorCritic
+from .policy import (
+    DualTimescaleActorCritic,
+    MultiNodeFactorizedActorCritic,
+    SparseCoordinatedCacheActorCritic,
+)
 from .trainer import (
     ALGORITHM_ID,
     CHECKPOINT_METHOD,
     CHECKPOINT_VERSION,
     MULTI_NODE_CHECKPOINT_VERSION,
+    SPARSE_COORDINATED_CHECKPOINT_VERSION,
     PPOTrainer,
     SUPPORTED_MACRO_ACTOR_LEARNING_RATES,
 )
@@ -150,10 +155,20 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         expected_policy = DualTimescaleActorCritic
         expected_version = CHECKPOINT_VERSION
         expected_unified_cache_action = True
+        expected_cache_action_mode = project_config.CACHE_ACTION_MODE_SINGLE_NODE
+        expected_cardinality_correction = True
     elif policy_schema == MultiNodeFactorizedActorCritic.architecture_id:
         expected_policy = MultiNodeFactorizedActorCritic
         expected_version = MULTI_NODE_CHECKPOINT_VERSION
         expected_unified_cache_action = False
+        expected_cache_action_mode = project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED
+        expected_cardinality_correction = True
+    elif policy_schema == SparseCoordinatedCacheActorCritic.architecture_id:
+        expected_policy = SparseCoordinatedCacheActorCritic
+        expected_version = SPARSE_COORDINATED_CHECKPOINT_VERSION
+        expected_unified_cache_action = False
+        expected_cache_action_mode = project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
+        expected_cardinality_correction = False
     else:
         raise ValueError("checkpoint policy schema is not supported by PROPOSED")
     if int(payload.get("checkpoint_version", -1)) != expected_version:
@@ -188,19 +203,29 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         raise ValueError("checkpoint config_contract policy_schema mismatch")
     if payload.get("unified_cache_action") is not expected_unified_cache_action:
         raise ValueError("checkpoint Cache candidate action mode does not match its policy schema")
-    if payload.get("cardinality_corrected_cache_action") is not True:
-        raise ValueError("checkpoint does not use Cache cardinality correction")
+    if payload.get("cardinality_corrected_cache_action") is not expected_cardinality_correction:
+        raise ValueError("checkpoint Cache probability contract does not match its schema")
+    sparse_probability_contract_valid = (
+        expected_cache_action_mode != project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
+        or (
+            contract.get("max_cache_updates_per_frame") == 1
+            and contract.get("cache_group_probability_semantics")
+            == "masked categorical over ALL_KEEP and each node with at least one legal UPDATE"
+            and contract.get("cache_conditional_probability_semantics")
+            == "masked categorical over legal UPDATE targets for the selected node only"
+        )
+    )
     if (
         contract.get("architecture_version") != expected_architecture
         or contract.get("unified_cache_action") is not expected_unified_cache_action
-        or contract.get("cache_action_mode")
-        != (
-            project_config.CACHE_ACTION_MODE_SINGLE_NODE
-            if expected_unified_cache_action
-            else project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED
-        )
-        or contract.get("cardinality_corrected_cache_action") is not True
+        or contract.get("cache_action_mode") != expected_cache_action_mode
+        or contract.get("cardinality_corrected_cache_action") is not expected_cardinality_correction
         or contract.get("macro_cache_feature_dim") != 200
+        or (
+            expected_cache_action_mode == project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
+            and contract.get("max_cache_updates_per_frame") != 1
+        )
+        or not sparse_probability_contract_valid
     ):
         raise ValueError("checkpoint PROPOSED configuration contract mismatch")
     expected_rates = {
@@ -616,7 +641,10 @@ def evaluate_pool(
                     context.cache_action_mode
                     == project_config.CACHE_ACTION_MODE_SINGLE_NODE
                 ),
-                cardinality_corrected_cache_action=True,
+                cardinality_corrected_cache_action=(
+                    context.cache_action_mode
+                    != project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
+                ),
             )
             trainer.load_checkpoint(
                 checkpoint,
@@ -656,6 +684,7 @@ def evaluate_pool(
                     context,
                     aligned_train_steps(context),
                     deterministic=policy_action_mode == "deterministic",
+                    episode_seed=episode_seed,
                 )
             summary = _episode_summary(collection, episode_seed, repeat_index)
             summary["policy_sampling_seed"] = action_seed

@@ -21,8 +21,12 @@ PROPOSED_POLICY_SCHEMA = (
 MULTI_NODE_FACTORIZED_POLICY_SCHEMA = (
     "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1"
 )
+SPARSE_COORDINATED_CACHE_POLICY_SCHEMA = (
+    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v5_sparse_coordinated_cache_v1"
+)
 CACHE_ACTION_MODE_SINGLE_NODE = "SINGLE_NODE_UNIFIED"
 CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED = "MULTI_NODE_FACTORIZED"
+CACHE_ACTION_MODE_SPARSE_COORDINATED = "SPARSE_COORDINATED_SINGLE_NODE_UPDATE"
 CACHE_RECONFIGURATION_MODEL_ABSTRACT = "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION"
 
 try:
@@ -868,6 +872,7 @@ def validate_config(
     if cache_action_mode not in {
         CACHE_ACTION_MODE_SINGLE_NODE,
         CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
+        CACHE_ACTION_MODE_SPARSE_COORDINATED,
     }:
         raise ValueError("algorithm.ppo.cache_action_mode 不受支持。")
     policy_schema = str(get_config_value(config, "algorithm.ppo.policy_schema", ""))
@@ -887,7 +892,7 @@ def validate_config(
             raise ValueError(
                 "SINGLE_NODE_UNIFIED 的 cache_reconfiguration_model 不受支持。"
             )
-    else:
+    elif cache_action_mode == CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED:
         if policy_schema != MULTI_NODE_FACTORIZED_POLICY_SCHEMA:
             raise ValueError(
                 "MULTI_NODE_FACTORIZED 必须使用独立的多节点策略 schema。"
@@ -898,6 +903,30 @@ def validate_config(
         if reconfiguration_model != CACHE_RECONFIGURATION_MODEL_ABSTRACT:
             raise ValueError(
                 "MULTI_NODE_FACTORIZED 必须显式启用 "
+                "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION。"
+            )
+    else:
+        if policy_schema != SPARSE_COORDINATED_CACHE_POLICY_SCHEMA:
+            raise ValueError(
+                "SPARSE_COORDINATED_SINGLE_NODE_UPDATE 必须使用独立稀疏策略 schema。"
+            )
+        max_cache_updates = get_config_value(
+            config, "algorithm.ppo.max_cache_updates_per_frame", None
+        )
+        if (
+            isinstance(max_cache_updates, bool)
+            or not isinstance(max_cache_updates, int)
+            or max_cache_updates != 1
+        ):
+            raise ValueError(
+                "SPARSE_COORDINATED_SINGLE_NODE_UPDATE 固定每个 Macro 帧最多更新一个节点。"
+            )
+        reconfiguration_model = str(
+            get_config_value(config, "algorithm.ppo.cache_reconfiguration_model", "")
+        )
+        if reconfiguration_model != CACHE_RECONFIGURATION_MODEL_ABSTRACT:
+            raise ValueError(
+                "SPARSE_COORDINATED_SINGLE_NODE_UPDATE 必须显式启用 "
                 "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION。"
             )
     required_flags = {

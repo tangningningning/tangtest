@@ -38,7 +38,7 @@ def build_episode_pool_provenance(
     if episode_pool is None:
         return None
     pool_path = Path(episode_pool).expanduser().resolve(strict=False)
-    manifest_path = pool_path / "stage6_training_pool_manifest.json"
+    manifest_path = pool_path / "formal_pool_manifest.json"
     if not manifest_path.is_file():
         return None
     raw_manifest = manifest_path.read_bytes()
@@ -48,25 +48,24 @@ def build_episode_pool_provenance(
         raise ValueError(f"Invalid training pool manifest: {manifest_path}") from exc
     if not isinstance(manifest, dict):
         raise ValueError(f"Training pool manifest root must be an object: {manifest_path}")
+    if manifest.get("schema_version") != "formal_task_data_pool_manifest_v1":
+        raise ValueError(f"Unsupported formal task-data pool manifest: {manifest_path}")
     fields = (
         "schema_version",
+        "task_data_model",
         "split",
         "seed_start",
         "seed_end",
         "episode_count",
         "config_sha256",
         "semantic_config_sha256",
-        "generation_config_fingerprint",
-        "generation_and_semantic_fingerprint",
-        "source_config_path",
-        "source_config_sha256",
-        "source_semantic_config_sha256",
-        "source_data_split_manifest_sha256",
-        "source_training_pool",
-        "source_service_catalog_sha256",
-        "stage6_service_catalog_path",
-        "stage6_service_catalog_sha256",
-        "transformation_formula",
+        "target_generation_config_fingerprint",
+        "task_data_contract",
+        "task_data_contract_sha256",
+        "service_catalog_path",
+        "service_catalog_sha256",
+        "data_split_manifest_sha256",
+        "source_provenance",
         "transformed_fields",
     )
     provenance = {
@@ -74,7 +73,7 @@ def build_episode_pool_provenance(
         "manifest_sha256": hashlib.sha256(raw_manifest).hexdigest(),
         **{field: manifest.get(field) for field in fields},
     }
-    baseline_path = pool_path / "stage6_training_pool_integrity_baseline.json"
+    baseline_path = pool_path / "formal_pool_integrity_baseline.json"
     if validated_integrity_baseline_sha256 is not None and not baseline_path.is_file():
         raise FileNotFoundError(
             f"Validated Training Pool integrity baseline is missing: {baseline_path}"
@@ -95,12 +94,16 @@ def build_episode_pool_provenance(
             raise ValueError("Training Pool integrity baseline root must be an object.")
         if baseline.get("pool_manifest_sha256") != provenance["manifest_sha256"]:
             raise ValueError("Training Pool integrity baseline does not identify this Pool Manifest.")
+        if baseline.get("task_data_contract_sha256") != provenance.get(
+            "task_data_contract_sha256"
+        ):
+            raise ValueError("Training Pool integrity baseline task-data contract mismatch.")
         provenance.update(
             {
                 "integrity_baseline_path": str(baseline_path),
                 "integrity_baseline_sha256": baseline_hash,
-                "generation_config_fingerprint": baseline.get(
-                    "generation_config_fingerprint"
+                "generation_config_fingerprint": manifest.get(
+                    "target_generation_config_fingerprint"
                 ),
                 "data_validation_level": (
                     "CURRENT_SNAPSHOT_VERIFIED"
@@ -108,12 +111,20 @@ def build_episode_pool_provenance(
                     else "CURRENT_SNAPSHOT_NOT_RUNNER_VERIFIED"
                 ),
                 "historical_source_status": baseline.get(
-                    "historical_source_status", "UNKNOWN"
+                    "historical_source_status", "SOURCE_SNAPSHOT_RECORDED"
                 ),
             }
         )
-    elif validated_integrity_baseline_sha256 is not None:
-        raise FileNotFoundError("Runner supplied a baseline identity but no baseline file exists.")
+    else:
+        provenance.update(
+            {
+                "generation_config_fingerprint": manifest.get(
+                    "target_generation_config_fingerprint"
+                ),
+                "data_validation_level": "POOL_MANIFEST_ONLY",
+                "historical_source_status": manifest.get("historical_source_status", "UNKNOWN"),
+            }
+        )
     return provenance
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:

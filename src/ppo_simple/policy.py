@@ -83,6 +83,26 @@ class MultiNodeMacroActionSample:
 
 
 @dataclass(frozen=True)
+class SparseCoordinatedCacheActionSample:
+    """One KEEP-or-node action and its conditional target distribution."""
+
+    cache_actions: np.ndarray
+    group_action: int
+    group_log_prob: Any
+    conditional_log_prob: Any
+    cache_log_prob: Any
+    cache_entropy: Any
+    value: Any
+    group_probabilities: np.ndarray
+    conditional_probabilities: np.ndarray
+    node_probabilities: np.ndarray
+    node_p_keep: Any
+    node_p_update: Any
+    node_marginal_entropies: Any
+    deterministic_diagnostics: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class TerminationActionSample:
     """单个可学习 CONTINUE/TERMINATE 决策的采样结果。"""
 
@@ -590,6 +610,248 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 deterministic_diagnostics=deterministic_diagnostics,
             )
 
+    def _sparse_cache_distributions(
+        self,
+        observations: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+    ) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+        """Build P(group|s) and P(candidate|group,s) from legal update features."""
+
+        device = next(self.parameters()).device
+        obs, _ = self._observation_batch(observations, device)
+        features = torch.as_tensor(
+            cache_candidate_features, dtype=torch.float32, device=device
+        )
+        masks = torch.as_tensor(
+            cache_candidate_masks, dtype=torch.bool, device=device
+        )
+        if features.ndim == 3:
+            features = features.unsqueeze(0)
+        if masks.ndim == 2:
+            masks = masks.unsqueeze(0)
+        if (
+            features.ndim != 4
+            or tuple(features.shape[:1]) != (int(obs.shape[0]),)
+            or tuple(features.shape[:-1]) != tuple(masks.shape)
+            or int(features.shape[-1]) != self.macro_cache_feature_dim
+            or int(features.shape[1]) < 1
+            or int(features.shape[2]) < 1
+            or not bool(torch.all(masks[..., 0]).item())
+        ):
+            raise ValueError("sparse Cache tensors must be aligned [B,N,K,D]/[B,N,K]")
+        if not bool(torch.isfinite(features[masks]).all().item()):
+            raise FloatingPointError("legal sparse Cache features contain NaN/Inf")
+
+        hidden = self.macro_actor_encoder(obs)
+        candidate_hidden = self.macro_cache_candidate_encoder(features)
+        batch_size, node_count, candidate_count = map(int, masks.shape)
+        update_masks = masks[..., 1:]
+        update_counts = update_masks.sum(dim=-1)
+        has_update = update_counts > 0
+        expanded_hidden = hidden[:, None, :].expand(-1, node_count, -1)
+
+        if candidate_count > 1:
+            update_embeddings = candidate_hidden[:, :, 1:, :]
+            weights = update_masks.to(dtype=update_embeddings.dtype).unsqueeze(-1)
+            pooled_update_embeddings = (update_embeddings * weights).sum(dim=2) / (
+                update_counts.clamp_min(1).to(dtype=update_embeddings.dtype).unsqueeze(-1)
+            )
+            conditional_logits = self.macro_cache_scorer(
+                torch.cat(
+                    (
+                        expanded_hidden.unsqueeze(2).expand(-1, -1, candidate_count - 1, -1),
+                        update_embeddings,
+                    ),
+                    dim=-1,
+                )
+            ).squeeze(-1)
+            safe_update_masks = update_masks.clone()
+            safe_update_masks[..., 0] |= ~has_update
+            conditional_distribution = _masked_categorical(
+                conditional_logits, safe_update_masks
+            )
+            conditional_probabilities = torch.where(
+                update_masks,
+                conditional_distribution.probs,
+                torch.zeros_like(conditional_distribution.probs),
+            )
+            conditional_entropies = torch.where(
+                has_update,
+                conditional_distribution.entropy(),
+                torch.zeros_like(update_counts, dtype=hidden.dtype),
+            )
+        else:
+            pooled_update_embeddings = torch.zeros_like(expanded_hidden)
+            conditional_distribution = None
+            conditional_probabilities = features.new_zeros(
+                (batch_size, node_count, 0)
+            )
+            conditional_entropies = features.new_zeros((batch_size, node_count))
+
+        group_features = torch.cat(
+            (
+                expanded_hidden,
+                pooled_update_embeddings,
+                torch.log1p(update_counts.to(dtype=hidden.dtype)).unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        node_group_logits = self.macro_cache_group_scorer(group_features).squeeze(-1)
+        keep_logits = self.macro_cache_keep_scorer(hidden)
+        group_logits = torch.cat((keep_logits, node_group_logits), dim=-1)
+        group_masks = torch.cat(
+            (
+                torch.ones((batch_size, 1), dtype=torch.bool, device=device),
+                has_update,
+            ),
+            dim=-1,
+        )
+        group_distribution = _masked_categorical(group_logits, group_masks)
+        group_probabilities = group_distribution.probs
+        if candidate_count > 1:
+            node_update_probabilities = group_probabilities[:, 1:].unsqueeze(-1) * (
+                conditional_probabilities
+            )
+        else:
+            node_update_probabilities = conditional_probabilities
+        node_keep_probabilities = 1.0 - group_probabilities[:, 1:]
+        node_probabilities = torch.cat(
+            (node_keep_probabilities.unsqueeze(-1), node_update_probabilities),
+            dim=-1,
+        )
+        node_marginal_entropies = -torch.where(
+            node_probabilities > 0,
+            node_probabilities * torch.log(node_probabilities.clamp_min(1.0e-30)),
+            torch.zeros_like(node_probabilities),
+        ).sum(dim=-1)
+        values = self.macro_value(obs)
+        return (
+            group_distribution,
+            conditional_distribution,
+            conditional_probabilities,
+            conditional_entropies,
+            values,
+            masks,
+            node_probabilities,
+        )
+
+    def sample_sparse_cache(
+        self,
+        observation: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+        deterministic: bool = False,
+    ) -> SparseCoordinatedCacheActionSample:
+        """Sample one group first, then only that node's legal UPDATE target."""
+
+        with torch.no_grad():
+            obs, single = self._observation_batch(
+                observation, next(self.parameters()).device
+            )
+            if not single or int(obs.shape[0]) != 1:
+                raise ValueError("sample_sparse_cache accepts one observation")
+            (
+                group_distribution,
+                conditional_distribution,
+                conditional_probabilities,
+                conditional_entropies,
+                values,
+                masks,
+                node_probabilities,
+            ) = self._sparse_cache_distributions(
+                obs, cache_candidate_features, cache_candidate_masks
+            )
+            group_probs = group_distribution.probs[0]
+            selected_group = 0
+            selected_candidate = 0
+            diagnostic = None
+            if deterministic:
+                if conditional_distribution is not None:
+                    joint_update_probs = (
+                        group_probs[1:, None]
+                        * conditional_probabilities[0]
+                    )
+                    if joint_update_probs.numel():
+                        flat_index = int(torch.argmax(joint_update_probs.reshape(-1)).item())
+                        best_update_probability = float(
+                            joint_update_probs.reshape(-1)[flat_index].item()
+                        )
+                        if best_update_probability > float(group_probs[0].item()):
+                            candidate_count = int(masks.shape[-1]) - 1
+                            selected_group = flat_index // candidate_count + 1
+                            selected_candidate = flat_index % candidate_count + 1
+                diagnostic = {
+                    "selected_group": "ALL_KEEP" if selected_group == 0 else "UPDATE_NODE",
+                    "selected_node_index": None if selected_group == 0 else selected_group - 1,
+                    "selected_candidate_index": None if selected_group == 0 else selected_candidate,
+                    "group_probabilities": group_probs.detach().cpu().numpy().tolist(),
+                    "selected_joint_probability": float(
+                        group_probs[selected_group].item()
+                        if selected_group == 0
+                        else group_probs[selected_group].item()
+                        * conditional_probabilities[
+                            0, selected_group - 1, selected_candidate - 1
+                        ].item()
+                    ),
+                }
+            else:
+                selected_group = int(group_distribution.sample().item())
+                if selected_group > 0:
+                    assert conditional_distribution is not None
+                    conditional_logits = conditional_distribution.logits[
+                        0, selected_group - 1
+                    ]
+                    conditional_action = torch.distributions.Categorical(
+                        logits=conditional_logits
+                    ).sample()
+                    selected_candidate = int(conditional_action.item()) + 1
+
+            cache_actions = np.zeros(int(masks.shape[1]), dtype=np.int64)
+            conditional_log_prob = group_probs.new_zeros(())
+            if selected_group > 0:
+                cache_actions[selected_group - 1] = selected_candidate
+                assert conditional_distribution is not None
+                conditional_actions = torch.zeros(
+                    (1, int(masks.shape[1])), dtype=torch.long, device=obs.device
+                )
+                conditional_actions[0, selected_group - 1] = selected_candidate - 1
+                conditional_log_prob = conditional_distribution.log_prob(
+                    conditional_actions
+                )[0, selected_group - 1]
+            group_action = torch.as_tensor(selected_group, dtype=torch.long, device=obs.device)
+            group_log_prob = group_distribution.log_prob(group_action)
+            cache_log_prob = _sum_log_probabilities(
+                torch.stack((group_log_prob.reshape(()), conditional_log_prob.reshape(()))),
+                dim=0,
+            )
+            cache_entropy = group_distribution.entropy()[0] + torch.sum(
+                group_probs[1:] * conditional_entropies[0]
+            )
+            row_probs = node_probabilities[0]
+            tiny = torch.finfo(row_probs.dtype).tiny
+            node_marginal_entropies = -torch.where(
+                row_probs > 0,
+                row_probs * torch.log(row_probs.clamp_min(tiny)),
+                torch.zeros_like(row_probs),
+            ).sum(dim=-1)
+            return SparseCoordinatedCacheActionSample(
+                cache_actions=cache_actions,
+                group_action=selected_group,
+                group_log_prob=group_log_prob,
+                conditional_log_prob=conditional_log_prob,
+                cache_log_prob=cache_log_prob,
+                cache_entropy=cache_entropy,
+                value=values.squeeze(0),
+                group_probabilities=group_probs.detach().cpu().numpy().copy(),
+                conditional_probabilities=conditional_probabilities[0].detach().cpu().numpy().copy(),
+                node_probabilities=row_probs.detach().cpu().numpy().copy(),
+                node_p_keep=1.0 - group_probs[1:],
+                node_p_update=group_probs[1:],
+                node_marginal_entropies=node_marginal_entropies,
+                deterministic_diagnostics=diagnostic,
+            )
+
     @staticmethod
     def _integer_elapsed_batch(
         elapsed_holding_slots: Any,
@@ -849,31 +1111,100 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         if raw_features.ndim == 4:
             if self.unified_cache_action:
                 raise ValueError("factorized Cache rollout cannot be evaluated by a unified policy")
-            cache_logits, _, values, masks = self._macro_cache_node_logits(
-                obs,
-                cache_candidate_features,
-                cache_candidate_masks,
-            )
             cache_action_values = torch.as_tensor(
                 cache_actions, dtype=torch.long, device=device
             )
-            expected_action_shape = (batch_size, int(masks.shape[1]))
-            if tuple(cache_action_values.shape) != expected_action_shape:
-                raise ValueError(f"factorized cache_actions must be {expected_action_shape}")
-            if bool(torch.any((cache_action_values < 0) | (cache_action_values >= masks.shape[2])).item()):
-                raise ValueError("factorized Cache action index out of range")
-            selected_legal = masks.gather(2, cache_action_values.unsqueeze(-1)).squeeze(-1)
-            if not bool(torch.all(selected_legal).item()):
-                raise ValueError("factorized Cache action is masked by its saved legal mask")
-            cache_distribution = _masked_categorical(cache_logits, masks)
-            node_cache_log_probs = cache_distribution.log_prob(cache_action_values)
-            node_cache_entropies = cache_distribution.entropy()
-            node_cache_probabilities = cache_distribution.probs
-            cache_log_prob = _sum_log_probabilities(node_cache_log_probs, dim=-1)
-            cache_entropy = node_cache_entropies.sum(dim=-1)
-            cache_probabilities = node_cache_probabilities
-            p_keep = cache_probabilities[:, :, 0]
-            p_update = cache_probabilities[:, :, 1:].sum(dim=-1)
+            if bool(getattr(self, "sparse_coordinated_cache_action", False)):
+                (
+                    group_distribution,
+                    conditional_distribution,
+                    _conditional_probabilities,
+                    conditional_entropies,
+                    values,
+                    masks,
+                    node_cache_probabilities,
+                ) = self._sparse_cache_distributions(
+                    obs, cache_candidate_features, cache_candidate_masks
+                )
+                cache_probabilities = node_cache_probabilities
+                expected_action_shape = (batch_size, int(masks.shape[1]))
+                if tuple(cache_action_values.shape) != expected_action_shape:
+                    raise ValueError(f"sparse cache_actions must be {expected_action_shape}")
+                if bool(torch.any((cache_action_values < 0) | (cache_action_values >= masks.shape[2])).item()):
+                    raise ValueError("sparse Cache action index out of range")
+                selected_legal = masks.gather(2, cache_action_values.unsqueeze(-1)).squeeze(-1)
+                if not bool(torch.all(selected_legal).item()):
+                    raise ValueError("sparse Cache action is masked by its saved legal mask")
+                selected_nodes = cache_action_values > 0
+                update_counts = selected_nodes.sum(dim=1)
+                if bool(torch.any(update_counts > 1).item()):
+                    raise ValueError("sparse Cache action may update at most one node per frame")
+                group_actions = torch.zeros(batch_size, dtype=torch.long, device=device)
+                selected_positions = torch.nonzero(selected_nodes, as_tuple=False)
+                conditional_log_prob = torch.zeros(
+                    batch_size, dtype=group_distribution.logits.dtype, device=device
+                )
+                if selected_positions.numel():
+                    rows = selected_positions[:, 0]
+                    nodes = selected_positions[:, 1]
+                    candidate_indices = cache_action_values[rows, nodes]
+                    group_actions[rows] = nodes + 1
+                    if conditional_distribution is None:
+                        raise ValueError("sparse UPDATE selected without a conditional candidate distribution")
+                    conditional_masks = masks[rows, nodes, 1:]
+                    conditional_indices = candidate_indices - 1
+                    if not bool(
+                        torch.all(
+                            conditional_masks.gather(1, conditional_indices[:, None]).squeeze(1)
+                        ).item()
+                    ):
+                        raise ValueError("sparse Cache UPDATE target is not legal")
+                    conditional_actions = torch.zeros(
+                        (batch_size, int(masks.shape[1])),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    conditional_actions[rows, nodes] = conditional_indices
+                    all_conditional_log_probs = conditional_distribution.log_prob(
+                        conditional_actions
+                    )
+                    conditional_log_prob = conditional_log_prob.index_put(
+                        (rows,), all_conditional_log_probs[rows, nodes]
+                    )
+                group_log_prob = group_distribution.log_prob(group_actions)
+                cache_log_prob = _sum_log_probabilities(
+                    torch.stack((group_log_prob, conditional_log_prob), dim=-1),
+                    dim=-1,
+                )
+                cache_entropy = group_distribution.entropy() + torch.sum(
+                    group_distribution.probs[:, 1:] * conditional_entropies,
+                    dim=-1,
+                )
+                p_keep = group_distribution.probs[:, 0]
+                p_update = group_distribution.probs[:, 1:].sum(dim=-1)
+            else:
+                cache_logits, _, values, masks = self._macro_cache_node_logits(
+                    obs,
+                    cache_candidate_features,
+                    cache_candidate_masks,
+                )
+                expected_action_shape = (batch_size, int(masks.shape[1]))
+                if tuple(cache_action_values.shape) != expected_action_shape:
+                    raise ValueError(f"factorized cache_actions must be {expected_action_shape}")
+                if bool(torch.any((cache_action_values < 0) | (cache_action_values >= masks.shape[2])).item()):
+                    raise ValueError("factorized Cache action index out of range")
+                selected_legal = masks.gather(2, cache_action_values.unsqueeze(-1)).squeeze(-1)
+                if not bool(torch.all(selected_legal).item()):
+                    raise ValueError("factorized Cache action is masked by its saved legal mask")
+                cache_distribution = _masked_categorical(cache_logits, masks)
+                node_cache_log_probs = cache_distribution.log_prob(cache_action_values)
+                node_cache_entropies = cache_distribution.entropy()
+                node_cache_probabilities = cache_distribution.probs
+                cache_log_prob = _sum_log_probabilities(node_cache_log_probs, dim=-1)
+                cache_entropy = node_cache_entropies.sum(dim=-1)
+                cache_probabilities = node_cache_probabilities
+                p_keep = cache_probabilities[:, :, 0]
+                p_update = cache_probabilities[:, :, 1:].sum(dim=-1)
         else:
             cache_logits, _, values, masks = self._macro_cache_logits(
                 obs,
@@ -1336,3 +1667,67 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
             unified_cache_action=False,
             cardinality_corrected_cache_action=True,
         )
+
+
+class SparseCoordinatedCacheActorCritic(MultiNodeFactorizedActorCritic):
+    """Versioned hierarchical Cache actor allowing at most one node UPDATE."""
+
+    architecture_id = (
+        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
+        "v5_sparse_coordinated_cache_v1"
+    )
+    architecture_version = 34
+    sparse_coordinated_cache_action = True
+
+    def __init__(
+        self,
+        observation_dim: int,
+        macro_cache_feature_dim: int,
+        micro_uav_feature_dim: int,
+        adaptive_holding_min_slots: int,
+        adaptive_holding_max_slots: int,
+        hidden_sizes: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__(
+            observation_dim,
+            macro_cache_feature_dim,
+            micro_uav_feature_dim,
+            adaptive_holding_min_slots,
+            adaptive_holding_max_slots,
+            hidden_sizes,
+        )
+        self.cardinality_corrected_cache_action = False
+        hidden = int(tuple(hidden_sizes)[-1])
+        self.macro_cache_keep_scorer = nn.Linear(hidden, 1)
+        self.macro_cache_group_scorer = nn.Sequential(
+            nn.Linear(hidden * 2 + 1, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+
+    def macro_actor_parameters(self) -> tuple[Any, ...]:
+        modules = (
+            self.macro_actor_encoder,
+            self.macro_cache_candidate_encoder,
+            self.macro_cache_scorer,
+            self.macro_cache_keep_scorer,
+            self.macro_cache_group_scorer,
+            self.macro_termination_scorer,
+        )
+        return tuple(parameter for module in modules for parameter in module.parameters())
+
+    def macro_state_dict(self) -> dict[str, Any]:
+        prefixes = (
+            "macro_actor_encoder.",
+            "macro_cache_candidate_encoder.",
+            "macro_cache_scorer.",
+            "macro_cache_keep_scorer.",
+            "macro_cache_group_scorer.",
+            "macro_termination_scorer.",
+            "macro_critic.",
+        )
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in self.state_dict().items()
+            if key.startswith(prefixes)
+        }

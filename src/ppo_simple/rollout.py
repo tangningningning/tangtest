@@ -23,6 +23,7 @@ from .interface import _copy_uav_positions
 from .policy import (
     DualTimescaleActorCritic,
     MultiNodeFactorizedActorCritic,
+    SparseCoordinatedCacheActorCritic,
     _macro_log_prob_from_components,
     _sum_log_probabilities,
 )
@@ -232,6 +233,7 @@ class MacroRolloutBuffer:
     transitions: list[MacroTransition] = field(default_factory=list)
     min_holding_slots: int = 1
     max_holding_slots: int = 5
+    cache_action_mode: str = interface.project_config.CACHE_ACTION_MODE_SINGLE_NODE
 
     def append(self, transition: MacroTransition) -> None:
         if self.transitions and bool(self.transitions[-1].done):
@@ -262,27 +264,43 @@ class MacroRolloutBuffer:
                 candidate_masks[np.arange(node_count), action_values]
             ):
                 raise ValueError("factorized Cache action is not legal under its saved mask")
-            if (
-                transition.old_node_cache_log_probs is None
-                or transition.old_node_cache_entropies is None
-                or np.asarray(transition.old_node_cache_log_probs).shape != (node_count,)
-                or np.asarray(transition.old_node_cache_entropies).shape != (node_count,)
-                or not np.isfinite(transition.old_node_cache_log_probs).all()
-                or not np.isfinite(transition.old_node_cache_entropies).all()
-                or transition.actual_cache_update_by_node is None
-                or np.asarray(transition.actual_cache_update_by_node).shape != (node_count,)
-            ):
-                raise ValueError("factorized Cache node probability/update trace is incomplete")
-            expected_cache_log_prob = np.float32(
-                np.sum(
-                    np.asarray(transition.old_node_cache_log_probs, dtype=np.float32),
-                    dtype=np.float64,
+            if self.cache_action_mode == interface.project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED:
+                if np.count_nonzero(action_values) > 1:
+                    raise ValueError("sparse Cache rollout may update at most one node per frame")
+                if (
+                    transition.old_node_cache_log_probs is not None
+                    or transition.old_node_cache_entropies is not None
+                    or transition.actual_cache_update_by_node is None
+                    or np.asarray(transition.actual_cache_update_by_node).shape != (node_count,)
+                    or np.count_nonzero(transition.actual_cache_update_by_node) > 1
+                ):
+                    raise ValueError("sparse Cache transition must retain one joint probability and at most one update")
+                if bool(np.any(transition.actual_cache_update_by_node)) and not bool(
+                    np.any(action_values > 0)
+                ):
+                    raise ValueError("sparse Cache changed without a sampled UPDATE action")
+            else:
+                if (
+                    transition.old_node_cache_log_probs is None
+                    or transition.old_node_cache_entropies is None
+                    or np.asarray(transition.old_node_cache_log_probs).shape != (node_count,)
+                    or np.asarray(transition.old_node_cache_entropies).shape != (node_count,)
+                    or not np.isfinite(transition.old_node_cache_log_probs).all()
+                    or not np.isfinite(transition.old_node_cache_entropies).all()
+                    or transition.actual_cache_update_by_node is None
+                    or np.asarray(transition.actual_cache_update_by_node).shape != (node_count,)
+                ):
+                    raise ValueError("factorized Cache node probability/update trace is incomplete")
+                expected_cache_log_prob = np.float32(
+                    np.sum(
+                        np.asarray(transition.old_node_cache_log_probs, dtype=np.float32),
+                        dtype=np.float64,
+                    )
                 )
-            )
-            if float(expected_cache_log_prob) != float(
-                np.float32(transition.old_cache_log_prob)
-            ):
-                raise ValueError("node Cache log-probabilities do not sum to the joint Cache log-probability")
+                if float(expected_cache_log_prob) != float(
+                    np.float32(transition.old_cache_log_prob)
+                ):
+                    raise ValueError("node Cache log-probabilities do not sum to the joint Cache log-probability")
         elif candidate_masks.ndim != 1 or action_values.ndim != 0:
             raise ValueError("unified Cache actions and masks must retain scalar/indexed semantics")
         if bool(transition.done) and float(transition.old_next_value) != 0.0:
@@ -508,6 +526,7 @@ def _cache_candidates(
     if context.policy_schema not in {
         interface.PROPOSED_POLICY_SCHEMA,
         interface.MULTI_NODE_FACTORIZED_POLICY_SCHEMA,
+        interface.SPARSE_COORDINATED_CACHE_POLICY_SCHEMA,
     }:
         raise ValueError(f"unsupported formal Macro Cache schema: {context.policy_schema}")
     if features.shape[1] != CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM:
@@ -759,6 +778,12 @@ def collect_dual_timescale_episode(
     total_slots = len(aligned_steps)
     if total_slots != int(context.episode_slots):
         raise ValueError("双时间尺度正式 rollout 必须覆盖完整 episode。")
+    episode_identity = (
+        str(int(episode_seed))
+        if episode_seed is not None
+        else f"origin-{int(aligned_steps[0].origin_index)}"
+    )
+    task_ledger = slot_environment.CrossSlotTaskLedger(episode_identity)
     sampled_slot_indices = (
         frozenset(int(slot) for slot in performance_sample_slots)
         if performance_sample_slots is not None
@@ -779,6 +804,7 @@ def collect_dual_timescale_episode(
     macro_buffer = MacroRolloutBuffer(
         min_holding_slots=min_holding_slots,
         max_holding_slots=max_holding_slots,
+        cache_action_mode=str(context.cache_action_mode),
     )
     cache = np.asarray(context.initial_cache, dtype=np.int8).copy()
     uav = {
@@ -849,57 +875,115 @@ def collect_dual_timescale_episode(
             frame_observation = _observation(cache, uav, step, context)
             multi_node = (
                 context.cache_action_mode
-                == interface.project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED
+                != interface.project_config.CACHE_ACTION_MODE_SINGLE_NODE
+            )
+            sparse_cache = (
+                context.cache_action_mode
+                == interface.project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
             )
             if multi_node:
                 node_candidates, frame_candidate_features, frame_candidate_masks = (
                     _cache_node_candidates(cache, uav, step, context, tensor_spec)
                 )
-                selected_nodes = policy.sample_macro_nodes(
-                    frame_observation,
-                    frame_candidate_features,
-                    frame_candidate_masks,
-                    deterministic=deterministic,
-                )
+                if sparse_cache:
+                    if not isinstance(policy, SparseCoordinatedCacheActorCritic):
+                        raise TypeError("sparse Cache configuration requires its versioned policy")
+                    selected_nodes = policy.sample_sparse_cache(
+                        frame_observation,
+                        frame_candidate_features,
+                        frame_candidate_masks,
+                        deterministic=deterministic,
+                    )
+                    if np.count_nonzero(selected_nodes.cache_actions) > 1:
+                        raise AssertionError("sparse Cache sampler selected multiple UPDATE nodes")
+                    frame_old_node_cache_log_probs = None
+                    frame_old_node_cache_entropies = None
+                    frame_old_cache_log_prob = float(
+                        selected_nodes.cache_log_prob.detach().cpu()
+                    )
+                    frame_old_macro_entropy = float(
+                        selected_nodes.cache_entropy.detach().cpu()
+                    )
+                    node_p_keep = np.asarray(
+                        selected_nodes.node_p_keep.detach().cpu(), dtype=np.float64
+                    )
+                    node_p_update = np.asarray(
+                        selected_nodes.node_p_update.detach().cpu(), dtype=np.float64
+                    )
+                    node_entropies = np.asarray(
+                        selected_nodes.node_marginal_entropies.detach().cpu(),
+                        dtype=np.float64,
+                    )
+                    node_logs = None
+                    node_raw_keep = None
+                    group_probabilities = selected_nodes.group_probabilities
+                    keep_probability = float(group_probabilities[0])
+                    update_group_probability = float(np.sum(group_probabilities[1:]))
+                    candidate_entropy = frame_old_macro_entropy
+                    raw_probabilities = None
+                else:
+                    selected_nodes = policy.sample_macro_nodes(
+                        frame_observation,
+                        frame_candidate_features,
+                        frame_candidate_masks,
+                        deterministic=deterministic,
+                    )
+                    frame_old_node_cache_log_probs = np.asarray(
+                        selected_nodes.node_log_probs.detach().cpu(), dtype=np.float32
+                    ).copy()
+                    frame_old_node_cache_entropies = np.asarray(
+                        selected_nodes.node_entropies.detach().cpu(), dtype=np.float32
+                    ).copy()
+                    cache_log_prob = _sum_log_probabilities(
+                        selected_nodes.node_log_probs.unsqueeze(0), dim=1
+                    )[0]
+                    frame_old_cache_log_prob = float(cache_log_prob.detach().cpu())
+                    frame_old_macro_entropy = float(
+                        np.sum(frame_old_node_cache_entropies, dtype=np.float64)
+                    )
+                    node_entropies = frame_old_node_cache_entropies.astype(np.float64)
+                    node_p_keep = np.asarray(
+                        selected_nodes.node_p_keep.detach().cpu(), dtype=np.float64
+                    )
+                    node_p_update = np.asarray(
+                        selected_nodes.node_p_update.detach().cpu(), dtype=np.float64
+                    )
+                    node_logs = frame_old_node_cache_log_probs.astype(np.float64)
+                    raw_probabilities = np.asarray(
+                        selected_nodes.raw_node_probabilities, dtype=np.float64
+                    )
+                    node_raw_keep = raw_probabilities[:, 0]
+                    keep_probability = float(
+                        np.mean(selected_nodes.node_p_keep.detach().cpu().numpy())
+                    )
+                    update_group_probability = float(
+                        np.mean(selected_nodes.node_p_update.detach().cpu().numpy())
+                    )
+                    candidate_entropy = float(np.sum(node_entropies))
                 frame_cache_actions = np.asarray(
                     selected_nodes.cache_actions, dtype=np.int64
                 ).copy()
                 frame_cache_index = frame_cache_actions.copy()
-                frame_old_node_cache_log_probs = np.asarray(
-                    selected_nodes.node_log_probs.detach().cpu(), dtype=np.float32
-                ).copy()
-                frame_old_node_cache_entropies = np.asarray(
-                    selected_nodes.node_entropies.detach().cpu(), dtype=np.float32
-                ).copy()
-                cache_log_prob = _sum_log_probabilities(
-                    selected_nodes.node_log_probs.unsqueeze(0), dim=1
-                )[0]
-                frame_old_cache_log_prob = float(cache_log_prob.detach().cpu())
-                frame_old_macro_entropy = float(
-                    np.sum(frame_old_node_cache_entropies, dtype=np.float64)
-                )
                 frame_old_value = float(selected_nodes.value.detach().cpu())
                 probabilities = np.asarray(
                     selected_nodes.node_probabilities, dtype=np.float64
                 )
-                raw_probabilities = np.asarray(
-                    selected_nodes.raw_node_probabilities, dtype=np.float64
-                )
                 if (
                     probabilities.shape != frame_candidate_masks.shape
-                    or raw_probabilities.shape != frame_candidate_masks.shape
                     or not np.isfinite(probabilities).all()
-                    or not np.isfinite(raw_probabilities).all()
                     or not np.allclose(probabilities.sum(axis=-1), 1.0, atol=1.0e-6, rtol=0.0)
-                    or not np.allclose(raw_probabilities.sum(axis=-1), 1.0, atol=1.0e-6, rtol=0.0)
                     or np.any(probabilities[~frame_candidate_masks] != 0.0)
                 ):
-                    raise AssertionError("factorized Cache probabilities/masks are invalid")
-                node_p_keep = np.asarray(selected_nodes.node_p_keep.detach().cpu(), dtype=np.float64)
-                node_p_update = np.asarray(selected_nodes.node_p_update.detach().cpu(), dtype=np.float64)
-                node_entropies = frame_old_node_cache_entropies.astype(np.float64)
-                node_logs = frame_old_node_cache_log_probs.astype(np.float64)
-                node_raw_keep = raw_probabilities[:, 0]
+                    raise AssertionError("multi-node Cache probabilities/masks are invalid")
+                if not sparse_cache and (
+                    raw_probabilities is None
+                    or raw_probabilities.shape != frame_candidate_masks.shape
+                    or not np.isfinite(raw_probabilities).all()
+                    or not np.allclose(
+                        raw_probabilities.sum(axis=-1), 1.0, atol=1.0e-6, rtol=0.0
+                    )
+                ):
+                    raise AssertionError("factorized raw Cache probabilities are invalid")
                 node_selected_updates = frame_cache_actions > 0
                 target_cache = cache.copy()
                 for node_index, candidate_index in enumerate(frame_cache_actions):
@@ -911,65 +995,94 @@ def collect_dual_timescale_episode(
                 frame_actual_update_by_node = cache_update_mask(cache, frame_cache)
                 if np.any(frame_actual_update_by_node & ~node_selected_updates):
                     raise AssertionError("Cache changed on a node whose sampled action was KEEP")
+                if sparse_cache:
+                    if int(np.count_nonzero(frame_actual_update_by_node)) > 1:
+                        raise AssertionError("sparse Cache execution changed more than one node")
+                    if selected_nodes.group_action == 0 and not np.array_equal(frame_cache, cache):
+                        raise AssertionError("ALL_KEEP changed the Cache configuration")
+                    cache_configuration.validate_cache_shape_and_capacity(
+                        frame_cache, context.service_catalog, context.cache_nodes
+                    )
                 node_keep_probability_records.append(node_p_keep.copy())
                 node_update_probability_records.append(node_p_update.copy())
-                node_raw_keep_probability_records.append(node_raw_keep.copy())
                 node_entropy_records.append(node_entropies.copy())
-                node_log_prob_records.append(node_logs.copy())
+                if node_raw_keep is not None:
+                    node_raw_keep_probability_records.append(node_raw_keep.copy())
+                if node_logs is not None:
+                    node_log_prob_records.append(node_logs.copy())
                 node_selected_update_records.append(node_selected_updates.copy())
                 node_actual_update_records.append(frame_actual_update_by_node.copy())
-                keep_probability = float(np.mean(node_p_keep))
-                update_group_probability = float(np.mean(node_p_update))
                 keep_probabilities.append(keep_probability)
                 update_group_probabilities.append(update_group_probability)
-                raw_candidate0_probabilities.append(float(np.mean(node_raw_keep)))
+                if node_raw_keep is not None:
+                    raw_candidate0_probabilities.append(float(np.mean(node_raw_keep)))
                 legal_update_candidate_counts.append(
                     int(np.count_nonzero(frame_candidate_masks[:, 1:]))
                 )
-                cache_entropies.append(float(np.sum(node_entropies)))
-                candidate_entropy = float(np.sum(node_entropies))
+                cache_entropies.append(frame_old_macro_entropy)
                 cache_candidate_entropies.append(candidate_entropy)
                 unified_candidate_entropies.append(candidate_entropy)
                 unified_candidate0_probabilities.append(keep_probability)
-                update_margin = float(np.mean(node_p_update - node_p_keep))
+                update_margin = update_group_probability - keep_probability
                 unified_update_margins.append(update_margin)
-                unified_candidate_state_diagnostics.append(
-                    {
-                        "macro_index": int(len(macro_buffer.transitions)),
-                        "selected_candidate_ids_by_node": frame_cache_actions.tolist(),
-                        "mean_keep_probability_by_node": keep_probability,
-                        "mean_update_probability_by_node": update_group_probability,
-                        "joint_cache_entropy_sum_by_node": candidate_entropy,
-                        "mean_per_node_cache_entropy": float(np.mean(node_entropies)),
-                        "update_margin_mean_by_node": update_margin,
-                    }
-                )
-                deterministic_node_records = (
-                    []
-                    if selected_nodes.deterministic_diagnostics is None
-                    else list(selected_nodes.deterministic_diagnostics)
-                )
-                if deterministic:
-                    if len(deterministic_node_records) != len(context.action_spec.cache_node_ids):
-                        raise AssertionError("deterministic factorized Cache selection lacks node diagnostics")
-                    for record, node_id in zip(
-                        deterministic_node_records,
-                        context.action_spec.cache_node_ids,
-                        strict=True,
-                    ):
-                        record["node_id"] = str(node_id)
-                    deterministic_cache_selections.append(
+                state_diagnostic = {
+                    "macro_index": int(len(macro_buffer.transitions)),
+                    "selected_candidate_ids_by_node": frame_cache_actions.tolist(),
+                    "mean_keep_probability_by_node": float(np.mean(node_p_keep)),
+                    "mean_update_probability_by_node": float(np.mean(node_p_update)),
+                    "joint_cache_entropy_sum_by_node": candidate_entropy,
+                    "mean_per_node_cache_entropy": float(np.mean(node_entropies)),
+                    "update_margin_mean_by_node": update_margin,
+                }
+                if sparse_cache:
+                    state_diagnostic.update(
                         {
-                            "frame_index": int(len(deterministic_cache_selections)),
-                            "decision_slot": int(step.slot),
-                            "legal_candidate_count_by_node": frame_candidate_masks.sum(axis=-1).astype(int).tolist(),
-                            "selected_candidate_index_by_node": frame_cache_actions.tolist(),
-                            "selected_group_by_node": [item["selected_group"] for item in deterministic_node_records],
-                            "nodes": deterministic_node_records,
-                            "probability_finite": bool(np.isfinite(probabilities).all()),
-                            "probability_sum_error_max": float(np.max(np.abs(probabilities.sum(axis=-1) - 1.0))),
+                            "joint_cache_entropy_sum_by_node": None,
+                            "group_keep_probability": keep_probability,
+                            "group_update_probability": update_group_probability,
+                            "cache_entropy": candidate_entropy,
                         }
                     )
+                unified_candidate_state_diagnostics.append(state_diagnostic)
+                if deterministic:
+                    if sparse_cache:
+                        deterministic_cache_selections.append(
+                            {
+                                "frame_index": int(len(deterministic_cache_selections)),
+                                "decision_slot": int(step.slot),
+                                "legal_candidate_count_by_node": frame_candidate_masks.sum(axis=-1).astype(int).tolist(),
+                                "selected_candidate_index_by_node": frame_cache_actions.tolist(),
+                                "selection": selected_nodes.deterministic_diagnostics,
+                                "probability_finite": bool(np.isfinite(probabilities).all()),
+                                "probability_sum_error_max": float(np.max(np.abs(probabilities.sum(axis=-1) - 1.0))),
+                            }
+                        )
+                    else:
+                        deterministic_node_records = (
+                            []
+                            if selected_nodes.deterministic_diagnostics is None
+                            else list(selected_nodes.deterministic_diagnostics)
+                        )
+                        if len(deterministic_node_records) != len(context.action_spec.cache_node_ids):
+                            raise AssertionError("deterministic factorized Cache selection lacks node diagnostics")
+                        for record, node_id in zip(
+                            deterministic_node_records,
+                            context.action_spec.cache_node_ids,
+                            strict=True,
+                        ):
+                            record["node_id"] = str(node_id)
+                        deterministic_cache_selections.append(
+                            {
+                                "frame_index": int(len(deterministic_cache_selections)),
+                                "decision_slot": int(step.slot),
+                                "legal_candidate_count_by_node": frame_candidate_masks.sum(axis=-1).astype(int).tolist(),
+                                "selected_candidate_index_by_node": frame_cache_actions.tolist(),
+                                "selected_group_by_node": [item["selected_group"] for item in deterministic_node_records],
+                                "nodes": deterministic_node_records,
+                                "probability_finite": bool(np.isfinite(probabilities).all()),
+                                "probability_sum_error_max": float(np.max(np.abs(probabilities.sum(axis=-1) - 1.0))),
+                            }
+                        )
                 frame_cache_changed = bool(np.any(frame_actual_update_by_node))
                 frame_macro_index = len(macro_buffer.transitions)
                 update_nodes_per_macro.append(int(np.count_nonzero(frame_actual_update_by_node)))
@@ -1270,6 +1383,7 @@ def collect_dual_timescale_episode(
             time_s=float(step.time_s),
             performance_profile=performance_profile,
             exact_q_timing_profile=exact_q_timing_profile,
+            task_ledger=task_ledger,
         )
         environment_seconds = time.perf_counter() - environment_started
         if not result.step_feasible or result.system_utility is None:
@@ -1569,6 +1683,10 @@ def collect_dual_timescale_episode(
     factorized_cache = np.asarray(
         macro_buffer.transitions[0].cache_candidate_masks
     ).ndim == 2
+    sparse_cache_mode = (
+        context.cache_action_mode
+        == interface.project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
+    )
     if factorized_cache:
         node_count = int(macro_buffer.transitions[0].cache_candidate_masks.shape[0])
         action_matrix = np.stack(
@@ -1594,24 +1712,43 @@ def collect_dual_timescale_episode(
         if node_keep_probability_records:
             keep_probabilities_array = np.stack(node_keep_probability_records)
             update_probabilities_array = np.stack(node_update_probability_records)
-            raw_keep_probabilities_array = np.stack(node_raw_keep_probability_records)
             entropy_array = np.stack(node_entropy_records)
-            log_prob_array = np.stack(node_log_prob_records)
+            raw_keep_probabilities_array = (
+                np.stack(node_raw_keep_probability_records)
+                if len(node_raw_keep_probability_records) == macro_count
+                else None
+            )
+            log_prob_array = (
+                np.stack(node_log_prob_records)
+                if len(node_log_prob_records) == macro_count
+                else None
+            )
             for node_index, node_id in enumerate(context.action_spec.cache_node_ids):
-                per_node_cache_diagnostics.append(
-                    {
-                        "node_index": int(node_index),
-                        "node_id": str(node_id),
-                        "keep_probability_mean": float(np.mean(keep_probabilities_array[:, node_index])),
-                        "update_probability_mean": float(np.mean(update_probabilities_array[:, node_index])),
-                        "raw_keep_probability_mean": float(np.mean(raw_keep_probabilities_array[:, node_index])),
-                        "sampled_update_frequency": float(node_selected_update_counts[node_index] / max(macro_count, 1)),
-                        "actual_update_frequency": float(node_actual_update_counts[node_index] / max(macro_count, 1)),
-                        "candidate_entropy_mean": float(np.mean(entropy_array[:, node_index])),
-                        "old_log_prob_mean": float(np.mean(log_prob_array[:, node_index])),
-                        "cache_cost_total": node_cost_totals[str(node_id)],
-                    }
-                )
+                node_diagnostic = {
+                    "node_index": int(node_index),
+                    "node_id": str(node_id),
+                    "keep_probability_mean": float(np.mean(keep_probabilities_array[:, node_index])),
+                    "update_probability_mean": float(np.mean(update_probabilities_array[:, node_index])),
+                    "raw_keep_probability_mean": (
+                        None
+                        if raw_keep_probabilities_array is None
+                        else float(np.mean(raw_keep_probabilities_array[:, node_index]))
+                    ),
+                    "sampled_update_frequency": float(node_selected_update_counts[node_index] / max(macro_count, 1)),
+                    "actual_update_frequency": float(node_actual_update_counts[node_index] / max(macro_count, 1)),
+                    "candidate_entropy_mean": float(np.mean(entropy_array[:, node_index])),
+                    "old_log_prob_mean": (
+                        None
+                        if log_prob_array is None
+                        else float(np.mean(log_prob_array[:, node_index]))
+                    ),
+                    "cache_cost_total": node_cost_totals[str(node_id)],
+                }
+                if sparse_cache_mode:
+                    node_diagnostic["probability_semantics"] = (
+                        "sparse node marginal; not an independent policy head"
+                    )
+                per_node_cache_diagnostics.append(node_diagnostic)
         else:
             per_node_cache_diagnostics = []
         update_nodes_per_macro = np.count_nonzero(actual_update_matrix, axis=1).astype(int).tolist()
@@ -1737,21 +1874,37 @@ def collect_dual_timescale_episode(
         * math.log(1.0 - micro_group_probability_soft_cap)
     )
     group_probability_max = np.max(micro_group_probabilities, axis=-1)
+    if task_ledger.active:
+        stage_counts = {
+            stage: sum(state.execution_stage == stage for state in task_ledger.active.values())
+            for stage in ("UPLOADING", "COMPUTING", "NETWORK_DELAY")
+        }
+        raise slot_environment.UnresolvedEpisodeTasksError(
+            "Episode ended with active tasks; their completion and reward cannot be "
+            "claimed: "
+            f"episode={episode_identity}, active={len(task_ledger.active)}, stages={stage_counts}"
+        )
     summary = {
         "episode_return": episode_return,
         "cache_action_mode": str(context.cache_action_mode),
         "episode_seed": None if episode_seed is None else int(episode_seed),
+        "cross_slot_task_count_completed": int(len(task_ledger.completed)),
+        "cross_slot_unresolved_task_count": 0,
         "macro_return": float(sum(item.frame_reward for item in macro_buffer.transitions)),
         "macro_frame_count": macro_count,
         "macro_entropy": float(np.mean([item.old_macro_entropy for item in macro_buffer.transitions])),
         "macro_cache_entropy": float(np.mean(cache_entropies)) if cache_entropies else 0.0,
         "macro_cache_entropy_aggregation": (
-            "sum of independent per-node categorical entropies; its scale is not directly comparable to single-node entropy"
+            "H(group) + sum_i P(group=i) H(candidate|group=i)"
+            if sparse_cache_mode
+            else "sum of independent per-node categorical entropies; its scale is not directly comparable to single-node entropy"
             if factorized_cache
             else "single unified Cache categorical entropy"
         ),
         "macro_cache_entropy_joint_sum_mean": (
-            float(np.mean([np.sum(item.old_node_cache_entropies) for item in macro_buffer.transitions]))
+            float(np.mean(cache_entropies))
+            if sparse_cache_mode
+            else float(np.mean([np.sum(item.old_node_cache_entropies) for item in macro_buffer.transitions]))
             if factorized_cache
             else (float(np.mean(cache_entropies)) if cache_entropies else 0.0)
         ),

@@ -70,7 +70,7 @@ class TaskConfig:
     service_size_max_gb: float = 20.0
     # 任务输入范围以 KB 配置，目录和任务行仍保存 bit，避免改变既有计算公式接口。
     input_size_min_kb: float = 500.0
-    input_size_max_kb: float = 5000.0
+    input_size_max_kb: float = 1000.0
     cycles_per_bit_min: float = 400.0
     cycles_per_bit_max: float = 1000.0
 

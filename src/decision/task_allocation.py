@@ -471,6 +471,7 @@ def enumerate_best_operation(
     ideal_utility_cache_stats: dict[str, int] | None = None,
     impact_scope_stats: dict[str, int] | None = None,
     prefer_edge_on_tie: bool = False,
+    mutable_task_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, int], float]:
     """枚举全部合法 transfer/exchange，返回本轮最大增益候选。
 
@@ -486,6 +487,10 @@ def enumerate_best_operation(
     if evaluation_mode not in {"full", "incremental"}:
         raise ValueError(f"未知 Matching candidate evaluation mode：{evaluation_mode}")
     task_ids = _sorted_ids([task.task_id for task in tasks])
+    mutable_ids = set(task_ids) if mutable_task_ids is None else set(mutable_task_ids)
+    unknown_mutable = mutable_ids - set(task_ids)
+    if unknown_mutable:
+        raise ValueError(f"mutable_task_ids contains unknown tasks: {sorted(unknown_mutable)}")
     stats = {
         "candidate_definitions_total": 0,
         "candidate_evaluations_total": 0,
@@ -544,6 +549,8 @@ def enumerate_best_operation(
         time.perf_counter() if timing_profile is not None else 0.0
     )
     for task_id in task_ids:
+        if task_id not in mutable_ids:
+            continue
         old_target = current_matching[task_id]
         for target in sorted(feasible_targets[task_id], key=str):
             if target == old_target:
@@ -569,7 +576,11 @@ def enumerate_best_operation(
         time.perf_counter() if timing_profile is not None else 0.0
     )
     for left_index, left_task in enumerate(task_ids):
+        if left_task not in mutable_ids:
+            continue
         for right_task in task_ids[left_index + 1 :]:
+            if right_task not in mutable_ids:
+                continue
             left_target = current_matching[left_task]
             right_target = current_matching[right_task]
             if left_target == right_target:
@@ -957,6 +968,8 @@ def optimize_task_matching(
     node_evaluation_cache: NodeEvaluationCache | None = None,
     timing_profile: dict[str, float] | None = None,
     cloud_fallback_mode: str = LEGACY_EDGE_GATE,
+    fixed_matching: dict[str, str] | None = None,
+    mutable_task_ids: set[str] | None = None,
 ) -> TransferExchangeMatchingResult:
     """在当前 slot 的缓存和无线状态下执行稳定匹配。"""
 
@@ -1087,8 +1100,26 @@ def optimize_task_matching(
             kkt_solve_diagnostics=tuple(kkt_summary["solve_diagnostics"]),
         )
 
+    fixed = {} if fixed_matching is None else {
+        str(key): str(value) for key, value in fixed_matching.items()
+    }
+    task_ids = {task.task_id for task in tasks}
+    if set(fixed) - task_ids:
+        raise ValueError("fixed_matching contains a task that is absent from tasks")
+    mutable_ids = (
+        task_ids - set(fixed)
+        if mutable_task_ids is None
+        else {str(value) for value in mutable_task_ids}
+    )
+    if mutable_ids & set(fixed) or mutable_ids - task_ids:
+        raise ValueError("mutable_task_ids must contain only non-fixed tasks")
+    tasks_by_id = {task.task_id: task for task in tasks}
+    new_or_uploading_tasks = [
+        task for task in tasks
+        if task.task_id not in fixed or task.execution_stage == "UPLOADING"
+    ]
     feasible_targets = build_feasible_targets(
-        tasks,
+        new_or_uploading_tasks,
         edge_cache_state,
         cache_nodes,
         vehicle_positions=vehicle_positions,
@@ -1097,8 +1128,29 @@ def optimize_task_matching(
         timing_profile=timing_profile,
         cloud_fallback_mode=cloud_fallback_mode,
     )
+    for task_id, target in fixed.items():
+        task = tasks_by_id[task_id]
+        if target == CLOUD:
+            feasible_targets[task_id] = [target]
+        elif task.execution_stage != "UPLOADING":
+            node_ids = [str(value) for value in cache_nodes["node_ids"]]
+            if target not in node_ids:
+                raise ValueError(f"fixed historical task {task_id} references missing node {target}")
+            node_index = node_ids.index(target)
+            cache_state = np.asarray(edge_cache_state, dtype=np.int8)
+            if int(cache_state[node_index, task.service_id]) != 1:
+                raise ValueError(
+                    f"fixed historical task {task_id} lost its cached service at {target}"
+                )
+            feasible_targets[task_id] = [target]
+        elif target not in feasible_targets.get(task_id, []):
+            raise ValueError(
+                f"fixed historical target is no longer feasible for task {task_id}: {target}"
+            )
+        else:
+            feasible_targets[task_id] = [target]
     current_matching = {
-        task.task_id: feasible_targets[task.task_id][0]
+        task.task_id: fixed.get(task.task_id, feasible_targets[task.task_id][0])
         for task in tasks
     }
     current_eval_started_at = (
@@ -1188,6 +1240,7 @@ def optimize_task_matching(
             ideal_utility_cache=ideal_utility_cache,
             ideal_utility_cache_stats=ideal_utility_cache_stats,
             impact_scope_stats=impact_scope_stats,
+            mutable_task_ids=mutable_ids,
             prefer_edge_on_tie=(
                 cloud_fallback_mode == RESOURCE_AWARE_FALLBACK
             ),
@@ -1258,6 +1311,7 @@ def optimize_task_matching(
             ideal_utility_cache=ideal_utility_cache,
             ideal_utility_cache_stats=ideal_utility_cache_stats,
             impact_scope_stats=impact_scope_stats,
+            mutable_task_ids=mutable_ids,
             prefer_edge_on_tie=(
                 cloud_fallback_mode == RESOURCE_AWARE_FALLBACK
             ),
@@ -1473,6 +1527,9 @@ class Task:
     service_id: int
     input_bits: float
     cpu_cycles: float
+    execution_stage: str = "NEW"
+    transmit_time_share: float = 1.0
+    remaining_network_delay_s: float = 0.0
 
 
 def load_actual_tasks(tasks_csv: Path, slot: int) -> list[Task]:
@@ -1499,6 +1556,8 @@ def load_vehicle_positions(
     trajectory_csv: Path,
     time_s: float,
     vehicle_ids: set[str],
+    *,
+    require_all: bool = True,
 ) -> dict[str, np.ndarray]:
     """Load exact-time vehicle positions needed by formal rollout execution."""
     positions: dict[str, np.ndarray] = {}
@@ -1515,7 +1574,7 @@ def load_vehicle_positions(
                 [float(row["x_m"]), float(row["y_m"])], dtype=np.float64
             )
     missing = sorted(vehicle_ids - set(positions))
-    if missing:
+    if require_all and missing:
         raise ValueError(
             f"trajectory.csv 缺少当前 time_s={time_s} 的车辆位置：{missing}"
         )
@@ -1546,12 +1605,20 @@ def _kkt_node_cache_key(
     node_id: str,
     node_tasks: list[Task],
     node_position: np.ndarray,
-) -> tuple[str, tuple[str, ...], tuple[float, float]]:
-    return (
-        str(node_id),
-        tuple(sorted((str(task.task_id) for task in node_tasks), key=_stable_id_key)),
-        _exact_position_key(node_position),
+) -> tuple[str, tuple[tuple[str, float, float, str, float], ...], tuple[float, float]]:
+    signature = tuple(
+        sorted(
+            (
+                str(task.task_id),
+                float(task.input_bits),
+                float(task.cpu_cycles),
+                str(task.execution_stage),
+                float(task.transmit_time_share),
+            )
+            for task in node_tasks
+        )
     )
+    return str(node_id), signature, _exact_position_key(node_position)
 
 
 @dataclass
@@ -2744,6 +2811,180 @@ def _group_edge_tasks(
     return grouped
 
 
+def _allocate_phase_resources_kkt(
+    tasks: list[Task],
+    matching: dict[str, str],
+    vehicle_positions: dict[str, np.ndarray],
+    service_node_positions: dict[str, np.ndarray],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    kkt_cache: KKTResourceAllocationCache | None,
+    timing_profile: dict[str, float] | None,
+) -> KKTResourceAllocationResult:
+    """Solve the existing CPU and bandwidth KKT over phase-eligible tasks."""
+    kkt_cfg = kkt_config_from_project(project_cfg)
+    grouped = _group_edge_tasks(tasks, matching, cache_nodes)
+    cpu_alloc: dict[str, dict[str, float]] = {}
+    bw_alloc: dict[str, dict[str, float]] = {}
+    cpu_sums: dict[str, float] = {}
+    bw_sums: dict[str, float] = {}
+    cpu_mu: dict[str, float] = {}
+    bw_nu: dict[str, float] = {}
+    all_diagnostics: list[KKTAllocationDiagnostics] = []
+
+    for node_id, node_tasks in grouped.items():
+        role = _edge_node_role(node_id, cache_nodes)
+        assert role is not None
+        cpu_tasks = [task for task in node_tasks if task.execution_stage in {"NEW", "COMPUTING"}]
+        upload_tasks = [task for task in node_tasks if task.execution_stage in {"NEW", "UPLOADING"}]
+        if any(task.execution_stage not in {"NEW", "UPLOADING", "COMPUTING", "NETWORK_DELAY"} for task in node_tasks):
+            return KKTResourceAllocationResult(False, f"{node_id} has unsupported execution stage", {}, {}, {}, {}, {}, {})
+        node_cpu = _node_cpu(role, cache_config)
+        node_bandwidth = _node_bandwidth(role, cache_config)
+        node_cpu_alloc: dict[str, float] = {}
+        node_bw_alloc: dict[str, float] = {}
+        cpu_total = bw_total = 0.0
+        cpu_multiplier = bw_multiplier = 0.0
+        node_diagnostics: list[KKTAllocationDiagnostics] = []
+        cache_key = _kkt_node_cache_key(
+            node_id, node_tasks, service_node_positions[node_id]
+        )
+        if kkt_cache is not None:
+            kkt_cache.requests += 1
+            cached_result = kkt_cache.entries.get(cache_key)
+            if cached_result is not None:
+                kkt_cache.hits += 1
+                cpu_alloc.update(cached_result.cpu_allocations)
+                bw_alloc.update(cached_result.bandwidth_allocations)
+                cpu_sums.update(cached_result.per_node_cpu_sum)
+                bw_sums.update(cached_result.per_node_bandwidth_sum)
+                cpu_mu.update(cached_result.cpu_multipliers)
+                bw_nu.update(cached_result.bandwidth_multipliers)
+                all_diagnostics.extend(cached_result.kkt_diagnostics)
+                continue
+            kkt_cache.misses += 1
+
+        if cpu_tasks:
+            if kkt_cfg.min_cpu_fraction * len(cpu_tasks) > 1.0:
+                return KKTResourceAllocationResult(False, f"{node_id} CPU epsilon infeasible", {}, {}, {}, {}, {}, {})
+            coeff = [
+                cache_config.omega_t * task.cpu_cycles / (cache_config.time_ref_s * node_cpu)
+                for task in cpu_tasks
+            ]
+            if kkt_cache is not None:
+                kkt_cache.solver_calls += 1
+            started = time.perf_counter() if timing_profile is not None else 0.0
+            values, cpu_multiplier, ok, reason, diag = solve_kkt_fraction_allocation(
+                coeff,
+                kkt_cfg.min_cpu_fraction,
+                kkt_cfg.bisection_tolerance,
+                kkt_cfg.max_bisection_iterations,
+                return_diagnostics=True,
+            )
+            if timing_profile is not None:
+                _profile_add(timing_profile, "kkt_solver_core_runtime", time.perf_counter() - started)
+            if kkt_cache is not None:
+                kkt_cache.record_diagnostics(diag)
+            node_diagnostics.append(diag)
+            if not ok:
+                return KKTResourceAllocationResult(False, f"{node_id} CPU infeasible: {reason}", {}, {}, {}, {}, {}, {}, tuple(node_diagnostics))
+            node_cpu_alloc = {task.task_id: float(value) for task, value in zip(cpu_tasks, values, strict=True)}
+            cpu_total = float(math.fsum(values))
+
+        if upload_tasks:
+            if kkt_cfg.min_bandwidth_fraction * len(upload_tasks) > 1.0:
+                return KKTResourceAllocationResult(False, f"{node_id} bandwidth epsilon infeasible", {}, {}, {}, {}, {}, {})
+            shares = [float(task.transmit_time_share) for task in upload_tasks]
+            if any(not math.isfinite(value) or value <= 0.0 or value > 1.0 for value in shares):
+                return KKTResourceAllocationResult(False, f"{node_id} invalid transmitter time share", {}, {}, {}, {}, {}, {})
+            gains = [
+                _channel_gain(role, vehicle_positions[task.vehicle_id], service_node_positions[node_id], cache_config)
+                for task in upload_tasks
+            ]
+            if any(not math.isfinite(value) or value <= 0.0 for value in gains):
+                return KKTResourceAllocationResult(False, f"{node_id} channel gain <= 0", {}, {}, {}, {}, {}, {})
+            coeff = []
+            for task, share in zip(upload_tasks, shares, strict=True):
+                # q scales wall-clock upload rate, while average transmit power
+                # scales by q as well; only the delay term gains a 1/q factor.
+                upload_weight = (
+                    cache_config.omega_t / (cache_config.time_ref_s * share)
+                    + cache_config.omega_e * cache_config.tx_power_w / cache_config.energy_ref_j
+                )
+                if cache_config.noise_model == system_model.BANDWIDTH_DEPENDENT_NOISE_V1:
+                    coeff.append(task.input_bits * upload_weight)
+                else:
+                    base_rate = _base_rate(role, vehicle_positions[task.vehicle_id], service_node_positions[node_id], cache_config)
+                    if base_rate <= 0.0:
+                        return KKTResourceAllocationResult(False, f"{node_id} base rate <= 0", {}, {}, {}, {}, {}, {})
+                    coeff.append(task.input_bits / base_rate * upload_weight)
+            if kkt_cache is not None:
+                kkt_cache.solver_calls += 1
+            started = time.perf_counter() if timing_profile is not None else 0.0
+            if cache_config.noise_model == system_model.BANDWIDTH_DEPENDENT_NOISE_V1:
+                if cache_config.noise_psd_w_per_hz is None or cache_config.receiver_noise_figure_db is None:
+                    return KKTResourceAllocationResult(False, "V1 noise configuration is incomplete", {}, {}, {}, {}, {}, {})
+                values, bw_multiplier, ok, reason, diag = solve_kkt_bandwidth_dependent_noise_allocation(
+                    coeff,
+                    node_bandwidth,
+                    cache_config.tx_power_w,
+                    gains,
+                    cache_config.noise_psd_w_per_hz,
+                    cache_config.receiver_noise_figure_db,
+                    kkt_cfg.min_bandwidth_fraction,
+                    kkt_cfg.bisection_tolerance,
+                    kkt_cfg.max_bisection_iterations,
+                    return_diagnostics=True,
+                )
+            else:
+                values, bw_multiplier, ok, reason, diag = solve_kkt_fraction_allocation(
+                    coeff,
+                    kkt_cfg.min_bandwidth_fraction,
+                    kkt_cfg.bisection_tolerance,
+                    kkt_cfg.max_bisection_iterations,
+                    return_diagnostics=True,
+                )
+            if timing_profile is not None:
+                _profile_add(timing_profile, "kkt_solver_core_runtime", time.perf_counter() - started)
+            if kkt_cache is not None:
+                kkt_cache.record_diagnostics(diag)
+            node_diagnostics.append(diag)
+            if not ok:
+                return KKTResourceAllocationResult(False, f"{node_id} bandwidth infeasible: {reason}", {}, {}, {}, {}, {}, {}, tuple(node_diagnostics))
+            node_bw_alloc = {task.task_id: float(value) for task, value in zip(upload_tasks, values, strict=True)}
+            bw_total = float(math.fsum(values))
+
+        def compute_node_result() -> KKTResourceAllocationResult:
+            return KKTResourceAllocationResult(
+                True,
+                "",
+                {node_id: node_cpu_alloc},
+                {node_id: node_bw_alloc},
+                {node_id: cpu_total},
+                {node_id: bw_total},
+                ({node_id: cpu_multiplier} if cpu_tasks else {}),
+                ({node_id: bw_multiplier} if upload_tasks else {}),
+                tuple(node_diagnostics),
+            )
+
+        # The cache key includes phase, residual work, and transmitter shares.
+        node_result = compute_node_result()
+        if not node_result.feasible:
+            return node_result
+        if kkt_cache is not None:
+            kkt_cache.entries[cache_key] = node_result
+        cpu_alloc.update(node_result.cpu_allocations)
+        bw_alloc.update(node_result.bandwidth_allocations)
+        cpu_sums.update(node_result.per_node_cpu_sum)
+        bw_sums.update(node_result.per_node_bandwidth_sum)
+        cpu_mu.update(node_result.cpu_multipliers)
+        bw_nu.update(node_result.bandwidth_multipliers)
+        all_diagnostics.extend(node_result.kkt_diagnostics)
+
+    return KKTResourceAllocationResult(True, "", cpu_alloc, bw_alloc, cpu_sums, bw_sums, cpu_mu, bw_nu, tuple(all_diagnostics))
+
+
 def allocate_resources_kkt(
     tasks: list[Task],
     matching: dict[str, str],
@@ -2756,6 +2997,19 @@ def allocate_resources_kkt(
     timing_profile: dict[str, float] | None = None,
 ) -> KKTResourceAllocationResult:
     """给定 matching 后，只为 edge 节点分配 KKT 的 w/b。"""
+
+    if any(task.execution_stage in {"NEW", "UPLOADING", "COMPUTING", "NETWORK_DELAY"} for task in tasks):
+        return _allocate_phase_resources_kkt(
+            tasks,
+            matching,
+            vehicle_positions,
+            service_node_positions,
+            project_cfg,
+            cache_nodes,
+            cache_config,
+            kkt_cache,
+            timing_profile,
+        )
 
     kkt_cfg = kkt_config_from_project(project_cfg)
     grouped = _group_edge_tasks(tasks, matching, cache_nodes)
@@ -3210,25 +3464,48 @@ def _evaluate_edge_node(
     total_utility = 0.0
     for task in node_tasks:
         per_target[task.task_id] = node_id
-        tv_xy = vehicle_positions[task.vehicle_id]
-        node_xy = service_node_positions[node_id]
-        gain = _channel_gain(role, tv_xy, node_xy, cache_config)
+        cpu_fraction = allocation.cpu_allocations.get(node_id, {}).get(task.task_id, 1.0)
+        bandwidth_fraction = allocation.bandwidth_allocations.get(node_id, {}).get(task.task_id, 1.0)
+        if task.execution_stage in {"COMPUTING", "NETWORK_DELAY"}:
+            delay = float(
+                task.remaining_network_delay_s
+                + task.cpu_cycles / (cpu_fraction * _node_cpu(role, cache_config))
+            )
+            energy = 0.0
+            utility = float(system_model.task_utility(
+                delay, energy, cache_config.time_ref_s, cache_config.energy_ref_j,
+                cache_config.omega_t, cache_config.omega_e,
+            ))
+            per_delay[task.task_id] = delay
+            per_energy[task.task_id] = energy
+            per_utility[task.task_id] = utility
+            total_utility += utility
+            continue
+        q = float(task.transmit_time_share)
+        if q <= 0.0 or q > 1.0:
+            raise ValueError(f"task {task.task_id} has invalid transmit_time_share={q}")
+        gain = _channel_gain(
+            role,
+            vehicle_positions[task.vehicle_id],
+            service_node_positions[node_id],
+            cache_config,
+        )
         edge = system_model.edge_execution(
-            task.input_bits,
+            task.input_bits / q if task.execution_stage in {"NEW", "UPLOADING"} else 0.0,
             task.cpu_cycles,
             _node_bandwidth(role, cache_config),
-            allocation.bandwidth_allocations[node_id][task.task_id],
+            bandwidth_fraction,
             cache_config.tx_power_w,
             gain,
             cache_config.noise_power_w,
             _node_cpu(role, cache_config),
-            allocation.cpu_allocations[node_id][task.task_id],
+            cpu_fraction,
             noise_model=cache_config.noise_model,
             noise_psd_w_per_hz=cache_config.noise_psd_w_per_hz,
             receiver_noise_figure_db=cache_config.receiver_noise_figure_db,
         )
         delay = float(edge["total_delay_s"])
-        energy = float(edge["vehicle_energy_j"])
+        energy = float(edge["vehicle_energy_j"] * q)
         utility = float(
             system_model.task_utility(
                 delay,
@@ -3380,11 +3657,14 @@ def evaluate_matching_with_kkt(
         bandwidth_resource_sums.update(node_evaluation.bandwidth_resource_sums)
 
     cloud_tasks = [task for task in tasks if matching[task.task_id] == CLOUD]
+    cloud_computing_tasks = [
+        task for task in cloud_tasks if task.execution_stage in {"NEW", "COMPUTING"}
+    ]
     cloud_kkt_started_at = (
         time.perf_counter() if timing_profile is not None else 0.0
     )
     cloud_allocation = _allocate_cloud_cpu_kkt(
-        cloud_tasks,
+        cloud_computing_tasks,
         cache_config,
         project_cfg,
         kkt_cache,
@@ -3420,6 +3700,11 @@ def evaluate_matching_with_kkt(
         else None
     )
     cloud_cpu_used = float(math.fsum(cloud_cpu_allocations.values()))
+    cloud_solo_cpu = (
+        float(cache_config.cloud_cpu_capacity_cycles_per_s)
+        if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+        else float(cache_config.cloud_total_cpu_cycles_per_s)
+    )
 
     per_delay: dict[str, float] = {}
     per_energy: dict[str, float] = {}
@@ -3437,16 +3722,20 @@ def evaluate_matching_with_kkt(
             energy = cached_node_evaluation.per_task_vehicle_energy_j[task.task_id]
             utility = cached_node_evaluation.per_task_utility[task.task_id]
         elif target == CLOUD:
-            result = system_model.cloud_execution(
-                task.input_bits,
-                task.cpu_cycles,
-                cache_config.cloud_total_bandwidth_bps,
-                cloud_cpu_allocations[task.task_id],
-                cache_config.cloud_delay_factor,
-                cache_config.tx_power_w,
+            q = float(task.transmit_time_share)
+            if q <= 0.0 or q > 1.0:
+                raise ValueError(f"task {task.task_id} has invalid transmit_time_share={q}")
+            remaining_upload = task.input_bits if task.execution_stage in {"NEW", "UPLOADING"} else 0.0
+            cpu_rate = cloud_cpu_allocations.get(task.task_id, cloud_solo_cpu)
+            upload_wall_s = remaining_upload / (cache_config.cloud_total_bandwidth_bps * q)
+            upload_delay_s = cache_config.cloud_delay_factor * upload_wall_s
+            compute_delay_s = task.cpu_cycles / cpu_rate
+            delay = float(
+                upload_delay_s
+                + compute_delay_s
+                + (task.remaining_network_delay_s if task.execution_stage == "NETWORK_DELAY" else 0.0)
             )
-            delay = float(result["total_delay_s"])
-            energy = float(result["vehicle_energy_j"])
+            energy = float(cache_config.tx_power_w * remaining_upload / cache_config.cloud_total_bandwidth_bps)
             utility = float(
                 system_model.task_utility(
                     delay,

@@ -39,7 +39,11 @@ from .interface import (
 from .macro_targets import (
     build_macro_n2_target,
 )
-from .policy import DualTimescaleActorCritic, MultiNodeFactorizedActorCritic
+from .policy import (
+    DualTimescaleActorCritic,
+    MultiNodeFactorizedActorCritic,
+    SparseCoordinatedCacheActorCritic,
+)
 from .primitive_control import (
     CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM,
     CACHE_ECONOMIC_FEATURE_DIM,
@@ -79,6 +83,7 @@ BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 INTERMEDIATE_CHECKPOINT_INTERVAL_UPDATES = 10
 CHECKPOINT_VERSION = 59
 MULTI_NODE_CHECKPOINT_VERSION = 60
+SPARSE_COORDINATED_CHECKPOINT_VERSION = 61
 ALGORITHM_ID = "PROPOSED"
 MACRO_ACTOR_UPDATE_CONTROL_VERSION = "macro_actor_post_step_joint_kl_backtracking_v1"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
@@ -884,7 +889,7 @@ class PPOTrainer:
         policy_update_total: int = FORMAL_TRAINING_EPISODES // 4,
         capture_macro_transition_trace: bool = False,
         unified_cache_action: bool | None = None,
-        cardinality_corrected_cache_action: bool = True,
+        cardinality_corrected_cache_action: bool | None = None,
     ) -> None:
         _require_torch()
         self.context = context
@@ -912,6 +917,9 @@ class PPOTrainer:
         ):
             raise ValueError("Current PROPOSED requires constant learning rates for every optimizer.")
         self.cache_action_mode = str(context.cache_action_mode)
+        self.sparse_coordinated_cache_action = (
+            self.cache_action_mode == project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
+        )
         expected_unified = (
             self.cache_action_mode == project_config.CACHE_ACTION_MODE_SINGLE_NODE
         )
@@ -920,23 +928,33 @@ class PPOTrainer:
             if unified_cache_action is None
             else bool(unified_cache_action)
         )
-        self.cardinality_corrected_cache_action = bool(
-            cardinality_corrected_cache_action
+        expected_cardinality_correction = not self.sparse_coordinated_cache_action
+        self.cardinality_corrected_cache_action = (
+            expected_cardinality_correction
+            if cardinality_corrected_cache_action is None
+            else bool(cardinality_corrected_cache_action)
         )
-        if self.unified_cache_action != expected_unified or not self.cardinality_corrected_cache_action:
+        if (
+            self.unified_cache_action != expected_unified
+            or self.cardinality_corrected_cache_action != expected_cardinality_correction
+        ):
             raise ValueError(
                 "Cache action mode and trainer distribution semantics do not match."
             )
         policy_schema = str(context.policy_schema)
-        expected_schema = (
-            PROPOSED_POLICY_SCHEMA
-            if expected_unified
-            else project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA
-        )
+        expected_schema = {
+            project_config.CACHE_ACTION_MODE_SINGLE_NODE: PROPOSED_POLICY_SCHEMA,
+            project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED: project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA,
+            project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED: project_config.SPARSE_COORDINATED_CACHE_POLICY_SCHEMA,
+        }.get(self.cache_action_mode)
         if policy_schema != expected_schema:
             raise ValueError(f"unsupported current PROPOSED policy_schema: {policy_schema}")
         self.checkpoint_version = (
-            CHECKPOINT_VERSION if expected_unified else MULTI_NODE_CHECKPOINT_VERSION
+            CHECKPOINT_VERSION
+            if expected_unified
+            else SPARSE_COORDINATED_CHECKPOINT_VERSION
+            if self.sparse_coordinated_cache_action
+            else MULTI_NODE_CHECKPOINT_VERSION
         )
         self.algorithm_id = ALGORITHM_ID
         self.macro_actor_update_control_version = MACRO_ACTOR_UPDATE_CONTROL_VERSION
@@ -1000,7 +1018,11 @@ class PPOTrainer:
         micro_feature_dim = int(tensor_spec.uav_feature_dim) + 2
         self.hidden_sizes = tuple(int(value) for value in self.config["hidden_sizes"])
         policy_type = (
-            DualTimescaleActorCritic if expected_unified else MultiNodeFactorizedActorCritic
+            DualTimescaleActorCritic
+            if expected_unified
+            else SparseCoordinatedCacheActorCritic
+            if self.sparse_coordinated_cache_action
+            else MultiNodeFactorizedActorCritic
         )
         policy_kwargs = (
             {
@@ -1170,7 +1192,7 @@ class PPOTrainer:
 
     @property
     def config_contract(self) -> dict[str, Any]:
-        return {
+        contract = {
             "observation_dim": int(self.policy.observation_dim),
             "macro_cache_feature_dim": int(self.policy.macro_cache_feature_dim),
             "micro_uav_feature_dim": int(self.policy.micro_uav_feature_dim),
@@ -1185,7 +1207,9 @@ class PPOTrainer:
                 "[B,N]" if not self.unified_cache_action else "[B]"
             ),
             "cache_joint_logprob": (
-                "sum of independent node categorical log-probabilities"
+                "log P(group|s) + log P(candidate|group,s)"
+                if self.sparse_coordinated_cache_action
+                else "sum of independent node categorical log-probabilities"
                 if not self.unified_cache_action
                 else "single unified Cache categorical log-probability"
             ),
@@ -1233,12 +1257,18 @@ class PPOTrainer:
             "long_value_steps_per_update": self.long_value_steps_per_update,
             "long_value_max_grad_norm": self.long_value_max_grad_norm,
             "cache_action_semantics": (
-                "nine shared-parameter masked node categoricals; each node candidate 0 is KEEP and legal UPDATE proposals are cardinality corrected; all use the same pre-action global observation"
+                "hierarchical categorical over ALL_KEEP or one legal UPDATE node, then a legal target for that node; at most one node changes per Macro frame"
+                if self.sparse_coordinated_cache_action
+                else "nine shared-parameter masked node categoricals; each node candidate 0 is KEEP and legal UPDATE proposals are cardinality corrected; all use the same pre-action global observation"
                 if not self.unified_cache_action
                 else "single masked categorical over KEEP candidate 0 and legal UPDATE candidates; holding termination uses post-slot observation and elapsed fraction"
             ),
-            "cardinality_corrected_cache_action": True,
-            "cache_candidate_probability_semantics": "legal UPDATE logits subtract log of the legal nonzero candidate count",
+            "cardinality_corrected_cache_action": self.cardinality_corrected_cache_action,
+            "cache_candidate_probability_semantics": (
+                "conditional categorical over legal targets after selecting an UPDATE node group"
+                if self.sparse_coordinated_cache_action
+                else "legal UPDATE logits subtract log of the legal nonzero candidate count"
+            ),
             "unified_cache_action": bool(self.unified_cache_action),
             "micro_group_entropy_floor_enabled": True,
             "micro_group_probability_soft_cap": float(
@@ -1255,6 +1285,15 @@ class PPOTrainer:
                 "STAY/MOVE group entropy-floor regularization"
             ),
         }
+        if self.sparse_coordinated_cache_action:
+            contract["max_cache_updates_per_frame"] = 1
+            contract["cache_group_probability_semantics"] = (
+                "masked categorical over ALL_KEEP and each node with at least one legal UPDATE"
+            )
+            contract["cache_conditional_probability_semantics"] = (
+                "masked categorical over legal UPDATE targets for the selected node only"
+            )
+        return contract
 
     def _micro_group_entropy_floor(self) -> float:
         probability_cap = float(self.config["micro_group_probability_soft_cap"])
@@ -2429,7 +2468,9 @@ class PPOTrainer:
                     np.max(sampled_termination_decisions)
                 ),
                 "macro_cache_entropy_aggregation": (
-                    "joint entropy is sum of independent node categorical entropies"
+                    "joint entropy is H(group) + sum_i P(group=i) H(candidate|group=i)"
+                    if self.sparse_coordinated_cache_action
+                    else "joint entropy is sum of independent node categorical entropies"
                     if not self.unified_cache_action
                     else "single unified Cache categorical entropy"
                 ),
@@ -3446,9 +3487,8 @@ class PPOTrainer:
             "architecture_version": int(self.policy.architecture_version),
             "macro_actor_update_control_version": self.macro_actor_update_control_version,
             "unified_cache_action": self.unified_cache_action,
+            "cardinality_corrected_cache_action": self.cardinality_corrected_cache_action,
         }
-        if self.cardinality_corrected_cache_action:
-            required["cardinality_corrected_cache_action"] = True
         for field, expected in required.items():
             if payload.get(field) != expected:
                 raise ValueError(
@@ -3463,7 +3503,10 @@ class PPOTrainer:
                 raise ValueError(f"checkpoint {field} mismatch.")
         current_contract = self.config_contract
         comparable_saved_contract = dict(saved_contract)
-        if self.cache_action_mode == project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED:
+        if self.cache_action_mode in {
+            project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
+            project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED,
+        }:
             saved_node_ids = saved_contract.get("cache_node_ids")
             current_node_ids = current_contract.get("cache_node_ids")
             expected_static_suffix = ["RSU_0", "RSU_1", "UAV_0", "UAV_1"]
