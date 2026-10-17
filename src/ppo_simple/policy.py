@@ -280,7 +280,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-        "v3_per_slot_analytic_task_model_v1"
+        "v3_per_slot_analytic_task_model_v1_training_p95_reward_norm_v1"
     )
     architecture_version = 34
 
@@ -1645,7 +1645,8 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-        "v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1"
+        "v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1_"
+        "training_p95_reward_norm_v1"
     )
     architecture_version = 35
 
@@ -1675,7 +1676,8 @@ class SparseCoordinatedCacheActorCritic(MultiNodeFactorizedActorCritic):
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-        "v5_sparse_coordinated_cache_v1_per_slot_analytic_task_model_v1"
+        "v5_sparse_coordinated_cache_v1_per_slot_analytic_task_model_v1_"
+        "training_p95_reward_norm_v1"
     )
     architecture_version = 36
     sparse_coordinated_cache_action = True

@@ -395,23 +395,19 @@ lambda_cache = 0.1
 lambda_movement = 1.76e-5
 uav_movement_cost_weight = 0.50
 cache_cost_weight = 0.1
-# T_ref/E_ref 是 frozen train-only calibration constants；Validation/Test 未参与拟合。
-# 当前正式协议按相互独立的完整 realizations 划分，不做单个 episode 的
-# Train/Test origin 切分：
-# Training: environment_data/proposed_joint_training，seeds 20001–20300，
-# 300 complete realizations，每个 realization 300 slots。
-# Validation: environment_data/proposed_joint_validation，seeds 30001–30030，
-# 30 complete realizations。
-# Test: environment_data/proposed_joint_test，seeds 40001–40100，
-# 100 complete realizations。
-# 三个 split 的 seed 区间互不重叠，每个 realization 均完整覆盖 300 slots。
-# 此参考值继续沿用移除 TV Local 前的 Stage6 Training 冻结校准，不因本次模型切换重标定。
-# 历史训练校准样本共 3343 个到达任务；cpu_cycles P95=30,628,985,166.15863 cycle；
-# 历史上按 1.0e9 cycle/s 的 TV CPU 换算为 30.6289851662 s。
-T_ref = 30.6289851662
-# 历史 E_ref 按同一 P95 工作负载与 kappa=1.0e-28 的 TV Local 模型标定；
-# 本次保留该冻结归一化常数，不代表整改后 TV 本地执行。
-E_ref = 3.06289851662
+# T_ref/E_ref are train-only P95 normalization constants for the PER_SLOT_ANALYTIC
+# task model. Calibration used 12 Training realizations (seeds 20001, 20028, 20055,
+# 20082, 20110, 20137, 20164, 20191, 20218, 20245, 20272, 20300), sampling slots
+# 0, 33, 66, 99, 132, 165, 198, 231, 264, 299 in each (120 slots; 1642 tasks).
+# Reference policy is independent of T_ref/E_ref: fixed feasible role-indexed initial
+# Cache (seed 4401), configured fixed UAV positions, greedy least-loaded choice among
+# physically feasible cached Edge nodes (stable node-order tie break; Cloud only if
+# no Edge candidate), equal per-node CPU/BW shares, and equal sharing of finite 40 GHz
+# Cloud CPU; Cloud upload is 20 Mbps and factor 13 applies to delay only.
+# T_ref is task-level P95 complete delay in seconds; E_ref is task-level P95 vehicle
+# upload energy in joules. Validation and Test were not used.
+T_ref = 30.473728355325758
+E_ref = 5.1574642506299275
 
 [prediction.vehicle]
 # 车辆预测 horizon H_p。当前实际值 5；修改需重跑车辆预测、GRU、scenario。
@@ -524,7 +520,7 @@ cloud_fallback_mode = "RESOURCE_AWARE_FALLBACK"
 enabled = true
 method = "PROPOSED"
 configuration_control_mode = "macro_cache_smdp_micro_uav_candidate"
-policy_schema = "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1"
+policy_schema = "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1_training_p95_reward_norm_v1"
 task_execution_model = "PER_SLOT_ANALYTIC"
 cache_action_mode = "MULTI_NODE_FACTORIZED"
 cache_reconfiguration_model = "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION"
