@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ppo-train = "ppo_simple.trainer:main"
+ppo-train = "ppo_simple.stage3_cli:main"
 ppo-eval = "ppo_simple.evaluator:main"
 
 [tool.setuptools]

@@ -295,6 +295,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         *,
         unified_cache_action: bool = True,
         cardinality_corrected_cache_action: bool = True,
+        separate_trigger_candidate: bool = False,
     ) -> None:
         _require_torch()
         super().__init__()
@@ -307,6 +308,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         self.cardinality_corrected_cache_action = bool(
             cardinality_corrected_cache_action
         )
+        self.separate_trigger_candidate = bool(separate_trigger_candidate)
         if not self.cardinality_corrected_cache_action:
             raise ValueError(
                 "The PROPOSED policy requires Cache candidate cardinality correction."
@@ -356,6 +358,47 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         self.long_value_critic = _mlp(
             self.observation_dim, (128, 128), 1, activation=nn.SiLU
         )
+
+        if self.separate_trigger_candidate:
+            # Preserve the existing operation-group scorer as the Trigger path
+            # and give the UPDATE-conditional distribution its own parameters.
+            # Register after legacy modules so their seeded initialization stays
+            # unchanged; copy initialization preserves the migrated policy.
+            self.macro_conditional_candidate_encoder = nn.Sequential(
+                nn.Linear(self.macro_cache_feature_dim, hidden), nn.Tanh()
+            )
+            self.macro_conditional_cache_scorer = nn.Sequential(
+                nn.Linear(hidden * 2, hidden), nn.Tanh(), nn.Linear(hidden, 1)
+            )
+            self.macro_conditional_candidate_encoder.load_state_dict(
+                self.macro_cache_candidate_encoder.state_dict(), strict=True
+            )
+            self.macro_conditional_cache_scorer.load_state_dict(
+                self.macro_cache_scorer.state_dict(), strict=True
+            )
+
+    def enable_separate_trigger_candidate(self) -> None:
+        """Install the copied conditional Candidate path for Stage3 MAPPO only."""
+
+        if self.separate_trigger_candidate:
+            return
+        if self.unified_cache_action:
+            raise ValueError("Separate Trigger/Candidate scoring requires factorized Cache actions.")
+        hidden = int(self.macro_cache_candidate_encoder[0].out_features)
+        reference = next(self.parameters())
+        conditional_encoder = nn.Sequential(
+            nn.Linear(self.macro_cache_feature_dim, hidden), nn.Tanh()
+        ).to(device=reference.device, dtype=reference.dtype)
+        conditional_scorer = nn.Sequential(
+            nn.Linear(hidden * 2, hidden), nn.Tanh(), nn.Linear(hidden, 1)
+        ).to(device=reference.device, dtype=reference.dtype)
+        conditional_encoder.load_state_dict(
+            self.macro_cache_candidate_encoder.state_dict(), strict=True
+        )
+        conditional_scorer.load_state_dict(self.macro_cache_scorer.state_dict(), strict=True)
+        self.macro_conditional_candidate_encoder = conditional_encoder
+        self.macro_conditional_cache_scorer = conditional_scorer
+        self.separate_trigger_candidate = True
 
     def _macro_critic_inputs(self, observations: Any) -> Any:
         return 2.0 * observations - 1.0
@@ -528,6 +571,66 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         values = self.macro_value(obs)
         return corrected_logits, raw_logits, values, masks
 
+    def _macro_cache_factorized_node_logits(
+        self,
+        observations: Any,
+        cache_candidate_features: Any,
+        cache_candidate_masks: Any,
+        *,
+        detach_candidate_context: bool = False,
+    ) -> tuple[Any, Any, Any, Any, Any, Any]:
+        """Return independent Trigger and UPDATE-conditional candidate scores.
+
+        Trigger logits deliberately use the legacy scorer so their group-mass
+        contract is preserved. Candidate scores use the copied conditional
+        head and are softmaxed only over legal UPDATE candidates by callers.
+        ``detach_candidate_context`` isolates candidate-ranking gradients from
+        the shared observation encoder, which is part of the Trigger path.
+        """
+
+        trigger_logits, trigger_raw, values, masks = self._macro_cache_node_logits(
+            observations, cache_candidate_features, cache_candidate_masks
+        )
+        if not self.separate_trigger_candidate:
+            return (
+                trigger_logits,
+                trigger_raw,
+                trigger_logits,
+                trigger_raw,
+                values,
+                masks,
+            )
+        device = next(self.parameters()).device
+        obs, _ = self._observation_batch(observations, device)
+        features = torch.as_tensor(
+            cache_candidate_features, dtype=torch.float32, device=device
+        )
+        if features.ndim == 3:
+            features = features.unsqueeze(0)
+        if tuple(features.shape[:-1]) != tuple(masks.shape):
+            raise ValueError("factorized conditional candidate features/mask mismatch")
+        hidden = self.macro_actor_encoder(obs)
+        if detach_candidate_context:
+            hidden = hidden.detach()
+        candidate_hidden = self.macro_conditional_candidate_encoder(features)
+        expanded_hidden = hidden[:, None, None, :].expand(
+            -1, int(features.shape[1]), int(features.shape[2]), -1
+        )
+        conditional_raw = self.macro_conditional_cache_scorer(
+            torch.cat((expanded_hidden, candidate_hidden), dim=-1)
+        ).squeeze(-1)
+        conditional_logits = self._cardinality_corrected_cache_logits(
+            conditional_raw, masks
+        )
+        return (
+            trigger_logits,
+            trigger_raw,
+            conditional_logits,
+            conditional_raw,
+            values,
+            masks,
+        )
+
     def sample_macro_nodes(
         self,
         observation: Any,
@@ -550,17 +653,117 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             obs, _ = self._observation_batch(observation, device)
             if int(obs.shape[0]) != 1:
                 raise ValueError("sample_macro_nodes accepts one observation")
-            logits, raw_logits, values, legal_masks = self._macro_cache_node_logits(
-                obs, features, masks
-            )
-            node_logits = logits[0]
-            node_raw_logits = raw_logits[0]
+            if not self.separate_trigger_candidate:
+                logits, raw_logits, values, legal_masks = self._macro_cache_node_logits(
+                    obs, features, masks
+                )
+                node_logits = logits[0]
+                node_raw_logits = raw_logits[0]
+                node_masks = legal_masks[0]
+                corrected = _masked_categorical(node_logits, node_masks)
+                raw = _masked_categorical(node_raw_logits, node_masks)
+                if not bool(torch.isfinite(corrected.probs).all().item()) or not torch.allclose(
+                    corrected.probs.sum(dim=-1),
+                    torch.ones(corrected.probs.shape[0], dtype=corrected.probs.dtype, device=device),
+                    atol=1.0e-6,
+                    rtol=0.0,
+                ):
+                    raise FloatingPointError("factorized Cache probabilities are invalid")
+                if deterministic:
+                    actions: list[int] = []
+                    diagnostics: list[dict[str, Any]] = []
+                    for node_index in range(int(node_logits.shape[0])):
+                        group_ids = torch.ones_like(node_masks[node_index], dtype=torch.long)
+                        group_ids[0] = 0
+                        selected, selected_group = _group_aware_deterministic_candidate(
+                            node_raw_logits[node_index],
+                            corrected.probs[node_index],
+                            node_masks[node_index],
+                            group_ids,
+                        )
+                        update_mask = node_masks[node_index] & (group_ids == 1)
+                        diagnostics.append(
+                            {
+                                "node_index": node_index,
+                                "selected_candidate_index": selected,
+                                "selected_group": "KEEP" if selected_group == 0 else "UPDATE",
+                                "p_keep": float(corrected.probs[node_index, 0].cpu()),
+                                "p_update": float(corrected.probs[node_index, 1:].sum().cpu()),
+                                "legal_update_candidate_count": int(update_mask.sum().item()),
+                                "selected_candidate_is_legal": bool(node_masks[node_index, selected].item()),
+                            }
+                        )
+                        actions.append(selected)
+                    action_values = torch.as_tensor(actions, dtype=torch.long, device=device)
+                    deterministic_diagnostics = tuple(diagnostics)
+                else:
+                    action_values = corrected.sample()
+                    deterministic_diagnostics = None
+                return MultiNodeMacroActionSample(
+                    cache_actions=action_values.detach().cpu().numpy().astype(np.int64, copy=True),
+                    node_log_probs=corrected.log_prob(action_values),
+                    node_entropies=corrected.entropy(),
+                    value=values.squeeze(0),
+                    cache_masks=node_masks.detach().cpu().numpy().copy(),
+                    node_probabilities=corrected.probs.detach().cpu().numpy().copy(),
+                    raw_node_probabilities=raw.probs.detach().cpu().numpy().copy(),
+                    node_p_keep=corrected.probs[:, 0],
+                    node_p_update=corrected.probs[:, 1:].sum(dim=-1),
+                    deterministic_diagnostics=deterministic_diagnostics,
+                )
+            (
+                trigger_logits,
+                trigger_raw_logits,
+                conditional_logits,
+                conditional_raw_logits,
+                values,
+                legal_masks,
+            ) = self._macro_cache_factorized_node_logits(obs, features, masks)
+            node_trigger_logits = trigger_logits[0]
+            node_trigger_raw_logits = trigger_raw_logits[0]
+            node_conditional_logits = conditional_logits[0]
+            node_conditional_raw_logits = conditional_raw_logits[0]
             node_masks = legal_masks[0]
-            corrected = _masked_categorical(node_logits, node_masks)
-            raw = _masked_categorical(node_raw_logits, node_masks)
-            if not bool(torch.isfinite(corrected.probs).all().item()) or not torch.allclose(
-                corrected.probs.sum(dim=-1),
-                torch.ones(corrected.probs.shape[0], dtype=corrected.probs.dtype, device=device),
+            trigger_distributions = []
+            for node_index in range(int(node_masks.shape[0])):
+                update_mask = node_masks[node_index, 1:]
+                has_update = bool(torch.any(update_mask).item())
+                update_logit = (
+                    torch.logsumexp(
+                        node_trigger_logits[node_index, 1:].masked_fill(
+                            ~update_mask, -float("inf")
+                        ),
+                        dim=0,
+                    )
+                    if has_update
+                    else node_trigger_logits.new_tensor(-float("inf"))
+                )
+                group_logits = torch.stack(
+                    (node_trigger_logits[node_index, 0], update_logit)
+                )
+                group_mask = torch.as_tensor(
+                    (True, has_update), dtype=torch.bool, device=device
+                )
+                trigger_distributions.append(_masked_categorical(group_logits, group_mask))
+            conditional_probs = torch.zeros_like(node_conditional_logits[:, 1:])
+            update_masks = node_masks[:, 1:]
+            if int(update_masks.shape[-1]) > 0:
+                has_update = torch.any(update_masks, dim=-1)
+                if bool(has_update.any().item()):
+                    conditional_probs[has_update] = _masked_categorical(
+                        node_conditional_logits[has_update, 1:],
+                        update_masks[has_update],
+                    ).probs
+            p_keep = torch.stack([distribution.probs[0] for distribution in trigger_distributions])
+            p_update = torch.stack([distribution.probs[1] for distribution in trigger_distributions])
+            joint_probs = torch.cat(
+                (p_keep.unsqueeze(-1), p_update.unsqueeze(-1) * conditional_probs),
+                dim=-1,
+            )
+            raw = _masked_categorical(node_trigger_raw_logits, node_masks)
+            if not bool(torch.isfinite(joint_probs).all().item()) or not torch.allclose(
+                joint_probs.sum(dim=-1),
+                torch.ones(joint_probs.shape[0], dtype=joint_probs.dtype, device=device),
                 atol=1.0e-6,
                 rtol=0.0,
             ):
@@ -568,12 +771,12 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             if deterministic:
                 actions: list[int] = []
                 diagnostics: list[dict[str, Any]] = []
-                for node_index in range(int(node_logits.shape[0])):
+                for node_index in range(int(node_trigger_logits.shape[0])):
                     group_ids = torch.ones_like(node_masks[node_index], dtype=torch.long)
                     group_ids[0] = 0
                     selected, selected_group = _group_aware_deterministic_candidate(
-                        node_raw_logits[node_index],
-                        corrected.probs[node_index],
+                        node_conditional_raw_logits[node_index],
+                        joint_probs[node_index],
                         node_masks[node_index],
                         group_ids,
                     )
@@ -584,8 +787,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                             "node_index": node_index,
                             "selected_candidate_index": selected,
                             "selected_group": "KEEP" if selected_group == 0 else "UPDATE",
-                            "p_keep": float(corrected.probs[node_index, 0].cpu()),
-                            "p_update": float(corrected.probs[node_index, 1:].sum().cpu()),
+                            "p_keep": float(joint_probs[node_index, 0].cpu()),
+                            "p_update": float(joint_probs[node_index, 1:].sum().cpu()),
                             "legal_update_candidate_count": update_count,
                             "selected_candidate_is_legal": bool(node_masks[node_index, selected].item()),
                         }
@@ -594,20 +797,57 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 action_values = torch.as_tensor(actions, dtype=torch.long, device=device)
                 deterministic_diagnostics = tuple(diagnostics)
             else:
-                action_values = corrected.sample()
+                actions = []
+                for node_index, trigger_distribution in enumerate(trigger_distributions):
+                    trigger = trigger_distribution.sample()
+                    if int(trigger.item()) == 0:
+                        actions.append(0)
+                    else:
+                        conditional_distribution = _masked_categorical(
+                            node_conditional_logits[node_index, 1:],
+                            node_masks[node_index, 1:],
+                        )
+                        actions.append(int(conditional_distribution.sample().item()) + 1)
+                action_values = torch.as_tensor(actions, dtype=torch.long, device=device)
                 deterministic_diagnostics = None
-            node_log_probs = corrected.log_prob(action_values)
-            node_entropies = corrected.entropy()
+            node_log_probs = []
+            node_entropies = []
+            for node_index, trigger_distribution in enumerate(trigger_distributions):
+                action = int(action_values[node_index].item())
+                trigger = torch.as_tensor(
+                    0 if action == 0 else 1, dtype=torch.long, device=device
+                )
+                log_prob = trigger_distribution.log_prob(trigger)
+                entropy = trigger_distribution.entropy()
+                if action > 0:
+                    conditional_distribution = _masked_categorical(
+                        node_conditional_logits[node_index, 1:],
+                        node_masks[node_index, 1:],
+                    )
+                    log_prob = log_prob + conditional_distribution.log_prob(
+                        torch.as_tensor(action - 1, dtype=torch.long, device=device)
+                    )
+                    entropy = entropy + trigger_distribution.probs[1] * conditional_distribution.entropy()
+                elif bool(torch.any(node_masks[node_index, 1:]).item()):
+                    conditional_distribution = _masked_categorical(
+                        node_conditional_logits[node_index, 1:],
+                        node_masks[node_index, 1:],
+                    )
+                    entropy = entropy + trigger_distribution.probs[1] * conditional_distribution.entropy()
+                node_log_probs.append(log_prob)
+                node_entropies.append(entropy)
+            node_log_probs = torch.stack(node_log_probs)
+            node_entropies = torch.stack(node_entropies)
             return MultiNodeMacroActionSample(
                 cache_actions=action_values.detach().cpu().numpy().astype(np.int64, copy=True),
                 node_log_probs=node_log_probs,
                 node_entropies=node_entropies,
                 value=values.squeeze(0),
                 cache_masks=node_masks.detach().cpu().numpy().copy(),
-                node_probabilities=corrected.probs.detach().cpu().numpy().copy(),
+                node_probabilities=joint_probs.detach().cpu().numpy().copy(),
                 raw_node_probabilities=raw.probs.detach().cpu().numpy().copy(),
-                node_p_keep=corrected.probs[:, 0],
-                node_p_update=corrected.probs[:, 1:].sum(dim=-1),
+                node_p_keep=joint_probs[:, 0],
+                node_p_update=joint_probs[:, 1:].sum(dim=-1),
                 deterministic_diagnostics=deterministic_diagnostics,
             )
 
@@ -1184,10 +1424,15 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 p_keep = group_distribution.probs[:, 0]
                 p_update = group_distribution.probs[:, 1:].sum(dim=-1)
             else:
-                cache_logits, _, values, masks = self._macro_cache_node_logits(
-                    obs,
-                    cache_candidate_features,
-                    cache_candidate_masks,
+                (
+                    trigger_logits,
+                    _,
+                    conditional_logits,
+                    _,
+                    values,
+                    masks,
+                ) = self._macro_cache_factorized_node_logits(
+                    obs, cache_candidate_features, cache_candidate_masks
                 )
                 expected_action_shape = (batch_size, int(masks.shape[1]))
                 if tuple(cache_action_values.shape) != expected_action_shape:
@@ -1197,10 +1442,80 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
                 selected_legal = masks.gather(2, cache_action_values.unsqueeze(-1)).squeeze(-1)
                 if not bool(torch.all(selected_legal).item()):
                     raise ValueError("factorized Cache action is masked by its saved legal mask")
-                cache_distribution = _masked_categorical(cache_logits, masks)
-                node_cache_log_probs = cache_distribution.log_prob(cache_action_values)
-                node_cache_entropies = cache_distribution.entropy()
-                node_cache_probabilities = cache_distribution.probs
+                per_node_log_probs: list[Any] = []
+                per_node_entropies: list[Any] = []
+                per_node_probabilities: list[Any] = []
+                for node_index in range(int(masks.shape[1])):
+                    node_mask = masks[:, node_index]
+                    update_mask = node_mask[:, 1:]
+                    has_update = torch.any(update_mask, dim=-1)
+                    update_logit = torch.logsumexp(
+                        trigger_logits[:, node_index, 1:].masked_fill(
+                            ~update_mask, -float("inf")
+                        ),
+                        dim=-1,
+                    )
+                    update_logit = torch.where(
+                        has_update,
+                        update_logit,
+                        torch.full_like(update_logit, -float("inf")),
+                    )
+                    group_logits = torch.stack(
+                        (trigger_logits[:, node_index, 0], update_logit), dim=-1
+                    )
+                    group_mask = torch.stack(
+                        (torch.ones_like(has_update), has_update), dim=-1
+                    )
+                    group_distribution = _masked_categorical(group_logits, group_mask)
+                    conditional_probabilities = torch.zeros_like(
+                        conditional_logits[:, node_index, 1:]
+                    )
+                    conditional_entropies = torch.zeros(
+                        batch_size,
+                        dtype=conditional_logits.dtype,
+                        device=device,
+                    )
+                    if int(update_mask.shape[-1]) > 0 and bool(has_update.any().item()):
+                        conditional_distribution = _masked_categorical(
+                            conditional_logits[has_update, node_index, 1:],
+                            update_mask[has_update],
+                        )
+                        conditional_probabilities[has_update] = conditional_distribution.probs
+                        conditional_entropies[has_update] = conditional_distribution.entropy()
+                    joint_probabilities = torch.cat(
+                        (
+                            group_distribution.probs[:, :1],
+                            group_distribution.probs[:, 1:2] * conditional_probabilities,
+                        ),
+                        dim=-1,
+                    )
+                    actions_for_node = cache_action_values[:, node_index]
+                    is_update = actions_for_node > 0
+                    node_log_prob = group_distribution.log_prob(is_update.long())
+                    if bool(is_update.any().item()):
+                        if int(update_mask.shape[-1]) == 0:
+                            raise ValueError("Macro UPDATE selected without an UPDATE candidate.")
+                        conditional_distribution = _masked_categorical(
+                            conditional_logits[is_update, node_index, 1:],
+                            update_mask[is_update],
+                        )
+                        conditional_actions = actions_for_node[is_update] - 1
+                        update_rows = torch.nonzero(is_update, as_tuple=False).flatten()
+                        conditional_log_prob = torch.zeros_like(node_log_prob).index_copy(
+                            0,
+                            update_rows,
+                            conditional_distribution.log_prob(conditional_actions),
+                        )
+                        node_log_prob = node_log_prob + conditional_log_prob
+                    node_entropy = group_distribution.entropy() + (
+                        group_distribution.probs[:, 1] * conditional_entropies
+                    )
+                    per_node_log_probs.append(node_log_prob)
+                    per_node_entropies.append(node_entropy)
+                    per_node_probabilities.append(joint_probabilities)
+                node_cache_log_probs = torch.stack(per_node_log_probs, dim=-1)
+                node_cache_entropies = torch.stack(per_node_entropies, dim=-1)
+                node_cache_probabilities = torch.stack(per_node_probabilities, dim=1)
                 cache_log_prob = _sum_log_probabilities(node_cache_log_probs, dim=-1)
                 cache_entropy = node_cache_entropies.sum(dim=-1)
                 cache_probabilities = node_cache_probabilities
@@ -1658,6 +1973,8 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
         adaptive_holding_min_slots: int,
         adaptive_holding_max_slots: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
+        *,
+        separate_trigger_candidate: bool = False,
     ) -> None:
         super().__init__(
             observation_dim,
@@ -1668,6 +1985,7 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
             hidden_sizes,
             unified_cache_action=False,
             cardinality_corrected_cache_action=True,
+            separate_trigger_candidate=separate_trigger_candidate,
         )
 
 

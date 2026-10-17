@@ -1332,7 +1332,13 @@ class PPOTrainer:
     def update_from_episodes(
         self, collections: list[EpisodeCollection]
     ) -> dict[str, Any]:
-        """用同一冻结策略采样的四条 rollout 执行一次 PROPOSED 更新。"""
+        """Retired legacy PPO update; Stage3 owns the formal training path."""
+
+        del collections
+        raise RuntimeError(
+            "Legacy PPO updates are retired. Use MAPPOBaselineTrainer via the "
+            "Stage3 training entrypoint."
+        )
 
         group_size = self.realizations_per_policy_update
         if len(collections) != group_size:
@@ -3756,7 +3762,12 @@ def run_training(
     verbose: bool = False,
     save_macro_transition_trace: bool = False,
 ) -> dict[str, Any]:
-    """按完整 episode 收集 on-policy 数据并更新 PROPOSED 主线策略。"""
+    """Retired legacy PPO runner; Stage3 is the only supported training entry."""
+
+    raise RuntimeError(
+        "Legacy PPO training is retired. Use the Stage3-only entrypoint "
+        "scripts/training/run_mappo_stage3_cache_value.py."
+    )
 
     _require_torch()
     if resume_checkpoint_path is not None and not resume:
@@ -4615,26 +4626,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    result = run_training(
-        args.config,
-        args.epochs,
-        args.run_dir,
-        episode_pool=args.episode_pool,
-        validated_integrity_baseline_sha256=args.validated_integrity_baseline_sha256,
-        episode_seed_start=args.episode_seed_start,
-        generate_missing_episodes=bool(args.generate_missing_episodes),
-        episode_generation_device=args.episode_generation_device,
-        actor_learning_rate_override=args.actor_learning_rate,
-        macro_actor_learning_rate_override=args.macro_actor_learning_rate,
-        critic_learning_rate_override=args.critic_learning_rate,
-        seed=args.seed,
-        resume=bool(args.resume),
-        resume_checkpoint_path=args.resume_checkpoint,
-        verbose=bool(args.verbose),
-        save_macro_transition_trace=bool(args.save_macro_transition_trace),
+    del argv
+    raise RuntimeError(
+        "The legacy PPO command is retired. The registered `ppo-train` command "
+        "and scripts/training/mainline_runner.py dispatch to Stage3."
     )
-    return 2 if result["early_stop_reason"] is not None else 0
 
 
 if __name__ == "__main__":

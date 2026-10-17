@@ -1,0 +1,17 @@
+{
+  "profile_schema": "mappo_stage3_loss_coefficient_profile_v1",
+  "profile_id": "stage3_cache_delta_q_initial_fixed_v1",
+  "algorithm_schema": "mappo_cache_delta_q_counterfactual_v2_common_micro_uniforms",
+  "loss_coefficients": {
+    "trigger_ranking": 0.01,
+    "candidate_ranking": 0.01,
+    "delta_q_huber": 1.0
+  },
+  "value_head_learning_rate": 0.001,
+  "tie_tolerances": {
+    "trigger": 0.01,
+    "candidate": 0.01
+  },
+  "pairwise_temperature": 1.0,
+  "huber_delta": 1.0
+}
