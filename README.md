@@ -2,7 +2,7 @@
 
 ## 正式主线
 
-当前唯一正式算法为 `PROPOSED`，使用 Architecture 33、Checkpoint 60 和策略 Schema `adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1`。正式配置是 `configs/proposed/system_config.toml`：`MULTI_NODE_FACTORIZED` Cache 控制 9 个节点（5 个 SV、2 个 RSU、2 架 UAV），其中两架 UAV 也由 Micro 策略控制位置。
+当前唯一正式算法为 `PROPOSED`，使用 PER_SLOT_ANALYTIC 任务效用模型、Architecture 35、Checkpoint 62 和策略 Schema `adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1`。Observation Spec 当前生成 400 维状态，不包含跨 Slot Ledger 特征。每个 Slot 仅对该 Slot 的到达任务执行 Matching/KKT 并计算完整时延、能耗与 Reward；Cache 和 UAV 配置仍跨 Slot 延续。正式配置是 `configs/proposed/system_config.toml`：`MULTI_NODE_FACTORIZED` Cache 控制 9 个节点（5 个 SV、2 个 RSU、2 架 UAV），其中两架 UAV 也由 Micro 策略控制位置。
 
 Macro Cache SMDP PPO 在每个 frame 起点为每个 Cache 节点各采样一个 masked categorical 候选动作。每个节点的候选 0 是 KEEP，其余合法候选是 UPDATE；UPDATE logits 按该节点合法 UPDATE 候选数进行 cardinality correction。给定 observation 和候选特征后，九个节点的 Cache 动作按分解分布采样，联合 Cache log-prob 是九个节点 log-prob 之和。Macro 联合策略还包含 frame 内实际采样的 holding termination 决策：Cache 联合 log-prob 与 termination log-prob 之和构成单一 PPO ratio；强制最大持有时间和 Episode 终点不计入 termination likelihood。Holding 范围为 1–5 slots。
 
@@ -12,8 +12,8 @@ Micro UAV PPO 每个 slot 按固定顺序先采样 UAV0 位置，再基于 UAV0 
 
 - SV、RSU、UAV 的链路系统带宽各为 10 MHz。
 - Edge 使用 `BANDWIDTH_DEPENDENT_NOISE_V1`；热噪声按 KKT 分配给任务的带宽计算。
-- Cloud 使用每任务固定等效速率 1633066.7164444982 bit/s、时延系数 1.0681932194051897，以及总量 40 GHz 的有限共享 CPU 池。
-- Cloud 速率和时延系数是基于 Training 数据条件拟合的抽象等效参数，不表示真实无线覆盖、吞吐保证或物理可靠性验证。
+- Cloud 使用 20 Mbps 等效上传速率、13 倍上传时延系数，以及总量 40 GHz 的有限共享 CPU 池。
+- Cloud 的等效上传速率和时延系数是当前系统模型配置，不表示真实无线覆盖、吞吐保证或物理可靠性验证。
 
 ## 正式训练
 

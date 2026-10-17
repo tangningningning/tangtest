@@ -279,9 +279,10 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
     """Macro Cache SMDP、独立 Long-Value Critic 与 Micro UAV PPO。"""
 
     architecture_id = (
-        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v3_no_tv_local"
+        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
+        "v3_per_slot_analytic_task_model_v1"
     )
-    architecture_version = 32
+    architecture_version = 34
 
     def __init__(
         self,
@@ -1644,9 +1645,9 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-        "v4_multi_node_cache_factorized_v1"
+        "v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1"
     )
-    architecture_version = 33
+    architecture_version = 35
 
     def __init__(
         self,
@@ -1674,9 +1675,9 @@ class SparseCoordinatedCacheActorCritic(MultiNodeFactorizedActorCritic):
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-        "v5_sparse_coordinated_cache_v1"
+        "v5_sparse_coordinated_cache_v1_per_slot_analytic_task_model_v1"
     )
-    architecture_version = 34
+    architecture_version = 36
     sparse_coordinated_cache_action = True
 
     def __init__(

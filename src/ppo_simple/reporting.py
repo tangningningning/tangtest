@@ -1616,8 +1616,15 @@ def build_macro_transition_trace_arrays(
         )
         if any(value.shape != (count,) for value in vectors):
             raise ValueError(f"Macro transition trace episode {episode} has misaligned fields.")
-        if observation.shape != (count, 400) or next_observation.shape != (count, 400):
-            raise ValueError(f"Macro transition trace episode {episode} must have 400D observations.")
+        if (
+            observation.ndim != 2
+            or observation.shape[0] != count
+            or observation.shape[1] <= 0
+            or next_observation.shape != observation.shape
+        ):
+            raise ValueError(
+                f"Macro transition trace episode {episode} has misaligned observations."
+            )
         floats = (
             observation,
             next_observation,
@@ -1889,6 +1896,8 @@ def write_dual_timescale_run_manifest(
     manifest = {
         "experiment_label": "PROPOSED",
         "algorithm_id": str(trainer.algorithm_id),
+        "task_execution_model": trainer.config_contract["task_execution_model"],
+        "observation_schema": trainer.config_contract["observation_schema"],
         "macro_actor_update_control_version": str(
             trainer.macro_actor_update_control_version
         ),

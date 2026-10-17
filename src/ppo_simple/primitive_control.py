@@ -48,7 +48,7 @@ def _intermediate_observation(
     step: Any,
     context: Any,
 ) -> np.ndarray:
-    """为保留的 Exact-Q diagnostic 构造中间状态 observation。"""
+    """构造 Exact-Q 分支的逐Slot状态 Observation。"""
 
     from . import interface
 

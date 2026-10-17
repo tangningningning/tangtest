@@ -1521,7 +1521,12 @@ def execute_configured_slot(
     exact_q_timing_profile: dict[str, float] | None = None,
     task_ledger: CrossSlotTaskLedger | None = None,
 ) -> SlotExecutionResult:
-    """执行控制器已确定的最终 Cache/UAV 配置及真实 Matching/KKT。"""
+    """执行确定的 Cache/UAV 配置及 Matching/KKT。
+
+    Formal PPO omits task_ledger and evaluates only this Slot's arrivals
+    through execute_slot. Supplying a ledger retains the legacy diagnostic
+    cross-Slot execution branch.
+    """
 
     previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     final_cache = np.asarray(final_cache_state, dtype=np.int8).copy()

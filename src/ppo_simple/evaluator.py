@@ -20,6 +20,8 @@ except ModuleNotFoundError:  # pragma: no cover - 仅静态导入环境
 from common import project_config
 from scenario.realization import REALIZATION_ARTIFACT_FILENAMES
 from .interface import (
+    PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA,
+    PER_SLOT_ANALYTIC_TASK_MODEL,
     PROPOSED_CONTROL_MODE,
     PROPOSED_POLICY_SCHEMA,
     _assert_realization_context_compatible,
@@ -188,6 +190,12 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         raise ValueError("checkpoint policy_schema mismatch")
     if not isinstance(contract, dict):
         raise ValueError("checkpoint PROPOSED configuration contract is missing")
+    if (
+        payload.get("task_execution_model") != PER_SLOT_ANALYTIC_TASK_MODEL
+        or contract.get("task_execution_model") != PER_SLOT_ANALYTIC_TASK_MODEL
+        or contract.get("observation_schema") != PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA
+    ):
+        raise ValueError("checkpoint task/observation model is not the current formal model")
     policy_update_total = contract.get("policy_update_total")
     if (
         isinstance(policy_update_total, bool)
@@ -723,6 +731,7 @@ def evaluate_pool(
         "config_semantic_sha256": semantic_sha256,
         "checkpoint_path": str(checkpoint),
         "checkpoint_version": int(checkpoint_metadata["checkpoint_version"]),
+        "task_execution_model": str(checkpoint_metadata["task_execution_model"]),
         "checkpoint_policy_schema": checkpoint_metadata["policy_schema"],
         "policy_schema": reference_context.policy_schema,
         "configuration_control_mode": PROPOSED_CONTROL_MODE,

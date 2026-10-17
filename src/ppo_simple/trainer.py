@@ -31,6 +31,8 @@ from scenario.realization import (
     _realization_artifacts_from_directory,
 )
 from .interface import (
+    PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA,
+    PER_SLOT_ANALYTIC_TASK_MODEL,
     PROPOSED_POLICY_SCHEMA,
     _assert_realization_context_compatible,
     aligned_train_steps,
@@ -81,9 +83,9 @@ CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 INITIAL_CHECKPOINT_FILENAME = "initial_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 INTERMEDIATE_CHECKPOINT_INTERVAL_UPDATES = 10
-CHECKPOINT_VERSION = 59
-MULTI_NODE_CHECKPOINT_VERSION = 60
-SPARSE_COORDINATED_CHECKPOINT_VERSION = 61
+CHECKPOINT_VERSION = 61
+MULTI_NODE_CHECKPOINT_VERSION = 62
+SPARSE_COORDINATED_CHECKPOINT_VERSION = 63
 ALGORITHM_ID = "PROPOSED"
 MACRO_ACTOR_UPDATE_CONTROL_VERSION = "macro_actor_post_step_joint_kl_backtracking_v1"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
@@ -1194,6 +1196,12 @@ class PPOTrainer:
     def config_contract(self) -> dict[str, Any]:
         contract = {
             "observation_dim": int(self.policy.observation_dim),
+            "observation_base_dim": int(
+                self.context.observation_spec.base_observation_dim
+            ),
+            "task_execution_model": PER_SLOT_ANALYTIC_TASK_MODEL,
+            "observation_schema": PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA,
+            "observation_feature_slices": self.context.observation_spec.feature_slices,
             "macro_cache_feature_dim": int(self.policy.macro_cache_feature_dim),
             "micro_uav_feature_dim": int(self.policy.micro_uav_feature_dim),
             "cache_action_mode": self.cache_action_mode,
@@ -1236,7 +1244,9 @@ class PPOTrainer:
             "macro_critic_value_loss_coefficient": float(
                 self.config["value_loss_coefficient"]
             ),
-            "macro_critic_architecture": "400-128-128-1 (SiLU)",
+            "macro_critic_architecture": (
+                f"{int(self.policy.observation_dim)}-128-128-1 (SiLU)"
+            ),
             "macro_critic_optimizer": "single Adam",
             "macro_critic_optimizer_epsilon": 1.0e-5,
             "macro_critic_group_objective": "0.01 times raw current-group and previous-group-last1 MSE",
@@ -3351,6 +3361,7 @@ class PPOTrainer:
         return {
             "checkpoint_version": self.checkpoint_version,
             "checkpoint_role": str(checkpoint_role),
+            "task_execution_model": PER_SLOT_ANALYTIC_TASK_MODEL,
             "algorithm_id": self.algorithm_id,
             "macro_actor_update_control_version": self.macro_actor_update_control_version,
             "macro_critic_target_mode": self.macro_critic_target_mode,
@@ -3458,9 +3469,10 @@ class PPOTrainer:
             payload.get("checkpoint_version") != self.checkpoint_version
             or payload.get("architecture_version")
             != int(self.policy.architecture_version)
+            or payload.get("task_execution_model") != PER_SLOT_ANALYTIC_TASK_MODEL
         ):
             raise ValueError(
-                "Checkpoint architecture/action semantics do not match the active trainer."
+                "Checkpoint task model/architecture/action semantics do not match the active trainer."
             )
         if payload.get("macro_critic_target_mode") != self.macro_critic_target_mode:
             raise ValueError("checkpoint macro_critic_target_mode mismatch.")
@@ -3485,6 +3497,7 @@ class PPOTrainer:
         required = {
             "checkpoint_version": self.checkpoint_version,
             "architecture_version": int(self.policy.architecture_version),
+            "task_execution_model": PER_SLOT_ANALYTIC_TASK_MODEL,
             "macro_actor_update_control_version": self.macro_actor_update_control_version,
             "unified_cache_action": self.unified_cache_action,
             "cardinality_corrected_cache_action": self.cardinality_corrected_cache_action,
@@ -3976,6 +3989,7 @@ def run_training(
         summary = {
             "experiment_type": "macro_cache_smdp_micro_uav_ppo",
             "algorithm_id": trainer.algorithm_id,
+            "task_execution_model": PER_SLOT_ANALYTIC_TASK_MODEL,
             "macro_actor_update_control_version": trainer.macro_actor_update_control_version,
             "architecture_version": int(trainer.policy.architecture_version),
             "checkpoint_version": trainer.checkpoint_version,

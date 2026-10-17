@@ -796,12 +796,6 @@ def collect_dual_timescale_episode(
     total_slots = len(aligned_steps)
     if total_slots != int(context.episode_slots):
         raise ValueError("双时间尺度正式 rollout 必须覆盖完整 episode。")
-    episode_identity = (
-        str(int(episode_seed))
-        if episode_seed is not None
-        else f"origin-{int(aligned_steps[0].origin_index)}"
-    )
-    task_ledger = slot_environment.CrossSlotTaskLedger(episode_identity)
     sampled_slot_indices = (
         frozenset(int(slot) for slot in performance_sample_slots)
         if performance_sample_slots is not None
@@ -900,14 +894,6 @@ def collect_dual_timescale_episode(
                 == interface.project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
             )
             if multi_node:
-                frame_active_service_locks = slot_environment.active_cache_service_locks(
-                    task_ledger,
-                    cache,
-                    context.service_catalog,
-                    context.cache_nodes,
-                    expected_node_ids=tuple(context.action_spec.cache_node_ids),
-                    expected_service_ids=tuple(context.observation_spec.service_ids),
-                )
                 node_candidates, frame_candidate_features, frame_candidate_masks = (
                     _cache_node_candidates(
                         cache,
@@ -915,7 +901,6 @@ def collect_dual_timescale_episode(
                         step,
                         context,
                         tensor_spec,
-                        frame_active_service_locks,
                     )
                 )
                 if sparse_cache:
@@ -1026,10 +1011,6 @@ def collect_dual_timescale_episode(
                     target_cache[node_index] = chosen[node_index]
                 frame_cache = target_cache
                 frame_actual_update_by_node = cache_update_mask(cache, frame_cache)
-                if np.any(frame_cache[frame_active_service_locks] != 1):
-                    raise AssertionError(
-                        "selected Cache action evicted an active task service"
-                    )
                 if np.any(frame_actual_update_by_node & ~node_selected_updates):
                     raise AssertionError("Cache changed on a node whose sampled action was KEEP")
                 if sparse_cache:
@@ -1137,21 +1118,12 @@ def collect_dual_timescale_episode(
                         update_candidate_selection_counts.get(candidate_signature, 0) + 1
                     )
             else:
-                frame_active_service_locks = slot_environment.active_cache_service_locks(
-                    task_ledger,
-                    cache,
-                    context.service_catalog,
-                    context.cache_nodes,
-                    expected_node_ids=tuple(context.action_spec.cache_node_ids),
-                    expected_service_ids=tuple(context.observation_spec.service_ids),
-                )
                 _candidates, frame_candidate_features = _cache_candidates(
                     cache,
                     uav,
                     step,
                     context,
                     tensor_spec,
-                    frame_active_service_locks,
                 )
                 frame_candidate_masks = np.ones(len(_candidates), dtype=bool)
                 if not bool(frame_candidate_masks[0]) or not np.array_equal(_candidates[0], cache):
@@ -1223,10 +1195,6 @@ def collect_dual_timescale_episode(
                 )
                 frame_cache = _candidates[frame_cache_index].copy()
                 frame_actual_update_by_node = cache_update_mask(cache, frame_cache)
-                if np.any(frame_cache[frame_active_service_locks] != 1):
-                    raise AssertionError(
-                        "selected Cache action evicted an active task service"
-                    )
                 frame_cache_changed = bool(np.any(frame_actual_update_by_node))
                 frame_macro_index = len(macro_buffer.transitions)
                 if deterministic:
@@ -1437,7 +1405,6 @@ def collect_dual_timescale_episode(
             time_s=float(step.time_s),
             performance_profile=performance_profile,
             exact_q_timing_profile=exact_q_timing_profile,
-            task_ledger=task_ledger,
         )
         environment_seconds = time.perf_counter() - environment_started
         if not result.step_feasible or result.system_utility is None:
@@ -1928,22 +1895,11 @@ def collect_dual_timescale_episode(
         * math.log(1.0 - micro_group_probability_soft_cap)
     )
     group_probability_max = np.max(micro_group_probabilities, axis=-1)
-    if task_ledger.active:
-        stage_counts = {
-            stage: sum(state.execution_stage == stage for state in task_ledger.active.values())
-            for stage in ("UPLOADING", "COMPUTING", "NETWORK_DELAY")
-        }
-        raise slot_environment.UnresolvedEpisodeTasksError(
-            "Episode ended with active tasks; their completion and reward cannot be "
-            "claimed: "
-            f"episode={episode_identity}, active={len(task_ledger.active)}, stages={stage_counts}"
-        )
     summary = {
         "episode_return": episode_return,
+        "task_execution_model": interface.PER_SLOT_ANALYTIC_TASK_MODEL,
         "cache_action_mode": str(context.cache_action_mode),
         "episode_seed": None if episode_seed is None else int(episode_seed),
-        "cross_slot_task_count_completed": int(len(task_ledger.completed)),
-        "cross_slot_unresolved_task_count": 0,
         "macro_return": float(sum(item.frame_reward for item in macro_buffer.transitions)),
         "macro_frame_count": macro_count,
         "macro_entropy": float(np.mean([item.old_macro_entropy for item in macro_buffer.transitions])),

@@ -3,6 +3,8 @@
 The policy plan is intentionally built in the trainer process.  This module
 contains only the environment/Matching/KKT branch evaluator so that worker
 processes do not touch Torch, NumPy, or Python random state for sampling.
+Each branch evaluates only that step's arriving tasks through execute_slot;
+task workload is not carried from earlier slots.
 """
 
 from __future__ import annotations
