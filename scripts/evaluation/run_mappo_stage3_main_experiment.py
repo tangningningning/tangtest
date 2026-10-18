@@ -185,7 +185,6 @@ def _stage3_label_metrics(
             observations, candidate_features, candidate_masks
         )
         node_trigger_logits = trigger_logits[:, 0]
-        node_conditional_logits = conditional_logits[:, 0]
         node_legal_masks = legal_masks[:, 0]
         update_legal = node_legal_masks[:, 1:]
         if not bool(torch.all(torch.any(update_legal, dim=-1)).item()):
