@@ -39,6 +39,8 @@ from .rollout import (
 
 COUNTERFACTUAL_VALUE_SCHEMA = "mappo_cache_delta_q_counterfactual_v2_common_micro_uniforms"
 TRIGGER_TARGET_SCHEMA = "deterministic_update_candidate_delta_q_v1"
+CANDIDATE_LOSS_SCHEMA = "best_vs_rest_top1_pairwise_logistic_v1"
+PREVIOUS_CANDIDATE_LOSS_SCHEMA = "all_pairs_pairwise_logistic_v1"
 CACHE_NODE_VALUE_FEATURE_DIM = 7
 
 
@@ -882,7 +884,12 @@ def candidate_value_pairwise_ranking_loss(
     tie_tolerance: float,
     temperature: float,
 ) -> tuple[Any, int]:
-    """Average legal UPDATE candidate-pair ordering loss per state/node."""
+    """Rank each state's best-ΔQ legal UPDATE candidate above the rest.
+
+    Comparisons within the ΔQ tie tolerance are omitted. Each valid state's
+    comparisons are averaged first, so states with larger candidate sets do
+    not receive greater weight solely because they have more candidates.
+    """
 
     if torch is None:
         raise ImportError("Stage3 ranking losses require PyTorch.")
@@ -893,6 +900,13 @@ def candidate_value_pairwise_ranking_loss(
         raise ValueError("Candidate ranking inputs must have aligned [B,N,K] shapes.")
     if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
         raise ValueError("Candidate ranking temperature must be finite and positive.")
+    if not math.isfinite(float(tie_tolerance)) or float(tie_tolerance) < 0.0:
+        raise ValueError("Candidate tie tolerance must be finite and non-negative.")
+    if bool(masks.any().item()):
+        if not bool(torch.isfinite(values[masks]).all().item()):
+            raise FloatingPointError("Legal Candidate ΔQ labels contain NaN/Inf.")
+        if not bool(torch.isfinite(scores[masks]).all().item()):
+            raise FloatingPointError("Legal Candidate scores contain NaN/Inf.")
     node_losses: list[Any] = []
     compared_pairs = 0
     for batch_index in range(int(scores.shape[0])):
@@ -902,30 +916,30 @@ def candidate_value_pairwise_ranking_loss(
             ).flatten()
             if int(indices.numel()) < 2:
                 continue
-            pair_indices = torch.triu_indices(
-                int(indices.numel()), int(indices.numel()), offset=1, device=scores.device
+            node_values = values[batch_index, node_index, indices]
+            best_local_index = int(torch.argmax(node_values).item())
+            best_index = indices[best_local_index]
+            rest_indices = torch.cat(
+                (indices[:best_local_index], indices[best_local_index + 1 :])
             )
-            left = indices[pair_indices[0]]
-            right = indices[pair_indices[1]]
+            if int(rest_indices.numel()) == 0:
+                continue
             value_difference = (
-                values[batch_index, node_index, left]
-                - values[batch_index, node_index, right]
+                node_values[best_local_index]
+                - values[batch_index, node_index, rest_indices]
             )
-            active = torch.isfinite(value_difference) & (
-                torch.abs(value_difference) > float(tie_tolerance)
-            )
+            active = value_difference > float(tie_tolerance)
             active_count = int(active.sum().item())
             if active_count == 0:
                 continue
             score_difference = (
-                scores[batch_index, node_index, left[active]]
-                - scores[batch_index, node_index, right[active]]
+                scores[batch_index, node_index, best_index]
+                - scores[batch_index, node_index, rest_indices[active]]
             ) / float(temperature)
-            directions = torch.sign(value_difference[active])
-            node_losses.append(F.softplus(-directions * score_difference).mean())
+            node_losses.append(F.softplus(-score_difference).mean())
             compared_pairs += active_count
     if not node_losses:
-        return scores.sum() * 0.0, 0
+        return scores.masked_fill(~masks, 0.0).sum() * 0.0, 0
     return torch.stack(node_losses).mean(), compared_pairs
 
 

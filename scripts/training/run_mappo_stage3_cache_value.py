@@ -26,6 +26,7 @@ for import_root in (SOURCE_ROOT, TRAINING_ROOT):
 
 from ppo_simple.cache_counterfactual_value import (  # noqa: E402
     COUNTERFACTUAL_VALUE_SCHEMA,
+    CANDIDATE_LOSS_SCHEMA,
     TRIGGER_TARGET_SCHEMA,
     Stage3CacheValueConfig,
 )
@@ -96,7 +97,7 @@ def _parser() -> argparse.ArgumentParser:
         "--initialize-from-stage3-checkpoint",
         type=Path,
         help=(
-            "Warm-start model weights from Stage3 v4/v5 while resetting all "
+            "Warm-start model weights from Stage3 v4/v5/v6 while resetting all "
             "optimizers, progress counters and RNG state. This is not resume."
         ),
     )
@@ -347,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         "baseline_schema": MAPPO_BASELINE_SCHEMA,
         "checkpoint_version": MAPPO_STAGE3_CHECKPOINT_VERSION,
         "algorithm_mode": COUNTERFACTUAL_VALUE_SCHEMA,
+        "candidate_loss_schema": CANDIDATE_LOSS_SCHEMA,
         "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
         "source_checkpoint": None if source_checkpoint is None else str(source_checkpoint),
         "source_checkpoint_sha256": source_sha256,

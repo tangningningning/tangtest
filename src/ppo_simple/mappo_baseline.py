@@ -35,6 +35,8 @@ from .policy import (
 )
 from .cache_counterfactual_value import (
     COUNTERFACTUAL_VALUE_SCHEMA,
+    CANDIDATE_LOSS_SCHEMA,
+    PREVIOUS_CANDIDATE_LOSS_SCHEMA,
     TRIGGER_TARGET_SCHEMA,
     CACHE_NODE_VALUE_FEATURE_DIM,
     CacheDeltaQValueHead,
@@ -75,7 +77,8 @@ MAPPO_BASELINE_SCHEMA = (
 MAPPO_CHECKPOINT_VERSION = 2
 MAPPO_STAGE3_LEGACY_CHECKPOINT_VERSION = 4
 MAPPO_STAGE3_PREVIOUS_CHECKPOINT_VERSION = 5
-MAPPO_STAGE3_CHECKPOINT_VERSION = 6
+MAPPO_STAGE3_ALL_PAIRS_CHECKPOINT_VERSION = 6
+MAPPO_STAGE3_CHECKPOINT_VERSION = 7
 MACRO_CONDITIONAL_CANDIDATE_PREFIXES = (
     "macro_conditional_candidate_encoder.",
     "macro_conditional_cache_scorer.",
@@ -2877,6 +2880,7 @@ class MAPPOBaselineTrainer:
             self.stage3_update_count += 1
             stage3_metrics = {
                 "algorithm_mode": COUNTERFACTUAL_VALUE_SCHEMA,
+                "stage3_candidate_loss_schema": CANDIDATE_LOSS_SCHEMA,
                 "stage3_update_index": int(self.stage3_update_count),
                 "stage3_loss_coefficients": {
                     "trigger_ranking": float(
@@ -3103,6 +3107,7 @@ class MAPPOBaselineTrainer:
             raise RuntimeError("Stage3 checkpoint contract requested while mode is disabled.")
         return {
             "algorithm_mode": COUNTERFACTUAL_VALUE_SCHEMA,
+            "candidate_loss_schema": CANDIDATE_LOSS_SCHEMA,
             "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
             "micro_common_random_contract": (
                 "per_slot_per_ordered_uav_operation_and_candidate_uniforms_inverse_cdf_v1"
@@ -3338,6 +3343,7 @@ class MAPPOBaselineTrainer:
         }
         if stage3_enabled:
             payload["algorithm_mode"] = COUNTERFACTUAL_VALUE_SCHEMA
+            payload["candidate_loss_schema"] = CANDIDATE_LOSS_SCHEMA
             payload["trigger_target_schema"] = TRIGGER_TARGET_SCHEMA
             payload["stage3_contract"] = self._stage3_checkpoint_contract()
             payload["stage3_initialization"] = {
@@ -3361,12 +3367,12 @@ class MAPPOBaselineTrainer:
     def _initialize_from_legacy_stage3_weights(
         self, payload: dict[str, Any], source: Path, checkpoint_version: int
     ) -> dict[str, Any]:
-        """Warm-start model weights from an unversioned Stage3 Trigger target.
+        """Warm-start recognized prior Stage3 objectives without training state.
 
         Stage3 v4/v5 checkpoints predate the explicit Trigger target contract.
-        They may seed the model, but their optimizer, progress and RNG state are
-        intentionally not restored. This prevents a different/unknown target
-        from being represented as an exact continuation.
+        Stage3 v6 uses all-pairs Candidate ranking rather than the current
+        Best-vs-Rest objective. These checkpoints may seed model weights, but
+        their optimizer, progress and RNG state are intentionally not restored.
         """
 
         if (
@@ -3418,10 +3424,13 @@ class MAPPOBaselineTrainer:
             )
 
         expected_stage3_contract = self._stage3_checkpoint_contract()
-        expected_pre_target_contract = copy.deepcopy(expected_stage3_contract)
+        expected_all_pairs_contract = copy.deepcopy(expected_stage3_contract)
+        expected_all_pairs_contract.pop("candidate_loss_schema", None)
+        accepted_legacy_stage3_contracts = [expected_all_pairs_contract]
+        expected_pre_target_contract = copy.deepcopy(expected_all_pairs_contract)
         expected_pre_target_contract.pop("trigger_target_schema", None)
         expected_pre_target_contract["config"].pop("trigger_target_schema", None)
-        accepted_legacy_stage3_contracts = [expected_pre_target_contract]
+        accepted_legacy_stage3_contracts.append(expected_pre_target_contract)
         expected_v4_contract = copy.deepcopy(expected_pre_target_contract)
         expected_v4_contract.pop("macro_probability_schema", None)
         expected_v4_contract.pop("candidate_optimizer_ownership", None)
@@ -3430,8 +3439,15 @@ class MAPPOBaselineTrainer:
         if saved_stage3_contract not in accepted_legacy_stage3_contracts:
             raise ValueError(
                 "Legacy Stage3 weight initialization accepts only recognized v4/v5 "
-                "contracts that differ from the current contract by the unstamped "
-                "Trigger target."
+                "contracts or the v6 all-pairs Candidate contract."
+            )
+        source_candidate_loss_schema = payload.get(
+            "candidate_loss_schema", PREVIOUS_CANDIDATE_LOSS_SCHEMA
+        )
+        if source_candidate_loss_schema != PREVIOUS_CANDIDATE_LOSS_SCHEMA:
+            raise ValueError(
+                "Legacy Stage3 weight initialization received an unknown Candidate "
+                f"loss schema: {source_candidate_loss_schema!r}."
             )
 
         saved_policy_state = payload.get("policy_state_dict")
@@ -3448,9 +3464,12 @@ class MAPPOBaselineTrainer:
         is_legacy = bool(conditional_names) and isinstance(
             saved_policy_state, dict
         ) and set(saved_policy_state) == legacy_names
-        if checkpoint_version == MAPPO_STAGE3_PREVIOUS_CHECKPOINT_VERSION and not is_split:
+        if checkpoint_version in (
+            MAPPO_STAGE3_PREVIOUS_CHECKPOINT_VERSION,
+            MAPPO_STAGE3_ALL_PAIRS_CHECKPOINT_VERSION,
+        ) and not is_split:
             raise ValueError(
-                "Stage3 v5 checkpoint is missing its split Candidate parameters."
+                f"Stage3 v{checkpoint_version} checkpoint is missing its split Candidate parameters."
             )
         if checkpoint_version == MAPPO_STAGE3_LEGACY_CHECKPOINT_VERSION and not is_legacy:
             raise ValueError(
@@ -3523,6 +3542,9 @@ class MAPPOBaselineTrainer:
         self.counterfactual_rollout_count = 0
         self.stage3_initialization_mode = (
             f"weights_only_from_stage3_v{checkpoint_version}_"
+            f"candidate_loss_{source_candidate_loss_schema}"
+            if checkpoint_version == MAPPO_STAGE3_ALL_PAIRS_CHECKPOINT_VERSION
+            else f"weights_only_from_stage3_v{checkpoint_version}_"
             "unverified_trigger_target"
         )
         self.stage3_source_checkpoint_sha256 = self._checkpoint_file_sha256(source)
@@ -3540,6 +3562,8 @@ class MAPPOBaselineTrainer:
             "update_count": 0,
             "seed": self.seed,
             "initialization_mode": self.stage3_initialization_mode,
+            "candidate_loss_schema_source": source_candidate_loss_schema,
+            "candidate_loss_schema": CANDIDATE_LOSS_SCHEMA,
             "trigger_target_schema_source": source_target_schema,
             "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
             "optimizers_restored": False,
@@ -3569,11 +3593,20 @@ class MAPPOBaselineTrainer:
         stage3_enabled = self.stage3_cache_value_config is not None
         legacy_stage3 = checkpoint_version == MAPPO_STAGE3_LEGACY_CHECKPOINT_VERSION
         previous_stage3 = checkpoint_version == MAPPO_STAGE3_PREVIOUS_CHECKPOINT_VERSION
+        all_pairs_stage3 = (
+            checkpoint_version == MAPPO_STAGE3_ALL_PAIRS_CHECKPOINT_VERSION
+        )
         current_stage3 = checkpoint_version == MAPPO_STAGE3_CHECKPOINT_VERSION
-        if legacy_stage3 or previous_stage3:
+        if legacy_stage3 or previous_stage3 or all_pairs_stage3:
             if allow_stage3_policy_initialization:
                 return self._initialize_from_legacy_stage3_weights(
                     payload, source, checkpoint_version
+                )
+            if all_pairs_stage3:
+                raise ValueError(
+                    "Stage3 v6 uses the all-pairs Candidate loss and cannot be "
+                    "strictly resumed with the Best-vs-Rest Candidate objective. "
+                    "Use the explicit weights-only Stage3 initialization option."
                 )
             raise ValueError(
                 f"Stage3 v{checkpoint_version} has no verifiable Trigger target "
@@ -3582,8 +3615,9 @@ class MAPPOBaselineTrainer:
             )
         if allow_stage3_policy_initialization:
             raise ValueError(
-                "--initialize-from-stage3-checkpoint is reserved for Stage3 v4/v5 "
-                "weight-only migration; use --source-checkpoint for current Stage3 v6."
+                "--initialize-from-stage3-checkpoint is reserved for recognized "
+                "Stage3 v4/v5/v6 weight-only migration; use --source-checkpoint "
+                "for current Stage3 v7."
             )
         stage3_checkpoint = current_stage3
         if checkpoint_version == MAPPO_CHECKPOINT_VERSION:
@@ -3607,6 +3641,12 @@ class MAPPOBaselineTrainer:
         if stage3_checkpoint:
             if payload.get("algorithm_mode") != COUNTERFACTUAL_VALUE_SCHEMA:
                 raise ValueError("Stage3 checkpoint algorithm mode mismatch.")
+            if payload.get("candidate_loss_schema") != CANDIDATE_LOSS_SCHEMA:
+                raise ValueError(
+                    "Stage3 checkpoint Candidate loss schema mismatch: "
+                    f"{payload.get('candidate_loss_schema')!r} != "
+                    f"{CANDIDATE_LOSS_SCHEMA!r}."
+                )
             if payload.get("trigger_target_schema") != TRIGGER_TARGET_SCHEMA:
                 raise ValueError(
                     "Stage3 checkpoint Trigger target schema mismatch: "
