@@ -179,6 +179,20 @@ def _macro_log_prob_from_components(
     return termination_log_prob_sum, cache_log_prob + termination_log_prob_sum
 
 
+def _greedy_legal_candidate_index(raw_scores: Any, candidate_mask: Any) -> int:
+    """Return the first legal maximum directly from the policy's raw scores."""
+
+    scores = torch.as_tensor(raw_scores).reshape(-1)
+    mask = torch.as_tensor(
+        candidate_mask, dtype=torch.bool, device=scores.device
+    ).reshape(-1)
+    if scores.shape != mask.shape or not len(scores) or not bool(torch.any(mask).item()):
+        raise ValueError("greedy candidate scores and legal mask must be aligned and non-empty")
+    if not bool(torch.all(torch.isfinite(scores[mask])).item()):
+        raise FloatingPointError("legal greedy candidate scores must be finite")
+    return int(scores.masked_fill(~mask, -float("inf")).argmax().item())
+
+
 def _group_aware_deterministic_candidate(
     raw_scores: Any,
     probabilities: Any,
@@ -213,7 +227,7 @@ def _group_aware_deterministic_candidate(
     selected_mask = mask & (groups == selected_group)
     if not bool(torch.any(selected_mask).item()):
         raise ValueError("selected action group has no legal candidates")
-    selected_index = int(scores.masked_fill(~selected_mask, -float("inf")).argmax().item())
+    selected_index = _greedy_legal_candidate_index(scores, selected_mask)
     return selected_index, selected_group
 
 

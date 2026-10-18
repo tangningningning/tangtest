@@ -28,7 +28,11 @@ except ModuleNotFoundError:  # pragma: no cover - import-only environments
 from common import project_config
 from decision import cache_configuration, slot_environment, uav_configuration
 
-from .policy import MultiNodeFactorizedActorCritic, _masked_categorical
+from .policy import (
+    MultiNodeFactorizedActorCritic,
+    _greedy_legal_candidate_index,
+    _masked_categorical,
+)
 from .cache_counterfactual_value import (
     COUNTERFACTUAL_VALUE_SCHEMA,
     TRIGGER_TARGET_SCHEMA,
@@ -461,7 +465,7 @@ class MAPPOBaselineTrainer:
                 trigger_logits,
                 _,
                 conditional_logits,
-                _,
+                conditional_raw_logits,
                 _,
                 masks,
             ) = self.policy._macro_cache_factorized_node_logits(
@@ -469,9 +473,22 @@ class MAPPOBaselineTrainer:
             )
             node_trigger_logits = trigger_logits[0]
             node_conditional_logits = conditional_logits[0]
+            node_conditional_raw_logits = conditional_raw_logits[0]
             node_masks = masks[0]
             if int(node_trigger_logits.shape[0]) != 9:
                 raise ValueError("Macro Cache head count changed from nine.")
+            deterministic_update_candidate_indices = np.full(
+                int(node_masks.shape[0]), -1, dtype=np.int64
+            )
+            for node_index in range(int(node_masks.shape[0])):
+                update_mask = node_masks[node_index, 1:]
+                if bool(torch.any(update_mask).item()):
+                    deterministic_update_candidate_indices[node_index] = (
+                        _greedy_legal_candidate_index(
+                            node_conditional_raw_logits[node_index, 1:], update_mask
+                        )
+                        + 1
+                    )
             conditional_distributions: list[Any | None] | None = None
             conditional_candidate_probabilities: np.ndarray | None = None
             if self.stage3_cache_value_config is not None:
@@ -524,7 +541,11 @@ class MAPPOBaselineTrainer:
                             "Macro UPDATE was sampled for a node without legal UPDATE candidates."
                         )
                     content = (
-                        torch.argmax(conditional_distribution.probs)
+                        torch.as_tensor(
+                            int(deterministic_update_candidate_indices[node_index]) - 1,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
                         if deterministic
                         else torch.multinomial(
                             conditional_distribution.probs, 1, generator=self.generator
@@ -553,6 +574,9 @@ class MAPPOBaselineTrainer:
                 None
                 if conditional_candidate_probabilities is None
                 else conditional_candidate_probabilities
+            ),
+            "deterministic_update_candidate_indices": (
+                deterministic_update_candidate_indices.copy()
             ),
             "actor_inference_seconds": float(inference_seconds),
         }
@@ -969,6 +993,10 @@ class MAPPOBaselineTrainer:
                         or cache_sample["conditional_candidate_probabilities"] is None
                         else cache_sample["conditional_candidate_probabilities"].copy()
                     ),
+                    "deterministic_update_candidate_indices": np.asarray(
+                        cache_sample["deterministic_update_candidate_indices"],
+                        dtype=np.int64,
+                    ).copy(),
                     "trigger_log_probs": cache_sample["trigger_log_probs"].copy(),
                     "content_log_probs": cache_sample["content_log_probs"].copy(),
                     "node_log_probs": cache_sample["node_log_probs"].copy(),
@@ -1338,6 +1366,9 @@ class MAPPOBaselineTrainer:
                             candidate_configurations=capture["candidate_configurations"],
                             candidate_features=frame["candidate_features"],
                             candidate_masks=frame["candidate_masks"],
+                            deterministic_update_candidate_indices=(
+                                frame["deterministic_update_candidate_indices"]
+                            ),
                             target_node_indices=self._counterfactual_target_nodes(
                                 int(capture["macro_index"])
                             ),
@@ -1638,10 +1669,8 @@ class MAPPOBaselineTrainer:
                     ) = deterministic_policy_selected_delta_q(
                         candidate_indices=legal_update_indices,
                         candidate_delta_q=delta_values,
-                        behavior_conditional_candidate_probabilities=(
-                            trace.behavior_conditional_candidate_probabilities[
-                                node_index
-                            ]
+                        selected_candidate_index=(
+                            trace.deterministic_update_candidate_indices[node_index]
                         ),
                         legal_candidate_mask=trace.candidate_masks[node_index],
                     )

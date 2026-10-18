@@ -169,6 +169,7 @@ class CounterfactualMacroTrace:
     candidate_configurations: tuple[tuple[np.ndarray, ...], ...]
     candidate_features: np.ndarray
     candidate_masks: np.ndarray
+    deterministic_update_candidate_indices: np.ndarray
     target_node_indices: tuple[int, ...]
     aligned_steps: tuple[Any, ...]
     micro_common_uniforms: np.ndarray
@@ -193,58 +194,41 @@ def deterministic_policy_selected_delta_q(
     *,
     candidate_indices: tuple[int, ...],
     candidate_delta_q: Any,
-    behavior_conditional_candidate_probabilities: Any,
+    selected_candidate_index: int,
     legal_candidate_mask: Any,
 ) -> tuple[int, float]:
     """Return the deterministic conditional UPDATE candidate and its ΔQ.
 
-    The action decoder selects the legal UPDATE candidate with the largest
-    conditional policy probability (equivalently, its largest conditional
-    logit). ``np.argmax`` gives the same stable first-index tie break as the
-    actor decoder. The returned target is a finite-horizon, frozen-Critic
-    action value, not a long-term optimal value.
+    The selected index is captured from the actor's raw conditional Candidate
+    logits during rollout. The returned target is a finite-horizon,
+    frozen-Critic action value, not a long-term optimal value.
     """
 
     indices = tuple(int(value) for value in candidate_indices)
     delta_values = np.asarray(candidate_delta_q, dtype=np.float64)
-    probabilities = np.asarray(
-        behavior_conditional_candidate_probabilities, dtype=np.float64
-    )
     legal_mask = np.asarray(legal_candidate_mask, dtype=bool)
     if (
-        probabilities.ndim != 1
-        or legal_mask.shape != probabilities.shape
+        legal_mask.ndim != 1
         or delta_values.shape != (len(indices),)
     ):
-        raise ValueError("Frozen Candidate probabilities, legal mask and ΔQ labels are misaligned.")
+        raise ValueError("Candidate legal mask and ΔQ labels are misaligned.")
     expected_indices = tuple(
         int(value) for value in np.flatnonzero(legal_mask) if int(value) != 0
     )
     if not expected_indices or indices != expected_indices:
         raise ValueError("Candidate ΔQ labels must cover exactly the legal UPDATE support.")
-    if not np.isfinite(probabilities).all() or not np.isfinite(delta_values).all():
-        raise FloatingPointError("Frozen Candidate policy probabilities or ΔQ labels are non-finite.")
-    if np.any(probabilities < 0.0):
-        raise ValueError("Frozen Candidate policy probabilities cannot be negative.")
-    update_mask = legal_mask.copy()
-    update_mask[0] = False
-    if (
-        probabilities[0] != 0.0
-        or np.any(probabilities[~update_mask] != 0.0)
-        or not np.isclose(
-            float(probabilities[update_mask].sum(dtype=np.float64)),
-            1.0,
-            atol=1.0e-6,
-            rtol=0.0,
-        )
+    if not np.isfinite(delta_values).all():
+        raise FloatingPointError("Candidate ΔQ labels are non-finite.")
+    if isinstance(selected_candidate_index, (bool, np.bool_)) or not isinstance(
+        selected_candidate_index, (int, np.integer)
     ):
+        raise ValueError("Deterministic Candidate index must be an integer.")
+    selected_index = int(selected_candidate_index)
+    if selected_index not in indices or not bool(legal_mask[selected_index]):
         raise ValueError(
-            "Frozen Candidate probabilities must normalize only over legal UPDATE candidates."
+            "Deterministic Candidate index is not present in the legal UPDATE labels."
         )
-    selected_offset = int(
-        np.argmax(probabilities[np.asarray(indices, dtype=np.int64)])
-    )
-    selected_index = indices[selected_offset]
+    selected_offset = indices.index(selected_index)
     selected_delta_q = float(delta_values[selected_offset])
     if not math.isfinite(selected_delta_q):
         raise FloatingPointError("Deterministic selected-candidate ΔQ is non-finite.")
@@ -295,6 +279,7 @@ def _snapshot_payload(
     candidate_configurations: tuple[tuple[np.ndarray, ...], ...],
     candidate_features: np.ndarray,
     candidate_masks: np.ndarray,
+    deterministic_update_candidate_indices: np.ndarray,
     target_node_indices: tuple[int, ...],
     aligned_steps: tuple[Any, ...],
     micro_common_uniforms: np.ndarray,
@@ -321,6 +306,7 @@ def _snapshot_payload(
         candidate_configurations,
         np.asarray(candidate_features, dtype=np.float32),
         np.asarray(candidate_masks, dtype=bool),
+        np.asarray(deterministic_update_candidate_indices, dtype=np.int64),
         tuple(int(value) for value in target_node_indices),
         _snapshot_value(aligned_steps),
         np.asarray(micro_common_uniforms, dtype=np.float64),
@@ -428,6 +414,7 @@ def make_counterfactual_trace(
     candidate_configurations: list[list[np.ndarray]],
     candidate_features: np.ndarray,
     candidate_masks: np.ndarray,
+    deterministic_update_candidate_indices: np.ndarray,
     target_node_indices: tuple[int, ...],
     aligned_steps: list[Any],
     micro_common_uniforms: list[Any],
@@ -514,6 +501,10 @@ def make_counterfactual_trace(
         raise ValueError("KEEP actions must not claim a sampled conditional content probability.")
     frozen_features = np.asarray(candidate_features, dtype=np.float32).copy()
     frozen_masks = np.asarray(candidate_masks, dtype=bool).copy()
+    raw_greedy_indices = np.asarray(deterministic_update_candidate_indices)
+    if not np.issubdtype(raw_greedy_indices.dtype, np.integer):
+        raise ValueError("Saved deterministic Candidate indices must use an integer dtype.")
+    frozen_greedy_indices = raw_greedy_indices.astype(np.int64, copy=True)
     frozen_conditional_candidate_probabilities = np.asarray(
         behavior_conditional_candidate_probabilities, dtype=np.float32
     ).copy()
@@ -526,6 +517,7 @@ def make_counterfactual_trace(
         or frozen_masks.ndim != 2
         or frozen_masks.shape[0] != node_count
         or frozen_features.shape[:2] != frozen_masks.shape
+        or frozen_greedy_indices.shape != (node_count,)
         or frozen_executed_cache.shape != frozen_pre_cache.shape
     ):
         raise ValueError("Counterfactual Macro snapshot arrays are not shape-aligned.")
@@ -540,6 +532,21 @@ def make_counterfactual_trace(
     for node_index in range(node_count):
         legal_update_mask = frozen_masks[node_index].copy()
         legal_update_mask[0] = False
+        greedy_index = int(frozen_greedy_indices[node_index])
+        if bool(np.any(legal_update_mask)):
+            if (
+                greedy_index < 0
+                or greedy_index >= frozen_masks.shape[1]
+                or not bool(frozen_masks[node_index, greedy_index])
+                or greedy_index == 0
+            ):
+                raise ValueError(
+                    "Saved deterministic Candidate index is not in the legal UPDATE support."
+                )
+        elif greedy_index != -1:
+            raise ValueError(
+                "Nodes without legal UPDATE candidates must use the -1 Candidate sentinel."
+            )
         probability_row = frozen_conditional_candidate_probabilities[node_index]
         if np.any(probability_row[~legal_update_mask] != 0.0):
             raise ValueError(
@@ -581,6 +588,10 @@ def make_counterfactual_trace(
         raise ValueError("Counterfactual target node indices must be non-empty and unique.")
     if any(node_index < 0 or node_index >= node_count for node_index in frozen_nodes):
         raise IndexError("Counterfactual target node index is outside the Cache matrix.")
+    if any(int(frozen_greedy_indices[node_index]) < 0 for node_index in frozen_nodes):
+        raise ValueError(
+            "Every counterfactual target node must have a legal saved UPDATE Candidate index."
+        )
     for offset, step in enumerate(frozen_steps):
         expected_slot = int(slot) + offset
         if int(step.slot) != expected_slot:
@@ -609,6 +620,7 @@ def make_counterfactual_trace(
         candidate_configurations=frozen_candidates,
         candidate_features=frozen_features,
         candidate_masks=frozen_masks,
+        deterministic_update_candidate_indices=frozen_greedy_indices,
         target_node_indices=frozen_nodes,
         aligned_steps=frozen_steps,
         micro_common_uniforms=frozen_micro_uniforms,
@@ -638,6 +650,7 @@ def make_counterfactual_trace(
         candidate_configurations=frozen_candidates,
         candidate_features=frozen_features,
         candidate_masks=frozen_masks,
+        deterministic_update_candidate_indices=frozen_greedy_indices,
         target_node_indices=frozen_nodes,
         aligned_steps=frozen_steps,
         micro_common_uniforms=frozen_micro_uniforms,
@@ -659,6 +672,27 @@ def validate_counterfactual_trace(trace: CounterfactualMacroTrace) -> None:
         or np.any(uniforms >= 1.0)
     ):
         raise ValueError("Counterfactual common uniforms must be finite and in [0, 1).")
+    saved_greedy_indices = np.asarray(
+        trace.deterministic_update_candidate_indices, dtype=np.int64
+    )
+    masks = np.asarray(trace.candidate_masks, dtype=bool)
+    if saved_greedy_indices.shape != (masks.shape[0],):
+        raise ValueError("Saved deterministic Candidate indices do not align with trace nodes.")
+    for node_index in trace.target_node_indices:
+        if node_index < 0 or node_index >= masks.shape[0]:
+            raise IndexError("Counterfactual target node index is outside the Cache matrix.")
+        candidate_index = int(saved_greedy_indices[node_index])
+        update_mask = masks[node_index].copy()
+        if len(update_mask):
+            update_mask[0] = False
+        if (
+            candidate_index < 0
+            or candidate_index >= len(update_mask)
+            or not bool(update_mask[candidate_index])
+        ):
+            raise ValueError(
+                "Saved deterministic Candidate index is not a legal UPDATE candidate."
+            )
 
     payload = _snapshot_payload(
         episode_key=trace.episode_key,
@@ -684,6 +718,9 @@ def validate_counterfactual_trace(trace: CounterfactualMacroTrace) -> None:
         candidate_configurations=trace.candidate_configurations,
         candidate_features=trace.candidate_features,
         candidate_masks=trace.candidate_masks,
+        deterministic_update_candidate_indices=(
+            trace.deterministic_update_candidate_indices
+        ),
         target_node_indices=trace.target_node_indices,
         aligned_steps=trace.aligned_steps,
         micro_common_uniforms=trace.micro_common_uniforms,
