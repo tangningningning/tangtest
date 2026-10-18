@@ -1,61 +1,49 @@
 # adaptive_cache_mec
 
-## 正式主线
+## 正式训练算法
 
-当前唯一正式算法为 `PROPOSED`，使用 PER_SLOT_ANALYTIC 任务效用模型、Architecture 35、Checkpoint 62 和策略 Schema `adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1`。Observation Spec 当前生成 400 维状态，不包含跨 Slot Ledger 特征。每个 Slot 仅对该 Slot 的到达任务执行 Matching/KKT 并计算完整时延、能耗与 Reward；Cache 和 UAV 配置仍跨 Slot 延续。正式配置是 `configs/proposed/system_config.toml`：`MULTI_NODE_FACTORIZED` Cache 控制 9 个节点（5 个 SV、2 个 RSU、2 架 UAV），其中两架 UAV 也由 Micro 策略控制位置。
+当前唯一正式 PPO 训练算法是 Stage3 MAPPO，实现在 `src/ppo_simple/mappo_baseline.py` 和 `src/ppo_simple/cache_counterfactual_value.py`，正式 Runner 为 `scripts/training/run_mappo_stage3_cache_value.py`。`ppo-train` 是同一 Runner 的打包命令入口；`scripts/training/mainline_runner.py` 仅保留为旧命令兼容转发器，不是另一套算法。
 
-Macro Cache SMDP PPO 在每个 frame 起点为每个 Cache 节点各采样一个 masked categorical 候选动作。每个节点的候选 0 是 KEEP，其余合法候选是 UPDATE；UPDATE logits 按该节点合法 UPDATE 候选数进行 cardinality correction。给定 observation 和候选特征后，九个节点的 Cache 动作按分解分布采样，联合 Cache log-prob 是九个节点 log-prob 之和。Macro 联合策略还包含 frame 内实际采样的 holding termination 决策：Cache 联合 log-prob 与 termination log-prob 之和构成单一 PPO ratio；强制最大持有时间和 Episode 终点不计入 termination likelihood。Holding 范围为 1–5 slots。
-
-Micro UAV PPO 每个 slot 按固定顺序先采样 UAV0 位置，再基于 UAV0 的位置条件采样 UAV1 位置；两项条件 log-prob 相加形成 UAV 联合 log-prob，并使用一个 PPO ratio。UAV 候选 0 表示 STAY，其余候选表示 MOVE。训练保留当前 Micro Actor 的 STAY/MOVE 组熵软正则及现有 PPO 更新机制。
-
-## 通信合同
-
-- SV、RSU、UAV 的链路系统带宽各为 10 MHz。
-- Edge 使用 `BANDWIDTH_DEPENDENT_NOISE_V1`；热噪声按 KKT 分配给任务的带宽计算。
-- Cloud 使用 20 Mbps 等效上传速率、13 倍上传时延系数，以及总量 40 GHz 的有限共享 CPU 池。
-- Cloud 的等效上传速率和时延系数是当前系统模型配置，不表示真实无线覆盖、吞吐保证或物理可靠性验证。
-
-## 正式训练
-
-正式 Training Pool 为 `environment_data/proposed_joint_training/`，包含 300 个 Training Episode（seed 20001–20300），每个 Episode 有 300 个 slot。正式 Runner 固定 PPO 初始化 seed 27005；每 4 个 Episode 执行一次 Policy Update，共 75 组更新。Macro Actor 学习率为 5e-4，所有优化器采用 constant 学习率合同。
-
-在 `adaptive_cache_mec` Conda 环境中，从头训练和严格恢复训练均使用同一个正式 Runner、配置、Training Pool 和输出目录：
+Stage3 使用 `configs/proposed/system_config.toml` 和已审查的 `environment_data/proposed_joint_training/` Training Pool。Runner 按 Manifest 校验来源，每次更新从一个 Training Episode 读取连续 Slot 窗口。默认执行 3 次更新、每次 40 Slot；默认输出到新的 `runs/research_mappo_stage3_cache_value/` 子目录，不覆盖已有运行。
 
 ```powershell
 conda activate adaptive_cache_mec
-python scripts/training/mainline_runner.py
-python scripts/training/mainline_runner.py --resume
+python scripts/training/run_mappo_stage3_cache_value.py --help
 ```
 
-Run 输出固定为 `runs/stageB3_10j_multi_node_v4_mainline/`。默认命令从头初始化策略和优化器；只要该 Run 目录已存在就会拒绝启动。`--resume` 要求该目录中已有 `run_manifest.json` 和 `checkpoints/latest_checkpoint.pt`，随后由 Trainer 执行既有严格恢复校验，恢复模型、优化器、计数器和随机数状态，并从完整 PPO 更新组边界继续。配置哈希、策略/架构、Checkpoint 版本、Training Pool provenance、Episode 数量、更新组边界和 Run 日志不匹配时会停止。新的通信配置不能严格恢复旧通信合同的 Checkpoint；此时应使用从头训练命令。
-
-## Checkpoint
-
-- `runs/stageB3_10j_multi_node_v4_mainline/checkpoints/latest_checkpoint.pt`：正式恢复训练和后续评价所用的 Checkpoint。
-- `runs/stageB3_10j_multi_node_v4_mainline/checkpoints/best_train_return_checkpoint.pt`：按单个 Training Episode return 保存的训练诊断产物，不用于最终模型选择。
-
-## 数据与评价入口
-
-Episode 数据生成入口：
-
-- `scripts/generation/generate_episode_realization.py`：生成单个 Episode realization。
-- `scripts/generation/generate_episode_pool.py`：按 seed 范围生成 Episode Pool。
+选择且只选择一种初始化方式：
 
 ```powershell
-python scripts/generation/generate_episode_realization.py --help
-python scripts/generation/generate_episode_pool.py --help
-ppo-eval --help
+# 从随机参数开始
+python scripts/training/run_mappo_stage3_cache_value.py --initialize-random
+
+# 从 MAPPO v2 初始化迁移，或严格恢复目标合同相同的 Stage3 v6 Checkpoint
+python scripts/training/run_mappo_stage3_cache_value.py --source-checkpoint <checkpoint.pt>
+
+# 从旧 Stage3 v4/v5 仅迁移模型权重；优化器、进度及随机状态会重新初始化
+python scripts/training/run_mappo_stage3_cache_value.py --initialize-from-stage3-checkpoint <checkpoint.pt>
 ```
 
-评价入口 `ppo-eval` 使用冻结策略并校验 Checkpoint 合同；正式评价和模型选择使用 `latest_checkpoint.pt`。Training、Validation 与 Test 使用各自对应的数据划分。
+`--source-checkpoint` 遇到 MAPPO v2 时执行显式 v2→Stage3 初始化迁移：恢复兼容策略权重和可迁移的基础优化器状态，Stage3 ΔQ 头与 Stage3 进度从新初始化开始；这不等于完整恢复。当前 Stage3 v6 Checkpoint 则必须通过严格模型、目标、优化器、进度和随机状态校验后才能恢复。Stage3 v4/v5 没有可验证的 Trigger 目标版本，不能严格续训；上述专用参数只恢复形状兼容的模型权重，清空优化器状态、进度计数并保留新 Trainer 的 RNG。`--resume` 不是当前 Runner 支持的参数。严格恢复会在新的唯一运行目录继续 Checkpoint 状态，不会写回旧运行目录。
 
-## 主流程
+Stage3 损失系数由 `configs/research/mappo_stage3_loss_coefficients_v1.json` 提供并按规范化 LF 内容校验 SHA-256 `c91bccc6bf91f76c407a18c9953b4fa2c2d346fcfef3337ad63ee49b23d8bdb4`。固定 Trigger/Candidate 排序系数为 `0.01/0.01`，ΔQ Huber 系数为 `1.0`，平局容差为 `0.01/0.01`，pairwise temperature 与 Huber δ 为 `1.0`，ΔQ 头学习率为 `0.001`。
 
-```text
-Episode observation
-→ 九节点因子化 Cache 动作与两 UAV 自回归位置动作
-→ Cache/UAV 执行
-→ Transfer–Exchange Matching → KKT → slot reward
-→ 每四个独立 Episode realization 合并并进行一次 Macro/Micro PPO 更新
-→ 在完整更新组边界保存 latest checkpoint
+## Trigger、Candidate 与评价合同
+
+训练使用随机策略采样以执行 MAPPO PPO 更新，Macro joint log-prob 和原有 PPO ratio 合同保持不变。Stage3 Candidate 排序损失比较全部合法 UPDATE 候选的真实反事实 ΔQ。
+
+当前主要冻结策略评价采用确定性“先选操作组、再选候选”解码：按 Trigger 组概率选择 KEEP/UPDATE（相等时选 KEEP）；若选 UPDATE，再在合法 UPDATE 集合中选择条件概率最大的 Candidate。Stage3 的 Trigger 标签合同 `deterministic_update_candidate_delta_q_v1` 与该解码一致：取行为策略条件 Candidate 分布的确定性 argmax 候选，并以该候选的反事实 ΔQ 监督 UPDATE-vs-KEEP。候选 argmax 使用稳定的首个最大值规则。该 ΔQ 是有限期 Macro SMDP 回报加冻结 Critic bootstrap 的条件估计，不是长期最优价值；推理时不读取真实未来任务，也不运行反事实 Oracle。
+
+Stage3 v6 Checkpoint 同时记录并校验 `trigger_target_schema`。不能将无目标标识的 v4/v5 Checkpoint 当作当前目标的严格恢复输入。评价脚本会分别报告 Actor 的确定性 Trigger 决策准确率与 ΔQ value head 的价值估计指标，避免把价值头的正负判别误称为 Actor 动作准确率。
+
+Stage3 冻结 Validation 适配器为 `scripts/evaluation/run_mappo_stage3_main_experiment.py`，可先检查参数：
+
+```powershell
+python scripts/evaluation/run_mappo_stage3_main_experiment.py --help
 ```
+
+该适配器使用 Validation seeds `30001–30003`、相同外生场景和上述确定性解码。`ppo-eval` 指向旧 PROPOSED Checkpoint 评价器，不接受 Stage3 MAPPO Checkpoint；Stage3 Checkpoint 应使用 Stage3 冻结 Validation 适配器。
+
+## 数据边界
+
+Training、Validation 与 Test 使用各自独立的数据划分。Stage3 训练 Runner 只接受 Training Pool；主冻结 Validation 适配器只读取指定 Validation seeds。除非明确执行数据生成任务，否则不要重生成或改写现有 Pool、Manifest 或 `environment_data/`。

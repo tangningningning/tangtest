@@ -1,4 +1,4 @@
-"""Compatibility entrypoint for the sole formal MAPPO Stage3 algorithm."""
+"""Legacy command alias; use run_mappo_stage3_cache_value.py directly."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ for import_root in (SOURCE_ROOT, TRAINING_ROOT):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Dispatch directly to Stage3; no legacy PPO algorithm selector remains."""
+    """Preserve the old command while dispatching to the sole Stage3 Runner."""
 
     from run_mappo_stage3_cache_value import main as stage3_main
 

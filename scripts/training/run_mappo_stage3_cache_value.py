@@ -26,6 +26,7 @@ for import_root in (SOURCE_ROOT, TRAINING_ROOT):
 
 from ppo_simple.cache_counterfactual_value import (  # noqa: E402
     COUNTERFACTUAL_VALUE_SCHEMA,
+    TRIGGER_TARGET_SCHEMA,
     Stage3CacheValueConfig,
 )
 from ppo_simple.mappo_baseline import (  # noqa: E402
@@ -82,7 +83,23 @@ def _write_event(stream: Any, event: dict[str, Any]) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-checkpoint", type=Path)
+    parser.add_argument(
+        "--source-checkpoint",
+        type=Path,
+        help=(
+            "Restore an exact current Stage3 checkpoint, or initialize/migrate "
+            "a supported MAPPO v2 checkpoint. Older Stage3 checkpoints require "
+            "--initialize-from-stage3-checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--initialize-from-stage3-checkpoint",
+        type=Path,
+        help=(
+            "Warm-start model weights from Stage3 v4/v5 while resetting all "
+            "optimizers, progress counters and RNG state. This is not resume."
+        ),
+    )
     parser.add_argument(
         "--initialize-random",
         action="store_true",
@@ -134,6 +151,7 @@ def _load_stage3_coefficient_profile(
 
     source = path.expanduser().resolve()
     raw = source.read_bytes()
+    canonical_raw = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     try:
         payload = json.loads(
             raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
@@ -211,7 +229,8 @@ def _load_stage3_coefficient_profile(
         "profile_schema": payload["profile_schema"],
         "algorithm_schema": payload["algorithm_schema"],
         "profile_path": str(source),
-        "profile_sha256": hashlib.sha256(raw).hexdigest(),
+        "profile_sha256": hashlib.sha256(canonical_raw).hexdigest(),
+        "profile_raw_sha256": hashlib.sha256(raw).hexdigest(),
         "profile_contents": payload,
     }
     if metadata["profile_sha256"] != EXPECTED_COEFFICIENT_PROFILE_SHA256:
@@ -226,10 +245,16 @@ def _load_stage3_coefficient_profile(
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.source_checkpoint is None and not args.initialize_random:
-        parser.error("Provide --source-checkpoint or explicitly choose --initialize-random.")
-    if args.source_checkpoint is not None and args.initialize_random:
-        parser.error("--source-checkpoint and --initialize-random are mutually exclusive.")
+    initialization_modes = (
+        args.source_checkpoint is not None,
+        args.initialize_from_stage3_checkpoint is not None,
+        bool(args.initialize_random),
+    )
+    if sum(initialization_modes) != 1:
+        parser.error(
+            "Choose exactly one of --source-checkpoint, "
+            "--initialize-from-stage3-checkpoint, or --initialize-random."
+        )
     if args.updates <= 0 or args.slots_per_update <= 0 or args.epochs <= 0:
         parser.error("updates, slots-per-update and epochs must be positive.")
     stage3_config, stage3_profile_metadata = _load_stage3_coefficient_profile(
@@ -258,8 +283,13 @@ def main(argv: list[str] | None = None) -> int:
     for episode_seed in training_seeds:
         pool_contract._validate_episode_snapshot(train_pool, episode_seed, pool_info)
 
+    source_checkpoint_arg = (
+        args.initialize_from_stage3_checkpoint
+        if args.initialize_from_stage3_checkpoint is not None
+        else args.source_checkpoint
+    )
     source_checkpoint = (
-        None if args.source_checkpoint is None else args.source_checkpoint.resolve()
+        None if source_checkpoint_arg is None else source_checkpoint_arg.resolve()
     )
     if source_checkpoint is not None and not source_checkpoint.is_file():
         raise FileNotFoundError(f"Source MAPPO checkpoint is missing: {source_checkpoint}")
@@ -277,6 +307,9 @@ def main(argv: list[str] | None = None) -> int:
         resume = trainer.load_checkpoint(
             source_checkpoint,
             allow_v2_initialization=True,
+            allow_stage3_policy_initialization=(
+                args.initialize_from_stage3_checkpoint is not None
+            ),
         )
         if resume.get("seed") != int(args.trainer_seed):
             raise ValueError(
@@ -314,9 +347,10 @@ def main(argv: list[str] | None = None) -> int:
         "baseline_schema": MAPPO_BASELINE_SCHEMA,
         "checkpoint_version": MAPPO_STAGE3_CHECKPOINT_VERSION,
         "algorithm_mode": COUNTERFACTUAL_VALUE_SCHEMA,
+        "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
         "source_checkpoint": None if source_checkpoint is None else str(source_checkpoint),
         "source_checkpoint_sha256": source_sha256,
-        "source_checkpoint_restore": resume,
+        "source_checkpoint_load": resume,
         "stage3_enabled": True,
         "stage3_config": stage3_config.contract(),
         "stage3_coefficient_profile": stage3_profile_metadata,

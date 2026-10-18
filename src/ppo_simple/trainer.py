@@ -4628,8 +4628,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     del argv
     raise RuntimeError(
-        "The legacy PPO command is retired. The registered `ppo-train` command "
-        "and scripts/training/mainline_runner.py dispatch to Stage3."
+        "The legacy PPO command is retired. Use the Stage3 MAPPO Runner: "
+        "python scripts/training/run_mappo_stage3_cache_value.py."
     )
 
 

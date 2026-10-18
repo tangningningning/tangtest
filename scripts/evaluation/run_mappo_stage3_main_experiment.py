@@ -1,6 +1,6 @@
 """Frozen paired Validation adapter using the existing Stage1C evaluator.
 
-The adapter enables strict Stage3-v4 checkpoint loading, then delegates action
+The adapter enables strict Stage3-v6 checkpoint loading, then delegates action
 collection and formal metric checks to the existing MAPPO baseline collector
 and Stage1C frozen evaluator. It never calls Trainer.update().
 """
@@ -28,6 +28,7 @@ from ppo_simple.mappo_baseline import (  # noqa: E402
     MAPPOBaselineTrainer,
 )
 from ppo_simple.cache_counterfactual_value import (  # noqa: E402
+    TRIGGER_TARGET_SCHEMA,
     Stage3CacheValueConfig,
 )
 from scripts.training import run_mappo_stage3_cache_value as stage3_runner  # noqa: E402
@@ -121,11 +122,14 @@ def _stage3_label_metrics(
     except CounterfactualLabelBatchError as exc:
         return {
             "status": "unresolved_no_valid_legal_update_labels",
+            "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
             "counterfactual": exc.summary,
             "delta_q_rmse": None,
             "delta_q_mae": None,
             "delta_q_sign_accuracy_excluding_ties": None,
-            "trigger_accuracy": None,
+            "value_head_best_delta_q_positive_accuracy": None,
+            "value_head_policy_selected_candidate_sign_accuracy_excluding_ties": None,
+            "actor_deterministic_trigger_accuracy_excluding_target_ties": None,
             "candidate_pairwise_rank_accuracy": None,
             "candidate_pair_count": 0,
         }
@@ -155,16 +159,115 @@ def _stage3_label_metrics(
         if bool(np.any(sign_valid))
         else None
     )
-    trigger_actual: list[bool] = []
-    trigger_predicted: list[bool] = []
+    true_best_positive: list[bool] = []
+    predicted_best_positive: list[bool] = []
     correct_pairs = 0
     compared_pairs = 0
+    trigger_targets = np.asarray(batch["delta_q_trigger"], dtype=np.float64)
+    observations = torch.as_tensor(
+        batch["observations"], dtype=torch.float32, device=trainer.device
+    )
+    candidate_features = torch.as_tensor(
+        batch["candidate_features"], dtype=torch.float32, device=trainer.device
+    ).unsqueeze(1)
+    candidate_masks = torch.as_tensor(
+        batch["candidate_masks"], dtype=torch.bool, device=trainer.device
+    ).unsqueeze(1)
+    with torch.inference_mode():
+        (
+            trigger_logits,
+            _,
+            _,
+            conditional_raw_logits,
+            _,
+            legal_masks,
+        ) = trainer.policy._macro_cache_factorized_node_logits(
+            observations, candidate_features, candidate_masks
+        )
+        node_trigger_logits = trigger_logits[:, 0]
+        node_conditional_logits = conditional_logits[:, 0]
+        node_legal_masks = legal_masks[:, 0]
+        update_legal = node_legal_masks[:, 1:]
+        if not bool(torch.all(torch.any(update_legal, dim=-1)).item()):
+            raise ValueError("Frozen Trigger diagnostics encountered an empty UPDATE support.")
+        update_group_logit = torch.logsumexp(
+            node_trigger_logits[:, 1:].masked_fill(~update_legal, -float("inf")),
+            dim=-1,
+        )
+        group_probabilities = torch.softmax(
+            torch.stack((node_trigger_logits[:, 0], update_group_logit), dim=-1),
+            dim=-1,
+        )
+        actor_update = group_probabilities[:, 1] > group_probabilities[:, 0]
+        deterministic_candidate = (
+            conditional_raw_logits[:, 0, 1:]
+            .masked_fill(~update_legal, -float("inf"))
+            .argmax(dim=-1)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64, copy=False)
+            + 1
+        )
+        actor_update = actor_update.detach().cpu().numpy().astype(bool, copy=False)
+    label_diagnostics = diagnostics.get("label_diagnostics", [])
+    recorded_selected_candidates = np.asarray(
+        [
+            int(item["trigger_selected_candidate_index"])
+            for item in label_diagnostics
+        ],
+        dtype=np.int64,
+    )
+    if not np.array_equal(recorded_selected_candidates, deterministic_candidate):
+        raise ValueError(
+            "Frozen Trigger target Candidate indices do not match the deterministic "
+            "UPDATE Candidate decoder."
+        )
+    row_indices = np.arange(len(targets), dtype=np.int64)
+    selected_true_delta = targets[row_indices, deterministic_candidate]
+    selected_predicted_delta = predicted[row_indices, deterministic_candidate]
+    if not np.allclose(
+        selected_true_delta,
+        trigger_targets,
+        atol=1.0e-6,
+        rtol=0.0,
+    ):
+        raise ValueError(
+            "Frozen Trigger labels do not match the deterministic conditional "
+            "Candidate selected by the current policy."
+        )
+    trigger_active = np.abs(trigger_targets) > float(profile.trigger_tie_tolerance)
+    trigger_action_accuracy = (
+        float(
+            np.mean(
+                actor_update[trigger_active]
+                == (trigger_targets[trigger_active] > 0.0)
+            )
+        )
+        if bool(np.any(trigger_active))
+        else None
+    )
+    selected_sign_active = (
+        np.abs(selected_true_delta) > float(profile.candidate_tie_tolerance)
+    )
+    selected_value_head_sign_accuracy = (
+        float(
+            np.mean(
+                np.sign(selected_predicted_delta[selected_sign_active])
+                == np.sign(selected_true_delta[selected_sign_active])
+            )
+        )
+        if bool(np.any(selected_sign_active))
+        else None
+    )
     for row in range(len(targets)):
         legal = np.flatnonzero(masks[row])
         true_best = float(np.max(targets[row, legal]))
         predicted_best = float(np.max(predicted[row, legal]))
-        trigger_actual.append(true_best > float(profile.trigger_tie_tolerance))
-        trigger_predicted.append(predicted_best > float(profile.trigger_tie_tolerance))
+        true_best_positive.append(true_best > float(profile.trigger_tie_tolerance))
+        predicted_best_positive.append(
+            predicted_best > float(profile.trigger_tie_tolerance)
+        )
         for left_pos, left in enumerate(legal):
             for right in legal[left_pos + 1 :]:
                 true_delta = float(targets[row, left] - targets[row, right])
@@ -175,15 +278,37 @@ def _stage3_label_metrics(
                 compared_pairs += 1
     return {
         "counterfactual": diagnostics,
+        "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
+        "trigger_target_semantics": (
+            "finite-horizon delta_q for the behavior-policy argmax legal UPDATE "
+            "candidate; future return uses the frozen Critic bootstrap"
+        ),
         "candidate_count": int(np.count_nonzero(masks)),
         "delta_q_rmse": float(np.sqrt(np.mean(errors**2))) if len(errors) else None,
         "delta_q_mae": float(np.mean(np.abs(errors))) if len(errors) else None,
         "delta_q_sign_accuracy_excluding_ties": sign_accuracy,
-        "trigger_accuracy": float(
-            np.mean(np.asarray(trigger_actual) == np.asarray(trigger_predicted))
+        "value_head_best_delta_q_positive_accuracy": float(
+            np.mean(
+                np.asarray(true_best_positive)
+                == np.asarray(predicted_best_positive)
+            )
         ),
-        "trigger_positive_count": int(sum(trigger_actual)),
-        "trigger_predicted_positive_count": int(sum(trigger_predicted)),
+        "value_head_best_delta_q_positive_count": int(sum(true_best_positive)),
+        "value_head_predicted_best_delta_q_positive_count": int(
+            sum(predicted_best_positive)
+        ),
+        "value_head_policy_selected_candidate_sign_accuracy_excluding_ties": (
+            selected_value_head_sign_accuracy
+        ),
+        "actor_deterministic_trigger_accuracy_excluding_target_ties": (
+            trigger_action_accuracy
+        ),
+        "actor_deterministic_trigger_update_count": int(np.count_nonzero(actor_update)),
+        "actor_deterministic_trigger_keep_count": int(
+            len(actor_update) - np.count_nonzero(actor_update)
+        ),
+        "trigger_target_row_count": int(len(trigger_targets)),
+        "trigger_target_active_row_count": int(np.count_nonzero(trigger_active)),
         "candidate_pairwise_rank_accuracy": (
             correct_pairs / compared_pairs if compared_pairs else None
         ),
@@ -245,9 +370,11 @@ def _main() -> int:
             "operation-first conditional greedy for learned policies; forced legal action 0 "
             "for KEEP+STAY"
         ),
+        "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
         "base_checkpoint_sha256": _sha256(base_checkpoint),
         "stage3_checkpoint_sha256": _sha256(stage3_checkpoint),
-        "profile_sha256": _sha256(profile_path),
+        "profile_sha256": profile_meta["profile_sha256"],
+        "profile_raw_sha256": profile_meta["profile_raw_sha256"],
         "evaluation_adapter_sha256": _sha256(Path(__file__).resolve()),
         "stage3_profile": profile_meta,
         "existing_evaluator_path": str(args.existing_evaluator.resolve()),

@@ -31,6 +31,7 @@ from decision import cache_configuration, slot_environment, uav_configuration
 from .policy import MultiNodeFactorizedActorCritic, _masked_categorical
 from .cache_counterfactual_value import (
     COUNTERFACTUAL_VALUE_SCHEMA,
+    TRIGGER_TARGET_SCHEMA,
     CACHE_NODE_VALUE_FEATURE_DIM,
     CacheDeltaQValueHead,
     CounterfactualMacroTrace,
@@ -40,7 +41,7 @@ from .cache_counterfactual_value import (
     delta_q_huber_loss,
     evaluate_counterfactual_trace,
     make_counterfactual_trace,
-    conditional_policy_expected_delta_q,
+    deterministic_policy_selected_delta_q,
     policy_state_fingerprint,
     trigger_value_ranking_loss,
 )
@@ -69,7 +70,8 @@ MAPPO_BASELINE_SCHEMA = (
 )
 MAPPO_CHECKPOINT_VERSION = 2
 MAPPO_STAGE3_LEGACY_CHECKPOINT_VERSION = 4
-MAPPO_STAGE3_CHECKPOINT_VERSION = 5
+MAPPO_STAGE3_PREVIOUS_CHECKPOINT_VERSION = 5
+MAPPO_STAGE3_CHECKPOINT_VERSION = 6
 MACRO_CONDITIONAL_CANDIDATE_PREFIXES = (
     "macro_conditional_candidate_encoder.",
     "macro_conditional_cache_scorer.",
@@ -1501,6 +1503,7 @@ class MAPPOBaselineTrainer:
             raise CounterfactualLabelBatchError(
                 "Stage3 update requires selected counterfactual Macro traces.",
                 {
+                    "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
                     "valid_trace_count": 0,
                     "valid_label_count": 0,
                     "invalid_trace_rejection_count": 0,
@@ -1509,9 +1512,9 @@ class MAPPOBaselineTrainer:
                     "legal_update_candidate_count": 0,
                     "trigger_supervision_row_count": 0,
                     "trigger_tie_excluded_row_count": 0,
-                    "trigger_delta_q_positive_count": 0,
-                    "trigger_delta_q_negative_count": 0,
-                    "trigger_delta_q_near_zero_count": 0,
+                    "trigger_target_delta_q_positive_count": 0,
+                    "trigger_target_delta_q_negative_count": 0,
+                    "trigger_target_delta_q_near_zero_count": 0,
                     "candidate_delta_q_positive_count": 0,
                     "candidate_delta_q_negative_count": 0,
                     "candidate_delta_q_near_zero_count": 0,
@@ -1629,7 +1632,10 @@ class MAPPOBaselineTrainer:
                         raise ValueError(
                             "Counterfactual best ΔQ does not match its legal UPDATE labels."
                         )
-                    delta_q_trigger_value = conditional_policy_expected_delta_q(
+                    (
+                        trigger_selected_candidate_index,
+                        delta_q_trigger_value,
+                    ) = deterministic_policy_selected_delta_q(
                         candidate_indices=legal_update_indices,
                         candidate_delta_q=delta_values,
                         behavior_conditional_candidate_probabilities=(
@@ -1661,7 +1667,7 @@ class MAPPOBaselineTrainer:
                     )
                     if not math.isfinite(delta_q_trigger_for_loss):
                         raise FloatingPointError(
-                            "Frozen Candidate-policy expected Trigger ΔQ is non-finite."
+                            "Deterministic selected-candidate Trigger ΔQ is non-finite."
                         )
                     delta_q_trigger_class = (
                         "positive"
@@ -1726,8 +1732,12 @@ class MAPPOBaselineTrainer:
                         "target_node_index": int(node_index),
                         "best_delta_q": best_delta_q_for_loss,
                         "best_delta_q_class": best_delta_q_class,
-                        "delta_q_trigger": delta_q_trigger_for_loss,
-                        "delta_q_trigger_class": delta_q_trigger_class,
+                        "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
+                        "trigger_selected_candidate_index": int(
+                            trigger_selected_candidate_index
+                        ),
+                        "trigger_target_delta_q": delta_q_trigger_for_loss,
+                        "trigger_target_class": delta_q_trigger_class,
                         "trigger_tie_tolerance": trigger_tie_tolerance,
                         "legal_update_candidate_count": int(len(delta_values_for_loss)),
                         "candidate_delta_q_positive_count": candidate_delta_q_counts[
@@ -1841,6 +1851,7 @@ class MAPPOBaselineTrainer:
             int(np.count_nonzero(item["update_mask"])) for item in records
         )
         summary = {
+            "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
             "valid_trace_count": int(valid_trace_count),
             "valid_label_count": int(valid_label_count),
             "invalid_trace_rejection_count": int(invalid_trace_rejection_count),
@@ -1851,9 +1862,15 @@ class MAPPOBaselineTrainer:
             "legal_update_candidate_count": int(legal_update_candidate_count),
             "trigger_supervision_row_count": int(trigger_supervision_row_count),
             "trigger_tie_excluded_row_count": int(trigger_tie_excluded_row_count),
-            "trigger_delta_q_positive_count": int(trigger_delta_q_positive_count),
-            "trigger_delta_q_negative_count": int(trigger_delta_q_negative_count),
-            "trigger_delta_q_near_zero_count": int(trigger_delta_q_near_zero_count),
+            "trigger_target_delta_q_positive_count": int(
+                trigger_delta_q_positive_count
+            ),
+            "trigger_target_delta_q_negative_count": int(
+                trigger_delta_q_negative_count
+            ),
+            "trigger_target_delta_q_near_zero_count": int(
+                trigger_delta_q_near_zero_count
+            ),
             "candidate_delta_q_positive_count": int(
                 candidate_delta_q_positive_count
             ),
@@ -1876,6 +1893,9 @@ class MAPPOBaselineTrainer:
             "rejection_reason_counts": rejection_reason_counts,
             "label_semantics": (
                 "finite_horizon_macro_smdp_return_plus_frozen_critic_bootstrap"
+            ),
+            "trigger_target_semantics": (
+                "delta_q_of_behavior_policy_argmax_legal_update_candidate"
             ),
         }
         if not records or legal_update_candidate_count <= 0:
@@ -2868,14 +2888,21 @@ class MAPPOBaselineTrainer:
                 "stage3_trigger_tie_excluded_row_count": int(
                     counterfactual_summary.get("trigger_tie_excluded_row_count", 0)
                 ),
-                "stage3_trigger_delta_q_positive_count": int(
-                    counterfactual_summary.get("trigger_delta_q_positive_count", 0)
+                "stage3_trigger_target_schema": TRIGGER_TARGET_SCHEMA,
+                "stage3_trigger_target_delta_q_positive_count": int(
+                    counterfactual_summary.get(
+                        "trigger_target_delta_q_positive_count", 0
+                    )
                 ),
-                "stage3_trigger_delta_q_negative_count": int(
-                    counterfactual_summary.get("trigger_delta_q_negative_count", 0)
+                "stage3_trigger_target_delta_q_negative_count": int(
+                    counterfactual_summary.get(
+                        "trigger_target_delta_q_negative_count", 0
+                    )
                 ),
-                "stage3_trigger_delta_q_near_zero_count": int(
-                    counterfactual_summary.get("trigger_delta_q_near_zero_count", 0)
+                "stage3_trigger_target_delta_q_near_zero_count": int(
+                    counterfactual_summary.get(
+                        "trigger_target_delta_q_near_zero_count", 0
+                    )
                 ),
                 "stage3_candidate_pair_count": int(sum(stage3_candidate_pair_counts)),
                 "stage3_candidate_pair_total_count": int(
@@ -3047,6 +3074,7 @@ class MAPPOBaselineTrainer:
             raise RuntimeError("Stage3 checkpoint contract requested while mode is disabled.")
         return {
             "algorithm_mode": COUNTERFACTUAL_VALUE_SCHEMA,
+            "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
             "micro_common_random_contract": (
                 "per_slot_per_ordered_uav_operation_and_candidate_uniforms_inverse_cdf_v1"
             ),
@@ -3281,6 +3309,7 @@ class MAPPOBaselineTrainer:
         }
         if stage3_enabled:
             payload["algorithm_mode"] = COUNTERFACTUAL_VALUE_SCHEMA
+            payload["trigger_target_schema"] = TRIGGER_TARGET_SCHEMA
             payload["stage3_contract"] = self._stage3_checkpoint_contract()
             payload["stage3_initialization"] = {
                 "mode": self.stage3_initialization_mode,
@@ -3300,11 +3329,203 @@ class MAPPOBaselineTrainer:
             raise
         return destination
 
+    def _initialize_from_legacy_stage3_weights(
+        self, payload: dict[str, Any], source: Path, checkpoint_version: int
+    ) -> dict[str, Any]:
+        """Warm-start model weights from an unversioned Stage3 Trigger target.
+
+        Stage3 v4/v5 checkpoints predate the explicit Trigger target contract.
+        They may seed the model, but their optimizer, progress and RNG state are
+        intentionally not restored. This prevents a different/unknown target
+        from being represented as an exact continuation.
+        """
+
+        if (
+            self.stage3_cache_value_config is None
+            or self.cache_delta_q_value_head is None
+            or self.cache_delta_q_value_optimizer is None
+            or self.counterfactual_micro_rng is None
+        ):
+            raise RuntimeError(
+                "Legacy Stage3 weight initialization requires Stage3 mode to be enabled."
+            )
+        optimizers = (
+            self.macro_actor_optimizer,
+            self.micro_actor_optimizer,
+            self.macro_critic_optimizer,
+            self.micro_critic_optimizer,
+            self.cache_delta_q_value_optimizer,
+        )
+        if (
+            self.update_count != 0
+            or self.stage3_update_count != 0
+            or self.candidate_supervised_update_count != 0
+            or self.counterfactual_rollout_count != 0
+            or any(optimizer.state for optimizer in optimizers)
+        ):
+            raise RuntimeError(
+                "Legacy Stage3 weights can only initialize a fresh trainer; "
+                "optimizer/progress state is already populated."
+            )
+        if payload.get("baseline_schema") != MAPPO_BASELINE_SCHEMA:
+            raise ValueError("Legacy Stage3 checkpoint baseline schema mismatch.")
+        if payload.get("algorithm_mode") != COUNTERFACTUAL_VALUE_SCHEMA:
+            raise ValueError("Legacy Stage3 checkpoint algorithm mode mismatch.")
+
+        expected_model_contract = self._checkpoint_contract()
+        expected_model_contract_without_candidate_head = dict(
+            expected_model_contract
+        )
+        expected_model_contract_without_candidate_head.pop(
+            "macro_candidate_head_schema", None
+        )
+        saved_model_contract = payload.get("model_contract")
+        if saved_model_contract not in (
+            expected_model_contract,
+            expected_model_contract_without_candidate_head,
+        ):
+            raise ValueError(
+                "Legacy Stage3 weight initialization model/config contract mismatch."
+            )
+
+        expected_stage3_contract = self._stage3_checkpoint_contract()
+        expected_pre_target_contract = copy.deepcopy(expected_stage3_contract)
+        expected_pre_target_contract.pop("trigger_target_schema", None)
+        expected_pre_target_contract["config"].pop("trigger_target_schema", None)
+        accepted_legacy_stage3_contracts = [expected_pre_target_contract]
+        expected_v4_contract = copy.deepcopy(expected_pre_target_contract)
+        expected_v4_contract.pop("macro_probability_schema", None)
+        expected_v4_contract.pop("candidate_optimizer_ownership", None)
+        accepted_legacy_stage3_contracts.append(expected_v4_contract)
+        saved_stage3_contract = payload.get("stage3_contract")
+        if saved_stage3_contract not in accepted_legacy_stage3_contracts:
+            raise ValueError(
+                "Legacy Stage3 weight initialization accepts only recognized v4/v5 "
+                "contracts that differ from the current contract by the unstamped "
+                "Trigger target."
+            )
+
+        saved_policy_state = payload.get("policy_state_dict")
+        live_policy_state = self.policy.state_dict()
+        conditional_names = {
+            name
+            for name in live_policy_state
+            if name.startswith(MACRO_CONDITIONAL_CANDIDATE_PREFIXES)
+        }
+        legacy_names = set(live_policy_state) - conditional_names
+        is_split = isinstance(saved_policy_state, dict) and set(
+            saved_policy_state
+        ) == set(live_policy_state)
+        is_legacy = bool(conditional_names) and isinstance(
+            saved_policy_state, dict
+        ) and set(saved_policy_state) == legacy_names
+        if checkpoint_version == MAPPO_STAGE3_PREVIOUS_CHECKPOINT_VERSION and not is_split:
+            raise ValueError(
+                "Stage3 v5 checkpoint is missing its split Candidate parameters."
+            )
+        if checkpoint_version == MAPPO_STAGE3_LEGACY_CHECKPOINT_VERSION and not is_legacy:
+            raise ValueError(
+                "Stage3 v4 checkpoint does not match the supported legacy policy schema."
+            )
+        if not is_split and not is_legacy:
+            raise ValueError(
+                "Legacy Stage3 checkpoint policy parameter names are incompatible."
+            )
+
+        initialized_policy_state = copy.deepcopy(saved_policy_state)
+        source_policy_names = set(live_policy_state) if is_split else legacy_names
+        for name in source_policy_names:
+            saved_tensor = saved_policy_state[name]
+            if not torch.is_tensor(saved_tensor) or tuple(saved_tensor.shape) != tuple(
+                live_policy_state[name].shape
+            ):
+                raise ValueError(
+                    f"Legacy Stage3 policy tensor is incompatible: {name}."
+                )
+        policy_was_migrated = not is_split
+        if policy_was_migrated:
+            for target_name in sorted(conditional_names):
+                if target_name.startswith("macro_conditional_candidate_encoder."):
+                    source_name = target_name.replace(
+                        "macro_conditional_candidate_encoder.",
+                        "macro_cache_candidate_encoder.",
+                        1,
+                    )
+                else:
+                    source_name = target_name.replace(
+                        "macro_conditional_cache_scorer.",
+                        "macro_cache_scorer.",
+                        1,
+                    )
+                source_tensor = saved_policy_state.get(source_name)
+                target_tensor = live_policy_state[target_name]
+                if not torch.is_tensor(source_tensor) or tuple(
+                    source_tensor.shape
+                ) != tuple(target_tensor.shape):
+                    raise ValueError(
+                        "Legacy Stage3 Candidate weight migration is incompatible: "
+                        f"{source_name} -> {target_name}."
+                    )
+                initialized_policy_state[target_name] = source_tensor.detach().clone()
+
+        saved_value_head = payload.get("cache_delta_q_value_head_state_dict")
+        live_value_head = self.cache_delta_q_value_head.state_dict()
+        if not isinstance(saved_value_head, dict) or set(saved_value_head) != set(
+            live_value_head
+        ):
+            raise ValueError("Legacy Stage3 ΔQ head parameter names are incompatible.")
+        for name, live_tensor in live_value_head.items():
+            saved_tensor = saved_value_head[name]
+            if not torch.is_tensor(saved_tensor) or tuple(saved_tensor.shape) != tuple(
+                live_tensor.shape
+            ):
+                raise ValueError(
+                    f"Legacy Stage3 ΔQ head tensor is incompatible: {name}."
+                )
+
+        # No optimizer, progress or RNG state is read from the source checkpoint.
+        self.policy.load_state_dict(initialized_policy_state, strict=True)
+        self.cache_delta_q_value_head.load_state_dict(saved_value_head, strict=True)
+        for optimizer in optimizers:
+            optimizer.state.clear()
+        self.update_count = 0
+        self.stage3_update_count = 0
+        self.candidate_supervised_update_count = 0
+        self.counterfactual_rollout_count = 0
+        self.stage3_initialization_mode = (
+            f"weights_only_from_stage3_v{checkpoint_version}_"
+            "unverified_trigger_target"
+        )
+        self.stage3_source_checkpoint_sha256 = self._checkpoint_file_sha256(source)
+        source_target_schema = payload.get("trigger_target_schema")
+        if source_target_schema is None:
+            source_target_schema = saved_stage3_contract.get(
+                "trigger_target_schema"
+            )
+        if source_target_schema is None:
+            source_config = saved_stage3_contract.get("config")
+            if isinstance(source_config, dict):
+                source_target_schema = source_config.get("trigger_target_schema")
+        return {
+            "checkpoint_version": checkpoint_version,
+            "update_count": 0,
+            "seed": self.seed,
+            "initialization_mode": self.stage3_initialization_mode,
+            "trigger_target_schema_source": source_target_schema,
+            "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
+            "optimizers_restored": False,
+            "progress_restored": False,
+            "random_state_restored": False,
+            "conditional_candidate_policy_migrated": policy_was_migrated,
+            "metadata": dict(payload.get("metadata", {})),
+        }
+
     def load_checkpoint(
         self,
         path: str | Path,
         *,
         allow_v2_initialization: bool = False,
+        allow_stage3_policy_initialization: bool = False,
     ) -> dict[str, Any]:
         """Strictly restore current checkpoints or explicitly migrate legacy heads."""
 
@@ -3318,14 +3539,30 @@ class MAPPOBaselineTrainer:
         checkpoint_version = int(payload.get("checkpoint_version", -1))
         stage3_enabled = self.stage3_cache_value_config is not None
         legacy_stage3 = checkpoint_version == MAPPO_STAGE3_LEGACY_CHECKPOINT_VERSION
+        previous_stage3 = checkpoint_version == MAPPO_STAGE3_PREVIOUS_CHECKPOINT_VERSION
         current_stage3 = checkpoint_version == MAPPO_STAGE3_CHECKPOINT_VERSION
-        stage3_checkpoint = legacy_stage3 or current_stage3
+        if legacy_stage3 or previous_stage3:
+            if allow_stage3_policy_initialization:
+                return self._initialize_from_legacy_stage3_weights(
+                    payload, source, checkpoint_version
+                )
+            raise ValueError(
+                f"Stage3 v{checkpoint_version} has no verifiable Trigger target "
+                "schema and cannot be strictly resumed. Use the explicit "
+                "weights-only Stage3 initialization option to warm-start it."
+            )
+        if allow_stage3_policy_initialization:
+            raise ValueError(
+                "--initialize-from-stage3-checkpoint is reserved for Stage3 v4/v5 "
+                "weight-only migration; use --source-checkpoint for current Stage3 v6."
+            )
+        stage3_checkpoint = current_stage3
         if checkpoint_version == MAPPO_CHECKPOINT_VERSION:
             if stage3_enabled and not allow_v2_initialization:
                 raise ValueError(
                     "Loading a v2 checkpoint into Stage3 requires explicit allow_v2_initialization=True."
                 )
-        elif legacy_stage3 or current_stage3:
+        elif current_stage3:
             if not stage3_enabled:
                 raise ValueError("A Stage3 checkpoint requires Stage3 mode to be explicitly enabled.")
         else:
@@ -3341,16 +3578,14 @@ class MAPPOBaselineTrainer:
         if stage3_checkpoint:
             if payload.get("algorithm_mode") != COUNTERFACTUAL_VALUE_SCHEMA:
                 raise ValueError("Stage3 checkpoint algorithm mode mismatch.")
+            if payload.get("trigger_target_schema") != TRIGGER_TARGET_SCHEMA:
+                raise ValueError(
+                    "Stage3 checkpoint Trigger target schema mismatch: "
+                    f"{payload.get('trigger_target_schema')!r} != "
+                    f"{TRIGGER_TARGET_SCHEMA!r}."
+                )
             expected_stage3_contract = self._stage3_checkpoint_contract()
-            expected_legacy_stage3_contract = dict(expected_stage3_contract)
-            expected_legacy_stage3_contract.pop("macro_probability_schema")
-            expected_legacy_stage3_contract.pop("candidate_optimizer_ownership")
-            accepted_stage3_contracts = (
-                (expected_stage3_contract,)
-                if current_stage3
-                else (expected_legacy_stage3_contract,)
-            )
-            if payload.get("stage3_contract") not in accepted_stage3_contracts:
+            if payload.get("stage3_contract") != expected_stage3_contract:
                 raise ValueError("Stage3 checkpoint value-head/loss contract mismatch.")
         elif payload.get("stage3_contract") is not None:
             raise ValueError("v2 checkpoint unexpectedly contains a Stage3 contract.")
@@ -3372,10 +3607,6 @@ class MAPPOBaselineTrainer:
             raise ValueError("MAPPO checkpoint policy parameter names differ from both supported schemas.")
         if current_stage3 and not split_policy_state:
             raise ValueError("Current Stage3 checkpoint is missing conditional Candidate parameters.")
-        if legacy_stage3 and (
-            saved_contract != expected_legacy_contract or not legacy_policy_state
-        ):
-            raise ValueError("Legacy Stage3 checkpoint schema and policy tensors are inconsistent.")
         if saved_contract == expected_contract and not split_policy_state:
             raise ValueError("Checkpoint declares the split Candidate schema but omits its parameters.")
         if (
@@ -3626,6 +3857,7 @@ class MAPPOBaselineTrainer:
             restored.update(
                 {
                     "algorithm_mode": COUNTERFACTUAL_VALUE_SCHEMA,
+                    "trigger_target_schema": TRIGGER_TARGET_SCHEMA,
                     "stage3_update_count": int(self.stage3_update_count),
                     "candidate_supervised_update_count": int(
                         self.candidate_supervised_update_count

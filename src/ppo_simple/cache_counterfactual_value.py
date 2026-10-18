@@ -38,6 +38,7 @@ from .rollout import (
 
 
 COUNTERFACTUAL_VALUE_SCHEMA = "mappo_cache_delta_q_counterfactual_v2_common_micro_uniforms"
+TRIGGER_TARGET_SCHEMA = "deterministic_update_candidate_delta_q_v1"
 CACHE_NODE_VALUE_FEATURE_DIM = 7
 
 
@@ -95,7 +96,7 @@ def _snapshot_value(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class Stage3CacheValueConfig:
-    """Explicit Stage3 loss, optimizer and bounded-label settings."""
+    """Explicit Stage3 target, loss, optimizer and bounded-label settings."""
 
     trigger_ranking_coefficient: float
     candidate_ranking_coefficient: float
@@ -107,8 +108,14 @@ class Stage3CacheValueConfig:
     huber_delta: float = 1.0
     max_macro_states_per_rollout: int = 4
     max_target_nodes_per_state: int = 2
+    trigger_target_schema: str = TRIGGER_TARGET_SCHEMA
 
     def validate(self) -> None:
+        if self.trigger_target_schema != TRIGGER_TARGET_SCHEMA:
+            raise ValueError(
+                "Unsupported Stage3 Trigger target schema: "
+                f"{self.trigger_target_schema!r}."
+            )
         coefficients = (
             self.trigger_ranking_coefficient,
             self.candidate_ranking_coefficient,
@@ -182,14 +189,21 @@ class CounterfactualTargetLabel:
     branch_summaries: tuple[dict[str, Any], ...]
 
 
-def conditional_policy_expected_delta_q(
+def deterministic_policy_selected_delta_q(
     *,
     candidate_indices: tuple[int, ...],
     candidate_delta_q: Any,
     behavior_conditional_candidate_probabilities: Any,
     legal_candidate_mask: Any,
-) -> float:
-    """Compute E[ΔQ | UPDATE] under the frozen rollout Candidate policy."""
+) -> tuple[int, float]:
+    """Return the deterministic conditional UPDATE candidate and its ΔQ.
+
+    The action decoder selects the legal UPDATE candidate with the largest
+    conditional policy probability (equivalently, its largest conditional
+    logit). ``np.argmax`` gives the same stable first-index tie break as the
+    actor decoder. The returned target is a finite-horizon, frozen-Critic
+    action value, not a long-term optimal value.
+    """
 
     indices = tuple(int(value) for value in candidate_indices)
     delta_values = np.asarray(candidate_delta_q, dtype=np.float64)
@@ -227,12 +241,14 @@ def conditional_policy_expected_delta_q(
         raise ValueError(
             "Frozen Candidate probabilities must normalize only over legal UPDATE candidates."
         )
-    result = float(
-        np.dot(probabilities[np.asarray(indices, dtype=np.int64)], delta_values)
+    selected_offset = int(
+        np.argmax(probabilities[np.asarray(indices, dtype=np.int64)])
     )
-    if not math.isfinite(result):
-        raise FloatingPointError("Frozen Candidate expected ΔQ is non-finite.")
-    return result
+    selected_index = indices[selected_offset]
+    selected_delta_q = float(delta_values[selected_offset])
+    if not math.isfinite(selected_delta_q):
+        raise FloatingPointError("Deterministic selected-candidate ΔQ is non-finite.")
+    return selected_index, selected_delta_q
 
 
 @dataclass(frozen=True)
@@ -803,7 +819,7 @@ def trigger_value_ranking_loss(
     *,
     tie_tolerance: float,
 ) -> tuple[Any, int]:
-    """Rank UPDATE-vs-KEEP log odds by the frozen Candidate-policy expected ΔQ."""
+    """Rank UPDATE-vs-KEEP log odds by deterministic selected-candidate ΔQ."""
 
     if torch is None:
         raise ImportError("Stage3 ranking losses require PyTorch.")
