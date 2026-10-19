@@ -42,12 +42,11 @@ from .macro_targets import (
     build_macro_n2_target,
 )
 from .policy import (
-    DualTimescaleActorCritic,
-    MultiNodeFactorizedActorCritic,
-    SparseCoordinatedCacheActorCritic,
+    AdaptiveDualTimescaleActorCritic,
+    AdaptiveMultiNodeFactorizedActorCritic,
+    AdaptiveSparseCoordinatedCacheActorCritic,
 )
 from .primitive_control import (
-    CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM,
     CACHE_ECONOMIC_FEATURE_DIM,
     PrimitiveTensorSpec,
 )
@@ -78,15 +77,15 @@ from .rollout import (
     compute_macro_smdp_gae,
 )
 
-CHECKPOINT_METHOD = "PROPOSED"
+CHECKPOINT_METHOD = "ADAPTIVE_CACHE_UAV_MAPPO"
 CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 INITIAL_CHECKPOINT_FILENAME = "initial_checkpoint.pt"
 BEST_TRAIN_RETURN_CHECKPOINT_FILENAME = "best_train_return_checkpoint.pt"
 INTERMEDIATE_CHECKPOINT_INTERVAL_UPDATES = 10
-CHECKPOINT_VERSION = 61
-MULTI_NODE_CHECKPOINT_VERSION = 62
-SPARSE_COORDINATED_CHECKPOINT_VERSION = 63
-ALGORITHM_ID = "PROPOSED"
+CHECKPOINT_VERSION = 64
+MULTI_NODE_CHECKPOINT_VERSION = 65
+SPARSE_COORDINATED_CHECKPOINT_VERSION = 66
+ALGORITHM_ID = "ADAPTIVE_CACHE_UAV_JOINT_MAPPO"
 MACRO_ACTOR_UPDATE_CONTROL_VERSION = "macro_actor_post_step_joint_kl_backtracking_v1"
 PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
 MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and sampled termination PPO"
@@ -771,7 +770,7 @@ def _micro_batch(buffer: MicroRolloutBuffer) -> dict[str, np.ndarray]:
         "candidate_features": np.stack([item.uav_candidate_features for item in items]).astype(np.float32),
         "candidate_masks": np.stack([item.uav_candidate_masks for item in items]).astype(bool),
         "actions": np.stack([item.actions for item in items]).astype(np.int64),
-        "conditions": np.stack([item.uav0_position_condition for item in items]).astype(np.float32),
+        "conditions": np.stack([item.uav_position_conditions for item in items]).astype(np.float32),
         "old_log_probs": np.asarray([item.old_joint_log_prob for item in items], dtype=np.float32),
         "old_values": np.asarray([item.old_value for item in items], dtype=np.float32),
         "rewards": np.asarray([item.reward for item in items], dtype=np.float32),
@@ -902,8 +901,8 @@ class PPOTrainer:
         self.realizations_per_policy_update = int(
             self.config.get("realizations_per_policy_update", 4)
         )
-        if self.realizations_per_policy_update != 4:
-            raise ValueError("PROPOSED formal training requires groups of four realizations.")
+        if self.realizations_per_policy_update <= 0:
+            raise ValueError("realizations_per_policy_update must be a positive integer.")
         self.policy_update_total = int(policy_update_total)
         if self.policy_update_total <= 0:
             raise ValueError("policy_update_total must be positive")
@@ -1004,27 +1003,27 @@ class PPOTrainer:
         self.adaptive_holding_max_slots = int(
             self.config.get("adaptive_holding_max_slots", 0)
         )
-        if (
-            not self.adaptive_holding_enabled
-            or self.adaptive_holding_min_slots <= 0
-            or self.adaptive_holding_max_slots < self.adaptive_holding_min_slots
-            or self.adaptive_holding_max_slots
-            > int(context.observation_spec.prediction_horizon)
-        ):
-            raise ValueError("PROPOSED adaptive holding contract is invalid.")
+        if self.adaptive_holding_enabled:
+            if (
+                self.adaptive_holding_min_slots <= 0
+                or self.adaptive_holding_max_slots < self.adaptive_holding_min_slots
+                or self.adaptive_holding_max_slots
+                > int(context.observation_spec.prediction_horizon)
+            ):
+                raise ValueError("Adaptive Cache holding contract is invalid.")
+        elif (self.adaptive_holding_min_slots, self.adaptive_holding_max_slots) != (2, 2):
+            raise ValueError("Fixed2 compatibility mode requires min_slots=max_slots=2.")
         tensor_spec = PrimitiveTensorSpec.create(context)
         original_macro_feature_dim = 2 * int(np.asarray(context.initial_cache).size) + 1
-        if original_macro_feature_dim != CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM:
-            raise ValueError("current PROPOSED requires the unchanged 181-D Macro feature base")
         macro_feature_dim = original_macro_feature_dim + CACHE_ECONOMIC_FEATURE_DIM
         micro_feature_dim = int(tensor_spec.uav_feature_dim) + 2
         self.hidden_sizes = tuple(int(value) for value in self.config["hidden_sizes"])
         policy_type = (
-            DualTimescaleActorCritic
+            AdaptiveDualTimescaleActorCritic
             if expected_unified
-            else SparseCoordinatedCacheActorCritic
+            else AdaptiveSparseCoordinatedCacheActorCritic
             if self.sparse_coordinated_cache_action
-            else MultiNodeFactorizedActorCritic
+            else AdaptiveMultiNodeFactorizedActorCritic
         )
         policy_kwargs = (
             {
@@ -1034,6 +1033,7 @@ class PPOTrainer:
             if expected_unified
             else {}
         )
+        policy_kwargs["num_uav_heads"] = len(context.action_spec.uav_ids)
         self.policy = policy_type(
             int(context.observation_spec.observation_dim),
             macro_feature_dim,
@@ -1208,8 +1208,17 @@ class PPOTrainer:
             "cache_reconfiguration_model": self.context.cache_reconfiguration_model,
             "cache_node_ids": [str(value) for value in self.context.action_spec.cache_node_ids],
             "cache_node_count": len(self.context.action_spec.cache_node_ids),
+            "cache_node_roles": [
+                str(value).upper() for value in self.context.cache_nodes["node_roles"]
+            ],
+            "service_count": len(self.context.observation_spec.service_ids),
+            "uav_ids": [str(value) for value in self.context.action_spec.uav_ids],
+            "uav_count": len(self.context.action_spec.uav_ids),
+            "uav_condition_dim": int(self.policy.micro_condition_dim),
             "cache_candidate_tensor_shape": (
-                "[B,N,K,200]" if not self.unified_cache_action else "[B,K,200]"
+                f"[B,N,K,{int(self.policy.macro_cache_feature_dim)}]"
+                if not self.unified_cache_action
+                else f"[B,K,{int(self.policy.macro_cache_feature_dim)}]"
             ),
             "cache_action_tensor_shape": (
                 "[B,N]" if not self.unified_cache_action else "[B]"
@@ -1270,7 +1279,7 @@ class PPOTrainer:
             "cache_action_semantics": (
                 "hierarchical categorical over ALL_KEEP or one legal UPDATE node, then a legal target for that node; at most one node changes per Macro frame"
                 if self.sparse_coordinated_cache_action
-                else "nine shared-parameter masked node categoricals; each node candidate 0 is KEEP and legal UPDATE proposals are cardinality corrected; all use the same pre-action global observation"
+                else "shared-parameter masked node categoricals; each node candidate 0 is KEEP and legal UPDATE proposals are cardinality corrected; all use the same pre-action global observation"
                 if not self.unified_cache_action
                 else "single masked categorical over KEEP candidate 0 and legal UPDATE candidates; holding termination uses post-slot observation and elapsed fraction"
             ),
@@ -1292,7 +1301,7 @@ class PPOTrainer:
             "micro_target_kl": float(self.config["micro_target_kl"]),
             "macro_target_kl": float(self.config["macro_target_kl"]),
             "micro_actor_objective": (
-                "single joint UAV0/UAV1 PPO clipped surrogate plus "
+                "single autoregressive joint UAV PPO clipped surrogate across configured UAV heads plus "
                 "STAY/MOVE group entropy-floor regularization"
             ),
         }
@@ -1332,13 +1341,7 @@ class PPOTrainer:
     def update_from_episodes(
         self, collections: list[EpisodeCollection]
     ) -> dict[str, Any]:
-        """Retired legacy PPO update; Stage3 owns the formal training path."""
-
-        del collections
-        raise RuntimeError(
-            "Legacy PPO updates are retired. Use MAPPOBaselineTrainer via the "
-            "Stage3 training entrypoint."
-        )
+        """Apply one frozen-rollout joint Cache–UAV MAPPO update."""
 
         group_size = self.realizations_per_policy_update
         if len(collections) != group_size:
@@ -1464,19 +1467,14 @@ class PPOTrainer:
                 before_tensors["actions"],
                 before_tensors["conditions"],
             )
-            uav0_group_entropy_before = float(
-                before_evaluation.uav0_group_entropy.mean().detach().cpu()
-            )
-            uav1_group_entropy_before = float(
-                before_evaluation.uav1_group_entropy.mean().detach().cpu()
+            head_group_entropy_before = (
+                before_evaluation.head_group_entropies.mean(dim=0).detach().cpu()
             )
             group_probability_max_before = float(
                 torch.stack(
                     (
-                        before_evaluation.uav0_stay_probability,
-                        before_evaluation.uav0_move_probability,
-                        before_evaluation.uav1_stay_probability,
-                        before_evaluation.uav1_move_probability,
+                        before_evaluation.head_stay_probabilities,
+                        before_evaluation.head_move_probabilities,
                     ),
                     dim=-1,
                 ).max().detach().cpu()
@@ -1503,10 +1501,7 @@ class PPOTrainer:
                 ).mean()
                 value_loss = torch.mean((evaluated.value - tensors["returns"]) ** 2)
                 entropy = evaluated.entropy.mean()
-                group_entropies = torch.stack(
-                    (evaluated.uav0_group_entropy, evaluated.uav1_group_entropy),
-                    dim=-1,
-                )
+                group_entropies = evaluated.head_group_entropies
                 group_entropy_floor_loss = group_entropy_floor_coefficient * torch.relu(
                     group_entropy_floor - group_entropies
                 ).mean()
@@ -1576,19 +1571,14 @@ class PPOTrainer:
                 before_tensors["actions"],
                 before_tensors["conditions"],
             )
-            uav0_group_entropy_after = float(
-                after_evaluation.uav0_group_entropy.mean().detach().cpu()
-            )
-            uav1_group_entropy_after = float(
-                after_evaluation.uav1_group_entropy.mean().detach().cpu()
+            head_group_entropy_after = (
+                after_evaluation.head_group_entropies.mean(dim=0).detach().cpu()
             )
             group_probability_max_after = float(
                 torch.stack(
                     (
-                        after_evaluation.uav0_stay_probability,
-                        after_evaluation.uav0_move_probability,
-                        after_evaluation.uav1_stay_probability,
-                        after_evaluation.uav1_move_probability,
+                        after_evaluation.head_stay_probabilities,
+                        after_evaluation.head_move_probabilities,
                     ),
                     dim=-1,
                 ).max().detach().cpu()
@@ -1630,10 +1620,12 @@ class PPOTrainer:
                 "micro_group_entropy_floor_coefficient": float(
                     group_entropy_floor_coefficient
                 ),
-                "micro_uav0_group_entropy_before_update": uav0_group_entropy_before,
-                "micro_uav1_group_entropy_before_update": uav1_group_entropy_before,
-                "micro_uav0_group_entropy_after_update": uav0_group_entropy_after,
-                "micro_uav1_group_entropy_after_update": uav1_group_entropy_after,
+                "micro_uav_group_entropy_before_update_by_head": head_group_entropy_before.numpy().astype(float).tolist(),
+                "micro_uav_group_entropy_after_update_by_head": head_group_entropy_after.numpy().astype(float).tolist(),
+                "micro_uav0_group_entropy_before_update": float(head_group_entropy_before[0]),
+                "micro_uav1_group_entropy_before_update": float(head_group_entropy_before[1]) if len(head_group_entropy_before) > 1 else None,
+                "micro_uav0_group_entropy_after_update": float(head_group_entropy_after[0]),
+                "micro_uav1_group_entropy_after_update": float(head_group_entropy_after[1]) if len(head_group_entropy_after) > 1 else None,
                 "micro_group_probability_max_before_update": group_probability_max_before,
                 "micro_group_probability_max_after_update": group_probability_max_after,
             }
@@ -3529,38 +3521,33 @@ class PPOTrainer:
         }:
             saved_node_ids = saved_contract.get("cache_node_ids")
             current_node_ids = current_contract.get("cache_node_ids")
-            expected_static_suffix = ["RSU_0", "RSU_1", "UAV_0", "UAV_1"]
-
-            def is_valid_node_order(value: Any) -> bool:
-                if (
-                    not isinstance(value, list)
-                    or len(value) != 9
-                    or any(not isinstance(item, str) or not item.strip() for item in value)
-                    or len(set(value)) != 9
-                    or value[5:] != expected_static_suffix
-                ):
-                    return False
-                return all(
-                    not item.upper().startswith(("RSU_", "UAV_"))
-                    for item in value[:5]
-                )
-
-            current_roles = tuple(
-                str(value).upper() for value in self.context.cache_nodes["node_roles"]
+            saved_roles = saved_contract.get("cache_node_roles")
+            current_roles = current_contract.get("cache_node_roles")
+            valid_node_contract = (
+                isinstance(saved_node_ids, list)
+                and isinstance(current_node_ids, list)
+                and isinstance(saved_roles, list)
+                and isinstance(current_roles, list)
+                and len(saved_node_ids) == len(current_node_ids) == len(saved_roles) == len(current_roles)
+                and len(set(saved_node_ids)) == len(saved_node_ids)
+                and len(set(current_node_ids)) == len(current_node_ids)
+                and all(isinstance(item, str) and item.strip() for item in saved_node_ids + current_node_ids)
+                and all(str(role).upper() in {"SV", "RSU", "UAV"} for role in saved_roles + current_roles)
+                and [str(role).upper() for role in saved_roles]
+                == [str(role).upper() for role in current_roles]
             )
-            expected_roles = ("SV",) * 5 + ("RSU",) * 2 + ("UAV",) * 2
-            if (
-                not is_valid_node_order(saved_node_ids)
-                or not is_valid_node_order(current_node_ids)
-                or current_roles != expected_roles
-            ):
+            if not valid_node_contract:
                 raise ValueError(
                     "checkpoint multi-node Cache role/order contract is invalid."
                 )
-            # Service-vehicle IDs identify the current realization's five SVs.
-            # Their ordered slots are part of the stable tensor contract; the IDs
-            # themselves are episode data, while RSU/UAV IDs remain fixed.
+            # SV identifiers vary between realizations; stable role order keeps
+            # the shared node tensor semantics. RSU/UAV identifiers are physical
+            # system identities and therefore must remain unchanged.
+            for index, role in enumerate(current_roles):
+                if str(role).upper() != "SV" and saved_node_ids[index] != current_node_ids[index]:
+                    raise ValueError("checkpoint static Cache node identity/order changed.")
             comparable_saved_contract["cache_node_ids"] = current_node_ids
+            comparable_saved_contract["cache_node_roles"] = current_roles
 
             # The planned number of future update groups may grow on a resumed
             # run. This is behavior-preserving only for the constant LR schedule
@@ -3762,12 +3749,7 @@ def run_training(
     verbose: bool = False,
     save_macro_transition_trace: bool = False,
 ) -> dict[str, Any]:
-    """Retired legacy PPO runner; Stage3 is the only supported training entry."""
-
-    raise RuntimeError(
-        "Legacy PPO training is retired. Use the Stage3-only entrypoint "
-        "scripts/training/run_mappo_stage3_cache_value.py."
-    )
+    """Run the formal adaptive Cache–UAV joint MAPPO training lifecycle."""
 
     _require_torch()
     if resume_checkpoint_path is not None and not resume:
@@ -4626,11 +4608,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    del argv
-    raise RuntimeError(
-        "The legacy PPO command is retired. Use the Stage3 MAPPO Runner: "
-        "python scripts/training/run_mappo_stage3_cache_value.py."
+    args = build_parser().parse_args(argv)
+    run_training(
+        args.config,
+        args.epochs,
+        args.run_dir,
+        episode_pool=args.episode_pool,
+        validated_integrity_baseline_sha256=args.validated_integrity_baseline_sha256,
+        episode_seed_start=args.episode_seed_start,
+        generate_missing_episodes=args.generate_missing_episodes,
+        episode_generation_device=args.episode_generation_device,
+        actor_learning_rate_override=args.actor_learning_rate,
+        macro_actor_learning_rate_override=args.macro_actor_learning_rate,
+        critic_learning_rate_override=args.critic_learning_rate,
+        seed=args.seed,
+        resume=args.resume,
+        resume_checkpoint_path=args.resume_checkpoint,
+        verbose=args.verbose,
+        save_macro_transition_trace=args.save_macro_transition_trace,
     )
+    return 0
 
 
 if __name__ == "__main__":

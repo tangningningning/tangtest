@@ -28,7 +28,6 @@ from .policy import (
     _sum_log_probabilities,
 )
 from .primitive_control import (
-    CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM,
     CACHE_ECONOMIC_FEATURE_DIM,
     PrimitiveTensorSpec,
     _normalized_xy,
@@ -120,8 +119,9 @@ class MicroTransition:
     uav_candidate_masks: np.ndarray
     uav_candidate_positions: np.ndarray
     uav_candidate_probabilities: np.ndarray
-    uav_candidate_sources: tuple[tuple[str, ...], tuple[str, ...]]
-    uav0_position_condition: np.ndarray
+    uav_candidate_sources: tuple[tuple[str, ...], ...]
+    uav_ids: tuple[str, ...]
+    uav_position_conditions: np.ndarray
     active_cache_configuration_id: str
     actual_task_utility: float
     actual_cache_update_count: int
@@ -184,8 +184,19 @@ def _aggregate_node_task_counts(
 
 
 @dataclass(frozen=True)
+class HoldingTransition:
+    """单个 Holding termination 决策及其行为概率合同。"""
+
+    observation: np.ndarray
+    elapsed_slots: int
+    action: int
+    old_log_prob: float
+    old_entropy: float
+
+
+@dataclass(frozen=True)
 class MacroTransition:
-    """一个完整 Cache frame 的 Macro SMDP transition。"""
+    """一个 Cache frame 的 SMDP transition 与其内部 Holding 决策序列。"""
 
     observation: np.ndarray
     cache_candidate_features: np.ndarray
@@ -197,11 +208,7 @@ class MacroTransition:
     old_node_cache_entropies: np.ndarray | None
     old_macro_log_prob: float
     old_macro_entropy: float
-    termination_observations: np.ndarray
-    termination_elapsed_slots: np.ndarray
-    termination_actions: np.ndarray
-    old_termination_log_probs: np.ndarray
-    old_termination_entropies: np.ndarray
+    holding_transitions: tuple[HoldingTransition, ...]
     old_value: float
     old_next_value: float
     frame_reward: float
@@ -210,6 +217,30 @@ class MacroTransition:
     cache_configuration_id: str
     actual_cache_update: bool
     actual_cache_update_by_node: np.ndarray | None
+
+    @property
+    def termination_observations(self) -> np.ndarray:
+        if not self.holding_transitions:
+            return np.empty((0, int(self.observation.shape[-1])), dtype=np.float32)
+        return np.stack([item.observation for item in self.holding_transitions]).astype(
+            np.float32, copy=False
+        )
+
+    @property
+    def termination_elapsed_slots(self) -> np.ndarray:
+        return np.asarray([item.elapsed_slots for item in self.holding_transitions], dtype=np.int64)
+
+    @property
+    def termination_actions(self) -> np.ndarray:
+        return np.asarray([item.action for item in self.holding_transitions], dtype=np.int64)
+
+    @property
+    def old_termination_log_probs(self) -> np.ndarray:
+        return np.asarray([item.old_log_prob for item in self.holding_transitions], dtype=np.float32)
+
+    @property
+    def old_termination_entropies(self) -> np.ndarray:
+        return np.asarray([item.old_entropy for item in self.holding_transitions], dtype=np.float32)
 
 @dataclass
 class MicroRolloutBuffer:
@@ -238,18 +269,52 @@ class MacroRolloutBuffer:
     def append(self, transition: MacroTransition) -> None:
         if self.transitions and bool(self.transitions[-1].done):
             raise ValueError("不能在 terminal Macro transition 后追加数据。")
-        if not (
-            int(self.min_holding_slots)
-            <= int(transition.actual_duration)
-            <= int(self.max_holding_slots)
-        ):
+        duration_is_eligible = int(self.min_holding_slots) <= int(
+            transition.actual_duration
+        ) <= int(self.max_holding_slots)
+        terminal_short_frame = bool(transition.done) and 0 < int(
+            transition.actual_duration
+        ) < int(self.min_holding_slots)
+        if not (duration_is_eligible or terminal_short_frame):
             raise ValueError("Macro actual_duration 超出 adaptive holding bounds。")
         if not np.isfinite(float(transition.old_next_value)):
             raise ValueError("Macro rollout old_next_value must be finite.")
+        holding_elapsed = [int(item.elapsed_slots) for item in transition.holding_transitions]
+        if holding_elapsed != sorted(set(holding_elapsed)):
+            raise ValueError("Holding decisions must have strictly increasing elapsed Slot indices.")
+        for item in transition.holding_transitions:
+            if (
+                int(item.action) not in (0, 1)
+                or not int(self.min_holding_slots) <= int(item.elapsed_slots) < int(self.max_holding_slots)
+                or np.asarray(item.observation).shape != np.asarray(transition.observation).shape
+                or not np.isfinite(np.asarray(item.observation, dtype=np.float32)).all()
+                or not np.isfinite(float(item.old_log_prob))
+                or not np.isfinite(float(item.old_entropy))
+            ):
+                raise ValueError("Holding transition violates its state/action/probability contract.")
         if not np.isfinite(float(transition.old_macro_log_prob)) or not np.isfinite(
             float(transition.old_cache_log_prob)
         ):
             raise ValueError("Macro rollout log-probabilities must be finite.")
+        holding_log_prob_sum = np.float32(
+            np.sum(
+                np.asarray(
+                    [item.old_log_prob for item in transition.holding_transitions],
+                    dtype=np.float64,
+                ),
+                dtype=np.float64,
+            )
+        )
+        expected_joint_log_prob = np.float32(
+            np.float32(transition.old_cache_log_prob) + holding_log_prob_sum
+        )
+        if not np.isclose(
+            float(transition.old_macro_log_prob),
+            float(expected_joint_log_prob),
+            rtol=0.0,
+            atol=2.0e-6,
+        ):
+            raise ValueError("Macro behavior joint log-prob does not match Cache plus Holding factors.")
         action_values = np.asarray(transition.cache_action, dtype=np.int64)
         candidate_masks = np.asarray(transition.cache_candidate_masks, dtype=bool)
         if candidate_masks.ndim == 2:
@@ -538,8 +603,9 @@ def _cache_candidates(
         interface.SPARSE_COORDINATED_CACHE_POLICY_SCHEMA,
     }:
         raise ValueError(f"unsupported formal Macro Cache schema: {context.policy_schema}")
-    if features.shape[1] != CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM:
-        raise ValueError("formal economic Macro features require an unchanged 181-D base")
+    macro_base_dim = 2 * int(current.size) + 1
+    if features.shape[1] != macro_base_dim:
+        raise ValueError("Macro candidate base feature dimension does not match Cache state")
     economic_features = cache_economic_candidate_features(
         current,
         candidates,
@@ -649,7 +715,11 @@ def _cache_node_candidates(
     if max_candidates > int(context.cache_cfg.target_candidate_capacity) + 1:
         raise AssertionError("factorized Cache candidate padding exceeds the configured limit")
     features = np.zeros(
-        (len(node_ids), max_candidates, CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM + CACHE_ECONOMIC_FEATURE_DIM),
+        (
+            len(node_ids),
+            max_candidates,
+            2 * int(current.size) + 1 + CACHE_ECONOMIC_FEATURE_DIM,
+        ),
         dtype=np.float32,
     )
     masks = np.zeros((len(node_ids), max_candidates), dtype=bool)
@@ -667,7 +737,7 @@ def _cache_node_candidates(
             )
         )
         row = np.concatenate((base, economic[flat_index])).astype(np.float32, copy=False)
-        if row.shape != (CACHE_ECONOMIC_BASE_MACRO_FEATURE_DIM + CACHE_ECONOMIC_FEATURE_DIM,):
+        if row.shape != (2 * int(current.size) + 1 + CACHE_ECONOMIC_FEATURE_DIM,):
             raise AssertionError("factorized Cache candidate feature dimension changed")
         features[node_index, candidate_index] = row
         masks[node_index, candidate_index] = True
@@ -751,10 +821,13 @@ def _pad_micro_candidates(
     max_candidates: int,
     feature_dim: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    padded_features = np.zeros((2, max_candidates, feature_dim), dtype=np.float32)
-    masks = np.zeros((2, max_candidates), dtype=bool)
-    padded_positions = np.zeros((2, max_candidates, 2), dtype=np.float32)
-    for head in range(2):
+    head_count = len(features)
+    if head_count <= 0 or len(positions) != head_count:
+        raise ValueError("Micro candidate heads and positions must have matching positive counts.")
+    padded_features = np.zeros((head_count, max_candidates, feature_dim), dtype=np.float32)
+    masks = np.zeros((head_count, max_candidates), dtype=bool)
+    padded_positions = np.zeros((head_count, max_candidates, 2), dtype=np.float32)
+    for head in range(head_count):
         count = int(len(features[head]))
         if count <= 0 or count > max_candidates:
             raise ValueError("UAV candidate 数量超出配置容量。")
@@ -773,6 +846,7 @@ def collect_dual_timescale_episode(
     *,
     deterministic: bool = False,
     episode_seed: int | None = None,
+    max_slots: int | None = None,
     progress_callback: Callable[[int, int, float, float], None] | None = None,
     performance_sample_slots: set[int] | frozenset[int] | None = None,
     performance_sample_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -784,20 +858,28 @@ def collect_dual_timescale_episode(
 
     if not aligned_steps:
         raise ValueError("完整 episode rollout 不能为空。")
-    if len(context.action_spec.uav_ids) != 2:
-        raise ValueError("第一版 autoregressive Micro PPO 固定要求两个 UAV。")
+    uav_count = len(context.action_spec.uav_ids)
+    if uav_count <= 0:
+        raise ValueError("联合 MAPPO 至少要求一个 UAV action head。")
     adaptive_holding_enabled = bool(
         context.cfg["algorithm"]["ppo"].get("adaptive_holding_enabled", False)
     )
     min_holding_slots = int(policy.adaptive_holding_min_slots)
     max_holding_slots = int(policy.adaptive_holding_max_slots)
-    if not adaptive_holding_enabled or min_holding_slots <= 0 or max_holding_slots < min_holding_slots:
-        raise ValueError("Adaptive holding rollout contract is invalid.")
+    if adaptive_holding_enabled:
+        if min_holding_slots <= 0 or max_holding_slots < min_holding_slots:
+            raise ValueError("Adaptive holding rollout contract is invalid.")
+    elif min_holding_slots != 2 or max_holding_slots != 2:
+        raise ValueError("Fixed2 compatibility mode requires a 2-slot Cache holding period.")
     if max_holding_slots > int(context.observation_spec.prediction_horizon):
         raise ValueError("Adaptive holding maximum exceeds prediction horizon.")
     total_slots = len(aligned_steps)
     if total_slots != int(context.episode_slots):
         raise ValueError("双时间尺度正式 rollout 必须覆盖完整 episode。")
+    rollout_slots = total_slots if max_slots is None else int(max_slots)
+    if rollout_slots <= 0 or rollout_slots > total_slots:
+        raise ValueError("max_slots 必须位于完整 Episode 的 Slot 范围内。")
+    window_truncated = rollout_slots < total_slots
     sampled_slot_indices = (
         frozenset(int(slot) for slot in performance_sample_slots)
         if performance_sample_slots is not None
@@ -882,7 +964,7 @@ def collect_dual_timescale_episode(
     start_time = time.perf_counter()
     matching_kkt_elapsed_seconds = 0.0
 
-    for slot_index, step in enumerate(aligned_steps):
+    for slot_index, step in enumerate(aligned_steps[:rollout_slots]):
         slot_started = time.perf_counter()
         previous_uav = {key: value.copy() for key, value in uav.items()}
         if slot_index == frame_start:
@@ -1284,7 +1366,8 @@ def collect_dual_timescale_episode(
         candidate_probability_lists: list[np.ndarray] = []
         candidate_source_lists: list[tuple[str, ...]] = []
         valid_counts: list[int] = []
-        selected_uav0_condition = np.zeros(2, dtype=np.float32)
+        condition_dim = int(policy.micro_condition_dim)
+        selected_uav_conditions = np.zeros((uav_count, condition_dim), dtype=np.float32)
         current_trial = {key: point.copy() for key, point in uav.items()}
         previous_positions = {key: point.copy() for key, point in previous_uav.items()}
         for uav_index, uav_id in enumerate(context.action_spec.uav_ids):
@@ -1300,16 +1383,24 @@ def collect_dual_timescale_episode(
                 np.asarray(candidate.target_position, dtype=np.float64).copy()
                 for candidate in candidates
             ]
-            if uav_index == 0:
-                condition = np.zeros(2, dtype=np.float32)
-            else:
-                condition = selected_uav0_condition.copy()
+            condition = (
+                np.concatenate(
+                    [
+                        _positions_condition(current_trial[str(previous_id)], context)
+                        for previous_id in context.action_spec.uav_ids[:uav_index]
+                    ]
+                ).astype(np.float32, copy=False)
+                if uav_index > 0
+                else np.zeros(condition_dim, dtype=np.float32)
+            )
+            if condition.shape != (condition_dim,):
+                raise ValueError("Autoregressive UAV condition does not match policy schema.")
             sample = policy.sample_micro_head(
                 observation,
                 candidate_features,
                 np.ones(len(candidate_features), dtype=bool),
                 uav_index=uav_index,
-                uav0_position_condition=condition,
+                prior_uav_position_condition=condition,
                 deterministic=deterministic,
             )
             selected_index = int(sample.selected_index)
@@ -1338,10 +1429,7 @@ def collect_dual_timescale_episode(
                 context.cfg,
                 context.flight_boundary,
             )
-            if uav_index == 0:
-                selected_uav0_condition = _positions_condition(
-                    current_trial[str(uav_id)], context
-                )
+            selected_uav_conditions[uav_index] = condition
             actions.append(selected_index)
             old_head_log_probs.append(sample.log_prob)
             old_head_entropies.append(sample.entropy)
@@ -1374,10 +1462,12 @@ def collect_dual_timescale_episode(
             max_uav_candidates,
             int(tensor_spec.uav_feature_dim) + 2,
         )
-        joint_log_prob = old_head_log_probs[0] + old_head_log_probs[1]
-        joint_entropy = old_head_entropies[0] + old_head_entropies[1]
-        probability_snapshot = np.zeros((2, max_uav_candidates), dtype=np.float32)
-        for head_index in range(2):
+        joint_log_prob = _sum_log_probabilities(
+            torch.stack(old_head_log_probs).reshape(1, -1), dim=1
+        )[0]
+        joint_entropy = torch.stack(old_head_entropies).sum()
+        probability_snapshot = np.zeros((uav_count, max_uav_candidates), dtype=np.float32)
+        for head_index in range(uav_count):
             probability_snapshot[head_index, :valid_counts[head_index]] = candidate_probability_lists[head_index]
         cache_id = hashlib.sha256(
             np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
@@ -1482,6 +1572,7 @@ def collect_dual_timescale_episode(
                 }
             )
         done = slot_index == total_slots - 1
+        truncated = window_truncated and slot_index == rollout_slots - 1
         next_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
         next_uav = {
             key: np.asarray(value, dtype=np.float64).copy()
@@ -1515,8 +1606,9 @@ def collect_dual_timescale_episode(
                 uav_candidate_masks=masks_padded,
                 uav_candidate_positions=positions_padded,
                 uav_candidate_probabilities=probability_snapshot,
-                uav_candidate_sources=(candidate_source_lists[0], candidate_source_lists[1]),
-                uav0_position_condition=selected_uav0_condition.copy(),
+                uav_candidate_sources=tuple(candidate_source_lists),
+                uav_ids=tuple(str(value) for value in context.action_spec.uav_ids),
+                uav_position_conditions=selected_uav_conditions.copy(),
                 active_cache_configuration_id=cache_id,
                 actual_task_utility=float(result.actual_task_utility),
                 actual_cache_update_count=actual_cache_update_count,
@@ -1551,6 +1643,11 @@ def collect_dual_timescale_episode(
         end_frame = bool(done)
         if done:
             terminal_frame_count += 1
+        elif truncated:
+            # A short frozen-evaluation window is a time-limit truncation, not
+            # an Episode terminal. Close its final Macro frame while retaining
+            # the next observed state for value bootstrapping.
+            end_frame = True
         elif elapsed_in_frame >= max_holding_slots:
             forced_termination_max_holding_count += 1
             end_frame = True
@@ -1645,22 +1742,22 @@ def collect_dual_timescale_episode(
                     ),
                     old_macro_log_prob=frame_old_macro_log_prob,
                     old_macro_entropy=frame_old_macro_entropy,
-                    termination_observations=(
-                        np.stack(frame_termination_observations).astype(np.float32)
-                        if frame_termination_observations
-                        else np.empty((0, int(context.observation_spec.observation_dim)), dtype=np.float32)
-                    ),
-                    termination_elapsed_slots=np.asarray(
-                        frame_termination_elapsed_slots, dtype=np.int64
-                    ),
-                    termination_actions=np.asarray(
-                        frame_termination_actions, dtype=np.int64
-                    ),
-                    old_termination_log_probs=np.asarray(
-                        frame_old_termination_log_probs, dtype=np.float32
-                    ),
-                    old_termination_entropies=np.asarray(
-                        frame_old_termination_entropies, dtype=np.float32
+                    holding_transitions=tuple(
+                        HoldingTransition(
+                            observation=np.asarray(observation_value, dtype=np.float32).copy(),
+                            elapsed_slots=int(elapsed_value),
+                            action=int(action_value),
+                            old_log_prob=float(log_prob_value),
+                            old_entropy=float(entropy_value),
+                        )
+                        for observation_value, elapsed_value, action_value, log_prob_value, entropy_value in zip(
+                            frame_termination_observations,
+                            frame_termination_elapsed_slots,
+                            frame_termination_actions,
+                            frame_old_termination_log_probs,
+                            frame_old_termination_entropies,
+                            strict=True,
+                        )
                     ),
                     old_value=frame_old_value,
                     old_next_value=frame_old_next_value,
@@ -1678,22 +1775,26 @@ def collect_dual_timescale_episode(
                 performance_profile.get("matching_kkt_seconds", 0.0)
             )
             slots_completed = slot_index + 1
-            if slots_completed % 30 == 0 or slots_completed == total_slots:
+            if slots_completed % 30 == 0 or slots_completed == rollout_slots:
                 progress_callback(
                     slots_completed,
-                    total_slots,
+                    rollout_slots,
                     time.perf_counter() - start_time,
                     matching_kkt_elapsed_seconds,
                 )
-    if not micro_buffer.transitions or not micro_buffer.transitions[-1].done:
-        raise AssertionError("formal rollout must end at the true episode terminal")
-    if not macro_buffer.transitions or not macro_buffer.transitions[-1].done:
-        raise AssertionError("Macro buffer must end at the true episode terminal")
+    if not micro_buffer.transitions or (
+        not micro_buffer.transitions[-1].done and not window_truncated
+    ):
+        raise AssertionError("formal rollout must end at an Episode terminal or evaluation truncation")
+    if not macro_buffer.transitions or (
+        not macro_buffer.transitions[-1].done and not window_truncated
+    ):
+        raise AssertionError("Macro buffer must end at an Episode terminal or evaluation truncation")
 
     actual_durations = [int(item.actual_duration) for item in macro_buffer.transitions]
     holding_duration_distribution = {
         str(value): int(actual_durations.count(value))
-        for value in range(min_holding_slots, max_holding_slots + 1)
+        for value in sorted(set(actual_durations))
     }
     macro_count = len(macro_buffer)
     micro_count = len(micro_buffer)
@@ -1820,7 +1921,7 @@ def collect_dual_timescale_episode(
     else:
         cache_action_pattern = "NORMAL"
     uav_action_patterns = []
-    for head_index in range(2):
+    for head_index in range(len(context.action_spec.uav_ids)):
         stay_count = int(stay_counts[head_index])
         move_count = int(micro_count - stay_count)
         uav_action_patterns.append(
@@ -1863,10 +1964,11 @@ def collect_dual_timescale_episode(
             update_candidate_selection_entropy -= selection_probability * float(
                 np.log(selection_probability)
             )
-    micro_group_probabilities = np.zeros((micro_count, 2, 2), dtype=np.float64)
-    micro_group_entropies = np.zeros((micro_count, 2), dtype=np.float64)
+    uav_count = len(context.action_spec.uav_ids)
+    micro_group_probabilities = np.zeros((micro_count, uav_count, 2), dtype=np.float64)
+    micro_group_entropies = np.zeros((micro_count, uav_count), dtype=np.float64)
     for transition_index, transition in enumerate(micro_buffer.transitions):
-        for head_index in range(2):
+        for head_index in range(uav_count):
             candidate_count = int(transition.valid_candidate_count[head_index])
             candidate_probabilities = np.asarray(
                 transition.uav_candidate_probabilities[head_index, :candidate_count],
@@ -1899,6 +2001,9 @@ def collect_dual_timescale_episode(
     group_probability_max = np.max(micro_group_probabilities, axis=-1)
     summary = {
         "episode_return": episode_return,
+        "window_slot_count": int(micro_count),
+        "window_truncated": bool(window_truncated),
+        "episode_terminal_observed": bool(not window_truncated),
         "task_execution_model": interface.PER_SLOT_ANALYTIC_TASK_MODEL,
         "cache_action_mode": str(context.cache_action_mode),
         "episode_seed": None if episode_seed is None else int(episode_seed),
@@ -2073,18 +2178,37 @@ def collect_dual_timescale_episode(
             else 0.0
         ),
         "nonzero_candidate_no_effect_rate": nonzero_candidate_no_effect_rate,
+        "uav_count": int(uav_count),
+        "uav_metrics": [
+            {
+                "uav_id": str(uav_id),
+                "stay_rate": float(stay_counts[index] / max(micro_count, 1)),
+                "move_rate": float(1.0 - stay_counts[index] / max(micro_count, 1)),
+                "stay_count": int(stay_counts[index]),
+                "move_count": int(micro_count - stay_counts[index]),
+                "action_pattern": uav_action_patterns[index],
+                "entropy": float(np.mean([item.old_uav_entropies[index] for item in micro_buffer.transitions])),
+                "group_stay_probability_mean": float(np.mean(micro_group_probabilities[:, index, 0])),
+                "group_move_probability_mean": float(np.mean(micro_group_probabilities[:, index, 1])),
+                "group_entropy_mean": float(np.mean(micro_group_entropies[:, index])),
+                "group_low_entropy_fraction": float(np.mean(micro_group_entropies[:, index] < micro_group_entropy_floor)),
+                "group_probability_over_90_fraction": float(np.mean(group_probability_max[:, index] > micro_group_probability_soft_cap)),
+                "mean_valid_candidates": float(np.mean([item.valid_candidate_count[index] for item in micro_buffer.transitions])),
+            }
+            for index, uav_id in enumerate(context.action_spec.uav_ids)
+        ],
         "uav0_stay_rate": float(stay_counts[0] / max(micro_count, 1)),
         "uav0_stay_count": int(stay_counts[0]),
         "uav0_move_count": int(micro_count - stay_counts[0]),
-        "uav1_stay_rate": float(stay_counts[1] / max(micro_count, 1)),
-        "uav1_stay_count": int(stay_counts[1]),
-        "uav1_move_count": int(micro_count - stay_counts[1]),
+        "uav1_stay_rate": float(stay_counts[1] / max(micro_count, 1)) if uav_count > 1 else None,
+        "uav1_stay_count": int(stay_counts[1]) if uav_count > 1 else None,
+        "uav1_move_count": int(micro_count - stay_counts[1]) if uav_count > 1 else None,
         "uav0_move_rate": float(1.0 - stay_counts[0] / max(micro_count, 1)),
-        "uav1_move_rate": float(1.0 - stay_counts[1] / max(micro_count, 1)),
+        "uav1_move_rate": float(1.0 - stay_counts[1] / max(micro_count, 1)) if uav_count > 1 else None,
         "uav0_action_pattern": uav_action_patterns[0],
-        "uav1_action_pattern": uav_action_patterns[1],
+        "uav1_action_pattern": uav_action_patterns[1] if uav_count > 1 else None,
         "uav0_entropy": float(np.mean([item.old_uav_entropies[0] for item in micro_buffer.transitions])),
-        "uav1_entropy": float(np.mean([item.old_uav_entropies[1] for item in micro_buffer.transitions])),
+        "uav1_entropy": float(np.mean([item.old_uav_entropies[1] for item in micro_buffer.transitions])) if uav_count > 1 else None,
         "micro_candidate_entropy": float(np.mean([item.old_joint_entropy for item in micro_buffer.transitions])),
         "uav0_group_stay_probability_mean": float(
             np.mean(micro_group_probabilities[:, 0, 0])
@@ -2093,33 +2217,25 @@ def collect_dual_timescale_episode(
             np.mean(micro_group_probabilities[:, 0, 1])
         ),
         "uav0_group_entropy_mean": float(np.mean(micro_group_entropies[:, 0])),
-        "uav1_group_stay_probability_mean": float(
-            np.mean(micro_group_probabilities[:, 1, 0])
-        ),
-        "uav1_group_move_probability_mean": float(
-            np.mean(micro_group_probabilities[:, 1, 1])
-        ),
-        "uav1_group_entropy_mean": float(np.mean(micro_group_entropies[:, 1])),
+        "uav1_group_stay_probability_mean": float(np.mean(micro_group_probabilities[:, 1, 0])) if uav_count > 1 else None,
+        "uav1_group_move_probability_mean": float(np.mean(micro_group_probabilities[:, 1, 1])) if uav_count > 1 else None,
+        "uav1_group_entropy_mean": float(np.mean(micro_group_entropies[:, 1])) if uav_count > 1 else None,
         "micro_group_entropy_mean": float(np.mean(micro_group_entropies)),
         "uav0_group_low_entropy_fraction": float(
             np.mean(micro_group_entropies[:, 0] < micro_group_entropy_floor)
         ),
-        "uav1_group_low_entropy_fraction": float(
-            np.mean(micro_group_entropies[:, 1] < micro_group_entropy_floor)
-        ),
+        "uav1_group_low_entropy_fraction": float(np.mean(micro_group_entropies[:, 1] < micro_group_entropy_floor)) if uav_count > 1 else None,
         "uav0_group_probability_over_90_fraction": float(
             np.mean(group_probability_max[:, 0] > micro_group_probability_soft_cap)
         ),
-        "uav1_group_probability_over_90_fraction": float(
-            np.mean(group_probability_max[:, 1] > micro_group_probability_soft_cap)
-        ),
+        "uav1_group_probability_over_90_fraction": float(np.mean(group_probability_max[:, 1] > micro_group_probability_soft_cap)) if uav_count > 1 else None,
         "uav_candidate_usage_by_index": [
             [int(sum(int(item.actions[head]) == candidate_index for item in micro_buffer.transitions)) for candidate_index in range(max_uav_candidates)]
-            for head in range(2)
+            for head in range(uav_count)
         ],
         "uav_proposal_source_usage": {
             f"uav{head}:{source}": int(sum(item.uav_candidate_sources[head][int(item.actions[head])] == source for item in micro_buffer.transitions))
-            for head in range(2)
+            for head in range(uav_count)
             for source in sorted({name for item in micro_buffer.transitions for name in item.uav_candidate_sources[head]})
         },
         "valid_candidate_count_mean": float(
@@ -2128,9 +2244,7 @@ def collect_dual_timescale_episode(
         "uav0_mean_valid_candidates": float(
             np.mean([item.valid_candidate_count[0] for item in micro_buffer.transitions])
         ),
-        "uav1_mean_valid_candidates": float(
-            np.mean([item.valid_candidate_count[1] for item in micro_buffer.transitions])
-        ),
+        "uav1_mean_valid_candidates": float(np.mean([item.valid_candidate_count[1] for item in micro_buffer.transitions])) if uav_count > 1 else None,
         "total_task_delay_s": float(
             sum(item.total_task_delay_s for item in micro_buffer.transitions)
         ),

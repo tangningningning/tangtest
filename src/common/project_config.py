@@ -951,8 +951,8 @@ def validate_config(
     adaptive_holding_enabled = get_config_value(
         config, "algorithm.ppo.adaptive_holding_enabled", None
     )
-    if adaptive_holding_enabled is not True:
-        raise ValueError("algorithm.ppo.adaptive_holding_enabled 必须为 true。")
+    if not isinstance(adaptive_holding_enabled, bool):
+        raise ValueError("algorithm.ppo.adaptive_holding_enabled 必须为布尔值。")
     adaptive_holding_min_slots = get_config_value(
         config, "algorithm.ppo.adaptive_holding_min_slots", None
     )
@@ -971,9 +971,14 @@ def validate_config(
         )
     if adaptive_holding_max_slots > prediction_horizon:
         raise ValueError("adaptive_holding_max_slots 不得超过当前预测 horizon。")
-    if adaptive_holding_min_slots != 1 or adaptive_holding_max_slots != 5:
+    if adaptive_holding_enabled:
+        if adaptive_holding_min_slots != 1 or adaptive_holding_max_slots != 5:
+            raise ValueError(
+                "自适应 Holding 合同固定为 min_slots=1、max_slots=5。"
+            )
+    elif adaptive_holding_min_slots != 2 or adaptive_holding_max_slots != 2:
         raise ValueError(
-            "PROPOSED adaptive holding 正式配置必须固定 min_slots=1、max_slots=5。"
+            "fixed2 兼容模式必须使用 adaptive_holding_enabled=false 且 min_slots=max_slots=2。"
         )
 
     if "target_kl" in get_config_value(config, "algorithm.ppo", {}):

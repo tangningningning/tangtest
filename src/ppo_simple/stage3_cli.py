@@ -1,4 +1,4 @@
-"""Package entrypoint for the sole Stage3 MAPPO training implementation."""
+"""Compatibility alias for the current formal joint Cache–UAV MAPPO CLI."""
 
 from __future__ import annotations
 
@@ -30,6 +30,6 @@ if str(TRAINING_ROOT) not in sys.path:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    from run_mappo_stage3_cache_value import main as stage3_main
+    from .trainer import main as trainer_main
 
-    return stage3_main(None if argv is None else list(argv))
+    return trainer_main(None if argv is None else list(argv))

@@ -7,6 +7,7 @@ import json
 import math
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -18,6 +19,7 @@ except ModuleNotFoundError:  # pragma: no cover - 仅静态导入环境
     torch = None  # type: ignore[assignment]
 
 from common import project_config
+from decision import slot_environment
 from scenario.realization import REALIZATION_ARTIFACT_FILENAMES
 from .interface import (
     PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA,
@@ -30,10 +32,11 @@ from .interface import (
 )
 from .reporting import resolve_checkpoint_reference
 from .rollout import collect_dual_timescale_episode
+from .primitive_control import CACHE_ECONOMIC_FEATURE_DIM
 from .policy import (
-    DualTimescaleActorCritic,
-    MultiNodeFactorizedActorCritic,
-    SparseCoordinatedCacheActorCritic,
+    AdaptiveDualTimescaleActorCritic,
+    AdaptiveMultiNodeFactorizedActorCritic,
+    AdaptiveSparseCoordinatedCacheActorCritic,
 )
 from .trainer import (
     ALGORITHM_ID,
@@ -51,6 +54,7 @@ DEFAULT_ENVIRONMENT_COUNT = 20
 DEFAULT_POLICY_REPEATS = 1
 EPISODE_METRIC_NAMES = (
     "total_return",
+    "net_utility",
     "total_q",
     "task_utility",
     "total_cache_cost",
@@ -153,20 +157,20 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
             "training-return diagnostic checkpoint is not a formal evaluation input"
         )
     policy_schema = payload.get("policy_schema")
-    if policy_schema == DualTimescaleActorCritic.architecture_id:
-        expected_policy = DualTimescaleActorCritic
+    if policy_schema == AdaptiveDualTimescaleActorCritic.architecture_id:
+        expected_policy = AdaptiveDualTimescaleActorCritic
         expected_version = CHECKPOINT_VERSION
         expected_unified_cache_action = True
         expected_cache_action_mode = project_config.CACHE_ACTION_MODE_SINGLE_NODE
         expected_cardinality_correction = True
-    elif policy_schema == MultiNodeFactorizedActorCritic.architecture_id:
-        expected_policy = MultiNodeFactorizedActorCritic
+    elif policy_schema == AdaptiveMultiNodeFactorizedActorCritic.architecture_id:
+        expected_policy = AdaptiveMultiNodeFactorizedActorCritic
         expected_version = MULTI_NODE_CHECKPOINT_VERSION
         expected_unified_cache_action = False
         expected_cache_action_mode = project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED
         expected_cardinality_correction = True
-    elif policy_schema == SparseCoordinatedCacheActorCritic.architecture_id:
-        expected_policy = SparseCoordinatedCacheActorCritic
+    elif policy_schema == AdaptiveSparseCoordinatedCacheActorCritic.architecture_id:
+        expected_policy = AdaptiveSparseCoordinatedCacheActorCritic
         expected_version = SPARSE_COORDINATED_CHECKPOINT_VERSION
         expected_unified_cache_action = False
         expected_cache_action_mode = project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
@@ -228,7 +232,11 @@ def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
         or contract.get("unified_cache_action") is not expected_unified_cache_action
         or contract.get("cache_action_mode") != expected_cache_action_mode
         or contract.get("cardinality_corrected_cache_action") is not expected_cardinality_correction
-        or contract.get("macro_cache_feature_dim") != 200
+        or not isinstance(contract.get("macro_cache_feature_dim"), int)
+        or contract.get("macro_cache_feature_dim")
+        != 2 * int(contract.get("cache_node_count", -1)) * int(contract.get("service_count", -1))
+        + 1
+        + CACHE_ECONOMIC_FEATURE_DIM
         or (
             expected_cache_action_mode == project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED
             and contract.get("max_cache_updates_per_frame") != 1
@@ -306,19 +314,24 @@ def _seed_policy_sampling(seed: int) -> None:
 def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> dict[str, Any]:
     micro = collection.micro.transitions
     slots = max(len(micro), 1)
-    joint_action_counts = {
-        "stay_stay": 0,
-        "stay_move": 0,
-        "move_stay": 0,
-        "move_move": 0,
-    }
+    if not micro:
+        raise ValueError("formal evaluation collection is empty")
+    uav_count = int(len(micro[0].actions))
+    if uav_count <= 0:
+        raise ValueError("formal evaluation requires at least one UAV head")
+    joint_action_counts: dict[str, int] = {}
     for transition in micro:
-        uav0_moved = bool(transition.actions[0] != 0)
-        uav1_moved = bool(transition.actions[1] != 0)
-        joint_key = (
-            "move_" if uav0_moved else "stay_"
-        ) + ("move" if uav1_moved else "stay")
-        joint_action_counts[joint_key] += 1
+        if len(transition.actions) != uav_count:
+            raise ValueError("Validation action head count changed within an episode")
+        joint_key = "|".join("MOVE" if int(action) != 0 else "STAY" for action in transition.actions)
+        joint_action_counts[joint_key] = joint_action_counts.get(joint_key, 0) + 1
+    if uav_count == 2:
+        joint_action_counts = {
+            "stay_stay": int(joint_action_counts.get("STAY|STAY", 0)),
+            "stay_move": int(joint_action_counts.get("STAY|MOVE", 0)),
+            "move_stay": int(joint_action_counts.get("MOVE|STAY", 0)),
+            "move_move": int(joint_action_counts.get("MOVE|MOVE", 0)),
+        }
     joint_action_rates = {
         key: value / slots for key, value in joint_action_counts.items()
     }
@@ -339,28 +352,63 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
     if cloud_task_count + edge_task_count != task_count:
         raise ValueError("Validation Cloud/Edge counts do not sum to the task count.")
     task_utility = float(sum(item.actual_task_utility for item in micro))
+    uav_metrics = list(collection.summary["uav_metrics"])
     uav0_move_candidate_rate = float(collection.summary["uav0_move_rate"])
-    uav1_move_candidate_rate = float(collection.summary["uav1_move_rate"])
+    uav1_move_candidate_rate = (
+        None
+        if collection.summary.get("uav1_move_rate") is None
+        else float(collection.summary["uav1_move_rate"])
+    )
+    movement_count = sum(int(item.uav_movement_count) for item in micro)
+    total_return = float(sum(item.reward for item in micro))
+    total_cache_cost = float(sum(item.cache_cost for item in micro))
+    total_movement_cost = float(sum(item.movement_cost for item in micro))
+    net_utility = task_utility - total_cache_cost - total_movement_cost
+    if not math.isclose(total_return, net_utility, rel_tol=1.0e-12, abs_tol=1.0e-8):
+        raise ValueError("frozen evaluation reward does not equal task utility less system costs")
+    joint_action_rates = {key: value / slots for key, value in joint_action_counts.items()}
+    if uav_count == 2:
+        legacy_joint_rates = {
+            "uav_joint_stay_stay_rate": joint_action_rates.get("stay_stay", 0.0),
+            "uav_joint_stay_move_rate": joint_action_rates.get("stay_move", 0.0),
+            "uav_joint_move_stay_rate": joint_action_rates.get("move_stay", 0.0),
+            "uav_joint_move_move_rate": joint_action_rates.get("move_move", 0.0),
+        }
+    else:
+        legacy_joint_rates = {
+            "uav_joint_stay_stay_rate": None,
+            "uav_joint_stay_move_rate": None,
+            "uav_joint_move_stay_rate": None,
+            "uav_joint_move_move_rate": None,
+        }
     record = {
         "episode_seed": int(episode_seed),
         "repeat_index": int(repeat_index),
-        "total_return": float(sum(item.reward for item in micro)),
+        "total_return": total_return,
+        "net_utility": net_utility,
         "total_q": task_utility,
         "task_utility": task_utility,
-        "total_cache_cost": float(sum(item.cache_cost for item in micro)),
-        "total_movement_cost": float(sum(item.movement_cost for item in micro)),
+        "total_cache_cost": total_cache_cost,
+        "total_movement_cost": total_movement_cost,
+        "window_slot_count": int(collection.summary.get("window_slot_count", slots)),
+        "window_truncated": bool(collection.summary.get("window_truncated", False)),
+        "episode_terminal_observed": bool(
+            collection.summary.get("episode_terminal_observed", True)
+        ),
         "cache_change_rate": float(
             sum(item.actual_cache_update_count for item in micro) / slots
         ),
         "uav_movement_rate": float(
-            sum(item.uav_movement_count for item in micro) / (2.0 * slots)
+            movement_count / (float(uav_count) * slots)
         ),
         "uav_stay_rate": float(
-            1.0 - sum(item.uav_movement_count for item in micro) / (2.0 * slots)
+            1.0 - movement_count / (float(uav_count) * slots)
         ),
         "uav_move_rate": float(
-            sum(item.uav_movement_count for item in micro) / (2.0 * slots)
+            movement_count / (float(uav_count) * slots)
         ),
+        "uav_count": uav_count,
+        "uav_metrics": uav_metrics,
         "uav0_move_candidate_rate": uav0_move_candidate_rate,
         "uav1_move_candidate_rate": uav1_move_candidate_rate,
         "cloud_task_count": cloud_task_count,
@@ -369,10 +417,7 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "edge_offload_rate": None if task_count == 0 else edge_task_count / task_count,
         "joint_action_counts": joint_action_counts,
         "joint_action_rates": joint_action_rates,
-        "uav_joint_stay_stay_rate": joint_action_rates["stay_stay"],
-        "uav_joint_stay_move_rate": joint_action_rates["stay_move"],
-        "uav_joint_move_stay_rate": joint_action_rates["move_stay"],
-        "uav_joint_move_move_rate": joint_action_rates["move_move"],
+        **legacy_joint_rates,
         "total_tasks": task_count,
         "mean_task_delay_s": None if task_count == 0 else total_delay / task_count,
         "mean_vehicle_energy_j": None if task_count == 0 else total_energy / task_count,
@@ -409,9 +454,13 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "keep_rate": float(collection.summary["keep_rate"]),
         "actual_cache_update_rate": float(collection.summary["actual_cache_update_rate"]),
         "uav0_stay_rate": float(collection.summary["uav0_stay_rate"]),
-        "uav1_stay_rate": float(collection.summary["uav1_stay_rate"]),
+        "uav1_stay_rate": (
+            None
+            if collection.summary.get("uav1_stay_rate") is None
+            else float(collection.summary["uav1_stay_rate"])
+        ),
         "uav0_move_rate": float(collection.summary["uav0_move_rate"]),
-        "uav1_move_rate": float(collection.summary["uav1_move_rate"]),
+        "uav1_move_rate": uav1_move_candidate_rate,
         "matching_call_count": int(collection.summary["matching_call_count"]),
         "kkt_call_count": int(collection.summary["kkt_call_count"]),
         "episode_runtime_seconds": float(collection.summary["episode_runtime_seconds"]),
@@ -429,7 +478,8 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "uav0_group_probability_over_90_fraction",
         "uav1_group_probability_over_90_fraction",
     ):
-        record[metric_name] = float(collection.summary[metric_name])
+        metric_value = collection.summary.get(metric_name)
+        record[metric_name] = None if metric_value is None else float(metric_value)
     deterministic_actions = collection.summary.get("deterministic_action_selection")
     if deterministic_actions is not None:
         record["deterministic_action_selection"] = deterministic_actions
@@ -440,6 +490,88 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
             "deterministic_cache_protocol_checks", {}
         )
     return record
+
+
+def _evaluate_keep_stay_window(
+    context: Any,
+    aligned_steps: list[Any],
+    max_slots: int,
+) -> dict[str, Any]:
+    """在同一组真实 Training Slot 上执行固定 KEEP+STAY 配对参考。"""
+
+    if max_slots <= 0 or max_slots > len(aligned_steps):
+        raise ValueError("KEEP+STAY 窗口必须落在已对齐的 Training Slot 内。")
+    cache = np.asarray(context.initial_cache, dtype=np.int8).copy()
+    uav = {
+        str(key): np.asarray(value, dtype=np.float64).copy()
+        for key, value in context.initial_uav.items()
+    }
+    task_utility = 0.0
+    cache_cost = 0.0
+    movement_cost = 0.0
+    net_utility = 0.0
+    kkt_call_count = 0
+    started = time.perf_counter()
+    for step in aligned_steps[:max_slots]:
+        result = slot_environment.execute_configured_slot(
+            cache,
+            uav,
+            cache,
+            uav,
+            step.scenario_slice,
+            step.actual_tasks,
+            step.actual_vehicle_positions,
+            context.service_catalog,
+            context.cfg,
+            context.cache_nodes,
+            context.cache_cfg,
+            context.flight_boundary,
+            slot_id=int(step.slot),
+            time_s=float(step.time_s),
+        )
+        if not result.step_feasible or result.system_utility is None:
+            raise RuntimeError(
+                "KEEP+STAY evaluation produced an infeasible formal Slot: "
+                f"origin={step.origin_index}, reason={result.infeasible_reason}"
+            )
+        if not np.array_equal(np.asarray(result.next_cache_state), cache):
+            raise AssertionError("KEEP+STAY changed the Cache configuration.")
+        if any(
+            not np.array_equal(np.asarray(result.next_uav_positions[key]), uav[key])
+            for key in uav
+        ):
+            raise AssertionError("KEEP+STAY changed a UAV position.")
+        expected = (
+            float(result.actual_task_utility)
+            - float(result.cache_cost)
+            - float(result.movement_cost)
+        )
+        if not math.isclose(
+            float(result.system_utility), expected, rel_tol=1.0e-12, abs_tol=1.0e-9
+        ):
+            raise ValueError("KEEP+STAY system utility does not match the formal reward contract")
+        task_utility += float(result.actual_task_utility)
+        cache_cost += float(result.cache_cost)
+        movement_cost += float(result.movement_cost)
+        net_utility += float(result.system_utility)
+        kkt_call_count += int(
+            result.matching_summary.get("KKT_SOLVER_CALL_COUNT", 0)
+        )
+    formula_net = task_utility - cache_cost - movement_cost
+    if not math.isclose(net_utility, formula_net, rel_tol=1.0e-12, abs_tol=1.0e-8):
+        raise ValueError("KEEP+STAY cumulative reward does not match task utility less costs")
+    return {
+        "policy": "KEEP+STAY",
+        "slot_count": int(max_slots),
+        "net_utility": float(net_utility),
+        "task_utility": float(task_utility),
+        "cache_cost": float(cache_cost),
+        "movement_cost": float(movement_cost),
+        "cache_update_count": 0,
+        "uav_movement_count": 0,
+        "kkt_call_count": int(kkt_call_count),
+        "runtime_seconds": float(time.perf_counter() - started),
+    }
 
 
 def _metric_statistics(
@@ -477,6 +609,7 @@ def _mean_environment_summary(
 ) -> dict[str, Any]:
     numeric_names = (
         "total_return",
+        "net_utility",
         "total_q",
         "task_utility",
         "total_cache_cost",
@@ -535,6 +668,40 @@ def _mean_environment_summary(
         values = [float(item[key]) for item in repeat_summaries if item.get(key) is not None]
         means[key] = None if not values else float(np.mean(values))
     means["repeat_count"] = len(repeat_summaries)
+    uav_count = int(repeat_summaries[0].get("uav_count", 0)) if repeat_summaries else 0
+    if any(int(item.get("uav_count", -1)) != uav_count for item in repeat_summaries):
+        raise ValueError("evaluation repeats have inconsistent UAV head counts")
+    means["uav_count"] = uav_count
+    means["uav_metrics"] = [
+        {
+            "uav_id": str(repeat_summaries[0]["uav_metrics"][head]["uav_id"]),
+            **{
+                field: float(
+                    np.mean(
+                        [
+                            float(item["uav_metrics"][head][field])
+                            for item in repeat_summaries
+                        ]
+                    )
+                )
+                for field in (
+                    "stay_rate",
+                    "move_rate",
+                    "stay_count",
+                    "move_count",
+                    "entropy",
+                    "group_stay_probability_mean",
+                    "group_move_probability_mean",
+                    "group_entropy_mean",
+                    "group_low_entropy_fraction",
+                    "group_probability_over_90_fraction",
+                    "mean_valid_candidates",
+                )
+            },
+            "action_pattern": "repeat_mean",
+        }
+        for head in range(uav_count)
+    ]
     means["holding_duration_distribution"] = {
         key: float(
             np.mean(
@@ -607,18 +774,31 @@ def evaluate_pool(
     device: str = "cpu",
     policy_action_mode: str = "deterministic",
     policy_sampling_seed: int | None = None,
+    max_slots: int | None = None,
 ) -> dict[str, Any]:
     _require_torch()
     if int(episodes) <= 0 or int(repeats) <= 0:
         raise ValueError("episodes 和 repeats 必须为正整数。")
     if policy_action_mode not in {"deterministic", "stochastic"}:
         raise ValueError("policy_action_mode must be deterministic or stochastic")
+    if max_slots is not None and (int(max_slots) <= 0 or int(episodes) != 1 or int(repeats) != 1):
+        raise ValueError("短窗配对评价要求正 max_slots、单个 Episode 和一次策略运行。")
     config_file = Path(config_path).expanduser().resolve(strict=True)
     checkpoint = resolve_checkpoint_reference(Path(checkpoint_path)).resolve(strict=True)
     checkpoint_metadata = _load_checkpoint_metadata(checkpoint)
     reference_context = load_environment_context(str(config_file))
-    if checkpoint_metadata["policy_schema"] != reference_context.policy_schema:
-        raise ValueError("checkpoint policy_schema does not match the selected formal config")
+    checkpoint_cache_mode = {
+        AdaptiveDualTimescaleActorCritic.architecture_id:
+            project_config.CACHE_ACTION_MODE_SINGLE_NODE,
+        AdaptiveMultiNodeFactorizedActorCritic.architecture_id:
+            project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
+        AdaptiveSparseCoordinatedCacheActorCritic.architecture_id:
+            project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED,
+    }.get(str(checkpoint_metadata["policy_schema"]))
+    if checkpoint_cache_mode is None or checkpoint_cache_mode != reference_context.cache_action_mode:
+        raise ValueError(
+            "checkpoint architecture Schema is incompatible with the selected formal Cache action mode"
+        )
     project_root = reference_context.root
     pool_path = _resolve_path(project_root, episode_pool)
     output_path = _resolve_path(project_root, run_dir)
@@ -630,7 +810,8 @@ def evaluate_pool(
     environment_means: list[dict[str, Any]] = []
     trainer: PPOTrainer | None = None
     parameter_snapshot: list[Any] | None = None
-    optimizer_step_snapshot: tuple[int, int] | None = None
+    optimizer_step_snapshot: tuple[tuple[str, int], ...] | None = None
+    paired_baselines: list[dict[str, Any]] = []
 
     for environment_index, realization_path in enumerate(episode_paths):
         context = load_environment_context(str(config_file), realization_dir=realization_path)
@@ -660,12 +841,15 @@ def evaluate_pool(
                 config_semantic_sha256=semantic_sha256,
                 episode_pool=None,
             )
+            trainer.policy.eval()
             parameter_snapshot = [
                 parameter.detach().clone() for parameter in trainer.policy.parameters()
             ]
-            optimizer_step_snapshot = (
-                int(trainer.training_counters["micro_optimizer_steps"]),
-                int(trainer.training_counters["macro_optimizer_steps"]),
+            optimizer_step_snapshot = tuple(
+                sorted(
+                    (str(key), int(value))
+                    for key, value in trainer.training_counters.items()
+                )
             )
         trainer.context = context
         repeat_records: list[dict[str, Any]] = []
@@ -676,6 +860,9 @@ def evaluate_pool(
             if re.search(r"(\d+)$", realization_path.name)
             else environment_index
         )
+        aligned_steps = aligned_train_steps(context)
+        if max_slots is not None and int(max_slots) > len(aligned_steps):
+            raise ValueError("max_slots exceeds the selected Training realization length.")
         for repeat_index in range(int(repeats)):
             action_seed = (
                 None
@@ -690,15 +877,24 @@ def evaluate_pool(
                 collection = collect_dual_timescale_episode(
                     trainer.policy,
                     context,
-                    aligned_train_steps(context),
+                    aligned_steps,
                     deterministic=policy_action_mode == "deterministic",
                     episode_seed=episode_seed,
+                    max_slots=max_slots,
                 )
             summary = _episode_summary(collection, episode_seed, repeat_index)
             summary["policy_sampling_seed"] = action_seed
             summary["policy_action_mode"] = policy_action_mode
             repeat_records.append(summary)
             summaries.append(summary)
+        keep_stay_summary = (
+            _evaluate_keep_stay_window(context, aligned_steps, int(max_slots))
+            if max_slots is not None
+            else None
+        )
+        if keep_stay_summary is not None:
+            keep_stay_summary["episode_seed"] = int(episode_seed)
+            paired_baselines.append(keep_stay_summary)
         destination = output_path / f"episode_{episode_seed}"
         destination.mkdir(parents=True, exist_ok=False)
         with (destination / "proposed_repeat_summaries.json").open(
@@ -706,6 +902,24 @@ def evaluate_pool(
         ) as stream:
             json.dump(repeat_records, stream, ensure_ascii=False, sort_keys=True, indent=2)
             stream.write("\n")
+        if keep_stay_summary is not None:
+            policy_summary = repeat_records[0]
+            paired_record = {
+                "episode_seed": int(episode_seed),
+                "policy_action_mode": policy_action_mode,
+                "window_slots": int(max_slots),
+                "mappo": policy_summary,
+                "keep_stay": keep_stay_summary,
+                "net_utility_difference_mappo_minus_keep_stay": float(
+                    policy_summary["net_utility"] - keep_stay_summary["net_utility"]
+                ),
+                "interpretation": "paired short-window chain verification; not a performance conclusion",
+            }
+            with (destination / "paired_keep_stay_window.json").open(
+                "w", encoding="utf-8", newline="\n"
+            ) as stream:
+                json.dump(paired_record, stream, ensure_ascii=False, sort_keys=True, indent=2)
+                stream.write("\n")
         environment_means.append(_mean_environment_summary(episode_seed, repeat_records))
 
     assert trainer is not None and parameter_snapshot is not None
@@ -714,18 +928,39 @@ def evaluate_pool(
         for before, after in zip(parameter_snapshot, trainer.policy.parameters(), strict=True)
     ):
         raise RuntimeError("evaluation modified policy parameters")
-    if optimizer_step_snapshot != (
-        int(trainer.training_counters["micro_optimizer_steps"]),
-        int(trainer.training_counters["macro_optimizer_steps"]),
+    if optimizer_step_snapshot != tuple(
+        sorted((str(key), int(value)) for key, value in trainer.training_counters.items())
     ):
         raise RuntimeError("evaluation performed a PPO optimizer step")
+    if any(parameter.grad is not None for parameter in trainer.policy.parameters()):
+        raise RuntimeError("frozen evaluation populated policy gradients")
 
     available = tuple(
         name for name in EPISODE_METRIC_NAMES
         if all(item.get(name) is not None for item in environment_means)
     )
+    if len(environment_means) == 1:
+        aggregate_statistics = {
+            name: {
+                "mean": float(environment_means[0][name]),
+                "std": None,
+                "median": float(environment_means[0][name]),
+                "min": float(environment_means[0][name]),
+                "max": float(environment_means[0][name]),
+                "se": None,
+                "ci95_low": None,
+                "ci95_high": None,
+            }
+            for name in available
+        }
+    else:
+        aggregate_statistics = _metric_statistics(environment_means, available)
     aggregate = {
-        "experiment_type": "macro_cache_smdp_micro_uav_episode_pool_evaluation",
+        "experiment_type": (
+            "paired_frozen_policy_window_evaluation"
+            if max_slots is not None
+            else "macro_cache_smdp_micro_uav_episode_pool_evaluation"
+        ),
         "config_path": str(config_file),
         "config_sha256": raw_config_sha256,
         "config_semantic_sha256": semantic_sha256,
@@ -742,11 +977,14 @@ def evaluate_pool(
         "repeats": int(repeats),
         "policy_action_mode": policy_action_mode,
         "policy_sampling_seed": policy_sampling_seed,
+        "max_slots": None if max_slots is None else int(max_slots),
+        "window_is_truncated": bool(max_slots is not None),
         "statistical_unit": "environment_realization",
         "repeat_aggregation": "within_environment_mean_then_across_environment_statistics",
-        "aggregate_statistics": _metric_statistics(environment_means, available),
+        "aggregate_statistics": aggregate_statistics,
         "environment_means": environment_means,
         "repeat_summaries": summaries,
+        "paired_keep_stay_summaries": paired_baselines,
     }
     cache_protocols = [
         item["deterministic_cache_protocol"]
@@ -777,6 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--policy-action-mode", choices=("deterministic", "stochastic"), default="deterministic")
     parser.add_argument("--policy-sampling-seed", type=int, default=None)
+    parser.add_argument("--max-slots", type=int, default=None, help="短窗配对模式；单 Episode 与一次策略运行，并自动比较 KEEP+STAY。")
     return parser
 
 
@@ -793,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         policy_action_mode=args.policy_action_mode,
         policy_sampling_seed=args.policy_sampling_seed,
+        max_slots=args.max_slots,
     )
     return 0
 

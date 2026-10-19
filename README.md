@@ -1,8 +1,37 @@
 # adaptive_cache_mec
 
-## 正式训练算法
+## 当前正式算法：自适应 Cache–UAV 联合 MAPPO
 
-当前唯一正式 PPO 训练算法是 Stage3 MAPPO，实现在 `src/ppo_simple/mappo_baseline.py` 和 `src/ppo_simple/cache_counterfactual_value.py`，正式 Runner 为 `scripts/training/run_mappo_stage3_cache_value.py`。`ppo-train` 是同一 Runner 的打包命令入口；`scripts/training/mainline_runner.py` 仅保留为旧命令兼容转发器，不是另一套算法。
+当前正式训练器是 `src/ppo_simple/trainer.py` 中的 `PPOTrainer`，训练入口为 `ppo-train` / `python -m ppo_simple.trainer`，冻结评价入口为 `ppo-eval`。该 MAPPO 使用每节点共享参数的合法 Cache 动作分布、逐 Slot 序贯 UAV 动作、1–5 Slot 自适应 Holding、Macro SMDP GAE 与每 Slot Micro GAE，并通过原正式环境执行 Matching/KKT 和系统奖励。`fixed2` 是相同 Trainer 的显式兼容模式。
+
+```powershell
+conda activate adaptive_cache_mec
+python -m ppo_simple.trainer --help
+python -m ppo_simple.evaluator --help
+```
+
+训练需要现有 Training Pool，`--epochs` 必须满足配置中的每次更新 realization 数量。冻结评价需要相应分区的 Episode Pool 与当前架构 Checkpoint。改变车辆、Cache 节点、UAV 或服务数量会改变观察、候选或模型合同；训练和 Checkpoint 校验会拒绝不兼容张量。代码可为不同规模建立相应接口，不代表策略已经跨规模训练或泛化。
+
+完整时间尺度、概率、Transition、Checkpoint 与兼容合同见[正式算法设计](docs/mappo_complete_solver.md)。Stage3 反事实标签代码保留为历史实验资料；它不是当前 PPO 更新的必要条件，当前正式 Trainer 不启用其辅助损失。
+
+## 研究基线：预测驱动的全局 Cache 求解器
+
+此非强化学习基线以成对 Training 标签拟合共享全局边际净效用网络，再在有限预算内逐次搜索合法的单节点 Cache 更新；被选中的配置由正式 Matching+KKT 环境执行，UAV 暂时保持 STAY。它不是当前正式 Cache–UAV 联合控制器。
+
+其实现入口与边界见[基线合同](docs/predictive_global_cache_solver.md)：
+
+- `src/decision/predictive_global_cache.py`：预测特征、Training 配对标签、价值网络与有界联合搜索。
+- `scripts/training/train_predictive_global_cache_value.py`：Training-only 标签生成与监督拟合。
+- `scripts/evaluation/run_predictive_global_cache_solver.py`：Training 窗口求解器入口。
+- `configs/research/predictive_global_cache_value_v1.json`：固定标签与搜索预算。
+
+历史结果仅用于研究对照，见 `reports/predictive_global_cache_first_training.md`。模型预测有限期条件化净效用差，q90 残差接受门槛只是经验启发式，不保证真实收益增加。
+
+## 历史 Stage3 MAPPO v7 实验路径
+
+Stage3 v7 保留为历史强化学习对照，实现在 `src/ppo_simple/mappo_baseline.py` 和 `src/ppo_simple/cache_counterfactual_value.py`，历史 Runner 为 `scripts/training/run_mappo_stage3_cache_value.py`。当前 `ppo-train` 和 `scripts/training/mainline_runner.py` 使用新的自适应 Cache–UAV 联合 MAPPO Trainer；要复现实验历史，只显式调用 Stage3 Runner。
+
+本节以下 Stage3 命令、Checkpoint 和评价合同只用于复现历史对照，不属于当前正式联合 MAPPO 路径。
 
 Stage3 使用 `configs/proposed/system_config.toml` 和已审查的 `environment_data/proposed_joint_training/` Training Pool。Runner 按 Manifest 校验来源，每次更新从一个 Training Episode 读取连续 Slot 窗口。默认执行 3 次更新、每次 40 Slot；默认输出到新的 `runs/research_mappo_stage3_cache_value/` 子目录，不覆盖已有运行。
 
@@ -42,7 +71,7 @@ Stage3 冻结 Validation 适配器为 `scripts/evaluation/run_mappo_stage3_main_
 python scripts/evaluation/run_mappo_stage3_main_experiment.py --help
 ```
 
-该适配器使用 Validation seeds `30001–30003`、相同外生场景和上述确定性解码。`ppo-eval` 指向旧 PROPOSED Checkpoint 评价器，不接受 Stage3 MAPPO Checkpoint；Stage3 Checkpoint 应使用 Stage3 冻结 Validation 适配器。
+该适配器使用 Validation seeds `30001–30003`、相同外生场景和上述确定性解码。`ppo-eval` 用于当前自适应联合 MAPPO Checkpoint；Stage3 Checkpoint 必须使用 Stage3 冻结 Validation 适配器。
 
 ## 数据边界
 

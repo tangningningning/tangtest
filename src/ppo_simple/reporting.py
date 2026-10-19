@@ -1963,9 +1963,9 @@ def write_dual_timescale_run_manifest(
         "checkpoint_version": int(trainer.checkpoint_version),
         "checkpoint_method": str(trainer.checkpoint_method),
         "macro_action": (
-            "nine factorized Cache node candidates with adaptive learned holding termination"
+            "shared masked factorized Cache candidates by node"
             if not trainer.unified_cache_action
-            else "Unified Cache candidate with adaptive learned holding termination"
+            else "single masked Cache candidate distribution"
         ),
         "adaptive_holding_enabled": bool(trainer.config["adaptive_holding_enabled"]),
         "adaptive_holding_min_slots": int(trainer.config["adaptive_holding_min_slots"]),
@@ -1990,8 +1990,12 @@ def write_dual_timescale_run_manifest(
             if not trainer.unified_cache_action
             else "one categorical over KEEP and legal UPDATE candidates with legal-cardinality correction"
         ),
-        "micro_action": "UAV0 followed by UAV1 conditioned on selected UAV0 position",
-        "micro_actor_objective": "single joint UAV0/UAV1 PPO clipped surrogate + STAY/MOVE group entropy-floor regularization",
+        "micro_action": "configured UAV ids in stable order; each head conditions on all previously selected UAV positions",
+        "micro_actor_objective": "single joint autoregressive UAV PPO clipped surrogate + per-head STAY/MOVE group entropy-floor regularization",
+        "uav_ids": [str(value) for value in context.action_spec.uav_ids],
+        "uav_count": len(context.action_spec.uav_ids),
+        "cache_node_count": len(context.action_spec.cache_node_ids),
+        "cache_node_roles": [str(value).upper() for value in context.cache_nodes["node_roles"]],
         "micro_group_entropy_floor_enabled": True,
         "micro_group_probability_soft_cap": float(
             trainer.config["micro_group_probability_soft_cap"]
@@ -2092,8 +2096,18 @@ def append_dual_timescale_slot_metrics(
                 "cache_cost": float(transition.cache_cost),
                 "movement_cost": float(transition.movement_cost),
                 "actual_cache_update_count": int(transition.actual_cache_update_count),
+                "uav_action_indices": [int(value) for value in transition.actions],
+                "uav_ids": [str(value) for value in transition.uav_ids],
+                "uav_stay_by_id": {
+                    str(uav_id): bool(int(transition.actions[index]) == 0)
+                    for index, uav_id in enumerate(transition.uav_ids)
+                },
                 "uav0_stay": bool(int(transition.actions[0]) == 0),
-                "uav1_stay": bool(int(transition.actions[1]) == 0),
+                "uav1_stay": (
+                    bool(int(transition.actions[1]) == 0)
+                    if len(transition.actions) > 1
+                    else None
+                ),
                 "uav0_move": bool(int(transition.actions[0]) != 0),
                 "uav1_move": bool(int(transition.actions[1]) != 0),
                 "matching_calls": 1,

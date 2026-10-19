@@ -123,7 +123,7 @@ class TerminationEvaluation:
 
 @dataclass(frozen=True)
 class JointMicroEvaluation:
-    """两个 UAV 条件式联合动作的 PPO 评估结果。"""
+    """按候选顺序自回归采样的 UAV 联合动作 PPO 评估结果。"""
 
     log_prob: Any
     entropy: Any
@@ -138,6 +138,10 @@ class JointMicroEvaluation:
     uav1_group_entropy: Any
     joint_group_entropy: Any
     mean_group_entropy: Any
+    head_log_probs: Any = None
+    head_stay_probabilities: Any = None
+    head_move_probabilities: Any = None
+    head_group_entropies: Any = None
 
 
 def _require_torch() -> None:
@@ -310,6 +314,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         unified_cache_action: bool = True,
         cardinality_corrected_cache_action: bool = True,
         separate_trigger_candidate: bool = False,
+        num_uav_heads: int = 2,
     ) -> None:
         _require_torch()
         super().__init__()
@@ -323,6 +328,13 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             cardinality_corrected_cache_action
         )
         self.separate_trigger_candidate = bool(separate_trigger_candidate)
+        self.num_uav_heads = int(num_uav_heads)
+        if self.num_uav_heads <= 0:
+            raise ValueError("Micro MAPPO requires at least one UAV action head.")
+        # The first head has a zero condition; every later head receives all
+        # preceding selected positions in stable UAV id order. Keep the legacy
+        # two-UAV tensor width unchanged for explicit weight initialization.
+        self.micro_condition_dim = 2 * max(1, self.num_uav_heads - 1)
         if not self.cardinality_corrected_cache_action:
             raise ValueError(
                 "The PROPOSED policy requires Cache candidate cardinality correction."
@@ -361,7 +373,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             nn.Linear(self.observation_dim, hidden), nn.Tanh()
         )
         self.micro_uav_candidate_scorer = nn.Sequential(
-            nn.Linear(hidden + self.micro_uav_feature_dim + 2, hidden),
+            nn.Linear(hidden + self.micro_uav_feature_dim + self.micro_condition_dim, hidden),
             nn.Tanh(),
             nn.Linear(hidden, 1),
         )
@@ -1679,7 +1691,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         observation: Any,
         candidate_features: Any,
         candidate_mask: Any,
-        uav0_position_condition: Any,
+        prior_uav_position_condition: Any,
     ) -> Any:
         device = next(self.parameters()).device
         obs, _ = self._observation_batch(observation, device)
@@ -1688,8 +1700,8 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         features = torch.as_tensor(candidate_features, dtype=torch.float32, device=device)
         mask = torch.as_tensor(candidate_mask, dtype=torch.bool, device=device).reshape(-1)
         condition = torch.as_tensor(
-            uav0_position_condition, dtype=torch.float32, device=device
-        ).reshape(2)
+            prior_uav_position_condition, dtype=torch.float32, device=device
+        ).reshape(self.micro_condition_dim)
         if (
             features.ndim != 2
             or int(features.shape[-1]) != self.micro_uav_feature_dim
@@ -1712,13 +1724,13 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         observation: Any,
         candidate_features: Any,
         candidate_mask: Any,
-        uav0_position_condition: Any,
+        prior_uav_position_condition: Any,
     ) -> Any:
         scores = self._micro_candidate_raw_logits(
             observation,
             candidate_features,
             candidate_mask,
-            uav0_position_condition,
+            prior_uav_position_condition,
         )
         features = torch.as_tensor(
             candidate_features, dtype=torch.float32, device=scores.device
@@ -1738,17 +1750,25 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         candidate_mask: Any,
         *,
         uav_index: int,
-        uav0_position_condition: Any,
+        uav0_position_condition: Any = None,
+        prior_uav_position_condition: Any = None,
         deterministic: bool = False,
     ) -> CategoricalSample:
-        if int(uav_index) not in (0, 1):
-            raise ValueError("当前 Micro 策略要求固定 UAV0、UAV1 顺序。")
+        if int(uav_index) < 0 or int(uav_index) >= self.num_uav_heads:
+            raise ValueError("Micro UAV action head index is out of range.")
+        condition = (
+            prior_uav_position_condition
+            if prior_uav_position_condition is not None
+            else uav0_position_condition
+        )
+        if condition is None:
+            condition = np.zeros(self.micro_condition_dim, dtype=np.float32)
         with torch.no_grad():
             raw_logits = self._micro_candidate_raw_logits(
                 observation,
                 candidate_features,
                 candidate_mask,
-                uav0_position_condition,
+                condition,
             )
             features = torch.as_tensor(
                 candidate_features, dtype=torch.float32, device=raw_logits.device
@@ -1795,16 +1815,19 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         conditions = torch.as_tensor(
             uav0_position_conditions, dtype=torch.float32, device=device
         )
-        if features.ndim != 4 or tuple(features.shape[:2]) != (int(obs.shape[0]), 2):
-            raise ValueError("Micro rollout features must be [B,2,C,F]。")
+        if features.ndim != 4 or tuple(features.shape[:2]) != (
+            int(obs.shape[0]), self.num_uav_heads
+        ):
+            raise ValueError("Micro rollout features must be [B,U,C,F] for configured UAV heads.")
         if int(features.shape[-1]) != self.micro_uav_feature_dim:
             raise ValueError("Micro candidate feature dimension mismatch。")
         if tuple(masks.shape) != tuple(features.shape[:3]):
             raise ValueError("Micro rollout masks must match candidate features。")
-        if tuple(action_values.shape) != (int(obs.shape[0]), 2):
-            raise ValueError("Micro rollout actions must be [B,2]。")
-        if tuple(conditions.shape) != (int(obs.shape[0]), 2):
-            raise ValueError("UAV0 conditional positions must be [B,2]。")
+        expected_conditions = (int(obs.shape[0]), self.num_uav_heads, self.micro_condition_dim)
+        if tuple(action_values.shape) != (int(obs.shape[0]), self.num_uav_heads):
+            raise ValueError("Micro rollout actions must be [B,U].")
+        if tuple(conditions.shape) != expected_conditions:
+            raise ValueError(f"Micro prior-position conditions must be {expected_conditions}.")
         if not bool(torch.all(torch.isfinite(features)).item()) or not bool(
             torch.all(torch.isfinite(conditions)).item()
         ):
@@ -1815,14 +1838,10 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
         head_group_stay_probabilities: list[Any] = []
         head_group_move_probabilities: list[Any] = []
         head_group_entropies: list[Any] = []
-        for head in range(2):
+        for head in range(self.num_uav_heads):
             head_features = features[:, head]
             head_masks = masks[:, head]
-            condition = (
-                torch.zeros_like(conditions)
-                if head == 0
-                else conditions
-            )
+            condition = conditions[:, head]
             expanded_hidden = hidden.unsqueeze(1).expand(-1, int(features.shape[2]), -1)
             logits = self.micro_uav_candidate_scorer(
                 torch.cat(
@@ -1869,24 +1888,38 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
             head_group_move_probabilities.append(p_move)
             head_group_entropies.append(group_entropy)
         values = self.micro_critic(self._micro_critic_inputs(obs)).squeeze(-1)
-        log0, log1 = head_log_probs
-        entropies = head_entropies[0] + head_entropies[1]
-        group_entropy0, group_entropy1 = head_group_entropies
-        joint_group_entropy = group_entropy0 + group_entropy1
+        stacked_log_probs = torch.stack(head_log_probs, dim=1)
+        stacked_entropies = torch.stack(head_entropies, dim=1)
+        stacked_stay = torch.stack(head_group_stay_probabilities, dim=1)
+        stacked_move = torch.stack(head_group_move_probabilities, dim=1)
+        stacked_group_entropies = torch.stack(head_group_entropies, dim=1)
+        joint_group_entropy = stacked_group_entropies.sum(dim=1)
+        log0 = stacked_log_probs[:, 0]
+        log1 = stacked_log_probs[:, 1] if self.num_uav_heads > 1 else torch.zeros_like(log0)
+        entropy0 = stacked_group_entropies[:, 0]
+        entropy1 = (
+            stacked_group_entropies[:, 1]
+            if self.num_uav_heads > 1
+            else torch.zeros_like(entropy0)
+        )
         return JointMicroEvaluation(
-            log_prob=log0 + log1,
-            entropy=entropies,
+            log_prob=_sum_log_probabilities(stacked_log_probs, dim=1),
+            entropy=stacked_entropies.sum(dim=1),
             value=values,
             uav0_log_prob=log0,
             uav1_log_prob=log1,
-            uav0_stay_probability=head_group_stay_probabilities[0],
-            uav0_move_probability=head_group_move_probabilities[0],
-            uav0_group_entropy=group_entropy0,
-            uav1_stay_probability=head_group_stay_probabilities[1],
-            uav1_move_probability=head_group_move_probabilities[1],
-            uav1_group_entropy=group_entropy1,
+            uav0_stay_probability=stacked_stay[:, 0],
+            uav0_move_probability=stacked_move[:, 0],
+            uav0_group_entropy=entropy0,
+            uav1_stay_probability=(stacked_stay[:, 1] if self.num_uav_heads > 1 else torch.zeros_like(log0)),
+            uav1_move_probability=(stacked_move[:, 1] if self.num_uav_heads > 1 else torch.zeros_like(log0)),
+            uav1_group_entropy=entropy1,
             joint_group_entropy=joint_group_entropy,
-            mean_group_entropy=joint_group_entropy / 2.0,
+            mean_group_entropy=joint_group_entropy / float(self.num_uav_heads),
+            head_log_probs=stacked_log_probs,
+            head_stay_probabilities=stacked_stay,
+            head_move_probabilities=stacked_move,
+            head_group_entropies=stacked_group_entropies,
         )
 
     def macro_actor_parameters(self) -> tuple[Any, ...]:
@@ -1970,7 +2003,7 @@ class DualTimescaleActorCritic(nn.Module if nn is not None else object):
 
 
 class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
-    """Versioned nine-head Cache policy sharing the established actor/scorer."""
+    """Versioned shared-parameter factorized Cache policy."""
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
@@ -1989,6 +2022,7 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
         hidden_sizes: tuple[int, ...] = (128, 128),
         *,
         separate_trigger_candidate: bool = False,
+        num_uav_heads: int = 2,
     ) -> None:
         super().__init__(
             observation_dim,
@@ -2000,6 +2034,7 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
             unified_cache_action=False,
             cardinality_corrected_cache_action=True,
             separate_trigger_candidate=separate_trigger_candidate,
+            num_uav_heads=num_uav_heads,
         )
 
 
@@ -2022,6 +2057,8 @@ class SparseCoordinatedCacheActorCritic(MultiNodeFactorizedActorCritic):
         adaptive_holding_min_slots: int,
         adaptive_holding_max_slots: int,
         hidden_sizes: tuple[int, ...] = (128, 128),
+        *,
+        num_uav_heads: int = 2,
     ) -> None:
         super().__init__(
             observation_dim,
@@ -2030,6 +2067,7 @@ class SparseCoordinatedCacheActorCritic(MultiNodeFactorizedActorCritic):
             adaptive_holding_min_slots,
             adaptive_holding_max_slots,
             hidden_sizes,
+            num_uav_heads=num_uav_heads,
         )
         self.cardinality_corrected_cache_action = False
         hidden = int(tuple(hidden_sizes)[-1])
@@ -2039,6 +2077,27 @@ class SparseCoordinatedCacheActorCritic(MultiNodeFactorizedActorCritic):
             nn.Tanh(),
             nn.Linear(hidden, 1),
         )
+
+
+class AdaptiveDualTimescaleActorCritic(DualTimescaleActorCritic):
+    """Current formal joint Cache–UAV policy; schema is distinct from legacy PPO."""
+
+    architecture_id = "adaptive_joint_cache_uav_mappo_v1_unified"
+    architecture_version = 1
+
+
+class AdaptiveMultiNodeFactorizedActorCritic(MultiNodeFactorizedActorCritic):
+    """Current formal shared-node factorized Cache actor with ordered UAV heads."""
+
+    architecture_id = "adaptive_joint_cache_uav_mappo_v1_factorized"
+    architecture_version = 1
+
+
+class AdaptiveSparseCoordinatedCacheActorCritic(SparseCoordinatedCacheActorCritic):
+    """Current formal sparse Cache actor with ordered UAV heads."""
+
+    architecture_id = "adaptive_joint_cache_uav_mappo_v1_sparse"
+    architecture_version = 1
 
     def macro_actor_parameters(self) -> tuple[Any, ...]:
         modules = (

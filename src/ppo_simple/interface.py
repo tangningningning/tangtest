@@ -210,11 +210,15 @@ def load_environment_context(
         if cache_reconfiguration_model != project_config.CACHE_RECONFIGURATION_MODEL_ABSTRACT:
             raise ValueError("multi-node mode requires the explicit abstract reconfiguration model")
         roles = [str(value).upper() for value in cache_nodes["node_roles"]]
-        if len(action_spec.cache_node_ids) != 9 or {
-            role: roles.count(role) for role in ("SV", "RSU", "UAV")
-        } != {"SV": 5, "RSU": 2, "UAV": 2}:
+        if (
+            not action_spec.cache_node_ids
+            or len(set(action_spec.cache_node_ids)) != len(action_spec.cache_node_ids)
+            or len(roles) != len(action_spec.cache_node_ids)
+            or any(role not in {"SV", "RSU", "UAV"} for role in roles)
+            or not action_spec.uav_ids
+        ):
             raise ValueError(
-                "MULTI_NODE_FACTORIZED requires stable 5-SV/2-RSU/2-UAV cache node order"
+                "Multi-node MAPPO requires unique ordered Cache nodes with supported roles and at least one UAV."
             )
         if cache_action_mode == project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED:
             max_updates = project_config.get_config_value(

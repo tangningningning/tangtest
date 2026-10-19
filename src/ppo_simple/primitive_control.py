@@ -326,9 +326,9 @@ def _all_cache_target_configurations_with_features(
     prediction_horizon_mask: Any = None,
     locked_services: Any = None,
 ) -> tuple[list[cache_configuration.CacheTargetCandidate], np.ndarray]:
-    """枚举全部可行配置，并只计算低成本特征。"""
+    """Build a bounded legal proposal set and compute its low-cost features."""
 
-    all_candidates = cache_configuration.enumerate_all_cache_target_configurations(
+    all_candidates = cache_configuration.generate_bounded_cache_target_configurations(
         current_cache,
         int(node_index),
         context.service_catalog,
@@ -337,6 +337,7 @@ def _all_cache_target_configurations_with_features(
         context.cache_cfg,
         prediction_horizon_mask=prediction_horizon_mask,
         locked_services=locked_services,
+        max_candidates=int(context.cache_cfg.target_candidate_capacity),
     )
     if not all_candidates:
         return [], np.zeros(

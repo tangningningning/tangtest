@@ -1099,6 +1099,161 @@ def enumerate_all_cache_target_configurations(
     return candidates
 
 
+def generate_bounded_cache_target_configurations(
+    current_cache_state: np.ndarray,
+    node_index: int,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    origin_scenario: dict[str, Any],
+    config: CacheOptimizationConfig,
+    *,
+    prediction_horizon_mask: Any = None,
+    locked_services: Any = None,
+    max_candidates: int | None = None,
+) -> list[CacheTargetCandidate]:
+    """Generate a bounded feasible proposal set without enumerating 2**F states.
+
+    The proposal budget is O(K) targets and O(KF) descriptor work (plus an
+    O(F log F) demand sort), where K is the configured per-node candidate
+    capacity. It keeps demand/replica anchors, low-change single flips, and a
+    bounded set of high-demand-for-low-demand swaps. This is a candidate
+    generator, not an optimizer over every feasible cache configuration.
+    """
+
+    current = np.asarray(current_cache_state, dtype=np.int8)
+    validate_cache_shape_and_capacity(current, service_catalog, cache_nodes)
+    index = int(node_index)
+    if index < 0 or index >= current.shape[0]:
+        raise IndexError("cache target node_index 越界")
+    before = current[index].copy()
+    sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64).reshape(-1)
+    service_count = int(service_catalog["num_services"])
+    if sizes.shape != (service_count,) or not np.isfinite(sizes).all() or np.any(sizes < 0.0):
+        raise ValueError("service sizes must be finite, nonnegative, and catalog-aligned")
+    limit = int(config.target_candidate_capacity if max_candidates is None else max_candidates)
+    if limit <= 0:
+        raise ValueError("bounded candidate budget must be positive")
+    limit = min(limit, int(config.target_candidate_capacity))
+    capacity = float(cache_nodes["capacities_mb"][index])
+    if locked_services is None:
+        locked = np.zeros(service_count, dtype=bool)
+    else:
+        raw_locked = np.asarray(locked_services)
+        if raw_locked.shape != (service_count,) or not np.all(np.isin(raw_locked, [0, 1, False, True])):
+            raise ValueError("locked services must be a binary vector aligned with catalog order")
+        locked = raw_locked.astype(bool, copy=False)
+    if np.any(locked & (before != 1)):
+        raise ValueError("an active service lock is absent from the current Cache row")
+
+    demand = np.asarray(
+        node_specific_predicted_demand(
+            origin_scenario,
+            index,
+            cache_nodes,
+            config,
+            prediction_horizon_mask=prediction_horizon_mask,
+        ),
+        dtype=np.float64,
+    ).reshape(-1)
+    if demand.shape != (service_count,) or not np.isfinite(demand).all() or np.any(demand < 0.0):
+        raise ValueError("predicted per-service demand is invalid")
+    replica_counts = np.sum(current, axis=0).astype(np.float64)
+    mean_demand = float(np.mean(demand)) if len(demand) else 0.0
+    used_locked = float(np.sum(sizes[locked]))
+    if used_locked > capacity + 1.0e-9:
+        raise ValueError("locked services exceed node cache capacity")
+
+    def greedy_target(scores: np.ndarray) -> np.ndarray:
+        target = locked.astype(np.int8, copy=True)
+        used = used_locked
+        candidates = [service for service in range(service_count) if not locked[service]]
+        candidates.sort(
+            key=lambda service: (
+                -float(scores[service] / max(float(sizes[service]), 1.0e-12)),
+                -float(scores[service]),
+                int(service),
+            )
+        )
+        for service in candidates:
+            if used + float(sizes[service]) <= capacity + 1.0e-9:
+                target[service] = 1
+                used += float(sizes[service])
+        return target
+
+    proposals: list[CacheTargetCandidate] = []
+    seen: set[bytes] = set()
+
+    def add_target(target: Any, source: str) -> None:
+        if len(proposals) >= limit:
+            return
+        value = np.asarray(target, dtype=np.int8).reshape(-1)
+        if (
+            value.shape != before.shape
+            or not np.all(np.isin(value, [0, 1]))
+            or np.any(locked & (value != 1))
+            or np.array_equal(value, before)
+            or not is_node_feasible(value, sizes, capacity)
+        ):
+            return
+        key = np.ascontiguousarray(value).tobytes()
+        if key in seen:
+            return
+        seen.add(key)
+        proposals.append(
+            CacheTargetCandidate(
+                node_index=index,
+                node_id=str(cache_nodes["node_ids"][index]),
+                before_node_cache=before.copy(),
+                target_node_cache=value.copy(),
+                proposal_source=source,
+            )
+        )
+
+    add_target(greedy_target(demand), "prediction")
+    replica_scores = demand + (mean_demand + 1.0e-12) / (1.0 + replica_counts)
+    add_target(greedy_target(replica_scores), "coverage_anchor")
+    for fraction in config.target_intermediate_fractions:
+        if len(proposals) >= limit:
+            break
+        blended = float(fraction) * demand + (1.0 - float(fraction)) * (
+            before.astype(np.float64) * (mean_demand + 1.0e-12)
+        )
+        add_target(greedy_target(blended), "intermediate")
+
+    removable = [service for service in range(service_count) if before[service] and not locked[service]]
+    removable.sort(key=lambda service: (float(demand[service]), -float(sizes[service]), int(service)))
+    addable = [service for service in range(service_count) if not before[service] and sizes[service] <= capacity - used_locked + 1.0e-9]
+    addable.sort(
+        key=lambda service: (
+            -float(demand[service] / max(float(sizes[service]), 1.0e-12)),
+            -float(demand[service]),
+            int(service),
+        )
+    )
+    flip_budget = max(1, min(8, limit))
+    for service in removable[:flip_budget]:
+        target = before.copy()
+        target[service] = 0
+        add_target(target, "low_reconfiguration")
+    for service in addable[:flip_budget]:
+        target = before.copy()
+        target[service] = 1
+        add_target(target, "prediction_single_add")
+
+    swap_budget = max(1, min(8, limit))
+    for remove_service in removable[:swap_budget]:
+        for add_service in addable[:swap_budget]:
+            if len(proposals) >= limit:
+                break
+            target = before.copy()
+            target[remove_service] = 0
+            target[add_service] = 1
+            add_target(target, "prediction_swap")
+        if len(proposals) >= limit:
+            break
+    return proposals
+
+
 def select_cache_target_configurations(
     candidates: list[CacheTargetCandidate],
     current_node_cache: np.ndarray,

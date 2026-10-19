@@ -1,4 +1,4 @@
-"""Legacy command alias; use run_mappo_stage3_cache_value.py directly."""
+"""Compatibility alias for the formal adaptive Cache–UAV MAPPO Trainer."""
 
 from __future__ import annotations
 
@@ -15,11 +15,11 @@ for import_root in (SOURCE_ROOT, TRAINING_ROOT):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Preserve the old command while dispatching to the sole Stage3 Runner."""
+    """Preserve the old command while dispatching to the sole formal Trainer."""
 
-    from run_mappo_stage3_cache_value import main as stage3_main
+    from ppo_simple.trainer import main as trainer_main
 
-    return stage3_main(None if argv is None else list(argv))
+    return trainer_main(None if argv is None else list(argv))
 
 
 if __name__ == "__main__":
