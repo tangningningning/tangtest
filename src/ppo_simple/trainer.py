@@ -1534,9 +1534,27 @@ class PPOTrainer:
                 self.training_counters["micro_optimizer_steps"] += 1
                 self.training_counters["micro_actor_optimizer_steps"] += 1
                 self.training_counters["micro_critic_optimizer_steps"] += 1
+                # Measure KL after the optimizer step. The pre-step ratio above
+                # is the one used for the PPO objective, but cannot detect an
+                # excessive policy shift caused by this optimizer step.
                 with torch.no_grad():
-                    approx_kl = torch.mean((ratio - 1.0) - log_ratio)
-                    clip_fraction = torch.mean((torch.abs(ratio - 1.0) > clip).float())
+                    post_step_evaluated = self.policy.evaluate_micro_joint(
+                        tensors["observations"],
+                        tensors["candidate_features"],
+                        tensors["candidate_masks"],
+                        tensors["actions"],
+                        tensors["conditions"],
+                    )
+                    post_step_log_ratio = (
+                        post_step_evaluated.log_prob - tensors["old_log_probs"]
+                    )
+                    post_step_ratio = torch.exp(post_step_log_ratio)
+                    approx_kl = torch.mean(
+                        (post_step_ratio - 1.0) - post_step_log_ratio
+                    )
+                    clip_fraction = torch.mean(
+                        (torch.abs(post_step_ratio - 1.0) > clip).float()
+                    )
                 records.append(
                     {
                         "actor_loss": float(actor_loss.detach().cpu()),
