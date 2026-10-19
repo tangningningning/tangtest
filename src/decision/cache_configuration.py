@@ -88,7 +88,6 @@ class CacheOptimizationConfig:
     kkt_min_bandwidth_fraction: float
     kkt_bisection_tolerance: float
     kkt_max_bisection_iterations: int
-    cache_cost_weight: float = 1.0
     # Proposed-policy target configuration proposal controls.  These are
     # engineering bounds/coverage knobs, not physical system parameters.
     target_candidate_capacity: int = 64
@@ -127,8 +126,8 @@ class CacheOptimizationConfig:
             raise ValueError("beta_discount 必须位于 (0, 1]。")
         if self.tolerance < 0.0:
             raise ValueError("tolerance 不能为负数。")
-        if not math.isfinite(self.cache_cost_weight) or self.cache_cost_weight < 0.0:
-            raise ValueError("cache_cost_weight 必须是非负有限数。")
+        if not math.isfinite(self.lambda_cache) or self.lambda_cache < 0.0:
+            raise ValueError("lambda_cache 必须是非负有限数。")
         if int(self.target_candidate_capacity) < 1:
             raise ValueError("target_candidate_capacity 必须 >= 1。")
         if not self.target_intermediate_fractions or any(
@@ -312,7 +311,6 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         kkt_max_bisection_iterations=int(
             get(config, "algorithm.kkt.max_bisection_iterations")
         ),
-        cache_cost_weight=float(get(config, "objective.cache_cost_weight", 1.0)),
         target_candidate_capacity=int(
             get(config, "algorithm.cache.target_candidate_capacity", 64)
         ),
@@ -512,7 +510,6 @@ def cache_update_cost_details(
         cache_nodes["eta_ca"],
         cache_nodes["xi_ca"],
         config.lambda_cache,
-        cache_cost_weight=config.cache_cost_weight,
     )
 
 

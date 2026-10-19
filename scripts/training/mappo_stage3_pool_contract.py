@@ -40,8 +40,8 @@ DEFAULT_OUTPUT_PARENT = PROJECT_ROOT / "runs" / "research_mappo_stage1b"
 LEGACY_POOL_CONFIG_REVISION = "df52747091cbd255f0dc65686d6e4d34656ba8e2"
 LEGACY_POOL_CONFIG_SHA256 = "80762a71c870499eb9cce6aba330531495eac88783732c2ead1b045b2ba8f7c9"
 LEGACY_POOL_SEMANTIC_SHA256 = "3ff3f083562393b6d66492ec2c43be9e5e8ff0bd9ecf425823ccac0ae40f533e"
-CURRENT_FORMAL_CONFIG_SHA256 = "afc45eeaea90fc6a56cde3ee8d7286cca415feb038840ceec52c414615951985"
-CURRENT_FORMAL_SEMANTIC_SHA256 = "2e336946dbea01a80a4cf0ee19c6a7cb49676e426263933dbca63a2690f08c43"
+CURRENT_FORMAL_CONFIG_SHA256 = "a4a150b7675ca4f287452f7c7477e989f53a11e0bd1479c4cebce6b4b65d102e"
+CURRENT_FORMAL_SEMANTIC_SHA256 = "ea7faf221e6e4b8e3e4ff2dee4a1b92fc3abb22af33550e868484ad37ebf7642"
 CURRENT_GENERATION_FINGERPRINT = "4083b917948cd7203972c0edd5b40d2efefd8984dde27089a77da43d460b32f3"
 SOURCE_CONFIG_REVISION = "eaa44d9169aa12c88012c8ad74a2c342098edfae"
 SOURCE_CONFIG_SHA256 = "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77"
@@ -67,8 +67,36 @@ LEGACY_POOL_FIELD_DIFFERENCES = {
         "PER_SLOT_ANALYTIC",
         "RUNTIME_ONLY",
     ),
+    "nodes.rsu.eta_ca": (0.10, 1.0, "COST_EQUIVALENT_REPARAMETERIZATION"),
+    "nodes.sv.eta_ca": (0.20, 2.0, "COST_EQUIVALENT_REPARAMETERIZATION"),
+    "nodes.uav.eta_ca": (0.15, 1.5, "COST_EQUIVALENT_REPARAMETERIZATION"),
+    "nodes.uav.movement.movement_fixed_cost": (
+        0.00176,
+        100.0,
+        "COST_EQUIVALENT_REPARAMETERIZATION",
+    ),
     "objective.E_ref": (3.06289851662, 5.1574642506299275, "RUNTIME_ONLY"),
     "objective.T_ref": (30.6289851662, 30.473728355325758, "RUNTIME_ONLY"),
+    "objective.cache_cost_weight": (
+        0.1,
+        None,
+        "COST_EQUIVALENT_REPARAMETERIZATION",
+    ),
+    "objective.lambda_cache": (
+        0.1,
+        0.01,
+        "COST_EQUIVALENT_REPARAMETERIZATION",
+    ),
+    "objective.lambda_movement": (
+        1.76e-5,
+        8.8e-6,
+        "COST_EQUIVALENT_REPARAMETERIZATION",
+    ),
+    "objective.uav_movement_cost_weight": (
+        0.50,
+        None,
+        "COST_EQUIVALENT_REPARAMETERIZATION",
+    ),
 }
 SOURCE_PREDICTION_ARTIFACTS = {
     "popularity.csv",
@@ -195,8 +223,11 @@ def _validate_pool_config_compatibility(
         for path in sorted(set(historical_flat) | set(runtime_flat))
         if historical_flat.get(path, missing) != runtime_flat.get(path, missing)
     }
+    def expected_value(value: Any) -> Any:
+        return missing if value is None else value
+
     expected_differences = {
-        path: (old_value if old_value is not None else missing, new_value)
+        path: (expected_value(old_value), expected_value(new_value))
         for path, (old_value, new_value, _category) in LEGACY_POOL_FIELD_DIFFERENCES.items()
     }
     if observed_differences != expected_differences:

@@ -55,7 +55,6 @@ class UavSearchConfig:
     movement_energy_coefficient_j_per_m: float
     movement_fixed_cost: float
     lambda_movement: float
-    movement_cost_weight: float
 
     @property
     def max_move_distance_m(self) -> float:
@@ -97,7 +96,6 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         ),
         movement_fixed_cost=float(get(config, "nodes.uav.movement.movement_fixed_cost")),
         lambda_movement=float(get(config, "objective.lambda_movement")),
-        movement_cost_weight=float(get(config, "objective.uav_movement_cost_weight")),
     )
 
 
@@ -597,7 +595,6 @@ def movement_summary(
             search_config.movement_fixed_cost,
             search_config.lambda_movement,
             tolerance_m=search_config.position_tolerance_m,
-            movement_cost_weight=search_config.movement_cost_weight,
         )
         displacement[uav_id] = float(result["distance_m"])
         energy_by_uav[uav_id] = float(result["movement_energy_j"])

@@ -150,12 +150,11 @@ cpu_cycles_per_s = 1.0e9
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
 # 参数状态：EXPERIMENT_DESIGN。
-# SV 触发固定配置成本 eta_ca；不是文献直接物理常数或实测能耗。
-# 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
-eta_ca = 0.20
+# SV 固定重配置项 eta_ca；这是由旧公式代数迁移的等效目标系数，不是实测能耗。
+eta_ca = 2.0
 # 参数状态：EXPERIMENT_DESIGN。
-# SV 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
-# 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
+# SV 的等效 Cache 装载能耗代理系数；xi_ca * loaded_MB 尚未标定为物理焦耳。
+# 三类节点固定相对比例为 0.001:0.0007:0.0012，lambda_cache 统一缩放整项成本。
 xi_ca = 1.0e-3
 # 正式 Cache 候选评分使用的 SV 服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 100.0
@@ -175,12 +174,11 @@ cpu_cycles_per_s = 10.0e9
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
 # 参数状态：EXPERIMENT_DESIGN。
-# RSU 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数或实测能耗。
-# 它表示 z_m^ca=1 且实际发生 cache reconfiguration 时的固定系统目标设计成本。
-eta_ca = 0.10
+# RSU 固定重配置项 eta_ca；这是由旧公式代数迁移的等效目标系数，不是实测能耗。
+eta_ca = 1.0
 # 参数状态：EXPERIMENT_DESIGN。
-# RSU 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
-# 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
+# RSU 的等效 Cache 装载能耗代理系数；xi_ca * loaded_MB 尚未标定为物理焦耳。
+# 三类节点固定相对比例为 0.001:0.0007:0.0012，lambda_cache 统一缩放整项成本。
 xi_ca = 0.7e-3
 # 正式 Cache 候选评分使用的 RSU 服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 250.0
@@ -214,13 +212,11 @@ cpu_cycles_per_s = 5.0e9
 # 这是文献校准实验基线，不代表硬件实测值。
 bandwidth_hz = 10.0e6
 # 参数状态：EXPERIMENT_DESIGN。
-# UAV 固定 cache reconfiguration cost eta_ca；不是文献直接物理常数或实测能耗。
-# 该值是固定系统目标设计成本；已有 validation 只作为行为可执行性证据，
-# 不将其解释为独立物理能耗标定。
-eta_ca = 0.15
+# UAV 固定重配置项 eta_ca；这是由旧公式代数迁移的等效目标系数，不是实测能耗。
+eta_ca = 1.5
 # 参数状态：EXPERIMENT_DESIGN。
-# UAV 的 equivalent/relative cache-loading coefficient；不代表 measured physical J/MB。
-# 三类节点固定相对比例为 0.001:0.0007:0.0012，整体强度由 lambda_cache 控制。
+# UAV 的等效 Cache 装载能耗代理系数；xi_ca * loaded_MB 尚未标定为物理焦耳。
+# 三类节点固定相对比例为 0.001:0.0007:0.0012，lambda_cache 统一缩放整项成本。
 xi_ca = 1.2e-3
 # 正式 UAV 候选评分使用的服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 300.0
@@ -250,9 +246,8 @@ min_safety_distance_m = 10.0
 # P(15)/15 ≈ 14.73 J/m，并取整为 15 J/m 作为线性等效系数。
 movement_energy_coefficient_j_per_m = 15.0
 # 参数状态：EXPERIMENT_DESIGN。
-# 人为设定的 UAV actual reconfiguration fixed penalty；不是文献直接物理常数。
-# 该成本保持 state-dependent，不强制每 slot 移动；已有 train-only probe 仅用于尺度核对。
-movement_fixed_cost = 0.00176
+# UAV 固定位置更新项；为使新公式与旧成本代数等价而迁移，非实测固定能耗。
+movement_fixed_cost = 100.0
 
 [nodes.cloud]
 # Cloud 数量固定为 1 个逻辑节点；本项目不展开 Cloud 实例列表。
@@ -375,26 +370,16 @@ omega_delay = 0.6
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_energy = 0.4
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
-# Cache 配置成本权重 lambda_cache，是系统目标函数中唯一的 lambda^ca 入口。
-# 它只把 cache loading energy 映射为 objective cost，
-# 用于人为控制 reconfiguration energy 相对于 task utility 的惩罚尺度。
-# 当前 0.1 是固定的目标权衡参数，不声称为物理量或文献校准值。
-# 既有配置说明曾把典型单节点配置动作约占 normal-slot utility 约 10% 作为设计假设；
-# 本轮将其明确为 experiment-design interpretation，不使用 accepted action 反向选择它。
-# 后续正式实验只做 one-factor-at-a-time 的 0.5x/1x/2x sensitivity；本轮不运行。
-# 正成本口径：C_ca = eta_ca*z_actual + lambda_cache*xi_ca*loaded_mb；
-# C_q = eta_q*z_q_actual + lambda_movement*xi_mov*distance；
-# G = Q - C_ca - C_q；负号只出现在 G 中，不写入 C_ca/C_q。
-lambda_cache = 0.1
-# 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
-# 它只把 UAV movement energy 映射为 objective cost，
-# 用于人为控制 movement energy 相对于 task utility 的惩罚尺度。
-# 当前 1.76e-5 是固定的目标权衡参数，不声称为物理量或文献校准值。
-# 不使用 accepted movement 或 optimizer 最终位置反向选择它；后续正式实验只做
-# one-factor-at-a-time 的 0.5x/1x/2x sensitivity，本轮不运行。
-lambda_movement = 1.76e-5
-uav_movement_cost_weight = 0.50
-cache_cost_weight = 0.1
+# E_ca,m = xi_ca,m * loaded_MB_m 是等效 Cache 装载能耗代理量，尚未标定为物理焦耳。
+# loaded_MB_m = sum_f service_size_MB_f * max(cache_new_mf - cache_old_mf, 0)。
+# C_ca = lambda_cache * sum_m [eta_ca_m * z_ca_actual_m + E_ca,m]；lambda_cache 缩放整项。
+# 删除服务不产生负装载量，KEEP 成本为零；eta_ca 是等价迁移后的目标系数。
+# C_q = lambda_movement * sum_u [movement_fixed_cost_u * z_q_actual_u + E_mov,u]。
+# E_mov,u = movement_energy_coefficient_j_per_m * effective_distance_m，单位 J。
+# movement_fixed_cost 是为保持旧成本等价而迁移的目标项，非实测固定能耗。
+# 系数由旧公式严格代数迁移，保持成本数值；G = Q - C_ca - C_q 且成本各扣一次。
+lambda_cache = 0.01
+lambda_movement = 8.8e-6
 # T_ref/E_ref are train-only P95 normalization constants for the PER_SLOT_ANALYTIC
 # task model. Calibration used 12 Training realizations (seeds 20001, 20028, 20055,
 # 20082, 20110, 20137, 20164, 20191, 20218, 20245, 20272, 20300), sampling slots

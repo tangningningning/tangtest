@@ -1230,19 +1230,21 @@ def validate_config(
             "objective.omega_delay 和 objective.omega_energy "
             "必须位于 [0,1] 且总和等于 1。"
         )
-    raw_uav_movement_cost_weight = get_config_value(
-        config, "objective.uav_movement_cost_weight"
-    )
-    if raw_uav_movement_cost_weight is None:
-        raise ValueError("缺少必需配置：objective.uav_movement_cost_weight。")
-    uav_movement_cost_weight = float(raw_uav_movement_cost_weight)
-    if not math.isfinite(uav_movement_cost_weight) or uav_movement_cost_weight < 0.0:
-        raise ValueError("objective.uav_movement_cost_weight 必须是非负有限数。")
-    cache_cost_weight = float(
-        get_config_value(config, "objective.cache_cost_weight", 1.0)
-    )
-    if not math.isfinite(cache_cost_weight) or cache_cost_weight < 0.0:
-        raise ValueError("objective.cache_cost_weight 必须是非负有限数。")
+    for obsolete_path in (
+        "objective.cache_cost_weight",
+        "objective.uav_movement_cost_weight",
+    ):
+        if get_config_value(config, obsolete_path) is not None:
+            raise ValueError(
+                f"{obsolete_path} 已废弃；请将成本尺度统一写入对应 lambda。"
+            )
+    for scale_path in ("objective.lambda_cache", "objective.lambda_movement"):
+        raw_scale = get_config_value(config, scale_path)
+        if raw_scale is None:
+            raise ValueError(f"缺少必需配置：{scale_path}。")
+        scale = float(raw_scale)
+        if not math.isfinite(scale) or scale < 0.0:
+            raise ValueError(f"{scale_path} 必须是非负有限数。")
     _require_positive(config, "objective.T_ref")
     _require_positive(config, "objective.E_ref")
     cloud_delay_factor = float(get_config_value(config, "nodes.cloud.cloud_delay_factor"))
