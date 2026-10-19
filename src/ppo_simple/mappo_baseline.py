@@ -3092,6 +3092,10 @@ class MAPPOBaselineTrainer:
             "max_grad_norm": self.max_grad_norm,
             "config_sha256": project_config.raw_config_sha256(config_path),
         }
+        policy_schema = str(self.policy.architecture_id)
+        if "keep_node_identity_v1" in policy_schema:
+            contract["policy_schema"] = policy_schema
+            contract["architecture_version"] = int(self.policy.architecture_version)
         if self.policy.separate_trigger_candidate:
             contract["macro_candidate_head_schema"] = (
                 "separate_legacy_trigger_and_conditional_candidate_v1"

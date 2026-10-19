@@ -21,12 +21,14 @@ PROPOSED_POLICY_SCHEMA = (
 )
 MULTI_NODE_FACTORIZED_POLICY_SCHEMA = (
     "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-    "v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1_"
+    "v5_multi_node_cache_factorized_v1_keep_node_identity_v1_"
+    "per_slot_analytic_task_model_v1_"
     "training_p95_reward_norm_v1"
 )
 SPARSE_COORDINATED_CACHE_POLICY_SCHEMA = (
     "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-    "v5_sparse_coordinated_cache_v1_per_slot_analytic_task_model_v1_"
+    "v6_sparse_coordinated_cache_v1_keep_node_identity_v1_"
+    "per_slot_analytic_task_model_v1_"
     "training_p95_reward_norm_v1"
 )
 CACHE_ACTION_MODE_SINGLE_NODE = "SINGLE_NODE_UNIFIED"

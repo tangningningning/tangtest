@@ -31,6 +31,7 @@ from .primitive_control import (
     CACHE_ECONOMIC_FEATURE_DIM,
     PrimitiveTensorSpec,
     _normalized_xy,
+    cache_node_identity_features,
     cache_economic_candidate_features,
     _target_cache_proposals_with_features,
     _uav_target_position_feature,
@@ -637,6 +638,14 @@ def _cache_node_candidates(
     node_ids = tuple(str(value) for value in context.action_spec.cache_node_ids)
     if current.ndim != 2 or current.shape[0] != len(node_ids):
         raise ValueError("multi-node Cache candidate state does not match stable node order")
+    cache_node_ids = tuple(str(value) for value in context.cache_nodes["node_ids"])
+    node_roles = tuple(
+        str(value).upper() for value in context.cache_nodes["node_roles"]
+    )
+    if cache_node_ids != node_ids or len(node_roles) != len(node_ids):
+        raise ValueError(
+            "factorized Cache action, matrix, and role orders must match the Cache node contract"
+        )
     locks = (
         np.zeros(current.shape, dtype=bool)
         if active_service_locks is None
@@ -744,6 +753,14 @@ def _cache_node_candidates(
     for node_index in range(1, len(node_ids)):
         features[node_index, 0] = features[0, 0]
         masks[node_index, 0] = True
+    economic_offset = features.shape[-1] - CACHE_ECONOMIC_FEATURE_DIM
+    for node_index, node_role in enumerate(node_roles):
+        keep_identity = cache_node_identity_features(
+            node_index, len(node_ids), node_role
+        )
+        features[node_index, 0, economic_offset + 1 : economic_offset + 5] = (
+            keep_identity
+        )
     if not np.all(masks[:, 0]) or not np.allclose(features[:, 0, -CACHE_ECONOMIC_FEATURE_DIM], 1.0):
         raise AssertionError("every factorized Cache head must retain legal KEEP candidate zero")
     if not np.isfinite(features[masks]).all():

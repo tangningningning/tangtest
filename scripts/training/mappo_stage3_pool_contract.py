@@ -40,8 +40,8 @@ DEFAULT_OUTPUT_PARENT = PROJECT_ROOT / "runs" / "research_mappo_stage1b"
 LEGACY_POOL_CONFIG_REVISION = "df52747091cbd255f0dc65686d6e4d34656ba8e2"
 LEGACY_POOL_CONFIG_SHA256 = "80762a71c870499eb9cce6aba330531495eac88783732c2ead1b045b2ba8f7c9"
 LEGACY_POOL_SEMANTIC_SHA256 = "3ff3f083562393b6d66492ec2c43be9e5e8ff0bd9ecf425823ccac0ae40f533e"
-CURRENT_FORMAL_CONFIG_SHA256 = "03328b88658a6f15c0518eee9f4903d5647f12a800432e58c74b42fdef51d80c"
-CURRENT_FORMAL_SEMANTIC_SHA256 = "8a95bd7925093f523bc9d6d38118c54fed240d3aab0dce3d031686cd5b94d2b7"
+CURRENT_FORMAL_CONFIG_SHA256 = "afc45eeaea90fc6a56cde3ee8d7286cca415feb038840ceec52c414615951985"
+CURRENT_FORMAL_SEMANTIC_SHA256 = "2e336946dbea01a80a4cf0ee19c6a7cb49676e426263933dbca63a2690f08c43"
 CURRENT_GENERATION_FINGERPRINT = "4083b917948cd7203972c0edd5b40d2efefd8984dde27089a77da43d460b32f3"
 SOURCE_CONFIG_REVISION = "eaa44d9169aa12c88012c8ad74a2c342098edfae"
 SOURCE_CONFIG_SHA256 = "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77"
@@ -59,7 +59,7 @@ VALIDATION_SOURCE_CONFIG_SHA256_AT_START = "759d42cc2b303339e5f71dded2f40a9d4858
 LEGACY_POOL_FIELD_DIFFERENCES = {
     "algorithm.ppo.policy_schema": (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1",
-        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1_training_p95_reward_norm_v1",
+        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v5_multi_node_cache_factorized_v1_keep_node_identity_v1_per_slot_analytic_task_model_v1_training_p95_reward_norm_v1",
         "METADATA_ONLY",
     ),
     "algorithm.ppo.task_execution_model": (

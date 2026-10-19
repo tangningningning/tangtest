@@ -42,6 +42,26 @@ CACHE_ECONOMIC_FEATURE_NAMES = (
 )
 
 
+def cache_node_identity_features(
+    node_index: int, node_count: int, node_role: str
+) -> np.ndarray:
+    """Encode the node index and supported role using the Cache feature contract."""
+
+    index = int(node_index)
+    count = int(node_count)
+    if count <= 0 or index < 0 or index >= count:
+        raise ValueError("Cache node identity index is outside the configured node order")
+    normalized_index = float(index) / max(float(count - 1), 1.0)
+    role = str(node_role).upper()
+    role_index = {"SV": 0, "RSU": 1, "UAV": 2}.get(role)
+    if role_index is None:
+        raise ValueError(f"Unsupported Cache node role for identity features: {role!r}")
+    values = np.zeros(4, dtype=np.float64)
+    values[0] = normalized_index
+    values[1 + role_index] = 1.0
+    return values
+
+
 def _intermediate_observation(
     cache_state: np.ndarray,
     uav_positions: dict[str, Any],
@@ -142,10 +162,10 @@ def _cache_target_configuration_feature(
     target_diversity = float(np.count_nonzero(target_replica_counts > 0.0))
     zero_after = float(np.count_nonzero(target_replica_counts == 0.0))
     single_after = float(np.count_nonzero(target_replica_counts == 1.0))
-    role = str(context.cache_nodes["node_roles"][candidate.node_index]).upper()
-    role_feature = np.asarray(
-        [float(role == "SV"), float(role == "RSU"), float(role == "UAV")],
-        dtype=np.float64,
+    identity_features = cache_node_identity_features(
+        candidate.node_index,
+        node_count,
+        context.cache_nodes["node_roles"][candidate.node_index],
     )
     scalar_features = np.asarray(
         [
@@ -168,11 +188,7 @@ def _cache_target_configuration_feature(
     )
     values = np.concatenate(
         [
-            np.asarray(
-                [float(candidate.node_index) / max(node_count - 1, 1)],
-                dtype=np.float64,
-            ),
-            role_feature,
+            identity_features,
             before,
             target,
             delta,

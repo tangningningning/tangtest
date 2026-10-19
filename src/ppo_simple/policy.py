@@ -2007,10 +2007,11 @@ class MultiNodeFactorizedActorCritic(DualTimescaleActorCritic):
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-        "v4_multi_node_cache_factorized_v1_per_slot_analytic_task_model_v1_"
+        "v5_multi_node_cache_factorized_v1_keep_node_identity_v1_"
+        "per_slot_analytic_task_model_v1_"
         "training_p95_reward_norm_v1"
     )
-    architecture_version = 35
+    architecture_version = 36
 
     def __init__(
         self,
@@ -2043,10 +2044,11 @@ class SparseCoordinatedCacheActorCritic(MultiNodeFactorizedActorCritic):
 
     architecture_id = (
         "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-        "v5_sparse_coordinated_cache_v1_per_slot_analytic_task_model_v1_"
+        "v6_sparse_coordinated_cache_v1_keep_node_identity_v1_"
+        "per_slot_analytic_task_model_v1_"
         "training_p95_reward_norm_v1"
     )
-    architecture_version = 36
+    architecture_version = 37
     sparse_coordinated_cache_action = True
 
     def __init__(
@@ -2089,15 +2091,15 @@ class AdaptiveDualTimescaleActorCritic(DualTimescaleActorCritic):
 class AdaptiveMultiNodeFactorizedActorCritic(MultiNodeFactorizedActorCritic):
     """Current formal shared-node factorized Cache actor with ordered UAV heads."""
 
-    architecture_id = "adaptive_joint_cache_uav_mappo_v1_factorized"
-    architecture_version = 1
+    architecture_id = "adaptive_joint_cache_uav_mappo_v1_factorized_keep_node_identity_v1"
+    architecture_version = 2
 
 
 class AdaptiveSparseCoordinatedCacheActorCritic(SparseCoordinatedCacheActorCritic):
     """Current formal sparse Cache actor with ordered UAV heads."""
 
-    architecture_id = "adaptive_joint_cache_uav_mappo_v1_sparse"
-    architecture_version = 1
+    architecture_id = "adaptive_joint_cache_uav_mappo_v1_sparse_keep_node_identity_v1"
+    architecture_version = 2
 
     def macro_actor_parameters(self) -> tuple[Any, ...]:
         modules = (
