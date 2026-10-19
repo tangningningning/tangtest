@@ -1,4 +1,4 @@
-"""Compatibility alias for the formal adaptive Cache–UAV MAPPO Trainer."""
+"""Official entry for the Adaptive Dual-Timescale Joint MAPPO workflow."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ for import_root in (SOURCE_ROOT, TRAINING_ROOT):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Preserve the old command while dispatching to the sole formal Trainer."""
+    """Dispatch the official command to the sole formal Trainer implementation."""
 
     from ppo_simple.trainer import main as trainer_main
 

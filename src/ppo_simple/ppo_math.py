@@ -1,4 +1,4 @@
-"""Shared PPO arithmetic used by the Stage3 joint policy optimizer."""
+"""PPO arithmetic used by the formal adaptive joint MAPPO Trainer."""
 
 from __future__ import annotations
 

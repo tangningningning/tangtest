@@ -10,7 +10,7 @@ import numpy as np
 
 from common import project_config, system_model
 from decision import cache_configuration, uav_configuration
-from scripts.training import mappo_stage3_pool_contract
+from scripts.training import training_pool_contract
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -62,18 +62,18 @@ class CostFormulaMigrationTests(unittest.TestCase):
         config = project_config.parse_toml_file(config_path)
         self.assertEqual(
             project_config.raw_config_sha256(config_path),
-            mappo_stage3_pool_contract.CURRENT_FORMAL_CONFIG_SHA256,
+            training_pool_contract.CURRENT_FORMAL_CONFIG_SHA256,
         )
         self.assertEqual(
             project_config.semantic_config_hash(config),
-            mappo_stage3_pool_contract.CURRENT_FORMAL_SEMANTIC_SHA256,
+            training_pool_contract.CURRENT_FORMAL_SEMANTIC_SHA256,
         )
 
         historical = subprocess.run(
             [
                 "git",
                 "show",
-                f"{mappo_stage3_pool_contract.LEGACY_POOL_CONFIG_REVISION}:"
+                f"{training_pool_contract.LEGACY_POOL_CONFIG_REVISION}:"
                 "configs/proposed/system_config.toml",
             ],
             cwd=PROJECT_ROOT,
@@ -106,7 +106,7 @@ class CostFormulaMigrationTests(unittest.TestCase):
                 missing if new is None else new,
             )
             for path, (old, new, _category)
-            in mappo_stage3_pool_contract.LEGACY_POOL_FIELD_DIFFERENCES.items()
+            in training_pool_contract.LEGACY_POOL_FIELD_DIFFERENCES.items()
         }
         self.assertEqual(observed, approved)
 

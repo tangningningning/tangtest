@@ -10,8 +10,8 @@ import numpy as np
 import torch
 
 from common import project_config
-from ppo_simple import mappo_baseline, policy, primitive_control, rollout, trainer
-from scripts.training import mappo_stage3_pool_contract
+from ppo_simple import policy, primitive_control, rollout, trainer
+from scripts.training import training_pool_contract
 
 
 class FactorizedCacheKeepIdentityTests(unittest.TestCase):
@@ -169,14 +169,14 @@ class CachePolicyVersionTests(unittest.TestCase):
         system_config = project_config.parse_toml_file(system_path)
         self.assertEqual(
             project_config.raw_config_sha256(system_path),
-            mappo_stage3_pool_contract.CURRENT_FORMAL_CONFIG_SHA256,
+            training_pool_contract.CURRENT_FORMAL_CONFIG_SHA256,
         )
         self.assertEqual(
             project_config.semantic_config_hash(system_config),
-            mappo_stage3_pool_contract.CURRENT_FORMAL_SEMANTIC_SHA256,
+            training_pool_contract.CURRENT_FORMAL_SEMANTIC_SHA256,
         )
         self.assertEqual(
-            mappo_stage3_pool_contract.LEGACY_POOL_FIELD_DIFFERENCES[
+            training_pool_contract.LEGACY_POOL_FIELD_DIFFERENCES[
                 "algorithm.ppo.policy_schema"
             ][1],
             project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA,
@@ -210,41 +210,6 @@ class CachePolicyVersionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "architecture/action semantics"):
                 trainer.PPOTrainer.load_checkpoint(fake_trainer, checkpoint_path)
-
-    def test_old_factorized_checkpoint_contract_is_rejected_without_global_bump(self) -> None:
-        with TemporaryDirectory(dir=Path(__file__).resolve().parent) as temporary_directory:
-            checkpoint_path = Path(temporary_directory) / "old_factorized_baseline.pt"
-            torch.save(
-                {
-                    "checkpoint_version": mappo_baseline.MAPPO_CHECKPOINT_VERSION,
-                    "baseline_schema": mappo_baseline.MAPPO_BASELINE_SCHEMA,
-                    # Old contracts did not identify the Cache candidate input semantics.
-                    "model_contract": {
-                        "baseline_schema": mappo_baseline.MAPPO_BASELINE_SCHEMA,
-                        "macro_candidate_feature_dim": 19,
-                    },
-                },
-                checkpoint_path,
-            )
-            fake_trainer = SimpleNamespace(
-                device=torch.device("cpu"),
-                stage3_cache_value_config=None,
-                _checkpoint_contract=lambda: {
-                    "baseline_schema": mappo_baseline.MAPPO_BASELINE_SCHEMA,
-                    "macro_candidate_feature_dim": 19,
-                    "policy_schema": policy.AdaptiveMultiNodeFactorizedActorCritic.architecture_id,
-                    "architecture_version": policy.AdaptiveMultiNodeFactorizedActorCritic.architecture_version,
-                },
-            )
-            self.assertEqual(
-                mappo_baseline.MAPPO_BASELINE_SCHEMA,
-                "mappo_shared_actor_global_critic_fixed_macro_2_v2_group_balanced_ops",
-            )
-            with self.assertRaisesRegex(ValueError, "model/config contract mismatch"):
-                mappo_baseline.MAPPOBaselineTrainer.load_checkpoint(
-                    fake_trainer, checkpoint_path
-                )
-
 
 if __name__ == "__main__":
     unittest.main()

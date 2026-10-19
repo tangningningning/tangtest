@@ -1,4 +1,4 @@
-"""在 episode pool 上评估冻结的双时间尺度 PPO 策略。"""
+"""Evaluate frozen Adaptive Dual-Timescale Joint MAPPO checkpoints."""
 
 from __future__ import annotations
 
@@ -1119,7 +1119,9 @@ def evaluate_pool(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="评估冻结的双时间尺度 Cache/UAV PPO 策略。")
+    parser = argparse.ArgumentParser(
+        description="评估冻结的 Adaptive Dual-Timescale Joint MAPPO 策略。"
+    )
     parser.add_argument("--config", default=PROPOSED_CONFIG_PATH)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--run-dir", required=True)

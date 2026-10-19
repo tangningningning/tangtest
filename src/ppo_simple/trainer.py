@@ -1,4 +1,4 @@
-"""训练 Macro Cache SMDP PPO 与 Micro UAV autoregressive PPO。"""
+"""Train Adaptive Dual-Timescale Joint MAPPO with PPO Clip updates."""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ SUPPORTED_MACRO_ACTOR_LEARNING_RATES = (1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3)
 
 def _require_torch() -> None:
     if torch is None:
-        raise ImportError("正式双时间尺度 PPO 需要 PyTorch。")
+        raise ImportError("正式 Adaptive Dual-Timescale Joint MAPPO 需要 PyTorch。")
 
 
 def _update_training_epoch_return_plot_optional(run_dir: Path) -> Path | None:
@@ -3994,7 +3994,7 @@ def run_training(
 
     def save_run_summary() -> None:
         summary = {
-            "experiment_type": "macro_cache_smdp_micro_uav_ppo",
+            "experiment_type": "adaptive_dual_timescale_joint_mappo",
             "algorithm_id": trainer.algorithm_id,
             "task_execution_model": PER_SLOT_ANALYTIC_TASK_MODEL,
             "macro_actor_update_control_version": trainer.macro_actor_update_control_version,
@@ -4592,7 +4592,9 @@ def run_training(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="训练双时间尺度 Cache/UAV PPO。")
+    parser = argparse.ArgumentParser(
+        description="训练 Adaptive Dual-Timescale Joint MAPPO（PPO Clip 更新）。"
+    )
     parser.add_argument("--config", default=PROPOSED_CONFIG_PATH)
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--run-dir", required=True)

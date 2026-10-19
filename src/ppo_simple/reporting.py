@@ -1,4 +1,4 @@
-"""记录正式 PPO run 的来源信息、清单和汇总指标。"""
+"""记录正式 joint MAPPO run 的来源信息、清单和汇总指标。"""
 
 from __future__ import annotations
 
@@ -1902,7 +1902,7 @@ def write_dual_timescale_run_manifest(
             trainer.macro_actor_update_control_version
         ),
         "method": str(trainer.checkpoint_method),
-        "experiment_type": "proposed_macro_cache_smdp_micro_uav_ppo",
+        "experiment_type": "adaptive_dual_timescale_joint_mappo",
         "config_path": str(Path(config_path).resolve()),
         "config_raw_sha256": str(config_raw_sha256),
         "config_semantic_sha256": str(config_semantic_sha256),

@@ -13,7 +13,7 @@ for import_root in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts" / "training")
 
 from common import project_config
 from ppo_simple.interface import prepare_aligned_rollout_steps
-import mappo_stage3_pool_contract as pool_contract
+import training_pool_contract as pool_contract
 
 
 def training_context_and_steps(

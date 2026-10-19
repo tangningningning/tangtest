@@ -2,7 +2,7 @@
 
 ## 正式实现与入口
 
-当前正式学习器为 `src/ppo_simple/trainer.py:PPOTrainer`，训练入口为 `python -m ppo_simple.trainer` / `ppo-train`，冻结评价入口为 `python -m ppo_simple.evaluator` / `ppo-eval`。`scripts/training/mainline_runner.py` 与 `src/ppo_simple/stage3_cli.py` 只转发到正式 Trainer。旧 Stage3 MAPPO 与反事实监督实现保留作历史实验读取和复现，不是当前正式 Trainer 的第二条更新路径。
+正式算法为 **Adaptive Dual-Timescale Joint MAPPO**（`ADAPTIVE_CACHE_UAV_JOINT_MAPPO`），Checkpoint 方法为 `ADAPTIVE_CACHE_UAV_MAPPO`。训练入口为 `scripts/training/mainline_runner.py`，它调用 `src/ppo_simple/trainer.py:PPOTrainer`；冻结评价入口为 `python -m ppo_simple.evaluator` / `ppo-eval`。实现采用共享参数、全局观测、因子化联合动作和集中式价值估计，不是完全分布式执行的标准 CTDE-MAPPO。兼容训练命令 `ppo-train` 与 `python -m ppo_simple.trainer` 使用同一个 Trainer，不是独立算法。
 
 执行仍由正式环境完成：Cache 配置进入 `slot_environment.execute_configured_slot`，任务匹配与资源分配继续使用原 Matching/KKT，奖励继续来自正式 `SlotExecutionResult.system_utility`。本改动没有改变任务效用、Cache 配置成本、UAV 移动成本或奖励公式。
 
@@ -35,7 +35,7 @@ SMDP TD bootstrap 使用 `γ^d V(s_(t+d))`；duration-aware GAE 的 frame trace 
 
 正式多节点 MAPPO 的候选动作张量由运行时 Cache 节点数 `N`、服务数 `F`、节点候选数 `K` 及 UAV 数 `U` 构造；Actor 不要求固定九节点或两个 UAV。角色按运行时节点顺序编码，UAV 条件宽度为 `2 × max(1, U−1)`。观测和候选特征从正式 `ConfigurationObservationSpec`、`PrimitiveTensorSpec` 和当前服务目录派生。训练过程中或 Checkpoint 恢复时，若维度、角色顺序、静态 RSU/UAV 身份或其他模型合同不一致即拒绝加载。
 
-正式多节点路径使用 `generate_bounded_cache_target_configurations`，按预测需求锚点、覆盖锚点、有限单项变化和有界交换生成候选，数量不超过配置的每节点候选预算 `K`；候选准备复杂度为 `O(F log F + KF)`，不会枚举全部 `2^F` 缓存子集。KEEP 永远保留为合法候选。历史 Stage3 需要的旧候选生成路径仍与这一正式有界生成器分离。
+正式多节点路径使用 `generate_bounded_cache_target_configurations`，按预测需求锚点、覆盖锚点、有限单项变化和有界交换生成候选，数量不超过配置的每节点候选预算 `K`；候选准备复杂度为 `O(F log F + KF)`，不会枚举全部 `2^F` 缓存子集。KEEP 永远保留为合法候选。
 
 这些接口支持不同车辆、服务、Cache 节点和 UAV 数量形成新的合法状态/动作张量，但每种维度都会改变网络和 Checkpoint 合同；代码支持不等于已经训练或证明跨规模泛化。
 
@@ -47,9 +47,7 @@ SMDP TD bootstrap 使用 `γ^d V(s_(t+d))`；duration-aware GAE 的 frame trace 
 - 共享参数多节点因子化动作：`adaptive_joint_cache_uav_mappo_v1_factorized`，格式版本 65。
 - 稀疏协同多节点动作：`adaptive_joint_cache_uav_mappo_v1_sparse`，格式版本 66。
 
-Checkpoint 合同记录观测、候选特征、节点角色/数量、服务数、UAV ID/数量/条件宽度、Holding、奖励模型、动作概率、优化器、学习率、训练进度、Pool/config 标识与 Python/NumPy/PyTorch RNG 状态。严格续训必须逐项匹配。历史 Stage3、旧 PROPOSED 或不同维度 Checkpoint 不会静默映射为当前联合算法；只有显式权重初始化流程证明张量及语义兼容时才可迁移，且不得将重置过的优化器、训练进度或 RNG 称为严格续训。
-
-Stage3 的反事实辅助监督仍作为历史研究机制保留，当前 MAPPO PPO 更新不依赖该监督，不包含独立监督价值网络或新增 Candidate Loss。
+Checkpoint 合同记录观测、候选特征、节点角色/数量、服务数、UAV ID/数量/条件宽度、Holding、奖励模型、动作概率、优化器、学习率、训练进度、Pool/config 标识与 Python/NumPy/PyTorch RNG 状态。严格续训必须逐项匹配。旧策略或不同维度 Checkpoint 不会静默映射为当前联合算法；只有显式权重初始化流程证明张量及语义兼容时才可迁移，且不得将重置过的优化器、训练进度或 RNG 称为严格续训。
 
 ## 检查边界
 

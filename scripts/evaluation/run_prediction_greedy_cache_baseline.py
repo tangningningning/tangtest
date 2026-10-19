@@ -30,7 +30,6 @@ for _import_root in (
 
 from decision import cache_configuration, slot_environment, task_allocation
 from ppo_simple.interface import prepare_aligned_rollout_steps
-from ppo_simple.mappo_baseline import MACRO_INTERVAL_SLOTS
 
 
 DEFAULT_EPISODE_SEED = 20031
@@ -38,6 +37,7 @@ DEFAULT_WINDOW_SLOTS = 10
 DEFAULT_FORECAST_SAMPLE_BUDGET = 4
 FORECAST_VALUE_HORIZON_SLOTS = 5
 MAX_CACHE_CANDIDATE_EVALUATIONS_PER_MACRO = 9
+PREDICTION_GREEDY_CACHE_INTERVAL_SLOTS = 2
 
 
 @dataclass(frozen=True)
@@ -383,7 +383,7 @@ def _actual_metrics(
     actual_execution_seconds = 0.0
     total_started = time.perf_counter()
     for index, step in enumerate(steps):
-        if predictive_greedy and index % int(MACRO_INTERVAL_SLOTS) == 0:
+        if predictive_greedy and index % PREDICTION_GREEDY_CACHE_INTERVAL_SLOTS == 0:
             prediction_started = time.perf_counter()
             target, decision = choose_cache_target(
                 context,
@@ -471,7 +471,7 @@ def _training_context_and_steps(
     episode_seed: int,
     slot_count: int,
 ) -> tuple[Any, list[Any], dict[str, Any]]:
-    import mappo_stage3_pool_contract as pool_contract
+    import training_pool_contract as pool_contract
     from common import project_config
 
     pool, pool_info = pool_contract._validate_pool(
@@ -546,7 +546,7 @@ def run_paired_training_window(
         "split": "train",
         "training_pool_manifest_sha256": pool_info["manifest_sha256"],
         "slot_count": int(slot_count),
-        "macro_interval_slots": int(MACRO_INTERVAL_SLOTS),
+        "macro_interval_slots": PREDICTION_GREEDY_CACHE_INTERVAL_SLOTS,
         "forecast_horizon_requested": int(FORECAST_VALUE_HORIZON_SLOTS),
         "forecast_horizon_evaluated": max(
             (len(item["forecast_horizons"]) for item in greedy["decisions"]),

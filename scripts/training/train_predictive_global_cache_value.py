@@ -73,7 +73,7 @@ def prepare_training_labels(
 
     budget.validate()
     profile, profile_sha256 = _load_profile()
-    import mappo_stage3_pool_contract as pool_contract
+    import training_pool_contract as pool_contract
 
     pool, pool_info = pool_contract._validate_pool(
         project_root.resolve(),
@@ -707,7 +707,7 @@ def fit_from_training_dataset(
     dataset_path = dataset_path.resolve()
     if metadata.get("dataset_sha256") != _sha256(dataset_path):
         raise ValueError("Training label dataset hash does not match its metadata")
-    import mappo_stage3_pool_contract as pool_contract
+    import training_pool_contract as pool_contract
 
     _pool, current_pool_info = pool_contract._validate_pool(
         project_root.resolve(),
