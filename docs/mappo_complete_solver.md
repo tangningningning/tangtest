@@ -10,6 +10,12 @@
 
 每次决策状态包含当前 Cache 矩阵、当前 UAV 坐标、决策时可用的车辆轨迹预测、服务流行度预测、预测 horizon mask 及 time-to-go。Macro 候选描述和 Micro UAV 候选描述使用同一时点的预测场景与合法性合同。真实任务和当 Slot 的实际车辆位置只在动作采样之后交给环境执行，不进入 Actor 状态或在线候选价值输入。
 
+### 车辆路线先验与研究车辆筛选边界
+
+车辆预测器在每个预测起点 `origin_slot=t` 只使用截至 `t-1` 的轨迹观测，并沿 Episode 的 `vehicle_roles.json` 中为该研究车辆记录的 `planned_routes.route_edges` 投影名义位置。当前系统模型将该 SUMO 已分配路线视为决策时可用的路线先验；预测器不读取起点之后的真实轨迹来构造 Actor 输入。若目标部署无法获得已提交路线，这一先验就不成立，必须先修订信息可用性合同，再讨论替换预测方法。
+
+正式数据生成只把在整个 Formal 区间每个 Slot 恰有一条有效轨迹记录、且在 Formal 起点前至少有一条有效 warm-up 记录的车辆纳入完整候选；随后按固定 seed 从中抽取研究车辆，再划分 SV 与任务车辆。因此当前车辆集合是整段 Episode 固定的完整轨迹 cohort，不覆盖 Formal 区间内新进入或提前离开的车辆，也不把背景车辆作为 Actor 的研究实体。该筛选适用于固定 cohort 的离线场景；动态车流成员变化需要额外的实体注册、存活 mask 和部分轨迹处理合同，当前实现不提供这类支持。
+
 - Macro Cache Actor 在 Holding 边界一次性选择 Cache 配置。多节点因子化模式对每个 Cache 节点使用共享参数策略，以 KEEP 为候选 0，对合法 UPDATE 候选使用 mask；各节点在同一决策前状态下采样，联合 log-prob 是各节点 log-prob 之和。稀疏协同动作模式使用“全 KEEP 或一个节点 UPDATE”的组分布，再按所选节点采样合法候选。
 - Micro UAV Actor 每 Slot 依稳定 UAV ID 顺序逐头采样。第一个头不依赖先前选择；后续头接收此前已选 UAV 坐标作为自回归条件。各头 log-prob 求和形成该 Slot 联合 log-prob。每个 UAV 都包含显式合法 STAY 候选。
 - 自适应 Holding 由 Macro 策略中的 termination head 决定。配置合同为 1–5 Slot；在达到最短间隔后，策略读取当前 Slot 执行后的观测决定继续或结束，达到 5 Slot 时强制结束。`fixed2` 通过同一 Trainer 的 `adaptive_holding_enabled=false, min=max=2` 固定为两个 Slot，不维护第二个 Trainer。
@@ -48,3 +54,5 @@ Stage3 的反事实辅助监督仍作为历史研究机制保留，当前 MAPPO 
 ## 检查边界
 
 当前合同通过的必要检查包括：源码语法/导入、动态 UAV 联合 log-prob 的采样与 Replay 形状、合法 Cache mask、SMDP duration 索引、正式 Reward 逐 Slot 一致性和当前 schema 的 Checkpoint round-trip。单次短训练只验证执行链路，不作为策略学习效果或泛化结论。完整 Validation/Test 评价和跨规模训练属于后续实验，不在代码结构交付中自动运行。
+
+正式冻结评价入口 `ppo-eval` 只接受 `environment_data/proposed_joint_validation/`。运行前会核对 Training 与 Validation Manifest 的 Episode seed/ID、源 Episode Manifest 哈希及共享 split Manifest，并把两份 Pool Manifest 哈希和实际选择的 Validation seed 写入结果；Training 或临时 Pool 会在读取 Episode 内容和创建输出目录前被拒绝。该入口不读取 Test Pool。

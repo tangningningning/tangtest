@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -137,6 +138,106 @@ def _episode_directories(pool: Path, seed_start: int, count: int) -> list[Path]:
     if len(children) < int(count):
         raise FileNotFoundError("evaluation episode pool 不足所需完整 realization 数量。")
     return children[: int(count)]
+
+
+def _validate_formal_validation_pool(
+    project_root: Path,
+    pool_path: Path,
+    seed_start: int,
+    episode_count: int,
+) -> dict[str, Any]:
+    """Require the frozen evaluator to use the official, disjoint Validation split."""
+    training_pool = (project_root / "environment_data/proposed_joint_training").resolve()
+    validation_pool = (project_root / "environment_data/proposed_joint_validation").resolve()
+    if pool_path.resolve() != validation_pool:
+        raise ValueError(
+            "ppo-eval requires the official Validation Pool; Training or ad-hoc pools "
+            "cannot be used for policy evaluation."
+        )
+
+    training_manifest_path = training_pool / "formal_pool_manifest.json"
+    validation_manifest_path = validation_pool / "formal_pool_manifest.json"
+    training_manifest_bytes = training_manifest_path.read_bytes()
+    validation_manifest_bytes = validation_manifest_path.read_bytes()
+    training_manifest = json.loads(training_manifest_bytes.decode("utf-8"))
+    validation_manifest = json.loads(validation_manifest_bytes.decode("utf-8"))
+    if training_manifest.get("split") != "train":
+        raise ValueError("Formal Training Pool manifest has an invalid split label.")
+    if validation_manifest.get("split") != "validation":
+        raise ValueError("Formal Validation Pool manifest has an invalid split label.")
+
+    def manifest_seed_ids(manifest: Mapping[str, Any], name: str) -> set[int]:
+        episode_hashes = manifest.get("episode_manifest_sha256")
+        if not isinstance(episode_hashes, Mapping):
+            raise ValueError(f"{name} manifest lacks episode manifest IDs.")
+        seeds = {int(value) for value in episode_hashes}
+        seed_start = int(manifest.get("seed_start", -1))
+        seed_end = int(manifest.get("seed_end", -1))
+        episode_count = int(manifest.get("episode_count", -1))
+        if (
+            episode_count <= 0
+            or len(seeds) != episode_count
+            or seeds != set(range(seed_start, seed_end + 1))
+        ):
+            raise ValueError(f"{name} manifest has incomplete or inconsistent seed coverage.")
+        return seeds
+
+    training_seeds = manifest_seed_ids(training_manifest, "Training Pool")
+    validation_seeds = manifest_seed_ids(validation_manifest, "Validation Pool")
+    if training_seeds & validation_seeds:
+        raise ValueError("Training and Validation Episode IDs/seeds overlap.")
+
+    training_sources = training_manifest.get("source_episode_manifest_sha256")
+    validation_sources = validation_manifest.get("source_episode_manifest_sha256")
+    if not isinstance(training_sources, Mapping) or not isinstance(validation_sources, Mapping):
+        raise ValueError("Formal split manifests lack source Episode provenance maps.")
+    if (
+        set(map(int, training_sources)) != training_seeds
+        or set(map(int, validation_sources)) != validation_seeds
+    ):
+        raise ValueError("Formal split source provenance does not cover every declared Episode.")
+
+    def source_manifest_hashes(values: Mapping[str, Any], name: str) -> set[str]:
+        hashes = [str(value) for value in values.values()]
+        if any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value.lower())
+            for value in hashes
+        ):
+            raise ValueError(f"{name} source Episode manifest hashes are invalid.")
+        return {value.lower() for value in hashes}
+
+    shared_sources = source_manifest_hashes(
+        training_sources, "Training Pool"
+    ) & source_manifest_hashes(validation_sources, "Validation Pool")
+    if shared_sources:
+        raise ValueError("Training and Validation share source Episode manifests.")
+    training_split_hash = training_manifest.get("data_split_manifest_sha256")
+    validation_split_hash = validation_manifest.get("data_split_manifest_sha256")
+    if not training_split_hash or training_split_hash != validation_split_hash:
+        raise ValueError("Training and Validation do not reference the same frozen split manifest.")
+
+    selected_seed_list = (
+        list(range(int(seed_start), int(seed_start) + int(episode_count)))
+        if int(seed_start) >= 0
+        else sorted(validation_seeds)[: int(episode_count)]
+    )
+    selected_seeds = set(selected_seed_list)
+    if (
+        len(selected_seeds) != int(episode_count)
+        or not selected_seeds.issubset(validation_seeds)
+    ):
+        raise ValueError("Selected evaluation Episodes are not unique members of frozen Validation.")
+    if selected_seeds & training_seeds:
+        raise ValueError("Selected evaluation Episodes overlap the Training Pool.")
+
+    return {
+        "split": "validation",
+        "manifest_sha256": hashlib.sha256(validation_manifest_bytes).hexdigest(),
+        "training_manifest_sha256": hashlib.sha256(training_manifest_bytes).hexdigest(),
+        "data_split_manifest_sha256": str(validation_split_hash),
+        "episode_seeds": selected_seed_list,
+    }
 
 
 def _load_checkpoint_metadata(path: Path) -> dict[str, Any]:
@@ -802,8 +903,21 @@ def evaluate_pool(
     project_root = reference_context.root
     pool_path = _resolve_path(project_root, episode_pool)
     output_path = _resolve_path(project_root, run_dir)
-    _ensure_fresh_output(output_path)
+    validation_pool_contract = _validate_formal_validation_pool(
+        project_root,
+        pool_path,
+        int(seed_start),
+        int(episodes),
+    )
     episode_paths = _episode_directories(pool_path, int(seed_start), int(episodes))
+    selected_path_seeds = [
+        int(re.fullmatch(r"episode_(\d+)", path.name).group(1))
+        for path in episode_paths
+        if re.fullmatch(r"episode_(\d+)", path.name)
+    ]
+    if selected_path_seeds != validation_pool_contract["episode_seeds"]:
+        raise ValueError("Resolved Validation Episode paths do not match the frozen manifest seed selection.")
+    _ensure_fresh_output(output_path)
     raw_config_sha256 = project_config.raw_config_sha256(config_file)
     semantic_sha256 = project_config.semantic_config_hash(reference_context.cfg)
     summaries: list[dict[str, Any]] = []
@@ -971,6 +1085,7 @@ def evaluate_pool(
         "policy_schema": reference_context.policy_schema,
         "configuration_control_mode": PROPOSED_CONTROL_MODE,
         "episode_pool": str(pool_path),
+        "evaluation_pool_contract": validation_pool_contract,
         "episode_count": len(environment_means),
         "seed_start": int(seed_start),
         "episodes": int(episodes),
