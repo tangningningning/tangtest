@@ -259,12 +259,12 @@ movement_fixed_cost = 100.0
 # Edge, and Hybrid Deployments, IEEE Transactions on Vehicular Technology 75(4):6565-6581, 2026,
 # DOI 10.1109/TVT.2025.3620810。
 # legacy_unlimited 模式使用的兼容每任务计算能力 F_c，单位 cycle/s。
-cpu_cycles_per_s = 40.0e9
+cpu_cycles_per_s = 20.0e9
 # legacy_unlimited 模式的兼容总 CPU 字段；finite_pool 改用 cpu_capacity_cycles_per_s。
-total_cpu_cycles_per_s = 40.0e9
-# Cloud有限共享CPU总池为40 GHz；这是仿真假设，不是部署测量。
+total_cpu_cycles_per_s = 20.0e9
+# Cloud有限共享CPU总池为20 GHz；这是仿真假设，不是部署测量。
 resource_mode = "finite_pool"
-cpu_capacity_cycles_per_s = 40.0e9
+cpu_capacity_cycles_per_s = 20.0e9
 # 本次实验设计指定 Cloud 每任务固定等效上行速率为 20 Mbps。
 # Matching运行时每个Cloud任务使用此固定等效值，不按任务数再次分摊。
 # 这是抽象实验参数，不代表实际网络保证吞吐或物理可靠接入。
@@ -375,18 +375,19 @@ omega_energy = 0.5
 # C_ca(t) = lambda_cache * sum_m [eta_ca_m * z_ca_actual_m(t) + E_ca,m(t)]。
 # lambda_cache 统一缩放固定重配置项和新增装载项；eta_ca 是等价迁移后的目标系数。
 # z_ca_actual_m=1 仅当该节点缓存实际变化；删除服务不产生负装载量，KEEP 成本为零。
-# 当前系数由旧公式严格代数迁移，保持成本数值；不代表新的物理能耗标定。
+# 基于 Training Pilot 的探索性降本配置；并非物理成本重新标定，也未验证为最优系数。
 # 系统 Slot 目标：G(t) = Q(t) - C_ca(t) - C_q(t)，两类正成本均只扣除一次。
 # Cache/UAV 配置固定时，成本对 Matching/KKT 是常数；资源优化仍以 Q(t) 为目标。
-lambda_cache = 0.01
+# lambda_cache 统一缩放固定重配置项和新增装载项。
+lambda_cache = 0.005
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
 # lambda_movement 统一缩放 UAV 固定位置更新项和移动能耗项。
 # E_mov,u = movement_energy_coefficient_j_per_m * effective_distance_m，单位 J。
 # C_q(t) = lambda_movement * sum_u [movement_fixed_cost_u * z_q_actual_u(t) + E_mov,u(t)]。
 # movement_fixed_cost 是为保持旧公式成本等价而迁移的目标项，不是实测固定能耗。
 # movement_energy_j 仍是原始移动能耗统计；只有 C_q 经 lambda_movement 缩放。
-# 当前参数由旧公式严格代数迁移，保持成本数值；不代表新的硬件能耗标定。
-lambda_movement = 8.8e-6
+# 基于 Training Pilot 的探索性降本配置；并非物理成本重新标定，也未验证为最优系数。
+lambda_movement = 5.0e-6
 # T_ref/E_ref are train-only P95 normalization constants for the PER_SLOT_ANALYTIC
 # task model. Calibration used 12 Training realizations (seeds 20001, 20028, 20055,
 # 20082, 20110, 20137, 20164, 20191, 20218, 20245, 20272, 20300), sampling slots
@@ -394,8 +395,9 @@ lambda_movement = 8.8e-6
 # Reference policy is independent of T_ref/E_ref: fixed feasible role-indexed initial
 # Cache (seed 4401), configured fixed UAV positions, greedy least-loaded choice among
 # physically feasible cached Edge nodes (stable node-order tie break; Cloud only if
-# no Edge candidate), equal per-node CPU/BW shares, and equal sharing of finite 40 GHz
-# Cloud CPU; Cloud upload is 20 Mbps and factor 13 applies to delay only.
+# no Edge candidate), equal per-node CPU/BW shares, and equal sharing of the finite
+# 40 GHz Cloud CPU pool used during the historical T_ref/E_ref calibration. Cloud
+# upload is 20 Mbps and factor 13 applies to delay only.
 # T_ref is task-level P95 complete delay in seconds; E_ref is task-level P95 vehicle
 # upload energy in joules. Validation and Test were not used.
 T_ref = 30.473728355325758
