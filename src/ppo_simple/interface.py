@@ -429,11 +429,12 @@ class ConfigurationObservationSpec:
     horizon_mask_slice: slice | None
     time_to_go_slice: slice | None
     base_observation_dim: int
-    edge_service_lock_slice: slice | None
-    edge_upload_workload_slice: slice | None
-    edge_compute_workload_slice: slice | None
-    cloud_backlog_slice: slice | None
-    uav_tv_upload_slice: slice | None
+    # Preserve these None-only metadata keys for existing feature-slice contracts.
+    edge_service_lock_slice: None
+    edge_upload_workload_slice: None
+    edge_compute_workload_slice: None
+    cloud_backlog_slice: None
+    uav_tv_upload_slice: None
     observation_dim: int
     prediction_horizon: int = 1
 
@@ -471,7 +472,6 @@ class ConfigurationObservationSpec:
         include_time_to_go: bool = False,
         prediction_horizon: int = 1,
         include_prediction_horizon_mask: bool = False,
-        include_ledger_features: bool = False,
     ) -> "ConfigurationObservationSpec":
         cache_node_ids_t = tuple(str(value) for value in cache_node_ids)
         service_ids_t = tuple(int(value) for value in service_ids)
@@ -525,20 +525,6 @@ class ConfigurationObservationSpec:
         edge_compute_workload_slice = None
         cloud_backlog_slice = None
         uav_tv_upload_slice = None
-        if include_ledger_features:
-            edge_service_feature_len = len(cache_node_ids_t) * len(service_ids_t)
-            edge_service_lock_slice = slice(start, start + edge_service_feature_len)
-            start += edge_service_feature_len
-            edge_upload_workload_slice = slice(start, start + edge_service_feature_len)
-            start += edge_service_feature_len
-            edge_compute_workload_slice = slice(start, start + edge_service_feature_len)
-            start += edge_service_feature_len
-            cloud_backlog_slice = slice(start, start + 4)
-            start += 4
-            uav_tv_upload_slice = slice(
-                start, start + len(uav_ids_t) * len(task_vehicle_ids_t)
-            )
-            start += len(uav_ids_t) * len(task_vehicle_ids_t)
         return cls(
             cache_node_ids=cache_node_ids_t,
             service_ids=service_ids_t,
@@ -573,7 +559,6 @@ class ConfigurationObservationSpec:
         include_time_to_go: bool = False,
         prediction_horizon: int = 1,
         include_prediction_horizon_mask: bool = False,
-        include_ledger_features: bool = False,
     ) -> "ConfigurationObservationSpec":
         return cls.create(
             cache_nodes["node_ids"],
@@ -584,7 +569,6 @@ class ConfigurationObservationSpec:
             include_time_to_go=include_time_to_go,
             prediction_horizon=prediction_horizon,
             include_prediction_horizon_mask=include_prediction_horizon_mask,
-            include_ledger_features=include_ledger_features,
         )
 
 
@@ -773,246 +757,6 @@ def prediction_horizon_valid_mask(
     )
 
 
-LEDGER_FEATURE_SCHEMA = "configuration_ledger_state_v1"
-LEDGER_FEATURE_NORMALIZATION = "bounded_log1p_ratio_v1"
-LEDGER_FEATURE_SLOT_SECONDS = 1.0
-
-
-def _normalize_ledger_workload(values: Any, references: Any, label: str) -> np.ndarray:
-    """Map finite nonnegative physical work to a bounded monotone [0, 1) value."""
-
-    workload = np.asarray(values, dtype=np.float64)
-    reference = np.asarray(references, dtype=np.float64)
-    if not np.all(np.isfinite(workload)) or np.any(workload < 0.0):
-        raise ValueError(f"{label} must be finite and nonnegative")
-    if not np.all(np.isfinite(reference)) or np.any(reference <= 0.0):
-        raise ValueError(f"{label} normalization reference must be finite and positive")
-    try:
-        workload, reference = np.broadcast_arrays(workload, reference)
-    except ValueError as exc:
-        raise ValueError(
-            f"{label} shape is incompatible with its normalization reference"
-        ) from exc
-    log_load = np.zeros(workload.shape, dtype=np.float64)
-    positive = workload > 0.0
-    log_ratio = np.log(workload[positive]) - np.log(reference[positive])
-    log_load[positive] = np.logaddexp(0.0, log_ratio)
-    normalized = log_load / (1.0 + log_load)
-    if (
-        not np.all(np.isfinite(normalized))
-        or np.any(normalized < 0.0)
-        or np.any(normalized >= 1.0)
-    ):
-        raise FloatingPointError(f"{label} normalization produced an invalid value")
-    return normalized
-
-
-def _ledger_finite_nonnegative(value: Any, field_name: str, task_id: str) -> float:
-    numeric = float(value)
-    if not np.isfinite(numeric) or numeric < 0.0:
-        raise ValueError(f"{field_name}[{task_id!r}] must be finite and nonnegative")
-    return numeric
-
-
-def _ledger_observation_features(
-    cache_state: Any,
-    task_ledger: slot_environment.CrossSlotTaskLedger,
-    observation_spec: ConfigurationObservationSpec,
-    service_catalog: dict[str, Any],
-    cache_nodes: dict[str, Any],
-    cache_cfg: cache_configuration.CacheOptimizationConfig,
-) -> np.ndarray:
-    """Build the appended workload features from the current persistent task ledger."""
-
-    ledger_slices = (
-        observation_spec.edge_service_lock_slice,
-        observation_spec.edge_upload_workload_slice,
-        observation_spec.edge_compute_workload_slice,
-        observation_spec.cloud_backlog_slice,
-        observation_spec.uav_tv_upload_slice,
-    )
-    if any(value is None for value in ledger_slices):
-        raise ValueError("Ledger features require an observation spec that includes them")
-    node_ids = tuple(str(value) for value in cache_nodes["node_ids"])
-    node_roles = tuple(str(value).upper() for value in cache_nodes["node_roles"])
-    if node_ids != observation_spec.cache_node_ids or len(node_roles) != len(node_ids):
-        raise ValueError(
-            "Ledger Cache node order differs from the observation specification"
-        )
-    catalog_service_ids = tuple(
-        int(value) for value in np.asarray(service_catalog["service_ids"]).tolist()
-    )
-    if catalog_service_ids != observation_spec.service_ids:
-        raise ValueError("Ledger service order differs from the observation specification")
-
-    locks = slot_environment.active_cache_service_locks(
-        task_ledger,
-        np.asarray(cache_state, dtype=np.int8),
-        service_catalog,
-        cache_nodes,
-        expected_node_ids=observation_spec.cache_node_ids,
-        expected_service_ids=observation_spec.service_ids,
-    )
-    node_index_by_id = {node_id: index for index, node_id in enumerate(node_ids)}
-    service_index_by_id = {
-        service_id: index for index, service_id in enumerate(observation_spec.service_ids)
-    }
-    uav_index_by_id = {
-        uav_id: index for index, uav_id in enumerate(observation_spec.uav_ids)
-    }
-    task_vehicle_index_by_id = {
-        vehicle_id: index
-        for index, vehicle_id in enumerate(observation_spec.task_vehicle_ids)
-    }
-    role_cpu_rates = {
-        "SV": float(cache_cfg.sv_cpu_cycles_per_s),
-        "RSU": float(cache_cfg.rsu_cpu_cycles_per_s),
-        "UAV": float(cache_cfg.uav_cpu_cycles_per_s),
-    }
-    unknown_roles = sorted(set(node_roles) - set(role_cpu_rates))
-    if unknown_roles:
-        raise ValueError(
-            f"unsupported Edge Cache node roles in Ledger observation: {unknown_roles}"
-        )
-    edge_cpu_references = np.asarray(
-        [role_cpu_rates[role] * LEDGER_FEATURE_SLOT_SECONDS for role in node_roles],
-        dtype=np.float64,
-    )[:, None]
-    upload_reference_bits = (
-        float(cache_cfg.cloud_uplink_rate_bps) * LEDGER_FEATURE_SLOT_SECONDS
-    )
-    cloud_cpu_reference = (
-        float(cache_cfg.cloud_cpu_capacity_cycles_per_s)
-        * LEDGER_FEATURE_SLOT_SECONDS
-    )
-    if not np.isfinite(upload_reference_bits) or upload_reference_bits <= 0.0:
-        raise ValueError("Cloud uplink rate must be positive to normalize upload workload")
-    if not np.isfinite(cloud_cpu_reference) or cloud_cpu_reference <= 0.0:
-        raise ValueError("Cloud CPU capacity must be positive to normalize compute workload")
-
-    edge_upload_bits = np.zeros((len(node_ids), len(service_index_by_id)), dtype=np.float64)
-    edge_cpu_cycles = np.zeros_like(edge_upload_bits)
-    cloud_task_count = 0.0
-    cloud_upload_bits = 0.0
-    cloud_cpu_cycles = 0.0
-    cloud_extra_delay_s = 0.0
-    uav_tv_upload_bits = np.zeros(
-        (len(observation_spec.uav_ids), len(observation_spec.task_vehicle_ids)),
-        dtype=np.float64,
-    )
-    allowed_stages = {"UPLOADING", "COMPUTING", "NETWORK_DELAY"}
-    for task_id, state in sorted(task_ledger.active.items(), key=lambda item: str(item[0])):
-        if str(task_id) != str(state.task_id):
-            raise ValueError(f"active task ledger key mismatch: {task_id}")
-        stage = str(state.execution_stage).upper()
-        if stage not in allowed_stages:
-            raise ValueError(
-                f"task {task_id} has invalid active execution stage at observation boundary: {stage}"
-            )
-        service_id = int(state.service_id)
-        if service_id not in service_index_by_id:
-            raise ValueError(f"task {task_id} references unknown service ID {service_id}")
-        vehicle_id = str(state.vehicle_id)
-        if vehicle_id not in task_vehicle_index_by_id:
-            raise ValueError(
-                f"task {task_id} vehicle {vehicle_id!r} is absent from formal vehicle order"
-            )
-        remaining_input_bits = _ledger_finite_nonnegative(
-            state.remaining_input_bits, "remaining_input_bits", task_id
-        )
-        remaining_cpu_cycles = _ledger_finite_nonnegative(
-            state.remaining_cpu_cycles, "remaining_cpu_cycles", task_id
-        )
-        remaining_network_delay_s = _ledger_finite_nonnegative(
-            state.remaining_network_delay_s, "remaining_network_delay_s", task_id
-        )
-        assigned_node = str(state.assigned_node)
-        if assigned_node == task_allocation.CLOUD:
-            cloud_task_count += 1.0
-            if stage == "UPLOADING":
-                cloud_upload_bits += remaining_input_bits
-            cloud_cpu_cycles += remaining_cpu_cycles
-            cloud_extra_delay_s += remaining_network_delay_s
-            continue
-        if assigned_node not in node_index_by_id:
-            raise ValueError(
-                f"task {task_id} references unknown Edge node {assigned_node!r}"
-            )
-        node_index = node_index_by_id[assigned_node]
-        service_index = service_index_by_id[service_id]
-        edge_cpu_cycles[node_index, service_index] += remaining_cpu_cycles
-        if stage == "UPLOADING":
-            edge_upload_bits[node_index, service_index] += remaining_input_bits
-            if assigned_node in uav_index_by_id:
-                uav_tv_upload_bits[
-                    uav_index_by_id[assigned_node], task_vehicle_index_by_id[vehicle_id]
-                ] += remaining_input_bits
-
-    normalized_edge_upload = _normalize_ledger_workload(
-        edge_upload_bits,
-        upload_reference_bits,
-        "Edge remaining upload bits",
-    )
-    normalized_edge_cpu = _normalize_ledger_workload(
-        edge_cpu_cycles,
-        edge_cpu_references,
-        "Edge remaining CPU cycles",
-    )
-    normalized_cloud_backlog = np.asarray(
-        [
-            float(
-                _normalize_ledger_workload(
-                    cloud_task_count, 1.0, "Cloud active task count"
-                )
-            ),
-            float(
-                _normalize_ledger_workload(
-                    cloud_upload_bits,
-                    upload_reference_bits,
-                    "Cloud remaining upload bits",
-                )
-            ),
-            float(
-                _normalize_ledger_workload(
-                    cloud_cpu_cycles,
-                    cloud_cpu_reference,
-                    "Cloud remaining CPU cycles",
-                )
-            ),
-            float(
-                _normalize_ledger_workload(
-                    cloud_extra_delay_s,
-                    LEDGER_FEATURE_SLOT_SECONDS,
-                    "Cloud extra network delay",
-                )
-            ),
-        ],
-        dtype=np.float64,
-    )
-    normalized_uav_tv_upload = _normalize_ledger_workload(
-        uav_tv_upload_bits,
-        upload_reference_bits,
-        "UAV/TV remaining upload bits",
-    )
-    features = np.concatenate(
-        [
-            locks.reshape(-1).astype(np.float64),
-            normalized_edge_upload.reshape(-1),
-            normalized_edge_cpu.reshape(-1),
-            normalized_cloud_backlog,
-            normalized_uav_tv_upload.reshape(-1),
-        ]
-    )
-    expected_size = (
-        sum(int(value.stop) - int(value.start) for value in ledger_slices)
-    )
-    if features.shape != (expected_size,) or not np.all(np.isfinite(features)):
-        raise ValueError("Ledger observation features have invalid shape or non-finite values")
-    if np.any(features < 0.0) or np.any(features > 1.0):
-        raise ValueError("Ledger observation features must lie in [0, 1]")
-    return features
-
-
 def build_configuration_observation(
     previous_cache_state: Any,
     previous_uav_positions: dict[str, Any] | Any,
@@ -1021,14 +765,10 @@ def build_configuration_observation(
     observation_spec: ConfigurationObservationSpec,
     flight_boundary: tuple[float, float, float, float],
     *,
-    task_ledger: slot_environment.CrossSlotTaskLedger | None = None,
-    service_catalog: dict[str, Any] | None = None,
-    cache_nodes: dict[str, Any] | None = None,
-    cache_cfg: cache_configuration.CacheOptimizationConfig | None = None,
     time_to_go: float | None = None,
     prediction_horizon_mask: Any = None,
 ) -> np.ndarray:
-    """Build the formal state, optionally appending legacy Ledger features."""
+    """Build the formal state from current configuration and predictions."""
 
     m = len(observation_spec.cache_node_ids)
     f = len(observation_spec.service_ids)
@@ -1104,26 +844,6 @@ def build_configuration_observation(
             raise ValueError("time_to_go must be finite and within [0, 1]")
         time_features = np.asarray([time_value], dtype=np.float64)
 
-    if task_ledger is None:
-        if any(
-            value is not None
-            for value in (service_catalog, cache_nodes, cache_cfg)
-        ):
-            raise ValueError(
-                "Ledger observation dependencies must be omitted when no Ledger is supplied"
-            )
-        ledger_features = np.empty(0, dtype=np.float64)
-    else:
-        if service_catalog is None or cache_nodes is None or cache_cfg is None:
-            raise ValueError("Ledger observation requires its catalog, nodes, and cache config")
-        ledger_features = _ledger_observation_features(
-            previous_cache,
-            task_ledger,
-            observation_spec,
-            service_catalog,
-            cache_nodes,
-            cache_cfg,
-        )
     observation = np.concatenate(
         [
             cache_features,
@@ -1132,7 +852,6 @@ def build_configuration_observation(
             popularity_features,
             horizon_mask_features,
             time_features,
-            ledger_features,
         ]
     )
     if observation.shape != (observation_spec.observation_dim,):
@@ -1151,10 +870,6 @@ def build_step_observation(
     train_origin_start: int,
     train_origin_end: int,
     *,
-    task_ledger: slot_environment.CrossSlotTaskLedger | None = None,
-    service_catalog: dict[str, Any] | None = None,
-    cache_nodes: dict[str, Any] | None = None,
-    cache_cfg: cache_configuration.CacheOptimizationConfig | None = None,
     time_to_go_override: float | None = None,
 ) -> np.ndarray:
     """构造 Macro Cache 与 Micro UAV 共用的正式 slot observation。"""
@@ -1185,10 +900,6 @@ def build_step_observation(
         predicted_service_popularity,
         observation_spec,
         flight_boundary,
-        task_ledger=task_ledger,
-        service_catalog=service_catalog,
-        cache_nodes=cache_nodes,
-        cache_cfg=cache_cfg,
         time_to_go=time_to_go,
         prediction_horizon_mask=prediction_horizon_mask,
     )

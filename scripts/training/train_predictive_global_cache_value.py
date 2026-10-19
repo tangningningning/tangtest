@@ -359,18 +359,6 @@ def prepare_state_coverage_training_labels(
     pair_count = 0
     pool_info: dict[str, Any] | None = None
 
-    def empty_lock_mask(seed: int, cache: np.ndarray, context: Any) -> np.ndarray:
-        # The formal predictive-Cache executor evaluates each Slot independently
-        # and carries no active task ledger. Constructing its empty ledger makes
-        # the service-lock contract explicit for these decision states.
-        ledger = slot_environment.CrossSlotTaskLedger(episode_id=f"train_{seed}")
-        return slot_environment.active_cache_service_locks(
-            ledger,
-            cache,
-            context.service_catalog,
-            context.cache_nodes,
-        )
-
     for episode_index, seed in enumerate(seeds):
         context, steps, loaded_pool_info = training_context_and_steps(
             project_root.resolve(), seed, requested_slots
@@ -393,7 +381,11 @@ def prepare_state_coverage_training_labels(
             if pair_count >= int(max_candidate_pairs):
                 break
             step = steps[offset]
-            locks = empty_lock_mask(seed, current_cache, context)
+            cache_configuration.validate_cache_shape_and_capacity(
+                current_cache, context.service_catalog, context.cache_nodes
+            )
+            # independent_per_slot has no active tasks that lock Cache contents.
+            locks = np.zeros_like(current_cache, dtype=bool)
             remaining_budget = int(max_candidate_pairs) - pair_count
             state_pair_budget = min(candidates_per_state, remaining_budget)
             proposals = predictive_global_cache.bounded_single_node_candidates(
@@ -461,7 +453,7 @@ def prepare_state_coverage_training_labels(
                     target_cache, context.service_catalog, context.cache_nodes
                 )
                 if np.any(locks[node_index] & (current_cache[node_index] != target_row)):
-                    raise ValueError("candidate update would evict a service locked by the formal task ledger")
+                    raise ValueError("candidate update violates the supplied service-lock mask")
                 features = predictive_global_cache.build_global_candidate_features(
                     current_cache,
                     target_cache,
