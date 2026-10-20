@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
-import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -33,15 +33,20 @@ TRAIN_POOL_RELATIVE = Path("environment_data/proposed_joint_training")
 VALIDATION_POOL_RELATIVE = Path("environment_data/proposed_joint_validation")
 DEFAULT_TRAINING_SEED_START = 20001
 
-# A single, reviewed compatibility profile for the frozen 500–1000 KB pools.
-# Any other hash or field difference remains a hard failure.
-LEGACY_POOL_CONFIG_REVISION = "df52747091cbd255f0dc65686d6e4d34656ba8e2"
-LEGACY_POOL_CONFIG_SHA256 = "80762a71c870499eb9cce6aba330531495eac88783732c2ead1b045b2ba8f7c9"
-LEGACY_POOL_SEMANTIC_SHA256 = "3ff3f083562393b6d66492ec2c43be9e5e8ff0bd9ecf425823ccac0ae40f533e"
-CURRENT_FORMAL_CONFIG_SHA256 = "a4a150b7675ca4f287452f7c7477e989f53a11e0bd1479c4cebce6b4b65d102e"
-CURRENT_FORMAL_SEMANTIC_SHA256 = "ea7faf221e6e4b8e3e4ff2dee4a1b92fc3abb22af33550e868484ad37ebf7642"
+# The training data contract is pinned independently of runtime/reward/MAPPO values.
+FORMAL_TRAINING_POOL_MANIFEST_SHA256 = (
+    "b6cae236b029f4d24c7488a91f0825247a20f475ec76b2d80737de44ae491bd3"
+)
+FORMAL_TRAINING_POOL_INTEGRITY_BASELINE_SHA256 = (
+    "43e82e19a1231ea2719541080c8b16b2137a7df5166a9a94a1ca19b9b7e01538"
+)
+FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT = 3002
+FORMAL_TRAINING_EPISODE_COUNT = 300
+FORMAL_TRAINING_EPISODE_SLOTS = 300
+FORMAL_TRAINING_TASK_CONTRACT_SHA256 = (
+    "dc7e83d99c69f1c3ea603c18fe9a2606f0bffe477556e75924e1d8dfd24387c3"
+)
 CURRENT_GENERATION_FINGERPRINT = "4083b917948cd7203972c0edd5b40d2efefd8984dde27089a77da43d460b32f3"
-SOURCE_CONFIG_REVISION = "eaa44d9169aa12c88012c8ad74a2c342098edfae"
 SOURCE_CONFIG_SHA256 = "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77"
 SOURCE_SEMANTIC_SHA256 = "10f893fc549c4016bedb1a5389ad996f9a3ff646aa012596a7230c284b13f542"
 SOURCE_GENERATION_FINGERPRINT = "cfb3ee9fae004108af2d6bcb641609142c305d3ad6cc3ca74be13faaa6ff9865"
@@ -50,52 +55,6 @@ TARGET_CATALOG_SHA256 = "6e8c497ed06d76e1251720ebc926e975a6a5c079fd224acab95ea5f
 VALIDATION_SOURCE_GENERATION_FINGERPRINT = "9ad3c6179be6cea67a0c95695f0cc2802e7570274c9be5446e51d996d5f7045d"
 VALIDATION_SOURCE_CATALOG_PATH = "data/generated/service_catalog.json"
 VALIDATION_SOURCE_CATALOG_SHA256 = "3adb64f9724a429a5cb6bf9c6eb609a54120d9918feaab1dd0475034af22e402"
-VALIDATION_SOURCE_SPLIT_SHA256 = "3ecc408fb6f1dba72f9a9d1575d51c8e308710e26f5504e81a5ea7824290c331"
-VALIDATION_SPLIT_MANIFEST_SHA256 = "70e6aea73efb23c929cecd2372d9c155b4aebea25c3bcfb59750c742f686f26d"
-VALIDATION_SOURCE_CONFIG_SHA256 = "09783c6b360443f18da1c96209aebf925cc080a429750350e1c6ea97471e1e5b"
-VALIDATION_SOURCE_CONFIG_SHA256_AT_START = "759d42cc2b303339e5f71dded2f40a9d4858e3a1878b66104d689081644a0cb9"
-LEGACY_POOL_FIELD_DIFFERENCES = {
-    "algorithm.ppo.policy_schema": (
-        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v4_multi_node_cache_factorized_v1",
-        "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_v5_multi_node_cache_factorized_v1_keep_node_identity_v1_per_slot_analytic_task_model_v1_training_p95_reward_norm_v1",
-        "METADATA_ONLY",
-    ),
-    "algorithm.ppo.task_execution_model": (
-        None,
-        "PER_SLOT_ANALYTIC",
-        "RUNTIME_ONLY",
-    ),
-    "nodes.rsu.eta_ca": (0.10, 1.0, "COST_EQUIVALENT_REPARAMETERIZATION"),
-    "nodes.sv.eta_ca": (0.20, 2.0, "COST_EQUIVALENT_REPARAMETERIZATION"),
-    "nodes.uav.eta_ca": (0.15, 1.5, "COST_EQUIVALENT_REPARAMETERIZATION"),
-    "nodes.uav.movement.movement_fixed_cost": (
-        0.00176,
-        100.0,
-        "COST_EQUIVALENT_REPARAMETERIZATION",
-    ),
-    "objective.E_ref": (3.06289851662, 5.1574642506299275, "RUNTIME_ONLY"),
-    "objective.T_ref": (30.6289851662, 30.473728355325758, "RUNTIME_ONLY"),
-    "objective.cache_cost_weight": (
-        0.1,
-        None,
-        "COST_EQUIVALENT_REPARAMETERIZATION",
-    ),
-    "objective.lambda_cache": (
-        0.1,
-        0.01,
-        "COST_EQUIVALENT_REPARAMETERIZATION",
-    ),
-    "objective.lambda_movement": (
-        1.76e-5,
-        8.8e-6,
-        "COST_EQUIVALENT_REPARAMETERIZATION",
-    ),
-    "objective.uav_movement_cost_weight": (
-        0.50,
-        None,
-        "COST_EQUIVALENT_REPARAMETERIZATION",
-    ),
-}
 SOURCE_PREDICTION_ARTIFACTS = {
     "popularity.csv",
     "popularity_history.csv",
@@ -143,223 +102,30 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    flattened: dict[str, Any] = {}
-    for key, value in config.items():
-        path = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, dict):
-            flattened.update(_flatten_config(value, path))
-        else:
-            flattened[path] = value
-    return flattened
-
-
-def _git_config_bytes(formal_root: Path, revision: str) -> bytes:
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{CONFIG_RELATIVE.as_posix()}"],
-        cwd=formal_root,
-        check=False,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise ValueError(
-            f"Unable to read pinned configuration {revision}:{CONFIG_RELATIVE}: "
-            f"{result.stderr.decode('utf-8', errors='replace').strip()}"
-        )
-    return result.stdout
-
-
 def _validate_pool_config_compatibility(
-    formal_root: Path,
-    config_path: Path,
     manifest: dict[str, Any],
     *,
-    config_hash: str,
-    semantic_hash: str,
     generation_fingerprint: str,
 ) -> dict[str, Any]:
-    pool_raw_hash = manifest.get("config_sha256")
-    pool_semantic_hash = manifest.get("semantic_config_sha256")
-    if (pool_raw_hash, pool_semantic_hash) == (config_hash, semantic_hash):
-        return {
-            "policy": "EXACT_CONFIG_MATCH",
-            "pool_config_sha256": pool_raw_hash,
-            "pool_semantic_config_sha256": pool_semantic_hash,
-            "runtime_config_sha256": config_hash,
-            "runtime_semantic_config_sha256": semantic_hash,
-            "approved_field_differences": [],
-        }
-
-    expected_pool_pair = (LEGACY_POOL_CONFIG_SHA256, LEGACY_POOL_SEMANTIC_SHA256)
-    expected_runtime_pair = (CURRENT_FORMAL_CONFIG_SHA256, CURRENT_FORMAL_SEMANTIC_SHA256)
-    if (pool_raw_hash, pool_semantic_hash) != expected_pool_pair:
+    pool_fingerprint = manifest.get("target_generation_config_fingerprint")
+    if generation_fingerprint != CURRENT_GENERATION_FINGERPRINT or (
+        pool_fingerprint != CURRENT_GENERATION_FINGERPRINT
+    ):
         raise ValueError(
-            "Unrecognized Training-Pool configuration provenance: "
-            f"pool=({pool_raw_hash!r}, {pool_semantic_hash!r}), "
-            f"runtime=({config_hash!r}, {semantic_hash!r})"
-        )
-    if (config_hash, semantic_hash) != expected_runtime_pair:
-        raise ValueError(
-            "Reviewed legacy compatibility applies only to the pinned current "
-            f"formal config; actual=({config_hash!r}, {semantic_hash!r})"
-        )
-
-    historical_bytes = _git_config_bytes(formal_root, LEGACY_POOL_CONFIG_REVISION)
-    historical_hash = hashlib.sha256(historical_bytes).hexdigest()
-    if historical_hash != LEGACY_POOL_CONFIG_SHA256:
-        raise ValueError(
-            "Pinned historical config bytes do not match the Training-Pool raw hash: "
-            f"git={historical_hash}, manifest={LEGACY_POOL_CONFIG_SHA256}"
-        )
-    historical_config = tomllib.loads(historical_bytes.decode("utf-8"))
-    runtime_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    historical_flat = _flatten_config(historical_config)
-    runtime_flat = _flatten_config(runtime_config)
-    missing = object()
-    observed_differences = {
-        path: (historical_flat.get(path, missing), runtime_flat.get(path, missing))
-        for path in sorted(set(historical_flat) | set(runtime_flat))
-        if historical_flat.get(path, missing) != runtime_flat.get(path, missing)
-    }
-    def expected_value(value: Any) -> Any:
-        return missing if value is None else value
-
-    expected_differences = {
-        path: (expected_value(old_value), expected_value(new_value))
-        for path, (old_value, new_value, _category) in LEGACY_POOL_FIELD_DIFFERENCES.items()
-    }
-    if observed_differences != expected_differences:
-        printable = {
-            path: ["<MISSING>" if before is missing else before,
-                   "<MISSING>" if after is missing else after]
-            for path, (before, after) in observed_differences.items()
-        }
-        raise ValueError(
-            "Legacy configuration has an unapproved field difference: "
-            f"{json.dumps(printable, ensure_ascii=False, sort_keys=True)}"
-        )
-
-    if generation_fingerprint != CURRENT_GENERATION_FINGERPRINT or manifest.get(
-        "target_generation_config_fingerprint"
-    ) != CURRENT_GENERATION_FINGERPRINT:
-        raise ValueError(
-            "Legacy compatibility requires the exact frozen generation fingerprint: "
-            f"pool={manifest.get('target_generation_config_fingerprint')!r}, "
+            "Training data generation contract mismatch: "
+            f"pool={pool_fingerprint!r}, "
             f"runtime={generation_fingerprint!r}"
         )
-
-    source_provenance = manifest.get("source_provenance")
-    split = manifest.get("split")
-    source_contract_identity: dict[str, Any]
-    if split == "train":
-        source_config_bytes = _git_config_bytes(formal_root, SOURCE_CONFIG_REVISION)
-        source_config_hash = hashlib.sha256(source_config_bytes).hexdigest()
-        if source_config_hash != SOURCE_CONFIG_SHA256:
-            raise ValueError(
-                "Pinned source-generation config does not match its recorded raw hash: "
-                f"git={source_config_hash}, expected={SOURCE_CONFIG_SHA256}"
-            )
-        expected_source_fields = {
-            "source_pool_manifest_sha256": "c9c401dfe6c36b11faecfa080b86cb878d325c2799ee7e54435ad85365992d93",
-            "source_integrity_baseline_sha256": "f25594d7da6fac36af2f8e7ce00b3f124e16e0fcc5d711d691ac99e5d0337b94",
-            "source_service_catalog_sha256": SOURCE_CATALOG_SHA256,
-            "canonical_old_service_catalog_path": (
-                "environment_data/stage6_candidate_feasibility_25_20_12_reduced/"
-                "service_catalog_500_2000.json"
-            ),
-            "canonical_old_service_catalog_sha256": SOURCE_CATALOG_SHA256,
-        }
-        expected_source_status = "HISTORICAL_GENERATION_ATTESTATION_UNAVAILABLE_SOURCE_SNAPSHOT_HASHED"
-        source_catalog_relative = (
-            "environment_data/stage6_candidate_feasibility_25_20_12_reduced/"
-            "service_catalog_500_2000.json"
-        )
-        expected_source_catalog_hash = SOURCE_CATALOG_SHA256
-        source_contract_identity = {
-            "source_config_revision": SOURCE_CONFIG_REVISION,
-            "source_config_sha256": source_config_hash,
-            "source_semantic_config_sha256": SOURCE_SEMANTIC_SHA256,
-            "source_generation_config_fingerprint": SOURCE_GENERATION_FINGERPRINT,
-        }
-    elif split == "validation":
-        expected_source_fields = {
-            "source_data_split_manifest_sha256": VALIDATION_SOURCE_SPLIT_SHA256,
-            "source_service_catalog_path": VALIDATION_SOURCE_CATALOG_PATH,
-            "source_service_catalog_sha256": VALIDATION_SOURCE_CATALOG_SHA256,
-            "canonical_old_service_catalog_path": (
-                "environment_data/stage6_candidate_feasibility_25_20_12_reduced/"
-                "service_catalog_500_2000.json"
-            ),
-            "canonical_old_service_catalog_sha256": SOURCE_CATALOG_SHA256,
-            "source_input_range_kb": [500.0, 5000.0],
-        }
-        expected_source_status = "SOURCE_GENERATION_MANIFESTS_AND_ARTIFACT_HASHES_VERIFIED"
-        source_catalog_relative = VALIDATION_SOURCE_CATALOG_PATH
-        expected_source_catalog_hash = VALIDATION_SOURCE_CATALOG_SHA256
-        split_manifest_path = formal_root / "environment_data" / "data_split_manifest.json"
-        if (
-            not split_manifest_path.is_file()
-            or _sha256(split_manifest_path) != VALIDATION_SPLIT_MANIFEST_SHA256
-            or manifest.get("data_split_manifest_sha256")
-            != VALIDATION_SPLIT_MANIFEST_SHA256
-        ):
-            raise ValueError("Validation source data-split manifest is missing or changed.")
-        split_manifest = json.loads(split_manifest_path.read_text(encoding="utf-8"))
-        split_source = split_manifest.get("source_generation_provenance", {})
-        if (
-            split_source.get("source_split_manifest_sha256")
-            != VALIDATION_SOURCE_SPLIT_SHA256
-            or split_source.get("source_generation_config_fingerprint")
-            != VALIDATION_SOURCE_GENERATION_FINGERPRINT
-            or split_source.get("source_service_catalog_sha256")
-            != VALIDATION_SOURCE_CATALOG_SHA256
-            or split_source.get("source_generator_config_sha256")
-            != VALIDATION_SOURCE_CONFIG_SHA256
-            or split_source.get("source_generator_config_sha256_at_generation_start")
-            != VALIDATION_SOURCE_CONFIG_SHA256_AT_START
-        ):
-            raise ValueError("Validation source generation contract is not the reviewed snapshot.")
-        source_contract_identity = {
-            "source_data_split_manifest_sha256": VALIDATION_SOURCE_SPLIT_SHA256,
-            "source_split_manifest_sha256": VALIDATION_SOURCE_SPLIT_SHA256,
-            "source_generation_config_fingerprint": VALIDATION_SOURCE_GENERATION_FINGERPRINT,
-            "source_config_sha256": VALIDATION_SOURCE_CONFIG_SHA256,
-            "source_config_sha256_at_generation_start": VALIDATION_SOURCE_CONFIG_SHA256_AT_START,
-        }
-    else:
-        raise ValueError(f"Unsupported source compatibility split: {split!r}")
-    if not isinstance(source_provenance, dict) or any(
-        source_provenance.get(key) != value
-        for key, value in expected_source_fields.items()
-    ):
-        raise ValueError("Pool source snapshot metadata is not the reviewed contract.")
-    if source_provenance.get("historical_source_status") != expected_source_status:
-        raise ValueError(
-            "Pool historical source status is not the reviewed split contract: "
-            f"split={split!r}, "
-            f"status={source_provenance.get('historical_source_status')!r}"
-        )
-
-    source_catalog_path = formal_root / Path(source_catalog_relative)
-    if (
-        not source_catalog_path.is_file()
-        or _sha256(source_catalog_path) != expected_source_catalog_hash
-    ):
-        raise ValueError("The recorded canonical source service catalog is missing or changed.")
-
+    if manifest.get("config_path") != CONFIG_RELATIVE.as_posix():
+        raise ValueError("Training Pool config_path does not identify the formal config.")
     return {
-        "policy": "APPROVED_LEGACY_RUNTIME_COMPATIBILITY_V1",
-        "legacy_config_revision": LEGACY_POOL_CONFIG_REVISION,
-        "legacy_config_sha256": pool_raw_hash,
-        "legacy_semantic_config_sha256": pool_semantic_hash,
-        "runtime_config_sha256": config_hash,
-        "runtime_semantic_config_sha256": semantic_hash,
-        **source_contract_identity,
-        "approved_field_differences": [
-            {"path": path, "category": category}
-            for path, (_old_value, _new_value, category)
-            in LEGACY_POOL_FIELD_DIFFERENCES.items()
-        ],
+        "policy": "TRAINING_DATA_GENERATION_COMPATIBILITY_V1",
+        "pool_config_sha256_recorded": manifest.get("config_sha256"),
+        "pool_semantic_config_sha256_recorded": manifest.get(
+            "semantic_config_sha256"
+        ),
+        "generation_config_fingerprint": generation_fingerprint,
+        "historical_git_config_read": False,
     }
 
 
@@ -370,6 +136,7 @@ def _validate_pool(
     expected_split: str,
     expected_seed_start: int,
     expected_episode_count: int,
+    runtime_config: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     pool = formal_root / relative_pool
     manifest_path = pool / "formal_pool_manifest.json"
@@ -381,7 +148,7 @@ def _validate_pool(
         "seed_start": expected_seed_start,
         "seed_end": expected_seed_start + expected_episode_count - 1,
         "episode_count": expected_episode_count,
-        "slots_per_episode": 300,
+        "slots_per_episode": FORMAL_TRAINING_EPISODE_SLOTS,
     }
     for key, value in expected.items():
         if manifest.get(key) != value:
@@ -390,14 +157,16 @@ def _validate_pool(
                 f"expected={value!r}, actual={manifest.get(key)!r}"
             )
     config_path = formal_root / CONFIG_RELATIVE
-    config_hash = project_config.raw_config_sha256(config_path)
-    cfg = project_config.parse_toml_file(config_path)
+    cfg = (
+        copy.deepcopy(runtime_config)
+        if runtime_config is not None
+        else project_config.parse_toml_file(config_path)
+    )
     cfg["_meta"] = {
         "config_path": str(config_path.resolve()),
         "project_root": str(formal_root),
     }
     project_config.validate_for_formal_experiment(cfg)
-    semantic_hash = project_config.semantic_config_hash(cfg)
     generation_fingerprint = generate_episode_realization.generation_config_fingerprint(cfg)
     catalog_relative = str(project_config.get_config_value(cfg, "paths.service_catalog"))
     catalog_path = project_config.resolve_path(formal_root, catalog_relative)
@@ -429,11 +198,7 @@ def _validate_pool(
     ).encode("utf-8")
     task_contract_hash = hashlib.sha256(contract_bytes).hexdigest()
     config_compatibility = _validate_pool_config_compatibility(
-        formal_root,
-        config_path,
         manifest,
-        config_hash=config_hash,
-        semantic_hash=semantic_hash,
         generation_fingerprint=generation_fingerprint,
     )
     expected_metadata = {
@@ -462,8 +227,6 @@ def _validate_pool(
         "manifest_sha256": manifest_hash,
         "pool_config_sha256": manifest.get("config_sha256"),
         "pool_semantic_config_sha256": manifest.get("semantic_config_sha256"),
-        "runtime_config_sha256": config_hash,
-        "runtime_semantic_config_sha256": semantic_hash,
         "config_compatibility": config_compatibility,
         "generation_config_fingerprint": generation_fingerprint,
         "task_data_contract": task_contract,
@@ -471,6 +234,159 @@ def _validate_pool(
         "generation_config_fields": generate_episode_realization._generation_config_payload(cfg),
         "service_catalog_sha256": catalog_hash,
         "task_data_model": manifest["task_data_model"],
+    }
+
+
+def _validate_training_integrity_baseline(
+    pool: Path,
+    pool_info: dict[str, Any],
+) -> dict[str, Any]:
+    baseline_path = pool / "formal_pool_integrity_baseline.json"
+    if not baseline_path.is_file():
+        raise FileNotFoundError(f"Training Pool integrity baseline is missing: {baseline_path}")
+    baseline_hash = _sha256(baseline_path)
+    if baseline_hash != FORMAL_TRAINING_POOL_INTEGRITY_BASELINE_SHA256:
+        raise ValueError(
+            "Training Pool integrity baseline identity changed: "
+            f"expected={FORMAL_TRAINING_POOL_INTEGRITY_BASELINE_SHA256}, "
+            f"actual={baseline_hash}"
+        )
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    expected = {
+        "schema_version": "formal_task_data_integrity_baseline_v1",
+        "integrity_baseline_type": "CURRENT_SNAPSHOT",
+        "task_data_model": "500_1000_KB",
+        "pool_manifest_sha256": pool_info["manifest_sha256"],
+        "task_data_contract_sha256": pool_info["task_data_contract_sha256"],
+        "target_generation_config_fingerprint": pool_info[
+            "generation_config_fingerprint"
+        ],
+        "service_catalog_path": pool_info["task_data_contract"][
+            "service_catalog_path"
+        ],
+        "service_catalog_sha256": pool_info["service_catalog_sha256"],
+        "split": "train",
+        "seed_start": DEFAULT_TRAINING_SEED_START,
+        "seed_end": DEFAULT_TRAINING_SEED_START
+        + FORMAL_TRAINING_EPISODE_COUNT
+        - 1,
+        "episode_count": FORMAL_TRAINING_EPISODE_COUNT,
+        "episode_file_count": FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT,
+    }
+    mismatches = {
+        key: {"baseline": baseline.get(key), "expected": value}
+        for key, value in expected.items()
+        if baseline.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "Training Pool integrity baseline metadata mismatch: "
+            f"{json.dumps(mismatches, ensure_ascii=False, sort_keys=True)}"
+        )
+    return {
+        "path": str(baseline_path),
+        "sha256": baseline_hash,
+        "file_count": FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT,
+        "previous_integrity_validation_reused": True,
+        "episode_files_rehashed_at_startup": False,
+    }
+
+
+def validate_formal_training_pool_for_run(
+    *,
+    formal_root: str | Path,
+    config_path: str | Path,
+    runtime_config: dict[str, Any],
+    episode_pool: str | Path,
+    episode_seed_start: int | None,
+    episode_count: int,
+    generate_missing: bool,
+) -> dict[str, Any]:
+    """Run the lightweight generation-contract gate for a new formal run."""
+
+    root = Path(formal_root).expanduser().resolve(strict=True)
+    expected_config = (root / CONFIG_RELATIVE).resolve(strict=True)
+    actual_config = Path(config_path).expanduser().resolve(strict=True)
+    if actual_config != expected_config:
+        raise ValueError(
+            "Formal Training requires the canonical system_config.toml: "
+            f"expected={expected_config}, actual={actual_config}"
+        )
+    expected_pool = (root / TRAIN_POOL_RELATIVE).resolve(strict=True)
+    actual_pool = project_config.resolve_path(root, episode_pool).resolve(strict=True)
+    if actual_pool != expected_pool:
+        raise ValueError(
+            "Formal Training requires the frozen proposed_joint_training pool: "
+            f"expected={expected_pool}, actual={actual_pool}"
+        )
+    if episode_seed_start != DEFAULT_TRAINING_SEED_START:
+        raise ValueError(
+            "Formal Training seed start must be "
+            f"{DEFAULT_TRAINING_SEED_START}, actual={episode_seed_start!r}"
+        )
+    if int(episode_count) != FORMAL_TRAINING_EPISODE_COUNT:
+        raise ValueError(
+            "Formal Training requires the complete frozen Pool episode count: "
+            f"expected={FORMAL_TRAINING_EPISODE_COUNT}, actual={episode_count}"
+        )
+    if bool(generate_missing):
+        raise ValueError("Formal Training Pool gate does not permit generating missing Episodes.")
+
+    cfg = copy.deepcopy(runtime_config)
+    cfg["_meta"] = {
+        "config_path": str(expected_config),
+        "project_root": str(root),
+    }
+    project_config.validate_for_formal_experiment(cfg)
+    protocol = project_config.get_ppo_data_protocol(cfg)
+    expected_protocol = {
+        "protocol": "full_episode_randomized",
+        "physical_episode_slots": FORMAL_TRAINING_EPISODE_SLOTS,
+        "episode_slots": FORMAL_TRAINING_EPISODE_SLOTS,
+        "train_origin_start": 0,
+        "train_origin_end": FORMAL_TRAINING_EPISODE_SLOTS - 1,
+        "rollout_steps": FORMAL_TRAINING_EPISODE_SLOTS,
+        "terminal_origin": FORMAL_TRAINING_EPISODE_SLOTS - 1,
+    }
+    protocol_mismatches = {
+        key: {"current": protocol.get(key), "expected": value}
+        for key, value in expected_protocol.items()
+        if protocol.get(key) != value
+    }
+    if protocol_mismatches:
+        raise ValueError(
+            "Formal Training Episode protocol mismatch: "
+            f"{json.dumps(protocol_mismatches, ensure_ascii=False, sort_keys=True)}"
+        )
+
+    pool, pool_info = _validate_pool(
+        root,
+        TRAIN_POOL_RELATIVE,
+        expected_split="train",
+        expected_seed_start=DEFAULT_TRAINING_SEED_START,
+        expected_episode_count=FORMAL_TRAINING_EPISODE_COUNT,
+        runtime_config=cfg,
+    )
+    if pool_info["manifest_sha256"] != FORMAL_TRAINING_POOL_MANIFEST_SHA256:
+        raise ValueError(
+            "Training Pool Manifest identity changed: "
+            f"expected={FORMAL_TRAINING_POOL_MANIFEST_SHA256}, "
+            f"actual={pool_info['manifest_sha256']}"
+        )
+    if pool_info["task_data_contract_sha256"] != FORMAL_TRAINING_TASK_CONTRACT_SHA256:
+        raise ValueError("Training Pool task-data contract is not the reviewed contract.")
+    baseline_info = _validate_training_integrity_baseline(pool, pool_info)
+    return {
+        **pool_info,
+        "pool_path": str(pool),
+        "integrity_baseline": baseline_info,
+        "episode_seed_start": DEFAULT_TRAINING_SEED_START,
+        "episode_seed_end": DEFAULT_TRAINING_SEED_START
+        + FORMAL_TRAINING_EPISODE_COUNT
+        - 1,
+        "episode_count": FORMAL_TRAINING_EPISODE_COUNT,
+        "episode_slots": FORMAL_TRAINING_EPISODE_SLOTS,
+        "protocol": protocol,
     }
 
 

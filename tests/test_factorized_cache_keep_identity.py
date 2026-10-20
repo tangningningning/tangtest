@@ -11,7 +11,6 @@ import torch
 
 from common import project_config
 from ppo_simple import policy, primitive_control, rollout, trainer
-from scripts.training import training_pool_contract
 
 
 class FactorizedCacheKeepIdentityTests(unittest.TestCase):
@@ -164,22 +163,6 @@ class CachePolicyVersionTests(unittest.TestCase):
         self.assertEqual(
             sparse["algorithm"]["ppo"]["policy_schema"],
             project_config.SPARSE_COORDINATED_CACHE_POLICY_SCHEMA,
-        )
-        system_path = root / "configs/proposed/system_config.toml"
-        system_config = project_config.parse_toml_file(system_path)
-        self.assertEqual(
-            project_config.raw_config_sha256(system_path),
-            training_pool_contract.CURRENT_FORMAL_CONFIG_SHA256,
-        )
-        self.assertEqual(
-            project_config.semantic_config_hash(system_config),
-            training_pool_contract.CURRENT_FORMAL_SEMANTIC_SHA256,
-        )
-        self.assertEqual(
-            training_pool_contract.LEGACY_POOL_FIELD_DIFFERENCES[
-                "algorithm.ppo.policy_schema"
-            ][1],
-            project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA,
         )
         self.assertIn("v5_multi_node_cache_factorized", project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA)
         self.assertIn("v6_sparse_coordinated_cache", project_config.SPARSE_COORDINATED_CACHE_POLICY_SCHEMA)

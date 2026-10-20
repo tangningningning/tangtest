@@ -3779,6 +3779,28 @@ def run_training(
         raise ValueError("--epochs must be divisible by realizations_per_policy_update")
     policy_update_total = int(target_episodes) // group_size
     project_root = Path(cfg["_meta"]["project_root"])
+    training_root = project_root / "scripts" / "training"
+    if str(training_root) not in sys.path:
+        sys.path.insert(0, str(training_root))
+    import training_pool_contract
+
+    pool_compatibility = training_pool_contract.validate_formal_training_pool_for_run(
+        formal_root=project_root,
+        config_path=config_file,
+        runtime_config=cfg,
+        episode_pool=episode_pool,
+        episode_seed_start=episode_seed_start,
+        episode_count=int(target_episodes),
+        generate_missing=bool(generate_missing_episodes),
+    )
+    validated_baseline_sha256 = pool_compatibility["integrity_baseline"]["sha256"]
+    if (
+        validated_integrity_baseline_sha256 is not None
+        and validated_integrity_baseline_sha256 != validated_baseline_sha256
+    ):
+        raise ValueError(
+            "Requested Training Pool integrity baseline does not match the reviewed baseline."
+        )
     episode_paths = _resolve_training_episodes(
         project_root=project_root,
         config_path=config_file,
@@ -3791,8 +3813,10 @@ def run_training(
     pool_path = _resolve_path(project_root, episode_pool)
     pool_provenance = build_episode_pool_provenance(
         pool_path,
-        validated_integrity_baseline_sha256=validated_integrity_baseline_sha256,
+        validated_integrity_baseline_sha256=validated_baseline_sha256,
     )
+    if pool_provenance is None:
+        raise ValueError("Formal Training Pool provenance could not be recorded.")
     context = load_environment_context(str(config_file), realization_dir=episode_paths[0])
     raw_hash = project_config.raw_config_sha256(config_file)
     semantic_hash = project_config.semantic_config_hash(context.cfg)

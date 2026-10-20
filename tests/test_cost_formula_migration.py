@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from pathlib import Path
-import subprocess
-import tomllib
 import unittest
 
 import numpy as np
@@ -11,9 +8,6 @@ import numpy as np
 from common import project_config, system_model
 from decision import cache_configuration, uav_configuration
 from scripts.training import training_pool_contract
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CostFormulaMigrationTests(unittest.TestCase):
@@ -57,58 +51,30 @@ class CostFormulaMigrationTests(unittest.TestCase):
                 config, require_artifacts=False
             )
 
-    def test_training_pool_compatibility_is_pinned_to_exact_cost_migration(self) -> None:
-        config_path = PROJECT_ROOT / "configs/proposed/system_config.toml"
-        config = project_config.parse_toml_file(config_path)
-        self.assertEqual(
-            project_config.raw_config_sha256(config_path),
-            training_pool_contract.CURRENT_FORMAL_CONFIG_SHA256,
-        )
-        self.assertEqual(
-            project_config.semantic_config_hash(config),
-            training_pool_contract.CURRENT_FORMAL_SEMANTIC_SHA256,
-        )
-
-        historical = subprocess.run(
-            [
-                "git",
-                "show",
-                f"{training_pool_contract.LEGACY_POOL_CONFIG_REVISION}:"
-                "configs/proposed/system_config.toml",
-            ],
-            cwd=PROJECT_ROOT,
-            check=True,
-            capture_output=True,
-        ).stdout
-        old_config = tomllib.loads(historical.decode("utf-8-sig"))
-
-        def flatten(values: dict[str, object], prefix: str = "") -> dict[str, object]:
-            result: dict[str, object] = {}
-            for key, value in values.items():
-                path = f"{prefix}.{key}" if prefix else key
-                if isinstance(value, dict):
-                    result.update(flatten(value, path))
-                else:
-                    result[path] = value
-            return result
-
-        old_values = flatten(old_config)
-        new_values = flatten(config)
-        missing = object()
-        observed = {
-            path: (old_values.get(path, missing), new_values.get(path, missing))
-            for path in sorted(set(old_values) | set(new_values))
-            if old_values.get(path, missing) != new_values.get(path, missing)
+    def test_training_pool_compatibility_uses_generation_contract(self) -> None:
+        manifest = {
+            "config_path": training_pool_contract.CONFIG_RELATIVE.as_posix(),
+            "target_generation_config_fingerprint": (
+                training_pool_contract.CURRENT_GENERATION_FINGERPRINT
+            ),
+            # Recorded full-config hashes remain provenance only.
+            "config_sha256": "pool-config-hash",
+            "semantic_config_sha256": "pool-semantic-hash",
         }
-        approved = {
-            path: (
-                missing if old is None else old,
-                missing if new is None else new,
+        compatibility = training_pool_contract._validate_pool_config_compatibility(
+            manifest,
+            generation_fingerprint=training_pool_contract.CURRENT_GENERATION_FINGERPRINT,
+        )
+        self.assertEqual(
+            compatibility["policy"], "TRAINING_DATA_GENERATION_COMPATIBILITY_V1"
+        )
+
+        manifest["target_generation_config_fingerprint"] = "different-generation"
+        with self.assertRaisesRegex(ValueError, "generation contract mismatch"):
+            training_pool_contract._validate_pool_config_compatibility(
+                manifest,
+                generation_fingerprint=training_pool_contract.CURRENT_GENERATION_FINGERPRINT,
             )
-            for path, (old, new, _category)
-            in training_pool_contract.LEGACY_POOL_FIELD_DIFFERENCES.items()
-        }
-        self.assertEqual(observed, approved)
 
     def test_cache_keep_add_delete_and_replace_costs_match_old_formula(self) -> None:
         service_sizes = np.asarray([100.0, 250.0], dtype=np.float64)
