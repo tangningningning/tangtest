@@ -245,9 +245,8 @@ min_safety_distance_m = 10.0
 # 因此在代表速度 V_ref=15m/s 处按 Li et al. 旋翼功率模型计算
 # P(15)/15 ≈ 14.73 J/m，并取整为 15 J/m 作为线性等效系数。
 movement_energy_coefficient_j_per_m = 15.0
-# 参数状态：EXPERIMENT_DESIGN。
-# UAV 固定位置更新项；为使新公式与旧成本代数等价而迁移，非实测固定能耗。
-movement_fixed_cost = 100.0
+# 兼容字段：保留配置接口，不参与移动成本计算。
+movement_fixed_cost = 0.0
 
 [nodes.cloud]
 # Cloud 数量固定为 1 个逻辑节点；本项目不展开 Cloud 实例列表。
@@ -381,11 +380,10 @@ omega_energy = 0.5
 # lambda_cache 统一缩放固定重配置项和新增装载项。
 lambda_cache = 0.005
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
-# lambda_movement 统一缩放 UAV 固定位置更新项和移动能耗项。
+# lambda_movement 将实际移动能耗映射为目标成本。
 # E_mov,u = movement_energy_coefficient_j_per_m * effective_distance_m，单位 J。
-# C_q(t) = lambda_movement * sum_u [movement_fixed_cost_u * z_q_actual_u(t) + E_mov,u(t)]。
-# movement_fixed_cost 是为保持旧公式成本等价而迁移的目标项，不是实测固定能耗。
-# movement_energy_j 仍是原始移动能耗统计；只有 C_q 经 lambda_movement 缩放。
+# C_q(t) = lambda_movement * sum_u E_mov,u(t)。
+# movement_fixed_cost 是兼容字段，不参与成本计算。
 # 基于 Training Pilot 的探索性降本配置；并非物理成本重新标定，也未验证为最优系数。
 lambda_movement = 5.0e-6
 # T_ref/E_ref are train-only P95 normalization constants for the PER_SLOT_ANALYTIC

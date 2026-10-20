@@ -408,6 +408,11 @@ def uav_movement_cost(
     lambda_movement: float,
     tolerance_m: float = 1e-9,
 ) -> dict[str, float | bool | int]:
+    """Compute UAV cost from actual movement energy only.
+
+    ``movement_fixed_cost`` remains in the signature for configuration
+    compatibility, but does not contribute to the cost.
+    """
     old = np.asarray(q_old_xy, dtype=float)
     new = np.asarray(q_new_xy, dtype=float)
     if old.shape != (2,) or new.shape != (2,):
@@ -420,7 +425,9 @@ def uav_movement_cost(
     dt = _require_finite("dt_s", dt_s)
     vmax = _require_finite("max_horizontal_speed_mps", max_horizontal_speed_mps)
     xi = _require_finite("movement_energy_coefficient_j_per_m", movement_energy_coefficient_j_per_m)
-    eta = _require_finite("movement_fixed_cost", movement_fixed_cost)
+    compat_fixed_cost = _require_finite(
+        "movement_fixed_cost", movement_fixed_cost
+    )
     lam = _require_finite("lambda_movement", lambda_movement)
     tolerance = _require_finite("tolerance_m", tolerance_m)
     if tolerance < 0.0:
@@ -429,7 +436,7 @@ def uav_movement_cost(
         dt <= 0.0
         or vmax < 0.0
         or xi < 0.0
-        or eta < 0.0
+        or compat_fixed_cost < 0.0
         or lam < 0.0
     ):
         raise ValueError("UAV movement 参数范围无效。")
@@ -447,7 +454,7 @@ def uav_movement_cost(
         "raw_distance_m": raw_distance,
         "speed_feasible": speed_feasible,
         "movement_energy_j": energy,
-        "movement_cost": lam * (actual_z * eta + energy),
+        "movement_cost": lam * energy,
         "actual_z_q": actual_z,
         "actual_update": bool(actual_z),
     }
