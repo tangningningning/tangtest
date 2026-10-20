@@ -1261,12 +1261,7 @@ def validate_config(
     if not isinstance(cloud_resource_sharing, bool):
         raise ValueError(
             "nodes.cloud.resource_sharing 必须显式配置为 true/false，"
-            "不允许缺失后静默采用默认共享语义。"
-        )
-    if cloud_resource_sharing:
-        raise ValueError(
-            "nodes.cloud.resource_sharing 必须为 false；"
-            "Cloud 上行保持每任务独立等效链路，CPU共享由 resource_mode 单独控制。"
+            "该兼容字段不控制 Cloud 总速率池，模型始终按总容量共享分配。"
         )
     cloud_resource_mode = str(
         get_config_value(config, "nodes.cloud.resource_mode", "legacy_unlimited")
@@ -1279,9 +1274,20 @@ def validate_config(
         config, "nodes.cloud.cpu_capacity_cycles_per_s"
     )
     if cloud_resource_mode == "finite_pool":
-        if cloud_cpu_capacity is None or float(cloud_cpu_capacity) <= 0.0:
+        if (
+            cloud_cpu_capacity is None
+            or not math.isfinite(float(cloud_cpu_capacity))
+            or float(cloud_cpu_capacity) <= 0.0
+        ):
             raise ValueError(
                 "finite_pool 模式要求 nodes.cloud.cpu_capacity_cycles_per_s 为正数。"
+            )
+        if float(cloud_cpu_capacity) != float(
+            get_config_value(config, "nodes.cloud.total_cpu_cycles_per_s")
+        ):
+            raise ValueError(
+                "finite_pool 模式下 cpu_capacity_cycles_per_s 必须与 "
+                "total_cpu_cycles_per_s 兼容字段保持数值一致。"
             )
     cloud_fallback_mode = str(
         get_config_value(
@@ -1329,13 +1335,17 @@ def validate_config(
     if float(get_config_value(config, "nodes.cloud.cpu_cycles_per_s")) != float(
         get_config_value(config, "nodes.cloud.total_cpu_cycles_per_s")
     ):
-        raise ValueError("Cloud 重复 CPU 字段必须与唯一总 CPU 容量一致。")
+        raise ValueError(
+            "nodes.cloud.cpu_cycles_per_s 与 total_cpu_cycles_per_s "
+            "两个兼容 CPU 字段必须相等；finite_pool 的实际总容量由 "
+            "cpu_capacity_cycles_per_s 单独指定。"
+        )
     if float(get_config_value(config, "nodes.cloud.uplink_rate_bps")) != float(
         get_config_value(config, "nodes.cloud.total_bandwidth_bps")
     ):
         raise ValueError(
-            "nodes.cloud.total_bandwidth_bps 是兼容字段，必须与每任务固定等效上行速率 "
-            "nodes.cloud.uplink_rate_bps 一致；它不表示Cloud共享总带宽池。"
+            "nodes.cloud.total_bandwidth_bps 与 nodes.cloud.uplink_rate_bps "
+            "必须相等；前者是每时隙共享总速率上限，后者是兼容别名。"
         )
 
     for key, status in config.get("parameter_status", {}).items():

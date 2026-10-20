@@ -67,10 +67,13 @@ class CacheOptimizationConfig:
     air_beta_nlos: float
     air_alpha_los: float
     air_alpha_nlos: float
-    # Cloud uplink remains an independent per-task equivalent link in both modes.
+    # Compatibility fields: Matching uses cloud_total_bandwidth_bps as the
+    # shared per-slot equivalent rate cap; cloud_uplink_rate_bps is its alias.
     cloud_uplink_rate_bps: float
     cloud_total_bandwidth_bps: float
     cloud_delay_factor: float
+    # Retained as a legacy config field; the shared total-rate constraint is
+    # enforced regardless of this flag's value.
     cloud_resource_sharing: bool
     cloud_fallback_mode: str
     sv_range_m: float
@@ -144,13 +147,12 @@ class CacheOptimizationConfig:
             raise ValueError("RSU instance 数量必须等于 num_rsu。")
         if self.num_uav != len(self.uav_instances):
             raise ValueError("UAV instance 数量必须等于 num_uav。")
+        if self.cloud_uplink_rate_bps != self.cloud_total_bandwidth_bps:
+            raise ValueError(
+                "Cloud uplink alias 必须与每时隙共享总速率上限保持数值一致。"
+            )
         if not isinstance(self.cloud_resource_sharing, bool):
             raise ValueError("cloud_resource_sharing 必须是显式 bool。")
-        if self.cloud_resource_sharing:
-            raise ValueError(
-                "Cloud 上行链路当前保持每任务独立，"
-                "cloud_resource_sharing 必须为 false。"
-            )
         if self.cloud_resource_mode not in {"legacy_unlimited", "finite_pool"}:
             raise ValueError(
                 "cloud_resource_mode 必须是 legacy_unlimited 或 finite_pool。"
@@ -161,6 +163,14 @@ class CacheOptimizationConfig:
         ):
             raise ValueError(
                 "finite_pool 模式要求正的 cloud_cpu_capacity_cycles_per_s。"
+            )
+        if (
+            self.cloud_resource_mode == "finite_pool"
+            and self.cloud_cpu_capacity_cycles_per_s
+            != self.cloud_total_cpu_cycles_per_s
+        ):
+            raise ValueError(
+                "finite_pool 模式下 Cloud CPU 容量必须与兼容 total_cpu 字段一致。"
             )
         if self.cloud_fallback_mode not in {
             "LEGACY_EDGE_GATE",
@@ -216,8 +226,8 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
     cloud_resource_sharing = get(config, "nodes.cloud.resource_sharing")
     if not isinstance(cloud_resource_sharing, bool):
         raise ValueError(
-            "缺少或非法的 nodes.cloud.resource_sharing；"
-            "正式模型不允许静默回退到 Cloud 共享资源。"
+            "缺少或非法的兼容字段 nodes.cloud.resource_sharing；"
+            "Cloud 上行总池始终按共享容量分配，该字段不控制上行共享。"
         )
     backhaul_rates = {}
     for role, key in (

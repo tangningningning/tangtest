@@ -128,6 +128,15 @@ class TransferExchangeMatchingResult:
     cloud_cpu_allocations_cycles_per_s: dict[str, float] = field(default_factory=dict)
     cloud_cpu_capacity_cycles_per_s: float | None = None
     cloud_cpu_used_cycles_per_s: float = 0.0
+    cloud_uplink_rate_allocations_bps: dict[str, float] = field(default_factory=dict)
+    cloud_uplink_rate_capacity_bps: float | None = None
+    cloud_uplink_rate_used_bps: float = 0.0
+    cloud_kkt_solve_count: int = 0
+    cloud_kkt_max_uplink_allocated_bps: float | None = None
+    cloud_kkt_max_cpu_allocated_cycles_per_s: float | None = None
+    cloud_kkt_max_uplink_capacity_violation_bps: float | None = None
+    cloud_kkt_max_cpu_capacity_violation_cycles_per_s: float | None = None
+    cloud_kkt_nonfinite_result_count: int = 0
     tie_break_count: int = 0
 
 
@@ -406,7 +415,8 @@ def _candidate_impact_scope(
 
     This is shared by strict candidate screening and the incremental evaluator;
     the scope must include every task sharing a current/candidate Edge node and,
-    for a finite Cloud pool, every task in the old or new Cloud allocation set.
+    whenever the Cloud assignment set changes, every task in the old or new
+    shared uplink pool (and the finite CPU pool when configured).
     """
 
     started_at = time.perf_counter() if timing_profile is not None else 0.0
@@ -421,10 +431,7 @@ def _candidate_impact_scope(
             affected_edge_nodes.add(target)
 
     impacted_task_ids = set(affected_task_ids)
-    if (
-        cache_config is not None
-        and cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
-    ):
+    if cache_config is not None:
         current_cloud_tasks = {
             task.task_id
             for task in tasks
@@ -436,6 +443,8 @@ def _candidate_impact_scope(
             if candidate_kkt[task.task_id] == CLOUD
         }
         if current_cloud_tasks != candidate_cloud_tasks:
+            # Cloud uplink is always allocated from one shared per-slot pool;
+            # finite-pool CPU allocation is coupled to the same task set.
             impacted_task_ids.update(current_cloud_tasks | candidate_cloud_tasks)
     for task in tasks:
         if (
@@ -938,6 +947,32 @@ def _resource_constraints_ok(
             for value in evaluation.cloud_cpu_allocations_cycles_per_s.values()
         ):
             return False
+    if evaluation.cloud_uplink_rate_capacity_bps is not None:
+        capacity = float(evaluation.cloud_uplink_rate_capacity_bps)
+        allocated = float(
+            math.fsum(evaluation.cloud_uplink_rate_allocations_bps.values())
+        )
+        absolute_tol = max(capacity * tol, 1.0e-6)
+        if (
+            not math.isfinite(capacity)
+            or capacity <= 0.0
+            or not math.isfinite(allocated)
+            or allocated > capacity + absolute_tol
+            or not math.isclose(
+                allocated,
+                float(evaluation.cloud_uplink_rate_used_bps),
+                rel_tol=1.0e-12,
+                abs_tol=absolute_tol,
+            )
+        ):
+            return False
+        if any(
+            not math.isfinite(value)
+            or value <= 0.0
+            or value / capacity + tol < eps_b
+            for value in evaluation.cloud_uplink_rate_allocations_bps.values()
+        ):
+            return False
     for node_id, values in evaluation.cpu_allocations.items():
         if node_id == CLOUD:
             continue
@@ -998,6 +1033,9 @@ def optimize_task_matching(
     if kkt_cache is None:
         kkt_cache = KKTResourceAllocationCache()
     kkt_diagnostics_before = len(kkt_cache.diagnostic_records)
+    cloud_kkt_cache_keys_before = {
+        key for key in kkt_cache.entries if key[0] == CLOUD
+    }
     matching_started_at = time.perf_counter() if timing_profile is not None else 0.0
     profile_before = (
         {
@@ -1389,6 +1427,18 @@ def optimize_task_matching(
     kkt_summary = _kkt_diagnostics_summary(
         kkt_cache.diagnostic_records[kkt_diagnostics_before:]
     )
+    cloud_kkt_summary = _cloud_kkt_runtime_summary(
+        (
+            allocation
+            for key, allocation in kkt_cache.entries.items()
+            if key[0] == CLOUD and key not in cloud_kkt_cache_keys_before
+        ),
+        cpu_capacity_cycles_per_s=(
+            float(cache_config.cloud_cpu_capacity_cycles_per_s)
+            if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+            else None
+        ),
+    )
     return TransferExchangeMatchingResult(
         matching=current_matching,
         execution_variables=matching_to_execution_variables(current_matching),
@@ -1479,6 +1529,29 @@ def optimize_task_matching(
         ),
         cloud_cpu_capacity_cycles_per_s=current_eval.cloud_cpu_capacity_cycles_per_s,
         cloud_cpu_used_cycles_per_s=current_eval.cloud_cpu_used_cycles_per_s,
+        cloud_uplink_rate_allocations_bps=(
+            current_eval.cloud_uplink_rate_allocations_bps
+        ),
+        cloud_uplink_rate_capacity_bps=(
+            current_eval.cloud_uplink_rate_capacity_bps
+        ),
+        cloud_uplink_rate_used_bps=current_eval.cloud_uplink_rate_used_bps,
+        cloud_kkt_solve_count=cloud_kkt_summary["solve_count"],
+        cloud_kkt_max_uplink_allocated_bps=(
+            cloud_kkt_summary["max_uplink_allocated_bps"]
+        ),
+        cloud_kkt_max_cpu_allocated_cycles_per_s=(
+            cloud_kkt_summary["max_cpu_allocated_cycles_per_s"]
+        ),
+        cloud_kkt_max_uplink_capacity_violation_bps=(
+            cloud_kkt_summary["max_uplink_capacity_violation_bps"]
+        ),
+        cloud_kkt_max_cpu_capacity_violation_cycles_per_s=(
+            cloud_kkt_summary["max_cpu_capacity_violation_cycles_per_s"]
+        ),
+        cloud_kkt_nonfinite_result_count=cloud_kkt_summary[
+            "nonfinite_result_count"
+        ],
         tie_break_count=tie_break_count,
     )
 
@@ -1592,6 +1665,9 @@ class KKTResourceAllocationResult:
     cpu_multipliers: dict[str, float]
     bandwidth_multipliers: dict[str, float]
     kkt_diagnostics: tuple[KKTAllocationDiagnostics, ...] = ()
+    cloud_uplink_rate_allocations_bps: dict[str, float] = field(default_factory=dict)
+    cloud_uplink_rate_capacity_bps: float | None = None
+    cloud_uplink_rate_used_bps: float = 0.0
 
 
 def _exact_position_key(node_position: np.ndarray) -> tuple[float, float]:
@@ -1690,6 +1766,101 @@ class KKTResourceAllocationCache:
         return result
 
 
+def _finite_resource_total(values: Any) -> float | None:
+    """Return a finite allocation total, or ``None`` for invalid values."""
+
+    resource_values = [float(value) for value in values]
+    if not all(math.isfinite(value) for value in resource_values):
+        return None
+    try:
+        total = float(math.fsum(resource_values))
+    except OverflowError:
+        return None
+    return total if math.isfinite(total) else None
+
+
+def _cloud_kkt_runtime_summary(
+    allocations: Any,
+    *,
+    cpu_capacity_cycles_per_s: float | None,
+) -> dict[str, Any]:
+    """Aggregate actual Cloud KKT cache-miss results for one Matching call.
+
+    Solver counts are scalar KKT calls from each newly computed Cloud resource
+    result. Allocation maxima are computed from those result objects; cache hits
+    are excluded because they did not execute a solver in this Matching call.
+    """
+
+    results = tuple(allocations)
+    solve_count = sum(len(result.kkt_diagnostics) for result in results)
+    nonfinite_result_count = 0
+    max_uplink_allocated_bps: float | None = None
+    max_cpu_allocated_cycles_per_s: float | None = None
+    max_uplink_violation_bps: float | None = None
+    max_cpu_violation_cycles_per_s: float | None = None
+
+    for result in results:
+        cpu_values = result.cpu_allocations.get(CLOUD, {}).values()
+        uplink_values = result.cloud_uplink_rate_allocations_bps.values()
+        cpu_total = _finite_resource_total(cpu_values)
+        uplink_total = _finite_resource_total(uplink_values)
+        uplink_capacity = result.cloud_uplink_rate_capacity_bps
+        has_nonfinite_result = (
+            any(not bool(record.finite) for record in result.kkt_diagnostics)
+            or cpu_total is None
+            or uplink_total is None
+            or (
+                uplink_capacity is not None
+                and not math.isfinite(float(uplink_capacity))
+            )
+            or (
+                cpu_capacity_cycles_per_s is not None
+                and not math.isfinite(float(cpu_capacity_cycles_per_s))
+            )
+        )
+        nonfinite_result_count += int(has_nonfinite_result)
+        if not result.feasible or has_nonfinite_result:
+            continue
+
+        if uplink_capacity is None:
+            continue
+        uplink_capacity = float(uplink_capacity)
+        max_uplink_allocated_bps = (
+            uplink_total
+            if max_uplink_allocated_bps is None
+            else max(max_uplink_allocated_bps, uplink_total)
+        )
+        uplink_violation = max(0.0, uplink_total - uplink_capacity)
+        max_uplink_violation_bps = (
+            uplink_violation
+            if max_uplink_violation_bps is None
+            else max(max_uplink_violation_bps, uplink_violation)
+        )
+
+        if cpu_capacity_cycles_per_s is not None:
+            cpu_capacity = float(cpu_capacity_cycles_per_s)
+            max_cpu_allocated_cycles_per_s = (
+                cpu_total
+                if max_cpu_allocated_cycles_per_s is None
+                else max(max_cpu_allocated_cycles_per_s, cpu_total)
+            )
+            cpu_violation = max(0.0, cpu_total - cpu_capacity)
+            max_cpu_violation_cycles_per_s = (
+                cpu_violation
+                if max_cpu_violation_cycles_per_s is None
+                else max(max_cpu_violation_cycles_per_s, cpu_violation)
+            )
+
+    return {
+        "solve_count": int(solve_count),
+        "max_uplink_allocated_bps": max_uplink_allocated_bps,
+        "max_cpu_allocated_cycles_per_s": max_cpu_allocated_cycles_per_s,
+        "max_uplink_capacity_violation_bps": max_uplink_violation_bps,
+        "max_cpu_capacity_violation_cycles_per_s": max_cpu_violation_cycles_per_s,
+        "nonfinite_result_count": int(nonfinite_result_count),
+    }
+
+
 @dataclass(frozen=True)
 class KKTMatchingEvaluation:
     resource_feasible: bool
@@ -1707,6 +1878,9 @@ class KKTMatchingEvaluation:
     cloud_cpu_allocations_cycles_per_s: dict[str, float] = field(default_factory=dict)
     cloud_cpu_capacity_cycles_per_s: float | None = None
     cloud_cpu_used_cycles_per_s: float = 0.0
+    cloud_uplink_rate_allocations_bps: dict[str, float] = field(default_factory=dict)
+    cloud_uplink_rate_capacity_bps: float | None = None
+    cloud_uplink_rate_used_bps: float = 0.0
 
 
 @dataclass
@@ -1915,11 +2089,12 @@ def _ideal_task_utility(
     cache_config: cache_configuration.CacheOptimizationConfig,
     timing_profile: dict[str, float] | None = None,
 ) -> float:
-    """Evaluate one task at the no-sharing ideal resource point.
+    """Evaluate one task at a relaxed, no-sharing ideal resource point.
 
-    Cloud uses its exact formal per-task model. Edge targets use CPU/BW
-    fractions of one only for an upper bound; this helper never calls the KKT
-    allocator.
+    A Cloud task is evaluated with the full configured pool as a single-task
+    upper bound. Final candidate utility always uses the shared Cloud KKT
+    allocation. Edge targets use CPU/BW fractions of one only for an upper
+    bound; this helper never calls the KKT allocator.
     """
 
     started_at = time.perf_counter() if timing_profile is not None else 0.0
@@ -3242,8 +3417,8 @@ def allocate_resources_kkt(
         cpu_mu.update(node_result.cpu_multipliers)
         bw_nu.update(node_result.bandwidth_multipliers)
 
-    # Cloud uses fixed per-task resources and is intentionally absent from the
-    # SV/RSU/UAV KKT allocation maps and fraction constraints.
+    # Cloud's shared per-slot rate and (when finite_pool is configured) CPU
+    # resources are allocated by the coupled Cloud KKT stage below.
 
     return KKTResourceAllocationResult(
         True,
@@ -3258,42 +3433,122 @@ def allocate_resources_kkt(
     )
 
 
-def _allocate_cloud_cpu_kkt(
+def _allocate_cloud_resources_kkt(
     cloud_tasks: list[Task],
     cache_config: cache_configuration.CacheOptimizationConfig,
     project_cfg: dict[str, Any],
     kkt_cache: KKTResourceAllocationCache | None,
     timing_profile: dict[str, float] | None = None,
 ) -> KKTResourceAllocationResult:
-    """Allocate the complete Cloud task set under the configured CPU contract.
+    """Allocate the shared Cloud uplink and, in finite-pool mode, shared CPU.
 
-    Legacy mode returns the old independent 5 GHz/task contract.  Finite-pool
-    mode solves the same normalized convex CPU allocation used by Edge KKT,
-    while keeping Cloud uplink rates independent and task-specific.
+    With ``x_i`` denoting a fraction of the total rate and ``y_i`` a fraction
+    of the total CPU capacity, the utility loss has coefficients
+    ``a_i = L_i/R_total * (omega_T*psi_c/(T_ref*q_i) +
+    omega_E*P_i/E_ref)`` and ``b_i = omega_T*C_i/(T_ref*F_total)``.
+    The resource constraints are ``sum(x_i) <= 1`` and ``sum(y_i) <= 1``;
+    the resulting reciprocal objectives are separable and convex. The existing
+    bounded-simplex KKT solver exactly solves each independent pool.
     """
 
+    rate_capacity = float(cache_config.cloud_total_bandwidth_bps)
     if not cloud_tasks:
-        return KKTResourceAllocationResult(True, "", {}, {}, {}, {}, {}, {})
-
-    if cache_config.cloud_resource_mode == LEGACY_CLOUD_RESOURCE_MODE:
-        allocations = {
-            task.task_id: float(cache_config.cloud_total_cpu_cycles_per_s)
-            for task in cloud_tasks
-        }
         return KKTResourceAllocationResult(
             True,
             "",
-            {CLOUD: allocations},
-            {},
-            {CLOUD: float(len(cloud_tasks))},
             {},
             {},
             {},
+            {},
+            {},
+            {},
+            cloud_uplink_rate_capacity_bps=rate_capacity,
         )
 
-    capacity = float(cache_config.cloud_cpu_capacity_cycles_per_s)
+    supported_stages = {"NEW", "UPLOADING", "COMPUTING", "NETWORK_DELAY"}
+    if any(task.execution_stage not in supported_stages for task in cloud_tasks):
+        return KKTResourceAllocationResult(
+            False,
+            "Cloud task has unsupported execution stage",
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            cloud_uplink_rate_capacity_bps=rate_capacity,
+        )
+    if any(
+        not math.isfinite(float(task.input_bits))
+        or float(task.input_bits) < 0.0
+        or not math.isfinite(float(task.cpu_cycles))
+        or float(task.cpu_cycles) <= 0.0
+        for task in cloud_tasks
+    ):
+        return KKTResourceAllocationResult(
+            False,
+            "Cloud task input_bits/cpu_cycles are invalid",
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            cloud_uplink_rate_capacity_bps=rate_capacity,
+        )
+
+    upload_tasks = [
+        task
+        for task in cloud_tasks
+        if task.execution_stage in {"NEW", "UPLOADING"} and task.input_bits > 0.0
+    ]
     kkt_cfg = kkt_config_from_project(project_cfg)
-    if kkt_cfg.min_cpu_fraction * len(cloud_tasks) > 1.0:
+    if rate_capacity <= 0.0 or not math.isfinite(rate_capacity):
+        return KKTResourceAllocationResult(
+            False,
+            "Cloud total uplink rate capacity must be finite and positive",
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            cloud_uplink_rate_capacity_bps=rate_capacity,
+        )
+    if kkt_cfg.min_bandwidth_fraction * len(upload_tasks) > 1.0:
+        return KKTResourceAllocationResult(
+            False,
+            "Cloud uplink rate epsilon infeasible",
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            cloud_uplink_rate_capacity_bps=rate_capacity,
+        )
+
+    finite_cpu_pool = cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
+    capacity = (
+        float(cache_config.cloud_cpu_capacity_cycles_per_s)
+        if finite_cpu_pool
+        else None
+    )
+    if finite_cpu_pool and (
+        capacity is None or not math.isfinite(capacity) or capacity <= 0.0
+    ):
+        return KKTResourceAllocationResult(
+            False,
+            "Cloud total CPU capacity must be finite and positive",
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            cloud_uplink_rate_capacity_bps=rate_capacity,
+        )
+    if finite_cpu_pool and kkt_cfg.min_cpu_fraction * len(cloud_tasks) > 1.0:
         return KKTResourceAllocationResult(
             False,
             "Cloud CPU epsilon infeasible",
@@ -3303,103 +3558,226 @@ def _allocate_cloud_cpu_kkt(
             {},
             {},
             {},
+            cloud_uplink_rate_capacity_bps=rate_capacity,
+        )
+
+    def infeasible(
+        reason: str,
+        diagnostics: tuple[KKTAllocationDiagnostics, ...] = (),
+    ) -> KKTResourceAllocationResult:
+        return KKTResourceAllocationResult(
+            False,
+            reason,
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            diagnostics,
+            cloud_uplink_rate_capacity_bps=rate_capacity,
         )
 
     def compute_pool() -> KKTResourceAllocationResult:
-        coefficients = [
-            cache_config.omega_t
-            * task.cpu_cycles
-            / (cache_config.time_ref_s * capacity)
-            for task in cloud_tasks
-        ]
-        if kkt_cache is not None:
-            kkt_cache.solver_calls += 1
-        solver_started = (
-            time.perf_counter() if timing_profile is not None else 0.0
-        )
-        fractions, multiplier, ok, reason, diagnostics = (
-            solve_kkt_fraction_allocation(
-                coefficients,
-                kkt_cfg.min_cpu_fraction,
-                kkt_cfg.bisection_tolerance,
-                kkt_cfg.max_bisection_iterations,
-                return_diagnostics=True,
+        diagnostics: list[KKTAllocationDiagnostics] = []
+        cpu_allocation: dict[str, float] = {}
+        cpu_fraction_total = 0.0
+        cpu_multiplier = 0.0
+
+        if finite_cpu_pool:
+            assert capacity is not None
+            cpu_coefficients = [
+                cache_config.omega_t
+                * task.cpu_cycles
+                / (cache_config.time_ref_s * capacity)
+                for task in cloud_tasks
+            ]
+            if kkt_cache is not None:
+                kkt_cache.solver_calls += 1
+            solver_started = (
+                time.perf_counter() if timing_profile is not None else 0.0
             )
-        )
-        if timing_profile is not None:
-            solver_runtime = time.perf_counter() - solver_started
-            _profile_add(
-                timing_profile,
-                "kkt_cloud_cpu_solver_core_runtime",
-                solver_runtime,
-            )
-            _profile_add(
-                timing_profile,
-                "kkt_solver_core_runtime",
-                solver_runtime,
-            )
-        if kkt_cache is not None:
-            kkt_cache.record_diagnostics(diagnostics)
-        if not ok:
-            return KKTResourceAllocationResult(
-                False,
-                f"Cloud CPU KKT infeasible: {reason}",
-                {},
-                {},
-                {},
-                {},
-                {},
-                {},
-                (diagnostics,),
-            )
-        fraction_values = np.asarray(fractions, dtype=np.float64)
-        fraction_total = float(math.fsum(float(value) for value in fraction_values))
-        if fraction_total > 1.0:
-            fraction_values = fraction_values / fraction_total
-        allocation_map = {
-            task.task_id: float(fraction) * capacity
-            for task, fraction in zip(cloud_tasks, fraction_values, strict=True)
-        }
-        allocated_total = float(math.fsum(allocation_map.values()))
-        if allocated_total > capacity:
-            largest_task_id = max(allocation_map, key=allocation_map.__getitem__)
-            allocation_map[largest_task_id] -= allocated_total - capacity
-            allocated_total = float(math.fsum(allocation_map.values()))
-            if allocated_total > capacity:
-                allocation_map[largest_task_id] = math.nextafter(
-                    allocation_map[largest_task_id], 0.0
+            cpu_fractions, cpu_multiplier, ok, reason, cpu_diagnostic = (
+                solve_kkt_fraction_allocation(
+                    cpu_coefficients,
+                    kkt_cfg.min_cpu_fraction,
+                    kkt_cfg.bisection_tolerance,
+                    kkt_cfg.max_bisection_iterations,
+                    return_diagnostics=True,
                 )
-                allocated_total = float(math.fsum(allocation_map.values()))
-            if allocated_total > capacity:
-                return KKTResourceAllocationResult(
-                    False,
-                    "Cloud CPU allocation rounding exceeded capacity",
-                    {},
-                    {},
-                    {},
-                    {},
-                    {},
-                    {},
-                    (diagnostics,),
+            )
+            if timing_profile is not None:
+                solver_runtime = time.perf_counter() - solver_started
+                _profile_add(
+                    timing_profile,
+                    "kkt_cloud_cpu_solver_core_runtime",
+                    solver_runtime,
                 )
+                _profile_add(
+                    timing_profile,
+                    "kkt_solver_core_runtime",
+                    solver_runtime,
+                )
+            diagnostics.append(cpu_diagnostic)
+            if kkt_cache is not None:
+                kkt_cache.record_diagnostics(cpu_diagnostic)
+            if not ok:
+                return infeasible(f"Cloud CPU KKT infeasible: {reason}", tuple(diagnostics))
+            cpu_fraction_values = np.asarray(cpu_fractions, dtype=np.float64)
+            cpu_fraction_total = float(
+                math.fsum(float(value) for value in cpu_fraction_values)
+            )
+            if cpu_fraction_total > 1.0:
+                cpu_fraction_values = cpu_fraction_values / cpu_fraction_total
+                cpu_fraction_total = float(
+                    math.fsum(float(value) for value in cpu_fraction_values)
+                )
+            cpu_allocation = {
+                task.task_id: float(fraction) * capacity
+                for task, fraction in zip(
+                    cloud_tasks, cpu_fraction_values, strict=True
+                )
+            }
+            cpu_used = float(math.fsum(cpu_allocation.values()))
+            if cpu_used > capacity:
+                largest_task_id = max(cpu_allocation, key=cpu_allocation.__getitem__)
+                cpu_allocation[largest_task_id] -= cpu_used - capacity
+                cpu_used = float(math.fsum(cpu_allocation.values()))
+                if cpu_used > capacity:
+                    cpu_allocation[largest_task_id] = math.nextafter(
+                        cpu_allocation[largest_task_id], 0.0
+                    )
+                    cpu_used = float(math.fsum(cpu_allocation.values()))
+                if cpu_used > capacity:
+                    return infeasible(
+                        "Cloud CPU allocation rounding exceeded capacity",
+                        tuple(diagnostics),
+                    )
+        else:
+            cpu_allocation = {
+                task.task_id: float(cache_config.cloud_total_cpu_cycles_per_s)
+                for task in cloud_tasks
+            }
+
+        uplink_allocation: dict[str, float] = {}
+        rate_fraction_total = 0.0
+        rate_multiplier = 0.0
+        if upload_tasks:
+            rate_coefficients = []
+            for task in upload_tasks:
+                q = float(task.transmit_time_share)
+                if not math.isfinite(q) or q <= 0.0 or q > 1.0:
+                    return infeasible(
+                        f"Cloud task {task.task_id} has invalid transmit_time_share={q}",
+                        tuple(diagnostics),
+                    )
+                rate_coefficients.append(
+                    task.input_bits
+                    / rate_capacity
+                    * (
+                        cache_config.omega_t
+                        * cache_config.cloud_delay_factor
+                        / (cache_config.time_ref_s * q)
+                        + cache_config.omega_e
+                        * cache_config.tx_power_w
+                        / cache_config.energy_ref_j
+                    )
+                )
+            if kkt_cache is not None:
+                kkt_cache.solver_calls += 1
+            solver_started = (
+                time.perf_counter() if timing_profile is not None else 0.0
+            )
+            rate_fractions, rate_multiplier, ok, reason, rate_diagnostic = (
+                solve_kkt_fraction_allocation(
+                    rate_coefficients,
+                    kkt_cfg.min_bandwidth_fraction,
+                    kkt_cfg.bisection_tolerance,
+                    kkt_cfg.max_bisection_iterations,
+                    return_diagnostics=True,
+                )
+            )
+            if timing_profile is not None:
+                solver_runtime = time.perf_counter() - solver_started
+                _profile_add(
+                    timing_profile,
+                    "kkt_cloud_uplink_solver_core_runtime",
+                    solver_runtime,
+                )
+                _profile_add(
+                    timing_profile,
+                    "kkt_solver_core_runtime",
+                    solver_runtime,
+                )
+            diagnostics.append(rate_diagnostic)
+            if kkt_cache is not None:
+                kkt_cache.record_diagnostics(rate_diagnostic)
+            if not ok:
+                return infeasible(
+                    f"Cloud uplink rate KKT infeasible: {reason}",
+                    tuple(diagnostics),
+                )
+            rate_fraction_values = np.asarray(rate_fractions, dtype=np.float64)
+            rate_fraction_total = float(
+                math.fsum(float(value) for value in rate_fraction_values)
+            )
+            if rate_fraction_total > 1.0:
+                rate_fraction_values = rate_fraction_values / rate_fraction_total
+                rate_fraction_total = float(
+                    math.fsum(float(value) for value in rate_fraction_values)
+                )
+            uplink_allocation = {
+                task.task_id: float(fraction) * rate_capacity
+                for task, fraction in zip(
+                    upload_tasks, rate_fraction_values, strict=True
+                )
+            }
+            rate_used = float(math.fsum(uplink_allocation.values()))
+            if rate_used > rate_capacity:
+                largest_task_id = max(
+                    uplink_allocation, key=uplink_allocation.__getitem__
+                )
+                uplink_allocation[largest_task_id] -= rate_used - rate_capacity
+                rate_used = float(math.fsum(uplink_allocation.values()))
+                if rate_used > rate_capacity:
+                    uplink_allocation[largest_task_id] = math.nextafter(
+                        uplink_allocation[largest_task_id], 0.0
+                    )
+                    rate_used = float(math.fsum(uplink_allocation.values()))
+                if rate_used > rate_capacity:
+                    return infeasible(
+                        "Cloud uplink allocation rounding exceeded capacity",
+                        tuple(diagnostics),
+                    )
+
         return KKTResourceAllocationResult(
-            True,
-            "",
-            {CLOUD: allocation_map},
-            {},
-            {CLOUD: float(math.fsum(float(value) for value in fraction_values))},
-            {},
-            {CLOUD: float(multiplier)},
-            {},
-            (diagnostics,),
+            feasible=True,
+            infeasible_reason="",
+            cpu_allocations=({CLOUD: cpu_allocation} if cpu_allocation else {}),
+            bandwidth_allocations={},
+            per_node_cpu_sum=(
+                {CLOUD: cpu_fraction_total}
+                if finite_cpu_pool
+                else {CLOUD: float(len(cloud_tasks))}
+            ),
+            per_node_bandwidth_sum={},
+            cpu_multipliers=(
+                {CLOUD: float(cpu_multiplier)} if finite_cpu_pool else {}
+            ),
+            bandwidth_multipliers={},
+            kkt_diagnostics=tuple(diagnostics),
+            cloud_uplink_rate_allocations_bps=uplink_allocation,
+            cloud_uplink_rate_capacity_bps=rate_capacity,
+            cloud_uplink_rate_used_bps=float(
+                math.fsum(uplink_allocation.values())
+            ),
         )
 
     kkt_started = time.perf_counter() if timing_profile is not None else 0.0
     if kkt_cache is None:
         result = compute_pool()
     else:
-        # The Cloud pool cache is keyed by the full sorted Cloud task set.  Its
-        # capacity is fixed for the lifetime of this Matching call.
+        # The Cloud resource cache is keyed by the full sorted Cloud task set.
         result = kkt_cache.get_or_compute(
             CLOUD,
             cloud_tasks,
@@ -3571,6 +3949,7 @@ def evaluate_matching_with_kkt(
                 if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
                 else None
             ),
+            cloud_uplink_rate_capacity_bps=cache_config.cloud_total_bandwidth_bps,
         )
 
     if node_evaluation_cache is not None:
@@ -3657,14 +4036,11 @@ def evaluate_matching_with_kkt(
         bandwidth_resource_sums.update(node_evaluation.bandwidth_resource_sums)
 
     cloud_tasks = [task for task in tasks if matching[task.task_id] == CLOUD]
-    cloud_computing_tasks = [
-        task for task in cloud_tasks if task.execution_stage in {"NEW", "COMPUTING"}
-    ]
     cloud_kkt_started_at = (
         time.perf_counter() if timing_profile is not None else 0.0
     )
-    cloud_allocation = _allocate_cloud_cpu_kkt(
-        cloud_computing_tasks,
+    cloud_allocation = _allocate_cloud_resources_kkt(
+        cloud_tasks,
         cache_config,
         project_cfg,
         kkt_cache,
@@ -3694,16 +4070,18 @@ def evaluate_matching_with_kkt(
     cloud_cpu_allocations = dict(
         cloud_allocation.cpu_allocations.get(CLOUD, {})
     )
+    cloud_uplink_rate_allocations = dict(
+        cloud_allocation.cloud_uplink_rate_allocations_bps
+    )
     cloud_cpu_capacity = (
         float(cache_config.cloud_cpu_capacity_cycles_per_s)
         if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
         else None
     )
     cloud_cpu_used = float(math.fsum(cloud_cpu_allocations.values()))
-    cloud_solo_cpu = (
-        float(cache_config.cloud_cpu_capacity_cycles_per_s)
-        if cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
-        else float(cache_config.cloud_total_cpu_cycles_per_s)
+    cloud_uplink_rate_capacity = float(cache_config.cloud_total_bandwidth_bps)
+    cloud_uplink_rate_used = float(
+        math.fsum(cloud_uplink_rate_allocations.values())
     )
 
     per_delay: dict[str, float] = {}
@@ -3726,8 +4104,29 @@ def evaluate_matching_with_kkt(
             if q <= 0.0 or q > 1.0:
                 raise ValueError(f"task {task.task_id} has invalid transmit_time_share={q}")
             remaining_upload = task.input_bits if task.execution_stage in {"NEW", "UPLOADING"} else 0.0
-            cpu_rate = cloud_cpu_allocations.get(task.task_id, cloud_solo_cpu)
-            upload_wall_s = remaining_upload / (cache_config.cloud_total_bandwidth_bps * q)
+            cpu_rate = cloud_cpu_allocations.get(task.task_id)
+            if cpu_rate is None or not math.isfinite(float(cpu_rate)) or cpu_rate <= 0.0:
+                raise RuntimeError(
+                    f"Cloud task {task.task_id} has no positive shared CPU allocation"
+                )
+            upload_rate_bps = (
+                cloud_uplink_rate_allocations.get(task.task_id)
+                if remaining_upload > 0.0
+                else None
+            )
+            if remaining_upload > 0.0 and (
+                upload_rate_bps is None
+                or not math.isfinite(float(upload_rate_bps))
+                or upload_rate_bps <= 0.0
+            ):
+                raise RuntimeError(
+                    f"Cloud task {task.task_id} has no positive shared uplink allocation"
+                )
+            upload_wall_s = (
+                remaining_upload / (float(upload_rate_bps) * q)
+                if upload_rate_bps is not None
+                else 0.0
+            )
             upload_delay_s = cache_config.cloud_delay_factor * upload_wall_s
             compute_delay_s = task.cpu_cycles / cpu_rate
             delay = float(
@@ -3735,7 +4134,12 @@ def evaluate_matching_with_kkt(
                 + compute_delay_s
                 + (task.remaining_network_delay_s if task.execution_stage == "NETWORK_DELAY" else 0.0)
             )
-            energy = float(cache_config.tx_power_w * remaining_upload / cache_config.cloud_total_bandwidth_bps)
+            radio_airtime_s = (
+                remaining_upload / float(upload_rate_bps)
+                if upload_rate_bps is not None
+                else 0.0
+            )
+            energy = float(cache_config.tx_power_w * radio_airtime_s)
             utility = float(
                 system_model.task_utility(
                     delay,
@@ -3769,6 +4173,9 @@ def evaluate_matching_with_kkt(
         cloud_cpu_allocations,
         cloud_cpu_capacity,
         cloud_cpu_used,
+        cloud_uplink_rate_allocations,
+        cloud_uplink_rate_capacity,
+        cloud_uplink_rate_used,
     )
 
 
@@ -3840,9 +4247,10 @@ def evaluate_matching_candidate_incremental(
     candidate_cloud_task_ids = {
         task_id for task_id, target in candidate_kkt.items() if target == CLOUD
     }
-    finite_cloud_pool_changed = (
+    cloud_task_set_changed = current_cloud_task_ids != candidate_cloud_task_ids
+    finite_cloud_cpu_pool_changed = (
         cache_config.cloud_resource_mode == FINITE_CLOUD_RESOURCE_MODE
-        and current_cloud_task_ids != candidate_cloud_task_ids
+        and cloud_task_set_changed
     )
 
     affected_ids = [str(task_id) for task_id in affected_task_ids]
@@ -3883,12 +4291,27 @@ def evaluate_matching_candidate_incremental(
     )
     cloud_cpu_capacity = current_evaluation.cloud_cpu_capacity_cycles_per_s
     cloud_cpu_used = float(current_evaluation.cloud_cpu_used_cycles_per_s)
-    if finite_cloud_pool_changed:
-        # The entire pool allocation is coupled: discard the old set so the
-        # candidate evaluator replaces it with a fresh allocation over every
-        # Cloud task in candidate_matching.
-        cloud_cpu_allocations.clear()
-        cloud_cpu_capacity = float(cache_config.cloud_cpu_capacity_cycles_per_s)
+    cloud_uplink_rate_allocations = dict(
+        current_evaluation.cloud_uplink_rate_allocations_bps
+    )
+    cloud_uplink_rate_capacity = (
+        current_evaluation.cloud_uplink_rate_capacity_bps
+    )
+    cloud_uplink_rate_used = float(
+        current_evaluation.cloud_uplink_rate_used_bps
+    )
+    if cloud_task_set_changed:
+        # Both Cloud pools are coupled to the full set of Cloud-assigned tasks.
+        cloud_uplink_rate_allocations.clear()
+        cloud_uplink_rate_capacity = float(cache_config.cloud_total_bandwidth_bps)
+        if finite_cloud_cpu_pool_changed:
+            cloud_cpu_allocations.clear()
+            cloud_cpu_capacity = float(cache_config.cloud_cpu_capacity_cycles_per_s)
+        elif cache_config.cloud_resource_mode == LEGACY_CLOUD_RESOURCE_MODE:
+            for task_id in current_cloud_task_ids | candidate_cloud_task_ids:
+                cloud_cpu_allocations.pop(task_id, None)
+        cloud_cpu_used = float(math.fsum(cloud_cpu_allocations.values()))
+        cloud_uplink_rate_used = 0.0
         cloud_cpu_used = 0.0
     if timing_profile is not None:
         _profile_add(
@@ -4071,7 +4494,17 @@ def evaluate_matching_candidate_incremental(
         per_task_delay.update(non_edge_evaluation.per_task_delay_s)
         per_task_energy.update(non_edge_evaluation.per_task_vehicle_energy_j)
         per_task_utility.update(non_edge_evaluation.per_task_utility)
-        if finite_cloud_pool_changed:
+        if cloud_task_set_changed:
+            cloud_uplink_rate_allocations = dict(
+                non_edge_evaluation.cloud_uplink_rate_allocations_bps
+            )
+            cloud_uplink_rate_capacity = (
+                non_edge_evaluation.cloud_uplink_rate_capacity_bps
+            )
+            cloud_uplink_rate_used = float(
+                non_edge_evaluation.cloud_uplink_rate_used_bps
+            )
+        if finite_cloud_cpu_pool_changed:
             cloud_cpu_allocations = dict(
                 non_edge_evaluation.cloud_cpu_allocations_cycles_per_s
             )
@@ -4142,6 +4575,9 @@ def evaluate_matching_candidate_incremental(
         cloud_cpu_allocations_cycles_per_s=cloud_cpu_allocations,
         cloud_cpu_capacity_cycles_per_s=cloud_cpu_capacity,
         cloud_cpu_used_cycles_per_s=cloud_cpu_used,
+        cloud_uplink_rate_allocations_bps=cloud_uplink_rate_allocations,
+        cloud_uplink_rate_capacity_bps=cloud_uplink_rate_capacity,
+        cloud_uplink_rate_used_bps=cloud_uplink_rate_used,
     )
 
 

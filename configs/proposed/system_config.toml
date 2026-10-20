@@ -237,8 +237,8 @@ movement_fixed_cost = 0.0
 
 [nodes.cloud]
 # Cloud 数量固定为 1 个逻辑节点；本项目不展开 Cloud 实例列表。
-# 本实验 Cloud CPU 使用有限共享池；上行保持每任务独立等效速率。
-# 正式系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c。
+# 本实验 Cloud CPU 和等效上行均使用每时隙共享总资源池。
+# 正式系统公式：T_vc = psi_c * D_v / R_i + L_v / f_i。
 # 资源感知卸载模式保留全部合法 Edge 与 Cloud 候选，按实际 KKT 后效用选择；
 # Edge 仅在效用数值平局时优先。
 # 文献来源：Al-Shareeda et al., Novel DT-assisted Vehicular Task Offloading for Cloud,
@@ -251,19 +251,19 @@ total_cpu_cycles_per_s = 20.0e9
 # Cloud有限共享CPU总池为20 GHz；这是仿真假设，不是部署测量。
 resource_mode = "finite_pool"
 cpu_capacity_cycles_per_s = 20.0e9
-# 本次实验设计指定 Cloud 每任务固定等效上行速率为 20 Mbps。
-# Matching运行时每个Cloud任务使用此固定等效值，不按任务数再次分摊。
+# 本次实验设计指定 Cloud 每时隙共享总等效上行能力为 20 Mbps。
+# uplink_rate_bps 为兼容别名；Matching 从 total_bandwidth_bps 读取共享池上限并按任务分配速率。
 # 这是抽象实验参数，不代表实际网络保证吞吐或物理可靠接入。
 uplink_rate_bps = 20.0e6
-# 兼容现有接口的重复字段，必须与 uplink_rate_bps 相等；字段名中的 total 不表示共享池。
+# Cloud 每时隙共享总等效上行能力，单位 bit/s；保留字段并要求与 uplink_rate_bps 相等。
 total_bandwidth_bps = 20.0e6
-# 当前接口要求 resource_sharing=false：不建模 Cloud 接入用户间的带宽竞争。
-# Cloud CPU 是否共享由 resource_mode 独立控制；本配置使用有限共享 CPU 池。
+# 兼容字段，保留 false 值以兼容既有配置；总上行速率始终按共享池分配，不受此字段控制。
+# Cloud CPU 总池由 resource_mode/cpu_capacity_cycles_per_s 控制；本配置使用有限共享池。
 resource_sharing = false
-# 当前系统公式：T_vc = psi_c * D_v / R_c + L_v / F_c，
-# E_vc_vehicle = p_v * D_v / R_c；psi_c 不进入能耗。
+# 当前系统公式：T_vc = psi_c * D_v / R_i + L_v / f_i，
+# E_vc_vehicle = p_v * D_v / R_i；psi_c 不进入车辆无线发射能耗。
 # 本次实验设计指定 Cloud 等效上行速率与时延系数；不表示实际无线覆盖、吞吐保证或显式回传链路。
-# Cloud传输时延仍按 psi_cloud * D_bits / R_cloud 计算；车辆发送能耗不乘psi_cloud。
+# Cloud通信时延仍按 psi_cloud * D_bits / R_i 计算；车辆发送能耗只按实际无线radio airtime计算。
 # psi_cloud=13.0 为本次指定的抽象实验参数。
 cloud_delay_factor = 13.0
 
@@ -328,7 +328,7 @@ inter_node_spectrum = "ORTHOGONAL_INDEPENDENT"
 interference = "NONE"
 
 [communication.cloud]
-# Cloud每任务固定等效上行速率，须与nodes.cloud重复字段相同；本次实验设计值为20 Mbps。
+# 共享总等效上行速率的兼容别名，须与nodes.cloud.uplink_rate_bps相等。
 uplink_rate_bps = 20.0e6
 
 [cache]

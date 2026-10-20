@@ -2088,6 +2088,7 @@ def append_dual_timescale_slot_metrics(
     count = 0
     with destination.open("a", encoding="utf-8", newline="\n") as stream:
         for transition in transitions:
+            matching_summary = transition.matching_summary
             expected_reward = (
                 float(transition.actual_task_utility)
                 - float(transition.cache_cost)
@@ -2103,7 +2104,49 @@ def append_dual_timescale_slot_metrics(
                 "origin": int(transition.origin_index),
                 "slot": int(transition.slot),
                 "node_task_count": dict(
-                    transition.matching_summary.get("node_task_count", {})
+                    matching_summary.get("node_task_count", {})
+                ),
+                "cloud_task_count": int(matching_summary["cloud_task_count"]),
+                "cloud_uplink_allocated_bps": matching_summary[
+                    "cloud_uplink_allocated_bps"
+                ],
+                "cloud_uplink_capacity_bps": matching_summary[
+                    "cloud_uplink_capacity_bps"
+                ],
+                "cloud_uplink_capacity_violation_bps": matching_summary[
+                    "cloud_uplink_capacity_violation_bps"
+                ],
+                "cloud_cpu_allocated_cycles_per_s": matching_summary[
+                    "cloud_cpu_allocated_cycles_per_s"
+                ],
+                "cloud_cpu_capacity_cycles_per_s": matching_summary[
+                    "cloud_cpu_capacity_cycles_per_s"
+                ],
+                "cloud_cpu_capacity_violation_cycles_per_s": matching_summary[
+                    "cloud_cpu_capacity_violation_cycles_per_s"
+                ],
+                "cloud_selected_resource_values_finite": bool(
+                    matching_summary["cloud_selected_resource_values_finite"]
+                ),
+                "cloud_kkt_solve_count": int(
+                    matching_summary["cloud_kkt_solve_count"]
+                ),
+                "cloud_kkt_max_uplink_allocated_bps": matching_summary[
+                    "cloud_kkt_max_uplink_allocated_bps"
+                ],
+                "cloud_kkt_max_cpu_allocated_cycles_per_s": matching_summary[
+                    "cloud_kkt_max_cpu_allocated_cycles_per_s"
+                ],
+                "cloud_kkt_max_uplink_capacity_violation_bps": matching_summary[
+                    "cloud_kkt_max_uplink_capacity_violation_bps"
+                ],
+                "cloud_kkt_max_cpu_capacity_violation_cycles_per_s": (
+                    matching_summary[
+                        "cloud_kkt_max_cpu_capacity_violation_cycles_per_s"
+                    ]
+                ),
+                "cloud_kkt_nonfinite_result_count": int(
+                    matching_summary["cloud_kkt_nonfinite_result_count"]
                 ),
                 "G": float(transition.reward),
                 "task_utility": float(transition.actual_task_utility),
@@ -2131,7 +2174,7 @@ def append_dual_timescale_slot_metrics(
                 "uav1_move": bool(int(transition.actions[1]) != 0),
                 "matching_calls": 1,
                 "kkt_calls": int(
-                    transition.matching_summary.get("KKT_SOLVER_CALL_COUNT", 0)
+                    matching_summary.get("KKT_SOLVER_CALL_COUNT", 0)
                 ),
                 "slot_runtime_seconds": float(transition.slot_runtime_seconds),
             }

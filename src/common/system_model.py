@@ -226,10 +226,11 @@ def cloud_execution(
     cloud_delay_factor: float,
     transmit_power_w: float,
 ) -> dict[str, float]:
-    """Evaluate one task using the CPU and uplink rates supplied by the caller.
+    """Evaluate one task using its assigned CPU service rate and uplink rate.
 
-    Callers provide either the legacy fixed per-task CPU rate or a rate allocated
-    from a finite shared pool.  The uplink rate remains task-specific.
+    The caller is responsible for allocating these per-task rates from any
+    shared Cloud pools. Communication delay uses ``cloud_delay_factor`` while
+    vehicle radio energy uses only the base airtime ``input_bits / rate``.
     """
     bits = _require_finite("input_bits", input_bits)
     cycles = _require_finite("cpu_cycles", cpu_cycles)

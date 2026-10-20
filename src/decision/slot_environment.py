@@ -67,6 +67,19 @@ def _position_tuples(positions: dict[str, Any]) -> dict[str, tuple[float, float]
     }
 
 
+def _finite_allocation_total(values: Any) -> tuple[float | None, bool]:
+    allocation_values = [float(value) for value in values]
+    if not all(math.isfinite(value) for value in allocation_values):
+        return None, False
+    try:
+        total = float(math.fsum(allocation_values))
+    except OverflowError:
+        return None, False
+    if not math.isfinite(total):
+        return None, False
+    return total, True
+
+
 def _matching_summary(
     result: task_allocation.TransferExchangeMatchingResult,
     cache_nodes: dict[str, Any],
@@ -121,6 +134,47 @@ def _matching_summary(
         float(math.fsum(result.per_task_utility.values()) / task_count)
         if task_count
         else None
+    )
+    cloud_cpu_allocated, cloud_cpu_allocations_finite = _finite_allocation_total(
+        result.cloud_cpu_allocations_cycles_per_s.values()
+    )
+    cloud_uplink_allocated, cloud_uplink_allocations_finite = (
+        _finite_allocation_total(result.cloud_uplink_rate_allocations_bps.values())
+    )
+    cloud_uplink_capacity = result.cloud_uplink_rate_capacity_bps
+    if cloud_uplink_capacity is None:
+        cloud_uplink_capacity = cache_config.cloud_total_bandwidth_bps
+    cloud_cpu_capacity = result.cloud_cpu_capacity_cycles_per_s
+    if (
+        cloud_cpu_capacity is None
+        and cache_config.cloud_resource_mode
+        == task_allocation.FINITE_CLOUD_RESOURCE_MODE
+    ):
+        cloud_cpu_capacity = cache_config.cloud_cpu_capacity_cycles_per_s
+    cloud_uplink_capacity = (
+        float(cloud_uplink_capacity)
+        if cloud_uplink_capacity is not None
+        and math.isfinite(float(cloud_uplink_capacity))
+        else None
+    )
+    cloud_cpu_capacity = (
+        float(cloud_cpu_capacity)
+        if cloud_cpu_capacity is not None
+        and math.isfinite(float(cloud_cpu_capacity))
+        else None
+    )
+    selected_cloud_allocations_finite = (
+        cloud_cpu_allocations_finite and cloud_uplink_allocations_finite
+    )
+    cloud_uplink_violation = (
+        None
+        if cloud_uplink_allocated is None or cloud_uplink_capacity is None
+        else max(0.0, cloud_uplink_allocated - cloud_uplink_capacity)
+    )
+    cloud_cpu_violation = (
+        None
+        if cloud_cpu_allocated is None or cloud_cpu_capacity is None
+        else max(0.0, cloud_cpu_allocated - cloud_cpu_capacity)
     )
     summary = {
         "resource_feasible": bool(result.resource_feasible),
@@ -184,6 +238,32 @@ def _matching_summary(
         "tie_break_count": result.tie_break_count,
         "cloud_resource_mode": cache_config.cloud_resource_mode,
         "cloud_fallback_mode": cache_config.cloud_fallback_mode,
+        "cloud_task_count": int(cloud_count),
+        "cloud_uplink_allocated_bps": cloud_uplink_allocated,
+        "cloud_uplink_capacity_bps": cloud_uplink_capacity,
+        "cloud_uplink_capacity_violation_bps": cloud_uplink_violation,
+        "cloud_cpu_allocated_cycles_per_s": cloud_cpu_allocated,
+        "cloud_cpu_capacity_cycles_per_s": cloud_cpu_capacity,
+        "cloud_cpu_capacity_violation_cycles_per_s": cloud_cpu_violation,
+        "cloud_selected_resource_values_finite": bool(
+            selected_cloud_allocations_finite
+        ),
+        "cloud_kkt_solve_count": int(result.cloud_kkt_solve_count),
+        "cloud_kkt_max_uplink_allocated_bps": (
+            result.cloud_kkt_max_uplink_allocated_bps
+        ),
+        "cloud_kkt_max_cpu_allocated_cycles_per_s": (
+            result.cloud_kkt_max_cpu_allocated_cycles_per_s
+        ),
+        "cloud_kkt_max_uplink_capacity_violation_bps": (
+            result.cloud_kkt_max_uplink_capacity_violation_bps
+        ),
+        "cloud_kkt_max_cpu_capacity_violation_cycles_per_s": (
+            result.cloud_kkt_max_cpu_capacity_violation_cycles_per_s
+        ),
+        "cloud_kkt_nonfinite_result_count": int(
+            result.cloud_kkt_nonfinite_result_count
+        ),
         "node_task_count": {
             "SV": int(sum(counts_by_role["SV"].values())),
             "SV_by_node": counts_by_role["SV"],
@@ -215,6 +295,26 @@ def _matching_summary(
             ),
             "cloud_cpu_allocations_cycles_per_s": dict(
                 result.cloud_cpu_allocations_cycles_per_s
+            ),
+            "cloud_uplink_rate_usage_bps": float(
+                result.cloud_uplink_rate_used_bps
+            ),
+            "cloud_uplink_rate_capacity_bps": (
+                None
+                if result.cloud_uplink_rate_capacity_bps is None
+                else float(result.cloud_uplink_rate_capacity_bps)
+            ),
+            "cloud_uplink_rate_remaining_bps": (
+                None
+                if result.cloud_uplink_rate_capacity_bps is None
+                else max(
+                    float(result.cloud_uplink_rate_capacity_bps)
+                    - float(result.cloud_uplink_rate_used_bps),
+                    0.0,
+                )
+            ),
+            "cloud_uplink_rate_allocations_bps": dict(
+                result.cloud_uplink_rate_allocations_bps
             ),
             "rsu_radio_bandwidth_fraction_sum_by_node": {
                 node_id: float(math.fsum(result.bandwidth_allocations.get(node_id, {}).values()))
