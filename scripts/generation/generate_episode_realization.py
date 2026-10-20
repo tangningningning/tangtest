@@ -33,11 +33,12 @@ from scenario import scenario_generator as scenario
 from scenario import sumo_scenario as sumo
 from scenario import task_scenario as task
 from scenario.realization import EPISODE_SEED_STREAMS, derive_episode_seeds
+from scenario.vehicle_order import RESIDUAL_SAMPLING_CONTRACT
 
 
 EXPECTED_SLOTS = 300
 EPISODE_MANIFEST_FILENAME = "episode_manifest.json"
-EPISODE_MANIFEST_SCHEMA_VERSION = "episode_manifest_v1"
+EPISODE_MANIFEST_SCHEMA_VERSION = "episode_manifest_v2"
 RUN_MANIFEST_FILENAME = "run_manifest.json"
 
 
@@ -158,6 +159,7 @@ def _generation_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema": EPISODE_MANIFEST_SCHEMA_VERSION,
         "episode_seed_protocol": "adaptive_cache_mec_episode_seed_v1",
+        "residual_sampling_contract": RESIDUAL_SAMPLING_CONTRACT,
         "simulation": {
             key: get(config, f"simulation.{key}")
             for key in (
@@ -276,6 +278,9 @@ def build_episode_manifest(
     source_hashes = _source_artifact_hashes(config)
     manifest = {
         "schema_version": EPISODE_MANIFEST_SCHEMA_VERSION,
+        "data_input_contracts": {
+            "residual_sampling": RESIDUAL_SAMPLING_CONTRACT,
+        },
         "episode_seed": int(episode_seed),
         "derived_episode_seed_streams": seeds,
         "generation_config_fingerprint": generation_config_fingerprint(config),
@@ -369,6 +374,11 @@ def validate_episode_provenance(
         )
     if manifest.get("generation_config_fields") != _generation_config_payload(config):
         raise RuntimeError(f"{prefix}: generation_config_fields mismatch")
+    expected_data_contracts = {
+        "residual_sampling": RESIDUAL_SAMPLING_CONTRACT,
+    }
+    if manifest.get("data_input_contracts") != expected_data_contracts:
+        raise RuntimeError(f"{prefix}: data input contract mismatch")
     expected_hashes = _source_artifact_hashes(config)
     for field, expected_hash in expected_hashes.items():
         if manifest.get(field) != expected_hash:
@@ -534,6 +544,24 @@ def validate_written_outputs(
         raise AssertionError("tasks.csv does not cover slots 0..299")
     if len(rows) != task_vehicle_count * EXPECTED_SLOTS:
         raise AssertionError("tasks.csv does not cover every TV×slot")
+    _roles, research_ids, service_ids, task_ids = scenario.load_roles(
+        output_dir / "vehicle_roles.json"
+    )
+    if (
+        len(task_ids) != task_vehicle_count
+        or len(research_ids) != research_vehicle_count
+    ):
+        raise AssertionError("vehicle role counts do not match generated artifacts")
+    task_ids_by_slot: dict[int, list[str]] = {}
+    for row in rows:
+        task_ids_by_slot.setdefault(int(row["slot"]), []).append(str(row["vehicle_id"]))
+    if any(
+        len(ids) != task_vehicle_count
+        or len(set(ids)) != len(ids)
+        or set(ids) != set(task_ids)
+        for ids in task_ids_by_slot.values()
+    ):
+        raise AssertionError("tasks.csv vehicle IDs do not match vehicle_roles.json")
 
     with prediction_file.open("r", encoding="utf-8", newline="") as stream:
         prediction_rows = list(csv.DictReader(stream))
@@ -553,6 +581,24 @@ def validate_written_outputs(
     )
     if len(vehicle_rows) != expected_vehicle_rows:
         raise AssertionError("vehicle_predictions.csv has an unexpected row count")
+    prediction_ids: dict[tuple[int, int], list[str]] = {}
+    for row in vehicle_rows:
+        key = (int(row["origin_slot"]), int(row["horizon"]))
+        prediction_ids.setdefault(key, []).append(str(row["vehicle_id"]))
+    expected_prediction_keys = {
+        (origin, horizon)
+        for origin in range(EXPECTED_SLOTS)
+        for horizon in range(horizon_steps)
+    }
+    if set(prediction_ids) != expected_prediction_keys or any(
+        len(ids) != research_vehicle_count
+        or len(set(ids)) != len(ids)
+        or set(ids) != set(research_ids)
+        for ids in prediction_ids.values()
+    ):
+        raise AssertionError(
+            "vehicle_predictions.csv vehicle IDs do not match vehicle_roles.json"
+        )
 
     with np.load(scenario_file, allow_pickle=False) as payload:
         origins = np.asarray(payload["origin_slots"], dtype=np.int64)
@@ -561,6 +607,44 @@ def validate_written_outputs(
         positions = np.asarray(payload["positions_xy"])
         if positions.shape[0] != EXPECTED_SLOTS:
             raise AssertionError("prediction_scenarios.npz is not a full episode")
+        vehicle_ids = tuple(np.asarray(payload["vehicle_ids"]).astype(str).tolist())
+        role_ids = np.asarray(payload["vehicle_roles"]).astype(str).tolist()
+        task_array = tuple(
+            np.asarray(payload["task_vehicle_ids"]).astype(str).tolist()
+        )
+        service_array = tuple(
+            np.asarray(payload["service_vehicle_ids"]).astype(str).tolist()
+        )
+        metadata = json.loads(str(payload["metadata_json"].item()))
+        role_by_id = {
+            **{vehicle_id: "SV" for vehicle_id in service_ids},
+            **{vehicle_id: "TV" for vehicle_id in task_ids},
+        }
+        if (
+            len(set(vehicle_ids)) != len(vehicle_ids)
+            or set(vehicle_ids) != set(research_ids)
+            or len(set(task_array)) != len(task_array)
+            or set(task_array) != set(task_ids)
+            or len(set(service_array)) != len(service_array)
+            or set(service_array) != set(service_ids)
+            or len(role_ids) != len(vehicle_ids)
+            or any(
+                role_by_id.get(vehicle_id) != role.upper()
+                for vehicle_id, role in zip(vehicle_ids, role_ids, strict=True)
+            )
+            or positions.ndim != 5
+            or positions.shape[3:] != (len(vehicle_ids), 2)
+            or any(
+                np.asarray(payload[field]).ndim != 4
+                or np.asarray(payload[field]).shape[-1] != len(task_array)
+                for field in ("arrival", "service_id", "input_size", "cpu_cycles")
+            )
+            or metadata.get("residual_sampling_contract")
+            != RESIDUAL_SAMPLING_CONTRACT
+        ):
+            raise AssertionError(
+                "prediction_scenarios.npz vehicle mapping contract mismatch"
+            )
 
 
 def run_episode(

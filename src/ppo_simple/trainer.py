@@ -87,7 +87,8 @@ MULTI_NODE_CHECKPOINT_VERSION = 65
 SPARSE_COORDINATED_CHECKPOINT_VERSION = 66
 ALGORITHM_ID = "ADAPTIVE_CACHE_UAV_JOINT_MAPPO"
 MACRO_ACTOR_UPDATE_CONTROL_VERSION = "macro_actor_post_step_joint_kl_backtracking_v1"
-PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
+ALTERNATING_ACTOR_UPDATE_SCHEDULE_VERSION = "ALTERNATING_ACTOR_UPDATES_V1"
+FORMAL_TRAINING_CONFIG_PATH = "configs/proposed/alternating_actor_updates_v1.toml"
 MACRO_ACTOR_ADVANTAGE_MODE = "formal Macro SMDP GAE; joint Cache and sampled termination PPO"
 MACRO_CRITIC_TARGET_MODE = "two_step_smdp_td"
 MACRO_CRITIC_LAST1_ALPHA = 1.0
@@ -884,9 +885,7 @@ class PPOTrainer:
         context: Any,
         *,
         device: str = "cpu",
-        actor_learning_rate_override: float | None = None,
         macro_actor_learning_rate_override: float | None = None,
-        critic_learning_rate_override: float | None = None,
         policy_update_total: int = FORMAL_TRAINING_EPISODES // 4,
         capture_macro_transition_trace: bool = False,
         unified_cache_action: bool | None = None,
@@ -903,6 +902,29 @@ class PPOTrainer:
         )
         if self.realizations_per_policy_update <= 0:
             raise ValueError("realizations_per_policy_update must be a positive integer.")
+        self.actor_update_mode = str(
+            self.config.get("actor_update_mode", "ALTERNATING")
+        ).strip().upper()
+        self.actor_update_first = str(
+            self.config.get("actor_update_first", "MICRO")
+        ).strip().upper()
+        actor_update_period = self.config.get("actor_update_period", 1)
+        if isinstance(actor_update_period, bool) or not isinstance(
+            actor_update_period, int
+        ):
+            raise ValueError("actor_update_period must be an integer.")
+        self.actor_update_period = int(actor_update_period)
+        if self.actor_update_mode != "ALTERNATING":
+            raise ValueError(
+                "The formal trainer requires actor_update_mode=ALTERNATING."
+            )
+        if (
+            self.actor_update_first != "MICRO" or self.actor_update_period != 1
+        ):
+            raise ValueError(
+                "ALTERNATING_ACTOR_UPDATES_V1 requires first=MICRO and period=1."
+            )
+        self.actor_update_schedule_version = ALTERNATING_ACTOR_UPDATE_SCHEDULE_VERSION
         self.policy_update_total = int(policy_update_total)
         if self.policy_update_total <= 0:
             raise ValueError("policy_update_total must be positive")
@@ -1044,9 +1066,7 @@ class PPOTrainer:
             **policy_kwargs,
         ).to(self.device)
         actor_lr = float(
-            actor_learning_rate_override
-            if actor_learning_rate_override is not None
-            else self.config.get("actor_learning_rate", self.config["learning_rate"])
+            self.config.get("actor_learning_rate", self.config["learning_rate"])
         )
         macro_actor_lr_initial = float(
             self.config.get("macro_actor_learning_rate", actor_lr)
@@ -1089,20 +1109,10 @@ class PPOTrainer:
         if not math.isfinite(macro_actor_lr) or macro_actor_lr <= 0.0:
             raise ValueError("macro actor learning rate must be finite and positive.")
         critic_lr = float(
-            critic_learning_rate_override
-            if critic_learning_rate_override is not None
-            else self.config.get("critic_learning_rate", self.config["learning_rate"])
+            self.config.get("critic_learning_rate", self.config["learning_rate"])
         )
-        macro_critic_lr = float(
-            critic_learning_rate_override
-            if critic_learning_rate_override is not None
-            else self.config.get("macro_critic_learning_rate", critic_lr)
-        )
-        micro_critic_lr = float(
-            critic_learning_rate_override
-            if critic_learning_rate_override is not None
-            else self.config.get("micro_critic_learning_rate", critic_lr)
-        )
+        macro_critic_lr = float(self.config.get("macro_critic_learning_rate", critic_lr))
+        micro_critic_lr = float(self.config.get("micro_critic_learning_rate", critic_lr))
         long_value_lr = float(self.config.get("long_value_learning_rate", 1.0e-3))
         if not math.isfinite(long_value_lr) or long_value_lr <= 0.0:
             raise ValueError("long_value_learning_rate must be finite and positive.")
@@ -1188,6 +1198,11 @@ class PPOTrainer:
             "matching_calls": 0,
             "kkt_calls": 0,
         }
+        self.actor_update_schedule_state = self._new_actor_update_schedule_state(
+            policy_update_index=0,
+            micro_actor_active_group_count=0,
+            macro_actor_active_group_count=0,
+        )
         self.last1_macro_transition_buffer: dict[str, Any] | None = None
 
 
@@ -1305,6 +1320,14 @@ class PPOTrainer:
                 "STAY/MOVE group entropy-floor regularization"
             ),
         }
+        contract.update(
+            {
+                "actor_update_mode": self.actor_update_mode,
+                "actor_update_schedule_version": self.actor_update_schedule_version,
+                "actor_update_first": self.actor_update_first,
+                "actor_update_period": self.actor_update_period,
+            }
+        )
         if self.sparse_coordinated_cache_action:
             contract["max_cache_updates_per_frame"] = 1
             contract["cache_group_probability_semantics"] = (
@@ -1314,6 +1337,38 @@ class PPOTrainer:
                 "masked categorical over legal UPDATE targets for the selected node only"
             )
         return contract
+
+    def _active_actor_for_update(self, update_index: int) -> str:
+        """Return the actor group enabled for a zero-based policy update."""
+
+        alternating_index = (int(update_index) // self.actor_update_period) % 2
+        return self.actor_update_first if alternating_index == 0 else (
+            "MACRO" if self.actor_update_first == "MICRO" else "MICRO"
+        )
+
+    def _new_actor_update_schedule_state(
+        self,
+        *,
+        policy_update_index: int,
+        micro_actor_active_group_count: int,
+        macro_actor_active_group_count: int,
+    ) -> dict[str, Any]:
+        """Build the persisted scheduler cursor and independently counted actor groups."""
+
+        return {
+            "schedule_version": self.actor_update_schedule_version,
+            "next_policy_update_index": int(policy_update_index),
+            "next_active_actor": self._active_actor_for_update(policy_update_index),
+            "micro_actor_active_group_count": int(micro_actor_active_group_count),
+            "macro_actor_active_group_count": int(macro_actor_active_group_count),
+        }
+
+    def _expected_actor_update_group_counts(self, update_count: int) -> tuple[int, int]:
+        """Return expected (Micro, Macro) actor-enabled groups after ``update_count`` updates."""
+
+        count = int(update_count)
+        micro_count = (count + 1) // 2
+        return micro_count, count // 2
 
     def _micro_group_entropy_floor(self) -> float:
         probability_cap = float(self.config["micro_group_probability_soft_cap"])
@@ -1341,7 +1396,7 @@ class PPOTrainer:
     def update_from_episodes(
         self, collections: list[EpisodeCollection]
     ) -> dict[str, Any]:
-        """Apply one frozen-rollout joint Cache–UAV MAPPO update."""
+        """Apply one frozen-rollout dual-timescale MAPPO update group."""
 
         group_size = self.realizations_per_policy_update
         if len(collections) != group_size:
@@ -1359,16 +1414,41 @@ class PPOTrainer:
                 "Macro",
             )
 
+        policy_update_index = int(self.training_counters["policy_update_count"])
+        active_actor = self._active_actor_for_update(policy_update_index)
+        micro_actor_update_enabled = active_actor == "MICRO"
+        macro_actor_update_enabled = active_actor == "MACRO"
         applied_learning_rate = self._apply_macro_actor_learning_rate(
-            int(self.training_counters["policy_update_count"])
+            policy_update_index
         )
-        micro_metrics = self._update_micro([collection.micro for collection in collections])
+        micro_metrics = self._update_micro(
+            [collection.micro for collection in collections],
+            update_actor=micro_actor_update_enabled,
+        )
         macro_metrics = self._update_macro(
             [collection.macro for collection in collections],
             episode_start_index=episode_start,
+            update_actor=macro_actor_update_enabled,
+        )
+        schedule_state = self.actor_update_schedule_state
+        schedule_state["micro_actor_active_group_count"] += int(
+            micro_actor_update_enabled
+        )
+        schedule_state["macro_actor_active_group_count"] += int(
+            macro_actor_update_enabled
         )
         self.training_counters["completed_episodes"] += group_size
         self.training_counters["policy_update_count"] += 1
+        next_update_index = int(self.training_counters["policy_update_count"])
+        self.actor_update_schedule_state = self._new_actor_update_schedule_state(
+            policy_update_index=next_update_index,
+            micro_actor_active_group_count=int(
+                schedule_state["micro_actor_active_group_count"]
+            ),
+            macro_actor_active_group_count=int(
+                schedule_state["macro_actor_active_group_count"]
+            ),
+        )
         for collection in collections:
             self.training_counters["environment_executions"] += int(
                 collection.summary["environment_execution_count"]
@@ -1384,8 +1464,14 @@ class PPOTrainer:
         return {
             **micro_metrics,
             **macro_metrics,
+            "active_actor": active_actor,
+            "micro_actor_update_enabled": micro_actor_update_enabled,
+            "macro_actor_update_enabled": macro_actor_update_enabled,
+            "actor_update_schedule_state": copy.deepcopy(
+                self.actor_update_schedule_state
+            ),
             "policy_update_group_id": update_index,
-            "policy_update_index": update_index,
+            "policy_update_index": policy_update_index,
             "policy_update_total": self.policy_update_total,
             "policy_update_group_start_episode": episode_start,
             "policy_update_group_end_episode": episode_end,
@@ -1418,7 +1504,12 @@ class PPOTrainer:
 
 
 
-    def _update_micro(self, buffers: list[MicroRolloutBuffer]) -> dict[str, Any]:
+    def _update_micro(
+        self,
+        buffers: list[MicroRolloutBuffer],
+        *,
+        update_actor: bool,
+    ) -> dict[str, Any]:
         episode_batches = [_micro_batch(buffer) for buffer in buffers]
         episode_advantages: list[np.ndarray] = []
         episode_returns: list[np.ndarray] = []
@@ -1458,6 +1549,8 @@ class PPOTrainer:
         max_grad_norm = float(self.config["max_grad_norm"])
         records: list[dict[str, float]] = []
         stopped = False
+        actor_optimizer_steps = 0
+        critic_optimizer_steps = 0
         before_tensors = self._tensor_batch(batch, np.arange(count, dtype=np.int64))
         with torch.no_grad():
             before_evaluation = self.policy.evaluate_micro_joint(
@@ -1513,27 +1606,53 @@ class PPOTrainer:
                     + value_coefficient * value_loss
                     + group_entropy_floor_loss
                     - entropy_coefficient * entropy
+                    if update_actor
+                    else value_coefficient * value_loss
                 )
                 self.micro_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 micro_actor_parameters = self.policy.micro_actor_parameters()
                 micro_critic_parameters = self.policy.micro_critic_parameters()
-                micro_actor_before_clip = float(
-                    torch.nn.utils.clip_grad_norm_(micro_actor_parameters, max_grad_norm)
-                    .detach()
-                    .cpu()
+                has_actor_grad = any(
+                    parameter.grad is not None for parameter in micro_actor_parameters
+                )
+                has_critic_grad = any(
+                    parameter.grad is not None for parameter in micro_critic_parameters
+                )
+                micro_actor_before_clip = (
+                    float(
+                        torch.nn.utils.clip_grad_norm_(
+                            micro_actor_parameters, max_grad_norm
+                        )
+                        .detach()
+                        .cpu()
+                    )
+                    if has_actor_grad
+                    else 0.0
                 )
                 micro_actor_after_clip = _gradient_norm(micro_actor_parameters)
-                micro_critic_before_clip = float(
-                    torch.nn.utils.clip_grad_norm_(micro_critic_parameters, max_grad_norm)
-                    .detach()
-                    .cpu()
+                micro_critic_before_clip = (
+                    float(
+                        torch.nn.utils.clip_grad_norm_(
+                            micro_critic_parameters, max_grad_norm
+                        )
+                        .detach()
+                        .cpu()
+                    )
+                    if has_critic_grad
+                    else 0.0
                 )
                 micro_critic_after_clip = _gradient_norm(micro_critic_parameters)
+                if not has_critic_grad:
+                    raise RuntimeError("Micro Critic update produced no Critic gradients.")
                 self.micro_optimizer.step()
                 self.training_counters["micro_optimizer_steps"] += 1
-                self.training_counters["micro_actor_optimizer_steps"] += 1
-                self.training_counters["micro_critic_optimizer_steps"] += 1
+                if has_actor_grad:
+                    actor_optimizer_steps += 1
+                    self.training_counters["micro_actor_optimizer_steps"] += 1
+                if has_critic_grad:
+                    critic_optimizer_steps += 1
+                    self.training_counters["micro_critic_optimizer_steps"] += 1
                 with torch.no_grad():
                     post_step_evaluated = self.policy.evaluate_micro_joint(
                         tensors["observations"],
@@ -1569,7 +1688,11 @@ class PPOTrainer:
                         "critic_grad_norm_after_clip": micro_critic_after_clip,
                     }
                 )
-                if target_kl > 0.0 and records[-1]["approx_kl"] > 1.5 * target_kl:
+                if (
+                    update_actor
+                    and target_kl > 0.0
+                    and records[-1]["approx_kl"] > 1.5 * target_kl
+                ):
                     stopped = True
                     break
             if stopped:
@@ -1608,8 +1731,9 @@ class PPOTrainer:
             )
         result.update(
             {
-                "micro_actor_optimizer_steps_this_update": len(records),
-                "micro_critic_optimizer_steps_this_update": len(records),
+                "micro_actor_update_enabled": bool(update_actor),
+                "micro_actor_optimizer_steps_this_update": actor_optimizer_steps,
+                "micro_critic_optimizer_steps_this_update": critic_optimizer_steps,
                 "micro_adv_mean": float(adv_mean),
                 "micro_adv_std": float(adv_std),
                 "micro_normalized_adv_mean": float(np.mean(normalized)),
@@ -1650,6 +1774,7 @@ class PPOTrainer:
         buffers: list[MacroRolloutBuffer],
         *,
         episode_start_index: int,
+        update_actor: bool,
     ) -> dict[str, Any]:
         episode_batches = [_macro_batch(buffer) for buffer in buffers]
         episode_advantages: list[np.ndarray] = []
@@ -1941,7 +2066,12 @@ class PPOTrainer:
                         return False
             return True
 
-        for _epoch in range(int(self.config["update_epochs"])):
+        if not update_actor:
+            # Macro Critic and Long-Value updates run outside this PPO Actor loop.
+            self.macro_optimizer.zero_grad(set_to_none=True)
+        for _epoch in range(
+            int(self.config["update_epochs"]) if update_actor else 0
+        ):
             tensors = self._tensor_batch(batch, all_indices)
             components = self.policy.evaluate_macro_components(
                 tensors["observations"],
@@ -2333,6 +2463,16 @@ class PPOTrainer:
                     .astype(float)
                     .tolist()
                 )
+        if not update_actor:
+            rollout_logprob_max_error = float(np.max(joint_log_ratio_abs))
+            if (
+                not math.isfinite(rollout_logprob_max_error)
+                or rollout_logprob_max_error > 5.0e-6
+            ):
+                raise RuntimeError(
+                    "Frozen Macro Actor log-probability does not match the stored rollout value: "
+                    f"{rollout_logprob_max_error:.9g}."
+                )
         duration_values = np.asarray(batch["actual_durations"], dtype=np.int64)
         macro_joint_log_ratio_abs_mean_by_duration = {
             f"D={duration}": (
@@ -2431,6 +2571,7 @@ class PPOTrainer:
         )
         result.update(
             {
+                "macro_actor_update_enabled": bool(update_actor),
                 "macro_actor_optimizer_steps_this_update": actor_steps_executed,
                 "macro_actor_update_control_version": self.macro_actor_update_control_version,
                 "attempted_step_count": attempted_step_count,
@@ -3369,12 +3510,29 @@ class PPOTrainer:
             raise ValueError("checkpoint completed_episodes is not on a complete group boundary")
         if update_count != completed // self.realizations_per_policy_update:
             raise ValueError("checkpoint policy_update_count disagrees with completed_episodes")
+        expected_micro_groups, expected_macro_groups = (
+            self._expected_actor_update_group_counts(update_count)
+        )
+        expected_schedule_state = self._new_actor_update_schedule_state(
+            policy_update_index=update_count,
+            micro_actor_active_group_count=expected_micro_groups,
+            macro_actor_active_group_count=expected_macro_groups,
+        )
+        if self.actor_update_schedule_state != expected_schedule_state:
+            raise ValueError("actor update scheduler state disagrees with completed updates.")
         last1 = self.last1_macro_transition_buffer
         return {
             "checkpoint_version": self.checkpoint_version,
             "checkpoint_role": str(checkpoint_role),
             "task_execution_model": PER_SLOT_ANALYTIC_TASK_MODEL,
             "algorithm_id": self.algorithm_id,
+            "actor_update_mode": self.actor_update_mode,
+            "actor_update_schedule_version": self.actor_update_schedule_version,
+            "actor_update_first": self.actor_update_first,
+            "actor_update_period": self.actor_update_period,
+            "actor_update_schedule_state": copy.deepcopy(
+                self.actor_update_schedule_state
+            ),
             "macro_actor_update_control_version": self.macro_actor_update_control_version,
             "macro_critic_target_mode": self.macro_critic_target_mode,
             "long_value_enabled": self.long_value_enabled,
@@ -3477,6 +3635,16 @@ class PPOTrainer:
         payload = torch.load(Path(path), map_location=self.device, weights_only=False)
         if not isinstance(payload, dict):
             raise ValueError("checkpoint payload must be a mapping.")
+        if payload.get("actor_update_mode") != self.actor_update_mode:
+            raise ValueError("checkpoint actor_update_mode mismatch.")
+        schedule_contract = {
+            "actor_update_schedule_version": self.actor_update_schedule_version,
+            "actor_update_first": self.actor_update_first,
+            "actor_update_period": self.actor_update_period,
+        }
+        for field, expected in schedule_contract.items():
+            if payload.get(field) != expected:
+                raise ValueError(f"checkpoint {field} mismatch.")
         if (
             payload.get("checkpoint_version") != self.checkpoint_version
             or payload.get("architecture_version")
@@ -3655,6 +3823,20 @@ class PPOTrainer:
             or int(self.training_counters["long_value_update_count"]) != expected_update_count
         ):
             raise ValueError("checkpoint update counters disagree with completed_episodes")
+        expected_micro_groups, expected_macro_groups = (
+            self._expected_actor_update_group_counts(expected_update_count)
+        )
+        expected_schedule_state = self._new_actor_update_schedule_state(
+            policy_update_index=expected_update_count,
+            micro_actor_active_group_count=expected_micro_groups,
+            macro_actor_active_group_count=expected_macro_groups,
+        )
+        saved_schedule_state = payload.get("actor_update_schedule_state")
+        if saved_schedule_state != expected_schedule_state:
+            raise ValueError(
+                "checkpoint actor update schedule state disagrees with completed updates."
+            )
+        self.actor_update_schedule_state = expected_schedule_state
         if raw_last1 is None:
             if completed_episodes != 0:
                 raise ValueError("PROPOSED checkpoint is missing its last1 Macro transition buffer.")
@@ -3753,22 +3935,34 @@ def run_training(
     episode_seed_start: int | None = None,
     generate_missing_episodes: bool = False,
     episode_generation_device: str = "cpu",
-    actor_learning_rate_override: float | None = None,
-    macro_actor_learning_rate_override: float | None = None,
-    critic_learning_rate_override: float | None = None,
     seed: int = 0,
+    stop_after_policy_updates: int | None = None,
     resume: bool = False,
     resume_checkpoint_path: str | Path | None = None,
     verbose: bool = False,
     save_macro_transition_trace: bool = False,
 ) -> dict[str, Any]:
-    """Run the formal adaptive Cache–UAV joint MAPPO training lifecycle."""
+    """Run the formal adaptive dual-timescale Cache–UAV MAPPO lifecycle."""
+
+    def console_log(message: str, *, always: bool = False) -> None:
+        """Emit a training message when verbose output is enabled or it is critical."""
+
+        if verbose or always:
+            print(message, flush=True)
 
     _require_torch()
     if resume_checkpoint_path is not None and not resume:
         raise ValueError("--resume-checkpoint requires --resume.")
     if int(target_episodes) <= 0:
         raise ValueError("--epochs 必须为正整数。")
+    if stop_after_policy_updates is not None and (
+        isinstance(stop_after_policy_updates, bool)
+        or not isinstance(stop_after_policy_updates, (int, np.integer))
+        or int(stop_after_policy_updates) <= 0
+    ):
+        raise ValueError("--stop-after-policy-updates 必须为正整数。")
+    if stop_after_policy_updates is not None:
+        stop_after_policy_updates = int(stop_after_policy_updates)
     if save_macro_transition_trace and (resume or episode_seed_start is None):
         raise ValueError("transition-trace reporting requires a fresh run with --episode-seed-start.")
     config_file = Path(config_path).expanduser().resolve(strict=True)
@@ -3818,6 +4012,34 @@ def run_training(
     if pool_provenance is None:
         raise ValueError("Formal Training Pool provenance could not be recorded.")
     context = load_environment_context(str(config_file), realization_dir=episode_paths[0])
+    loaded_source_contract = context.scenarios["metadata"].get(
+        "loader_compatibility"
+    )
+    if not isinstance(loaded_source_contract, dict):
+        raise ValueError("Loaded Episode is missing its validated data-input compatibility record.")
+    pool_compatibility["data_input_compatibility"] = {
+        **pool_compatibility["data_input_compatibility"],
+        "first_loaded_episode_seed": (
+            None if episode_seed_start is None else int(episode_seed_start)
+        ),
+        "first_loaded_episode_source_contracts": {
+            "observation_vehicle_order_source": loaded_source_contract.get(
+                "observation_vehicle_order_source"
+            ),
+            "source_vehicle_order_markers": loaded_source_contract.get(
+                "source_vehicle_order_markers"
+            ),
+            "source_residual_sampling_provenance": loaded_source_contract.get(
+                "source_residual_sampling_provenance"
+            ),
+            "saved_prediction_scenarios_reused": loaded_source_contract.get(
+                "saved_prediction_scenarios_reused"
+            ),
+            "scenario_metadata_preserved": loaded_source_contract.get(
+                "scenario_metadata_preserved"
+            ),
+        },
+    }
     raw_hash = project_config.raw_config_sha256(config_file)
     semantic_hash = project_config.semantic_config_hash(context.cfg)
     run_path = _resolve_path(project_root, run_dir)
@@ -3847,14 +4069,12 @@ def run_training(
     _seed_everything(seed)
     trainer = PPOTrainer(
         context,
-        actor_learning_rate_override=actor_learning_rate_override,
-        macro_actor_learning_rate_override=macro_actor_learning_rate_override,
-        critic_learning_rate_override=critic_learning_rate_override,
         policy_update_total=policy_update_total,
         capture_macro_transition_trace=save_macro_transition_trace,
     )
     completed = 0
     best_return: float | None = None
+    completion_metadata: dict[str, Any] = {}
     if resume:
         if not checkpoint_path.is_file() or not manifest_path.is_file():
             raise FileNotFoundError(
@@ -3924,6 +4144,14 @@ def run_training(
             "micro_critic_learning_rate": trainer.learning_rates["micro_critic"],
             "long_value_learning_rate": trainer.learning_rates["long_value"],
         }
+        expected_manifest_contract.update(
+            {
+                "actor_update_mode": trainer.actor_update_mode,
+                "actor_update_schedule_version": trainer.actor_update_schedule_version,
+                "actor_update_first": trainer.actor_update_first,
+                "actor_update_period": trainer.actor_update_period,
+            }
+        )
         for field, expected in expected_manifest_contract.items():
             if manifest.get(field) != expected:
                 raise ValueError(f"run manifest {field} mismatch。")
@@ -3934,6 +4162,8 @@ def run_training(
             episode_pool=checkpoint_pool_identity,
             restore_rng=True,
         )
+        if manifest.get("actor_update_schedule_state") != trainer.actor_update_schedule_state:
+            raise ValueError("run manifest actor update schedule state mismatch.")
         completed = int(trainer.training_counters["completed_episodes"])
         checkpoint_counters = dict(trainer.training_counters)
         if payload.get("checkpoint_role") != "RESUMABLE_MAINLINE_CHECKPOINT":
@@ -3976,9 +4206,56 @@ def run_training(
             or summary["last_update"].get("episode") != completed
         ):
             raise ValueError("run_summary.json does not match the selected Checkpoint.")
+        if (
+            summary.get("actor_update_mode") != trainer.actor_update_mode
+            or summary.get("actor_update_schedule_version")
+            != trainer.actor_update_schedule_version
+            or summary.get("actor_update_schedule_state")
+            != trainer.actor_update_schedule_state
+        ):
+            raise ValueError("run_summary.json actor update schedule identity mismatch.")
     else:
         ensure_fresh_run_dir_is_clean(run_path)
         run_path.mkdir(parents=True, exist_ok=True)
+    resume_controlled_stop_at_checkpoint = False
+    restored_policy_updates = int(trainer.training_counters["policy_update_count"])
+    if (
+        stop_after_policy_updates is not None
+        and restored_policy_updates > stop_after_policy_updates
+    ):
+        raise ValueError(
+            "--stop-after-policy-updates cannot be lower than the number of "
+            "Policy Updates already completed in the resumed run."
+        )
+    if resume:
+        previous_completion_status = manifest.get("training_completion_status")
+        if previous_completion_status in {
+            "CONTROLLED_STOP_AFTER_UPDATES",
+            "FORMAL_TRAINING_COMPLETE",
+            "TRAINING_TARGET_COMPLETE",
+        }:
+            completion_metadata["training_completion_status"] = (
+                previous_completion_status
+            )
+            for field in (
+                "controlled_stop_after_policy_updates",
+                "controlled_stop_completed_policy_updates",
+            ):
+                if field in manifest:
+                    completion_metadata[field] = manifest[field]
+        resume_controlled_stop_at_checkpoint = bool(
+            stop_after_policy_updates is not None
+            and restored_policy_updates == stop_after_policy_updates
+            and completed < int(target_episodes)
+        )
+        if resume_controlled_stop_at_checkpoint:
+            completion_metadata = {
+                "training_completion_status": "CONTROLLED_STOP_AFTER_UPDATES",
+                "controlled_stop_after_policy_updates": int(
+                    stop_after_policy_updates
+                ),
+                "controlled_stop_completed_policy_updates": restored_policy_updates,
+            }
     run_config_path = run_path / "run_config.toml"
     if run_config_path.is_file():
         if project_config.raw_config_sha256(run_config_path) != raw_hash:
@@ -4000,8 +4277,18 @@ def run_training(
             target_episodes=target_episodes,
             episode_pool=str(pool_path),
             episode_pool_provenance=pool_provenance,
+            data_input_compatibility=pool_compatibility["data_input_compatibility"],
             episode_seed_start=episode_seed_start,
             resume=resume,
+            training_completion_status=completion_metadata.get(
+                "training_completion_status"
+            ),
+            controlled_stop_after_policy_updates=completion_metadata.get(
+                "controlled_stop_after_policy_updates"
+            ),
+            controlled_stop_completed_policy_updates=completion_metadata.get(
+                "controlled_stop_completed_policy_updates"
+            ),
         )
 
     episode_metrics_path = run_path / "episode_metrics.jsonl"
@@ -4018,7 +4305,7 @@ def run_training(
 
     def save_run_summary() -> None:
         summary = {
-            "experiment_type": "adaptive_dual_timescale_joint_mappo",
+            "experiment_type": "adaptive_dual_timescale_alternating_actor_updates_v1_mappo",
             "algorithm_id": trainer.algorithm_id,
             "task_execution_model": PER_SLOT_ANALYTIC_TASK_MODEL,
             "macro_actor_update_control_version": trainer.macro_actor_update_control_version,
@@ -4041,6 +4328,13 @@ def run_training(
             "early_stop_reason": early_stop_reason,
             "early_stop_detail": early_stop_detail,
             "training_counters": dict(trainer.training_counters),
+            "actor_update_mode": trainer.actor_update_mode,
+            "actor_update_schedule_version": trainer.actor_update_schedule_version,
+            "actor_update_first": trainer.actor_update_first,
+            "actor_update_period": trainer.actor_update_period,
+            "actor_update_schedule_state": dict(
+                trainer.actor_update_schedule_state
+            ),
             "initialization_metadata": dict(trainer.initialization_metadata),
             "unified_cache_action": bool(trainer.unified_cache_action),
             "cardinality_corrected_cache_action": bool(
@@ -4049,6 +4343,7 @@ def run_training(
             "last_episode": last_episode_record,
             "last_update": last_update_record,
         }
+        summary.update(completion_metadata)
         with run_summary_path.open("w", encoding="utf-8", newline="\n") as stream:
             json.dump(summary, stream, ensure_ascii=False, sort_keys=True, indent=2)
             stream.write("\n")
@@ -4078,6 +4373,38 @@ def run_training(
             stale_plot.unlink(missing_ok=True)
 
     save_run_summary()
+    if resume_controlled_stop_at_checkpoint:
+        write_dual_timescale_run_manifest(
+            manifest_path,
+            config_path=config_file,
+            config_raw_sha256=raw_hash,
+            config_semantic_sha256=semantic_hash,
+            seed=seed,
+            trainer=trainer,
+            context=context,
+            target_episodes=target_episodes,
+            episode_pool=str(pool_path),
+            episode_pool_provenance=pool_provenance,
+            data_input_compatibility=pool_compatibility["data_input_compatibility"],
+            episode_seed_start=episode_seed_start,
+            resume=resume,
+            training_completion_status=completion_metadata.get(
+                "training_completion_status"
+            ),
+            controlled_stop_after_policy_updates=completion_metadata.get(
+                "controlled_stop_after_policy_updates"
+            ),
+            controlled_stop_completed_policy_updates=completion_metadata.get(
+                "controlled_stop_completed_policy_updates"
+            ),
+        )
+        save_run_summary()
+        console_log(
+            "[TRAIN] CONTROLLED_STOP_AFTER_UPDATES | "
+            f"Completed Policy Updates={restored_policy_updates} | "
+            f"Completed Episodes={completed}/{target_episodes}",
+            always=True,
+        )
     if not resume:
         trainer.save_checkpoint(
             checkpoint_path_for_write(run_path, INITIAL_CHECKPOINT_FILENAME),
@@ -4088,9 +4415,8 @@ def run_training(
             best_episode_return=None,
             checkpoint_role="INITIAL_POLICY_REFERENCE",
         )
-        print(
+        console_log(
             "[CHECKPOINT] Saved Initialization | Completed Episodes=0",
-            flush=True,
         )
         trainer.save_checkpoint(
             checkpoint_path,
@@ -4100,13 +4426,17 @@ def run_training(
             seed=seed,
             best_episode_return=None,
         )
-        print(
+        console_log(
             "[CHECKPOINT] Saved | Completed Episodes="
-            f"{int(trainer.training_counters['completed_episodes'])}",
-            flush=True,
+            f"{int(trainer.training_counters['completed_episodes'])}"
         )
 
-    for group_zero_start in range(completed, int(target_episodes), group_size):
+    group_zero_starts = (
+        ()
+        if resume_controlled_stop_at_checkpoint
+        else range(completed, int(target_episodes), group_size)
+    )
+    for group_zero_start in group_zero_starts:
         group_started_at = time.perf_counter()
         collections: list[EpisodeCollection] = []
         collection_runtimes: list[float] = []
@@ -4137,10 +4467,9 @@ def run_training(
             episode_start_time = time.strftime(
                 "%Y-%m-%dT%H:%M:%S%z", time.localtime()
             )
-            print(
+            console_log(
                 f"[TRAIN] Episode {episode_number}/{target_episodes} | Collecting | "
-                f"Seed={episode_seed} | Started={episode_start_time}",
-                flush=True,
+                f"Seed={episode_seed} | Started={episode_start_time}"
             )
             realization_path = episode_paths[episode_index]
             next_context = load_environment_context(
@@ -4155,12 +4484,11 @@ def run_training(
                 elapsed_seconds: float,
                 matching_kkt_elapsed_seconds: float,
             ) -> None:
-                print(
+                console_log(
                     f"[ROLLOUT] Episode {episode_number}/{target_episodes} | "
                     f"Slot {slots_completed}/{total_slots} | "
                     f"Elapsed={elapsed_seconds:.1f}s | "
-                    f"MatchingKKT={matching_kkt_elapsed_seconds:.1f}s",
-                    flush=True,
+                    f"MatchingKKT={matching_kkt_elapsed_seconds:.1f}s"
                 )
 
             try:
@@ -4172,12 +4500,11 @@ def run_training(
                     episode_seed=episode_seed,
                     progress_callback=report_rollout_progress,
                 )
-                print(
+                console_log(
                     f"[TRAIN] Episode {episode_number}/{target_episodes} | "
                     "Collection Completed | "
                     f"Return={float(collection.summary['episode_return']):.6f} | "
-                    f"Time={time.perf_counter() - collection_started_at:.1f}s",
-                    flush=True,
+                    f"Time={time.perf_counter() - collection_started_at:.1f}s"
                 )
             except FloatingPointError as exc:
                 early_stop_reason = "NAN_INF"
@@ -4207,10 +4534,9 @@ def run_training(
 
         update_group_number = int(trainer.training_counters["policy_update_count"]) + 1
         update_group_total = int(trainer.policy_update_total)
-        print(
+        console_log(
             f"[PPO] Update Group {update_group_number}/{update_group_total} | "
             f"Episodes={group_size} | Starting",
-            flush=True,
         )
         update_started_at = time.perf_counter()
         try:
@@ -4226,7 +4552,7 @@ def run_training(
                 - optimizer_steps_before_by_key["micro_actor_optimizer_steps"]
             )
             update_executed = macro_actor_steps + micro_actor_steps > 0
-            print(
+            console_log(
                 f"[PPO-UPDATE] Group={update_group_number} | "
                 f"UPDATE_EXECUTED={'YES' if update_executed else 'NO'} | "
                 f"MacroActorSteps={macro_actor_steps} | "
@@ -4235,12 +4561,12 @@ def run_training(
                 "UPDATE_NUMERICALLY_SAFE=FAIL | NaNInf=YES | "
                 f"EarlyStop=NAN_INF ({exc}) | "
                 "POLICY_REWARD_IMPROVED=NOT_EVALUATED",
-                flush=True,
+                always=True,
             )
-            print(
+            console_log(
                 f"[PPO] Update Group {update_group_number}/{update_group_total} | "
                 f"Stopped | Time={update_runtime:.1f}s | EarlyStop=NAN_INF",
-                flush=True,
+                always=True,
             )
             early_stop_reason = "NAN_INF"
             early_stop_detail = str(exc)
@@ -4255,7 +4581,7 @@ def run_training(
                 update_metrics.get("micro_actor_optimizer_steps_this_update", 0)
             )
             update_executed = macro_actor_steps + micro_actor_steps > 0
-            print(
+            console_log(
                 f"[PPO-UPDATE] Group={update_group_number} | "
                 f"UPDATE_EXECUTED={'YES' if update_executed else 'NO'} | "
                 f"MacroActorSteps={macro_actor_steps} | "
@@ -4264,22 +4590,21 @@ def run_training(
                 "UPDATE_NUMERICALLY_SAFE=FAIL | NaNInf=YES | "
                 "EarlyStop=NAN_INF (PPO update metrics contain NaN/Inf) | "
                 "POLICY_REWARD_IMPROVED=NOT_EVALUATED",
-                flush=True,
+                always=True,
             )
-            print(
+            console_log(
                 f"[PPO] Update Group {update_group_number}/{update_group_total} | "
                 f"Stopped | Time={update_runtime:.1f}s | EarlyStop=NAN_INF",
-                flush=True,
+                always=True,
             )
             early_stop_reason = "NAN_INF"
             early_stop_detail = "PPO update metrics contain NaN/Inf."
             save_run_summary()
             break
-        print(
+        console_log(
             f"[PPO] Update Group "
             f"{int(update_metrics['policy_update_group_id'])}/{update_group_total} | "
-            f"Completed | Time={update_runtime:.1f}s",
-            flush=True,
+            f"Completed | Time={update_runtime:.1f}s"
         )
         macro_actor_steps = int(
             update_metrics["macro_actor_optimizer_steps_this_update"]
@@ -4299,8 +4624,10 @@ def run_training(
         )
         final_stop_reason = str(update_metrics.get("final_stop_reason") or "NONE")
         micro_early_stop = bool(update_metrics.get("micro_early_stop", False))
-        print(
+        console_log(
             f"[PPO-UPDATE] Group={int(update_metrics['policy_update_group_id'])} | "
+            f"PolicyIndex={int(update_metrics['policy_update_index'])} | "
+            f"ActiveActor={update_metrics['active_actor']} | "
             f"UPDATE_EXECUTED={'YES' if actor_optimizer_steps > 0 else 'NO'} | "
             f"MacroActorSteps={macro_actor_steps} | MicroActorSteps={micro_actor_steps} | "
             "ActorParameterDelta=NOT_MEASURED | "
@@ -4327,12 +4654,12 @@ def run_training(
             f"EarlyStop={final_stop_reason} | "
             f"MacroEarlyStop={macro_stop_reason} | "
             f"MicroEarlyStop={'YES' if micro_early_stop else 'NO'} | "
-            "POLICY_REWARD_IMPROVED=NOT_EVALUATED",
-            flush=True,
+            "POLICY_REWARD_IMPROVED=NOT_EVALUATED"
         )
         group_collection_runtime = float(sum(collection_runtimes))
         group_training_runtime = time.perf_counter() - group_started_at
         completed = int(trainer.training_counters["completed_episodes"])
+        completion_metadata = {}
         group_start = int(update_metrics["policy_update_group_start_episode"])
         group_end = int(update_metrics["policy_update_group_end_episode"])
         group_id = int(update_metrics["policy_update_group_id"])
@@ -4402,6 +4729,11 @@ def run_training(
             "critic_target_",
         )
         grouped_metric_names = {
+            "policy_update_index",
+            "active_actor",
+            "macro_actor_update_enabled",
+            "micro_actor_update_enabled",
+            "actor_update_schedule_state",
             "macro_actor_advantage_mode",
             "macro_critic_target_mode",
             "macro_critic_fit_snapshots",
@@ -4530,15 +4862,12 @@ def run_training(
                 episode=int(episode_record["episode"]),
                 transitions=collection.micro.transitions,
             )
-            print(
+            console_log(
                 format_training_epoch_log(
                     episode_record,
                     target_epochs=int(target_episodes),
-                    macro_actor_learning_rate=float(
-                        update_metrics["macro_actor_learning_rate_applied"]
-                    ),
                 ),
-                flush=True,
+                always=True,
             )
 
         write_dual_timescale_run_manifest(
@@ -4552,8 +4881,18 @@ def run_training(
             target_episodes=target_episodes,
             episode_pool=str(pool_path),
             episode_pool_provenance=pool_provenance,
+            data_input_compatibility=pool_compatibility["data_input_compatibility"],
             episode_seed_start=episode_seed_start,
             resume=resume,
+            training_completion_status=completion_metadata.get(
+                "training_completion_status"
+            ),
+            controlled_stop_after_policy_updates=completion_metadata.get(
+                "controlled_stop_after_policy_updates"
+            ),
+            controlled_stop_completed_policy_updates=completion_metadata.get(
+                "controlled_stop_completed_policy_updates"
+            ),
         )
         save_run_summary()
         # Persist the post-update model and optimizer state before optional
@@ -4566,7 +4905,7 @@ def run_training(
             seed=seed,
             best_episode_return=best_return,
         )
-        print(f"[CHECKPOINT] Saved | Completed Episodes={completed}", flush=True)
+        console_log(f"[CHECKPOINT] Saved | Completed Episodes={completed}")
         update_count = int(trainer.training_counters["policy_update_count"])
         if update_count % INTERMEDIATE_CHECKPOINT_INTERVAL_UPDATES == 0:
             intermediate_name = f"update_{update_count:03d}_checkpoint.pt"
@@ -4578,10 +4917,9 @@ def run_training(
                 seed=seed,
                 best_episode_return=best_return,
             )
-            print(
+            console_log(
                 f"[CHECKPOINT] Saved Intermediate | Update Group={update_count} | "
-                f"Completed Episodes={completed} | File={intermediate_name}",
-                flush=True,
+                f"Completed Episodes={completed} | File={intermediate_name}"
             )
         if save_best_train_return_checkpoint:
             trainer.save_checkpoint(
@@ -4600,9 +4938,83 @@ def run_training(
                 trace_episode_batches,
                 gamma=float(cfg["algorithm"]["ppo"]["gamma"]),
             )
-        if verbose:
-            print(json.dumps(update_record, ensure_ascii=False, sort_keys=True))
-    return {
+        console_log(json.dumps(update_record, ensure_ascii=False, sort_keys=True))
+        completed_policy_updates = int(
+            trainer.training_counters["policy_update_count"]
+        )
+        controlled_stop_reached = bool(
+            stop_after_policy_updates is not None
+            and completed_policy_updates >= stop_after_policy_updates
+            and completed < int(target_episodes)
+        )
+        if controlled_stop_reached:
+            completion_metadata = {
+                "training_completion_status": "CONTROLLED_STOP_AFTER_UPDATES",
+                "controlled_stop_after_policy_updates": int(
+                    stop_after_policy_updates
+                ),
+                "controlled_stop_completed_policy_updates": completed_policy_updates,
+            }
+        elif completed >= int(target_episodes):
+            completion_metadata = {
+                "training_completion_status": (
+                    "FORMAL_TRAINING_COMPLETE"
+                    if int(target_episodes) == FORMAL_TRAINING_EPISODES
+                    else "TRAINING_TARGET_COMPLETE"
+                )
+            }
+        if completion_metadata:
+            write_dual_timescale_run_manifest(
+                manifest_path,
+                config_path=config_file,
+                config_raw_sha256=raw_hash,
+                config_semantic_sha256=semantic_hash,
+                seed=seed,
+                trainer=trainer,
+                context=context,
+                target_episodes=target_episodes,
+                episode_pool=str(pool_path),
+                episode_pool_provenance=pool_provenance,
+                data_input_compatibility=pool_compatibility["data_input_compatibility"],
+                episode_seed_start=episode_seed_start,
+                resume=resume,
+                training_completion_status=completion_metadata.get(
+                    "training_completion_status"
+                ),
+                controlled_stop_after_policy_updates=completion_metadata.get(
+                    "controlled_stop_after_policy_updates"
+                ),
+                controlled_stop_completed_policy_updates=completion_metadata.get(
+                    "controlled_stop_completed_policy_updates"
+                ),
+            )
+            save_run_summary()
+        if controlled_stop_reached:
+            console_log(
+                "[TRAIN] CONTROLLED_STOP_AFTER_UPDATES | "
+                f"Completed Policy Updates={completed_policy_updates} | "
+                f"Completed Episodes={completed}/{target_episodes}",
+                always=True,
+            )
+            break
+    if early_stop_reason is not None:
+        console_log(
+            f"[TRAIN] STOPPED | Reason={early_stop_reason} | "
+            f"Completed Episodes={completed}/{target_episodes} | "
+            f"Details={early_stop_detail}",
+            always=True,
+        )
+    elif completion_metadata.get("training_completion_status") in {
+        "FORMAL_TRAINING_COMPLETE",
+        "TRAINING_TARGET_COMPLETE",
+    }:
+        console_log(
+            f"[TRAIN] {completion_metadata['training_completion_status']} | "
+            f"Completed Episodes={completed}/{target_episodes} | "
+            f"Policy Updates={trainer.training_counters['policy_update_count']}",
+            always=True,
+        )
+    result = {
         "run_dir": str(run_path),
         "completed_episodes": completed,
         "target_episodes": int(target_episodes),
@@ -4611,16 +5023,38 @@ def run_training(
         "macro_transition_trace": trace_summary,
         "early_stop_reason": early_stop_reason,
     }
+    if completion_metadata:
+        result.update(completion_metadata)
+    return result
 
 
+
+
+def _positive_integer_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须为正整数。") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须为正整数。")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="训练 Adaptive Dual-Timescale Joint MAPPO（PPO Clip 更新）。"
+        description="训练 Alternating Actor Optimization V1 MAPPO。"
     )
-    parser.add_argument("--config", default=PROPOSED_CONFIG_PATH)
+    parser.add_argument("--config", default=FORMAL_TRAINING_CONFIG_PATH)
     parser.add_argument("--epochs", type=int, required=True)
+    parser.add_argument(
+        "--stop-after-policy-updates",
+        type=_positive_integer_argument,
+        default=None,
+        help=(
+            "Stop after this cumulative number of completed Policy Updates; "
+            "the limit is checked only at complete update-group boundaries."
+        ),
+    )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--episode-pool", required=True)
     parser.add_argument(
@@ -4631,9 +5065,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-seed-start", type=int, default=None)
     parser.add_argument("--generate-missing-episodes", action="store_true")
     parser.add_argument("--episode-generation-device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--actor-learning-rate", type=float, default=None)
-    parser.add_argument("--macro-actor-learning-rate", type=float, default=None)
-    parser.add_argument("--critic-learning-rate", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -4657,17 +5088,11 @@ def main(argv: list[str] | None = None) -> int:
         episode_seed_start=args.episode_seed_start,
         generate_missing_episodes=args.generate_missing_episodes,
         episode_generation_device=args.episode_generation_device,
-        actor_learning_rate_override=args.actor_learning_rate,
-        macro_actor_learning_rate_override=args.macro_actor_learning_rate,
-        critic_learning_rate_override=args.critic_learning_rate,
         seed=args.seed,
+        stop_after_policy_updates=args.stop_after_policy_updates,
         resume=args.resume,
         resume_checkpoint_path=args.resume_checkpoint,
         verbose=args.verbose,
         save_macro_transition_trace=args.save_macro_transition_trace,
     )
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

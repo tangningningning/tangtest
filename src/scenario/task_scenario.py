@@ -745,11 +745,6 @@ def attach_history_observed_counts(
 
 
 
-def _stable_id_key(value: str) -> tuple[int, int | str]:
-    text = str(value)
-    return (0, int(text)) if text.isdigit() else (1, text)
-
-
 def build_episode_artifacts(
     task_vehicles: list[str],
     service_catalog: dict[str, Any],
@@ -780,7 +775,6 @@ def build_episode_artifacts(
     catalog = [dict(row) for row in catalog]
     if len(catalog) != config.num_services:
         raise ValueError("service catalog 的 service_count 与配置不一致。")
-
     num_slots = int(round(episode_s / dt_s))
     history_slots = int(config.popularity_history_length)
     (

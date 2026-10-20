@@ -1,4 +1,4 @@
-"""Official entry for the Adaptive Dual-Timescale Joint MAPPO workflow."""
+"""Sole formal entry for Alternating Actor Optimization V1 MAPPO training."""
 
 from __future__ import annotations
 

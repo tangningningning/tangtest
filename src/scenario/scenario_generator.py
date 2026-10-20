@@ -27,6 +27,9 @@ import torch
 from common import project_config as project_config_module
 from scenario import popularity_prediction as pop
 from scenario import vehicle_prediction as veh
+from scenario.vehicle_order import (
+    RESIDUAL_SAMPLING_CONTRACT,
+)
 from scenario.task_scenario import (
     TaskConfig,
     catalog_by_id,
@@ -93,15 +96,29 @@ def resolve_path(project_root: Path, value: str | Path) -> Path:
 
 def load_roles(path: Path) -> tuple[dict[str, Any], list[str], list[str], list[str]]:
     roles = load_json(path)
-    sv_ids = [str(vehicle_id) for vehicle_id in roles.get("service_vehicles", [])]
-    tv_ids = [str(vehicle_id) for vehicle_id in roles.get("task_vehicles", [])]
-    research_ids = list(dict.fromkeys(sv_ids + tv_ids))
-    declared = {str(vehicle_id) for vehicle_id in roles.get("research_vehicles", [])}
-    if set(research_ids) != declared:
-        raise ValueError("research_vehicles 与 service_vehicles + task_vehicles 不一致。")
-    if set(sv_ids) & set(tv_ids):
-        raise ValueError("SV 与 TV 集合存在交集。")
-    return roles, research_ids, sv_ids, tv_ids
+
+    def get_role_ids(field: str) -> tuple[str, ...]:
+        value = roles.get(field)
+        if not isinstance(value, list):
+            raise ValueError(f"vehicle_roles.json {field} must be a list of IDs")
+        ids = tuple(str(item) for item in value)
+        if any(not vehicle_id.strip() for vehicle_id in ids):
+            raise ValueError(f"vehicle_roles.json {field} contains empty IDs")
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"vehicle_roles.json {field} contains duplicate IDs")
+        return ids
+
+    sv_ids = get_role_ids("service_vehicles")
+    tv_ids = get_role_ids("task_vehicles")
+    research_ids = get_role_ids("research_vehicles")
+    if (
+        set(sv_ids) & set(tv_ids)
+        or set(research_ids) != set(sv_ids) | set(tv_ids)
+    ):
+        raise ValueError("vehicle_roles.json has conflicting research/SV/TV ID sets")
+    # SV and TV blocks preserve their serialized role-specific sequence. The
+    # matching IDs travel with each NPZ axis and are joined explicitly by ID.
+    return roles, list(sv_ids + tv_ids), list(sv_ids), list(tv_ids)
 
 
 def load_residual_bank(path: Path) -> dict[str, Any]:
@@ -357,15 +374,22 @@ def build_residual_indices(
     research_ids: list[str],
 ) -> tuple[dict[str, np.ndarray], list[str]]:
     pooled = np.arange(len(residual_blocks), dtype=np.int64)
-    by_vehicle: dict[str, np.ndarray] = {}
+    blocks = np.asarray(residual_blocks)
+    # Calibration IDs are provenance labels, not persistent Training vehicle identities.
+    ids = np.asarray(vehicle_ids).astype(str)
+    if (
+        blocks.ndim != 3
+        or blocks.shape[0] <= 0
+        or blocks.shape[1] <= 0
+        or blocks.shape[2] != 2
+        or ids.shape != (blocks.shape[0],)
+        or not np.all(np.isfinite(blocks))
+    ):
+        raise ValueError("residual bank blocks/vehicle IDs have invalid shape or values")
+    if len(set(str(value) for value in research_ids)) != len(research_ids):
+        raise ValueError("research_ids must not contain duplicates")
+    by_vehicle = {str(vehicle_id): pooled for vehicle_id in research_ids}
     warnings: list[str] = []
-    for vehicle_id in research_ids:
-        indices = np.where(vehicle_ids == vehicle_id)[0].astype(np.int64)
-        if len(indices) > 0:
-            by_vehicle[vehicle_id] = indices
-        else:
-            by_vehicle[vehicle_id] = pooled
-            warnings.append(f"vehicle {vehicle_id} residual bank fallback to pooled")
     return by_vehicle, warnings
 
 
@@ -424,13 +448,27 @@ def sample_positions(
     config: ScenarioConfig,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    residual_blocks = residual_bank["residual_blocks"]
+    residual_blocks = np.asarray(residual_bank["residual_blocks"], dtype=np.float64)
+    nominal = np.asarray(nominal_xy, dtype=np.float64)
+    tangent_values = np.asarray(tangents, dtype=np.float64)
+    if (
+        nominal.ndim != 4
+        or nominal.shape[-1] != 2
+        or tangent_values.shape != nominal.shape
+        or not np.all(np.isfinite(nominal))
+        or not np.all(np.isfinite(tangent_values))
+    ):
+        raise ValueError("nominal positions/tangents have invalid shape or values")
     by_vehicle, warnings = build_residual_indices(
         residual_blocks,
         residual_bank["vehicle_ids"],
         research_ids,
     )
-    n_origin, horizon_steps, n_vehicle, _ = nominal_xy.shape
+    n_origin, horizon_steps, n_vehicle, _ = nominal.shape
+    if len(research_ids) != n_vehicle:
+        raise ValueError("research_ids length does not match nominal vehicle axis")
+    if residual_blocks.shape[1] != horizon_steps:
+        raise ValueError("residual block horizon does not match nominal positions")
     positions = np.zeros(
         (n_origin, config.num_scenarios, horizon_steps, n_vehicle, 2),
         dtype=np.float32,
@@ -439,8 +477,7 @@ def sample_positions(
     raw_invalid_count = 0
     resampled_count = 0
     fallback_projection_count = 0
-    used_own_bank_count = 0
-    used_pooled_bank_count = 0
+    used_global_pooled_bank_count = 0
 
     for origin_index in range(n_origin):
         for scenario_index in range(config.num_scenarios):
@@ -448,14 +485,13 @@ def sample_positions(
                 geometry = route_geometries[vehicle_id]
                 candidate_points: np.ndarray | None = None
                 indices = by_vehicle[vehicle_id]
-                uses_own_bank = bool(np.any(residual_bank["vehicle_ids"][indices] == vehicle_id))
                 for attempt in range(config.max_resample_attempts):
                     raw_attempt_count += 1
                     block_index = int(indices[int(rng.integers(0, len(indices)))])
                     residual_block = residual_blocks[block_index]
                     points = apply_residual_block(
-                        nominal_xy[origin_index, :, vehicle_index, :],
-                        tangents[origin_index, :, vehicle_index, :],
+                        nominal[origin_index, :, vehicle_index, :],
+                        tangent_values[origin_index, :, vehicle_index, :],
                         residual_block,
                     )
                     # residual 加到 nominal trajectory 后，使用 block_is_road_valid()
@@ -466,7 +502,7 @@ def sample_positions(
                     # 进入逐段几何投影。该短路不改变判定结果，只避免扩容后
                     # 对相同的已知合法 nominal route 重复扫描几何线段。
                     residual_distance = np.linalg.norm(
-                        points - nominal_xy[origin_index, :, vehicle_index, :],
+                        points - nominal[origin_index, :, vehicle_index, :],
                         axis=1,
                     )
                     if (
@@ -487,11 +523,8 @@ def sample_positions(
                     resampled_count += 1
                 if candidate_points is None:
                     fallback_projection_count += horizon_steps
-                    candidate_points = nominal_xy[origin_index, :, vehicle_index, :]
-                if uses_own_bank:
-                    used_own_bank_count += 1
-                else:
-                    used_pooled_bank_count += 1
+                    candidate_points = nominal[origin_index, :, vehicle_index, :]
+                used_global_pooled_bank_count += 1
                 positions[origin_index, scenario_index, :, vehicle_index, :] = (
                     candidate_points.astype(np.float32)
                 )
@@ -509,13 +542,16 @@ def sample_positions(
             fallback_projection_count
             / max(n_origin * config.num_scenarios * horizon_steps * n_vehicle, 1)
         ),
-        "used_own_vehicle_bank_count": used_own_bank_count,
-        "used_pooled_bank_count": used_pooled_bank_count,
+        # Keep the historical count key at zero for readers of old diagnostics.
+        "used_own_vehicle_bank_count": 0,
+        "used_pooled_bank_count": used_global_pooled_bank_count,
+        "used_global_pooled_bank_count": used_global_pooled_bank_count,
         "residual_bank_warnings": warnings,
         "residual_block_sampling": "whole_block_per_vehicle_scenario",
         "cross_vehicle_residual_sampling": "independent",
+        "residual_sampling_contract": RESIDUAL_SAMPLING_CONTRACT,
     }
-    if used_own_bank_count + used_pooled_bank_count != total_vehicle_scenarios:
+    if used_global_pooled_bank_count != total_vehicle_scenarios:
         raise AssertionError("residual bank 使用计数不一致。")
     return positions, stats
 
@@ -1126,7 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
             dtype="U8",
         )
         metadata = {
-            "schema_version": 2,
+            "schema_version": 3,
             "S": config.num_scenarios,
             "H_p": config.horizon_steps,
             "F": int(service_catalog["service_count"]),
@@ -1149,7 +1185,8 @@ def main(argv: list[str] | None = None) -> int:
             "calibration_artifact_metadata_reference": residual_bank["metadata"],
             "cross_vehicle_residual_sampling": "independent",
             "residual_block_sampling": "whole_block_per_vehicle_scenario",
-            "vehicle_residual_bank_preference": "same_vehicle_first_else_pooled",
+            "residual_sampling_contract": RESIDUAL_SAMPLING_CONTRACT,
+            "vehicle_residual_bank_preference": "global_pooled_no_vehicle_id_matching",
             "max_resample_attempts": config.max_resample_attempts,
             "road_distance_tolerance_m": config.road_distance_tolerance_m,
             "noise_related_metadata_reference": residual_bank["metadata"].get(

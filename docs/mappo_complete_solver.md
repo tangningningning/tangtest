@@ -2,11 +2,17 @@
 
 ## 正式实现与入口
 
-正式算法为 **Adaptive Dual-Timescale Joint MAPPO**（`ADAPTIVE_CACHE_UAV_JOINT_MAPPO`），Checkpoint 方法为 `ADAPTIVE_CACHE_UAV_MAPPO`。训练入口为 `scripts/training/mainline_runner.py`，它调用 `src/ppo_simple/trainer.py:PPOTrainer`；冻结评价入口为 `python -m ppo_simple.evaluator` / `ppo-eval`。实现采用共享参数、全局观测、因子化联合动作和集中式价值估计，不是完全分布式执行的标准 CTDE-MAPPO。兼容训练命令 `ppo-train` 与 `python -m ppo_simple.trainer` 使用同一个 Trainer，不是独立算法。
+正式算法为 **Alternating Actor Optimization V1（MAPPO）**（算法标识 `ADAPTIVE_CACHE_UAV_JOINT_MAPPO`），Checkpoint 方法为 `ADAPTIVE_CACHE_UAV_MAPPO`。唯一训练入口为 `scripts/training/mainline_runner.py`，它调用 `src/ppo_simple/trainer.py:PPOTrainer`；Trainer 模块不再作为独立命令行入口。冻结评价入口为 `python -m ppo_simple.evaluator` / `ppo-eval`。这里的 Joint 表示联合 Cache/UAV 策略；Actor 更新采用 Macro/Micro 交替调度。正式算法配置为 `configs/proposed/alternating_actor_updates_v1.toml`；`configs/proposed/system_config.toml` 仍承载共享物理系统和数据生成参数。
 
 执行仍由正式环境完成：Cache 配置进入 `slot_environment.execute_configured_slot`，任务匹配与资源分配继续使用原 Matching/KKT，奖励继续来自正式 `SlotExecutionResult.system_utility`。本改动没有改变任务效用、Cache 配置成本、UAV 移动成本或奖励公式。
 
 ## 决策信息与双时间尺度
+
+### Alternating Actor Optimization V1 更新合同
+
+每组使用同一冻结旧策略采集 4 个完整 Episode 后执行一次 Policy Update。零起始 Update index 为偶数时只允许 Micro Actor 更新，奇数时只允许 Macro Actor 更新；首组因此更新 Micro Actor。每组仍更新 Macro Critic、Micro Critic 和 Long-Value Critic。冻结的 Actor 不产生 Actor 梯度，且其 Adam 状态不推进。正式 Runner 与 Training Pool 合同仅接受 `ALTERNATING_ACTOR_UPDATES_V1` 配置，不提供切换回 Joint Actor 更新的模式。
+
+受控停止只在完整的 4-Episode 更新组保存日志、Manifest、Summary 和 Checkpoint 后生效；它不会被记录为完成目标 Episode 数的正式训练。
 
 每次决策状态包含当前 Cache 矩阵、当前 UAV 坐标、决策时可用的车辆轨迹预测、服务流行度预测、预测 horizon mask 及 time-to-go。Macro 候选描述和 Micro UAV 候选描述使用同一时点的预测场景与合法性合同。真实任务和当 Slot 的实际车辆位置只在动作采样之后交给环境执行，不进入 Actor 状态或在线候选价值输入。
 

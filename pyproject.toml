@@ -12,7 +12,6 @@ dependencies = [
 ]
 
 [project.scripts]
-ppo-train = "ppo_simple.trainer:main"
 ppo-eval = "ppo_simple.evaluator:main"
 
 [tool.setuptools]

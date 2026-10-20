@@ -754,6 +754,8 @@ def build_role_assignments(
 
     service_set = set(service)
     task = [vehicle_id for vehicle_id in research if vehicle_id not in service_set]
+    # Preserve the original seeded research order and role-specific selection
+    # orders. Scenario axes are built from SV followed by TV and carry their IDs.
     research_set = set(research)
     background = sorted(seen_vehicle_ids - research_set)
 
@@ -768,9 +770,9 @@ def build_role_assignments(
     }
 
     roles = {
-        "research_vehicles": research,
-        "service_vehicles": service,
-        "task_vehicles": task,
+        "research_vehicles": list(research),
+        "service_vehicles": list(service),
+        "task_vehicles": list(task),
         "background_vehicles": background,
         "seed": config.random_seed,
         "dt": config.dt_s,

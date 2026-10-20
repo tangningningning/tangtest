@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ from scenario.realization import (
     _realization_artifacts_from_directory,
     configured_realization_artifacts,
 )
+from scenario.vehicle_order import id_axis_indices
 
 
 PROPOSED_POLICY_SCHEMA = project_config.PROPOSED_POLICY_SCHEMA
@@ -116,9 +118,8 @@ def _assert_realization_context_compatible(
     candidate_cache_roles = tuple(
         str(value).upper() for value in candidate.cache_nodes["node_roles"]
     )
-    # Service-vehicle IDs may differ across full_episode_randomized realizations.
-    # Each episode builds and saves observations/candidate descriptors in its own
-    # action order, so the cross-episode tensor contract is the role ordering.
+    # Vehicle IDs and their per-Episode order may differ. Each Episode validates
+    # its own ID-to-axis map; the shared contract is feature shape and role counts.
     if (
         len(reference.action_spec.cache_node_ids)
         != len(candidate.action_spec.cache_node_ids)
@@ -130,6 +131,231 @@ def _assert_realization_context_compatible(
         raise ValueError("PPO episode realization changes the initial cache tensor shape")
     if set(reference.initial_uav) != set(candidate.initial_uav):
         raise ValueError("PPO episode realization changes the initial UAV ID set")
+
+
+def _validate_episode_vehicle_mapping(
+    realization: RealizationArtifacts,
+    scenarios: dict[str, Any],
+    *,
+    expected_service_vehicle_count: int,
+    expected_task_count: int,
+    expected_catalog_service_count: int,
+    expected_origin_count: int,
+    expected_horizon_count: int,
+) -> dict[str, Any]:
+    """Validate one Episode's ID joins and normalize vehicle-axis arrays by ID."""
+
+    with realization.vehicle_roles.open("r", encoding="utf-8") as stream:
+        roles = json.load(stream)
+    metadata = scenarios.get("metadata", {})
+    if not isinstance(roles, dict) or not isinstance(metadata, dict):
+        raise ValueError("vehicle_roles.json and prediction_scenarios metadata must be objects")
+
+    def role_id_list(field: str) -> tuple[str, ...]:
+        value = roles.get(field)
+        if not isinstance(value, list):
+            raise ValueError(f"vehicle_roles.json {field} must be a list of explicit IDs")
+        ids = tuple(str(item) for item in value)
+        if any(not item.strip() for item in ids) or len(set(ids)) != len(ids):
+            raise ValueError(f"vehicle_roles.json {field} contains missing or duplicate IDs")
+        return ids
+
+    role_service_ids = role_id_list("service_vehicles")
+    role_task_ids = role_id_list("task_vehicles")
+    role_research_ids = role_id_list("research_vehicles")
+    if (
+        len(role_service_ids) != int(expected_service_vehicle_count)
+        or len(role_task_ids) != int(expected_task_count)
+        or len(role_research_ids)
+        != int(expected_service_vehicle_count) + int(expected_task_count)
+        or set(role_service_ids) & set(role_task_ids)
+        or set(role_research_ids) != set(role_service_ids) | set(role_task_ids)
+    ):
+        raise ValueError("vehicle_roles.json has invalid role counts or overlapping ID sets")
+
+    required_arrays = (
+        "origin_slots",
+        "origin_times_s",
+        "scenario_ids",
+        "horizons",
+        "vehicle_ids",
+        "vehicle_roles",
+        "service_vehicle_ids",
+        "task_vehicle_ids",
+        "positions_xy",
+        "arrival",
+        "service_id",
+        "input_size",
+        "cpu_cycles",
+        "rho_hat",
+    )
+    missing = [name for name in required_arrays if name not in scenarios]
+    if missing:
+        raise ValueError(f"prediction_scenarios.npz is missing required arrays: {missing}")
+
+    scenario_research = tuple(np.asarray(scenarios["vehicle_ids"]).astype(str).tolist())
+    scenario_service = tuple(
+        np.asarray(scenarios["service_vehicle_ids"]).astype(str).tolist()
+    )
+    scenario_task = tuple(np.asarray(scenarios["task_vehicle_ids"]).astype(str).tolist())
+    scenario_roles = tuple(np.asarray(scenarios["vehicle_roles"]).astype(str).tolist())
+    if (
+        any(not value.strip() for value in scenario_research + scenario_service + scenario_task)
+        or len(set(scenario_research)) != len(scenario_research)
+        or len(set(scenario_service)) != len(scenario_service)
+        or len(set(scenario_task)) != len(scenario_task)
+        or set(scenario_service) & set(scenario_task)
+        or set(scenario_research) != set(scenario_service) | set(scenario_task)
+        or set(scenario_research) != set(role_research_ids)
+        or set(scenario_service) != set(role_service_ids)
+        or set(scenario_task) != set(role_task_ids)
+        or len(scenario_research)
+        != int(expected_service_vehicle_count) + int(expected_task_count)
+    ):
+        raise ValueError("vehicle_roles.json and prediction_scenarios.npz ID sets do not join")
+
+    metadata_id_fields = {
+        "research_vehicle_ids": role_research_ids,
+        "SV IDs": role_service_ids,
+        "TV IDs": role_task_ids,
+    }
+    for field, expected_ids in metadata_id_fields.items():
+        if field not in metadata:
+            continue
+        value = metadata[field]
+        if not isinstance(value, (list, tuple, np.ndarray)):
+            raise ValueError(f"prediction_scenarios metadata {field} is not an ID sequence")
+        ids = tuple(str(item) for item in value)
+        if len(set(ids)) != len(ids) or set(ids) != set(expected_ids):
+            raise ValueError(f"prediction_scenarios metadata {field} conflicts with role IDs")
+
+    role_order_contract = roles.get("vehicle_order_contract")
+    metadata_order_contract = metadata.get("vehicle_order_contract")
+    residual_contract = metadata.get("residual_sampling_contract")
+    legacy_residual_marker = metadata.get("vehicle_residual_bank_preference")
+    residual_provenance = (
+        residual_contract or legacy_residual_marker or "UNRECORDED"
+    )
+    role_by_id = {
+        **{vehicle_id: "SV" for vehicle_id in role_service_ids},
+        **{vehicle_id: "TV" for vehicle_id in role_task_ids},
+    }
+    if len(scenario_roles) != len(scenario_research) or any(
+        role_by_id.get(vehicle_id) != str(role).upper()
+        for vehicle_id, role in zip(scenario_research, scenario_roles, strict=True)
+    ):
+        raise ValueError("prediction_scenarios.npz vehicle_roles conflicts with its ID mapping")
+
+    # The NPZ vehicle axis is the existing observation order source. Preserve its
+    # order within each role and only group the role blocks needed by ObservationSpec.
+    primary_service_ids = tuple(
+        vehicle_id for vehicle_id in scenario_research if role_by_id[vehicle_id] == "SV"
+    )
+    primary_task_ids = tuple(
+        vehicle_id for vehicle_id in scenario_research if role_by_id[vehicle_id] == "TV"
+    )
+    primary_research_ids = primary_service_ids + primary_task_ids
+
+    origin_slots = np.asarray(scenarios["origin_slots"])
+    origin_times = np.asarray(scenarios["origin_times_s"], dtype=np.float64)
+    scenario_ids = np.asarray(scenarios["scenario_ids"])
+    horizons = np.asarray(scenarios["horizons"])
+    positions = np.asarray(scenarios["positions_xy"])
+    if (
+        origin_slots.ndim != 1
+        or len(origin_slots) != int(expected_origin_count)
+        or not np.array_equal(origin_slots, np.arange(len(origin_slots)))
+        or origin_times.shape != origin_slots.shape
+        or not np.all(np.isfinite(origin_times))
+        or np.any(np.diff(origin_times) <= 0.0)
+        or scenario_ids.ndim != 1
+        or len(scenario_ids) == 0
+        or len(set(scenario_ids.astype(str).tolist())) != len(scenario_ids)
+        or horizons.ndim != 1
+        or len(horizons) != int(expected_horizon_count)
+        or len(horizons) == 0
+        or horizons.dtype.kind not in "iu"
+        or not np.array_equal(
+            horizons, np.arange(int(expected_horizon_count), dtype=horizons.dtype)
+        )
+        or positions.ndim != 5
+        or positions.shape[:3]
+        != (len(origin_slots), len(scenario_ids), len(horizons))
+        or positions.shape[3:] != (len(scenario_research), 2)
+    ):
+        raise ValueError("prediction_scenarios.npz has invalid origin, horizon, or position axes")
+    expected_task_shape = (
+        len(origin_slots),
+        len(scenario_ids),
+        len(horizons),
+        len(scenario_task),
+    )
+    for field in ("arrival", "service_id", "input_size", "cpu_cycles"):
+        value = np.asarray(scenarios[field])
+        if value.shape != expected_task_shape:
+            raise ValueError(
+                f"prediction_scenarios.npz {field} shape does not align with TV IDs: "
+                f"expected={expected_task_shape}, actual={value.shape}"
+            )
+    rho_hat = np.asarray(scenarios["rho_hat"])
+    if (
+        rho_hat.ndim != 3
+        or rho_hat.shape[:2] != (len(origin_slots), len(horizons))
+        or rho_hat.shape[2] != int(expected_catalog_service_count)
+    ):
+        raise ValueError("prediction_scenarios.npz rho_hat is not aligned with the service axis")
+    for field in (
+        "origin_times_s",
+        "positions_xy",
+        "arrival",
+        "service_id",
+        "input_size",
+        "cpu_cycles",
+        "rho_hat",
+    ):
+        value = np.asarray(scenarios[field])
+        if value.dtype.kind not in "biuf" or not np.all(np.isfinite(value)):
+            raise ValueError(
+                f"prediction_scenarios.npz {field} contains non-finite or non-numeric values"
+            )
+
+    vehicle_indices = id_axis_indices(
+        scenario_research,
+        primary_research_ids,
+        context="prediction_scenarios.npz positions_xy",
+    )
+    task_indices = id_axis_indices(
+        scenario_task,
+        primary_task_ids,
+        context="prediction_scenarios.npz task arrays",
+    )
+    normalized = dict(scenarios)
+    normalized["vehicle_ids"] = np.asarray(primary_research_ids, dtype=str)
+    normalized["vehicle_roles"] = np.asarray(
+        ("SV",) * len(primary_service_ids) + ("TV",) * len(primary_task_ids),
+        dtype=str,
+    )
+    normalized["service_vehicle_ids"] = np.asarray(primary_service_ids, dtype=str)
+    normalized["task_vehicle_ids"] = np.asarray(primary_task_ids, dtype=str)
+    normalized["positions_xy"] = np.take(positions, vehicle_indices, axis=-2).copy()
+    for field in ("arrival", "service_id", "input_size", "cpu_cycles"):
+        normalized[field] = np.take(np.asarray(scenarios[field]), task_indices, axis=-1).copy()
+    normalized_metadata = dict(metadata)
+    normalized_metadata["loader_compatibility"] = {
+        "observation_vehicle_order_source": (
+            "prediction_scenarios.npz:vehicle_ids; stable subsequence within each role"
+        ),
+        "source_vehicle_order_markers": {
+            "vehicle_roles": role_order_contract,
+            "prediction_scenarios": metadata_order_contract,
+        },
+        "source_residual_sampling_provenance": residual_provenance,
+        "saved_prediction_scenarios_reused": True,
+        "scenario_metadata_preserved": True,
+    }
+    normalized["metadata"] = normalized_metadata
+    return normalized
+
 
 def load_environment_context(
     config_path: str = "configs/proposed/system_config.toml",
@@ -151,6 +377,23 @@ def load_environment_context(
     cache_cfg = cache_configuration.cache_config_from_project(cfg)
     scenarios = cache_configuration.load_prediction_scenarios(
         realization.prediction_scenarios
+    )
+    scenarios = _validate_episode_vehicle_mapping(
+        realization,
+        scenarios,
+        expected_service_vehicle_count=int(
+            project_config.get_config_value(cfg, "simulation.num_service_vehicles")
+        ),
+        expected_task_count=int(
+            project_config.get_config_value(cfg, "simulation.num_task_vehicles")
+        ),
+        expected_catalog_service_count=int(
+            project_config.get_config_value(cfg, "service.count")
+        ),
+        expected_origin_count=int(data_protocol["physical_episode_slots"]),
+        expected_horizon_count=int(
+            project_config.get_config_value(cfg, "prediction.vehicle.horizon")
+        ),
     )
     service_catalog = cache_configuration.load_service_catalog(
         project_config.resolve_path(root, project_config.get_config_value(cfg, "paths.service_catalog"))
@@ -934,8 +1177,10 @@ class AlignedRolloutStep:
 def _load_vehicle_prediction_h0(
     path: Path,
     allowed_origins: set[int] | None = None,
+    expected_vehicle_ids: tuple[str, ...] | list[str] | None = None,
 ) -> dict[int, dict[str, tuple[float, float, int, float]]]:
     by_origin: dict[int, dict[str, tuple[float, float, int, float]]] = {}
+    order_by_origin: dict[int, list[str]] = {}
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         for row in reader:
@@ -944,12 +1189,28 @@ def _load_vehicle_prediction_h0(
             origin = int(row["origin_slot"])
             if allowed_origins is not None and origin not in allowed_origins:
                 continue
-            by_origin.setdefault(origin, {})[str(row["vehicle_id"])] = (
+            vehicle_id = str(row["vehicle_id"])
+            if vehicle_id in by_origin.setdefault(origin, {}):
+                raise ValueError(
+                    "vehicle_predictions.csv duplicate prediction row: "
+                    f"origin={origin}, horizon=0, vehicle_id={vehicle_id}"
+                )
+            order_by_origin.setdefault(origin, []).append(vehicle_id)
+            by_origin[origin][vehicle_id] = (
                 float(row["x_pred"]),
                 float(row["y_pred"]),
                 int(row["target_slot"]),
                 float(row["target_time_s"]),
             )
+    if expected_vehicle_ids is not None:
+        expected = tuple(str(value) for value in expected_vehicle_ids)
+        for origin, ids in order_by_origin.items():
+            if len(ids) != len(expected) or set(ids) != set(expected):
+                raise ValueError(
+                    "vehicle_predictions.csv IDs do not match the observation mapping: "
+                    f"origin={origin}, missing={sorted(set(expected) - set(ids))}, "
+                    f"unexpected={sorted(set(ids) - set(expected))}"
+                )
     return by_origin
 
 
@@ -979,6 +1240,7 @@ def _load_vehicle_prediction_horizon(
     path: Path,
     prediction_horizon: int,
     allowed_origins: set[int] | None = None,
+    expected_vehicle_ids: tuple[str, ...] | list[str] | None = None,
 ) -> dict[int, dict[int, dict[str, tuple[float, float, int, float]]]]:
     """Load only predicted x/y values for every requested prediction horizon."""
 
@@ -986,6 +1248,7 @@ def _load_vehicle_prediction_horizon(
     if horizon <= 0:
         raise ValueError("prediction_horizon 必须大于0。")
     by_origin: dict[int, dict[int, dict[str, tuple[float, float, int, float]]]] = {}
+    order_by_origin_horizon: dict[tuple[int, int], list[str]] = {}
     seen: set[tuple[int, int, str]] = set()
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -1004,12 +1267,25 @@ def _load_vehicle_prediction_horizon(
                     f"origin={origin}, horizon={horizon_index}, vehicle_id={vehicle_id}"
                 )
             seen.add(key)
+            order_by_origin_horizon.setdefault((origin, horizon_index), []).append(
+                vehicle_id
+            )
             by_origin.setdefault(origin, {}).setdefault(horizon_index, {})[vehicle_id] = (
                 float(row["x_pred"]),
                 float(row["y_pred"]),
                 int(row["target_slot"]),
                 float(row["target_time_s"]),
             )
+    if expected_vehicle_ids is not None:
+        expected = tuple(str(value) for value in expected_vehicle_ids)
+        for (origin, horizon_index), ids in order_by_origin_horizon.items():
+            if len(ids) != len(expected) or set(ids) != set(expected):
+                raise ValueError(
+                    "vehicle_predictions.csv IDs do not match the observation mapping: "
+                    f"origin={origin}, horizon={horizon_index}, "
+                    f"missing={sorted(set(expected) - set(ids))}, "
+                    f"unexpected={sorted(set(ids) - set(expected))}"
+                )
     return by_origin
 
 
@@ -1053,8 +1329,10 @@ def _load_popularity_prediction_horizon(
 def _load_task_time_by_slot(
     path: Path,
     allowed_slots: set[int] | None = None,
+    expected_vehicle_ids: tuple[str, ...] | list[str] | None = None,
 ) -> dict[int, float]:
     result: dict[int, float] = {}
+    vehicle_ids_by_slot: dict[int, list[str]] = {}
     with path.open("r", encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         for row in reader:
@@ -1062,11 +1340,31 @@ def _load_task_time_by_slot(
             if allowed_slots is not None and slot not in allowed_slots:
                 continue
             time_s = float(row["time_s"])
+            vehicle_id = str(row["vehicle_id"])
+            slot_vehicle_ids = vehicle_ids_by_slot.setdefault(slot, [])
+            if vehicle_id in slot_vehicle_ids:
+                raise ValueError(
+                    f"tasks.csv slot={slot} contains duplicate vehicle {vehicle_id}"
+                )
+            slot_vehicle_ids.append(vehicle_id)
             if slot in result and not math.isclose(
                 result[slot], time_s, rel_tol=0.0, abs_tol=1e-9
             ):
                 raise ValueError(f"tasks.csv slot={slot} time_s 不一致。")
             result[slot] = time_s
+    if expected_vehicle_ids is not None:
+        expected = tuple(str(value) for value in expected_vehicle_ids)
+        for slot, ids in vehicle_ids_by_slot.items():
+            if len(ids) != len(expected) or set(ids) != set(expected):
+                raise ValueError(
+                    "tasks.csv vehicle IDs do not match the Observation TV mapping: "
+                    f"slot={slot}, missing={sorted(set(expected) - set(ids))}, "
+                    f"unexpected={sorted(set(ids) - set(expected))}"
+                )
+        if allowed_slots is not None:
+            missing_slots = set(allowed_slots) - set(vehicle_ids_by_slot)
+            if missing_slots:
+                raise ValueError(f"tasks.csv is missing selected slots: {sorted(missing_slots)}")
     return result
 
 
@@ -1122,12 +1420,14 @@ def prepare_aligned_rollout_steps(
     task_time_by_slot = _load_task_time_by_slot(
         tasks_file,
         allowed_slots=selected_origin_slots,
+        expected_vehicle_ids=expected_task_vehicle_ids,
     )
     if horizon > 1:
         vehicle_pred_horizon = _load_vehicle_prediction_horizon(
             vehicle_prediction_file,
             horizon,
             allowed_origins=selected_origin_slots,
+            expected_vehicle_ids=expected_vehicle_ids,
         )
         popularity_pred_horizon = _load_popularity_prediction_horizon(
             popularity_prediction_file,
@@ -1140,6 +1440,7 @@ def prepare_aligned_rollout_steps(
         vehicle_pred = _load_vehicle_prediction_h0(
             vehicle_prediction_file,
             allowed_origins=selected_origin_slots,
+            expected_vehicle_ids=expected_vehicle_ids,
         )
         popularity_pred = _load_popularity_prediction_h0(
             popularity_prediction_file,
@@ -1195,7 +1496,30 @@ def prepare_aligned_rollout_steps(
                 "scenario task vehicle IDs differ from the fixed Observation order: "
                 f"origin={origin_index}"
             )
-        if horizon > 1 and expected_vehicle_ids_t is not None:
+        if (
+            expected_task_vehicle_ids_t is not None
+            and task_vehicle_ids != expected_task_vehicle_ids_t
+        ):
+            raise ValueError(
+                "scenario task vehicle ID order differs from ObservationSpec: "
+                f"origin={origin_index}"
+            )
+        service_vehicle_ids = tuple(
+            str(value) for value in scenario["service_vehicle_ids"].tolist()
+        )
+        vehicle_roles = tuple(str(value) for value in scenario["vehicle_roles"].tolist())
+        expected_roles = ("SV",) * len(service_vehicle_ids) + (
+            "TV",
+        ) * len(task_vehicle_ids)
+        if (
+            vehicle_roles != expected_roles
+            or vehicle_ids != service_vehicle_ids + task_vehicle_ids
+        ):
+            raise ValueError(
+                "scenario vehicle IDs/roles do not match the SV-then-TV mapping: "
+                f"origin={origin_index}"
+            )
+        if expected_vehicle_ids_t is not None:
             if vehicle_ids != expected_vehicle_ids_t:
                 raise ValueError(
                     "scenario vehicle IDs/order 与 observation spec 不一致："
@@ -1303,7 +1627,7 @@ def prepare_aligned_rollout_steps(
             if raw_vehicle is None or set(raw_vehicle) != set(vehicle_ids):
                 raise ValueError(f"vehicle_predictions.csv 缺少 origin slot={slot} 的完整车辆预测。")
             predicted_positions = {}
-            for vehicle_id in vehicle_ids:
+            for vehicle_id in observation_vehicle_ids:
                 x_pred, y_pred, target_slot, target_time = raw_vehicle[vehicle_id]
                 if target_slot != slot or not math.isclose(
                     target_time,

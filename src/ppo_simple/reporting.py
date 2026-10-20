@@ -255,7 +255,8 @@ def update_training_epoch_return_plot(run_dir: Path) -> Path:
         axis.set_title("PPO Training Return (MA20)")
         axis.grid(True, axis="y", alpha=0.25)
         axis.set_axisbelow(True)
-        axis.legend(frameon=False)
+        if axis.get_legend_handles_labels()[1]:
+            axis.legend(frameon=False)
         figure.tight_layout()
         output_path = run_path / "plots" / TRAINING_EPOCH_RETURN_PLOT_FILENAME
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,16 +264,6 @@ def update_training_epoch_return_plot(run_dir: Path) -> Path:
     finally:
         plt.close(figure)
     return output_path
-
-
-def _format_learning_rate(value: Any) -> str:
-    try:
-        converted = float(value)
-    except (TypeError, ValueError):
-        return "NA"
-    if not math.isfinite(converted):
-        return "NA"
-    return f"{converted:.0e}".replace("e-0", "e-").replace("e+0", "e+")
 
 
 def _format_metric(value: Any, precision: int) -> str:
@@ -297,9 +288,8 @@ def format_training_epoch_log(
     record: dict[str, Any],
     *,
     target_epochs: int,
-    macro_actor_learning_rate: float,
 ) -> str:
-    """Format one compact formal PPO epoch line from episode/update metrics."""
+    """Format one compact formal PPO episode line from episode/update metrics."""
 
     epoch = record.get("epoch", record.get("episode", "?"))
     uav_move_rates = [record.get("uav0_move_rate"), record.get("uav1_move_rate")]
@@ -311,15 +301,12 @@ def format_training_epoch_log(
     else:
         uav_move_rate = math.nan
     return (
-        f"[PPO] Epoch {epoch}/{int(target_epochs)} "
-        f"| LR={_format_learning_rate(macro_actor_learning_rate)} "
+        f"[PPO] Episode {epoch}/{int(target_epochs)} "
         f"| Return={_format_metric(record.get('episode_return'), 2)} "
         f"| N2EV={_format_metric(record.get('n2_post_ev', record.get('post_update_target_ev')), 3)} "
         f"| LongCorr={_format_metric(record.get('long_value_post_correlation'), 3)} "
         f"| CacheChange={_format_rate_percent(record.get('actual_cache_update_rate'))}% "
         f"| UAVMove={_format_rate_percent(uav_move_rate)}% "
-        f"| Entropy={_format_metric(record.get('macro_entropy'), 2)} "
-        f"| KL={_format_metric(record.get('macro_joint_approx_kl'), 5)} "
         f"| Time={_format_metric(record.get('training_epoch_runtime_seconds', record.get('episode_runtime_seconds')), 1)}s"
     )
 
@@ -450,7 +437,8 @@ def plot_formal_actor_lr_comparison_300(project_root: Path | None = None) -> Pat
         axis.set_title("Formal Macro Actor Learning-Rate Comparison (300 Epochs)")
         axis.grid(True, axis="y", alpha=0.25)
         axis.set_axisbelow(True)
-        axis.legend(frameon=False)
+        if axis.get_legend_handles_labels()[1]:
+            axis.legend(frameon=False)
         figure.tight_layout()
         output_path = root / "reports" / "plots" / "formal_actor_lr_comparison_300.png"
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1885,8 +1873,12 @@ def write_dual_timescale_run_manifest(
     target_episodes: int,
     episode_pool: str | Path | None = None,
     episode_pool_provenance: dict[str, Any] | None = None,
+    data_input_compatibility: dict[str, Any] | None = None,
     episode_seed_start: int | None = None,
     resume: bool = False,
+    training_completion_status: str | None = None,
+    controlled_stop_after_policy_updates: int | None = None,
+    controlled_stop_completed_policy_updates: int | None = None,
 ) -> dict[str, Any]:
     """记录当前 PROPOSED 训练、动作、Critic 和数据协议。"""
 
@@ -1902,7 +1894,7 @@ def write_dual_timescale_run_manifest(
             trainer.macro_actor_update_control_version
         ),
         "method": str(trainer.checkpoint_method),
-        "experiment_type": "adaptive_dual_timescale_joint_mappo",
+        "experiment_type": "adaptive_dual_timescale_alternating_actor_updates_v1_mappo",
         "config_path": str(Path(config_path).resolve()),
         "config_raw_sha256": str(config_raw_sha256),
         "config_semantic_sha256": str(config_semantic_sha256),
@@ -1922,6 +1914,9 @@ def write_dual_timescale_run_manifest(
         "rollout_group_contract": "four independent realizations collected with one frozen old policy; targets are episode-local; advantages are normalized over the combined update group",
         "episode_pool": None if episode_pool is None else str(Path(episode_pool).resolve()),
         "episode_pool_provenance": episode_pool_provenance,
+        # Descriptive loader compatibility is recorded separately from the
+        # unchanged Checkpoint identity and episode-pool provenance contract.
+        "data_input_compatibility": data_input_compatibility,
         "training_pool_manifest_sha256": (
             None
             if episode_pool_provenance is None
@@ -2055,6 +2050,27 @@ def write_dual_timescale_run_manifest(
         "training_counters": dict(trainer.training_counters),
         "resume": bool(resume),
     }
+    manifest.update(
+        {
+            "actor_update_mode": trainer.actor_update_mode,
+            "actor_update_schedule_version": trainer.actor_update_schedule_version,
+            "actor_update_first": trainer.actor_update_first,
+            "actor_update_period": trainer.actor_update_period,
+            "actor_update_schedule_state": dict(
+                trainer.actor_update_schedule_state
+            ),
+        }
+    )
+    if training_completion_status is not None:
+        manifest["training_completion_status"] = str(training_completion_status)
+    if controlled_stop_after_policy_updates is not None:
+        manifest["controlled_stop_after_policy_updates"] = int(
+            controlled_stop_after_policy_updates
+        )
+    if controlled_stop_completed_policy_updates is not None:
+        manifest["controlled_stop_completed_policy_updates"] = int(
+            controlled_stop_completed_policy_updates
+        )
     _write_json(Path(path), manifest)
     return manifest
 

@@ -29,6 +29,9 @@ from ppo_simple.interface import (  # noqa: E402
 
 
 CONFIG_RELATIVE = Path("configs/proposed/system_config.toml")
+ALTERNATING_ACTOR_UPDATES_CONFIG_RELATIVE = Path(
+    "configs/proposed/alternating_actor_updates_v1.toml"
+)
 TRAIN_POOL_RELATIVE = Path("environment_data/proposed_joint_training")
 VALIDATION_POOL_RELATIVE = Path("environment_data/proposed_joint_validation")
 DEFAULT_TRAINING_SEED_START = 20001
@@ -46,7 +49,9 @@ FORMAL_TRAINING_EPISODE_SLOTS = 300
 FORMAL_TRAINING_TASK_CONTRACT_SHA256 = (
     "dc7e83d99c69f1c3ea603c18fe9a2606f0bffe477556e75924e1d8dfd24387c3"
 )
-CURRENT_GENERATION_FINGERPRINT = "4083b917948cd7203972c0edd5b40d2efefd8984dde27089a77da43d460b32f3"
+LEGACY_FORMAL_POOL_GENERATION_FINGERPRINT = (
+    "4083b917948cd7203972c0edd5b40d2efefd8984dde27089a77da43d460b32f3"
+)
 SOURCE_CONFIG_SHA256 = "684bdfa4dc200db6227b2b00a7718797a98bf658e54d2d4dbef6f7d1f5babf77"
 SOURCE_SEMANTIC_SHA256 = "10f893fc549c4016bedb1a5389ad996f9a3ff646aa012596a7230c284b13f542"
 SOURCE_GENERATION_FINGERPRINT = "cfb3ee9fae004108af2d6bcb641609142c305d3ad6cc3ca74be13faaa6ff9865"
@@ -106,25 +111,56 @@ def _validate_pool_config_compatibility(
     manifest: dict[str, Any],
     *,
     generation_fingerprint: str,
+    runtime_config: dict[str, Any],
 ) -> dict[str, Any]:
     pool_fingerprint = manifest.get("target_generation_config_fingerprint")
-    if generation_fingerprint != CURRENT_GENERATION_FINGERPRINT or (
-        pool_fingerprint != CURRENT_GENERATION_FINGERPRINT
-    ):
-        raise ValueError(
-            "Training data generation contract mismatch: "
-            f"pool={pool_fingerprint!r}, "
-            f"runtime={generation_fingerprint!r}"
+    if pool_fingerprint == generation_fingerprint:
+        policy = "CURRENT_GENERATION_CONTRACT"
+        reason = "pool and runtime generation fingerprints are identical"
+    else:
+        legacy_payload = copy.deepcopy(
+            generate_episode_realization._generation_config_payload(runtime_config)
+        )
+        legacy_payload["schema"] = "episode_manifest_v1"
+        legacy_payload.pop("residual_sampling_contract", None)
+        legacy_fingerprint = hashlib.sha256(
+            json.dumps(
+                legacy_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            pool_fingerprint != LEGACY_FORMAL_POOL_GENERATION_FINGERPRINT
+            or legacy_fingerprint != LEGACY_FORMAL_POOL_GENERATION_FINGERPRINT
+        ):
+            raise ValueError(
+                "Training data generation contract mismatch: "
+                f"pool={pool_fingerprint!r}, runtime={generation_fingerprint!r}, "
+                f"reconstructed_legacy={legacy_fingerprint!r}"
+            )
+        policy = "LEGACY_FORMAL_POOL_V1_VERSION_COMPATIBLE"
+        reason = (
+            "the stored fingerprint is reproduced from the current generation "
+            "payload after reverting the legacy schema marker and residual-sampling "
+            "metadata; vehicle ordering is not a compatibility condition because "
+            "the loader joins explicit IDs and preserves their within-role NPZ order; all "
+            "generation config fields remain equal"
         )
     if manifest.get("config_path") != CONFIG_RELATIVE.as_posix():
-        raise ValueError("Training Pool config_path does not identify the formal config.")
+        raise ValueError(
+            "Training Pool config_path does not identify the formal config."
+        )
     return {
-        "policy": "TRAINING_DATA_GENERATION_COMPATIBILITY_V1",
+        "policy": policy,
+        "reason": reason,
+        "pool_generation_config_fingerprint": pool_fingerprint,
         "pool_config_sha256_recorded": manifest.get("config_sha256"),
         "pool_semantic_config_sha256_recorded": manifest.get(
             "semantic_config_sha256"
         ),
-        "generation_config_fingerprint": generation_fingerprint,
+        "runtime_generation_config_fingerprint": generation_fingerprint,
         "historical_git_config_read": False,
     }
 
@@ -200,9 +236,9 @@ def _validate_pool(
     config_compatibility = _validate_pool_config_compatibility(
         manifest,
         generation_fingerprint=generation_fingerprint,
+        runtime_config=cfg,
     )
     expected_metadata = {
-        "target_generation_config_fingerprint": generation_fingerprint,
         "task_data_contract": task_contract,
         "task_data_contract_sha256": task_contract_hash,
         "service_catalog_path": catalog_relative,
@@ -229,6 +265,9 @@ def _validate_pool(
         "pool_semantic_config_sha256": manifest.get("semantic_config_sha256"),
         "config_compatibility": config_compatibility,
         "generation_config_fingerprint": generation_fingerprint,
+        "pool_generation_config_fingerprint": manifest.get(
+            "target_generation_config_fingerprint"
+        ),
         "task_data_contract": task_contract,
         "task_data_contract_sha256": task_contract_hash,
         "generation_config_fields": generate_episode_realization._generation_config_payload(cfg),
@@ -259,7 +298,7 @@ def _validate_training_integrity_baseline(
         "pool_manifest_sha256": pool_info["manifest_sha256"],
         "task_data_contract_sha256": pool_info["task_data_contract_sha256"],
         "target_generation_config_fingerprint": pool_info[
-            "generation_config_fingerprint"
+            "pool_generation_config_fingerprint"
         ],
         "service_catalog_path": pool_info["task_data_contract"][
             "service_catalog_path"
@@ -305,12 +344,25 @@ def validate_formal_training_pool_for_run(
     """Run the lightweight generation-contract gate for a new formal run."""
 
     root = Path(formal_root).expanduser().resolve(strict=True)
-    expected_config = (root / CONFIG_RELATIVE).resolve(strict=True)
+    alternating_config = (
+        root / ALTERNATING_ACTOR_UPDATES_CONFIG_RELATIVE
+    ).resolve(strict=True)
     actual_config = Path(config_path).expanduser().resolve(strict=True)
-    if actual_config != expected_config:
+    if actual_config != alternating_config:
         raise ValueError(
-            "Formal Training requires the canonical system_config.toml: "
-            f"expected={expected_config}, actual={actual_config}"
+            "Formal Training requires the reviewed "
+            "ALTERNATING_ACTOR_UPDATES_V1 config: "
+            f"expected={alternating_config}, actual={actual_config}"
+        )
+    actor_update_config = runtime_config["algorithm"]["ppo"]
+    if (
+        actor_update_config.get("actor_update_mode") != "ALTERNATING"
+        or actor_update_config.get("actor_update_first") != "MICRO"
+        or actor_update_config.get("actor_update_period") != 1
+    ):
+        raise ValueError(
+            "ALTERNATING_ACTOR_UPDATES_V1 requires mode=ALTERNATING, "
+            "first=MICRO, and period=1."
         )
     expected_pool = (root / TRAIN_POOL_RELATIVE).resolve(strict=True)
     actual_pool = project_config.resolve_path(root, episode_pool).resolve(strict=True)
@@ -334,7 +386,7 @@ def validate_formal_training_pool_for_run(
 
     cfg = copy.deepcopy(runtime_config)
     cfg["_meta"] = {
-        "config_path": str(expected_config),
+        "config_path": str(actual_config),
         "project_root": str(root),
     }
     project_config.validate_for_formal_experiment(cfg)
@@ -376,10 +428,34 @@ def validate_formal_training_pool_for_run(
     if pool_info["task_data_contract_sha256"] != FORMAL_TRAINING_TASK_CONTRACT_SHA256:
         raise ValueError("Training Pool task-data contract is not the reviewed contract.")
     baseline_info = _validate_training_integrity_baseline(pool, pool_info)
+    pool_manifest = json.loads(
+        Path(pool_info["manifest_path"]).read_text(encoding="utf-8")
+    )
     return {
         **pool_info,
         "pool_path": str(pool),
         "integrity_baseline": baseline_info,
+        "data_input_compatibility": {
+            "policy": pool_info["config_compatibility"]["policy"],
+            "reason": pool_info["config_compatibility"]["reason"],
+            "pool_manifest_schema_version": pool_manifest.get("schema_version"),
+            "pool_generation_config_fingerprint": pool_info[
+                "pool_generation_config_fingerprint"
+            ],
+            "runtime_generation_config_fingerprint": pool_info[
+                "generation_config_fingerprint"
+            ],
+            "vehicle_order_handling": (
+                "VALIDATE_ROLE_ID_SETS; PRESERVE_NPZ_WITHIN_ROLE_ORDER; "
+                "MAP_POSITION_AND_TASK_AXES_BY_ID; JOIN_CSV_ROWS_BY_ID"
+            ),
+            "saved_prediction_handling": (
+                "READ_EXISTING_SCENARIOS_AND_PRESERVE_ORIGINAL_NPZ_METADATA"
+            ),
+            "historical_source_status": pool_manifest.get(
+                "source_provenance", {}
+            ).get("historical_source_status", "UNRESOLVED"),
+        },
         "episode_seed_start": DEFAULT_TRAINING_SEED_START,
         "episode_seed_end": DEFAULT_TRAINING_SEED_START
         + FORMAL_TRAINING_EPISODE_COUNT
@@ -413,7 +489,7 @@ def _validate_episode_snapshot(
         "config_sha256": pool_info["pool_config_sha256"],
         "semantic_config_sha256": pool_info["pool_semantic_config_sha256"],
         "target_generation_config_fingerprint": pool_info[
-            "generation_config_fingerprint"
+            "pool_generation_config_fingerprint"
         ],
         "task_data_contract_sha256": pool_info["task_data_contract_sha256"],
         "service_catalog_sha256": pool_info["service_catalog_sha256"],
