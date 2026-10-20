@@ -467,12 +467,9 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "nodes.rsu.cache_capacity_mb",
     "nodes.uav.count",
     "nodes.uav.cache_capacity_mb",
-    "nodes.sv.eta_ca",
-    "nodes.rsu.eta_ca",
-    "nodes.uav.eta_ca",
-    "nodes.sv.xi_ca",
-    "nodes.rsu.xi_ca",
-    "nodes.uav.xi_ca",
+    "nodes.sv.cache_backhaul_rate_bps",
+    "nodes.rsu.cache_backhaul_rate_bps",
+    "nodes.uav.cache_backhaul_rate_bps",
     "nodes.vehicle.transmit_power_w",
     "nodes.sv.cpu_cycles_per_s",
     "nodes.rsu.cpu_cycles_per_s",
@@ -526,6 +523,12 @@ def validate_for_formal_experiment(
     allow_provisional: bool = False,
 ) -> None:
     validate_config(config)
+    for key in (
+        "nodes.sv.cache_backhaul_rate_bps",
+        "nodes.rsu.cache_backhaul_rate_bps",
+        "nodes.uav.cache_backhaul_rate_bps",
+    ):
+        _require_positive(config, key)
     unresolved = {
         key: status
         for key, status in list_unresolved_parameters(config).items()

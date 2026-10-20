@@ -141,7 +141,7 @@ def _cache_target_configuration_feature(
     capacity = float(context.cache_nodes["capacities_mb"][candidate.node_index])
     trial = np.asarray(current_cache, dtype=np.int8).copy()
     trial[candidate.node_index] = target.astype(np.int8)
-    total_cost, loading_energy = cache_configuration.cache_update_cost(
+    cache_cost, cache_cost_by_node = cache_configuration.cache_update_cost(
         previous_cache,
         trial,
         cache_triggers,
@@ -177,8 +177,8 @@ def _cache_target_configuration_feature(
             float(np.sum(demand_before)),
             float(np.sum(demand_after)),
             float(np.sum(demand_gain)),
-            math.log1p(max(float(total_cost), 0.0)),
-            math.log1p(max(float(loading_energy[candidate.node_index]), 0.0)),
+            math.log1p(max(float(cache_cost), 0.0)),
+            math.log1p(max(float(cache_cost_by_node[candidate.node_index]), 0.0)),
             float(np.mean(np.abs(delta))),
             (target_diversity - current_diversity) / max(float(service_count), 1.0),
             zero_after / max(float(service_count), 1.0),

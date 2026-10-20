@@ -43,6 +43,7 @@ class SlotExecutionResult:
     predictive_configuration_utility: float | None
     predictive_configuration_objective: float | None
     cache_cost: float | None
+    cache_download_delay_s: float | None
     movement_energy: float | None
     movement_cost: float | None
     actual_task_utility: float | None
@@ -267,8 +268,12 @@ def _configuration_summary(
         "predictive_utility": None if prediction_skipped else result.predictive_utility,
         "predictive_objective": None if prediction_skipped else result.objective_value,
         "cache_cost": result.cache_cost,
+        "cache_download_delay_s": result.cache_download_delay_s,
         "cache_cost_by_node": dict(
             result.cache_result_summary.get("cache_cost_by_node", {})
+        ),
+        "cache_download_delay_s_by_node": dict(
+            result.cache_result_summary.get("cache_download_delay_s_by_node", {})
         ),
         "movement_energy": result.movement_energy,
         "movement_cost": result.movement_cost,
@@ -427,6 +432,7 @@ def execute_slot(
             infeasible_reason="",
             predictive_utility=0.0,
             cache_cost=0.0,
+            cache_download_delay_s=0.0,
             movement_energy=0.0,
             movement_cost=0.0,
             objective_value=0.0,
@@ -479,6 +485,7 @@ def execute_slot(
             predictive_configuration_utility=None,
             predictive_configuration_objective=None,
             cache_cost=None,
+            cache_download_delay_s=None,
             movement_energy=None,
             movement_cost=None,
             actual_task_utility=None,
@@ -578,6 +585,7 @@ def execute_slot(
             predictive_configuration_utility=None,
             predictive_configuration_objective=None,
             cache_cost=None,
+            cache_download_delay_s=None,
             movement_energy=None,
             movement_cost=None,
             actual_task_utility=None,
@@ -610,6 +618,7 @@ def execute_slot(
         time.perf_counter() if exact_q_timing_profile is not None else 0.0
     )
     cache_cost = float(configuration.cache_cost)
+    cache_download_delay_s = float(configuration.cache_download_delay_s)
     movement_cost = float(configuration.movement_cost)
     if exact_q_timing_profile is not None:
         exact_q_timing_profile["reward_cost_aggregation_runtime"] += (
@@ -658,6 +667,7 @@ def execute_slot(
             else float(configuration.objective_value)
         ),
         cache_cost=cache_cost,
+        cache_download_delay_s=cache_download_delay_s,
         movement_energy=float(configuration.movement_energy),
         movement_cost=movement_cost,
         actual_task_utility=actual_q,
@@ -707,6 +717,7 @@ class JointConfigurationResult:
     infeasible_reason: str
     predictive_utility: float
     cache_cost: float
+    cache_download_delay_s: float
     movement_energy: float
     movement_cost: float
     objective_value: float
@@ -737,7 +748,7 @@ def _cache_cost(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
 ) -> tuple[float, np.ndarray, np.ndarray]:
-    """Cache cost 始终由 C_prev -> C_candidate 一次性计算。"""
+    """Compute download delay and Cache cost once from C_prev -> C_candidate."""
 
     result = cache_configuration.cache_update_cost_details(
         previous_cache_state,
@@ -748,9 +759,9 @@ def _cache_cost(
         cache_config,
     )
     return (
-        float(result["total_cost"]),
-        np.asarray(result["loading_energy"], dtype=np.float64),
-        np.asarray(result["cost_by_node"], dtype=np.float64),
+        float(result["cache_cost"]),
+        np.asarray(result["cache_download_delay_s_by_node"], dtype=np.float64),
+        np.asarray(result["cache_cost_by_node"], dtype=np.float64),
     )
 
 
@@ -798,7 +809,7 @@ def build_policy_target_configuration(
         project_cfg,
         flight_boundary,
     )
-    cache_cost, _, cache_cost_by_node = _cache_cost(
+    cache_cost, cache_download_delay_s_by_node, cache_cost_by_node = _cache_cost(
         previous_cache,
         final_cache,
         cache_trigger,
@@ -831,6 +842,7 @@ def build_policy_target_configuration(
         infeasible_reason="",
         predictive_utility=0.0,
         cache_cost=float(cache_cost),
+        cache_download_delay_s=float(np.sum(cache_download_delay_s_by_node)),
         movement_energy=float(movement_energy),
         movement_cost=float(movement_cost),
         objective_value=0.0,
@@ -842,6 +854,13 @@ def build_policy_target_configuration(
         stop_reason="policy_target_prediction_skipped",
         cache_result_summary={
             "target_actions": [dict(value) for value in cache_actions],
+            "cache_download_delay_s": float(
+                np.sum(cache_download_delay_s_by_node)
+            ),
+            "cache_download_delay_s_by_node": {
+                str(node_id): float(cache_download_delay_s_by_node[index])
+                for index, node_id in enumerate(cache_nodes["node_ids"])
+            },
             "cache_cost_by_node": {
                 str(node_id): float(cache_cost_by_node[index])
                 for index, node_id in enumerate(cache_nodes["node_ids"])
@@ -917,6 +936,8 @@ def execute_configured_slot(
     )
     if not bool(np.any(cache_updates)) and configuration.cache_cost != 0.0:
         raise AssertionError("Cache 配置未变化时不得产生 reconfiguration cost。")
+    if not bool(np.any(cache_updates)) and configuration.cache_download_delay_s != 0.0:
+        raise AssertionError("Cache 配置未变化时下载时延必须为零。")
     return execute_slot(
         previous_cache,
         previous_uav,
@@ -986,6 +1007,13 @@ def _validated_configuration_override(
     )
     if not math.isclose(rebuilt.cache_cost, configuration.cache_cost, rel_tol=0.0, abs_tol=0.0):
         raise ValueError("configuration_override cache cost 不匹配。")
+    if not math.isclose(
+        rebuilt.cache_download_delay_s,
+        configuration.cache_download_delay_s,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError("configuration_override cache download delay 不匹配。")
     if not math.isclose(
         rebuilt.movement_cost, configuration.movement_cost, rel_tol=0.0, abs_tol=0.0
     ):

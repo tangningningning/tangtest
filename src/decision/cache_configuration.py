@@ -36,12 +36,9 @@ class CacheOptimizationConfig:
     sv_capacity_mb: float
     rsu_capacity_mb: float
     uav_capacity_mb: float
-    sv_eta_ca: float
-    rsu_eta_ca: float
-    uav_eta_ca: float
-    sv_xi_ca: float
-    rsu_xi_ca: float
-    uav_xi_ca: float
+    sv_cache_backhaul_rate_bps: float
+    rsu_cache_backhaul_rate_bps: float
+    uav_cache_backhaul_rate_bps: float
     lambda_cache: float
     beta_discount: float
     omega_t: float
@@ -105,6 +102,9 @@ class CacheOptimizationConfig:
             self.sv_capacity_mb,
             self.rsu_capacity_mb,
             self.uav_capacity_mb,
+            self.sv_cache_backhaul_rate_bps,
+            self.rsu_cache_backhaul_rate_bps,
+            self.uav_cache_backhaul_rate_bps,
             self.time_ref_s,
             self.energy_ref_j,
             self.cloud_total_cpu_cycles_per_s,
@@ -120,8 +120,11 @@ class CacheOptimizationConfig:
             self.kkt_bisection_tolerance,
             self.kkt_max_bisection_iterations,
         ]
-        if any(float(value) <= 0.0 for value in values):
-            raise ValueError("缓存优化配置存在非正数参数。")
+        if any(
+            not math.isfinite(float(value)) or float(value) <= 0.0
+            for value in values
+        ):
+            raise ValueError("缓存优化配置存在非正数或非有限参数。")
         if not 0.0 < self.beta_discount <= 1.0:
             raise ValueError("beta_discount 必须位于 (0, 1]。")
         if self.tolerance < 0.0:
@@ -216,6 +219,21 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
             "缺少或非法的 nodes.cloud.resource_sharing；"
             "正式模型不允许静默回退到 Cloud 共享资源。"
         )
+    backhaul_rates = {}
+    for role, key in (
+        ("SV", "nodes.sv.cache_backhaul_rate_bps"),
+        ("RSU", "nodes.rsu.cache_backhaul_rate_bps"),
+        ("UAV", "nodes.uav.cache_backhaul_rate_bps"),
+    ):
+        raw_rate = get(config, key)
+        if raw_rate is None:
+            raise ValueError(
+                f"缺少必需配置 {key}；Cache 下载时延成本不允许静默默认速率。"
+            )
+        rate = float(raw_rate)
+        if not math.isfinite(rate) or rate <= 0.0:
+            raise ValueError(f"{key} 必须是正的有限 bit/s 数值。")
+        backhaul_rates[role] = rate
     return CacheOptimizationConfig(
         num_rsu=int(get(config, "nodes.rsu.count")),
         num_uav=int(get(config, "nodes.uav.count")),
@@ -224,12 +242,9 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         sv_capacity_mb=float(get(config, "nodes.sv.cache_capacity_mb")),
         rsu_capacity_mb=float(get(config, "nodes.rsu.cache_capacity_mb")),
         uav_capacity_mb=float(get(config, "nodes.uav.cache_capacity_mb")),
-        sv_eta_ca=float(get(config, "nodes.sv.eta_ca")),
-        rsu_eta_ca=float(get(config, "nodes.rsu.eta_ca")),
-        uav_eta_ca=float(get(config, "nodes.uav.eta_ca")),
-        sv_xi_ca=float(get(config, "nodes.sv.xi_ca")),
-        rsu_xi_ca=float(get(config, "nodes.rsu.xi_ca")),
-        uav_xi_ca=float(get(config, "nodes.uav.xi_ca")),
+        sv_cache_backhaul_rate_bps=backhaul_rates["SV"],
+        rsu_cache_backhaul_rate_bps=backhaul_rates["RSU"],
+        uav_cache_backhaul_rate_bps=backhaul_rates["UAV"],
         lambda_cache=float(get(config, "objective.lambda_cache")),
         beta_discount=float(get(config, "cache.discount_beta")),
         omega_t=float(get(config, "objective.omega_delay")),
@@ -431,21 +446,17 @@ def build_cache_nodes(
         node_roles.append("UAV")
 
     capacities = []
-    eta = []
-    xi = []
+    backhaul_rates = []
     for role in node_roles:
         if role == "SV":
             capacities.append(config.sv_capacity_mb)
-            eta.append(config.sv_eta_ca)
-            xi.append(config.sv_xi_ca)
+            backhaul_rates.append(config.sv_cache_backhaul_rate_bps)
         elif role == "RSU":
             capacities.append(config.rsu_capacity_mb)
-            eta.append(config.rsu_eta_ca)
-            xi.append(config.rsu_xi_ca)
+            backhaul_rates.append(config.rsu_cache_backhaul_rate_bps)
         elif role == "UAV":
             capacities.append(config.uav_capacity_mb)
-            eta.append(config.uav_eta_ca)
-            xi.append(config.uav_xi_ca)
+            backhaul_rates.append(config.uav_cache_backhaul_rate_bps)
         else:
             raise AssertionError("未知 cache node role。")
 
@@ -458,8 +469,7 @@ def build_cache_nodes(
         "node_ids": node_ids,
         "node_roles": node_roles,
         "capacities_mb": np.asarray(capacities, dtype=np.float64),
-        "eta_ca": np.asarray(eta, dtype=np.float64),
-        "xi_ca": np.asarray(xi, dtype=np.float64),
+        "cache_backhaul_rate_bps": np.asarray(backhaul_rates, dtype=np.float64),
         "fixed_positions": fixed_positions,
     }
 
@@ -489,7 +499,9 @@ def cache_update_cost(
         cache_nodes,
         config,
     )
-    return float(result["total_cost"]), np.asarray(result["loading_energy"], dtype=np.float64)
+    return float(result["cache_cost"]), np.asarray(
+        result["cache_cost_by_node"], dtype=np.float64
+    )
 
 
 def cache_update_cost_details(
@@ -500,15 +512,14 @@ def cache_update_cost_details(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> dict[str, Any]:
-    """Expose the formal additive per-node cost breakdown without a second formula."""
+    """Expose download delays and costs without duplicating the formal formula."""
 
     return system_model.cache_update_cost(
         previous_cache,
         new_cache,
         cache_trigger,
         service_sizes_mb,
-        cache_nodes["eta_ca"],
-        cache_nodes["xi_ca"],
+        cache_nodes["cache_backhaul_rate_bps"],
         config.lambda_cache,
     )
 

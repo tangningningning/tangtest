@@ -128,6 +128,7 @@ class MicroTransition:
     actual_cache_update_count: int
     uav_movement_count: int
     cache_cost: float
+    cache_download_delay_s: float
     cache_cost_by_node: dict[str, float]
     movement_cost: float
     task_count: int
@@ -1534,6 +1535,9 @@ def collect_dual_timescale_episode(
                     "task_utility": float(result.actual_task_utility),
                     "system_utility": float(result.system_utility),
                     "cache_cost": float(result.cache_cost),
+                    "cache_download_delay_s": float(
+                        result.cache_download_delay_s
+                    ),
                     "movement_cost": float(result.movement_cost),
                     "matching": dict(result.matching),
                     "matching_seconds": float(
@@ -1631,6 +1635,7 @@ def collect_dual_timescale_episode(
                 actual_cache_update_count=actual_cache_update_count,
                 uav_movement_count=int(sum(action_index != 0 for action_index in actions)),
                 cache_cost=float(result.cache_cost),
+                cache_download_delay_s=float(result.cache_download_delay_s),
                 cache_cost_by_node={
                     str(node_id): float(
                         result.configuration_summary.get("cache_cost_by_node", {}).get(
@@ -2269,6 +2274,9 @@ def collect_dual_timescale_episode(
             sum(item.total_vehicle_energy_j for item in micro_buffer.transitions)
         ),
         "total_cache_cost": float(sum(item.cache_cost for item in micro_buffer.transitions)),
+        "total_cache_download_delay_s": float(
+            sum(item.cache_download_delay_s for item in micro_buffer.transitions)
+        ),
         "total_movement_cost": float(
             sum(item.movement_cost for item in micro_buffer.transitions)
         ),

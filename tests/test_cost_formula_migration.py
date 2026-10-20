@@ -21,20 +21,26 @@ class CostFormulaMigrationTests(unittest.TestCase):
             )
         }
 
-    def test_proposed_configs_use_new_cost_contract_without_legacy_weights(self) -> None:
-        for name, config in self.configs.items():
-            with self.subTest(config=name):
-                objective = config["objective"]
-                self.assertNotIn("cache_cost_weight", objective)
-                self.assertNotIn("uav_movement_cost_weight", objective)
-                self.assertEqual(float(objective["lambda_cache"]), 0.01)
-                self.assertAlmostEqual(float(objective["lambda_movement"]), 8.8e-6)
-                cache_config = cache_configuration.cache_config_from_project(
-                    config
-                )
-                movement_config = uav_configuration.uav_search_config_from_project(config)
-                self.assertFalse(hasattr(cache_config, "cache_cost_weight"))
-                self.assertFalse(hasattr(movement_config, "movement_cost_weight"))
+    def test_formal_config_requires_explicit_backhaul_rates_and_cost_weights(self) -> None:
+        config = self.configs["factorized"]
+        objective = config["objective"]
+        self.assertNotIn("cache_cost_weight", objective)
+        self.assertNotIn("uav_movement_cost_weight", objective)
+        self.assertEqual(float(objective["lambda_cache"]), 2.0e-5)
+        self.assertAlmostEqual(float(objective["lambda_movement"]), 5.0e-6)
+        for role in ("sv", "rsu", "uav"):
+            self.assertEqual(
+                float(config["nodes"][role]["cache_backhaul_rate_bps"]),
+                200.0e6,
+            )
+        cache_config = cache_configuration.cache_config_from_project(config)
+        movement_config = uav_configuration.uav_search_config_from_project(config)
+        self.assertFalse(hasattr(cache_config, "sv_eta_ca"))
+        self.assertFalse(hasattr(cache_config, "sv_xi_ca"))
+        self.assertFalse(hasattr(movement_config, "movement_cost_weight"))
+
+        with self.assertRaisesRegex(ValueError, "缺少必需配置 nodes.sv.cache_backhaul_rate_bps"):
+            cache_configuration.cache_config_from_project(self.configs["sparse"])
 
     def test_deprecated_outer_cost_weights_are_rejected(self) -> None:
         config = deepcopy(self.configs["factorized"])
@@ -76,63 +82,60 @@ class CostFormulaMigrationTests(unittest.TestCase):
                 generation_fingerprint=training_pool_contract.CURRENT_GENERATION_FINGERPRINT,
             )
 
-    def test_cache_keep_add_delete_and_replace_costs_match_old_formula(self) -> None:
-        service_sizes = np.asarray([100.0, 250.0], dtype=np.float64)
-        old_xi = np.asarray([1.0e-3, 0.7e-3, 1.2e-3], dtype=np.float64)
-        old_eta = np.asarray([0.20, 0.10, 0.15], dtype=np.float64)
-        new_eta = np.asarray([2.0, 1.0, 1.5], dtype=np.float64)
-        old_weight = 0.1
-        old_lambda = 0.1
-        new_lambda = 0.01
+    def test_cache_keep_delete_and_add_costs_use_download_delay_only(self) -> None:
+        service_sizes = np.asarray([2000.0], dtype=np.float64)
+        backhaul_rate_bps = np.asarray([200.0e6], dtype=np.float64)
+        lambda_cache = 2.0e-5
         cases = (
-            ("keep", 0, [1, 0], [1, 0]),
-            ("add", 0, [0, 0], [1, 0]),
-            ("delete", 1, [1, 0], [0, 0]),
-            ("replace", 2, [1, 0], [0, 1]),
+            ("keep", [1], [1], 0.0, 0.0),
+            ("add", [0], [1], 80.0, 0.0016),
+            ("delete", [1], [0], 0.0, 0.0),
         )
-        for label, node_index, old_row, new_row in cases:
+        for label, old_row, new_row, expected_delay_s, expected_cost in cases:
             with self.subTest(case=label):
                 previous = np.asarray([old_row], dtype=np.int8)
                 final = np.asarray([new_row], dtype=np.int8)
                 changed = int(not np.array_equal(previous[0], final[0]))
                 trigger = np.asarray([changed], dtype=np.int8)
-                old_trigger = np.asarray([changed], dtype=np.float64)
-                loading_proxy = old_xi[node_index] * float(
-                    np.maximum(final[0] - previous[0], 0) @ service_sizes
-                )
-                old_cost = old_weight * (
-                    old_trigger[0] * old_eta[node_index]
-                    + old_lambda * loading_proxy
-                )
                 result = system_model.cache_update_cost(
                     previous,
                     final,
                     trigger,
                     service_sizes,
-                    np.asarray([new_eta[node_index]]),
-                    np.asarray([old_xi[node_index]]),
-                    new_lambda,
+                    backhaul_rate_bps,
+                    lambda_cache,
                 )
                 self.assertEqual(int(result["actual_trigger"][0]), changed)
-                self.assertAlmostEqual(float(result["loaded_mb"][0]), float(
-                    np.maximum(final[0] - previous[0], 0) @ service_sizes
-                ))
-                self.assertAlmostEqual(float(result["loading_energy"][0]), loading_proxy)
                 self.assertAlmostEqual(
-                    float(result["loading_energy_proxy"][0]), loading_proxy
+                    float(result["cache_download_delay_s_by_node"][0]),
+                    expected_delay_s,
                 )
-                self.assertAlmostEqual(float(result["cost_by_node"][0]), old_cost, places=14)
-                self.assertAlmostEqual(float(result["total_cost"]), old_cost, places=14)
-                if label in {"keep", "delete"}:
-                    self.assertEqual(float(result["loaded_mb"][0]), 0.0)
+                self.assertAlmostEqual(float(result["cache_cost_by_node"][0]), expected_cost)
+                self.assertAlmostEqual(float(result["cache_download_delay_s"]), expected_delay_s)
+                self.assertAlmostEqual(float(result["cache_cost"]), expected_cost)
 
-    def test_uav_stay_and_move_costs_match_old_formula(self) -> None:
+        multi_node_result = system_model.cache_update_cost(
+            np.asarray([[0], [0]], dtype=np.int8),
+            np.asarray([[1], [1]], dtype=np.int8),
+            np.asarray([1, 1], dtype=np.int8),
+            service_sizes,
+            np.asarray([200.0e6, 200.0e6], dtype=np.float64),
+            lambda_cache,
+        )
+        np.testing.assert_allclose(
+            multi_node_result["cache_download_delay_s_by_node"], [80.0, 80.0]
+        )
+        np.testing.assert_allclose(multi_node_result["cache_cost_by_node"], [0.0016, 0.0016])
+        self.assertAlmostEqual(multi_node_result["cache_download_delay_s"], 160.0)
+        self.assertAlmostEqual(multi_node_result["cache_cost"], 0.0032)
+
+    def test_uav_stay_and_move_costs_use_movement_energy_only(self) -> None:
         config = self.configs["factorized"]
         movement = uav_configuration.uav_search_config_from_project(config)
-        old_weight = 0.50
-        old_lambda = 1.76e-5
-        old_eta = 0.00176
         energy_coefficient = movement.movement_energy_coefficient_j_per_m
+        self.assertEqual(energy_coefficient, 15.0)
+        self.assertEqual(movement.movement_fixed_cost, 0.0)
+        self.assertEqual(movement.lambda_movement, 5.0e-6)
 
         stay = system_model.uav_movement_cost(
             np.asarray([0.0, 0.0]),
@@ -149,7 +152,7 @@ class CostFormulaMigrationTests(unittest.TestCase):
         self.assertEqual(stay["movement_energy_j"], 0.0)
         self.assertEqual(stay["movement_cost"], 0.0)
 
-        distance = min(10.0, movement.max_move_distance_m)
+        distance = min(5.0, movement.max_move_distance_m)
         move = system_model.uav_movement_cost(
             np.asarray([0.0, 0.0]),
             np.asarray([distance, 0.0]),
@@ -161,16 +164,18 @@ class CostFormulaMigrationTests(unittest.TestCase):
             movement.lambda_movement,
             tolerance_m=movement.position_tolerance_m,
         )
-        old_energy = energy_coefficient * distance
-        old_cost = old_weight * (old_eta + old_lambda * old_energy)
+        expected_energy = energy_coefficient * distance
+        expected_cost = movement.lambda_movement * expected_energy
         self.assertEqual(move["actual_z_q"], 1)
-        self.assertAlmostEqual(float(move["movement_energy_j"]), old_energy)
-        self.assertAlmostEqual(float(move["movement_cost"]), old_cost, places=14)
+        self.assertAlmostEqual(float(move["movement_energy_j"]), expected_energy)
+        self.assertAlmostEqual(float(move["movement_cost"]), expected_cost, places=14)
         self.assertAlmostEqual(
             float(move["movement_cost"]),
-            movement.lambda_movement * (movement.movement_fixed_cost + old_energy),
+            movement.lambda_movement * expected_energy,
             places=14,
         )
+        self.assertAlmostEqual(float(move["movement_energy_j"]), 75.0)
+        self.assertAlmostEqual(float(move["movement_cost"]), 0.000375)
 
 if __name__ == "__main__":
     unittest.main()

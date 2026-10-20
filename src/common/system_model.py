@@ -311,28 +311,25 @@ def cache_update_cost(
     new_cache: np.ndarray,
     cache_trigger: np.ndarray,
     service_sizes_mb: np.ndarray,
-    eta_ca: np.ndarray,
-    xi_ca_per_mb: np.ndarray,
+    cache_backhaul_rate_bps: np.ndarray,
     lambda_ca: float,
 ) -> dict[str, Any]:
-    """Compute cache reconfiguration cost using one scale for both terms.
+    """Compute cache cost from only the download delay of newly added services.
 
-    ``loading_energy`` is the existing equivalent loading proxy
-    ``xi_ca_per_mb * loaded_mb``; it has not been calibrated as physical joules.
+    ``service_sizes_mb`` uses decimal MB (1 MB = 1e6 bytes). Download delay is
+    an independent reward penalty; it is not added to task completion delay.
     """
     raw_old = np.asarray(previous_cache)
     raw_new = np.asarray(new_cache)
     raw_trigger = np.asarray(cache_trigger)
     raw_sizes = np.asarray(service_sizes_mb)
-    raw_eta = np.asarray(eta_ca)
-    raw_xi = np.asarray(xi_ca_per_mb)
+    raw_rates = np.asarray(cache_backhaul_rate_bps)
     try:
         old_values = np.asarray(raw_old, dtype=float)
         new_values = np.asarray(raw_new, dtype=float)
         trigger_values = np.asarray(raw_trigger, dtype=float)
         sizes = np.asarray(raw_sizes, dtype=float)
-        eta = np.asarray(raw_eta, dtype=float)
-        xi = np.asarray(raw_xi, dtype=float)
+        rates = np.asarray(raw_rates, dtype=float)
     except (TypeError, ValueError) as exc:
         raise ValueError("cache 输入必须是数值数组。") from exc
     for name, values in (
@@ -340,8 +337,7 @@ def cache_update_cost(
         ("new_cache", new_values),
         ("cache_trigger", trigger_values),
         ("service_sizes_mb", sizes),
-        ("eta_ca", eta),
-        ("xi_ca_per_mb", xi),
+        ("cache_backhaul_rate_bps", rates),
     ):
         if not np.all(np.isfinite(values)):
             raise ValueError(f"{name} 不能包含 NaN/Inf。")
@@ -353,8 +349,8 @@ def cache_update_cost(
         raise ValueError("cache_trigger shape 错误。")
     if sizes.shape != (old_values.shape[1],):
         raise ValueError("service_sizes_mb shape 错误。")
-    if eta.shape != trigger_values.shape or xi.shape != trigger_values.shape:
-        raise ValueError("eta_ca/xi_ca shape 错误。")
+    if rates.shape != trigger_values.shape:
+        raise ValueError("cache_backhaul_rate_bps shape 错误。")
     if not np.all(np.isin(old_values, [0.0, 1.0])) or not np.all(
         np.isin(new_values, [0.0, 1.0])
     ):
@@ -363,10 +359,8 @@ def cache_update_cost(
         raise ValueError("cache_trigger 必须只包含 0 和 1。")
     if np.any(sizes < 0.0):
         raise ValueError("service_sizes_mb 不能为负数。")
-    if np.any(eta < 0.0):
-        raise ValueError("eta_ca 不能为负数。")
-    if np.any(xi < 0.0):
-        raise ValueError("xi_ca_per_mb 不能为负数。")
+    if np.any(rates <= 0.0):
+        raise ValueError("cache_backhaul_rate_bps 必须全部大于 0。")
     lam = _require_finite("lambda_ca", lambda_ca)
     if lam < 0.0:
         raise ValueError("lambda_ca 不能为负数。")
@@ -381,19 +375,19 @@ def cache_update_cost(
         )
     additions = np.maximum(new - old, 0)
     loaded_mb = additions @ sizes
-    # This equivalent loading proxy is intentionally preserved for compatibility;
-    # it is not a physically calibrated energy measurement in joules.
-    loading_energy = xi * loaded_mb
-    cost_by_node = lam * (
-        actual_trigger.astype(float) * eta + loading_energy
-    )
+    loaded_bits = loaded_mb * 8.0e6
+    cache_download_delay_s_by_node = loaded_bits / rates
+    cache_cost_by_node = lam * cache_download_delay_s_by_node
+    total_cache_download_delay_s = float(np.sum(cache_download_delay_s_by_node))
+    total_cache_cost = float(np.sum(cache_cost_by_node))
     return {
         "actual_trigger": actual_trigger,
         "loaded_mb": loaded_mb,
-        "loading_energy_proxy": loading_energy,
-        "loading_energy": loading_energy,
-        "cost_by_node": cost_by_node,
-        "total_cost": float(np.sum(cost_by_node)),
+        "loaded_bits": loaded_bits,
+        "cache_download_delay_s_by_node": cache_download_delay_s_by_node,
+        "cache_download_delay_s": total_cache_download_delay_s,
+        "cache_cost_by_node": cache_cost_by_node,
+        "cache_cost": total_cache_cost,
     }
 
 

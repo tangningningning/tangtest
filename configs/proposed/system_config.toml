@@ -141,6 +141,9 @@ transmit_power_w = 0.1995262315
 [nodes.sv]
 # SV 公共缓存容量，单位 MB；由 cache.capacity_policy.sv_ratio 自动生成。
 cache_capacity_mb = 12000
+# 统一 Cache 回传仿真基准，单位 bit/s；Liu et al., IEEE TWC 2024, DOI 10.1109/TWC.2024.3430486。
+# SV/UAV 采用同一数值是本项目的抽象实验假设，不代表原论文实测其无线回传能力。
+cache_backhaul_rate_bps = 200.0e6
 # SV 总 CPU 能力，单位 cycle/s。
 # 正式固定值：SV 总 CPU 能力为 1GHz，单位 cycle/s。
 # 这是文献校准实验基线，不代表硬件实测数据。
@@ -149,13 +152,6 @@ cpu_cycles_per_s = 1.0e9
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
-# 参数状态：EXPERIMENT_DESIGN。
-# SV 固定重配置项 eta_ca；这是由旧公式代数迁移的等效目标系数，不是实测能耗。
-eta_ca = 2.0
-# 参数状态：EXPERIMENT_DESIGN。
-# SV 的等效 Cache 装载能耗代理系数；xi_ca * loaded_MB 尚未标定为物理焦耳。
-# 三类节点固定相对比例为 0.001:0.0007:0.0012，lambda_cache 统一缩放整项成本。
-xi_ca = 1.0e-3
 # 正式 Cache 候选评分使用的 SV 服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 100.0
 
@@ -166,6 +162,8 @@ count = 2
 deployment_altitude_m = 10.0
 # RSU 公共缓存容量，单位 MB；由 cache.capacity_policy.rsu_ratio 自动生成。
 cache_capacity_mb = 25000
+# 统一 Cache 回传仿真基准，单位 bit/s；Liu et al., IEEE TWC 2024, DOI 10.1109/TWC.2024.3430486。
+cache_backhaul_rate_bps = 200.0e6
 # RSU 总 CPU 能力，单位 cycle/s。
 # 正式固定值：RSU MEC server computation rate 为 5GHz。
 cpu_cycles_per_s = 10.0e9
@@ -173,13 +171,6 @@ cpu_cycles_per_s = 10.0e9
 # 第一版地面 V2V/V2I 统一采用 10MHz 系统带宽，并与 b_vm 正交资源比例模型配套。
 # 这是文献校准实验基线，不代表硬件实测数据。
 bandwidth_hz = 10.0e6
-# 参数状态：EXPERIMENT_DESIGN。
-# RSU 固定重配置项 eta_ca；这是由旧公式代数迁移的等效目标系数，不是实测能耗。
-eta_ca = 1.0
-# 参数状态：EXPERIMENT_DESIGN。
-# RSU 的等效 Cache 装载能耗代理系数；xi_ca * loaded_MB 尚未标定为物理焦耳。
-# 三类节点固定相对比例为 0.001:0.0007:0.0012，lambda_cache 统一缩放整项成本。
-xi_ca = 0.7e-3
 # 正式 Cache 候选评分使用的 RSU 服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 250.0
 
@@ -202,6 +193,9 @@ initialization_mode = "topology_aware"
 altitude_m = 100.0
 # UAV 公共缓存容量，单位 MB；由 cache.capacity_policy.uav_ratio 自动生成。
 cache_capacity_mb = 20000
+# 统一 Cache 回传仿真基准，单位 bit/s；Liu et al., IEEE TWC 2024, DOI 10.1109/TWC.2024.3430486。
+# 对 UAV 使用该值是本项目的抽象实验假设，不代表原论文实测 UAV 无线回传能力。
+cache_backhaul_rate_bps = 200.0e6
 # UAV 总 CPU 能力，单位 cycle/s。
 # 正式固定值：UAV MEC computation rate 为 5GHz。
 cpu_cycles_per_s = 5.0e9
@@ -211,13 +205,6 @@ cpu_cycles_per_s = 5.0e9
 # 因此 10 MHz 直接换算为 10.0e6 Hz。
 # 这是文献校准实验基线，不代表硬件实测值。
 bandwidth_hz = 10.0e6
-# 参数状态：EXPERIMENT_DESIGN。
-# UAV 固定重配置项 eta_ca；这是由旧公式代数迁移的等效目标系数，不是实测能耗。
-eta_ca = 1.5
-# 参数状态：EXPERIMENT_DESIGN。
-# UAV 的等效 Cache 装载能耗代理系数；xi_ca * loaded_MB 尚未标定为物理焦耳。
-# 三类节点固定相对比例为 0.001:0.0007:0.0012，lambda_cache 统一缩放整项成本。
-xi_ca = 1.2e-3
 # 正式 UAV 候选评分使用的服务距离尺度；不作为 Matching/KKT 的硬覆盖截断。
 range_m = 300.0
 # 参数状态：文献校准实验基线。
@@ -368,17 +355,13 @@ omega_delay = 0.5
 # 该值属于实验设计参数，不是硬件物理常数或已确认数据。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_energy = 0.5
-# 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
-# E_ca,m = xi_ca,m * loaded_MB_m 是等效 Cache 装载能耗代理量，尚未标定为物理焦耳。
-# loaded_MB_m = sum_f service_size_MB_f * max(cache_new_mf - cache_old_mf, 0)。
-# C_ca(t) = lambda_cache * sum_m [eta_ca_m * z_ca_actual_m(t) + E_ca,m(t)]。
-# lambda_cache 统一缩放固定重配置项和新增装载项；eta_ca 是等价迁移后的目标系数。
-# z_ca_actual_m=1 仅当该节点缓存实际变化；删除服务不产生负装载量，KEEP 成本为零。
-# 基于 Training Pilot 的探索性降本配置；并非物理成本重新标定，也未验证为最优系数。
+# Cache 只惩罚新增服务下载时延：T_ca,m = sum_f(s_f * 8e6 / R_m_back) * [c_new-c_old]^+。
+# program_size/service_sizes 使用十进制 MB；下载时延单位秒，不加入任务完成时延。
+# C_ca = lambda_cache * sum_m T_ca,m；固定更新成本和旧装载能耗代理已移除，无时延归一化项。
+# lambda_cache 单位 1/s，将秒计量的下载时延映射为无量纲目标惩罚；该权重尚未校准为最优值。
 # 系统 Slot 目标：G(t) = Q(t) - C_ca(t) - C_q(t)，两类正成本均只扣除一次。
 # Cache/UAV 配置固定时，成本对 Matching/KKT 是常数；资源优化仍以 Q(t) 为目标。
-# lambda_cache 统一缩放固定重配置项和新增装载项。
-lambda_cache = 0.005
+lambda_cache = 2.0e-5
 # 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
 # lambda_movement 将实际移动能耗映射为目标成本。
 # E_mov,u = movement_energy_coefficient_j_per_m * effective_distance_m，单位 J。
@@ -619,12 +602,9 @@ terminal_origin = 299
 "nodes.sv.cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.rsu.cache_capacity_mb" = "CONFIRMED_DATA"
 "nodes.uav.cache_capacity_mb" = "CONFIRMED_DATA"
-"nodes.sv.eta_ca" = "EXPERIMENT_DESIGN"
-"nodes.rsu.eta_ca" = "EXPERIMENT_DESIGN"
-"nodes.uav.eta_ca" = "EXPERIMENT_DESIGN"
-"nodes.sv.xi_ca" = "EXPERIMENT_DESIGN"
-"nodes.rsu.xi_ca" = "EXPERIMENT_DESIGN"
-"nodes.uav.xi_ca" = "EXPERIMENT_DESIGN"
+"nodes.sv.cache_backhaul_rate_bps" = "EXPERIMENT_DESIGN"
+"nodes.rsu.cache_backhaul_rate_bps" = "EXPERIMENT_DESIGN"
+"nodes.uav.cache_backhaul_rate_bps" = "EXPERIMENT_DESIGN"
 "cache.discount_beta" = "ALGORITHM_DESIGN"
 "algorithm.ppo.long_value_enabled" = "ALGORITHM_DESIGN"
 "algorithm.ppo.long_value_target" = "ALGORITHM_DESIGN"

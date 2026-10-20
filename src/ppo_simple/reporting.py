@@ -2093,6 +2093,9 @@ def append_dual_timescale_slot_metrics(
                 "task_utility": float(transition.actual_task_utility),
                 "delay": float(transition.total_task_delay_s),
                 "energy": float(transition.total_vehicle_energy_j),
+                "cache_download_delay_s": float(
+                    transition.cache_download_delay_s
+                ),
                 "cache_cost": float(transition.cache_cost),
                 "movement_cost": float(transition.movement_cost),
                 "actual_cache_update_count": int(transition.actual_cache_update_count),
