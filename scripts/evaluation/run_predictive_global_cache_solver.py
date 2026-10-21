@@ -27,6 +27,7 @@ for import_root in (
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
+from common import system_model
 from decision import predictive_global_cache, slot_environment
 from predictive_global_cache_data import training_context_and_steps
 
@@ -110,6 +111,8 @@ def run_training_window(
     total_cache_cost = 0.0
     total_uav_cost = 0.0
     total_net_utility = 0.0
+    beta_ca = float(context.cfg["objective"]["beta_ca"])
+    beta_q = float(context.cfg["objective"]["beta_q"])
     execution_seconds = 0.0
     search_seconds = 0.0
     cache_node_changes = 0
@@ -177,7 +180,15 @@ def run_training_window(
         values = (result.actual_task_utility, result.cache_cost, result.movement_cost, result.system_utility)
         if any(value is None or not math.isfinite(float(value)) for value in values):
             raise FloatingPointError(f"non-finite formal reward at slot {step.slot}")
-        decomposition = float(result.actual_task_utility) - float(result.cache_cost) - float(result.movement_cost)
+        if result.beta_ca is None or result.beta_q is None:
+            raise AssertionError("formal Slot result lacks system utility weights")
+        decomposition = system_model.aggregate_system_utility(
+            float(result.actual_task_utility),
+            float(result.cache_cost),
+            float(result.movement_cost),
+            float(result.beta_ca),
+            float(result.beta_q),
+        )
         if not math.isclose(decomposition, float(result.system_utility), rel_tol=0.0, abs_tol=1.0e-7):
             raise ValueError(f"formal reward decomposition mismatch at slot {step.slot}")
         total_task_utility += float(result.actual_task_utility)
@@ -198,6 +209,10 @@ def run_training_window(
                 "task_utility": float(result.actual_task_utility),
                 "cache_cost": float(result.cache_cost),
                 "uav_cost": float(result.movement_cost),
+                "beta_ca": float(result.beta_ca),
+                "beta_q": float(result.beta_q),
+                "cache_cost_penalty": float(result.beta_ca * result.cache_cost),
+                "uav_cost_penalty": float(result.beta_q * result.movement_cost),
                 "net_utility": float(result.system_utility),
                 "matching_feasible": bool(result.step_feasible),
             }
@@ -229,6 +244,10 @@ def run_training_window(
         "cache_task_utility": float(total_task_utility),
         "cache_configuration_cost": float(total_cache_cost),
         "uav_movement_cost": float(total_uav_cost),
+        "beta_ca": beta_ca,
+        "beta_q": beta_q,
+        "cache_cost_penalty": float(beta_ca * total_cache_cost),
+        "uav_movement_cost_penalty": float(beta_q * total_uav_cost),
         "net_utility": float(total_net_utility),
         "actual_cache_node_changes": int(cache_node_changes),
         "cache_change_rate_per_node_slot": float(

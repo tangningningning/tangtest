@@ -56,11 +56,11 @@ z_m^ca(k) = I[存在 f: c_{m,f}^{(k)} != c_{m,f}^{(k-1)}]
 
 ```text
 T_ca,m(t) = sum_f [(8e6 * s_f_MB / R_back,m_bps) * max(c_new,mf(t)-c_old,mf(t), 0)]
-T_ca,m_ref = 8e6 * cache_capacity_m_MB / R_back,m_bps
+T_ca,m_ref = 800 s  (fixed configured per-node design scale)
 C_ca(t) = sum_m [T_ca,m(t) / T_ca,m_ref]
 ```
 
-当前正式 `MULTI_NODE_FACTORIZED` 策略对 5 个 SV、2 个 RSU、2 个 UAV 缓存节点提供在线配置动作，故全部 9 行缓存状态按节点分别归一化；不变节点的实际下载成本仍为零。运行初始化固定每节点 `T_ca,m_ref=8e6*capacity_m_MB/R_back,m_bps`。更新后缓存容量约束保证新增服务总大小不超过节点容量，所以这是保守上界；离散目录和合法替换约束可能使实际最大时延更小。参考值总和只用于沿用配置权重来源 `beta_ca=lambda_cache*sum_m(T_ca,m_ref)`，不再作为归一化分母。零容量节点的参考量为零，且正下载时延与零参考量会被拒绝。
+当前正式 `MULTI_NODE_FACTORIZED` 策略对 5 个 SV、2 个 RSU、2 个 UAV 缓存节点提供在线配置动作，故全部 9 行缓存状态按节点分别归一化；不变节点的实际下载成本仍为零。运行初始化对每个节点固定 `T_ca,m_ref=800 s`，这是设计归一化尺度，不是物理上界。按当前容量及回传速率，各 SV/RSU/UAV 的物理下载时延上界为 `480/1000/800 s`，全系统合计 `6000 s`；所以归一化 Cache 成本的容量约束上界为 `7.5`，RSU 单节点成本可能超过 `1`。Cache 成本函数返回未加权的 `C_ca=sum_m(T_ca,m/T_ca,m_ref)`。`beta_ca=1.0` 在唯一系统效用聚合函数中乘一次。配置中的 `lambda_cache` 仅作为旧合同的分析/报告字段保留，不进入 Cache 成本或当前奖励。参考尺度必须为有限正数；零容量或非法回传速率在初始化时明确拒绝。
 
 UAV 能耗仍使用实际前后水平二维位置差：
 
@@ -70,9 +70,9 @@ E_mov,u_ref = xi_mov,u * vmax,u * dt
 C_q(t) = sum_u [E_mov,u(t) / E_mov,u_ref]
 ```
 
-每架 UAV 的速度上限给出保守能耗上界；位置边界与联合安全距离只会进一步限制实际能耗。零参考量时仅允许零移动能耗。`beta_q=lambda_movement*sum_u(E_mov,u_ref)` 保留原有无量纲权重来源。正式奖励仍由 `slot_environment`、`cache_configuration.cache_update_cost_details` 和 `uav_configuration.movement_summary` 组合；`Q(t)`、缓存罚项、移动罚项分别只进入 `G(t)=Q(t)-beta_ca*C_ca(t)-beta_q*C_q(t)` 一次。
+每架 UAV 的速度上限给出保守能耗上界；位置边界与联合安全距离只会进一步限制实际能耗。UAV 成本函数返回未加权的 `C_q=sum_u(E_mov,u/E_mov,u_ref)`；显式外部权重 `beta_q=0.00225` 在唯一系统效用聚合处乘一次。它保持原有效系数 `(5e-6 J^-1)*(sum_u E_mov,u_ref=450 J)`，而 `lambda_movement` 仅作为旧合同的历史/分析字段，不再用于当前奖励。`slot_environment` 调用 `system_model.aggregate_system_utility` 计算 `G(t)=Q(t)-beta_ca*C_ca(t)-beta_q*C_q(t)`；Cache/UAV 成本字段都不含外部权重。
 
-当前配置中每个 SV/RSU/UAV 的 Cache 参考值分别为 `480/1000/800 s`，对应节点数量 `5/2/2`，总和 `6000 s`；`beta_ca=0.12`。每架 UAV 的移动参考值为 `225 J`，两架总和 `450 J`；`beta_q=0.00225`。因此最大归一化成本上界从旧系统级 `1` 变为 Cache `9`、UAV `2`，节点级成本系数变化，奖励目标不与旧公式数值等价。成本合同版本同步为 `node_level_cost_upper_bounds_v1`，旧配置哈希 Checkpoint 不满足新奖励合同的严格恢复条件。
+当前每个 Cache 节点固定使用 `800 s` 参考尺度，9 个节点的参考值总和为 `7200 s`；按各节点容量与速率计算的物理下载上界合计 `6000 s`，因此 `C_ca<=7.5`，而非每节点均严格不超过 `1`。每架 UAV 的移动参考值仍为 `225 J`，两架总和 `450 J`；未加权 UAV 归一化成本上界仍为 `2`，`beta_q=0.00225`，加权扣费上界仍为 `0.0045`。正式配置没有 `cache_cost_weight=0.1` 和 `uav_movement_cost_weight=0.50` 这两个参数，配置校验拒绝它们。当前 `lambda_cache=2e-5`、`lambda_movement=5e-6` 仅保留为旧合同/分析字段，不再计算当前系统效用。Cache 分母由节点容量上界改为固定设计尺度，改变了缓存成本的相对贡献及优化目标。成本合同版本为 `node_level_cost_fixed_reference_explicit_weights_v2`；严格恢复门禁逻辑未修改，配置哈希及成本合同可区分旧 Checkpoint。
 
 ## 3. Macro frame reward 与 SMDP target
 

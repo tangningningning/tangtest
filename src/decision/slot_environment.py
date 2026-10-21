@@ -58,6 +58,8 @@ class SlotExecutionResult:
     matching_summary: dict[str, Any]
     next_cache_state: np.ndarray | None
     next_uav_positions: dict[str, tuple[float, float]] | None
+    beta_ca: float | None = None
+    beta_q: float | None = None
 
 
 def _position_tuples(positions: dict[str, Any]) -> dict[str, tuple[float, float]]:
@@ -384,7 +386,6 @@ def _configuration_summary(
                 "cache_download_delay_reference_s_by_node", {}
             )
         ),
-        "cache_cost_beta": result.cache_result_summary.get("cache_cost_beta"),
         "cache_cost_by_node": dict(
             result.cache_result_summary.get("cache_cost_by_node", {})
         ),
@@ -404,9 +405,6 @@ def _configuration_summary(
         ),
         "movement_energy_reference_j_by_uav": dict(
             result.uav_result_summary.get("movement_energy_reference_j_by_uav", {})
-        ),
-        "movement_cost_beta": result.uav_result_summary.get(
-            "movement_cost_beta"
         ),
         "movement_cost": result.movement_cost,
         "outer_rounds": result.outer_rounds,
@@ -752,6 +750,8 @@ def execute_slot(
     cache_cost = float(configuration.cache_cost)
     cache_download_delay_s = float(configuration.cache_download_delay_s)
     movement_cost = float(configuration.movement_cost)
+    beta_ca = float(project_config.get_config_value(project_cfg, "objective.beta_ca"))
+    beta_q = float(project_config.get_config_value(project_cfg, "objective.beta_q"))
     if exact_q_timing_profile is not None:
         exact_q_timing_profile["reward_cost_aggregation_runtime"] += (
             time.perf_counter() - reward_cost_started_at
@@ -759,8 +759,11 @@ def execute_slot(
     reward_final_started_at = (
         time.perf_counter() if exact_q_timing_profile is not None else 0.0
     )
-    # Both cost fields already contain beta times one normalized physical cost.
-    system_utility = actual_q - cache_cost - movement_cost
+    # Both costs are unweighted normalized quantities. Apply the external
+    # system-utility weights exactly once here.
+    system_utility = system_model.aggregate_system_utility(
+        actual_q, cache_cost, movement_cost, beta_ca, beta_q
+    )
     if exact_q_timing_profile is not None:
         exact_q_timing_profile["reward_final_combination_runtime"] += (
             time.perf_counter() - reward_final_started_at
@@ -818,6 +821,8 @@ def execute_slot(
         ),
         next_cache_state=final_cache.copy(),
         next_uav_positions=final_uav,
+        beta_ca=beta_ca,
+        beta_q=beta_q,
     )
 
 
@@ -988,7 +993,6 @@ def build_policy_target_configuration(
                 )
                 for index, node_id in enumerate(cache_nodes["node_ids"])
             },
-            "cache_cost_beta": float(cache_result["cache_cost_beta"]),
             "cache_cost_reference_kind": cache_nodes[
                 "cache_cost_normalization"
             ]["reference_kind"],
@@ -1014,7 +1018,6 @@ def build_policy_target_configuration(
             "movement_distance_m_by_uav": movement_distance_by_uav,
             "movement_energy_j_by_uav": movement_energy_by_uav,
             "movement_cost_by_uav": movement_cost_by_uav,
-            "movement_cost_beta": search.beta_movement,
             "movement_cost_reference_kind": (
                 "per_uav_conservative_speed_limit_upper_bound"
                 if search.movement_energy_reference_j > 0.0

@@ -828,8 +828,10 @@ def main() -> int:
                 "omega_energy": float(objective["omega_energy"]),
                 "T_ref_s": float(objective["T_ref"]),
                 "E_ref_j": float(objective["E_ref"]),
-                "lambda_cache": float(objective["lambda_cache"]),
-                "lambda_movement": float(objective["lambda_movement"]),
+                "beta_ca": float(objective["beta_ca"]),
+                "beta_q": float(objective["beta_q"]),
+                "legacy_lambda_cache": float(objective["lambda_cache"]),
+                "legacy_lambda_movement": float(objective["lambda_movement"]),
             },
             "matching_contract": {
                 "method": str(cfg["algorithm"]["matching"]["method"]),

@@ -39,7 +39,6 @@ class CacheOptimizationConfig:
     sv_cache_backhaul_rate_bps: float
     rsu_cache_backhaul_rate_bps: float
     uav_cache_backhaul_rate_bps: float
-    lambda_cache: float
     beta_discount: float
     omega_t: float
     omega_e: float
@@ -132,8 +131,6 @@ class CacheOptimizationConfig:
             raise ValueError("beta_discount 必须位于 (0, 1]。")
         if self.tolerance < 0.0:
             raise ValueError("tolerance 不能为负数。")
-        if not math.isfinite(self.lambda_cache) or self.lambda_cache < 0.0:
-            raise ValueError("lambda_cache 必须是非负有限数。")
         if int(self.target_candidate_capacity) < 1:
             raise ValueError("target_candidate_capacity 必须 >= 1。")
         if not self.target_intermediate_fractions or any(
@@ -255,7 +252,6 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
         sv_cache_backhaul_rate_bps=backhaul_rates["SV"],
         rsu_cache_backhaul_rate_bps=backhaul_rates["RSU"],
         uav_cache_backhaul_rate_bps=backhaul_rates["UAV"],
-        lambda_cache=float(get(config, "objective.lambda_cache")),
         beta_discount=float(get(config, "cache.discount_beta")),
         omega_t=float(get(config, "objective.omega_delay")),
         omega_e=float(get(config, "objective.omega_energy")),
@@ -487,16 +483,14 @@ def build_cache_nodes(
 def initialize_cache_cost_normalization(
     cache_nodes: dict[str, Any],
     service_sizes_mb: np.ndarray,
-    lambda_cache: float,
+    reference_s_per_node_s: float,
 ) -> dict[str, Any]:
-    """Fix a conservative cache-delay reference and one dimensionless weight per node.
+    """Fix a positive per-node cache-delay design scale at environment setup.
 
     Every node in ``cache_nodes`` is a policy-controlled cache head in the
-    formal multi-node action schema. The node's full capacity bounds the total
-    size of services added by any feasible target; the catalog can make the
-    attainable maximum smaller, so this is an upper bound rather than an exact
-    maximum. The sum is retained only to derive beta_cache; normalization uses
-    each node's own reference.
+    formal multi-node action schema. Each node uses the configured fixed
+    reference scale, independent of capacity, policy actions, and Slot state.
+    This is a normalization scale, not a physical upper bound on download delay.
     """
 
     sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
@@ -514,32 +508,40 @@ def initialize_cache_cost_normalization(
         or rates.shape != (len(node_ids),)
         or not np.isfinite(capacities).all()
         or not np.isfinite(rates).all()
-        or np.any(capacities < 0.0)
+        or np.any(capacities <= 0.0)
         or np.any(rates <= 0.0)
     ):
-        raise ValueError("Cache 节点容量或实际回传速率非法。")
-    lam = float(lambda_cache)
-    if not math.isfinite(lam) or lam < 0.0:
-        raise ValueError("lambda_cache 必须是非负有限数。")
+        raise ValueError("Cache 节点容量必须为正，实际回传速率必须为正有限数。")
 
-    reference_s_by_node = capacities * 8.0e6 / rates
+    reference_scale_s = float(reference_s_per_node_s)
+    if not math.isfinite(reference_scale_s) or reference_scale_s <= 0.0:
+        raise ValueError("Cache 每节点归一化参考时延必须为有限正数。")
+
+    reference_s_by_node = np.full(len(node_ids), reference_scale_s, dtype=np.float64)
+    capacity_upper_bound_s_by_node = capacities * 8.0e6 / rates
     reference_s_total = float(np.sum(reference_s_by_node))
-    reference_kind = (
-        "per_node_conservative_capacity_upper_bound"
-        if reference_s_total > 0.0
-        else "zero_no_positive_cache_capacity"
-    )
-    beta_cache = lam * reference_s_total
-    if not np.isfinite(reference_s_by_node).all() or np.any(reference_s_by_node < 0.0):
+    reference_kind = "fixed_per_node_design_normalization_scale"
+    if (
+        not np.isfinite(reference_s_by_node).all()
+        or np.any(reference_s_by_node <= 0.0)
+        or not np.isfinite(capacity_upper_bound_s_by_node).all()
+        or np.any(capacity_upper_bound_s_by_node <= 0.0)
+        or not math.isfinite(reference_s_total)
+        or reference_s_total <= 0.0
+    ):
         raise FloatingPointError("per-node cache delay references are invalid")
     metadata = {
         "reference_s_by_node": [float(value) for value in reference_s_by_node],
-        # Aggregate retained for weight derivation and diagnostics, not as a divisor.
+        "reference_s_per_node": reference_scale_s,
+        "capacity_upper_bound_s_by_node": [
+            float(value) for value in capacity_upper_bound_s_by_node
+        ],
+        # Aggregate retained for diagnostics only; every node has its own divisor.
         "reference_s_total": reference_s_total,
         "reference_kind": reference_kind,
-        "formula": "T_ca_m_ref_s=8e6 * cache_capacity_m_MB / actual_backhaul_rate_m_bps",
-        "beta_cache": beta_cache,
-        "beta_source": "objective.lambda_cache_per_s * sum_m(T_ca_m_ref_s)",
+        "formula": "T_ca_m_ref_s=objective.cost_normalization.cache_reference_s_per_node",
+        "cost_formula": "C_ca=sum_m(T_ca_m_s/T_ca_m_ref_s)",
+        "additional_cost_multiplier": "none",
         "service_count": int(sizes.size),
         "cache_node_count": int(len(node_ids)),
         "unit": "s",
@@ -601,7 +603,6 @@ def cache_update_cost_details(
         service_sizes_mb,
         cache_nodes["cache_backhaul_rate_bps"],
         np.asarray(normalization["reference_s_by_node"], dtype=np.float64),
-        float(normalization["beta_cache"]),
     )
 
 

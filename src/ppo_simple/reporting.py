@@ -15,7 +15,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - 无 PyTorch 环境也可检查 reporting
     torch = None  # type: ignore[assignment]
 
-from common import project_config
+from common import project_config, system_model
 from .macro_targets import (
     build_macro_n2_target,
 )
@@ -2016,7 +2016,9 @@ def write_dual_timescale_run_manifest(
         "macro_critic_gradient_conflict_method": "last1 norm matching, current-priority last1-only projection, final norm matching to current",
         "long_value_enabled": bool(trainer.long_value_enabled),
         "long_value_target": str(trainer.long_value_target),
-        "reward_definition": "task utility minus Cache cost and UAV movement cost",
+        "reward_definition": "G=Q-beta_ca*C_ca-beta_q*C_q",
+        "beta_ca": float(context.cfg["objective"]["beta_ca"]),
+        "beta_q": float(context.cfg["objective"]["beta_q"]),
         "matching": "Transfer-Exchange",
         "kkt": "continuous resource allocation",
         "configuration_control_mode": str(context.configuration_control_mode),
@@ -2089,10 +2091,12 @@ def append_dual_timescale_slot_metrics(
     with destination.open("a", encoding="utf-8", newline="\n") as stream:
         for transition in transitions:
             matching_summary = transition.matching_summary
-            expected_reward = (
-                float(transition.actual_task_utility)
-                - float(transition.cache_cost)
-                - float(transition.movement_cost)
+            expected_reward = system_model.aggregate_system_utility(
+                float(transition.actual_task_utility),
+                float(transition.cache_cost),
+                float(transition.movement_cost),
+                float(transition.beta_ca),
+                float(transition.beta_q),
             )
             if not math.isclose(
                 float(transition.reward), expected_reward, rel_tol=1e-12, abs_tol=1e-9
@@ -2150,13 +2154,17 @@ def append_dual_timescale_slot_metrics(
                 ),
                 "G": float(transition.reward),
                 "task_utility": float(transition.actual_task_utility),
+                "beta_ca": float(transition.beta_ca),
+                "beta_q": float(transition.beta_q),
+                "cache_cost_penalty": float(transition.beta_ca * transition.cache_cost),
+                "movement_cost_penalty": float(transition.beta_q * transition.movement_cost),
+                "cache_cost": float(transition.cache_cost),
+                "movement_cost": float(transition.movement_cost),
                 "delay": float(transition.total_task_delay_s),
                 "energy": float(transition.total_vehicle_energy_j),
                 "cache_download_delay_s": float(
                     transition.cache_download_delay_s
                 ),
-                "cache_cost": float(transition.cache_cost),
-                "movement_cost": float(transition.movement_cost),
                 "actual_cache_update_count": int(transition.actual_cache_update_count),
                 "uav_action_indices": [int(value) for value in transition.actions],
                 "uav_ids": [str(value) for value in transition.uav_ids],

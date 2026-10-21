@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from common import system_model
 from . import cache_configuration, slot_environment
 
 
@@ -1044,12 +1045,14 @@ def evaluate_fixed_cache_training_horizon(
             if value is None or not math.isfinite(float(value)):
                 raise FloatingPointError(f"Training label branch returned non-finite {key}")
             totals[key] += float(value)
-    if not math.isclose(
-        totals["net_utility"],
-        totals["task_utility"] - totals["cache_cost"] - totals["uav_cost"],
-        rel_tol=0.0,
-        abs_tol=1.0e-7,
-    ):
+    expected_net = system_model.aggregate_system_utility(
+        totals["task_utility"],
+        totals["cache_cost"],
+        totals["uav_cost"],
+        float(context.cfg["objective"]["beta_ca"]),
+        float(context.cfg["objective"]["beta_q"]),
+    )
+    if not math.isclose(totals["net_utility"], expected_net, rel_tol=0.0, abs_tol=1.0e-7):
         raise ValueError("paired Training label utility decomposition is inconsistent")
     return totals
 

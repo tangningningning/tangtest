@@ -32,7 +32,7 @@ SPARSE_COORDINATED_CACHE_POLICY_SCHEMA = project_config.SPARSE_COORDINATED_CACHE
 PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
 PER_SLOT_ANALYTIC_TASK_MODEL = "PER_SLOT_ANALYTIC"
 PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA = "configuration_per_slot_analytic_v1"
-NORMALIZED_COST_CONTRACT_VERSION = "node_level_cost_upper_bounds_v1"
+NORMALIZED_COST_CONTRACT_VERSION = "node_level_cost_fixed_reference_explicit_weights_v2"
 _REPORTED_COST_NORMALIZATION_CONTRACTS: set[str] = set()
 
 
@@ -444,15 +444,18 @@ def load_environment_context(
     cache_cost_reference = cache_configuration.initialize_cache_cost_normalization(
         cache_nodes,
         service_catalog["service_sizes_mb"],
-        cache_cfg.lambda_cache,
+        float(
+            project_config.get_config_value(
+                cfg, "objective.cost_normalization.cache_reference_s_per_node"
+            )
+        ),
     )
     movement_reference_by_uav = uav_configuration.movement_energy_upper_bounds_by_uav_j(
         cfg
     )
     movement_reference_j = float(sum(movement_reference_by_uav.values()))
-    lambda_movement = float(
-        project_config.get_config_value(cfg, "objective.lambda_movement")
-    )
+    beta_ca = float(project_config.get_config_value(cfg, "objective.beta_ca"))
+    beta_q = float(project_config.get_config_value(cfg, "objective.beta_q"))
     movement_cost_reference = {
         "reference_j": movement_reference_j,
         "reference_j_by_uav": movement_reference_by_uav,
@@ -462,8 +465,6 @@ def load_environment_context(
             else "zero_no_possible_positive_movement_energy"
         ),
         "formula": "E_mov_u_ref_j=xi_mov_u_J_per_m * vmax_u_m_per_s * slot_duration_s",
-        "beta_movement": lambda_movement * movement_reference_j,
-        "beta_source": "objective.lambda_movement_per_J * sum_u(E_mov_u_ref_J)",
         "uav_count": int(project_config.get_config_value(cfg, "nodes.uav.count")),
         "unit": "J",
     }
@@ -471,6 +472,11 @@ def load_environment_context(
         "contract_version": NORMALIZED_COST_CONTRACT_VERSION,
         "cache": cache_cost_reference,
         "movement": movement_cost_reference,
+        "system_utility_weights": {
+            "beta_ca": beta_ca,
+            "beta_q": beta_q,
+            "source": "explicit objective.beta_ca and objective.beta_q",
+        },
     }
     reference_record = json.dumps(
         cfg["_meta"]["reward_cost_normalization"],
@@ -481,15 +487,15 @@ def load_environment_context(
     if reference_record not in _REPORTED_COST_NORMALIZATION_CONTRACTS:
         print(
             "[reward-cost normalization] "
+            "C_ca=sum_m(T_ca,m_s/T_ca,m_ref_s), C_q=sum_u(E_mov_u_J/E_mov_u_ref_J); "
             f"T_ca_m_ref_s_by_node="
             f"{dict(zip(cache_nodes['node_ids'], cache_cost_reference['reference_s_by_node']))} "
             f"(sum={cache_cost_reference['reference_s_total']:.12g} s) "
             f"({cache_cost_reference['reference_kind']}), "
-            f"beta_ca={cache_cost_reference['beta_cache']:.12g}; "
             f"E_mov_u_ref_j_by_uav={movement_reference_by_uav} "
             f"(sum={movement_cost_reference['reference_j']:.12g} J) "
             f"({movement_cost_reference['reference_kind']}), "
-            f"beta_q={movement_cost_reference['beta_movement']:.12g}",
+            f"beta_ca={beta_ca:.12g}, beta_q={beta_q:.12g}",
             flush=True,
         )
         _REPORTED_COST_NORMALIZATION_CONTRACTS.add(reference_record)

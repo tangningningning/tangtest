@@ -28,6 +28,7 @@ for _import_root in (
     if str(_import_root) not in sys.path:
         sys.path.insert(0, str(_import_root))
 
+from common import system_model
 from decision import cache_configuration, slot_environment, task_allocation
 from ppo_simple.interface import prepare_aligned_rollout_steps
 
@@ -439,7 +440,12 @@ def _actual_metrics(
     total_seconds = time.perf_counter() - total_started
     if any(not np.array_equal(uav[key], initial_uav[key]) for key in uav):
         raise ValueError("UAV STAY baseline unexpectedly moved a UAV")
-    decomposition_error = slot_net - (slot_task - slot_cache_cost - slot_uav_cost)
+    beta_ca = float(context.cfg["objective"]["beta_ca"])
+    beta_q = float(context.cfg["objective"]["beta_q"])
+    decomposed_net = system_model.aggregate_system_utility(
+        slot_task, slot_cache_cost, slot_uav_cost, beta_ca, beta_q
+    )
+    decomposition_error = slot_net - decomposed_net
     if abs(decomposition_error) > 1.0e-8:
         raise ValueError(f"Net utility decomposition mismatch: {decomposition_error}")
     return {
@@ -449,6 +455,10 @@ def _actual_metrics(
         "task_utility": float(slot_task),
         "cache_cost": float(slot_cache_cost),
         "uav_movement_cost": float(slot_uav_cost),
+        "beta_ca": beta_ca,
+        "beta_q": beta_q,
+        "cache_cost_penalty": float(beta_ca * slot_cache_cost),
+        "uav_movement_cost_penalty": float(beta_q * slot_uav_cost),
         "net_utility": float(slot_net),
         "actual_cache_node_changes": int(cache_node_changes),
         "macro_update_count": int(macro_update_count),

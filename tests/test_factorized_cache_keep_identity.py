@@ -212,14 +212,17 @@ class CacheReplacementRuleTests(unittest.TestCase):
         search = SimpleNamespace(
             position_tolerance_m=1.0e-6,
             movement_energy_reference_j=0.0,
-            beta_movement=0.0,
+            movement_energy_reference_j_by_uav={},
         )
         cache_cost_details = {
             "cache_cost": 0.0,
             "cache_download_delay_s": 0.0,
             "cache_download_delay_normalized": 0.0,
             "cache_download_delay_reference_s": 6000.0,
-            "cache_cost_beta": 0.12,
+            "cache_download_delay_reference_s_total": 6000.0,
+            "cache_download_delay_reference_s_by_node": np.asarray(
+                [6000.0], dtype=np.float64
+            ),
             "cache_download_delay_s_by_node": np.zeros(1, dtype=np.float64),
             "cache_cost_by_node": np.zeros(1, dtype=np.float64),
         }

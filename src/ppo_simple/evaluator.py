@@ -19,7 +19,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - 仅静态导入环境
     torch = None  # type: ignore[assignment]
 
-from common import project_config
+from common import project_config, system_model
 from decision import slot_environment
 from scenario.realization import REALIZATION_ARTIFACT_FILENAMES
 from .interface import (
@@ -464,9 +464,19 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
     total_return = float(sum(item.reward for item in micro))
     total_cache_cost = float(sum(item.cache_cost for item in micro))
     total_movement_cost = float(sum(item.movement_cost for item in micro))
-    net_utility = task_utility - total_cache_cost - total_movement_cost
+    beta_ca = float(micro[0].beta_ca)
+    beta_q = float(micro[0].beta_q)
+    if any(
+        not math.isclose(float(item.beta_ca), beta_ca, rel_tol=0.0, abs_tol=0.0)
+        or not math.isclose(float(item.beta_q), beta_q, rel_tol=0.0, abs_tol=0.0)
+        for item in micro
+    ):
+        raise ValueError("system utility weights changed within a frozen evaluation episode")
+    net_utility = system_model.aggregate_system_utility(
+        task_utility, total_cache_cost, total_movement_cost, beta_ca, beta_q
+    )
     if not math.isclose(total_return, net_utility, rel_tol=1.0e-12, abs_tol=1.0e-8):
-        raise ValueError("frozen evaluation reward does not equal task utility less system costs")
+        raise ValueError("frozen evaluation reward does not match the weighted system utility")
     joint_action_rates = {key: value / slots for key, value in joint_action_counts.items()}
     if uav_count == 2:
         legacy_joint_rates = {
@@ -491,6 +501,10 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "task_utility": task_utility,
         "total_cache_cost": total_cache_cost,
         "total_movement_cost": total_movement_cost,
+        "beta_ca": beta_ca,
+        "beta_q": beta_q,
+        "total_cache_cost_penalty": beta_ca * total_cache_cost,
+        "total_movement_cost_penalty": beta_q * total_movement_cost,
         "window_slot_count": int(collection.summary.get("window_slot_count", slots)),
         "window_truncated": bool(collection.summary.get("window_truncated", False)),
         "episode_terminal_observed": bool(
@@ -649,15 +663,19 @@ def _evaluate_keep_stay_window(
             for key in uav
         ):
             raise AssertionError("KEEP+STAY changed a UAV position.")
-        expected = (
-            float(result.actual_task_utility)
-            - float(result.cache_cost)
-            - float(result.movement_cost)
+        if result.beta_ca is None or result.beta_q is None:
+            raise AssertionError("KEEP+STAY result lacks external utility weights")
+        expected = system_model.aggregate_system_utility(
+            float(result.actual_task_utility),
+            float(result.cache_cost),
+            float(result.movement_cost),
+            float(result.beta_ca),
+            float(result.beta_q),
         )
         if not math.isclose(
             float(result.system_utility), expected, rel_tol=1.0e-12, abs_tol=1.0e-9
         ):
-            raise ValueError("KEEP+STAY system utility does not match the formal reward contract")
+            raise ValueError("KEEP+STAY system utility does not match the weighted reward contract")
         task_utility += float(result.actual_task_utility)
         cache_cost += float(result.cache_cost)
         movement_cost += float(result.movement_cost)
@@ -665,9 +683,15 @@ def _evaluate_keep_stay_window(
         kkt_call_count += int(
             result.matching_summary.get("KKT_SOLVER_CALL_COUNT", 0)
         )
-    formula_net = task_utility - cache_cost - movement_cost
+    formula_net = system_model.aggregate_system_utility(
+        task_utility,
+        cache_cost,
+        movement_cost,
+        float(context.cfg["objective"]["beta_ca"]),
+        float(context.cfg["objective"]["beta_q"]),
+    )
     if not math.isclose(net_utility, formula_net, rel_tol=1.0e-12, abs_tol=1.0e-8):
-        raise ValueError("KEEP+STAY cumulative reward does not match task utility less costs")
+        raise ValueError("KEEP+STAY cumulative reward does not match weighted system utility")
     return {
         "policy": "KEEP+STAY",
         "slot_count": int(max_slots),
@@ -675,6 +699,14 @@ def _evaluate_keep_stay_window(
         "task_utility": float(task_utility),
         "cache_cost": float(cache_cost),
         "movement_cost": float(movement_cost),
+        "beta_ca": float(context.cfg["objective"]["beta_ca"]),
+        "beta_q": float(context.cfg["objective"]["beta_q"]),
+        "cache_cost_penalty": float(
+            context.cfg["objective"]["beta_ca"] * cache_cost
+        ),
+        "movement_cost_penalty": float(
+            context.cfg["objective"]["beta_q"] * movement_cost
+        ),
         "cache_update_count": 0,
         "uav_movement_count": 0,
         "kkt_call_count": int(kkt_call_count),

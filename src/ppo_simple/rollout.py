@@ -10,6 +10,7 @@ import time
 from typing import Any, Callable, Mapping
 
 import numpy as np
+from common import system_model
 
 try:
     import torch
@@ -131,6 +132,8 @@ class MicroTransition:
     cache_download_delay_s: float
     cache_cost_by_node: dict[str, float]
     movement_cost: float
+    beta_ca: float
+    beta_q: float
     task_count: int
     total_task_delay_s: float
     total_vehicle_energy_j: float
@@ -461,10 +464,14 @@ def _check_reward(result: slot_environment.SlotExecutionResult) -> float:
 
     if result.system_utility is None:
         raise AssertionError("feasible slot result 缺少 system_utility。")
-    expected = (
-        float(result.actual_task_utility)
-        - float(result.cache_cost)
-        - float(result.movement_cost)
+    if result.beta_ca is None or result.beta_q is None:
+        raise AssertionError("feasible slot result 缺少系统效用外部成本权重。")
+    expected = system_model.aggregate_system_utility(
+        float(result.actual_task_utility),
+        float(result.cache_cost),
+        float(result.movement_cost),
+        float(result.beta_ca),
+        float(result.beta_q),
     )
     if not np.isclose(float(result.system_utility), expected, rtol=1e-12, atol=1e-12):
         raise AssertionError("slot reward 与 system utility 不一致。")
@@ -2181,6 +2188,8 @@ def collect_dual_timescale_episode(
                     for node_id in context.action_spec.cache_node_ids
                 },
                 movement_cost=float(result.movement_cost),
+                beta_ca=float(result.beta_ca),
+                beta_q=float(result.beta_q),
                 task_count=metrics.task_count,
                 total_task_delay_s=metrics.total_task_delay_s,
                 total_vehicle_energy_j=metrics.total_vehicle_energy_j,
@@ -2810,11 +2819,21 @@ def collect_dual_timescale_episode(
             sum(item.total_vehicle_energy_j for item in micro_buffer.transitions)
         ),
         "total_cache_cost": float(sum(item.cache_cost for item in micro_buffer.transitions)),
+        "beta_ca": float(context.cfg["objective"]["beta_ca"]),
+        "beta_q": float(context.cfg["objective"]["beta_q"]),
+        "total_cache_cost_penalty": float(
+            context.cfg["objective"]["beta_ca"]
+            * sum(item.cache_cost for item in micro_buffer.transitions)
+        ),
         "total_cache_download_delay_s": float(
             sum(item.cache_download_delay_s for item in micro_buffer.transitions)
         ),
         "total_movement_cost": float(
             sum(item.movement_cost for item in micro_buffer.transitions)
+        ),
+        "total_movement_cost_penalty": float(
+            context.cfg["objective"]["beta_q"]
+            * sum(item.movement_cost for item in micro_buffer.transitions)
         ),
         "total_task_utility": float(
             sum(item.actual_task_utility for item in micro_buffer.transitions)

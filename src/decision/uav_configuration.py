@@ -54,9 +54,7 @@ class UavSearchConfig:
     min_safety_distance_m: float
     movement_energy_coefficient_j_per_m: float
     movement_fixed_cost: float
-    lambda_movement: float
     movement_energy_reference_j_by_uav: dict[str, float]
-    beta_movement: float
 
     @property
     def movement_energy_reference_j(self) -> float:
@@ -75,7 +73,6 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
     """从统一 TOML 配置构造 UAV 搜索配置。"""
 
     get = project_config.get_config_value
-    lambda_movement = float(get(config, "objective.lambda_movement"))
     cost_normalization = get(config, "_meta.reward_cost_normalization", {})
     movement_normalization = (
         cost_normalization.get("movement", {})
@@ -102,15 +99,6 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         ):
             raise ValueError("固定 UAV 移动参考值与配置物理参数不一致。")
         movement_energy_reference_j_by_uav = configured_references
-    movement_energy_reference_j = float(
-        sum(movement_energy_reference_j_by_uav.values())
-    )
-    beta_value = movement_normalization.get("beta_movement")
-    beta_movement = (
-        lambda_movement * movement_energy_reference_j
-        if beta_value is None
-        else float(beta_value)
-    )
     return UavSearchConfig(
         coarse_num_angles=int(get(config, "algorithm.uav.coarse_num_angles")),
         coarse_radius_fractions=tuple(
@@ -139,9 +127,7 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
             get(config, "nodes.uav.movement.movement_energy_coefficient_j_per_m")
         ),
         movement_fixed_cost=float(get(config, "nodes.uav.movement.movement_fixed_cost")),
-        lambda_movement=lambda_movement,
         movement_energy_reference_j_by_uav=movement_energy_reference_j_by_uav,
-        beta_movement=beta_movement,
     )
 
 
@@ -672,7 +658,7 @@ def movement_summary(
     dict[str, float],
     float,
 ]:
-    """用 system_model.uav_movement_cost 计算一次性最终移动成本。"""
+    """计算实际能耗与未加权的归一化 UAV 成本 C_q。"""
 
     total_energy = 0.0
     total_cost = 0.0
@@ -692,7 +678,6 @@ def movement_summary(
             search_config.movement_energy_coefficient_j_per_m,
             search_config.movement_fixed_cost,
             search_config.movement_energy_reference_j_by_uav[uav_id],
-            search_config.beta_movement,
             tolerance_m=search_config.position_tolerance_m,
         )
         displacement[uav_id] = float(result["distance_m"])

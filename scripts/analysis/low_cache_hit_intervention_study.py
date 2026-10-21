@@ -26,7 +26,7 @@ for import_root in (PROJECT_ROOT, SOURCE_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from common import project_config
+from common import project_config, system_model
 from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
 from ppo_simple import interface
 from ppo_simple.primitive_control import (
@@ -793,15 +793,19 @@ def _evaluate_configuration(
             f"episode_seed={record['episode_seed']}, slot={record['slot']}, "
             f"reason={result.infeasible_reason}"
         )
-    expected_utility = (
-        float(result.actual_task_utility)
-        - float(result.cache_cost)
-        - float(result.movement_cost)
+    if result.beta_ca is None or result.beta_q is None:
+        raise AssertionError("Official Slot result lacks system utility weights.")
+    expected_utility = system_model.aggregate_system_utility(
+        float(result.actual_task_utility),
+        float(result.cache_cost),
+        float(result.movement_cost),
+        float(result.beta_ca),
+        float(result.beta_q),
     )
     if not math.isclose(
         float(result.system_utility), expected_utility, rel_tol=1.0e-12, abs_tol=1.0e-12
     ):
-        raise AssertionError("Official G != Q - cache_cost - movement_cost.")
+        raise AssertionError("Official G does not match weighted system utility.")
 
     cache_cost_details = cache_configuration.cache_update_cost_details(
         previous_cache,
@@ -2745,11 +2749,17 @@ def _forced_edge_task_counterfactual(
         task_count = len(tasks)
         cache_cost = float(baseline["cache_cost"])
         movement_cost = float(baseline["movement_cost"])
-        system_utility = float(result.task_utility_sum) - cache_cost - movement_cost
-        expected_baseline_g = (
-            float(baseline["task_utility"])
-            - cache_cost
-            - movement_cost
+        beta_ca = float(context.cfg["objective"]["beta_ca"])
+        beta_q = float(context.cfg["objective"]["beta_q"])
+        system_utility = system_model.aggregate_system_utility(
+            float(result.task_utility_sum),
+            cache_cost,
+            movement_cost,
+            beta_ca,
+            beta_q,
+        )
+        expected_baseline_g = system_model.aggregate_system_utility(
+            float(baseline["task_utility"]), cache_cost, movement_cost, beta_ca, beta_q
         )
         if not math.isclose(
             float(baseline["G"]), expected_baseline_g, rel_tol=1.0e-12, abs_tol=1.0e-12
@@ -3576,7 +3586,7 @@ def _render_report(data: dict[str, Any]) -> str:
         f"低命中 Cache 触发判定：`{data['low_hit_trigger_assessment']['cache_only']}`；低命中 UAV 触发判定：`{data['low_hit_trigger_assessment']['uav_only']}`。判定基于低命中组自身 Oracle 收益和相对匹配高命中组的收益差及其 95% bootstrap 区间，定义见 JSON。",
         "当前代码没有依照低命中率触发 Cache 或 UAV 干预的规则，故 `DEPLOYABLE_PREDICTION_DRIVEN_TRIGGER=NOT_IMPLEMENTED`。现有冻结 Actor 的预测驱动动作已另行报告，但不能把 Oracle 候选收益当成 Actor 已学会的行为。",
         "",
-        "所有效用都由正式路径计算并校验 `G = task_utility - cache_cost - movement_cost`。Cache-only 与 UAV-only 成本由正式 Slot 结果产生；每个候选和后续重放 Slot 都重新运行完整 Matching+KKT，资源分配违反/非有限值会使本分析失败。",
+        "所有效用都由正式路径计算并校验 `G = task_utility - beta_ca*cache_cost - beta_q*movement_cost`。其中成本字段保存未加权归一化值；Cache-only 与 UAV-only 成本由正式 Slot 结果产生；每个候选和后续重放 Slot 都重新运行完整 Matching+KKT，资源分配违反/非有限值会使本分析失败。",
         "",
         f"40 个即时配对状态中，Cache-only 与 UAV-only 的最佳枚举动作都没有超过冻结策略基线的状态数为 {data['both_interventions_nonpositive_count']}；低命中原因与不同主因下最佳单项干预见 JSON：{json.dumps(low_summary['best_intervention_by_dominant_cause'], ensure_ascii=False, sort_keys=True)}。",
         "",

@@ -515,6 +515,8 @@ FORMAL_SYSTEM_PARAMETER_KEYS = {
     "communication.cloud.uplink_rate_bps",
     "objective.omega_delay",
     "objective.omega_energy",
+    "objective.beta_ca",
+    "objective.beta_q",
     "objective.lambda_cache",
     "objective.lambda_movement",
     "objective.T_ref",
@@ -1247,8 +1249,16 @@ def validate_config(
     ):
         if get_config_value(config, obsolete_path) is not None:
             raise ValueError(
-                f"{obsolete_path} 已废弃；请将成本尺度统一写入对应 lambda。"
+                f"{obsolete_path} 已废弃；正式系统效用使用 objective.beta_ca "
+                "和 objective.beta_q 显式配置外部成本权重。"
             )
+    for weight_path in ("objective.beta_ca", "objective.beta_q"):
+        raw_weight = get_config_value(config, weight_path)
+        if raw_weight is None:
+            raise ValueError(f"缺少必需配置：{weight_path}。")
+        weight = float(raw_weight)
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(f"{weight_path} 必须是非负有限数。")
     for scale_path in ("objective.lambda_cache", "objective.lambda_movement"):
         raw_scale = get_config_value(config, scale_path)
         if raw_scale is None:
