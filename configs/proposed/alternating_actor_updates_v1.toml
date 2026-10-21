@@ -359,13 +359,13 @@ omega_delay = 0.5
 omega_energy = 0.5
 # Cache 只惩罚实际新增服务下载时延：T_ca,m=sum_f(8e6*s_f_MB/R_m_back,bps)*max(c_new-c_old,0)。
 # 服务大小为十进制 MB、速率为 bit/s，换算因子 8e6 bit/MB；删除服务不产生下载成本。
-# 环境初始化固定 T_ca_upper=sum_m(8e6*cache_capacity_m_MB/R_m_back,bps)，这是容量上界，不声称可由离散服务目录精确达到。
-# C_ca_norm(t)=sum_m T_ca,m(t)/T_ca_upper；beta_ca=lambda_cache*T_ca_upper，将既有 1/s 系数换算为无量纲权重。
+# 环境初始化按每个可在线更新节点固定 T_ca,m_ref=8e6*cache_capacity_m_MB/R_m_back,m_bps；这是容量上界，不声称可由离散服务目录精确达到。
+# C_ca(t)=sum_m T_ca,m(t)/T_ca,m_ref；beta_ca=lambda_cache*sum_m(T_ca,m_ref)，lambda_cache 保持原值。
 # Cache 成本只由执行前后实际配置计算，UPDATE 意图本身不计费。
 lambda_cache = 2.0e-5
 # E_mov,u=xi_mov,u*||q_u(t)-q_u(t-1)||_2，使用实际二维水平位置差，单位 J。
-# 环境初始化固定 E_mov_upper=sum_u(xi_mov,u*vmax_u*dt)，是单 UAV 速度约束上界；联合安全距离和边界可能使精确最大值更小。
-# C_q_norm(t)=sum_u E_mov,u(t)/E_mov_upper；beta_q=lambda_movement*E_mov_upper，将既有 1/J 系数换算为无量纲权重。
+# 环境初始化按每架 UAV 固定 E_mov,u_ref=xi_mov,u*vmax,u*dt，是单 UAV 速度约束上界；联合安全距离和边界可能使精确最大值更小。
+# C_q(t)=sum_u E_mov,u(t)/E_mov,u_ref；beta_q=lambda_movement*sum_u(E_mov,u_ref)，lambda_movement 保持原值。
 # 仅实际位置变化产生能耗；MOVE 标签不单独计费。movement_fixed_cost 保留为兼容字段且不参与计算。
 lambda_movement = 5.0e-6
 # Fixed system-level conservative upper bounds for task utility (not training P95).
@@ -383,14 +383,14 @@ T_ref = 10640415.0
 E_ref = 95772.59112
 
 [objective.cost_normalization]
-contract_version = "max_feasible_cost_upper_bounds_v1"
-cache_method = "max_feasible_delay_capacity_upper_bound"
-cache_reference_formula = "sum_m(8e6 * cache_capacity_m_MB / actual_backhaul_rate_m_bps)"
-movement_method = "max_feasible_energy_single_uav_speed_upper_bound"
-movement_reference_formula = "sum_u(xi_mov_u_J_per_m * vmax_u_m_per_s * dt_s)"
+contract_version = "node_level_cost_upper_bounds_v1"
+cache_method = "per_node_capacity_upper_bound"
+cache_reference_formula = "T_ca_m_ref_s=8e6 * cache_capacity_m_MB / actual_backhaul_rate_m_bps"
+movement_method = "per_uav_speed_limited_energy_upper_bound"
+movement_reference_formula = "E_mov_u_ref_J=xi_mov_u_J_per_m * vmax_u_m_per_s * dt_s"
 movement_distance_model = "horizontal_2d_euclidean"
-beta_cache_source = "objective.lambda_cache_per_s * T_ca_upper_s"
-beta_movement_source = "objective.lambda_movement_per_J * E_mov_upper_J"
+beta_cache_source = "objective.lambda_cache_per_s * sum_m(T_ca_m_ref_s)"
+beta_movement_source = "objective.lambda_movement_per_J * sum_u(E_mov_u_ref_J)"
 
 [prediction.vehicle]
 # 车辆预测 horizon H_p。当前实际值 5；修改需重跑车辆预测、GRU、scenario。

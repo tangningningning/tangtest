@@ -56,21 +56,23 @@ z_m^ca(k) = I[存在 f: c_{m,f}^{(k)} != c_{m,f}^{(k-1)}]
 
 ```text
 T_ca,m(t) = sum_f [(8e6 * s_f_MB / R_back,m_bps) * max(c_new,mf(t)-c_old,mf(t), 0)]
-T_ca_upper = sum_m [8e6 * cache_capacity_m_MB / R_back,m_bps]
-C_ca_norm(t) = sum_m T_ca,m(t) / T_ca_upper
+T_ca,m_ref = 8e6 * cache_capacity_m_MB / R_back,m_bps
+C_ca(t) = sum_m [T_ca,m(t) / T_ca,m_ref]
 ```
 
-`T_ca_upper` 在环境初始化时按正式节点容量和实际回传速率固定，是保守上界，不表示离散服务目录下必然可达到。零参考量时仅允许零下载时延，成本归一化结果为零。配置成本通过 `beta_ca=lambda_cache*T_ca_upper` 进入 Slot 目标；`lambda_cache` 保留为既有效用尺度来源，未直接作用于归一化成本。
+当前正式 `MULTI_NODE_FACTORIZED` 策略对 5 个 SV、2 个 RSU、2 个 UAV 缓存节点提供在线配置动作，故全部 9 行缓存状态按节点分别归一化；不变节点的实际下载成本仍为零。运行初始化固定每节点 `T_ca,m_ref=8e6*capacity_m_MB/R_back,m_bps`。更新后缓存容量约束保证新增服务总大小不超过节点容量，所以这是保守上界；离散目录和合法替换约束可能使实际最大时延更小。参考值总和只用于沿用配置权重来源 `beta_ca=lambda_cache*sum_m(T_ca,m_ref)`，不再作为归一化分母。零容量节点的参考量为零，且正下载时延与零参考量会被拒绝。
 
 UAV 能耗仍使用实际前后水平二维位置差：
 
 ```text
 E_mov,u(t) = xi_mov,u * ||q_u(t)-q_u(t-1)||_2
-E_mov_upper = sum_u [xi_mov,u * vmax_u * dt]
-C_q_norm(t) = sum_u E_mov,u(t) / E_mov_upper
+E_mov,u_ref = xi_mov,u * vmax,u * dt
+C_q(t) = sum_u [E_mov,u(t) / E_mov,u_ref]
 ```
 
-`E_mov_upper` 是逐 UAV 最大速度位移的保守上界；位置边界与联合安全距离只会进一步限制实际能耗。零参考量时仅允许零移动能耗。`beta_q=lambda_movement*E_mov_upper` 是由既有效用尺度系数换算出的无量纲权重。正式奖励仍由 `slot_environment.execute_configured_slot`、`cache_configuration.cache_update_cost_details` 和 `slot_environment.execute_slot` 组合；`Q(t)`、缓存罚项、移动罚项分别只进入 `G(t)=Q(t)-beta_ca*C_ca_norm(t)-beta_q*C_q_norm(t)` 一次。
+每架 UAV 的速度上限给出保守能耗上界；位置边界与联合安全距离只会进一步限制实际能耗。零参考量时仅允许零移动能耗。`beta_q=lambda_movement*sum_u(E_mov,u_ref)` 保留原有无量纲权重来源。正式奖励仍由 `slot_environment`、`cache_configuration.cache_update_cost_details` 和 `uav_configuration.movement_summary` 组合；`Q(t)`、缓存罚项、移动罚项分别只进入 `G(t)=Q(t)-beta_ca*C_ca(t)-beta_q*C_q(t)` 一次。
+
+当前配置中每个 SV/RSU/UAV 的 Cache 参考值分别为 `480/1000/800 s`，对应节点数量 `5/2/2`，总和 `6000 s`；`beta_ca=0.12`。每架 UAV 的移动参考值为 `225 J`，两架总和 `450 J`；`beta_q=0.00225`。因此最大归一化成本上界从旧系统级 `1` 变为 Cache `9`、UAV `2`，节点级成本系数变化，奖励目标不与旧公式数值等价。成本合同版本同步为 `node_level_cost_upper_bounds_v1`，旧配置哈希 Checkpoint 不满足新奖励合同的严格恢复条件。
 
 ## 3. Macro frame reward 与 SMDP target
 
@@ -236,8 +238,8 @@ With one KEEP candidate and `K_s` legal UPDATE candidates, subtracting `log(K_s)
 | Cache KEEP/UPDATE candidate cardinality correction 与确定性组选择 | `src/ppo_simple/policy.py::_cardinality_corrected_cache_logits`; `_group_aware_deterministic_candidate` | IMPLEMENTED：训练采样与评价选择共用当前 Cache categorical 概率 |
 | 状态相关 termination、Cache persistence、Macro reward | `src/ppo_simple/rollout.py::collect_dual_timescale_episode`; `src/ppo_simple/policy.py::sample_termination` | IMPLEMENTED：逐 slot sampled CONTINUE/TERMINATE、terminal/max 强制边界不计 logprob |
 | Cache update mask 与 boundary cost | `src/ppo_simple/rollout.py::cache_update_mask`; `src/decision/slot_environment.py::execute_configured_slot` | IMPLEMENTED / VERIFIED：相同/变化配置的成本合成检查 |
-| Cache 下载时延最大上界归一化 | `src/decision/cache_configuration.py::initialize_cache_cost_normalization`; `src/common/system_model.py::cache_update_cost` | IMPLEMENTED：容量上界固定于环境初始化；实际下载时延和归一化成本均有限、非负并受上界检查 |
-| UAV 移动能耗最大上界归一化 | `src/decision/uav_configuration.py::movement_energy_upper_bound_j`; `src/common/system_model.py::uav_movement_cost` | IMPLEMENTED：速度与 Slot 时长形成单 UAV 上界之和；只按实际水平位移计费 |
+| Cache 下载时延节点级上界归一化 | `src/decision/cache_configuration.py::initialize_cache_cost_normalization`; `src/common/system_model.py::cache_update_cost` | IMPLEMENTED：各在线节点按容量和有效回传速率固定独立参考值；实际新增下载时延逐节点归一化并受逐节点上界检查 |
+| UAV 移动能耗节点级上界归一化 | `src/decision/uav_configuration.py::movement_energy_upper_bounds_by_uav_j`; `src/common/system_model.py::uav_movement_cost` | IMPLEMENTED：每架 UAV 由速度、Slot 时长和单位距离能耗系数计算独立上界；只按实际水平位移计费 |
 | 归一化成本与 Checkpoint 合同 | `src/ppo_simple/interface.py::load_environment_context`; `src/ppo_simple/trainer.py::PPOTrainer.load_checkpoint` | IMPLEMENTED：运行上下文固定成本参考量；训练恢复仍按配置 raw/semantic hash 严格校验。评价专用的旧 Checkpoint 成本合同兼容门禁在 `evaluator.py` 中未实现 |
 | actual-duration SMDP GAE | `src/ppo_simple/rollout.py::compute_macro_smdp_gae` | IMPLEMENTED：SMDP GAE 与 N2 使用真实 adaptive duration |
 | Micro ordinary GAE | `src/ppo_simple/rollout.py::compute_gae` | IMPLEMENTED / VERIFIED：代码路径与 terminal 截断检查 |

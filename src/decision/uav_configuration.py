@@ -55,8 +55,14 @@ class UavSearchConfig:
     movement_energy_coefficient_j_per_m: float
     movement_fixed_cost: float
     lambda_movement: float
-    movement_energy_reference_j: float
+    movement_energy_reference_j_by_uav: dict[str, float]
     beta_movement: float
+
+    @property
+    def movement_energy_reference_j(self) -> float:
+        """Sum of per-UAV references, used only for joint-bound diagnostics."""
+
+        return float(sum(self.movement_energy_reference_j_by_uav.values()))
 
     @property
     def max_move_distance_m(self) -> float:
@@ -76,11 +82,28 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         if isinstance(cost_normalization, dict)
         else {}
     )
-    reference_value = movement_normalization.get("reference_j")
-    movement_energy_reference_j = (
-        movement_energy_upper_bound_j(config)
-        if reference_value is None
-        else float(reference_value)
+    movement_energy_reference_j_by_uav = movement_energy_upper_bounds_by_uav_j(config)
+    reference_by_uav_value = movement_normalization.get("reference_j_by_uav")
+    if reference_by_uav_value is not None:
+        if not isinstance(reference_by_uav_value, dict) or set(
+            reference_by_uav_value
+        ) != set(movement_energy_reference_j_by_uav):
+            raise ValueError("固定 UAV 移动参考值与配置 UAV ID 不一致。")
+        configured_references = {
+            str(uav_id): float(value)
+            for uav_id, value in reference_by_uav_value.items()
+        }
+        if any(
+            not math.isclose(
+                configured_references[uav_id], derived_reference,
+                rel_tol=1.0e-12, abs_tol=1.0e-12,
+            )
+            for uav_id, derived_reference in movement_energy_reference_j_by_uav.items()
+        ):
+            raise ValueError("固定 UAV 移动参考值与配置物理参数不一致。")
+        movement_energy_reference_j_by_uav = configured_references
+    movement_energy_reference_j = float(
+        sum(movement_energy_reference_j_by_uav.values())
     )
     beta_value = movement_normalization.get("beta_movement")
     beta_movement = (
@@ -117,13 +140,15 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
         ),
         movement_fixed_cost=float(get(config, "nodes.uav.movement.movement_fixed_cost")),
         lambda_movement=lambda_movement,
-        movement_energy_reference_j=movement_energy_reference_j,
+        movement_energy_reference_j_by_uav=movement_energy_reference_j_by_uav,
         beta_movement=beta_movement,
     )
 
 
-def movement_energy_upper_bound_j(config: dict[str, Any]) -> float:
-    """Return the fixed single-UAV speed-limited system energy upper bound."""
+def movement_energy_upper_bounds_by_uav_j(
+    config: dict[str, Any],
+) -> dict[str, float]:
+    """Return fixed per-UAV speed-limited energy upper bounds in joules."""
 
     get = project_config.get_config_value
     uav_count = int(get(config, "nodes.uav.count"))
@@ -143,7 +168,23 @@ def movement_energy_upper_bound_j(config: dict[str, Any]) -> float:
         or xi_j_per_m < 0.0
     ):
         raise ValueError("UAV 移动能耗参考量参数非法。")
-    return float(uav_count * xi_j_per_m * max_speed_mps * dt_s)
+    instances = get(config, "nodes.uav.instances", [])
+    uav_ids = [str(item["id"]) for item in instances]
+    if not uav_ids:
+        # Unit-level config parsing may omit artifact-materialized IDs.
+        uav_ids = [f"UAV_{index}" for index in range(uav_count)]
+    if len(uav_ids) != uav_count or len(set(uav_ids)) != len(uav_ids):
+        raise ValueError("UAV 移动参考值要求配置数量与唯一 UAV ID 一致。")
+    reference_j = xi_j_per_m * max_speed_mps * dt_s
+    if not math.isfinite(reference_j) or reference_j < 0.0:
+        raise ValueError("单 UAV 移动能耗参考量非法。")
+    return {uav_id: float(reference_j) for uav_id in uav_ids}
+
+
+def movement_energy_upper_bound_j(config: dict[str, Any]) -> float:
+    """Return the sum of per-UAV speed-limited references for diagnostics."""
+
+    return float(sum(movement_energy_upper_bounds_by_uav_j(config).values()))
 
 
 def uav_ids_from_project(config: dict[str, Any]) -> list[str]:
@@ -639,6 +680,8 @@ def movement_summary(
     energy_by_uav: dict[str, float] = {}
     cost_by_uav: dict[str, float] = {}
     normalized_energy = 0.0
+    if set(old_positions) != set(search_config.movement_energy_reference_j_by_uav):
+        raise ValueError("UAV 位置 ID 与固定的节点级移动参考值不一致。")
     for uav_id in old_positions:
         result = system_model.uav_movement_cost(
             old_positions[uav_id],
@@ -648,7 +691,7 @@ def movement_summary(
             search_config.max_horizontal_speed_mps,
             search_config.movement_energy_coefficient_j_per_m,
             search_config.movement_fixed_cost,
-            search_config.movement_energy_reference_j,
+            search_config.movement_energy_reference_j_by_uav[uav_id],
             search_config.beta_movement,
             tolerance_m=search_config.position_tolerance_m,
         )

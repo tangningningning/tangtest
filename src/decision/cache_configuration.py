@@ -489,12 +489,14 @@ def initialize_cache_cost_normalization(
     service_sizes_mb: np.ndarray,
     lambda_cache: float,
 ) -> dict[str, Any]:
-    """Fix the system cache-delay upper bound and its derived dimensionless weight.
+    """Fix a conservative cache-delay reference and one dimensionless weight per node.
 
-    The reference uses each node's full cache capacity as a conservative bound
-    on newly added service size. Catalog sizes are checked to represent the
-    zero-cost degenerate case, but are not used to claim an exactly attainable
-    maximum.
+    Every node in ``cache_nodes`` is a policy-controlled cache head in the
+    formal multi-node action schema. The node's full capacity bounds the total
+    size of services added by any feasible target; the catalog can make the
+    attainable maximum smaller, so this is an upper bound rather than an exact
+    maximum. The sum is retained only to derive beta_cache; normalization uses
+    each node's own reference.
     """
 
     sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
@@ -520,23 +522,24 @@ def initialize_cache_cost_normalization(
     if not math.isfinite(lam) or lam < 0.0:
         raise ValueError("lambda_cache 必须是非负有限数。")
 
-    feasible_positive_addition = any(
-        np.any((sizes > 0.0) & (sizes <= capacity + 1.0e-9))
-        for capacity in capacities
+    reference_s_by_node = capacities * 8.0e6 / rates
+    reference_s_total = float(np.sum(reference_s_by_node))
+    reference_kind = (
+        "per_node_conservative_capacity_upper_bound"
+        if reference_s_total > 0.0
+        else "zero_no_positive_cache_capacity"
     )
-    if feasible_positive_addition:
-        reference_s = float(np.sum(capacities * 8.0e6 / rates))
-        reference_kind = "conservative_capacity_upper_bound"
-    else:
-        reference_s = 0.0
-        reference_kind = "zero_no_feasible_positive_cache_addition"
-    beta_cache = lam * reference_s
+    beta_cache = lam * reference_s_total
+    if not np.isfinite(reference_s_by_node).all() or np.any(reference_s_by_node < 0.0):
+        raise FloatingPointError("per-node cache delay references are invalid")
     metadata = {
-        "reference_s": reference_s,
+        "reference_s_by_node": [float(value) for value in reference_s_by_node],
+        # Aggregate retained for weight derivation and diagnostics, not as a divisor.
+        "reference_s_total": reference_s_total,
         "reference_kind": reference_kind,
-        "formula": "sum_m(8e6 * cache_capacity_m_MB / actual_backhaul_rate_m_bps)",
+        "formula": "T_ca_m_ref_s=8e6 * cache_capacity_m_MB / actual_backhaul_rate_m_bps",
         "beta_cache": beta_cache,
-        "beta_source": "objective.lambda_cache_per_s * T_ca_upper_s",
+        "beta_source": "objective.lambda_cache_per_s * sum_m(T_ca_m_ref_s)",
         "service_count": int(sizes.size),
         "cache_node_count": int(len(node_ids)),
         "unit": "s",
@@ -597,7 +600,7 @@ def cache_update_cost_details(
         cache_trigger,
         service_sizes_mb,
         cache_nodes["cache_backhaul_rate_bps"],
-        float(normalization["reference_s"]),
+        np.asarray(normalization["reference_s_by_node"], dtype=np.float64),
         float(normalization["beta_cache"]),
     )
 
@@ -998,6 +1001,22 @@ class CacheTargetCandidate:
     proposal_source: str
 
 
+def is_legal_cache_replacement(before_node_cache: Any, target_node_cache: Any) -> bool:
+    """Return whether a target both removes an old service and adds a new one."""
+
+    before = np.asarray(before_node_cache)
+    target = np.asarray(target_node_cache)
+    if (
+        before.shape != target.shape
+        or not np.all(np.isin(before, [0, 1]))
+        or not np.all(np.isin(target, [0, 1]))
+    ):
+        return False
+    removed = np.any((before == 1) & (target == 0))
+    added = np.any((before == 0) & (target == 1))
+    return bool(removed and added)
+
+
 def has_legal_cache_target_configuration(
     current_cache_state: np.ndarray,
     node_index: int,
@@ -1006,12 +1025,7 @@ def has_legal_cache_target_configuration(
     *,
     locked_services: Any = None,
 ) -> bool:
-    """Return whether a different capacity-feasible target preserves locks.
-
-    This cheap trigger check does not inspect demand or evaluate the
-    environment. Removing any cached unlocked service is legal; if all cached
-    services are locked, an absent service must fit in remaining capacity.
-    """
+    """Return whether at least one capacity-feasible replacement preserves locks."""
 
     raw_cache = np.asarray(current_cache_state)
     service_count = int(service_catalog["num_services"])
@@ -1041,10 +1055,10 @@ def has_legal_cache_target_configuration(
         locked = raw_locked.astype(bool, copy=False)
     if np.any(locked & (before != 1)):
         raise ValueError("an active service lock is absent from the current Cache row")
-    if bool(np.any((before == 1) & ~locked)):
-        return True
-    used = node_used_capacity_mb(before, sizes)
-    remaining = capacity - used
+    if not bool(np.any((before == 1) & ~locked)):
+        return False
+    used_locked = float(np.sum(sizes[locked]))
+    remaining = capacity - used_locked
     return bool(
         np.any(
             (before == 0)
@@ -1197,13 +1211,14 @@ def generate_bounded_cache_target_configurations(
     locked_services: Any = None,
     max_candidates: int | None = None,
 ) -> list[CacheTargetCandidate]:
-    """Generate a bounded feasible proposal set without enumerating 2**F states.
+    """Generate bounded feasible replacement proposals without enumerating 2**F states.
 
     The proposal budget is O(K) targets and O(KF) descriptor work (plus an
     O(F log F) demand sort), where K is the configured per-node candidate
-    capacity. It keeps demand/replica anchors, low-change single flips, and a
-    bounded set of high-demand-for-low-demand swaps. This is a candidate
-    generator, not an optimizer over every feasible cache configuration.
+    capacity. It keeps demand/replica anchors and a bounded set of
+    high-demand-for-low-demand replacements. KEEP is supplied separately by
+    the policy action builder. This is a candidate generator, not an optimizer
+    over every feasible cache configuration.
     """
 
     current = np.asarray(current_cache_state, dtype=np.int8)
@@ -1277,7 +1292,7 @@ def generate_bounded_cache_target_configurations(
             value.shape != before.shape
             or not np.all(np.isin(value, [0, 1]))
             or np.any(locked & (value != 1))
-            or np.array_equal(value, before)
+            or not is_legal_cache_replacement(before, value)
             or not is_node_feasible(value, sizes, capacity)
         ):
             return
@@ -1316,16 +1331,6 @@ def generate_bounded_cache_target_configurations(
             int(service),
         )
     )
-    flip_budget = max(1, min(8, limit))
-    for service in removable[:flip_budget]:
-        target = before.copy()
-        target[service] = 0
-        add_target(target, "low_reconfiguration")
-    for service in addable[:flip_budget]:
-        target = before.copy()
-        target[service] = 1
-        add_target(target, "prediction_single_add")
-
     swap_budget = max(1, min(8, limit))
     for remove_service in removable[:swap_budget]:
         for add_service in addable[:swap_budget]:
@@ -1493,6 +1498,11 @@ def apply_cache_target_configuration(
         raise ValueError("target cache configuration must be binary and shape-aligned")
     if np.array_equal(target, before):
         raise ValueError("UPDATE target configuration must differ from KEEP state")
+    if not is_legal_cache_replacement(before, target):
+        raise ValueError(
+            "UPDATE target configuration must remove at least one cached service "
+            "and add at least one previously uncached service"
+        )
     if not is_node_feasible(
         target,
         np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64),

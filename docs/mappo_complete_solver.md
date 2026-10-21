@@ -18,25 +18,25 @@
 
 ```text
 T_ca,m(t) = sum_f [(8e6 * s_f_MB / R_back,m_bps) * max(c_new,mf(t)-c_old,mf(t), 0)]
-T_ca_upper = sum_m [8e6 * cache_capacity_m_MB / R_back,m_bps]
-C_ca_norm(t) = sum_m T_ca,m(t) / T_ca_upper
+T_ca,m_ref = 8e6 * cache_capacity_m_MB / R_back,m_bps
+C_ca(t) = sum_m [T_ca,m(t) / T_ca,m_ref]
 ```
 
-服务大小使用十进制 MB，回传速率使用 bit/s，因此 `8e6` 的单位换算正确。`T_ca_upper` 是以各节点缓存容量为依据的保守系统上界；离散服务目录和合法更新集合可能使真实最大值更小。缓存删除不计下载开销，UPDATE 意图不单独计费。
+服务大小使用十进制 MB，回传速率使用 bit/s，因此 `8e6` 的单位换算正确。当前 `MULTI_NODE_FACTORIZED` 策略允许 5 个 SV、2 个 RSU 和 2 个 UAV 缓存节点在线重配置，故这些节点各自有固定参考值；未发生变化的节点成本为零。容量参考值是保守上界：新增服务大小不超过更新后的缓存容量，离散目录和合法替换规则可能使上界不可达到。缓存删除不计下载开销，UPDATE 意图不单独计费。
 
 UAV 移动能耗仍使用实际水平二维位移：
 
 ```text
 E_mov,u(t) = xi_mov,u * ||q_u(t)-q_u(t-1)||_2
-E_mov_upper = sum_u [xi_mov,u * vmax_u * dt]
-C_q_norm(t) = sum_u E_mov,u(t) / E_mov_upper
+E_mov,u_ref = xi_mov,u * vmax,u * dt
+C_q(t) = sum_u [E_mov,u(t) / E_mov,u_ref]
 ```
 
-`E_mov_upper` 是逐 UAV 速度上界之和；地图边界和多 UAV 安全距离可能降低联合可达最大值，所以按保守上界记录。位置不变时能耗为零，策略输出 MOVE 标签本身不计费。
+每架 UAV 的参考值是速度约束给出的保守上界；地图边界和多 UAV 安全距离可能降低可达最大值。位置不变时能耗为零，策略输出 MOVE 标签本身不计费。
 
-正式系统目标为 `G(t)=Q(t)-beta_ca*C_ca_norm(t)-beta_q*C_q_norm(t)`。当前正式配置保留原来的 `lambda_cache=2e-5 s^-1` 与 `lambda_movement=5e-6 J^-1` 作为效用尺度来源，并在环境初始化时转换为无量纲权重：`beta_ca=lambda_cache*T_ca_upper`、`beta_q=lambda_movement*E_mov_upper`。对于当前 5 个 SV、2 个 RSU、2 个 UAV，容量上界给出 `T_ca_upper=6000 s`、`beta_ca=0.12`；`dt=1 s`、每 UAV `vmax=15 m/s`、`xi_mov=15 J/m`、2 个 UAV 给出 `E_mov_upper=450 J`、`beta_q=0.00225`。两类成本在 Slot 系统效用中各扣除一次。
+正式系统目标为 `G(t)=Q(t)-beta_ca*C_ca(t)-beta_q*C_q(t)`。配置保留 `lambda_cache=2e-5 s^-1` 和 `lambda_movement=5e-6 J^-1`，运行时仍按参考值总和派生无量纲权重：`beta_ca=lambda_cache*sum_m(T_ca,m_ref)`、`beta_q=lambda_movement*sum_u(E_mov,u_ref)`。当前每个节点的 Cache 参考值为 SV `480 s`（5 个）、RSU `1000 s`（2 个）、UAV `800 s`（2 个），合计 `6000 s`，故 `beta_ca=0.12`。每架 UAV 的移动参考值为 `225 J`（2 架合计 `450 J`），故 `beta_q=0.00225`。各节点成本分别除以自己的参考值；归一化成本上界为 `C_ca<=9`、`C_q<=2`，对应成本上界分别为 `1.08` 和 `0.0045`。相较旧系统级分母，缓存成本的实际时延系数按节点变为 `2.5e-4 s^-1`（SV）、`1.2e-4 s^-1`（RSU）、`1.5e-4 s^-1`（UAV）；移动成本系数变为每 UAV `1e-5 J^-1`。这次节点级归一化改变了系统优化目标，不与旧公式数值等价。两类成本在 Slot 系统效用中仍各扣除一次。
 
-参考量在环境初始化时由固定系统配置生成并写入运行时上下文及初始化日志。由于 `beta=lambda*reference`，本次归一化在数值上等价于旧 `lambda*实际时延/能耗` 奖励。冻结评价入口只为当前正式配置和旧正式 Runner 配置的已知语义哈希登记该等价关系，并将旧版记录为 `legacy_formula_algebraically_reward_equivalent`；其它目标或未知配置哈希会被拒绝。严格训练恢复仍受现有原始配置哈希门禁约束，旧 Checkpoint 不能作为新配置的严格 Resume。Checkpoint 格式、Actor/网络结构及动作 Schema 不变。
+参考值在环境初始化时由固定容量、回传速率、移动速度和能耗系数生成，并写入运行时上下文及初始化日志。成本合同版本已改变，严格训练恢复仍由现有配置哈希门禁控制；旧 Checkpoint 不因结构可加载就与节点级奖励目标兼容。本次未修改恢复门禁或 Checkpoint 格式。
 
 ## 决策信息与双时间尺度
 

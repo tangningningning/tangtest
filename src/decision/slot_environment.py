@@ -375,6 +375,15 @@ def _configuration_summary(
         "cache_download_delay_reference_s": result.cache_result_summary.get(
             "cache_download_delay_reference_s"
         ),
+        "cache_download_delay_reference_s_total": result.cache_result_summary.get(
+            "cache_download_delay_reference_s_total",
+            result.cache_result_summary.get("cache_download_delay_reference_s"),
+        ),
+        "cache_download_delay_reference_s_by_node": dict(
+            result.cache_result_summary.get(
+                "cache_download_delay_reference_s_by_node", {}
+            )
+        ),
         "cache_cost_beta": result.cache_result_summary.get("cache_cost_beta"),
         "cache_cost_by_node": dict(
             result.cache_result_summary.get("cache_cost_by_node", {})
@@ -388,6 +397,13 @@ def _configuration_summary(
         ),
         "movement_energy_reference_j": result.uav_result_summary.get(
             "movement_energy_reference_j"
+        ),
+        "movement_energy_reference_j_total": result.uav_result_summary.get(
+            "movement_energy_reference_j_total",
+            result.uav_result_summary.get("movement_energy_reference_j"),
+        ),
+        "movement_energy_reference_j_by_uav": dict(
+            result.uav_result_summary.get("movement_energy_reference_j_by_uav", {})
         ),
         "movement_cost_beta": result.uav_result_summary.get(
             "movement_cost_beta"
@@ -884,6 +900,19 @@ def build_policy_target_configuration(
     actual_cache = np.any(final_cache != previous_cache, axis=1).astype(np.int8)
     if np.any(actual_cache > cache_trigger):
         raise ValueError("policy target cache state 违反 trigger=0 保持不变语义。")
+    for node_index, trigger in enumerate(cache_trigger):
+        changed = bool(actual_cache[node_index])
+        if int(trigger) == 1 and not changed:
+            raise ValueError(
+                f"policy Cache UPDATE for node {node_index} must produce an actual REPLACE"
+            )
+        if changed and not cache_configuration.is_legal_cache_replacement(
+            previous_cache[node_index], final_cache[node_index]
+        ):
+            raise ValueError(
+                f"policy Cache target for node {node_index} must delete at least one "
+                "cached service and add at least one previously uncached service"
+            )
     uav_configuration.validate_uav_configuration_transition(
         previous_uav,
         final_uav,
@@ -903,9 +932,9 @@ def build_policy_target_configuration(
     (
         movement_energy,
         movement_cost,
-        _,
-        _,
-        _,
+        movement_distance_by_uav,
+        movement_energy_by_uav,
+        movement_cost_by_uav,
         movement_energy_normalized,
     ) = uav_configuration.movement_summary(
         previous_uav,
@@ -950,6 +979,15 @@ def build_policy_target_configuration(
             "cache_download_delay_reference_s": float(
                 cache_result["cache_download_delay_reference_s"]
             ),
+            "cache_download_delay_reference_s_total": float(
+                cache_result["cache_download_delay_reference_s_total"]
+            ),
+            "cache_download_delay_reference_s_by_node": {
+                str(node_id): float(
+                    cache_result["cache_download_delay_reference_s_by_node"][index]
+                )
+                for index, node_id in enumerate(cache_nodes["node_ids"])
+            },
             "cache_cost_beta": float(cache_result["cache_cost_beta"]),
             "cache_cost_reference_kind": cache_nodes[
                 "cache_cost_normalization"
@@ -969,9 +1007,16 @@ def build_policy_target_configuration(
             "target_actions": [dict(value) for value in uav_actions],
             "movement_energy_normalized": movement_energy_normalized,
             "movement_energy_reference_j": search.movement_energy_reference_j,
+            "movement_energy_reference_j_total": search.movement_energy_reference_j,
+            "movement_energy_reference_j_by_uav": dict(
+                search.movement_energy_reference_j_by_uav
+            ),
+            "movement_distance_m_by_uav": movement_distance_by_uav,
+            "movement_energy_j_by_uav": movement_energy_by_uav,
+            "movement_cost_by_uav": movement_cost_by_uav,
             "movement_cost_beta": search.beta_movement,
             "movement_cost_reference_kind": (
-                "conservative_single_uav_speed_limit_upper_bound"
+                "per_uav_conservative_speed_limit_upper_bound"
                 if search.movement_energy_reference_j > 0.0
                 else "zero_no_possible_positive_movement_energy"
             ),

@@ -313,25 +313,29 @@ def cache_update_cost(
     cache_trigger: np.ndarray,
     service_sizes_mb: np.ndarray,
     cache_backhaul_rate_bps: np.ndarray,
-    cache_delay_reference_s: float,
+    cache_delay_reference_s_by_node: np.ndarray,
     beta_cache: float,
 ) -> dict[str, Any]:
-    """Compute cache cost from only the download delay of newly added services.
+    """Compute cache cost from added-service delays and per-node references.
 
     ``service_sizes_mb`` uses decimal MB (1 MB = 1e6 bytes). Download delay is
     an independent reward penalty; it is not added to task completion delay.
+    Each node's delay is normalized by its own fixed reference. The summed
+    reference is returned for diagnostics only and is never used as divisor.
     """
     raw_old = np.asarray(previous_cache)
     raw_new = np.asarray(new_cache)
     raw_trigger = np.asarray(cache_trigger)
     raw_sizes = np.asarray(service_sizes_mb)
     raw_rates = np.asarray(cache_backhaul_rate_bps)
+    raw_references = np.asarray(cache_delay_reference_s_by_node)
     try:
         old_values = np.asarray(raw_old, dtype=float)
         new_values = np.asarray(raw_new, dtype=float)
         trigger_values = np.asarray(raw_trigger, dtype=float)
         sizes = np.asarray(raw_sizes, dtype=float)
         rates = np.asarray(raw_rates, dtype=float)
+        references = np.asarray(raw_references, dtype=float)
     except (TypeError, ValueError) as exc:
         raise ValueError("cache 输入必须是数值数组。") from exc
     for name, values in (
@@ -340,6 +344,7 @@ def cache_update_cost(
         ("cache_trigger", trigger_values),
         ("service_sizes_mb", sizes),
         ("cache_backhaul_rate_bps", rates),
+        ("cache_delay_reference_s_by_node", references),
     ):
         if not np.all(np.isfinite(values)):
             raise ValueError(f"{name} 不能包含 NaN/Inf。")
@@ -351,8 +356,10 @@ def cache_update_cost(
         raise ValueError("cache_trigger shape 错误。")
     if sizes.shape != (old_values.shape[1],):
         raise ValueError("service_sizes_mb shape 错误。")
-    if rates.shape != trigger_values.shape:
-        raise ValueError("cache_backhaul_rate_bps shape 错误。")
+    if rates.shape != trigger_values.shape or references.shape != trigger_values.shape:
+        raise ValueError(
+            "cache_backhaul_rate_bps/cache_delay_reference_s_by_node shape 错误。"
+        )
     if not np.all(np.isin(old_values, [0.0, 1.0])) or not np.all(
         np.isin(new_values, [0.0, 1.0])
     ):
@@ -363,12 +370,9 @@ def cache_update_cost(
         raise ValueError("service_sizes_mb 不能为负数。")
     if np.any(rates <= 0.0):
         raise ValueError("cache_backhaul_rate_bps 必须全部大于 0。")
-    delay_reference = _require_finite(
-        "cache_delay_reference_s", cache_delay_reference_s
-    )
     beta = _require_finite("beta_cache", beta_cache)
-    if delay_reference < 0.0:
-        raise ValueError("cache_delay_reference_s 不能为负数。")
+    if np.any(references < 0.0):
+        raise ValueError("cache_delay_reference_s_by_node 不能为负数。")
     if beta < 0.0:
         raise ValueError("beta_cache 不能为负数。")
     old = old_values.astype(np.int8)
@@ -390,23 +394,27 @@ def cache_update_cost(
         or not math.isfinite(total_cache_download_delay_s)
     ):
         raise FloatingPointError("cache download delay is not finite")
-    if delay_reference == 0.0:
-        if total_cache_download_delay_s > 0.0:
-            raise ValueError(
-                "positive cache download delay is incompatible with a zero reference"
-            )
-        cache_download_delay_normalized_by_node = np.zeros_like(
-            cache_download_delay_s_by_node
+    zero_reference = references == 0.0
+    if np.any(zero_reference & (cache_download_delay_s_by_node > 0.0)):
+        raise ValueError(
+            "positive cache download delay is incompatible with a zero node reference"
         )
-    else:
-        delay_tolerance_s = max(1.0e-12, delay_reference * 1.0e-12)
-        if total_cache_download_delay_s > delay_reference + delay_tolerance_s:
-            raise AssertionError(
-                "actual cache download delay exceeds the fixed normalization reference"
-            )
-        cache_download_delay_normalized_by_node = (
-            cache_download_delay_s_by_node / delay_reference
+    delay_tolerance_s = np.maximum(1.0e-12, references * 1.0e-12)
+    if np.any(cache_download_delay_s_by_node > references + delay_tolerance_s):
+        offending = np.flatnonzero(
+            cache_download_delay_s_by_node > references + delay_tolerance_s
+        ).tolist()
+        raise AssertionError(
+            "actual cache download delay exceeds its fixed node reference for "
+            f"node indices: {offending}"
         )
+    cache_download_delay_normalized_by_node = np.divide(
+        cache_download_delay_s_by_node,
+        references,
+        out=np.zeros_like(cache_download_delay_s_by_node),
+        where=references > 0.0,
+    )
+    delay_reference_total_s = float(np.sum(references))
     cache_download_delay_normalized = float(
         np.sum(cache_download_delay_normalized_by_node)
     )
@@ -433,7 +441,10 @@ def cache_update_cost(
             cache_download_delay_normalized_by_node
         ),
         "cache_download_delay_normalized": cache_download_delay_normalized,
-        "cache_download_delay_reference_s": delay_reference,
+        "cache_download_delay_reference_s_by_node": references,
+        # Aggregate retained for diagnostics only; normalization uses each node's value.
+        "cache_download_delay_reference_s": delay_reference_total_s,
+        "cache_download_delay_reference_s_total": delay_reference_total_s,
         "cache_cost_beta": beta,
         "cache_cost_by_node": cache_cost_by_node,
         "cache_cost": total_cache_cost,

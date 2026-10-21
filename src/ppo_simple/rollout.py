@@ -571,8 +571,13 @@ def _cache_candidates(
         ):
             raise AssertionError("selected Cache candidates and primitive features are misaligned")
         for item, node_feature in zip(node_candidates, node_features, strict=True):
+            target_row = np.asarray(item.target_node_cache, dtype=np.int8)
+            if not cache_configuration.is_legal_cache_replacement(
+                current[node_index], target_row
+            ):
+                continue
             target = current.copy()
-            target[node_index] = np.asarray(item.target_node_cache, dtype=np.int8)
+            target[node_index] = target_row
             key = target.tobytes()
             if key not in seen:
                 seen.add(key)
@@ -689,14 +694,32 @@ def _cache_node_candidates(
         ]
         seen = {current.tobytes()}
         for proposal, primitive_feature in zip(proposals, primitive, strict=True):
+            target_row = np.asarray(proposal.target_node_cache, dtype=np.int8)
+            if not cache_configuration.is_legal_cache_replacement(
+                current[node_index], target_row
+            ):
+                continue
             target = current.copy()
-            target[node_index] = np.asarray(proposal.target_node_cache, dtype=np.int8)
+            target[node_index] = target_row
             key = target.tobytes()
             if key in seen:
                 continue
             seen.add(key)
             candidates.append(target)
             primitive_for_node.append(np.asarray(primitive_feature, dtype=np.float32).copy())
+        if not candidates or not np.array_equal(candidates[0], current):
+            raise AssertionError("each factorized Cache head must start with exact KEEP")
+        if any(
+            not cache_configuration.is_legal_cache_replacement(
+                current[node_index], candidate[node_index]
+            )
+            or not np.array_equal(
+                candidate[np.arange(candidate.shape[0]) != node_index],
+                current[np.arange(current.shape[0]) != node_index],
+            )
+            for candidate in candidates[1:]
+        ):
+            raise AssertionError("factorized Cache candidates must be node-local REPLACE actions")
         if len(candidates) > int(context.cache_cfg.target_candidate_capacity) + 1:
             raise AssertionError("per-node candidates exceeded the configured 64-update limit")
         node_candidates.append(candidates)
@@ -1048,6 +1071,11 @@ def collect_dual_timescale_episode(
                         frame_candidate_masks,
                         deterministic=deterministic,
                     )
+                    if not np.array_equal(
+                        np.asarray(selected_nodes.cache_masks, dtype=bool),
+                        frame_candidate_masks,
+                    ):
+                        raise AssertionError("sampled Cache masks differ from rollout candidates")
                     frame_old_node_cache_log_probs = np.asarray(
                         selected_nodes.node_log_probs.detach().cpu(), dtype=np.float32
                     ).copy()
@@ -1106,10 +1134,22 @@ def collect_dual_timescale_episode(
                     raise AssertionError("factorized raw Cache probabilities are invalid")
                 node_selected_updates = frame_cache_actions > 0
                 target_cache = cache.copy()
+                if frame_cache_actions.shape != (len(node_candidates),):
+                    raise AssertionError("factorized Cache actions do not match node heads")
                 for node_index, candidate_index in enumerate(frame_cache_actions):
+                    if (
+                        candidate_index < 0
+                        or candidate_index >= len(node_candidates[node_index])
+                        or not frame_candidate_masks[node_index, candidate_index]
+                    ):
+                        raise AssertionError("sampled Cache action is outside its legal candidate mask")
                     chosen = node_candidates[node_index][int(candidate_index)]
                     if candidate_index == 0 and not np.array_equal(chosen, cache):
                         raise AssertionError("node KEEP candidate changed the global Cache")
+                    if candidate_index > 0 and not cache_configuration.is_legal_cache_replacement(
+                        cache[node_index], chosen[node_index]
+                    ):
+                        raise AssertionError("sampled Cache UPDATE must be a legal REPLACE")
                     target_cache[node_index] = chosen[node_index]
                 frame_cache = target_cache
                 frame_actual_update_by_node = cache_update_mask(cache, frame_cache)
