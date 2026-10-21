@@ -891,6 +891,10 @@ def collect_dual_timescale_episode(
     progress_callback: Callable[[int, int, float, float], None] | None = None,
     performance_sample_slots: set[int] | frozenset[int] | None = None,
     performance_sample_callback: Callable[[dict[str, Any]], None] | None = None,
+    counterfactual_joint_selector: bool = False,
+    counterfactual_cache_candidate_budget: int = 8,
+    counterfactual_uav_candidate_budget: int = 2,
+    counterfactual_improvement_tolerance: float = 1.0e-9,
 ) -> EpisodeCollection:
     """冻结策略完成完整 episode rollout，并返回分离的 Micro/Macro 数据。
 
@@ -899,6 +903,24 @@ def collect_dual_timescale_episode(
 
     if not aligned_steps:
         raise ValueError("完整 episode rollout 不能为空。")
+    if counterfactual_joint_selector:
+        if bool(getattr(policy, "training", False)):
+            raise ValueError(
+                "The counterfactual joint selector is evaluation-only; policy must be in eval mode."
+            )
+        if context.cache_action_mode != interface.project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED:
+            raise ValueError(
+                "The counterfactual joint selector currently requires the formal factorized Cache action mode."
+            )
+        if int(counterfactual_cache_candidate_budget) < 0:
+            raise ValueError("counterfactual Cache candidate budget cannot be negative")
+        if int(counterfactual_uav_candidate_budget) < 0:
+            raise ValueError("counterfactual UAV candidate budget cannot be negative")
+        if (
+            not math.isfinite(float(counterfactual_improvement_tolerance))
+            or float(counterfactual_improvement_tolerance) < 0.0
+        ):
+            raise ValueError("counterfactual improvement tolerance must be finite and nonnegative")
     uav_count = len(context.action_spec.uav_ids)
     if uav_count <= 0:
         raise ValueError("联合 MAPPO 至少要求一个 UAV action head。")
@@ -952,6 +974,8 @@ def collect_dual_timescale_episode(
     frame_observation: np.ndarray | None = None
     frame_candidate_features: np.ndarray | None = None
     frame_candidate_masks: np.ndarray | None = None
+    frame_node_candidates: list[list[np.ndarray]] | None = None
+    frame_candidate_probabilities: np.ndarray | None = None
     frame_cache_index = 0
     frame_cache_actions = np.asarray(0, dtype=np.int64)
     frame_old_cache_log_prob = 0.0
@@ -1002,14 +1026,126 @@ def collect_dual_timescale_episode(
     node_selected_update_records: list[np.ndarray] = []
     node_actual_update_records: list[np.ndarray] = []
     update_nodes_per_macro: list[int] = []
+    counterfactual_selector_stats: dict[str, Any] = {
+        "enabled": bool(counterfactual_joint_selector),
+        "cache_candidate_budget_per_macro": int(counterfactual_cache_candidate_budget),
+        "uav_candidate_budget_per_uav_per_slot": int(counterfactual_uav_candidate_budget),
+        "improvement_tolerance": float(counterfactual_improvement_tolerance),
+        "slots_evaluated": 0,
+        "macro_cache_decisions_evaluated": 0,
+        "baseline_evaluation_count": 0,
+        "cache_candidate_evaluation_count": 0,
+        "uav_candidate_evaluation_count": 0,
+        "total_configuration_evaluation_count": 0,
+        "candidate_failure_count": 0,
+        "baseline_failure_count": 0,
+        "candidate_rejection_count": 0,
+        "baseline_system_utility_sum": 0.0,
+        "selected_system_utility_sum": 0.0,
+        "immediate_system_utility_delta_sum": 0.0,
+        "actual_cache_changed_nodes": 0,
+        "actual_uav_movements": 0,
+        "candidate_evaluation_seconds": 0.0,
+        "extra_candidate_evaluation_seconds": 0.0,
+        "selector_wall_seconds": 0.0,
+        "failure_examples": [],
+        "slot_records": [],
+    }
     start_time = time.perf_counter()
     matching_kkt_elapsed_seconds = 0.0
+
+    def record_selector_failure(kind: str, slot: int, error: BaseException) -> None:
+        counterfactual_selector_stats[
+            "baseline_failure_count" if kind == "baseline" else "candidate_failure_count"
+        ] += 1
+        examples = counterfactual_selector_stats["failure_examples"]
+        if len(examples) < 10:
+            examples.append(
+                {
+                    "kind": str(kind),
+                    "slot": int(slot),
+                    "error_type": type(error).__name__,
+                    "message": str(error)[:240],
+                }
+            )
+
+    def evaluate_selector_configuration(
+        previous_cache: np.ndarray,
+        previous_positions: dict[str, np.ndarray],
+        final_cache: np.ndarray,
+        final_positions: dict[str, np.ndarray],
+        step: Any,
+        slot_index: int,
+        category: str,
+        slot_performance_profile: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any], dict[str, float] | None] | None:
+        if category not in {"baseline", "cache", "uav"}:
+            raise ValueError(f"unknown counterfactual evaluation category: {category}")
+        counterfactual_selector_stats["total_configuration_evaluation_count"] += 1
+        if category == "baseline":
+            counterfactual_selector_stats["baseline_evaluation_count"] += 1
+        elif category == "cache":
+            counterfactual_selector_stats["cache_candidate_evaluation_count"] += 1
+        else:
+            counterfactual_selector_stats["uav_candidate_evaluation_count"] += 1
+        branch_profile: dict[str, Any] = {}
+        branch_exact_profile = (
+            {}
+            if sampled_slot_indices is not None and int(slot_index) in sampled_slot_indices
+            else None
+        )
+        started = time.perf_counter()
+        try:
+            result = slot_environment.execute_configured_slot(
+                previous_cache,
+                previous_positions,
+                final_cache,
+                final_positions,
+                step.scenario_slice,
+                step.actual_tasks,
+                step.actual_vehicle_positions,
+                context.service_catalog,
+                context.cfg,
+                context.cache_nodes,
+                context.cache_cfg,
+                context.flight_boundary,
+                slot_id=int(step.slot),
+                time_s=float(step.time_s),
+                performance_profile=branch_profile,
+                matching_kkt_cache=None,
+                node_evaluation_cache=None,
+                exact_q_timing_profile=branch_exact_profile,
+            )
+            if not result.step_feasible or result.system_utility is None:
+                raise RuntimeError(
+                    "candidate execution was infeasible: "
+                    f"{result.infeasible_reason or 'missing system utility'}"
+                )
+            utility = float(result.system_utility)
+            if not math.isfinite(utility):
+                raise FloatingPointError("candidate system utility is not finite")
+        except Exception as exc:
+            record_selector_failure(category, int(step.slot), exc)
+            return None
+        finally:
+            elapsed = time.perf_counter() - started
+            counterfactual_selector_stats["candidate_evaluation_seconds"] += elapsed
+            if category != "baseline":
+                counterfactual_selector_stats["extra_candidate_evaluation_seconds"] += elapsed
+            for key, value in branch_profile.items():
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    slot_performance_profile[key] = float(
+                        slot_performance_profile.get(key, 0.0)
+                    ) + float(value)
+        return result, branch_profile, branch_exact_profile
 
     for slot_index, step in enumerate(aligned_steps[:rollout_slots]):
         slot_started = time.perf_counter()
         previous_uav = {key: value.copy() for key, value in uav.items()}
         if slot_index == frame_start:
             frame_observation = _observation(cache, uav, step, context)
+            frame_node_candidates = None
+            frame_candidate_probabilities = None
             multi_node = (
                 context.cache_action_mode
                 != interface.project_config.CACHE_ACTION_MODE_SINGLE_NODE
@@ -1028,6 +1164,7 @@ def collect_dual_timescale_episode(
                         tensor_spec,
                     )
                 )
+                frame_node_candidates = node_candidates
                 if sparse_cache:
                     if not isinstance(policy, SparseCoordinatedCacheActorCritic):
                         raise TypeError("sparse Cache configuration requires its versioned policy")
@@ -1116,6 +1253,12 @@ def collect_dual_timescale_episode(
                 probabilities = np.asarray(
                     selected_nodes.node_probabilities, dtype=np.float64
                 )
+                if counterfactual_joint_selector:
+                    if sparse_cache:
+                        raise ValueError(
+                            "The counterfactual joint selector does not support sparse Cache policies."
+                        )
+                    frame_candidate_probabilities = probabilities.copy()
                 if (
                     probabilities.shape != frame_candidate_masks.shape
                     or not np.isfinite(probabilities).all()
@@ -1527,10 +1670,6 @@ def collect_dual_timescale_episode(
         probability_snapshot = np.zeros((uav_count, max_uav_candidates), dtype=np.float32)
         for head_index in range(uav_count):
             probability_snapshot[head_index, :valid_counts[head_index]] = candidate_probability_lists[head_index]
-        cache_id = hashlib.sha256(
-            np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
-        ).hexdigest()[:16]
-        actual_cache_update_count = int(np.count_nonzero(cache_update_mask(cache, frame_cache)))
         performance_profile: dict[str, Any] = {}
         exact_q_timing_profile = (
             {}
@@ -1538,30 +1677,370 @@ def collect_dual_timescale_episode(
             else None
         )
         environment_started = time.perf_counter()
-        result = slot_environment.execute_configured_slot(
-            cache,
-            previous_uav,
-            frame_cache,
-            current_trial,
-            step.scenario_slice,
-            step.actual_tasks,
-            step.actual_vehicle_positions,
-            context.service_catalog,
-            context.cfg,
-            context.cache_nodes,
-            context.cache_cfg,
-            context.flight_boundary,
-            slot_id=int(step.slot),
-            time_s=float(step.time_s),
-            performance_profile=performance_profile,
-            exact_q_timing_profile=exact_q_timing_profile,
-        )
+        if counterfactual_joint_selector:
+            selector_started = time.perf_counter()
+            evaluation_count_before = int(
+                counterfactual_selector_stats["total_configuration_evaluation_count"]
+            )
+            cache_evaluation_count_before = int(
+                counterfactual_selector_stats["cache_candidate_evaluation_count"]
+            )
+            uav_evaluation_count_before = int(
+                counterfactual_selector_stats["uav_candidate_evaluation_count"]
+            )
+            failure_count_before = int(
+                counterfactual_selector_stats["candidate_failure_count"]
+            )
+            rejection_count_before = int(
+                counterfactual_selector_stats["candidate_rejection_count"]
+            )
+            extra_evaluation_seconds_before = float(
+                counterfactual_selector_stats["extra_candidate_evaluation_seconds"]
+            )
+            branch_performance_profile: dict[str, Any] = {}
+            baseline_evaluation = evaluate_selector_configuration(
+                cache,
+                previous_uav,
+                frame_cache.copy(),
+                {key: value.copy() for key, value in current_trial.items()},
+                step,
+                slot_index,
+                "baseline",
+                branch_performance_profile,
+            )
+            if baseline_evaluation is None:
+                raise RuntimeError(
+                    "Actor baseline action was infeasible during counterfactual selection: "
+                    f"slot={step.slot}"
+                )
+            best_result, _baseline_profile, best_exact_profile = baseline_evaluation
+            baseline_utility = float(best_result.system_utility)
+            best_cache = frame_cache.copy()
+            best_positions = {key: value.copy() for key, value in current_trial.items()}
+            improvement_tolerance = float(counterfactual_improvement_tolerance)
+
+            if slot_index == frame_start:
+                counterfactual_selector_stats["macro_cache_decisions_evaluated"] += 1
+                if frame_node_candidates is None or frame_candidate_probabilities is None:
+                    raise AssertionError(
+                        "Factorized Cache candidates/probabilities are required by the selector."
+                    )
+                cache_budget_used = 0
+                cache_budget = int(counterfactual_cache_candidate_budget)
+                for node_index, candidates in enumerate(frame_node_candidates):
+                    selected_index = int(frame_cache_actions[node_index])
+                    remaining = [
+                        candidate_index
+                        for candidate_index in range(len(candidates))
+                        if candidate_index not in {0, selected_index}
+                    ]
+                    remaining.sort(
+                        key=lambda candidate_index: (
+                            -float(
+                                frame_candidate_probabilities[
+                                    node_index, candidate_index
+                                ]
+                            ),
+                            int(candidate_index),
+                        )
+                    )
+                    ordered_indices = [0]
+                    if selected_index != 0:
+                        ordered_indices.append(selected_index)
+                    ordered_indices.extend(remaining)
+                    for candidate_index in ordered_indices:
+                        if cache_budget_used >= cache_budget:
+                            break
+                        candidate = candidates[candidate_index]
+                        target_row = np.asarray(
+                            candidate[node_index], dtype=np.int8
+                        ).copy()
+                        if np.array_equal(target_row, best_cache[node_index]):
+                            continue
+                        cache_budget_used += 1
+                        if candidate_index > 0 and not cache_configuration.is_legal_cache_replacement(
+                            cache[node_index], target_row
+                        ):
+                            record_selector_failure(
+                                "cache_validation",
+                                int(step.slot),
+                                ValueError("Cache candidate is not a legal REPLACE."),
+                            )
+                            continue
+                        proposal_cache = best_cache.copy()
+                        proposal_cache[node_index] = target_row
+                        try:
+                            cache_configuration.validate_cache_shape_and_capacity(
+                                proposal_cache,
+                                context.service_catalog,
+                                context.cache_nodes,
+                            )
+                        except Exception as exc:
+                            record_selector_failure(
+                                "cache_validation", int(step.slot), exc
+                            )
+                            continue
+                        evaluated = evaluate_selector_configuration(
+                            cache,
+                            previous_uav,
+                            proposal_cache,
+                            {key: value.copy() for key, value in best_positions.items()},
+                            step,
+                            slot_index,
+                            "cache",
+                            branch_performance_profile,
+                        )
+                        if evaluated is None:
+                            continue
+                        candidate_result, _candidate_profile, candidate_exact_profile = evaluated
+                        candidate_utility = float(candidate_result.system_utility)
+                        if candidate_utility > float(best_result.system_utility) + improvement_tolerance:
+                            best_cache = proposal_cache
+                            best_result = candidate_result
+                            best_exact_profile = candidate_exact_profile
+                        else:
+                            counterfactual_selector_stats["candidate_rejection_count"] += 1
+                    if cache_budget_used >= cache_budget:
+                        break
+
+            movement_tolerance = float(
+                uav_configuration.uav_search_config_from_project(
+                    context.cfg
+                ).position_tolerance_m
+            )
+            for uav_index, uav_id_value in enumerate(context.action_spec.uav_ids):
+                uav_id = str(uav_id_value)
+                generation_positions = {
+                    key: value.copy() for key, value in best_positions.items()
+                }
+                # Candidate generation's STAY origin is the actual pre-Slot position.
+                generation_positions[uav_id] = previous_uav[uav_id].copy()
+                try:
+                    candidates, _candidate_features = _uav_candidates(
+                        uav_index,
+                        generation_positions,
+                        previous_uav,
+                        best_cache,
+                        step,
+                        context,
+                    )
+                except Exception as exc:
+                    record_selector_failure("uav_generation", int(step.slot), exc)
+                    continue
+                uav_budget_used = 0
+                for candidate in candidates:
+                    target_position = np.asarray(
+                        candidate.target_position, dtype=np.float64
+                    ).copy()
+                    if float(
+                        np.linalg.norm(target_position - best_positions[uav_id])
+                    ) <= movement_tolerance:
+                        continue
+                    if uav_budget_used >= int(counterfactual_uav_candidate_budget):
+                        break
+                    uav_budget_used += 1
+                    proposal_positions = {
+                        key: value.copy() for key, value in best_positions.items()
+                    }
+                    try:
+                        uav_configuration.apply_uav_candidate(
+                            proposal_positions,
+                            previous_uav,
+                            uav_id,
+                            target_position,
+                            {key: 1 for key in context.action_spec.uav_ids},
+                            context.cfg,
+                            context.flight_boundary,
+                        )
+                        actual_triggers = {
+                            key: int(
+                                np.linalg.norm(
+                                    proposal_positions[key] - previous_uav[key]
+                                )
+                                > movement_tolerance
+                            )
+                            for key in context.action_spec.uav_ids
+                        }
+                        uav_configuration.validate_uav_configuration_transition(
+                            previous_uav,
+                            proposal_positions,
+                            actual_triggers,
+                            context.cfg,
+                            context.flight_boundary,
+                        )
+                    except Exception as exc:
+                        record_selector_failure(
+                            "uav_validation", int(step.slot), exc
+                        )
+                        continue
+                    evaluated = evaluate_selector_configuration(
+                        cache,
+                        previous_uav,
+                        best_cache,
+                        proposal_positions,
+                        step,
+                        slot_index,
+                        "uav",
+                        branch_performance_profile,
+                    )
+                    if evaluated is None:
+                        continue
+                    candidate_result, _candidate_profile, candidate_exact_profile = evaluated
+                    candidate_utility = float(candidate_result.system_utility)
+                    if candidate_utility > float(best_result.system_utility) + improvement_tolerance:
+                        best_positions = proposal_positions
+                        best_result = candidate_result
+                        best_exact_profile = candidate_exact_profile
+                    else:
+                        counterfactual_selector_stats["candidate_rejection_count"] += 1
+
+            uav_configuration.validate_uav_configuration_transition(
+                previous_uav,
+                best_positions,
+                {
+                    key: int(
+                        np.linalg.norm(best_positions[key] - previous_uav[key])
+                        > movement_tolerance
+                    )
+                    for key in context.action_spec.uav_ids
+                },
+                context.cfg,
+                context.flight_boundary,
+            )
+            frame_cache = best_cache.copy()
+            current_trial = {key: value.copy() for key, value in best_positions.items()}
+            if slot_index == frame_start:
+                frame_actual_update_by_node = cache_update_mask(cache, frame_cache)
+                frame_cache_changed = bool(np.any(frame_actual_update_by_node))
+                if update_nodes_per_macro:
+                    update_nodes_per_macro[-1] = int(
+                        np.count_nonzero(frame_actual_update_by_node)
+                    )
+                if node_actual_update_records:
+                    node_actual_update_records[-1] = frame_actual_update_by_node.copy()
+            baseline_utility_total = float(
+                counterfactual_selector_stats["baseline_system_utility_sum"]
+            )
+            selected_utility_total = float(
+                counterfactual_selector_stats["selected_system_utility_sum"]
+            )
+            counterfactual_selector_stats["baseline_system_utility_sum"] = (
+                baseline_utility_total + baseline_utility
+            )
+            selected_utility = float(best_result.system_utility)
+            counterfactual_selector_stats["selected_system_utility_sum"] = (
+                selected_utility_total + selected_utility
+            )
+            counterfactual_selector_stats["immediate_system_utility_delta_sum"] += (
+                selected_utility - baseline_utility
+            )
+            counterfactual_selector_stats["actual_cache_changed_nodes"] += int(
+                np.count_nonzero(cache_update_mask(cache, frame_cache))
+            )
+            counterfactual_selector_stats["actual_uav_movements"] += int(
+                sum(
+                    np.linalg.norm(current_trial[key] - previous_uav[key])
+                    > movement_tolerance
+                    for key in context.action_spec.uav_ids
+                )
+            )
+            counterfactual_selector_stats["slots_evaluated"] += 1
+            counterfactual_selector_stats["selector_wall_seconds"] += (
+                time.perf_counter() - selector_started
+            )
+            counterfactual_selector_stats["slot_records"].append(
+                {
+                    "slot": int(step.slot),
+                    "G_base": float(baseline_utility),
+                    "G_selected": float(selected_utility),
+                    "immediate_utility_delta": float(
+                        selected_utility - baseline_utility
+                    ),
+                    "actual_cache_changed_nodes": int(
+                        np.count_nonzero(cache_update_mask(cache, frame_cache))
+                    ),
+                    "actual_uav_movements": int(
+                        sum(
+                            np.linalg.norm(current_trial[key] - previous_uav[key])
+                            > movement_tolerance
+                            for key in context.action_spec.uav_ids
+                        )
+                    ),
+                    "configuration_evaluation_count": int(
+                        counterfactual_selector_stats[
+                            "total_configuration_evaluation_count"
+                        ]
+                        - evaluation_count_before
+                    ),
+                    "cache_candidate_evaluation_count": int(
+                        counterfactual_selector_stats[
+                            "cache_candidate_evaluation_count"
+                        ]
+                        - cache_evaluation_count_before
+                    ),
+                    "uav_candidate_evaluation_count": int(
+                        counterfactual_selector_stats[
+                            "uav_candidate_evaluation_count"
+                        ]
+                        - uav_evaluation_count_before
+                    ),
+                    "candidate_failure_count": int(
+                        counterfactual_selector_stats["candidate_failure_count"]
+                        - failure_count_before
+                    ),
+                    "candidate_rejection_count": int(
+                        counterfactual_selector_stats["candidate_rejection_count"]
+                        - rejection_count_before
+                    ),
+                    "extra_candidate_evaluation_seconds": float(
+                        counterfactual_selector_stats[
+                            "extra_candidate_evaluation_seconds"
+                        ]
+                        - extra_evaluation_seconds_before
+                    ),
+                }
+            )
+            performance_profile = branch_performance_profile
+            exact_q_timing_profile = best_exact_profile
+            result = best_result
+        else:
+            result = slot_environment.execute_configured_slot(
+                cache,
+                previous_uav,
+                frame_cache,
+                current_trial,
+                step.scenario_slice,
+                step.actual_tasks,
+                step.actual_vehicle_positions,
+                context.service_catalog,
+                context.cfg,
+                context.cache_nodes,
+                context.cache_cfg,
+                context.flight_boundary,
+                slot_id=int(step.slot),
+                time_s=float(step.time_s),
+                performance_profile=performance_profile,
+                exact_q_timing_profile=exact_q_timing_profile,
+            )
         environment_seconds = time.perf_counter() - environment_started
         if not result.step_feasible or result.system_utility is None:
             raise RuntimeError(
                 "正式选中配置导致 slot infeasible："
                 f"origin={step.origin_index}, reason={result.infeasible_reason}"
             )
+        if counterfactual_joint_selector:
+            actual_cache_update_count = int(
+                np.count_nonzero(
+                    cache_update_mask(cache, np.asarray(result.next_cache_state, dtype=np.int8))
+                )
+            )
+        else:
+            actual_cache_update_count = int(
+                np.count_nonzero(cache_update_mask(cache, frame_cache))
+            )
+        cache_id = hashlib.sha256(
+            np.ascontiguousarray(frame_cache, dtype=np.int8).tobytes()
+        ).hexdigest()[:16]
         _check_request_contract(cache, previous_uav, result, context.action_spec)
         reward = _check_reward(result)
         metrics = task_metrics_from_result(result, context.cache_nodes)
@@ -1673,7 +2152,24 @@ def collect_dual_timescale_episode(
                 active_cache_configuration_id=cache_id,
                 actual_task_utility=float(result.actual_task_utility),
                 actual_cache_update_count=actual_cache_update_count,
-                uav_movement_count=int(sum(action_index != 0 for action_index in actions)),
+                uav_movement_count=(
+                    int(
+                        sum(
+                            np.linalg.norm(
+                                np.asarray(
+                                    result.next_uav_positions[key], dtype=np.float64
+                                )
+                                - previous_uav[key]
+                            )
+                            > uav_configuration.uav_search_config_from_project(
+                                context.cfg
+                            ).position_tolerance_m
+                            for key in context.action_spec.uav_ids
+                        )
+                    )
+                    if counterfactual_joint_selector
+                    else int(sum(action_index != 0 for action_index in actions))
+                ),
                 cache_cost=float(result.cache_cost),
                 cache_download_delay_s=float(result.cache_download_delay_s),
                 cache_cost_by_node={
@@ -2345,6 +2841,35 @@ def collect_dual_timescale_episode(
         "exact_q_branch_requests": 0,
         "exact_q_environment_executions": 0,
     }
+    selector_slots = int(counterfactual_selector_stats["slots_evaluated"])
+    counterfactual_selector_stats["baseline_system_utility_mean"] = (
+        float(counterfactual_selector_stats["baseline_system_utility_sum"])
+        / max(selector_slots, 1)
+        if counterfactual_joint_selector
+        else None
+    )
+    counterfactual_selector_stats["selected_system_utility_mean"] = (
+        float(counterfactual_selector_stats["selected_system_utility_sum"])
+        / max(selector_slots, 1)
+        if counterfactual_joint_selector
+        else None
+    )
+    counterfactual_selector_stats["immediate_system_utility_delta_mean"] = (
+        float(counterfactual_selector_stats["immediate_system_utility_delta_sum"])
+        / max(selector_slots, 1)
+        if counterfactual_joint_selector
+        else None
+    )
+    counterfactual_selector_stats["evaluation_count_semantics"] = (
+        "total configuration evaluator calls, including one Actor baseline call per Slot; "
+        "Cache/UAV candidate fields count their individual evaluator calls"
+    )
+    counterfactual_selector_stats["actor_probability_semantics"] = (
+        "Actor proposals and log probabilities are retained unchanged; selector execution "
+        "statistics are reported separately and are evaluation-only"
+    )
+    if counterfactual_joint_selector:
+        summary["counterfactual_joint_selector"] = counterfactual_selector_stats
     if deterministic:
         summary["deterministic_action_selection"] = {
             "cache": deterministic_cache_selections,

@@ -566,6 +566,13 @@ def _episode_summary(collection: Any, episode_seed: int, repeat_index: int) -> d
         "kkt_call_count": int(collection.summary["kkt_call_count"]),
         "episode_runtime_seconds": float(collection.summary["episode_runtime_seconds"]),
     }
+    selector_summary = collection.summary.get("counterfactual_joint_selector")
+    if isinstance(selector_summary, Mapping):
+        record["counterfactual_joint_selector"] = dict(selector_summary)
+        record["policy_execution_mode"] = "actor_with_counterfactual_joint_selector"
+        record["policy_action_statistics_semantics"] = (
+            "actor_proposals_and_probabilities; selected execution metrics are in counterfactual_joint_selector"
+        )
     for metric_name in (
         "uav0_group_stay_probability_mean",
         "uav0_group_move_probability_mean",
@@ -876,6 +883,10 @@ def evaluate_pool(
     policy_action_mode: str = "deterministic",
     policy_sampling_seed: int | None = None,
     max_slots: int | None = None,
+    counterfactual_joint_selector: bool = False,
+    counterfactual_cache_candidate_budget: int = 8,
+    counterfactual_uav_candidate_budget: int = 2,
+    counterfactual_improvement_tolerance: float = 1.0e-9,
 ) -> dict[str, Any]:
     _require_torch()
     if int(episodes) <= 0 or int(repeats) <= 0:
@@ -884,6 +895,13 @@ def evaluate_pool(
         raise ValueError("policy_action_mode must be deterministic or stochastic")
     if max_slots is not None and (int(max_slots) <= 0 or int(episodes) != 1 or int(repeats) != 1):
         raise ValueError("短窗配对评价要求正 max_slots、单个 Episode 和一次策略运行。")
+    if counterfactual_joint_selector and (
+        int(counterfactual_cache_candidate_budget) < 0
+        or int(counterfactual_uav_candidate_budget) < 0
+        or not math.isfinite(float(counterfactual_improvement_tolerance))
+        or float(counterfactual_improvement_tolerance) < 0.0
+    ):
+        raise ValueError("反事实选择器预算或改善容差非法。")
     config_file = Path(config_path).expanduser().resolve(strict=True)
     checkpoint = resolve_checkpoint_reference(Path(checkpoint_path)).resolve(strict=True)
     checkpoint_metadata = _load_checkpoint_metadata(checkpoint)
@@ -995,6 +1013,10 @@ def evaluate_pool(
                     deterministic=policy_action_mode == "deterministic",
                     episode_seed=episode_seed,
                     max_slots=max_slots,
+                    counterfactual_joint_selector=counterfactual_joint_selector,
+                    counterfactual_cache_candidate_budget=counterfactual_cache_candidate_budget,
+                    counterfactual_uav_candidate_budget=counterfactual_uav_candidate_budget,
+                    counterfactual_improvement_tolerance=counterfactual_improvement_tolerance,
                 )
             summary = _episode_summary(collection, episode_seed, repeat_index)
             summary["policy_sampling_seed"] = action_seed
@@ -1029,6 +1051,10 @@ def evaluate_pool(
                 ),
                 "interpretation": "paired short-window chain verification; not a performance conclusion",
             }
+            if counterfactual_joint_selector:
+                paired_record["policy_variant"] = (
+                    "MAPPO plus one-Slot counterfactual selector"
+                )
             with (destination / "paired_keep_stay_window.json").open(
                 "w", encoding="utf-8", newline="\n"
             ) as stream:
@@ -1101,6 +1127,18 @@ def evaluate_pool(
         "repeat_summaries": summaries,
         "paired_keep_stay_summaries": paired_baselines,
     }
+    if counterfactual_joint_selector:
+        aggregate["counterfactual_joint_selector"] = {
+            "enabled": True,
+            "cache_candidate_budget_per_macro": int(
+                counterfactual_cache_candidate_budget
+            ),
+            "uav_candidate_budget_per_uav_per_slot": int(
+                counterfactual_uav_candidate_budget
+            ),
+            "improvement_tolerance": float(counterfactual_improvement_tolerance),
+            "scope": "evaluation only; one-Slot immediate system utility",
+        }
     cache_protocols = [
         item["deterministic_cache_protocol"]
         for item in summaries
@@ -1133,6 +1171,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-action-mode", choices=("deterministic", "stochastic"), default="deterministic")
     parser.add_argument("--policy-sampling-seed", type=int, default=None)
     parser.add_argument("--max-slots", type=int, default=None, help="短窗配对模式；单 Episode 与一次策略运行，并自动比较 KEEP+STAY。")
+    parser.add_argument(
+        "--counterfactual-joint-selector",
+        action="store_true",
+        help="在冻结策略评价中启用有限 Cache/UAV 单步反事实效用选择器。",
+    )
+    parser.add_argument(
+        "--counterfactual-cache-candidate-budget",
+        type=int,
+        default=8,
+        help="每次 Macro Cache 决策允许评价的替代 Cache 候选数。",
+    )
+    parser.add_argument(
+        "--counterfactual-uav-candidate-budget",
+        type=int,
+        default=2,
+        help="每架 UAV 每 Slot 允许评价的替代位置数。",
+    )
+    parser.add_argument(
+        "--counterfactual-improvement-tolerance",
+        type=float,
+        default=1.0e-9,
+        help="接受候选动作所需的最小系统效用提升。",
+    )
     return parser
 
 
@@ -1150,6 +1211,10 @@ def main(argv: list[str] | None = None) -> int:
         policy_action_mode=args.policy_action_mode,
         policy_sampling_seed=args.policy_sampling_seed,
         max_slots=args.max_slots,
+        counterfactual_joint_selector=args.counterfactual_joint_selector,
+        counterfactual_cache_candidate_budget=args.counterfactual_cache_candidate_budget,
+        counterfactual_uav_candidate_budget=args.counterfactual_uav_candidate_budget,
+        counterfactual_improvement_tolerance=args.counterfactual_improvement_tolerance,
     )
     return 0
 
