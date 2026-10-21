@@ -386,9 +386,9 @@ def plot_formal_actor_lr_comparison_300(project_root: Path | None = None) -> Pat
             if int(manifest.get("episode_seed_start", -1)) != 20001:
                 raise ValueError("episode seed start does not match the shared order 20001")
             if Path(str(manifest.get("config_path", ""))).resolve() != (
-                root / "configs" / "proposed" / "system_config.toml"
+                root / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
             ).resolve():
-                raise ValueError("run does not use the common formal system_config.toml")
+                raise ValueError("run does not use the formal alternating_actor_updates_v1.toml")
             epochs, returns = _read_episode_returns(metrics_path)
             if len(epochs) != 300 or not np.array_equal(epochs, np.arange(1, 301)):
                 raise ValueError("episode_metrics does not contain exactly epochs 1..300")

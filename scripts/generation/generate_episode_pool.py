@@ -205,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="configs/proposed/system_config.toml",
+        default="configs/proposed/alternating_actor_updates_v1.toml",
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start-seed", type=int, required=True)

@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable
 ROOT = Path(__file__).resolve().parents[2]
 TRAIN_DIR = ROOT / "environment_data" / "proposed_joint_training"
 MANIFEST_PATH = ROOT / "environment_data" / "data_split_manifest.json"
-CONFIG_PATH = ROOT / "configs" / "proposed" / "system_config.toml"
+CONFIG_PATH = ROOT / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
 CATALOG_PATH = ROOT / "data" / "generated" / "service_catalog.json"
 REPORT_PATH = ROOT / "reports" / "training_environment_diversity.md"
 SUMMARY_PATH = ROOT / "reports" / "training_environment_diversity_summary.csv"

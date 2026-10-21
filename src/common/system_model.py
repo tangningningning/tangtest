@@ -313,7 +313,8 @@ def cache_update_cost(
     cache_trigger: np.ndarray,
     service_sizes_mb: np.ndarray,
     cache_backhaul_rate_bps: np.ndarray,
-    lambda_ca: float,
+    cache_delay_reference_s: float,
+    beta_cache: float,
 ) -> dict[str, Any]:
     """Compute cache cost from only the download delay of newly added services.
 
@@ -362,9 +363,14 @@ def cache_update_cost(
         raise ValueError("service_sizes_mb 不能为负数。")
     if np.any(rates <= 0.0):
         raise ValueError("cache_backhaul_rate_bps 必须全部大于 0。")
-    lam = _require_finite("lambda_ca", lambda_ca)
-    if lam < 0.0:
-        raise ValueError("lambda_ca 不能为负数。")
+    delay_reference = _require_finite(
+        "cache_delay_reference_s", cache_delay_reference_s
+    )
+    beta = _require_finite("beta_cache", beta_cache)
+    if delay_reference < 0.0:
+        raise ValueError("cache_delay_reference_s 不能为负数。")
+    if beta < 0.0:
+        raise ValueError("beta_cache 不能为负数。")
     old = old_values.astype(np.int8)
     new = new_values.astype(np.int8)
     actual_trigger = np.any(old != new, axis=1).astype(np.int8)
@@ -378,15 +384,57 @@ def cache_update_cost(
     loaded_mb = additions @ sizes
     loaded_bits = loaded_mb * 8.0e6
     cache_download_delay_s_by_node = loaded_bits / rates
-    cache_cost_by_node = lam * cache_download_delay_s_by_node
     total_cache_download_delay_s = float(np.sum(cache_download_delay_s_by_node))
-    total_cache_cost = float(np.sum(cache_cost_by_node))
+    if (
+        not np.isfinite(cache_download_delay_s_by_node).all()
+        or not math.isfinite(total_cache_download_delay_s)
+    ):
+        raise FloatingPointError("cache download delay is not finite")
+    if delay_reference == 0.0:
+        if total_cache_download_delay_s > 0.0:
+            raise ValueError(
+                "positive cache download delay is incompatible with a zero reference"
+            )
+        cache_download_delay_normalized_by_node = np.zeros_like(
+            cache_download_delay_s_by_node
+        )
+    else:
+        delay_tolerance_s = max(1.0e-12, delay_reference * 1.0e-12)
+        if total_cache_download_delay_s > delay_reference + delay_tolerance_s:
+            raise AssertionError(
+                "actual cache download delay exceeds the fixed normalization reference"
+            )
+        cache_download_delay_normalized_by_node = (
+            cache_download_delay_s_by_node / delay_reference
+        )
+    cache_download_delay_normalized = float(
+        np.sum(cache_download_delay_normalized_by_node)
+    )
+    cache_cost_by_node = beta * cache_download_delay_normalized_by_node
+    total_cache_cost = beta * cache_download_delay_normalized
+    if (
+        not np.isfinite(cache_download_delay_normalized_by_node).all()
+        or not math.isfinite(cache_download_delay_normalized)
+        or np.any(cache_download_delay_normalized_by_node < 0.0)
+        or cache_download_delay_normalized < 0.0
+        or not np.isfinite(cache_cost_by_node).all()
+        or np.any(cache_cost_by_node < 0.0)
+        or not math.isfinite(total_cache_cost)
+        or total_cache_cost < 0.0
+    ):
+        raise FloatingPointError("normalized cache cost is not finite")
     return {
         "actual_trigger": actual_trigger,
         "loaded_mb": loaded_mb,
         "loaded_bits": loaded_bits,
         "cache_download_delay_s_by_node": cache_download_delay_s_by_node,
         "cache_download_delay_s": total_cache_download_delay_s,
+        "cache_download_delay_normalized_by_node": (
+            cache_download_delay_normalized_by_node
+        ),
+        "cache_download_delay_normalized": cache_download_delay_normalized,
+        "cache_download_delay_reference_s": delay_reference,
+        "cache_cost_beta": beta,
         "cache_cost_by_node": cache_cost_by_node,
         "cache_cost": total_cache_cost,
     }
@@ -400,7 +448,8 @@ def uav_movement_cost(
     max_horizontal_speed_mps: float,
     movement_energy_coefficient_j_per_m: float,
     movement_fixed_cost: float,
-    lambda_movement: float,
+    movement_energy_reference_j: float,
+    beta_movement: float,
     tolerance_m: float = 1e-9,
 ) -> dict[str, float | bool | int]:
     """Compute UAV cost from actual movement energy only.
@@ -423,7 +472,10 @@ def uav_movement_cost(
     compat_fixed_cost = _require_finite(
         "movement_fixed_cost", movement_fixed_cost
     )
-    lam = _require_finite("lambda_movement", lambda_movement)
+    energy_reference = _require_finite(
+        "movement_energy_reference_j", movement_energy_reference_j
+    )
+    beta = _require_finite("beta_movement", beta_movement)
     tolerance = _require_finite("tolerance_m", tolerance_m)
     if tolerance < 0.0:
         raise ValueError("tolerance_m 不能为负数。")
@@ -432,7 +484,8 @@ def uav_movement_cost(
         or vmax < 0.0
         or xi < 0.0
         or compat_fixed_cost < 0.0
-        or lam < 0.0
+        or energy_reference < 0.0
+        or beta < 0.0
     ):
         raise ValueError("UAV movement 参数范围无效。")
     raw_distance = float(np.linalg.norm(new - old))
@@ -444,12 +497,37 @@ def uav_movement_cost(
     if not speed_feasible:
         raise ValueError("UAV 水平移动距离违反 C6 最大移动距离约束。")
     energy = xi * effective_distance
+    if not math.isfinite(energy):
+        raise FloatingPointError("UAV movement energy is not finite")
+    if energy_reference == 0.0:
+        if energy > 0.0:
+            raise ValueError(
+                "positive UAV movement energy is incompatible with a zero reference"
+            )
+        energy_normalized = 0.0
+    else:
+        energy_tolerance_j = max(1.0e-12, energy_reference * 1.0e-12)
+        if energy > energy_reference + energy_tolerance_j:
+            raise AssertionError(
+                "actual UAV movement energy exceeds the fixed normalization reference"
+            )
+        energy_normalized = energy / energy_reference
+    movement_cost = beta * energy_normalized
+    if (
+        not math.isfinite(energy_normalized)
+        or energy_normalized < 0.0
+        or not math.isfinite(movement_cost)
+    ):
+        raise FloatingPointError("normalized UAV movement cost is not finite and nonnegative")
     return {
         "distance_m": effective_distance,
         "raw_distance_m": raw_distance,
         "speed_feasible": speed_feasible,
         "movement_energy_j": energy,
-        "movement_cost": lam * energy,
+        "movement_energy_normalized": energy_normalized,
+        "movement_energy_reference_j": energy_reference,
+        "movement_cost_beta": beta,
+        "movement_cost": movement_cost,
         "actual_z_q": actual_z,
         "actual_update": bool(actual_z),
     }

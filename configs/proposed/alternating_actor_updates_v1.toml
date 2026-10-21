@@ -1,7 +1,6 @@
-# Stage6 isolated candidate derived from Stage3B; source file left unchanged.
+# Sole formal configuration for Alternating Actor Optimization V1.
 # Capacities use decimal GB-to-MB conversion (1 GB = 1000 MB).
-# 独立实验配置：Alternating Actor Optimization V1。
-# 源自 configs/proposed/system_config.toml；物理系统、动作、Reward 与 Training Pool 合同保持一致。
+# 本文件统一承载正式物理系统、数据生成、成本、奖励和训练参数。
 # 训练时必须使用独立的 --run-dir，例如 runs/adaptive_alternating_actor_updates_v1。
 # adaptive_cache_mec 统一系统配置入口
 #
@@ -47,7 +46,7 @@ output_tag = "alternating_actor_updates_v1"
 # 已生成服务目录。缓存模块必须从该 JSON 读取实际 s_f / D / cycles_per_bit，
 # 不在本 TOML 中复制具体服务，避免两份 service catalog 不一致。
 service_catalog = "environment_data/proposed_joint_training/service_catalog_500_1000.json"
-# 车辆角色文件。SV/TV 真实 ID 从这里读取，system_config 不写死 46/29/80。
+# 车辆角色文件。SV/TV 真实 ID 从这里读取，不在本配置中写死车辆 ID。
 vehicle_roles = "data/generated/vehicle_roles.json"
 # 正式 SUMO 轨迹与任务/流行度输入的固定 artifact 路径。
 trajectory = "data/generated/trajectory.csv"
@@ -267,8 +266,8 @@ resource_sharing = false
 # E_vc_vehicle = p_v * D_v / R_i；psi_c 不进入车辆无线发射能耗。
 # 本次实验设计指定 Cloud 等效上行速率与时延系数；不表示实际无线覆盖、吞吐保证或显式回传链路。
 # Cloud通信时延仍按 psi_cloud * D_bits / R_i 计算；车辆发送能耗只按实际无线radio airtime计算。
-# psi_cloud=13.0 为本次指定的抽象实验参数。
-cloud_delay_factor = 13.0
+# psi_cloud=17.0 为本次指定的抽象实验参数。
+cloud_delay_factor = 17.0
 
 [communication]
 # 本 section 集中通信模型参数，后续 Cache surrogate、Matching、KKT 必须共用。
@@ -358,34 +357,40 @@ omega_delay = 0.5
 # 该值属于实验设计参数，不是硬件物理常数或已确认数据。
 # 后续敏感性实验使用：(omega_T, omega_E) = (0.3,0.7), (0.5,0.5), (0.7,0.3)。
 omega_energy = 0.5
-# Cache 只惩罚新增服务下载时延：T_ca,m = sum_f(s_f * 8e6 / R_m_back) * [c_new-c_old]^+。
-# program_size/service_sizes 使用十进制 MB；下载时延单位秒，不加入任务完成时延。
-# C_ca = lambda_cache * sum_m T_ca,m；固定更新成本和旧装载能耗代理已移除，无时延归一化项。
-# lambda_cache 单位 1/s，将秒计量的下载时延映射为无量纲目标惩罚；该权重尚未校准为最优值。
-# 系统 Slot 目标：G(t) = Q(t) - C_ca(t) - C_q(t)，两类正成本均只扣除一次。
-# Cache/UAV 配置固定时，成本对 Matching/KKT 是常数；资源优化仍以 Q(t) 为目标。
+# Cache 只惩罚实际新增服务下载时延：T_ca,m=sum_f(8e6*s_f_MB/R_m_back,bps)*max(c_new-c_old,0)。
+# 服务大小为十进制 MB、速率为 bit/s，换算因子 8e6 bit/MB；删除服务不产生下载成本。
+# 环境初始化固定 T_ca_upper=sum_m(8e6*cache_capacity_m_MB/R_m_back,bps)，这是容量上界，不声称可由离散服务目录精确达到。
+# C_ca_norm(t)=sum_m T_ca,m(t)/T_ca_upper；beta_ca=lambda_cache*T_ca_upper，将既有 1/s 系数换算为无量纲权重。
+# Cache 成本只由执行前后实际配置计算，UPDATE 意图本身不计费。
 lambda_cache = 2.0e-5
-# 参数状态：EXPERIMENT_DESIGN；不是物理能耗参数或文献直接物理常数。
-# lambda_movement 将实际移动能耗映射为目标成本。
-# E_mov,u = movement_energy_coefficient_j_per_m * effective_distance_m，单位 J。
-# C_q(t) = lambda_movement * sum_u E_mov,u(t)。
-# movement_fixed_cost 是兼容字段，不参与成本计算。
-# 基于 Training Pilot 的探索性降本配置；并非物理成本重新标定，也未验证为最优系数。
+# E_mov,u=xi_mov,u*||q_u(t)-q_u(t-1)||_2，使用实际二维水平位置差，单位 J。
+# 环境初始化固定 E_mov_upper=sum_u(xi_mov,u*vmax_u*dt)，是单 UAV 速度约束上界；联合安全距离和边界可能使精确最大值更小。
+# C_q_norm(t)=sum_u E_mov,u(t)/E_mov_upper；beta_q=lambda_movement*E_mov_upper，将既有 1/J 系数换算为无量纲权重。
+# 仅实际位置变化产生能耗；MOVE 标签不单独计费。movement_fixed_cost 保留为兼容字段且不参与计算。
 lambda_movement = 5.0e-6
-# T_ref/E_ref are train-only P95 normalization constants for the PER_SLOT_ANALYTIC
-# task model. Calibration used 12 Training realizations (seeds 20001, 20028, 20055,
-# 20082, 20110, 20137, 20164, 20191, 20218, 20245, 20272, 20300), sampling slots
-# 0, 33, 66, 99, 132, 165, 198, 231, 264, 299 in each (120 slots; 1642 tasks).
-# Reference policy is independent of T_ref/E_ref: fixed feasible role-indexed initial
-# Cache (seed 4401), configured fixed UAV positions, greedy least-loaded choice among
-# physically feasible cached Edge nodes (stable node-order tie break; Cloud only if
-# no Edge candidate), equal per-node CPU/BW shares, and equal sharing of the finite
-# 40 GHz Cloud CPU pool used during the historical T_ref/E_ref calibration. Cloud
-# upload is 20 Mbps and factor 13 applies to delay only.
-# T_ref is task-level P95 complete delay in seconds; E_ref is task-level P95 vehicle
-# upload energy in joules. Validation and Test were not used.
-T_ref = 30.473728355325758
-E_ref = 5.1574642506299275
+# Fixed system-level conservative upper bounds for task utility (not training P95).
+# D_max=1000 KB*8000 bit/KB*(1+0.20)=9.6e6 bit;
+# L_max=1000 cycle/bit*D_max*(1+0.10)=10.56e9 cycle.
+# KKT floors are 1e-6: F_min is 1000 cycle/s on the 1 GHz SV; minimum Cloud
+# rate is 20 Mbps*1e-6=20 bit/s. At the SUMO boundary diagonal (2664.329 m),
+# the minimum edge rates are 119.381 bit/s (ground) and 169.464 bit/s (air),
+# so 20 bit/s is a conservative common radio-rate lower bound. Cloud psi_c=17
+# applies to delay only. T_ref stores max_r(T_r_upper), with
+# T_r_upper=psi_r*D_max/R_r_min+L_max/F_r_min; the maximum is the SV path.
+# E_ref stores max_r(P_tx*D_max/R_r_min); the maximum is the Cloud uplink path.
+# These legacy config keys are fixed upper-bound references in seconds and joules.
+T_ref = 10640415.0
+E_ref = 95772.59112
+
+[objective.cost_normalization]
+contract_version = "max_feasible_cost_upper_bounds_v1"
+cache_method = "max_feasible_delay_capacity_upper_bound"
+cache_reference_formula = "sum_m(8e6 * cache_capacity_m_MB / actual_backhaul_rate_m_bps)"
+movement_method = "max_feasible_energy_single_uav_speed_upper_bound"
+movement_reference_formula = "sum_u(xi_mov_u_J_per_m * vmax_u_m_per_s * dt_s)"
+movement_distance_model = "horizontal_2d_euclidean"
+beta_cache_source = "objective.lambda_cache_per_s * T_ca_upper_s"
+beta_movement_source = "objective.lambda_movement_per_J * E_mov_upper_J"
 
 [prediction.vehicle]
 # 车辆预测 horizon H_p。当前实际值 5；修改需重跑车辆预测、GRU、scenario。
@@ -664,5 +669,5 @@ terminal_origin = 299
 "objective.omega_energy" = "EXPERIMENT_DESIGN"
 "objective.lambda_cache" = "EXPERIMENT_DESIGN"
 "objective.lambda_movement" = "EXPERIMENT_DESIGN"
-"objective.T_ref" = "TRAIN_ONLY_CALIBRATION"
-"objective.E_ref" = "TRAIN_ONLY_CALIBRATION"
+"objective.T_ref" = "ALGORITHM_DESIGN"
+"objective.E_ref" = "ALGORITHM_DESIGN"

@@ -484,6 +484,67 @@ def build_cache_nodes(
     }
 
 
+def initialize_cache_cost_normalization(
+    cache_nodes: dict[str, Any],
+    service_sizes_mb: np.ndarray,
+    lambda_cache: float,
+) -> dict[str, Any]:
+    """Fix the system cache-delay upper bound and its derived dimensionless weight.
+
+    The reference uses each node's full cache capacity as a conservative bound
+    on newly added service size. Catalog sizes are checked to represent the
+    zero-cost degenerate case, but are not used to claim an exactly attainable
+    maximum.
+    """
+
+    sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
+    capacities = np.asarray(cache_nodes["capacities_mb"], dtype=np.float64).reshape(-1)
+    rates = np.asarray(
+        cache_nodes["cache_backhaul_rate_bps"], dtype=np.float64
+    ).reshape(-1)
+    node_ids = list(cache_nodes["node_ids"])
+    if sizes.ndim != 1 or not np.isfinite(sizes).all():
+        raise ValueError("service_sizes_mb 必须是有限的一维数组。")
+    if np.any(sizes < 0.0):
+        raise ValueError("service_sizes_mb 不能为负数。")
+    if (
+        capacities.shape != (len(node_ids),)
+        or rates.shape != (len(node_ids),)
+        or not np.isfinite(capacities).all()
+        or not np.isfinite(rates).all()
+        or np.any(capacities < 0.0)
+        or np.any(rates <= 0.0)
+    ):
+        raise ValueError("Cache 节点容量或实际回传速率非法。")
+    lam = float(lambda_cache)
+    if not math.isfinite(lam) or lam < 0.0:
+        raise ValueError("lambda_cache 必须是非负有限数。")
+
+    feasible_positive_addition = any(
+        np.any((sizes > 0.0) & (sizes <= capacity + 1.0e-9))
+        for capacity in capacities
+    )
+    if feasible_positive_addition:
+        reference_s = float(np.sum(capacities * 8.0e6 / rates))
+        reference_kind = "conservative_capacity_upper_bound"
+    else:
+        reference_s = 0.0
+        reference_kind = "zero_no_feasible_positive_cache_addition"
+    beta_cache = lam * reference_s
+    metadata = {
+        "reference_s": reference_s,
+        "reference_kind": reference_kind,
+        "formula": "sum_m(8e6 * cache_capacity_m_MB / actual_backhaul_rate_m_bps)",
+        "beta_cache": beta_cache,
+        "beta_source": "objective.lambda_cache_per_s * T_ca_upper_s",
+        "service_count": int(sizes.size),
+        "cache_node_count": int(len(node_ids)),
+        "unit": "s",
+    }
+    cache_nodes["cache_cost_normalization"] = metadata
+    return dict(metadata)
+
+
 
 
 
@@ -524,13 +585,20 @@ def cache_update_cost_details(
 ) -> dict[str, Any]:
     """Expose download delays and costs without duplicating the formal formula."""
 
+    normalization = cache_nodes.get("cache_cost_normalization")
+    if not isinstance(normalization, dict):
+        raise RuntimeError(
+            "Cache 成本归一化参考量必须在环境初始化时固定。"
+        )
+
     return system_model.cache_update_cost(
         previous_cache,
         new_cache,
         cache_trigger,
         service_sizes_mb,
         cache_nodes["cache_backhaul_rate_bps"],
-        config.lambda_cache,
+        float(normalization["reference_s"]),
+        float(normalization["beta_cache"]),
     )
 
 

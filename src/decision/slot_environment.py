@@ -369,6 +369,13 @@ def _configuration_summary(
         "predictive_objective": None if prediction_skipped else result.objective_value,
         "cache_cost": result.cache_cost,
         "cache_download_delay_s": result.cache_download_delay_s,
+        "cache_download_delay_normalized": result.cache_result_summary.get(
+            "cache_download_delay_normalized"
+        ),
+        "cache_download_delay_reference_s": result.cache_result_summary.get(
+            "cache_download_delay_reference_s"
+        ),
+        "cache_cost_beta": result.cache_result_summary.get("cache_cost_beta"),
         "cache_cost_by_node": dict(
             result.cache_result_summary.get("cache_cost_by_node", {})
         ),
@@ -376,6 +383,15 @@ def _configuration_summary(
             result.cache_result_summary.get("cache_download_delay_s_by_node", {})
         ),
         "movement_energy": result.movement_energy,
+        "movement_energy_normalized": result.uav_result_summary.get(
+            "movement_energy_normalized"
+        ),
+        "movement_energy_reference_j": result.uav_result_summary.get(
+            "movement_energy_reference_j"
+        ),
+        "movement_cost_beta": result.uav_result_summary.get(
+            "movement_cost_beta"
+        ),
         "movement_cost": result.movement_cost,
         "outer_rounds": result.outer_rounds,
         "accepted_cache_updates": result.accepted_cache_updates,
@@ -727,19 +743,12 @@ def execute_slot(
     reward_final_started_at = (
         time.perf_counter() if exact_q_timing_profile is not None else 0.0
     )
+    # Both cost fields already contain beta times one normalized physical cost.
     system_utility = actual_q - cache_cost - movement_cost
     if exact_q_timing_profile is not None:
         exact_q_timing_profile["reward_final_combination_runtime"] += (
             time.perf_counter() - reward_final_started_at
         )
-    if not math.isclose(
-        system_utility,
-        actual_q - cache_cost - movement_cost,
-        rel_tol=1e-12,
-        abs_tol=1e-12,
-    ):
-        raise AssertionError("G(t)=Q(t)-C_ca(t)-C_q(t) 恒等式失败。")
-
     _record_slot_performance_profile(
         performance_profile,
         configuration_seconds,
@@ -840,33 +849,6 @@ def _position_arrays(positions: dict[str, Any]) -> dict[str, np.ndarray]:
     }
 
 
-def _cache_cost(
-    previous_cache_state: np.ndarray,
-    cache_state: np.ndarray,
-    cache_triggers: np.ndarray,
-    service_catalog: dict[str, Any],
-    cache_nodes: dict[str, Any],
-    cache_config: cache_configuration.CacheOptimizationConfig,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Compute download delay and Cache cost once from C_prev -> C_candidate."""
-
-    result = cache_configuration.cache_update_cost_details(
-        previous_cache_state,
-        cache_state,
-        cache_triggers,
-        service_catalog["service_sizes_mb"],
-        cache_nodes,
-        cache_config,
-    )
-    return (
-        float(result["cache_cost"]),
-        np.asarray(result["cache_download_delay_s_by_node"], dtype=np.float64),
-        np.asarray(result["cache_cost_by_node"], dtype=np.float64),
-    )
-
-
-
-
 def build_policy_target_configuration(
     previous_cache_state: np.ndarray,
     previous_uav_positions: dict[str, Any],
@@ -909,16 +891,23 @@ def build_policy_target_configuration(
         project_cfg,
         flight_boundary,
     )
-    cache_cost, cache_download_delay_s_by_node, cache_cost_by_node = _cache_cost(
+    cache_result = cache_configuration.cache_update_cost_details(
         previous_cache,
         final_cache,
         cache_trigger,
-        service_catalog,
+        service_catalog["service_sizes_mb"],
         cache_nodes,
         cache_config,
     )
     search = uav_configuration.uav_search_config_from_project(project_cfg)
-    movement_energy, movement_cost, _, _, _ = uav_configuration.movement_summary(
+    (
+        movement_energy,
+        movement_cost,
+        _,
+        _,
+        _,
+        movement_energy_normalized,
+    ) = uav_configuration.movement_summary(
         previous_uav,
         final_uav,
         {key: int(value) for key, value in uav_triggers.items()},
@@ -941,8 +930,8 @@ def build_policy_target_configuration(
         trigger_feasible=True,
         infeasible_reason="",
         predictive_utility=0.0,
-        cache_cost=float(cache_cost),
-        cache_download_delay_s=float(np.sum(cache_download_delay_s_by_node)),
+        cache_cost=float(cache_result["cache_cost"]),
+        cache_download_delay_s=float(cache_result["cache_download_delay_s"]),
         movement_energy=float(movement_energy),
         movement_cost=float(movement_cost),
         objective_value=0.0,
@@ -954,19 +943,39 @@ def build_policy_target_configuration(
         stop_reason="policy_target_prediction_skipped",
         cache_result_summary={
             "target_actions": [dict(value) for value in cache_actions],
-            "cache_download_delay_s": float(
-                np.sum(cache_download_delay_s_by_node)
+            "cache_download_delay_s": float(cache_result["cache_download_delay_s"]),
+            "cache_download_delay_normalized": float(
+                cache_result["cache_download_delay_normalized"]
             ),
+            "cache_download_delay_reference_s": float(
+                cache_result["cache_download_delay_reference_s"]
+            ),
+            "cache_cost_beta": float(cache_result["cache_cost_beta"]),
+            "cache_cost_reference_kind": cache_nodes[
+                "cache_cost_normalization"
+            ]["reference_kind"],
             "cache_download_delay_s_by_node": {
-                str(node_id): float(cache_download_delay_s_by_node[index])
+                str(node_id): float(
+                    cache_result["cache_download_delay_s_by_node"][index]
+                )
                 for index, node_id in enumerate(cache_nodes["node_ids"])
             },
             "cache_cost_by_node": {
-                str(node_id): float(cache_cost_by_node[index])
+                str(node_id): float(cache_result["cache_cost_by_node"][index])
                 for index, node_id in enumerate(cache_nodes["node_ids"])
             },
         },
-        uav_result_summary={"target_actions": [dict(value) for value in uav_actions]},
+        uav_result_summary={
+            "target_actions": [dict(value) for value in uav_actions],
+            "movement_energy_normalized": movement_energy_normalized,
+            "movement_energy_reference_j": search.movement_energy_reference_j,
+            "movement_cost_beta": search.beta_movement,
+            "movement_cost_reference_kind": (
+                "conservative_single_uav_speed_limit_upper_bound"
+                if search.movement_energy_reference_j > 0.0
+                else "zero_no_possible_positive_movement_energy"
+            ),
+        },
     )
 
 

@@ -3444,8 +3444,8 @@ def _allocate_cloud_resources_kkt(
 
     With ``x_i`` denoting a fraction of the total rate and ``y_i`` a fraction
     of the total CPU capacity, the utility loss has coefficients
-    ``a_i = L_i/R_total * (omega_T*psi_c/(T_ref*q_i) +
-    omega_E*P_i/E_ref)`` and ``b_i = omega_T*C_i/(T_ref*F_total)``.
+    ``a_i = L_i/R_total * (omega_T*psi_c/(T_v,max*q_i) +
+    omega_E*P_i/E_v,max)`` and ``b_i = omega_T*C_i/(T_v,max*F_total)``.
     The resource constraints are ``sum(x_i) <= 1`` and ``sum(y_i) <= 1``;
     the resulting reciprocal objectives are separable and convex. The existing
     bounded-simplex KKT solver exactly solves each independent pool.

@@ -32,6 +32,8 @@ SPARSE_COORDINATED_CACHE_POLICY_SCHEMA = project_config.SPARSE_COORDINATED_CACHE
 PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
 PER_SLOT_ANALYTIC_TASK_MODEL = "PER_SLOT_ANALYTIC"
 PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA = "configuration_per_slot_analytic_v1"
+NORMALIZED_COST_CONTRACT_VERSION = "max_feasible_cost_upper_bounds_v1"
+_REPORTED_COST_NORMALIZATION_CONTRACTS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,18 @@ def _assert_realization_context_compatible(
                 f"field={field}, reference={getattr(reference, field)!r}, "
                 f"candidate={getattr(candidate, field)!r}"
             )
+    reference_cost_normalization = reference.cfg.get("_meta", {}).get(
+        "reward_cost_normalization"
+    )
+    candidate_cost_normalization = candidate.cfg.get("_meta", {}).get(
+        "reward_cost_normalization"
+    )
+    if reference_cost_normalization != candidate_cost_normalization:
+        raise ValueError(
+            "Episode realization changes the fixed system reward-cost references: "
+            f"reference={reference_cost_normalization!r}, "
+            f"candidate={candidate_cost_normalization!r}"
+        )
     reference_observation = reference.observation_spec
     candidate_observation = candidate.observation_spec
     if (
@@ -363,6 +377,17 @@ def load_environment_context(
 ) -> EnvironmentContext:
     cfg = project_config.load_config(config_path)
     project_config.validate_for_formal_experiment(cfg)
+    configured_cost_contract = project_config.get_config_value(
+        cfg, "objective.cost_normalization.contract_version"
+    )
+    if (
+        configured_cost_contract is not None
+        and configured_cost_contract != NORMALIZED_COST_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "Unsupported objective.cost_normalization.contract_version: "
+            f"{configured_cost_contract!r}"
+        )
     data_protocol = project_config.get_ppo_data_protocol(cfg)
     root = Path(cfg["_meta"]["project_root"])
     realization = (
@@ -405,6 +430,62 @@ def load_environment_context(
         raise ValueError("训练起点范围超出 prediction_scenarios。")
     first_origin = cache_configuration.scenario_at_origin(scenarios, train_start)
     cache_nodes = cache_configuration.build_cache_nodes(first_origin, cache_cfg)
+    expected_cache_node_count = (
+        int(project_config.get_config_value(cfg, "simulation.num_service_vehicles"))
+        + int(project_config.get_config_value(cfg, "nodes.rsu.count"))
+        + int(project_config.get_config_value(cfg, "nodes.uav.count"))
+    )
+    if len(cache_nodes["node_ids"]) != expected_cache_node_count:
+        raise ValueError(
+            "Cache 节点数与固定系统配置不一致："
+            f"actual={len(cache_nodes['node_ids'])}, "
+            f"expected={expected_cache_node_count}"
+        )
+    cache_cost_reference = cache_configuration.initialize_cache_cost_normalization(
+        cache_nodes,
+        service_catalog["service_sizes_mb"],
+        cache_cfg.lambda_cache,
+    )
+    movement_reference_j = uav_configuration.movement_energy_upper_bound_j(cfg)
+    lambda_movement = float(
+        project_config.get_config_value(cfg, "objective.lambda_movement")
+    )
+    movement_cost_reference = {
+        "reference_j": movement_reference_j,
+        "reference_kind": (
+            "conservative_single_uav_speed_limit_upper_bound"
+            if movement_reference_j > 0.0
+            else "zero_no_possible_positive_movement_energy"
+        ),
+        "formula": "sum_u(xi_mov_u_J_per_m * vmax_u_m_per_s * slot_duration_s)",
+        "beta_movement": lambda_movement * movement_reference_j,
+        "beta_source": "objective.lambda_movement_per_J * E_mov_upper_J",
+        "uav_count": int(project_config.get_config_value(cfg, "nodes.uav.count")),
+        "unit": "J",
+    }
+    cfg["_meta"]["reward_cost_normalization"] = {
+        "contract_version": NORMALIZED_COST_CONTRACT_VERSION,
+        "cache": cache_cost_reference,
+        "movement": movement_cost_reference,
+    }
+    reference_record = json.dumps(
+        cfg["_meta"]["reward_cost_normalization"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if reference_record not in _REPORTED_COST_NORMALIZATION_CONTRACTS:
+        print(
+            "[reward-cost normalization] "
+            f"T_ca_upper={cache_cost_reference['reference_s']:.12g} s "
+            f"({cache_cost_reference['reference_kind']}), "
+            f"beta_ca={cache_cost_reference['beta_cache']:.12g}; "
+            f"E_mov_upper={movement_cost_reference['reference_j']:.12g} J "
+            f"({movement_cost_reference['reference_kind']}), "
+            f"beta_q={movement_cost_reference['beta_movement']:.12g}",
+            flush=True,
+        )
+        _REPORTED_COST_NORMALIZATION_CONTRACTS.add(reference_record)
     action_spec = ConfigurationActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
     policy_schema = str(
         project_config.get_config_value(

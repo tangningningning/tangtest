@@ -48,9 +48,13 @@ except ModuleNotFoundError:  # pragma: no cover - only for Python < 3.11
 def find_project_root() -> Path:
     candidates = (Path(__file__).resolve().parents[2], Path.cwd().resolve())
     for candidate in candidates:
-        if (candidate / "configs" / "proposed" / "system_config.toml").is_file() and (candidate / "data").is_dir():
+        if (
+            candidate / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
+        ).is_file() and (candidate / "data").is_dir():
             return candidate
-    raise FileNotFoundError("无法找到包含 configs/proposed/system_config.toml 的项目根目录。")
+    raise FileNotFoundError(
+        "无法找到包含 configs/proposed/alternating_actor_updates_v1.toml 的项目根目录。"
+    )
 
 
 def resolve_path(project_root: Path, value: str | Path) -> Path:
@@ -96,7 +100,7 @@ def raw_config_sha256(path: str | Path) -> str:
 
 
 def load_config(
-    path: str | Path = "configs/proposed/system_config.toml",
+    path: str | Path = "configs/proposed/alternating_actor_updates_v1.toml",
     *,
     require_artifacts: bool = True,
 ) -> dict[str, Any]:
@@ -713,7 +717,10 @@ def validate_config(
 
     uav_count = int(get_config_value(config, "nodes.uav.count"))
     if uav_count < 1:
-        raise ValueError("nodes.uav.count 必须至少为1，请检查 configs/proposed/system_config.toml。")
+        raise ValueError(
+            "nodes.uav.count 必须至少为1，请检查 "
+            "configs/proposed/alternating_actor_updates_v1.toml。"
+        )
     if require_artifacts:
         uav_instances = get_config_value(config, "nodes.uav.instances", [])
         if len(uav_instances) != uav_count:
@@ -757,7 +764,8 @@ def validate_config(
             configured_tv,
         ):
             raise ValueError(
-                "vehicle_roles.json 车辆数量必须与 configs/proposed/system_config.toml 的正式配置一致。"
+                "vehicle_roles.json 车辆数量必须与 "
+                "configs/proposed/alternating_actor_updates_v1.toml 的正式配置一致。"
             )
         if len(research) != len(set(research)) or len(sv) != len(set(sv)) or len(tv) != len(set(tv)):
             raise ValueError("vehicle_roles.json 研究车辆角色列表不能包含重复 ID。")

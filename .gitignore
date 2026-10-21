@@ -9,6 +9,8 @@
 .runs/
 
 adaptive_cache_mec.zip
+# Generated environment data
+/environment_data/
 
 .data/episode_pools/
 
@@ -56,7 +58,4 @@ build/
 dist/
 *.egg-info/
 
-# =========================
-# Reference paper
-# =========================
-11.pdf
+

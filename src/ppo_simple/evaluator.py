@@ -50,7 +50,7 @@ from .trainer import (
 )
 
 
-PROPOSED_CONFIG_PATH = "configs/proposed/system_config.toml"
+PROPOSED_CONFIG_PATH = "configs/proposed/alternating_actor_updates_v1.toml"
 DEFAULT_ENVIRONMENT_COUNT = 20
 DEFAULT_POLICY_REPEATS = 1
 EPISODE_METRIC_NAMES = (

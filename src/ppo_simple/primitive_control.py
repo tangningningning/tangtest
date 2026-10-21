@@ -480,7 +480,7 @@ def _uav_target_position_feature(
         for key, value in current_uav.items()
     }
     trial[candidate.uav_id] = np.asarray(candidate.target_position, dtype=np.float64).copy()
-    movement_energy, movement_cost, _, _, _ = uav_configuration.movement_summary(
+    movement_energy, movement_cost, _, _, _, _ = uav_configuration.movement_summary(
         previous_uav,
         trial,
         uav_triggers,

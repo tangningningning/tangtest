@@ -27,7 +27,7 @@ from decision import task_allocation  # noqa: E402
 from ppo_simple.interface import aligned_train_steps, load_environment_context  # noqa: E402
 
 
-CONFIG_PATH = ROOT / "configs" / "proposed" / "system_config.toml"
+CONFIG_PATH = ROOT / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
 POOL_ROOT = ROOT / "environment_data" / "proposed_joint_training"
 POOL_MANIFEST_PATH = POOL_ROOT / "formal_pool_manifest.json"
 EFFICIENCY_JSON = ROOT / "reports" / "matching_kkt_training_efficiency.json"

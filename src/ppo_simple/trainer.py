@@ -3936,6 +3936,7 @@ def run_training(
     generate_missing_episodes: bool = False,
     episode_generation_device: str = "cpu",
     seed: int = 0,
+    macro_actor_learning_rate_override: float | None = None,
     stop_after_policy_updates: int | None = None,
     resume: bool = False,
     resume_checkpoint_path: str | Path | None = None,
@@ -4069,6 +4070,7 @@ def run_training(
     _seed_everything(seed)
     trainer = PPOTrainer(
         context,
+        macro_actor_learning_rate_override=macro_actor_learning_rate_override,
         policy_update_total=policy_update_total,
         capture_macro_transition_trace=save_macro_transition_trace,
     )
@@ -5066,6 +5068,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generate-missing-episodes", action="store_true")
     parser.add_argument("--episode-generation-device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--macro-actor-learning-rate", type=float, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--resume-checkpoint",
@@ -5089,6 +5092,7 @@ def main(argv: list[str] | None = None) -> int:
         generate_missing_episodes=args.generate_missing_episodes,
         episode_generation_device=args.episode_generation_device,
         seed=args.seed,
+        macro_actor_learning_rate_override=args.macro_actor_learning_rate,
         stop_after_policy_updates=args.stop_after_policy_updates,
         resume=args.resume,
         resume_checkpoint_path=args.resume_checkpoint,

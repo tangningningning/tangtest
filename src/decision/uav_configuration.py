@@ -55,6 +55,8 @@ class UavSearchConfig:
     movement_energy_coefficient_j_per_m: float
     movement_fixed_cost: float
     lambda_movement: float
+    movement_energy_reference_j: float
+    beta_movement: float
 
     @property
     def max_move_distance_m(self) -> float:
@@ -67,6 +69,25 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
     """从统一 TOML 配置构造 UAV 搜索配置。"""
 
     get = project_config.get_config_value
+    lambda_movement = float(get(config, "objective.lambda_movement"))
+    cost_normalization = get(config, "_meta.reward_cost_normalization", {})
+    movement_normalization = (
+        cost_normalization.get("movement", {})
+        if isinstance(cost_normalization, dict)
+        else {}
+    )
+    reference_value = movement_normalization.get("reference_j")
+    movement_energy_reference_j = (
+        movement_energy_upper_bound_j(config)
+        if reference_value is None
+        else float(reference_value)
+    )
+    beta_value = movement_normalization.get("beta_movement")
+    beta_movement = (
+        lambda_movement * movement_energy_reference_j
+        if beta_value is None
+        else float(beta_value)
+    )
     return UavSearchConfig(
         coarse_num_angles=int(get(config, "algorithm.uav.coarse_num_angles")),
         coarse_radius_fractions=tuple(
@@ -95,8 +116,34 @@ def uav_search_config_from_project(config: dict[str, Any]) -> UavSearchConfig:
             get(config, "nodes.uav.movement.movement_energy_coefficient_j_per_m")
         ),
         movement_fixed_cost=float(get(config, "nodes.uav.movement.movement_fixed_cost")),
-        lambda_movement=float(get(config, "objective.lambda_movement")),
+        lambda_movement=lambda_movement,
+        movement_energy_reference_j=movement_energy_reference_j,
+        beta_movement=beta_movement,
     )
+
+
+def movement_energy_upper_bound_j(config: dict[str, Any]) -> float:
+    """Return the fixed single-UAV speed-limited system energy upper bound."""
+
+    get = project_config.get_config_value
+    uav_count = int(get(config, "nodes.uav.count"))
+    dt_s = float(get(config, "simulation.dt_s"))
+    max_speed_mps = float(get(config, "nodes.uav.max_horizontal_speed_mps"))
+    xi_j_per_m = float(
+        get(config, "nodes.uav.movement.movement_energy_coefficient_j_per_m")
+    )
+    if (
+        uav_count < 0
+        or not all(
+            math.isfinite(value)
+            for value in (dt_s, max_speed_mps, xi_j_per_m)
+        )
+        or dt_s <= 0.0
+        or max_speed_mps < 0.0
+        or xi_j_per_m < 0.0
+    ):
+        raise ValueError("UAV 移动能耗参考量参数非法。")
+    return float(uav_count * xi_j_per_m * max_speed_mps * dt_s)
 
 
 def uav_ids_from_project(config: dict[str, Any]) -> list[str]:
@@ -576,7 +623,14 @@ def movement_summary(
     new_positions: dict[str, np.ndarray],
     triggers: dict[str, int],
     search_config: UavSearchConfig,
-) -> tuple[float, float, dict[str, float], dict[str, float], dict[str, float]]:
+) -> tuple[
+    float,
+    float,
+    dict[str, float],
+    dict[str, float],
+    dict[str, float],
+    float,
+]:
     """用 system_model.uav_movement_cost 计算一次性最终移动成本。"""
 
     total_energy = 0.0
@@ -584,6 +638,7 @@ def movement_summary(
     displacement: dict[str, float] = {}
     energy_by_uav: dict[str, float] = {}
     cost_by_uav: dict[str, float] = {}
+    normalized_energy = 0.0
     for uav_id in old_positions:
         result = system_model.uav_movement_cost(
             old_positions[uav_id],
@@ -593,12 +648,28 @@ def movement_summary(
             search_config.max_horizontal_speed_mps,
             search_config.movement_energy_coefficient_j_per_m,
             search_config.movement_fixed_cost,
-            search_config.lambda_movement,
+            search_config.movement_energy_reference_j,
+            search_config.beta_movement,
             tolerance_m=search_config.position_tolerance_m,
         )
         displacement[uav_id] = float(result["distance_m"])
         energy_by_uav[uav_id] = float(result["movement_energy_j"])
         cost_by_uav[uav_id] = float(result["movement_cost"])
+        normalized_energy += float(result["movement_energy_normalized"])
         total_energy += energy_by_uav[uav_id]
         total_cost += cost_by_uav[uav_id]
-    return total_energy, total_cost, displacement, energy_by_uav, cost_by_uav
+    energy_tolerance_j = max(
+        1.0e-12, search_config.movement_energy_reference_j * 1.0e-12
+    )
+    if total_energy > search_config.movement_energy_reference_j + energy_tolerance_j:
+        raise AssertionError(
+            "joint actual UAV movement energy exceeds the fixed normalization reference"
+        )
+    return (
+        total_energy,
+        total_cost,
+        displacement,
+        energy_by_uav,
+        cost_by_uav,
+        normalized_energy,
+    )

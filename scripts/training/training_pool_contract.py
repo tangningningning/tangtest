@@ -28,10 +28,9 @@ from ppo_simple.interface import (  # noqa: E402
 )
 
 
-CONFIG_RELATIVE = Path("configs/proposed/system_config.toml")
-ALTERNATING_ACTOR_UPDATES_CONFIG_RELATIVE = Path(
-    "configs/proposed/alternating_actor_updates_v1.toml"
-)
+CONFIG_RELATIVE = Path("configs/proposed/alternating_actor_updates_v1.toml")
+# Frozen pool manifests retain their original source-path provenance.
+POOL_MANIFEST_SOURCE_CONFIG_RELATIVE = Path("configs/proposed/system_config.toml")
 TRAIN_POOL_RELATIVE = Path("environment_data/proposed_joint_training")
 VALIDATION_POOL_RELATIVE = Path("environment_data/proposed_joint_validation")
 DEFAULT_TRAINING_SEED_START = 20001
@@ -148,7 +147,7 @@ def _validate_pool_config_compatibility(
             "the loader joins explicit IDs and preserves their within-role NPZ order; all "
             "generation config fields remain equal"
         )
-    if manifest.get("config_path") != CONFIG_RELATIVE.as_posix():
+    if manifest.get("config_path") != POOL_MANIFEST_SOURCE_CONFIG_RELATIVE.as_posix():
         raise ValueError(
             "Training Pool config_path does not identify the formal config."
         )
@@ -344,9 +343,7 @@ def validate_formal_training_pool_for_run(
     """Run the lightweight generation-contract gate for a new formal run."""
 
     root = Path(formal_root).expanduser().resolve(strict=True)
-    alternating_config = (
-        root / ALTERNATING_ACTOR_UPDATES_CONFIG_RELATIVE
-    ).resolve(strict=True)
+    alternating_config = (root / CONFIG_RELATIVE).resolve(strict=True)
     actual_config = Path(config_path).expanduser().resolve(strict=True)
     if actual_config != alternating_config:
         raise ValueError(

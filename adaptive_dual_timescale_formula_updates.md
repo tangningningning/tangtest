@@ -52,7 +52,25 @@ z_m^ca(k) = I[存在 f: c_{m,f}^{(k)} != c_{m,f}^{(k-1)}]
 
 重新进行 Macro 决策不等于发生 Cache 更新。若 `C_k = C_{k-1}`，则 `z_m^ca(k)=0`，loaded amount 为 0，且不产生 Cache reconfiguration cost；若配置不同，才在 boundary slot 执行实际更新并调用现有 Cache loading/cost helper。更新 cost 只在新配置生效的 boundary slot 计算一次。
 
-现有 Cache loading / cost 数学公式保持原样；本版只改变其调用时机。实现路径：`rollout._cache_candidates`、`rollout.collect_dual_timescale_episode`、`rollout.cache_update_mask`、`slot_environment.execute_configured_slot` 和 `slot_environment._cache_cost`。
+实际 Cache 下载仍按新增服务计算，服务大小是十进制 MB、回传速率是 bit/s：
+
+```text
+T_ca,m(t) = sum_f [(8e6 * s_f_MB / R_back,m_bps) * max(c_new,mf(t)-c_old,mf(t), 0)]
+T_ca_upper = sum_m [8e6 * cache_capacity_m_MB / R_back,m_bps]
+C_ca_norm(t) = sum_m T_ca,m(t) / T_ca_upper
+```
+
+`T_ca_upper` 在环境初始化时按正式节点容量和实际回传速率固定，是保守上界，不表示离散服务目录下必然可达到。零参考量时仅允许零下载时延，成本归一化结果为零。配置成本通过 `beta_ca=lambda_cache*T_ca_upper` 进入 Slot 目标；`lambda_cache` 保留为既有效用尺度来源，未直接作用于归一化成本。
+
+UAV 能耗仍使用实际前后水平二维位置差：
+
+```text
+E_mov,u(t) = xi_mov,u * ||q_u(t)-q_u(t-1)||_2
+E_mov_upper = sum_u [xi_mov,u * vmax_u * dt]
+C_q_norm(t) = sum_u E_mov,u(t) / E_mov_upper
+```
+
+`E_mov_upper` 是逐 UAV 最大速度位移的保守上界；位置边界与联合安全距离只会进一步限制实际能耗。零参考量时仅允许零移动能耗。`beta_q=lambda_movement*E_mov_upper` 是由既有效用尺度系数换算出的无量纲权重。正式奖励仍由 `slot_environment.execute_configured_slot`、`cache_configuration.cache_update_cost_details` 和 `slot_environment.execute_slot` 组合；`Q(t)`、缓存罚项、移动罚项分别只进入 `G(t)=Q(t)-beta_ca*C_ca_norm(t)-beta_q*C_q_norm(t)` 一次。
 
 ## 3. Macro frame reward 与 SMDP target
 
@@ -189,7 +207,7 @@ Macro update 另记录 `macro_sampled_termination_decisions_per_frame_mean`、`m
 - UAV safety distance
 - Transfer-Exchange Matching
 - KKT resource allocation
-- slot utility `G(t)`
+- Matching/KKT 任务效用 `Q(t)` 及任务效用内部公式
 - 现有车辆/popularity prediction 模块与 prediction artifacts
 
 策略 observation 和候选特征复用当前 prediction artifact 和 observation builder；prediction 网络不在 PPO rollout 中重新训练。正式每 slot 只执行采样到的真实配置，并调用当前 slot environment 中 Matching/KKT 路径。
@@ -218,12 +236,15 @@ With one KEEP candidate and `K_s` legal UPDATE candidates, subtracting `log(K_s)
 | Cache KEEP/UPDATE candidate cardinality correction 与确定性组选择 | `src/ppo_simple/policy.py::_cardinality_corrected_cache_logits`; `_group_aware_deterministic_candidate` | IMPLEMENTED：训练采样与评价选择共用当前 Cache categorical 概率 |
 | 状态相关 termination、Cache persistence、Macro reward | `src/ppo_simple/rollout.py::collect_dual_timescale_episode`; `src/ppo_simple/policy.py::sample_termination` | IMPLEMENTED：逐 slot sampled CONTINUE/TERMINATE、terminal/max 强制边界不计 logprob |
 | Cache update mask 与 boundary cost | `src/ppo_simple/rollout.py::cache_update_mask`; `src/decision/slot_environment.py::execute_configured_slot` | IMPLEMENTED / VERIFIED：相同/变化配置的成本合成检查 |
+| Cache 下载时延最大上界归一化 | `src/decision/cache_configuration.py::initialize_cache_cost_normalization`; `src/common/system_model.py::cache_update_cost` | IMPLEMENTED：容量上界固定于环境初始化；实际下载时延和归一化成本均有限、非负并受上界检查 |
+| UAV 移动能耗最大上界归一化 | `src/decision/uav_configuration.py::movement_energy_upper_bound_j`; `src/common/system_model.py::uav_movement_cost` | IMPLEMENTED：速度与 Slot 时长形成单 UAV 上界之和；只按实际水平位移计费 |
+| 归一化成本与 Checkpoint 合同 | `src/ppo_simple/interface.py::load_environment_context`; `src/ppo_simple/trainer.py::PPOTrainer.load_checkpoint` | IMPLEMENTED：运行上下文固定成本参考量；训练恢复仍按配置 raw/semantic hash 严格校验。评价专用的旧 Checkpoint 成本合同兼容门禁在 `evaluator.py` 中未实现 |
 | actual-duration SMDP GAE | `src/ppo_simple/rollout.py::compute_macro_smdp_gae` | IMPLEMENTED：SMDP GAE 与 N2 使用真实 adaptive duration |
 | Micro ordinary GAE | `src/ppo_simple/rollout.py::compute_gae` | IMPLEMENTED / VERIFIED：代码路径与 terminal 截断检查 |
 | group-balanced masked conditional UAV policy | `src/ppo_simple/policy.py`; `src/ppo_simple/rollout.py::_uav_candidates` | IMPLEMENTED / VERIFIED：synthetic sample/evaluate、mask support 与 log probability 检查 |
 | STAY/MOVE 组熵软底限与 actor-only 梯度 | `src/ppo_simple/policy.py::evaluate_micro_joint`; `src/ppo_simple/trainer.py::_update_micro` | IMPLEMENTED：从 0.90 概率软上限推导 `H_floor`，低熵时正则，保持 joint PPO |
 | Micro/Macro 独立 target KL | `src/ppo_simple/trainer.py::_update_micro`; `src/ppo_simple/trainer.py::_update_macro` | IMPLEMENTED：Micro 0.02、Macro 0.10，Micro joint KL 超过 0.03 时提前停止 |
 | 四条 episode-local rollout 合并为一次 PPO update | `src/ppo_simple/trainer.py::PPOTrainer.update_from_episodes` | IMPLEMENTED：源码实现；本轮 synthetic batching 检查 |
-| 物理系统与 allocation 数学不变 | `src/decision/task_allocation.py`; `src/decision/slot_environment.py` | UNCHANGED / VERIFIED：task allocation 无 diff，slot environment 仅新增最终配置入口 |
+| 任务分配、物理成本原始量与 slot reward 聚合边界 | `src/decision/task_allocation.py`; `src/decision/slot_environment.py` | Matching/KKT 与实际时延/能耗公式保持；成本归一化和系统效用合同已更新 |
 
 本次没有从 GitHub 复制或引入代码，也没有增加 dependency。Masked PPO 遵循任务说明给出的 MaskablePPO 设计语义：先 mask 再构造 distribution、rollout 保存 masks、evaluate 复用历史 action support。

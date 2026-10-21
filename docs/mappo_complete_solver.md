@@ -2,9 +2,41 @@
 
 ## 正式实现与入口
 
-正式算法为 **Alternating Actor Optimization V1（MAPPO）**（算法标识 `ADAPTIVE_CACHE_UAV_JOINT_MAPPO`），Checkpoint 方法为 `ADAPTIVE_CACHE_UAV_MAPPO`。唯一训练入口为 `scripts/training/mainline_runner.py`，它调用 `src/ppo_simple/trainer.py:PPOTrainer`；Trainer 模块不再作为独立命令行入口。冻结评价入口为 `python -m ppo_simple.evaluator` / `ppo-eval`。这里的 Joint 表示联合 Cache/UAV 策略；Actor 更新采用 Macro/Micro 交替调度。正式算法配置为 `configs/proposed/alternating_actor_updates_v1.toml`；`configs/proposed/system_config.toml` 仍承载共享物理系统和数据生成参数。
+正式算法为 **Alternating Actor Optimization V1（MAPPO）**（算法标识 `ADAPTIVE_CACHE_UAV_JOINT_MAPPO`），Checkpoint 方法为 `ADAPTIVE_CACHE_UAV_MAPPO`。唯一训练入口为 `scripts/training/mainline_runner.py`，它调用 `src/ppo_simple/trainer.py:PPOTrainer`；Trainer 模块不再作为独立命令行入口。冻结评价入口为 `python -m ppo_simple.evaluator` / `ppo-eval`。这里的 Joint 表示联合 Cache/UAV 策略；Actor 更新采用 Macro/Micro 交替调度。正式训练、评价及共享物理系统和数据生成参数统一使用 `configs/proposed/alternating_actor_updates_v1.toml`。
 
-执行仍由正式环境完成：Cache 配置进入 `slot_environment.execute_configured_slot`，任务匹配与资源分配继续使用原 Matching/KKT，奖励继续来自正式 `SlotExecutionResult.system_utility`。本改动没有改变任务效用、Cache 配置成本、UAV 移动成本或奖励公式。
+执行仍由正式环境完成：Cache 配置进入 `slot_environment.execute_configured_slot`，任务匹配与资源分配继续使用原 Matching/KKT，奖励来自正式 `SlotExecutionResult.system_utility`。
+
+## Slot 系统效用与成本归一化
+
+每个任务的效用为 `q_v(t)=omega_delay*(1-T_v(t)/T_v,max)+omega_energy*(1-E_v,veh(t)/E_v,max)`。`T_v(t)` 用秒计量，`E_v,veh(t)` 用焦耳计量；两者分别除以固定的系统级时延与车辆能耗上界。正式配置没有任务截止时间或任务级能耗预算，因此所有任务共用这两个系统级参考值。当前代码仍通过兼容配置键 `objective.T_ref`、`objective.E_ref` 读取它们。`Q(t)=sum_v q_v(t)` 是 Slot 内实际任务效用之和，因而为无量纲值。
+
+本次正式配置的任务模型是每 Slot 独立完成，`T_v` 包含上传与计算时延；Cloud 上传项乘 `psi_c=17`，边缘节点上传项不乘该系数。最大任务规模由 `D_max=1000 KB*8000 bit/KB*(1+0.20)=9.6e6 bit`、`L_max=1000 cycle/bit*D_max*(1+0.10)=10.56e9 cycle` 给出。KKT 资源份额下限为 `1e-6`。按 `node_positions.json` 中 SUMO 区域边界对角线 `2664.329 m` 计算，最小地面链路速率下界为 `119.381 bit/s`，最小空地链路速率下界为 `169.464 bit/s`；Cloud 最小共享速率为 `20 Mbps*1e-6=20 bit/s`。因此对 Cloud、SV、RSU、UAV 分别计算 `T_r^upper=psi_r*D_max/R_r,min+L_max/F_r,min` 后取最大，得到 `T_v,max=10,640,415 s`（向上取整）。SV 的 1 GHz CPU 与最小 CPU 份额决定该上界；Cloud 路径上界为 `8,688,000 s`。这是覆盖当前合法路径的保守上界，不是精确可达最大值。
+
+车辆能耗口径只包含上传无线发射能耗，不含计算能耗；Cloud 的 `psi_c` 不进入能耗。以 `P_tx=0.1995262315 W` 和各路径最小速率计算 `E_r^upper=P_tx*D_max/R_r,min` 后取最大，得到 `E_v,max=95,772.59112 J`，由 Cloud 的 `20 bit/s` 最小共享速率决定。该值同样是保守上界，不是训练集统计分位数。
+
+缓存下载时延只按实际执行前后的缓存配置计算：
+
+```text
+T_ca,m(t) = sum_f [(8e6 * s_f_MB / R_back,m_bps) * max(c_new,mf(t)-c_old,mf(t), 0)]
+T_ca_upper = sum_m [8e6 * cache_capacity_m_MB / R_back,m_bps]
+C_ca_norm(t) = sum_m T_ca,m(t) / T_ca_upper
+```
+
+服务大小使用十进制 MB，回传速率使用 bit/s，因此 `8e6` 的单位换算正确。`T_ca_upper` 是以各节点缓存容量为依据的保守系统上界；离散服务目录和合法更新集合可能使真实最大值更小。缓存删除不计下载开销，UPDATE 意图不单独计费。
+
+UAV 移动能耗仍使用实际水平二维位移：
+
+```text
+E_mov,u(t) = xi_mov,u * ||q_u(t)-q_u(t-1)||_2
+E_mov_upper = sum_u [xi_mov,u * vmax_u * dt]
+C_q_norm(t) = sum_u E_mov,u(t) / E_mov_upper
+```
+
+`E_mov_upper` 是逐 UAV 速度上界之和；地图边界和多 UAV 安全距离可能降低联合可达最大值，所以按保守上界记录。位置不变时能耗为零，策略输出 MOVE 标签本身不计费。
+
+正式系统目标为 `G(t)=Q(t)-beta_ca*C_ca_norm(t)-beta_q*C_q_norm(t)`。当前正式配置保留原来的 `lambda_cache=2e-5 s^-1` 与 `lambda_movement=5e-6 J^-1` 作为效用尺度来源，并在环境初始化时转换为无量纲权重：`beta_ca=lambda_cache*T_ca_upper`、`beta_q=lambda_movement*E_mov_upper`。对于当前 5 个 SV、2 个 RSU、2 个 UAV，容量上界给出 `T_ca_upper=6000 s`、`beta_ca=0.12`；`dt=1 s`、每 UAV `vmax=15 m/s`、`xi_mov=15 J/m`、2 个 UAV 给出 `E_mov_upper=450 J`、`beta_q=0.00225`。两类成本在 Slot 系统效用中各扣除一次。
+
+参考量在环境初始化时由固定系统配置生成并写入运行时上下文及初始化日志。由于 `beta=lambda*reference`，本次归一化在数值上等价于旧 `lambda*实际时延/能耗` 奖励。冻结评价入口只为当前正式配置和旧正式 Runner 配置的已知语义哈希登记该等价关系，并将旧版记录为 `legacy_formula_algebraically_reward_equivalent`；其它目标或未知配置哈希会被拒绝。严格训练恢复仍受现有原始配置哈希门禁约束，旧 Checkpoint 不能作为新配置的严格 Resume。Checkpoint 格式、Actor/网络结构及动作 Schema 不变。
 
 ## 决策信息与双时间尺度
 

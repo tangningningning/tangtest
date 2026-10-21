@@ -19,6 +19,7 @@ from typing import Any, Sequence
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FORMAL_CONFIG_RELATIVE = Path("configs/proposed/alternating_actor_updates_v1.toml")
 for import_root in (
     PROJECT_ROOT / "src",
     PROJECT_ROOT / "scripts" / "training",
@@ -251,7 +252,9 @@ def prepare_training_labels(
         "split_schema": "episode_grouped_fit_early_stop_calibration_v1",
         "training_pool_manifest_sha256": pool_info["manifest_sha256"],
         "training_pool_manifest_path": str(Path(pool_info["manifest_path"]).resolve()),
-        "config_sha256": pool_info["runtime_config_sha256"],
+        "config_sha256": cache_configuration.project_config.raw_config_sha256(
+            project_root / FORMAL_CONFIG_RELATIVE
+        ),
         "loss_profile_sha256": profile_sha256,
         "episode_seeds": episode_seeds,
         "state_slots": state_slots,
@@ -620,7 +623,9 @@ def prepare_state_coverage_training_labels(
         "search_schema": predictive_global_cache.SEARCH_SCHEMA,
         "label_source_split": "train",
         "training_pool_manifest_sha256": pool_info["manifest_sha256"],
-        "config_sha256": pool_info["runtime_config_sha256"],
+        "config_sha256": cache_configuration.project_config.raw_config_sha256(
+            project_root / FORMAL_CONFIG_RELATIVE
+        ),
         "loss_profile_sha256": profile_sha256,
         "episode_seeds": seeds,
         "excluded_episode_ids": sorted(excluded),
@@ -719,7 +724,7 @@ def fit_from_training_dataset(
     if metadata.get("training_pool_manifest_sha256") != current_pool_info["manifest_sha256"]:
         raise ValueError("Training label dataset was built from a different pool manifest")
     if metadata.get("config_sha256") != cache_configuration.project_config.raw_config_sha256(
-        project_root / "configs" / "proposed" / "system_config.toml"
+        project_root / FORMAL_CONFIG_RELATIVE
     ):
         raise ValueError("label dataset config hash does not match the current formal system config")
     with np.load(dataset_path, allow_pickle=False) as data:

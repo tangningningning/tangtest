@@ -36,7 +36,7 @@ from decision import slot_environment, task_allocation  # noqa: E402
 from ppo_simple.interface import aligned_train_steps, load_environment_context  # noqa: E402
 
 
-CONFIG_PATH = PROJECT_ROOT / "configs" / "proposed" / "system_config.toml"
+CONFIG_PATH = PROJECT_ROOT / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
 POOL_ROOT = PROJECT_ROOT / "environment_data" / "proposed_joint_training"
 POOL_MANIFEST_PATH = POOL_ROOT / "formal_pool_manifest.json"
 REPORT_MD = PROJECT_ROOT / "reports" / "matching_kkt_training_efficiency.md"
@@ -472,10 +472,10 @@ def build_report(payload: dict[str, Any]) -> str:
         f"- 工作区基线状态：本任务开始时已有大量未跟踪数据与报告；诊断只新增本脚本及本报告的 Markdown/JSON，不改写已有文件。",
         f"- Python：`{payload['environment']['python_executable']}`；`sys.prefix`=`{payload['environment']['python_prefix']}`。Conda 环境核验：`{payload['environment']['conda_environment']}`。",
         f"- 硬件：`{payload['environment']['platform']}`；处理器 `{payload['environment']['processor'] or 'OS 未提供处理器型号'}`；逻辑 CPU `{payload['environment']['logical_cpu_count']}`；内存 `{payload['environment'].get('total_memory_gib') if payload['environment'].get('total_memory_gib') is not None else 'NOT_AVAILABLE'} GiB`。",
-        f"- 配置：`configs/proposed/system_config.toml`，SHA-256 `{cfg['sha256']}`。Training Pool Manifest SHA-256 `{payload['training_pool']['manifest_sha256']}`。",
+        f"- 配置：`{cfg['path']}`，SHA-256 `{cfg['sha256']}`。Training Pool Manifest SHA-256 `{payload['training_pool']['manifest_sha256']}`。",
         f"- Pool 配置哈希与当前配置哈希相同：`{payload['training_pool']['config_hash_matches_current']}`；任务生成合同逐字段一致且 Service Catalog 哈希匹配：`{payload['data_contract']['valid']}`。",
         "- Pool 的完整配置哈希与当前配置哈希不一致；任务生成合同字段和服务目录哈希通过核对，因此报告只确认任务数据合同一致，不声称 Pool 完整参数快照与当前配置完全相同。执行测量使用当前本地配置。",
-        "- 当前工作区还存在 `configs/proposed/system_config.toml` 的未提交成本系数差异（`lambda_cache=0.005`、`lambda_movement=5.0e-6`）；本诊断未编辑该文件并保留该差异。冻结 Cache/UAV 不触发配置成本，因此不改变本次 Matching/KKT 的任务评价。",
+        "- 本诊断冻结 Cache/UAV 状态，不触发 Cache 更新或 UAV 移动成本。",
         f"- 仅扫描 `{payload['training_pool']['path']}`。未读取 Validation/Test。Pool 声明 `{payload['training_pool']['episode_count']}` 个 Episode、每 Episode `{payload['training_pool']['slots_per_episode']}` Slot；其中经 Pool Manifest 与 Episode Manifest 绑定且任务表覆盖完整的 Episode `{payload['sample_scan']['manifest_attested_complete_episodes_scanned']}` 个。",
         "- Slot 任务数定义为 `tasks.csv` 对该 Slot 的实际行中 `arrival=1` 的数量；每个样本还与正式 `aligned_train_steps()` 的 `len(actual_tasks)` 核对。任务输入字段单位按正式 `Task.input_bits` 处理，汇总以十进制 MB 表示；计算需求以 Gcycle 表示。",
         f"- 选样规则：{payload['sample_scan']['selection_rule']}",
