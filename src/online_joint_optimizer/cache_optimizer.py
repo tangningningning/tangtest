@@ -196,9 +196,16 @@ class CacheOptimizer:
                 total_evaluations += count
                 continue
 
+            first_slot_final_positions = (
+                first_eval.slot_result.final_uav_positions
+                if first_eval.slot_result is not None
+                and first_eval.slot_result.final_uav_positions is not None
+                else first_schedule.target_uav_positions
+            )
+
             tail = self.evaluate_forecast_tail(
                 target_cache_state=target.target_state,
-                current_uav_positions=first_schedule.target_uav_positions,
+                current_uav_positions=first_slot_final_positions,
                 forecast_slots=effective_future,
                 model=slot_input.model,
                 search_budget=settings,

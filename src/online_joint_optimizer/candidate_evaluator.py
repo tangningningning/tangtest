@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import copy
 import math
+import numbers
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from decision import slot_environment, task_allocation
+from decision import cache_configuration, slot_environment, task_allocation
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class SlotInput:
     prediction_horizon_mask: Any | None = None
     scenario_id: str = ""
     source_kind: str = "current_actual"
+    prediction_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class PredictedSlotInput:
     predicted_vehicle_positions: Mapping[str, Any]
     prediction_horizon_mask: Any | None = None
     scenario_id: str = ""
+    prediction_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def as_slot_input(self, model: SystemModelContext) -> SlotInput:
         """Adapt caller-supplied forecasts to the formal deterministic Slot API."""
@@ -65,6 +68,7 @@ class PredictedSlotInput:
             prediction_horizon_mask=self.prediction_horizon_mask,
             scenario_id=str(self.scenario_id),
             source_kind="forecast",
+            prediction_metadata=self.prediction_metadata,
         )
 
 
@@ -95,7 +99,12 @@ class SearchBudget:
             self.max_uav_coordinate_rounds,
             self.max_joint_rounds,
         )
-        if any(isinstance(value, bool) or int(value) <= 0 for value in integer_fields):
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, numbers.Integral)
+            or int(value) <= 0
+            for value in integer_fields
+        ):
             raise ValueError("all search budgets and candidate limits must be positive integers")
         category_total = (
             int(self.max_cache_evaluations)
@@ -243,6 +252,16 @@ class CandidateEvaluator:
                 raise ValueError("previous and candidate Cache states must be aligned binary matrices")
             old_cache = old_cache_raw.astype(np.int8, copy=True)
             target_cache = target_cache_raw.astype(np.int8, copy=True)
+            node_ids = tuple(str(item) for item in slot_input.model.cache_nodes["node_ids"])
+            if len(node_ids) != old_cache.shape[0]:
+                raise ValueError("Cache rows do not align with configured cache nodes")
+            for node_index, node_id in enumerate(node_ids):
+                if not np.array_equal(old_cache[node_index], target_cache[node_index]) and not cache_configuration.is_legal_cache_replacement(
+                    old_cache[node_index], target_cache[node_index]
+                ):
+                    raise ValueError(
+                        f"candidate Cache at {node_id} is not a legal REPLACE; KEEP must be unchanged"
+                    )
             old_uav = copy_uav_positions(previous_uav_positions)
             target_uav = copy_uav_positions(candidate_uav_positions)
             if tuple(old_uav) != tuple(target_uav):
@@ -319,6 +338,9 @@ class CandidateEvaluator:
                 per_task_delay_s=copy.deepcopy(result.per_task_delay_s),
                 per_task_utility=copy.deepcopy(result.per_task_utility),
                 diagnostics={
+                    "prediction_metadata": copy.deepcopy(
+                        dict(slot_input.prediction_metadata)
+                    ),
                     "matching_summary": copy.deepcopy(result.matching_summary),
                     "configuration_summary": copy.deepcopy(result.configuration_summary),
                     "predictive_configuration_utility": result.predictive_configuration_utility,
