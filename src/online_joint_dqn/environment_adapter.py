@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import pickle
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -24,6 +24,7 @@ from .candidate_features import (
     ActionCandidate,
     CandidateFeatureEncoder,
     CandidateOption,
+    DecisionForecast,
     _state_fingerprint,
 )
 
@@ -72,6 +73,7 @@ class ExclusiveDQNEnvironment:
         *,
         context: Any,
         slot_inputs: Sequence[SlotInput],
+        decision_steps: Sequence[Any],
         search_budget: SearchBudget | None = None,
         decision_count: int | None = None,
         terminal_at_end: bool = True,
@@ -82,6 +84,18 @@ class ExclusiveDQNEnvironment:
             raise ValueError("训练环境只接受当前实际 Slot，不接受未来真实输入冒充预测")
         self.context = context
         self.slot_inputs = tuple(slot_inputs)
+        self.decision_forecasts = tuple(
+            DecisionForecast.from_aligned_step(step) for step in decision_steps
+        )
+        if len(self.decision_forecasts) != len(self.slot_inputs):
+            raise ValueError("正式对齐预测步骤与 Slot 输入数量不一致")
+        if any(
+            forecast.slot != slot_input.slot_id
+            for forecast, slot_input in zip(
+                self.decision_forecasts, self.slot_inputs, strict=True
+            )
+        ):
+            raise ValueError("正式预测步骤与 Slot 输入未按同一时隙对齐")
         self.model = self.slot_inputs[0].model
         self.search_budget = search_budget or self._candidate_capacity_budget()
         self.decision_count = len(self.slot_inputs) if decision_count is None else int(decision_count)
@@ -93,7 +107,12 @@ class ExclusiveDQNEnvironment:
         self.evaluator = None
         self.uav_scheduler = UavScheduler()
         self.cache_optimizer = CacheOptimizer(self.uav_scheduler)
-        self.encoder = CandidateFeatureEncoder(self.slot_inputs[0])
+        self.encoder = CandidateFeatureEncoder(
+            self.slot_inputs[0],
+            observation_spec=context.observation_spec,
+            train_origin_start=int(context.train_origin_start),
+            train_origin_end=int(context.train_origin_end),
+        )
         self._initial_cache = np.asarray(context.initial_cache, dtype=np.int8).copy()
         self._initial_uav = {
             key: np.asarray(value, dtype=np.float64).copy()
@@ -186,6 +205,7 @@ class ExclusiveDQNEnvironment:
         return cls(
             context=context,
             slot_inputs=slot_inputs,
+            decision_steps=steps,
             search_budget=search_budget,
             decision_count=decision_count,
             terminal_at_end=terminal_at_end,
@@ -228,15 +248,20 @@ class ExclusiveDQNEnvironment:
         if self.index >= len(self.slot_inputs):
             raise StopIteration("没有可用于当前状态或 bootstrap 的下一 Slot 输入")
         slot_input = self.slot_inputs[self.index]
-        fingerprint = _state_fingerprint(self.cache_state, self.uav_positions, slot_input)
+        forecast = self.decision_forecasts[self.index]
+        formal_observation = self._formal_observation(forecast)
+        state_features = self.encoder.encode_state(formal_observation, forecast)
+        fingerprint = self._decision_state_fingerprint(
+            slot_input, forecast, state_features
+        )
         if fingerprint != self._cached_state_fingerprint:
             input_before = _input_fingerprint(slot_input)
             cache_before = self.cache_state.copy()
             uav_before = {key: value.copy() for key, value in self.uav_positions.items()}
-            self._cached_state_features = self.encoder.encode_state(
-                slot_input, self.cache_state, self.uav_positions
+            self._cached_state_features = state_features
+            self._cached_candidates = self._generate_legal_candidates(
+                slot_input, forecast, fingerprint
             )
-            self._cached_candidates = self._generate_legal_candidates(slot_input)
             generation_isolation = (
                 _input_fingerprint(slot_input) == input_before
                 and np.array_equal(cache_before, self.cache_state)
@@ -255,14 +280,24 @@ class ExclusiveDQNEnvironment:
         assert self._cached_candidates is not None
         return self._cached_state_features.copy(), self._cached_candidates
 
-    def _generate_legal_candidates(self, slot_input: SlotInput) -> tuple[CandidateOption, ...]:
+    def _generate_legal_candidates(
+        self,
+        slot_input: SlotInput,
+        forecast: DecisionForecast,
+        source_state_fingerprint: str,
+    ) -> tuple[CandidateOption, ...]:
+        # 候选器只接收预测场景及配置，不接触当前真实任务和实际车辆轨迹。
+        candidate_input = replace(slot_input, tasks=(), vehicle_positions={})
+        if candidate_input.tasks or candidate_input.vehicle_positions:
+            raise RuntimeError("候选生成输入未能隔离当前真实任务或车辆位置")
         candidates: list[CandidateOption] = []
         keep = ActionCandidate.from_states(
             previous_cache_state=self.cache_state,
             previous_uav_positions=self.uav_positions,
             target_cache_state=self.cache_state,
             target_uav_positions=self.uav_positions,
-            slot_input=slot_input,
+            slot_input=candidate_input,
+            source_state_fingerprint=source_state_fingerprint,
             proposal_source="KEEP_STAY",
         )
         candidates.append(
@@ -272,14 +307,15 @@ class ExclusiveDQNEnvironment:
                     keep,
                     previous_cache_state=self.cache_state,
                     previous_uav_positions=self.uav_positions,
-                    slot_input=slot_input,
+                    slot_input=candidate_input,
+                    decision_forecast=forecast,
                 ),
             )
         )
         cache_generation_diagnostics: dict[str, Any] = {}
         cache_targets, cache_generation_complete = self.cache_optimizer.generate_candidates(
             current_cache_state=self.cache_state,
-            slot_input=slot_input,
+            slot_input=candidate_input,
             search_budget=self.search_budget,
             generation_diagnostics=cache_generation_diagnostics,
         )
@@ -291,7 +327,8 @@ class ExclusiveDQNEnvironment:
                 previous_uav_positions=self.uav_positions,
                 target_cache_state=target.target_state,
                 target_uav_positions=self.uav_positions,
-                slot_input=slot_input,
+                slot_input=candidate_input,
+                source_state_fingerprint=source_state_fingerprint,
                 proposal_source=target.proposal_source,
             )
             candidates.append(
@@ -301,7 +338,8 @@ class ExclusiveDQNEnvironment:
                         action,
                         previous_cache_state=self.cache_state,
                         previous_uav_positions=self.uav_positions,
-                        slot_input=slot_input,
+                        slot_input=candidate_input,
+                        decision_forecast=forecast,
                     ),
                 )
             )
@@ -310,7 +348,7 @@ class ExclusiveDQNEnvironment:
             previous_cache_state=self.cache_state,
             current_uav_positions=self.uav_positions,
             previous_uav_positions=self.uav_positions,
-            slot_input=slot_input,
+            slot_input=candidate_input,
             search_budget=self.search_budget,
             generation_diagnostics=uav_generation_diagnostics,
         )
@@ -320,7 +358,8 @@ class ExclusiveDQNEnvironment:
                 previous_uav_positions=self.uav_positions,
                 target_cache_state=self.cache_state,
                 target_uav_positions=move.target_uav_positions,
-                slot_input=slot_input,
+                slot_input=candidate_input,
+                source_state_fingerprint=source_state_fingerprint,
                 proposal_source=move.proposal_source,
             )
             candidates.append(
@@ -330,13 +369,14 @@ class ExclusiveDQNEnvironment:
                         action,
                         previous_cache_state=self.cache_state,
                         previous_uav_positions=self.uav_positions,
-                        slot_input=slot_input,
+                        slot_input=candidate_input,
+                        decision_forecast=forecast,
                     ),
                 )
             )
         unique: dict[str, CandidateOption] = {}
         for option in candidates:
-            if option.action.source_state_fingerprint != self._current_state_hash():
+            if option.action.source_state_fingerprint != source_state_fingerprint:
                 raise RuntimeError("候选动作来源状态与当前环境状态不一致")
             if option.action.candidate_id in unique:
                 continue
@@ -365,8 +405,65 @@ class ExclusiveDQNEnvironment:
                 self.search_budget.max_uav_candidates_per_uav
             ),
             "candidate_generation_used_matching_or_kkt": False,
+            "candidate_generation_received_actual_tasks": False,
+            "candidate_generation_received_actual_vehicle_positions": False,
+            "state_features_used_current_actual_task_data": False,
+            "state_features_used_current_actual_vehicle_positions": False,
+            "candidate_features_used_current_actual_vehicle_positions": False,
+            "decision_state_feature_contract_version": self.encoder.state_feature_contract_version,
+            "decision_candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
+            "prediction_horizon_count": self.encoder.horizon_count,
+            "prediction_horizon_mask": self.encoder._forecast_mask(forecast).tolist(),
         }
         return tuple(unique.values())
+
+    def _formal_observation(self, forecast: DecisionForecast) -> np.ndarray:
+        """复用正式 MAPPO 观测构造器，输入对象仅含当前决策可见的预测。"""
+
+        from ppo_simple.interface import build_step_observation
+
+        single_origin_override = None
+        if (
+            self.context.observation_spec.time_to_go_slice is not None
+            and int(self.context.train_origin_end) == int(self.context.train_origin_start)
+        ):
+            single_origin_override = 0.0
+        return build_step_observation(
+            self.cache_state,
+            self.uav_positions,
+            forecast,
+            self.context.observation_spec,
+            tuple(self.model.flight_boundary),
+            int(self.context.train_origin_start),
+            int(self.context.train_origin_end),
+            time_to_go_override=single_origin_override,
+        )
+
+    def _decision_state_fingerprint(
+        self,
+        slot_input: SlotInput,
+        forecast: DecisionForecast,
+        state_features: np.ndarray,
+    ) -> str:
+        prediction_context = {
+            "origin_index": int(forecast.origin_index),
+            "slot": int(forecast.slot),
+            "prediction_horizon_mask": (
+                None
+                if forecast.prediction_horizon_mask is None
+                else np.asarray(forecast.prediction_horizon_mask, dtype=np.int8)
+            ),
+            # 场景字段由正式预测池提供，候选生成器据此构造有限合法动作。
+            "prediction_scenario": slot_input.scenario_slice,
+            "predicted_vehicle_positions_horizon": forecast.predicted_vehicle_positions_horizon,
+            "predicted_service_popularity_horizon": forecast.predicted_service_popularity_horizon,
+        }
+        return _state_fingerprint(
+            self.cache_state,
+            self.uav_positions,
+            state_features,
+            prediction_context,
+        )
 
     def step(self, option: CandidateOption) -> EnvironmentTransition:
         """只把所选候选送入正式执行器，并推进一个真实 Slot。"""
@@ -517,16 +614,28 @@ class ExclusiveDQNEnvironment:
                 "duration_semantics": "每个动作恰好执行一个正式 Slot",
                 **candidate_generation_diagnostics,
                 "state_features_used_future_actual_data": False,
+                "state_features_used_current_actual_task_data": False,
+                "candidate_generation_received_actual_tasks": False,
+                "candidate_generation_received_actual_vehicle_positions": False,
+                "candidate_features_used_current_actual_vehicle_positions": False,
+                "decision_state_feature_contract_version": self.encoder.state_feature_contract_version,
+                "decision_candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
+                "prediction_horizon_count": self.encoder.horizon_count,
+                "prediction_horizon_mask": self.encoder._forecast_mask(
+                    self.decision_forecasts[self.index - 1]
+                ).tolist(),
             },
         )
 
     def _current_state_hash(self) -> str:
         if self.index >= len(self.slot_inputs):
             return _state_fingerprint(self.cache_state, self.uav_positions)
-        return _state_fingerprint(
-            self.cache_state,
-            self.uav_positions,
-            self.slot_inputs[self.index],
+        slot_input = self.slot_inputs[self.index]
+        forecast = self.decision_forecasts[self.index]
+        formal_observation = self._formal_observation(forecast)
+        state_features = self.encoder.encode_state(formal_observation, forecast)
+        return self._decision_state_fingerprint(
+            slot_input, forecast, state_features
         )
 
 

@@ -17,12 +17,65 @@ from online_joint_optimizer.candidate_evaluator import SlotInput, copy_uav_posit
 
 
 OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
+STATE_FEATURE_CONTRACT_VERSION = "formal_observation_horizon_workload_v2"
+CANDIDATE_FEATURE_CONTRACT_VERSION = "prediction_only_exclusive_candidate_v2"
+NETWORK_ARCHITECTURE_VERSION = "candidate_conditioned_q_mlp_v2"
+
+
+@dataclass(frozen=True)
+class DecisionForecast:
+    """只包含正式决策观测可见的预测字段，不携带真实任务或真实轨迹。"""
+
+    origin_index: int
+    slot: int
+    predicted_vehicle_positions: Mapping[str, Any]
+    predicted_service_popularity: Mapping[int, float]
+    predicted_vehicle_positions_horizon: tuple[Mapping[str, Any], ...]
+    predicted_service_popularity_horizon: tuple[Mapping[int, float], ...]
+    prediction_horizon_mask: Any | None
+
+    @classmethod
+    def from_aligned_step(cls, step: Any) -> "DecisionForecast":
+        """从正式对齐步骤中只复制预测接口字段。"""
+
+        vehicle_horizon = tuple(
+            {
+                str(vehicle_id): np.asarray(position, dtype=np.float64).reshape(2).copy()
+                for vehicle_id, position in positions.items()
+            }
+            for positions in step.predicted_vehicle_positions_horizon
+        )
+        popularity_horizon = tuple(
+            {int(service_id): float(value) for service_id, value in popularity.items()}
+            for popularity in step.predicted_service_popularity_horizon
+        )
+        mask = (
+            None
+            if step.prediction_horizon_mask is None
+            else np.asarray(step.prediction_horizon_mask, dtype=np.int8).reshape(-1).copy()
+        )
+        return cls(
+            origin_index=int(step.origin_index),
+            slot=int(step.slot),
+            predicted_vehicle_positions={
+                str(vehicle_id): np.asarray(position, dtype=np.float64).reshape(2).copy()
+                for vehicle_id, position in step.predicted_vehicle_positions.items()
+            },
+            predicted_service_popularity={
+                int(service_id): float(value)
+                for service_id, value in step.predicted_service_popularity.items()
+            },
+            predicted_vehicle_positions_horizon=vehicle_horizon,
+            predicted_service_popularity_horizon=popularity_horizon,
+            prediction_horizon_mask=mask,
+        )
 
 
 def _state_fingerprint(
     cache: np.ndarray,
     positions: Mapping[str, Any],
-    slot_input: SlotInput | None = None,
+    decision_features: Any | None = None,
+    prediction_context: Any | None = None,
 ) -> str:
     hasher = hashlib.sha256()
     array = np.ascontiguousarray(cache, dtype=np.int8)
@@ -31,22 +84,18 @@ def _state_fingerprint(
     for uav_id, xy in positions.items():
         hasher.update(str(uav_id).encode("utf-8"))
         hasher.update(np.ascontiguousarray(xy, dtype=np.float64).tobytes())
-    if slot_input is not None:
+    if decision_features is not None:
+        features = np.ascontiguousarray(decision_features, dtype=np.float32).reshape(-1)
+        if not np.all(np.isfinite(features)):
+            raise ValueError("状态指纹只能使用有限的决策特征")
         hasher.update(
-            pickle.dumps(
-                (
-                    slot_input.slot_id,
-                    slot_input.time_s,
-                    slot_input.scenario_id,
-                    slot_input.scenario_slice,
-                    slot_input.tasks,
-                    slot_input.vehicle_positions,
-                    slot_input.predicted_vehicle_positions,
-                    slot_input.prediction_horizon_mask,
-                ),
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
+            b"decision_features_v2"
+            + np.asarray([features.size], dtype=np.int64).tobytes()
+            + features.tobytes()
         )
+    if prediction_context is not None:
+        # 候选生成器会读取正式预测场景；把预测来源纳入身份，但不写入真实任务/轨迹。
+        hasher.update(pickle.dumps(prediction_context, protocol=pickle.HIGHEST_PROTOCOL))
     return hasher.hexdigest()
 
 
@@ -72,6 +121,7 @@ class ActionCandidate:
         target_cache_state: Any,
         target_uav_positions: Mapping[str, Any],
         slot_input: SlotInput,
+        source_state_fingerprint: str,
         proposal_source: str,
     ) -> "ActionCandidate":
         """根据正式候选生成器的输出建立并验证一个动作。"""
@@ -127,7 +177,9 @@ class ActionCandidate:
             dict(slot_input.model.project_cfg),
             tuple(float(value) for value in slot_input.model.flight_boundary),
         )
-        state_hash = _state_fingerprint(before_cache, before_uav, slot_input)
+        state_hash = str(source_state_fingerprint)
+        if not state_hash:
+            raise ValueError("候选必须绑定到当前合法决策状态指纹")
         target_cache_tuple = tuple(
             tuple(int(value) for value in row) for row in after_cache.tolist()
         )
@@ -226,39 +278,84 @@ class CandidateOption:
 class CandidateFeatureEncoder:
     """将正式 Slot 状态和合法目标配置编码为固定维度向量。"""
 
-    def __init__(self, slot_input: SlotInput) -> None:
-        self.node_ids = tuple(str(value) for value in slot_input.model.cache_nodes["node_ids"])
-        self.service_ids = tuple(
-            int(value) for value in np.asarray(slot_input.model.service_catalog["service_ids"]).tolist()
+    def __init__(
+        self,
+        slot_input: SlotInput,
+        *,
+        observation_spec: Any,
+        train_origin_start: int,
+        train_origin_end: int,
+    ) -> None:
+        self.node_ids = tuple(str(value) for value in observation_spec.cache_node_ids)
+        configured_node_ids = tuple(str(value) for value in slot_input.model.cache_nodes["node_ids"])
+        self.service_ids = tuple(int(value) for value in observation_spec.service_ids)
+        configured_service_ids = tuple(
+            int(value)
+            for value in np.asarray(slot_input.model.service_catalog["service_ids"]).tolist()
         )
+        if self.node_ids != configured_node_ids or self.service_ids != configured_service_ids:
+            raise ValueError("DQN 特征顺序必须与正式 observation spec 和服务目录一致")
+        self.observation_spec = observation_spec
+        self.train_origin_start = int(train_origin_start)
+        self.train_origin_end = int(train_origin_end)
+        self.state_feature_contract_version = STATE_FEATURE_CONTRACT_VERSION
+        self.candidate_feature_contract_version = CANDIDATE_FEATURE_CONTRACT_VERSION
+        self.network_architecture_version = NETWORK_ARCHITECTURE_VERSION
         self.service_index = {service_id: index for index, service_id in enumerate(self.service_ids)}
-        self.uav_ids = tuple(str(value) for value in slot_input.vehicle_positions if str(value).startswith("UAV_"))
+        self.uav_ids = tuple(str(value) for value in observation_spec.uav_ids)
+        self.vehicle_ids = tuple(str(value) for value in observation_spec.vehicle_ids)
+        self.task_vehicle_ids = tuple(str(value) for value in observation_spec.task_vehicle_ids)
         configured_uavs = tuple(uav_configuration.uav_ids_from_project(dict(slot_input.model.project_cfg)))
         if self.uav_ids != configured_uavs:
-            self.uav_ids = configured_uavs
-        self.vehicle_ids = tuple(str(value) for value in slot_input.predicted_vehicle_positions)
+            raise ValueError("正式 observation spec 的 UAV 顺序与配置不一致")
         self.bounds = tuple(float(value) for value in slot_input.model.flight_boundary)
-        scenario = slot_input.scenario_slice
-        rho = np.asarray(scenario.get("rho_hat", np.zeros((1, len(self.service_ids)))), dtype=np.float64)
-        self.horizon_count = int(rho.shape[0]) if rho.ndim == 2 else int(len(scenario.get("horizons", ())))
-        if self.horizon_count <= 0:
-            self.horizon_count = 1
-        self.task_vehicle_capacity = max(1, len(tuple(scenario.get("task_vehicle_ids", ()))))
-        service_cfg = slot_input.model.project_cfg.get("service", {}).get("generation", {})
+        self.horizon_count = int(observation_spec.prediction_horizon)
+        configured_horizon = int(
+            project_config.get_config_value(slot_input.model.project_cfg, "prediction.vehicle.horizon")
+        )
+        if self.horizon_count != configured_horizon:
+            raise ValueError("DQN 预测时域必须与正式配置和 observation spec 一致")
         task_cfg = slot_input.model.project_cfg.get("task", {})
-        self.max_input_bits = max(
-            1.0,
-            float(service_cfg.get("input_size_max_kb", 1000.0)) * 8000.0,
-        )
-        self.max_cpu_cycles = max(
-            1.0,
-            self.max_input_bits
-            * float(service_cfg.get("cycles_per_bit_max", 1000.0))
-            * (1.0 + float(task_cfg.get("load_relative_jitter", 0.0))),
-        )
-        self.episode_time_s = max(
-            1.0,
-            float(project_config.get_config_value(slot_input.model.project_cfg, "simulation.episode_time_s", 1.0)),
+        service_cfg = slot_input.model.project_cfg.get("service", {}).get("generation", {})
+        self.input_relative_jitter = float(task_cfg.get("input_relative_jitter", 0.0))
+        self.load_relative_jitter = float(task_cfg.get("load_relative_jitter", 0.0))
+        if not 0.0 <= self.input_relative_jitter < 1.0:
+            raise ValueError("正式输入大小扰动范围必须位于 [0,1)")
+        if not 0.0 <= self.load_relative_jitter < 1.0:
+            raise ValueError("正式计算负载扰动范围必须位于 [0,1)")
+        input_min_kb = float(service_cfg["input_size_min_kb"])
+        input_max_kb = float(service_cfg["input_size_max_kb"])
+        if input_min_kb <= 0.0 or input_max_kb < input_min_kb:
+            raise ValueError("正式服务输入大小范围非法")
+        base_input_min_bits = input_min_kb * 8000.0
+        base_input_max_bits = input_max_kb * 8000.0
+        self.service_mean_input_bits = np.asarray(
+            slot_input.model.service_catalog["mean_input_size_bit"], dtype=np.float64
+        ).reshape(-1)
+        self.service_cycles_per_bit = np.asarray(
+            slot_input.model.service_catalog["cycles_per_bit"], dtype=np.float64
+        ).reshape(-1)
+        if (
+            self.service_mean_input_bits.shape != (len(self.service_ids),)
+            or self.service_cycles_per_bit.shape != (len(self.service_ids),)
+            or not np.isfinite(self.service_mean_input_bits).all()
+            or not np.isfinite(self.service_cycles_per_bit).all()
+            or np.any(self.service_mean_input_bits <= 0.0)
+            or np.any(self.service_cycles_per_bit <= 0.0)
+        ):
+            raise ValueError("服务目录的输入大小/计算密度必须有限且与服务顺序一致")
+        range_tolerance = 1.0e-6 * max(1.0, base_input_max_bits)
+        if np.any(self.service_mean_input_bits < base_input_min_bits - range_tolerance) or np.any(
+            self.service_mean_input_bits > base_input_max_bits + range_tolerance
+        ):
+            raise ValueError("服务目录输入基准超出正式配置声明的 KB 范围")
+        # service_catalog 的 mean_input_size 单位是 bit；配置范围以 KB 给出，1 KB=8000 bit。
+        self.base_max_input_bits = base_input_max_bits
+        self.max_input_bits = base_input_max_bits * (1.0 + self.input_relative_jitter)
+        self.max_cpu_cycles = float(
+            np.max(base_input_max_bits * self.service_cycles_per_bit)
+            * (1.0 + self.input_relative_jitter)
+            * (1.0 + self.load_relative_jitter)
         )
         self.service_sizes_mb = np.asarray(
             slot_input.model.service_catalog["service_sizes_mb"], dtype=np.float64
@@ -266,23 +363,14 @@ class CandidateFeatureEncoder:
         self.total_service_size_mb = max(1.0, float(np.sum(self.service_sizes_mb)))
         self.map_diagonal_m = max(
             1.0,
-            math.hypot(self.bounds[1] - self.bounds[0], self.bounds[3] - self.bounds[2]),
+            math.hypot(self.bounds[2] - self.bounds[0], self.bounds[3] - self.bounds[1]),
         )
         search = uav_configuration.uav_search_config_from_project(dict(slot_input.model.project_cfg))
         self.max_move_distance_m = max(
             1.0, float(search.max_horizontal_speed_mps) * float(search.dt_s)
         )
         node_count, service_count, uav_count = len(self.node_ids), len(self.service_ids), len(self.uav_ids)
-        self.state_dim = (
-            node_count * service_count
-            + 2 * uav_count
-            + 2
-            + service_count
-            + 2
-            + service_count
-            + 2 * len(self.vehicle_ids)
-            + self.horizon_count
-        )
+        self.state_dim = int(observation_spec.observation_dim) + 2 * self.horizon_count
         self.candidate_dim = (
             3 + 2 + node_count * service_count + node_count
             + 2 * node_count * service_count + 4 + 8 * uav_count
@@ -290,59 +378,42 @@ class CandidateFeatureEncoder:
 
     def encode_state(
         self,
-        slot_input: SlotInput,
-        cache_state: Any,
-        uav_positions: Mapping[str, Any],
+        formal_observation: Any,
+        decision_forecast: DecisionForecast,
     ) -> np.ndarray:
-        cache = np.asarray(cache_state, dtype=np.float32)
-        if cache.shape != (len(self.node_ids), len(self.service_ids)):
-            raise ValueError("缓存状态形状与特征编码器不一致")
-        positions = copy_uav_positions(uav_positions)
-        if tuple(positions) != self.uav_ids:
-            raise ValueError("UAV 状态顺序与特征编码器不一致")
-        features: list[float] = cache.reshape(-1).tolist()
-        features.extend(self._positions_xy(positions))
-        features.append(float(np.clip(float(slot_input.time_s or 0.0) / self.episode_time_s, 0.0, 1.0)))
-        tasks = tuple(slot_input.tasks)
-        features.append(float(len(tasks) / self.task_vehicle_capacity))
-        histogram = np.zeros(len(self.service_ids), dtype=np.float32)
-        input_values: list[float] = []
-        cpu_values: list[float] = []
-        for task in tasks:
-            try:
-                histogram[self.service_index[int(task.service_id)]] += 1.0
-            except KeyError as exc:
-                raise ValueError(f"任务服务 ID 不在正式服务目录中：{task.service_id}") from exc
-            input_values.append(float(task.input_bits) / self.max_input_bits)
-            cpu_values.append(float(task.cpu_cycles) / self.max_cpu_cycles)
-        if len(tasks):
-            histogram /= float(len(tasks))
-        features.extend(histogram.tolist())
-        features.extend(
-            [
-                float(np.mean(input_values)) if input_values else 0.0,
-                float(np.mean(cpu_values)) if cpu_values else 0.0,
-            ]
+        observation = np.asarray(formal_observation, dtype=np.float32).reshape(-1)
+        if observation.shape != (int(self.observation_spec.observation_dim),):
+            raise ValueError("正式 MAPPO observation 维度与 DQN observation spec 不一致")
+        if not np.all(np.isfinite(observation)):
+            raise ValueError("正式观测包含非有限值")
+        mask = self._forecast_mask(decision_forecast)
+        if self.observation_spec.horizon_mask_slice is not None:
+            observed_mask = observation[self.observation_spec.horizon_mask_slice]
+            if not np.array_equal(observed_mask.astype(np.int8), mask):
+                raise ValueError("正式观测与预测时域 mask 不一致")
+        expected_input: list[float] = []
+        expected_cycles: list[float] = []
+        for horizon_index, valid in enumerate(mask):
+            if not valid:
+                expected_input.append(0.0)
+                expected_cycles.append(0.0)
+                continue
+            popularity = self._ordered_popularity(
+                decision_forecast.predicted_service_popularity_horizon[horizon_index]
+            )
+            expected_input_bits = float(popularity @ self.service_mean_input_bits)
+            expected_cpu_cycles = float(
+                popularity @ (self.service_mean_input_bits * self.service_cycles_per_bit)
+            )
+            expected_input.append(self._normalize_workload(expected_input_bits, self.max_input_bits, "预测输入大小"))
+            expected_cycles.append(self._normalize_workload(expected_cpu_cycles, self.max_cpu_cycles, "预测计算量"))
+        result = np.concatenate(
+            (
+                observation,
+                np.asarray(expected_input, dtype=np.float32),
+                np.asarray(expected_cycles, dtype=np.float32),
+            )
         )
-        rho = np.asarray(slot_input.scenario_slice.get("rho_hat", ()), dtype=np.float32)
-        if rho.ndim == 2 and rho.shape[0] and rho.shape[1] == len(self.service_ids):
-            popularity = np.clip(rho[0], 0.0, None)
-            denominator = float(popularity.sum())
-            if denominator > 0.0:
-                popularity = popularity / denominator
-            features.extend(popularity.tolist())
-        else:
-            features.extend([0.0] * len(self.service_ids))
-        predicted = slot_input.predicted_vehicle_positions
-        for vehicle_id in self.vehicle_ids:
-            if vehicle_id not in predicted:
-                raise ValueError(f"预测车辆位置缺少配置车辆：{vehicle_id}")
-            features.extend(self._normalize_xy(predicted[vehicle_id]))
-        mask = np.asarray(slot_input.prediction_horizon_mask, dtype=np.float32).reshape(-1)
-        if mask.size < self.horizon_count:
-            mask = np.pad(mask, (0, self.horizon_count - mask.size))
-        features.extend(mask[: self.horizon_count].tolist())
-        result = np.asarray(features, dtype=np.float32)
         if result.shape != (self.state_dim,) or not np.all(np.isfinite(result)):
             raise ValueError("状态特征维度或数值无效")
         return result
@@ -354,6 +425,7 @@ class CandidateFeatureEncoder:
         previous_cache_state: Any,
         previous_uav_positions: Mapping[str, Any],
         slot_input: SlotInput,
+        decision_forecast: DecisionForecast,
     ) -> np.ndarray:
         before_cache = np.asarray(previous_cache_state, dtype=np.int8)
         after_cache = action.cache_array()
@@ -410,20 +482,25 @@ class CandidateFeatureEncoder:
         uav_triggers = {uav_id: int(uav_id in action.moved_uav_ids) for uav_id in self.uav_ids}
         movement = uav_configuration.movement_summary(before_uav, after_uav, uav_triggers, search)
         features.append(float(movement[1]))
+        horizon_mask = self._forecast_mask(decision_forecast)
         demand_xy = [
-            np.asarray(slot_input.vehicle_positions[task.vehicle_id], dtype=np.float64)
-            for task in slot_input.tasks
-            if task.vehicle_id in slot_input.vehicle_positions
+            np.asarray(decision_forecast.predicted_vehicle_positions_horizon[horizon][vehicle_id], dtype=np.float64)
+            for horizon, valid in enumerate(horizon_mask)
+            if valid
+            for vehicle_id in self.task_vehicle_ids
+            if vehicle_id in decision_forecast.predicted_vehicle_positions_horizon[horizon]
         ]
+        if not demand_xy:
+            raise ValueError("合法预测时域中缺少任务车辆预测位置")
         for positions in (before_uav, after_uav):
             for uav_id in self.uav_ids:
-                if demand_xy:
-                    mean_distance = float(
-                        np.mean([np.linalg.norm(positions[uav_id] - vehicle_xy) for vehicle_xy in demand_xy])
-                    )
-                    features.append(min(mean_distance / self.map_diagonal_m, 1.0))
-                else:
-                    features.append(0.0)
+                mean_distance = float(
+                    np.mean([np.linalg.norm(positions[uav_id] - vehicle_xy) for vehicle_xy in demand_xy])
+                )
+                normalized_distance = mean_distance / self.map_diagonal_m
+                if not np.isfinite(normalized_distance) or normalized_distance > 1.0 + 1.0e-6:
+                    raise ValueError("预测需求距离超出地图对角线归一化范围")
+                features.append(min(normalized_distance, 1.0))
         result = np.asarray(features, dtype=np.float32)
         if result.shape != (self.candidate_dim,) or not np.all(np.isfinite(result)):
             raise ValueError("候选动作特征维度或数值无效")
@@ -431,14 +508,65 @@ class CandidateFeatureEncoder:
 
     def _normalize_xy(self, position: Any) -> list[float]:
         x, y = np.asarray(position, dtype=np.float64).reshape(2)
-        x0, x1, y0, y1 = self.bounds
+        x_min, y_min, x_max, y_max = self.bounds
         return [
-            float(np.clip((x - x0) / max(x1 - x0, 1.0), 0.0, 1.0)),
-            float(np.clip((y - y0) / max(y1 - y0, 1.0), 0.0, 1.0)),
+            float(np.clip((x - x_min) / max(x_max - x_min, 1.0), 0.0, 1.0)),
+            float(np.clip((y - y_min) / max(y_max - y_min, 1.0), 0.0, 1.0)),
         ]
 
     def _positions_xy(self, positions: Mapping[str, Any]) -> list[float]:
         return [value for uav_id in self.uav_ids for value in self._normalize_xy(positions[uav_id])]
 
+    def _forecast_mask(self, forecast: DecisionForecast) -> np.ndarray:
+        if len(forecast.predicted_vehicle_positions_horizon) != self.horizon_count or len(
+            forecast.predicted_service_popularity_horizon
+        ) != self.horizon_count:
+            raise ValueError("预测车辆/服务流行度时域数量与正式配置不一致")
+        if forecast.prediction_horizon_mask is None:
+            if self.horizon_count != 1:
+                raise ValueError("多时域决策必须提供正式预测有效 mask")
+            mask = np.ones(1, dtype=np.int8)
+        else:
+            mask = np.asarray(forecast.prediction_horizon_mask, dtype=np.int8).reshape(-1)
+        if mask.shape != (self.horizon_count,) or not np.all(np.isin(mask, [0, 1])):
+            raise ValueError("预测有效 mask 必须是与时域对齐的二进制向量")
+        if not np.any(mask):
+            raise ValueError("正式决策至少需要一个有效预测时域")
+        for horizon, valid in enumerate(mask):
+            if valid:
+                positions = forecast.predicted_vehicle_positions_horizon[horizon]
+                missing = set(self.vehicle_ids) - set(str(value) for value in positions)
+                if missing:
+                    raise ValueError(f"预测时域 {horizon} 缺少车辆位置：{sorted(missing)}")
+                if not set(self.task_vehicle_ids).issubset(positions):
+                    raise ValueError(f"预测时域 {horizon} 缺少任务车辆位置")
+        return mask
 
-__all__ = ["ActionCandidate", "CandidateOption", "CandidateFeatureEncoder", "OPERATIONS"]
+    def _ordered_popularity(self, popularity: Mapping[int, float]) -> np.ndarray:
+        values = np.asarray([float(popularity[service_id]) for service_id in self.service_ids], dtype=np.float64)
+        if not np.isfinite(values).all() or np.any(values < 0.0):
+            raise ValueError("预测服务流行度必须有限且非负")
+        if not math.isclose(float(values.sum()), 1.0, rel_tol=1.0e-5, abs_tol=1.0e-5):
+            raise ValueError("预测服务流行度必须符合正式归一化合同")
+        return values
+
+    @staticmethod
+    def _normalize_workload(value: float, upper_bound: float, label: str) -> float:
+        if not np.isfinite(value) or value < 0.0 or upper_bound <= 0.0:
+            raise ValueError(f"{label}或其固定归一化上界非法")
+        normalized = float(value / upper_bound)
+        if normalized > 1.0:
+            raise ValueError(f"{label}超过正式配置推导的固定上界")
+        return normalized
+
+
+__all__ = [
+    "ActionCandidate",
+    "CandidateOption",
+    "CandidateFeatureEncoder",
+    "DecisionForecast",
+    "STATE_FEATURE_CONTRACT_VERSION",
+    "CANDIDATE_FEATURE_CONTRACT_VERSION",
+    "NETWORK_ARCHITECTURE_VERSION",
+    "OPERATIONS",
+]

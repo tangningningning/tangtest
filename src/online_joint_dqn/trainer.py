@@ -290,6 +290,33 @@ def train_episode(
                 "state_features_used_future_actual_data": transition.diagnostics.get(
                     "state_features_used_future_actual_data"
                 ),
+                "state_features_used_current_actual_task_data": transition.diagnostics.get(
+                    "state_features_used_current_actual_task_data"
+                ),
+                "state_features_used_current_actual_vehicle_positions": transition.diagnostics.get(
+                    "state_features_used_current_actual_vehicle_positions"
+                ),
+                "candidate_generation_received_actual_tasks": transition.diagnostics.get(
+                    "candidate_generation_received_actual_tasks"
+                ),
+                "candidate_generation_received_actual_vehicle_positions": transition.diagnostics.get(
+                    "candidate_generation_received_actual_vehicle_positions"
+                ),
+                "candidate_features_used_current_actual_vehicle_positions": transition.diagnostics.get(
+                    "candidate_features_used_current_actual_vehicle_positions"
+                ),
+                "state_feature_contract_version": transition.diagnostics.get(
+                    "decision_state_feature_contract_version"
+                ),
+                "candidate_feature_contract_version": transition.diagnostics.get(
+                    "decision_candidate_feature_contract_version"
+                ),
+                "prediction_horizon_count": transition.diagnostics.get(
+                    "prediction_horizon_count"
+                ),
+                "prediction_horizon_mask": transition.diagnostics.get(
+                    "prediction_horizon_mask"
+                ),
                 "replay_size": len(replay_buffer),
                 "replay_capacity": replay_buffer.capacity,
                 "replay_write_count": replay_buffer.write_count,

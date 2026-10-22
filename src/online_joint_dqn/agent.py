@@ -12,7 +12,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .candidate_features import CandidateOption
+from .candidate_features import (
+    CANDIDATE_FEATURE_CONTRACT_VERSION,
+    NETWORK_ARCHITECTURE_VERSION,
+    STATE_FEATURE_CONTRACT_VERSION,
+    CandidateOption,
+)
 from .replay_buffer import ReplayTransition
 
 
@@ -304,6 +309,9 @@ class DoubleDQNAgent:
 
     def state_dict(self) -> dict[str, Any]:
         return {
+            "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
+            "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
+            "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
             "state_dim": self.state_dim,
             "candidate_dim": self.candidate_dim,
             "gamma": self.gamma,
@@ -325,8 +333,29 @@ class DoubleDQNAgent:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        expected_contract = {
+            "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
+            "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
+            "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
+        }
+        missing = [key for key in expected_contract if key not in state]
+        if missing:
+            raise ValueError(
+                "Checkpoint 缺少 DQN 特征/网络合同版本，属于旧版输入合同，拒绝恢复："
+                + ", ".join(missing)
+            )
+        mismatched = [
+            f"{key}={state.get(key)!r}（期望 {expected!r}）"
+            for key, expected in expected_contract.items()
+            if state.get(key) != expected
+        ]
+        if mismatched:
+            raise ValueError(
+                "Checkpoint 的 DQN 特征/网络合同与当前输入不兼容，拒绝恢复："
+                + "; ".join(mismatched)
+            )
         if int(state["state_dim"]) != self.state_dim or int(state["candidate_dim"]) != self.candidate_dim:
-            raise ValueError("模型状态维度与当前候选条件化网络不一致")
+            raise ValueError("模型状态维度与当前候选条件化网络不一致，拒绝补零或截断恢复")
         self.online_network.load_state_dict(state["online_network"])
         self.target_network.load_state_dict(state["target_network"])
         self.optimizer.load_state_dict(state["optimizer"])

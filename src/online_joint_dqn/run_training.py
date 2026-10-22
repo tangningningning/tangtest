@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -24,6 +25,11 @@ if str(PROJECT_ROOT / "scripts" / "training") not in sys.path:
 
 from common import project_config  # noqa: E402
 from online_joint_dqn.agent import DoubleDQNAgent  # noqa: E402
+from online_joint_dqn.candidate_features import (  # noqa: E402
+    CANDIDATE_FEATURE_CONTRACT_VERSION,
+    NETWORK_ARCHITECTURE_VERSION,
+    STATE_FEATURE_CONTRACT_VERSION,
+)
 from online_joint_dqn.environment_adapter import (  # noqa: E402
     ExclusiveDQNEnvironment,
 )
@@ -32,7 +38,7 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 
@@ -216,7 +222,10 @@ def _run_identity(
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
     identity = {
-        "algorithm": "candidate_conditioned_double_dqn_exclusive_v1",
+        "algorithm": "candidate_conditioned_double_dqn_exclusive_v2",
+        "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
+        "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
+        "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
         "seed": int(seed),
         "config_path": config_path.relative_to(PROJECT_ROOT).as_posix(),
         "config_raw_sha256": project_config.raw_config_sha256(config_path),
@@ -263,6 +272,7 @@ def _save_checkpoint(
     replay: ReplayBuffer,
     identity_sha256: str,
     episode_order: list[int],
+    episode_rows: list[dict[str, Any]],
     next_episode_index: int,
     global_step: int,
 ) -> int:
@@ -274,6 +284,7 @@ def _save_checkpoint(
         "agent_state": agent.state_dict(),
         "replay_state": replay.state_dict(),
         "episode_order": list(episode_order),
+        "completed_episode_rows": list(episode_rows),
         "next_episode_index": int(next_episode_index),
         "completed_episode_count": int(next_episode_index),
         "global_step": int(global_step),
@@ -281,7 +292,10 @@ def _save_checkpoint(
         "gradient_update_count": int(agent.gradient_steps),
         "saved_at_utc": datetime.now(timezone.utc).isoformat(),
     }
-    torch.save(payload, temporary)
+    with temporary.open("wb") as stream:
+        torch.save(payload, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(temporary, path)
     return int(path.stat().st_size)
 
@@ -295,6 +309,28 @@ def _read_episode_metrics(path: Path) -> list[dict[str, Any]]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def _write_episode_metrics_atomic(
+    path: Path, rows: list[dict[str, Any]]
+) -> None:
+    """按 Checkpoint 提交点原子重写完整 Episode 汇总。"""
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+        for row in rows:
+            stream.write(
+                json.dumps(
+                    _jsonable(row),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def _write_run_summary(
@@ -425,7 +461,7 @@ def run_training(
         run_dir.joinpath("config_snapshot.toml").write_bytes(config_path.read_bytes())
         _write_json(run_dir / "training_pool_identity.json", pool_info)
         manifest = {
-            "schema_version": "online_joint_dqn_run_v1",
+            "schema_version": "online_joint_dqn_run_v2",
             **identity,
             "code_identity": _code_identity(),
             "training_pool": {
@@ -454,6 +490,7 @@ def run_training(
         episode_order = list(pool_info["episode_seeds"])
         next_episode_index = 0
         global_step = 0
+        checkpoint_episode_rows: list[dict[str, Any]] = []
     else:
         checkpoint_path = resume_checkpoint.resolve(strict=True)
         run_dir = checkpoint_path.parent.parent
@@ -475,6 +512,21 @@ def run_training(
             raise ValueError("Checkpoint Episode 顺序与正式 Training Pool 不匹配")
         next_episode_index = int(payload["next_episode_index"])
         global_step = int(payload["global_step"])
+        checkpoint_episode_rows = [
+            dict(row) for row in payload.get("completed_episode_rows", [])
+        ]
+        if len(checkpoint_episode_rows) != next_episode_index:
+            raise ValueError("Checkpoint Episode 汇总数与完成进度不一致")
+        expected_indices = list(range(next_episode_index))
+        actual_indices = [int(row.get("episode_index", -1)) for row in checkpoint_episode_rows]
+        actual_seeds = [int(row.get("episode_seed", -1)) for row in checkpoint_episode_rows]
+        if actual_indices != expected_indices or actual_seeds != episode_order[:next_episode_index]:
+            raise ValueError("Checkpoint Episode 汇总与正式训练顺序不一致")
+        expected_global_step = (
+            next_episode_index * pool_contract.FORMAL_TRAINING_EPISODE_SLOTS
+        )
+        if global_step != expected_global_step:
+            raise ValueError("Checkpoint Slot 数与完整 Episode 进度不一致")
 
     if not np.all(np.isfinite(state)):
         raise FloatingPointError("正式训练初始状态包含非有限值")
@@ -498,19 +550,60 @@ def run_training(
     )
 
     episode_metrics_path = run_dir / "episode_metrics.jsonl"
-    episode_rows = _read_episode_metrics(episode_metrics_path)
+    episode_rows = checkpoint_episode_rows
+    if _read_episode_metrics(episode_metrics_path) != episode_rows:
+        # Checkpoint 是完成进度的提交点；恢复时修复可能落后的派生汇总文件。
+        _write_episode_metrics_atomic(episode_metrics_path, episode_rows)
     total_slots = len(episode_order) * pool_contract.FORMAL_TRAINING_EPISODE_SLOTS
     run_start = time.perf_counter()
     checkpoint_path = run_dir / "checkpoints" / "latest_checkpoint.pt"
     last_checkpoint_bytes: int | None = None
     if checkpoint_path.is_file():
         last_checkpoint_bytes = int(checkpoint_path.stat().st_size)
+    checkpointed_gradient_steps = int(agent.gradient_steps)
 
     manifest["training_status"] = "RUNNING"
     manifest["resumed_from_checkpoint"] = (
         str(resume_checkpoint) if resume_checkpoint is not None else None
     )
+    manifest["completed_episodes"] = next_episode_index
+    manifest["completed_slots"] = global_step
+    manifest["gradient_update_count"] = checkpointed_gradient_steps
     _write_json(run_dir / "run_manifest.json", manifest, atomic=True)
+    _write_run_summary(
+        run_dir / "run_summary.json",
+        status="RUNNING",
+        episode_rows=episode_rows,
+        global_step=global_step,
+        gradient_steps=checkpointed_gradient_steps,
+        last_checkpoint=str(checkpoint_path) if checkpoint_path.is_file() else None,
+        last_checkpoint_bytes=last_checkpoint_bytes,
+        elapsed_seconds=0.0,
+        total_slots=total_slots,
+    )
+
+    stop_requested = False
+    previous_signal_handlers: dict[int, Any] = {}
+
+    def request_episode_boundary_stop(signum: int, _frame: Any) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+        print(
+            json.dumps(
+                {
+                    "status": "STOP_REQUESTED",
+                    "signal": int(signum),
+                    "message": "将在当前完整 Episode 提交后停止",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+    for signal_number in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if signal_number is not None:
+            previous_signal_handlers[int(signal_number)] = signal.getsignal(signal_number)
+            signal.signal(signal_number, request_episode_boundary_stop)
 
     try:
         attempts_by_seed: dict[int, int] = {}
@@ -600,23 +693,32 @@ def run_training(
                 # 逐步与逐更新明细已写入 JSONL；Episode 汇总不重复嵌入大数组。
                 row.pop("steps", None)
                 row.pop("updates", None)
-                _append_line(episode_metrics_path, row)
-                episode_rows.append(row)
-                global_step = int(metrics["global_step_end"])
-                next_episode_index = episode_index + 1
+                committed_episode_rows = [*episode_rows, row]
+                committed_global_step = int(metrics["global_step_end"])
+                committed_episode_index = episode_index + 1
+                if hasattr(step_stream, "fileno"):
+                    os.fsync(step_stream.fileno())
+                    os.fsync(update_stream.fileno())
                 last_checkpoint_bytes = _save_checkpoint(
                     checkpoint_path,
                     agent=agent,
                     replay=replay,
                     identity_sha256=identity["identity_sha256"],
                     episode_order=episode_order,
-                    next_episode_index=next_episode_index,
-                    global_step=global_step,
+                    episode_rows=committed_episode_rows,
+                    next_episode_index=committed_episode_index,
+                    global_step=committed_global_step,
                 )
+                # Checkpoint 成功替换后才提交对应的内存进度与派生日志。
+                episode_rows = committed_episode_rows
+                global_step = committed_global_step
+                next_episode_index = committed_episode_index
+                checkpointed_gradient_steps = int(agent.gradient_steps)
+                _write_episode_metrics_atomic(episode_metrics_path, episode_rows)
                 manifest["training_status"] = "RUNNING"
                 manifest["completed_episodes"] = next_episode_index
                 manifest["completed_slots"] = global_step
-                manifest["gradient_update_count"] = agent.gradient_steps
+                manifest["gradient_update_count"] = checkpointed_gradient_steps
                 manifest["last_checkpoint"] = str(checkpoint_path)
                 manifest["last_checkpoint_bytes"] = last_checkpoint_bytes
                 manifest["last_completed_episode_seed"] = episode_seed
@@ -626,15 +728,12 @@ def run_training(
                     status="RUNNING",
                     episode_rows=episode_rows,
                     global_step=global_step,
-                    gradient_steps=agent.gradient_steps,
+                    gradient_steps=checkpointed_gradient_steps,
                     last_checkpoint=str(checkpoint_path),
                     last_checkpoint_bytes=last_checkpoint_bytes,
                     elapsed_seconds=time.perf_counter() - run_start,
                     total_slots=total_slots,
                 )
-                if hasattr(step_stream, "fileno"):
-                    os.fsync(step_stream.fileno())
-                    os.fsync(update_stream.fileno())
                 elapsed = time.perf_counter() - run_start
                 rate = global_step / elapsed if elapsed > 0 else 0.0
                 remaining = max(0, total_slots - global_step)
@@ -657,7 +756,13 @@ def run_training(
                     ),
                     flush=True,
                 )
-        status = "FORMAL_TRAINING_COMPLETE"
+                if stop_requested:
+                    break
+        status = (
+            "STOPPED_AT_EPISODE_BOUNDARY"
+            if stop_requested and next_episode_index < len(episode_order)
+            else "FORMAL_TRAINING_COMPLETE"
+        )
     except BaseException as exc:
         status = "STOPPED_WITH_ERROR"
         failure = {
@@ -666,7 +771,7 @@ def run_training(
             "error": str(exc),
             "completed_episodes": next_episode_index,
             "completed_slots_checkpointed": global_step,
-            "gradient_updates_checkpointed": agent.gradient_steps,
+            "gradient_updates_checkpointed": checkpointed_gradient_steps,
             "last_checkpoint": str(checkpoint_path) if checkpoint_path.is_file() else None,
             "diagnostic_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -679,18 +784,21 @@ def run_training(
             status=status,
             episode_rows=episode_rows,
             global_step=global_step,
-            gradient_steps=agent.gradient_steps,
+            gradient_steps=checkpointed_gradient_steps,
             last_checkpoint=str(checkpoint_path) if checkpoint_path.is_file() else None,
             last_checkpoint_bytes=last_checkpoint_bytes,
             elapsed_seconds=time.perf_counter() - run_start,
             total_slots=total_slots,
         )
         raise
+    finally:
+        for signal_number, previous_handler in previous_signal_handlers.items():
+            signal.signal(signal_number, previous_handler)
 
     manifest["training_status"] = status
     manifest["completed_episodes"] = next_episode_index
     manifest["completed_slots"] = global_step
-    manifest["gradient_update_count"] = agent.gradient_steps
+    manifest["gradient_update_count"] = checkpointed_gradient_steps
     manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
     _write_json(run_dir / "run_manifest.json", manifest, atomic=True)
     _write_run_summary(
@@ -698,14 +806,14 @@ def run_training(
         status=status,
         episode_rows=episode_rows,
         global_step=global_step,
-        gradient_steps=agent.gradient_steps,
+        gradient_steps=checkpointed_gradient_steps,
         last_checkpoint=str(checkpoint_path),
         last_checkpoint_bytes=last_checkpoint_bytes,
         elapsed_seconds=time.perf_counter() - run_start,
         total_slots=total_slots,
     )
     print(json.dumps({"status": status, "run_dir": str(run_dir)}, ensure_ascii=False))
-    return 0
+    return 130 if status == "STOPPED_AT_EPISODE_BOUNDARY" else 0
 
 
 def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -718,11 +826,6 @@ def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
-
-
-def _append_line(path: Path, row: Mapping[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as stream:
-        _append_jsonl(stream, row)
 
 
 def main() -> int:
