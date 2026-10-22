@@ -52,6 +52,7 @@ class ForecastTailResult:
     evaluation_horizon_slots: tuple[int, ...]
     effective_prediction_scenarios: tuple[str, ...]
     evaluation_count: int
+    search_complete: bool = True
     slot_schedules: tuple[UavScheduleResult, ...] = ()
     failure_reason: str = ""
 
@@ -69,7 +70,7 @@ class CacheOptimizationResult:
 
 
 @dataclass(frozen=True)
-class _CacheTarget:
+class CacheTargetCandidate:
     target_state: np.ndarray
     changed_node_ids: tuple[str, ...]
     proposal_source: str
@@ -113,7 +114,9 @@ class CacheOptimizer:
         effective_future = future[: int(settings.max_forecast_slots)]
 
         try:
-            targets = self._generate_targets(current, slot_input, settings)
+            targets, candidate_generation_complete = self._generate_targets(
+                current, slot_input, settings
+            )
         except (KeyError, TypeError, ValueError, IndexError, FloatingPointError) as exc:
             return CacheOptimizationResult(
                 is_feasible=False,
@@ -148,7 +151,7 @@ class CacheOptimizer:
             )
             return CacheOptimizationResult(
                 is_feasible=False,
-                search_complete=True,
+                search_complete=candidate_generation_complete,
                 target_cache_state=current.copy(),
                 selected_candidate=None,
                 candidates=unscored,
@@ -163,23 +166,20 @@ class CacheOptimizer:
 
         score_rows: list[CacheCandidateScore] = []
         total_evaluations = 0
-        search_complete = True
+        search_complete = candidate_generation_complete
         for index, target in enumerate(targets):
-            first_schedule = self.uav_scheduler.optimize(
-                previous_cache_state=current,
-                target_cache_state=target.target_state,
-                current_uav_positions=start_uav,
-                previous_uav_positions=start_uav,
+            first_eval = self.uav_scheduler.evaluator.evaluate(
                 slot_input=slot_input,
-                search_budget=settings,
-                evaluation_budget=ledger,
+                previous_cache_state=current,
+                previous_uav_positions=start_uav,
+                candidate_cache_state=target.target_state,
+                candidate_uav_positions=start_uav,
+                budget=ledger,
                 budget_category="cache",
-                max_candidates_per_uav=2,
-                max_coordinate_rounds=1,
             )
-            count = int(first_schedule.evaluation_count)
-            if not first_schedule.is_feasible or not first_schedule.search_complete:
-                failure = first_schedule.failure_reason or "first_slot_uav_search_incomplete"
+            count = int(first_eval.evaluation_count)
+            if not first_eval.is_feasible or first_eval.system_utility is None:
+                failure = first_eval.failure_reason or "first_slot_utility_missing"
                 score_rows.append(
                     self._failed_score(index, target, failure, count, (slot_input.slot_id,), (slot_input.scenario_id,))
                 )
@@ -188,19 +188,11 @@ class CacheOptimizer:
                 if ledger.remaining == 0:
                     break
                 continue
-            first_eval = first_schedule.selected_evaluation
-            if first_eval is None or first_eval.system_utility is None:
-                score_rows.append(
-                    self._failed_score(index, target, "first_slot_utility_missing", count, (slot_input.slot_id,), (slot_input.scenario_id,))
-                )
-                total_evaluations += count
-                continue
-
             first_slot_final_positions = (
                 first_eval.slot_result.final_uav_positions
                 if first_eval.slot_result is not None
                 and first_eval.slot_result.final_uav_positions is not None
-                else first_schedule.target_uav_positions
+                else start_uav
             )
 
             tail = self.evaluate_forecast_tail(
@@ -225,7 +217,7 @@ class CacheOptimizer:
                         count,
                         (slot_input.slot_id, *tail.evaluation_horizon_slots),
                         (slot_input.scenario_id, *tail.effective_prediction_scenarios),
-                        first_schedule,
+                        None,
                     )
                 )
                 search_complete = False
@@ -261,10 +253,11 @@ class CacheOptimizer:
                         *tail.effective_prediction_scenarios,
                     ),
                     evaluation_count=count,
-                    first_slot_schedule=first_schedule,
+                    first_slot_schedule=None,
                     future_slot_schedules=tail.slot_schedules,
                 )
             )
+            search_complete = search_complete and tail.search_complete
             if ledger.remaining == 0 and index + 1 < len(targets):
                 search_complete = False
                 break
@@ -350,6 +343,7 @@ class CacheOptimizer:
                 evaluation_horizon_slots=(),
                 effective_prediction_scenarios=(),
                 evaluation_count=0,
+                search_complete=True,
                 failure_reason="future_predicted_slot_inputs_unavailable",
             )
         cache_target = np.asarray(target_cache_state, dtype=np.int8).copy()
@@ -361,6 +355,7 @@ class CacheOptimizer:
         slot_ids: list[int] = []
         scenario_ids: list[str] = []
         evaluation_count = 0
+        search_complete = True
         for forecast in forecast_slots:
             predicted_input = forecast.as_slot_input(model)
             schedule = self.uav_scheduler.optimize(
@@ -376,7 +371,8 @@ class CacheOptimizer:
                 max_coordinate_rounds=max_coordinate_rounds,
             )
             evaluation_count += int(schedule.evaluation_count)
-            if not schedule.is_feasible or not schedule.search_complete:
+            search_complete = search_complete and schedule.search_complete
+            if not schedule.is_feasible or schedule.selected_evaluation is None:
                 return ForecastTailResult(
                     is_available=True,
                     is_feasible=False,
@@ -388,6 +384,7 @@ class CacheOptimizer:
                     evaluation_horizon_slots=tuple(slot_ids),
                     effective_prediction_scenarios=tuple(scenario_ids),
                     evaluation_count=evaluation_count,
+                    search_complete=False,
                     slot_schedules=tuple(schedule_rows),
                     failure_reason=schedule.failure_reason or "forecast_uav_search_incomplete",
                 )
@@ -404,6 +401,7 @@ class CacheOptimizer:
                     evaluation_horizon_slots=tuple(slot_ids),
                     effective_prediction_scenarios=tuple(scenario_ids),
                     evaluation_count=evaluation_count,
+                    search_complete=False,
                     slot_schedules=tuple(schedule_rows),
                     failure_reason="forecast_slot_result_missing",
                 )
@@ -427,6 +425,7 @@ class CacheOptimizer:
                     evaluation_horizon_slots=tuple(slot_ids),
                     effective_prediction_scenarios=tuple(scenario_ids),
                     evaluation_count=evaluation_count,
+                    search_complete=False,
                     slot_schedules=tuple(schedule_rows),
                     failure_reason="forecast_slot_final_uav_positions_missing",
                 )
@@ -443,20 +442,51 @@ class CacheOptimizer:
             evaluation_horizon_slots=tuple(slot_ids),
             effective_prediction_scenarios=tuple(scenario_ids),
             evaluation_count=evaluation_count,
+            search_complete=search_complete,
             slot_schedules=tuple(schedule_rows),
         )
+
+    def generate_candidates(
+        self,
+        *,
+        current_cache_state: Any,
+        slot_input: SlotInput,
+        search_budget: SearchBudget | None = None,
+        generation_diagnostics: dict[str, Any] | None = None,
+    ) -> tuple[tuple[CacheTargetCandidate, ...], bool]:
+        """生成有界合法缓存目标。
+
+        返回布尔值只表示本层提议上限或组合策略是否触发截断，不代表穷举了
+        全部合法缓存动作；传入诊断字典时会记录截断原因和实际提议覆盖。
+        """
+
+        settings = search_budget or SearchBudget()
+        current = np.asarray(current_cache_state)
+        if current.ndim != 2 or not np.all(np.isin(current, [0, 1])):
+            raise ValueError("current_cache_state must be a binary node-by-service matrix")
+        targets, complete = self._generate_targets(
+            current.astype(np.int8, copy=True),
+            slot_input,
+            settings,
+            generation_diagnostics=generation_diagnostics,
+        )
+        return tuple(targets), complete
 
     def _generate_targets(
         self,
         current: np.ndarray,
         slot_input: SlotInput,
         settings: SearchBudget,
-    ) -> list[_CacheTarget]:
+        generation_diagnostics: dict[str, Any] | None = None,
+    ) -> tuple[list[CacheTargetCandidate], bool]:
         node_ids = tuple(str(item) for item in slot_input.model.cache_nodes["node_ids"])
         if current.shape[0] != len(node_ids):
             raise ValueError("current Cache rows do not align with configured cache nodes")
-        targets = [_CacheTarget(current.copy(), (), "KEEP")]
+        targets = [CacheTargetCandidate(current.copy(), (), "KEEP")]
         per_node: list[list[Any]] = []
+        proposals_per_node_limit = max(1, int(settings.max_cache_candidates) - 1)
+        generation_complete = True
+        node_limits_reached: list[str] = []
         for node_index, node_id in enumerate(node_ids):
             proposals = cache_configuration.generate_bounded_cache_target_configurations(
                 current,
@@ -466,12 +496,21 @@ class CacheOptimizer:
                 copy.deepcopy(dict(slot_input.scenario_slice)),
                 slot_input.model.cache_config,
                 prediction_horizon_mask=copy.deepcopy(slot_input.prediction_horizon_mask),
-                max_candidates=max(1, int(settings.max_cache_candidates) - 1),
+                max_candidates=proposals_per_node_limit,
             )
             for proposal in proposals:
                 if str(proposal.node_id) != node_id:
                     raise ValueError("cache candidate generator returned a misaligned node ID")
             per_node.append(proposals)
+            if len(proposals) >= proposals_per_node_limit:
+                generation_complete = False
+                node_limits_reached.append(node_id)
+
+        active_nodes = [proposals for proposals in per_node if proposals]
+        if len(active_nodes) > 2 or (
+            len(active_nodes) == 2 and any(len(proposals) > 1 for proposals in active_nodes)
+        ):
+            generation_complete = False
 
         composite = current.copy()
         composite_nodes: list[str] = []
@@ -484,6 +523,7 @@ class CacheOptimizer:
                 composite_nodes.append(node_ids[node_index])
                 composite_sources.append(str(proposals[0].proposal_source))
         if composite_nodes:
+            before = len(targets)
             self._append_target(
                 targets,
                 current,
@@ -492,11 +532,21 @@ class CacheOptimizer:
                 "all_nodes_first_proposal:" + "+".join(composite_sources),
                 int(settings.max_cache_candidates),
             )
-
+            if len(targets) == before and before >= int(settings.max_cache_candidates):
+                generation_complete = False
+        node_round_robin_order = list(range(len(node_ids)))
+        if node_round_robin_order:
+            # 按 Slot 轮转单节点候选起点，避免全局上限长期偏向节点列表前部。
+            start_index = int(slot_input.slot_id) % len(node_round_robin_order)
+            node_round_robin_order = (
+                node_round_robin_order[start_index:]
+                + node_round_robin_order[:start_index]
+            )
         rank = 0
         while len(targets) < int(settings.max_cache_candidates):
             added = False
-            for node_index, proposals in enumerate(per_node):
+            for node_index in node_round_robin_order:
+                proposals = per_node[node_index]
                 if rank >= len(proposals):
                     continue
                 proposal = proposals[rank]
@@ -518,11 +568,86 @@ class CacheOptimizer:
             if not added:
                 break
             rank += 1
-        return targets
+        if len(targets) >= int(settings.max_cache_candidates):
+            generation_complete = False
+        if generation_diagnostics is not None:
+            generated_keys = {
+                np.ascontiguousarray(item.target_state, dtype=np.int8).tobytes()
+                for item in targets
+            }
+            proposal_keys: set[bytes] = set()
+            omitted_single_node_candidates: dict[str, int] = {}
+            generated_single_node_candidates: dict[str, int] = {}
+            for node_index, proposals in enumerate(per_node):
+                node_keys: set[bytes] = set()
+                for proposal in proposals:
+                    candidate = current.copy()
+                    candidate[node_index] = np.asarray(
+                        proposal.target_node_cache, dtype=np.int8
+                    ).copy()
+                    key = np.ascontiguousarray(candidate, dtype=np.int8).tobytes()
+                    proposal_keys.add(key)
+                    node_keys.add(key)
+                omitted_single_node_candidates[node_ids[node_index]] = sum(
+                    key not in generated_keys for key in node_keys
+                )
+                generated_single_node_candidates[node_ids[node_index]] = sum(
+                    key in generated_keys for key in node_keys
+                )
+            if composite_nodes:
+                proposal_keys.add(np.ascontiguousarray(composite, dtype=np.int8).tobytes())
+
+            reasons: list[str] = []
+            if node_limits_reached:
+                reasons.append("per_node_candidate_cap_reached")
+            if len(active_nodes) > 2 or (
+                len(active_nodes) == 2
+                and any(len(proposals) > 1 for proposals in active_nodes)
+            ):
+                reasons.append("cross_node_candidate_combinations_not_enumerated")
+            omitted_proposal_count = len(proposal_keys - generated_keys)
+            if omitted_proposal_count:
+                reasons.append("global_candidate_cap_omitted_generated_proposals")
+            elif len(targets) >= int(settings.max_cache_candidates):
+                reasons.append("global_candidate_cap_reached")
+            # 底层按需求锚点与有界 REPLACE 提议生成，不穷举全部合法缓存配置。
+            reasons.append("bounded_heuristic_generator_does_not_enumerate_all_legal_replacements")
+            generation_diagnostics.update(
+                {
+                    "generation_complete_within_bounded_proposal_policy": bool(
+                        generation_complete
+                    ),
+                    "legal_action_space_exhaustive": False,
+                    "candidate_limit_including_keep": int(settings.max_cache_candidates),
+                    "per_node_proposal_limit": int(proposals_per_node_limit),
+                    "formal_per_node_candidate_capacity": int(
+                        slot_input.model.cache_config.target_candidate_capacity
+                    ),
+                    "per_node_proposal_counts": {
+                        node_ids[index]: len(proposals)
+                        for index, proposals in enumerate(per_node)
+                    },
+                    "per_node_limit_reached": list(node_limits_reached),
+                    "active_node_ids": [
+                        node_ids[index]
+                        for index, proposals in enumerate(per_node)
+                        if proposals
+                    ],
+                    "single_node_round_robin_order": [
+                        node_ids[index] for index in node_round_robin_order
+                    ],
+                    "generated_candidate_count_including_keep": len(targets),
+                    "generated_single_node_candidate_count_by_node": generated_single_node_candidates,
+                    "omitted_single_node_candidate_count_by_node": omitted_single_node_candidates,
+                    "omitted_generated_proposal_count": int(omitted_proposal_count),
+                    "incomplete_reasons": reasons,
+                }
+            )
+        return targets, generation_complete
 
     @staticmethod
     def _append_target(
-        targets: list[_CacheTarget],
+        targets: list[CacheTargetCandidate],
         current: np.ndarray,
         candidate: np.ndarray,
         node_ids: Sequence[str],
@@ -549,12 +674,12 @@ class CacheOptimizer:
         key = np.ascontiguousarray(target).tobytes()
         if any(np.ascontiguousarray(item.target_state).tobytes() == key for item in targets):
             return
-        targets.append(_CacheTarget(target.copy(), changed, proposal_source))
+        targets.append(CacheTargetCandidate(target.copy(), changed, proposal_source))
 
     @staticmethod
     def _failed_score(
         index: int,
-        target: _CacheTarget,
+        target: CacheTargetCandidate,
         reason: str,
         evaluation_count: int,
         slots: Sequence[int],
@@ -583,5 +708,6 @@ __all__ = [
     "CacheCandidateScore",
     "CacheOptimizationResult",
     "CacheOptimizer",
+    "CacheTargetCandidate",
     "ForecastTailResult",
 ]

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import numbers
-from dataclasses import dataclass, field
+import pickle
+import time
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from decision import cache_configuration, slot_environment, task_allocation
+
+
+MAX_SAMPLE_SLOT_EVALUATIONS = 80
 
 
 @dataclass(frozen=True)
@@ -74,12 +80,13 @@ class PredictedSlotInput:
 
 @dataclass(frozen=True)
 class SearchBudget:
-    """Hard limits shared by cache, UAV, and joint candidate evaluations."""
+    """设置正式 Slot 评价的总硬上限及各类别优先额度。"""
 
-    max_total_evaluations: int = 256
-    max_cache_evaluations: int = 128
-    max_uav_evaluations: int = 64
-    max_joint_evaluations: int = 64
+    max_total_evaluations: int = MAX_SAMPLE_SLOT_EVALUATIONS
+    # 类别额度用于优先分配；有类别达到额度时，可借用其他类别未用额度。
+    max_cache_evaluations: int = 35
+    max_uav_evaluations: int = 35
+    max_joint_evaluations: int = 10
     max_cache_candidates: int = 8
     max_forecast_slots: int = 3
     max_uav_candidates_per_uav: int = 4
@@ -106,45 +113,73 @@ class SearchBudget:
             for value in integer_fields
         ):
             raise ValueError("all search budgets and candidate limits must be positive integers")
-        category_total = (
-            int(self.max_cache_evaluations)
-            + int(self.max_uav_evaluations)
-            + int(self.max_joint_evaluations)
-        )
-        if category_total > int(self.max_total_evaluations):
-            raise ValueError("per-stage evaluation limits exceed max_total_evaluations")
+        if int(self.max_total_evaluations) > MAX_SAMPLE_SLOT_EVALUATIONS:
+            raise ValueError(
+                f"max_total_evaluations cannot exceed {MAX_SAMPLE_SLOT_EVALUATIONS} per sample"
+            )
         if not math.isfinite(float(self.utility_tolerance)) or self.utility_tolerance < 0.0:
             raise ValueError("utility_tolerance must be finite and non-negative")
 
     def new_ledger(self) -> EvaluationBudget:
+        """创建总预算硬限制、类别额度可借用的评价账本。"""
+
         return EvaluationBudget(
             max_total_evaluations=int(self.max_total_evaluations),
             category_limits={
-                "cache": int(self.max_cache_evaluations),
-                "uav": int(self.max_uav_evaluations),
-                "joint": int(self.max_joint_evaluations),
+                "cache": min(
+                    int(self.max_total_evaluations), int(self.max_cache_evaluations)
+                ),
+                "uav": min(
+                    int(self.max_total_evaluations), int(self.max_uav_evaluations)
+                ),
+                "joint": min(
+                    int(self.max_total_evaluations), int(self.max_joint_evaluations)
+                ),
             },
         )
 
 
 @dataclass
 class EvaluationBudget:
-    """Mutable ledger counting attempted formal Slot evaluations."""
+    """记录正式 Slot 执行器实际调用次数的可变账本。"""
 
     max_total_evaluations: int
     category_limits: Mapping[str, int]
     evaluations_used: int = 0
     category_counts: dict[str, int] = field(default_factory=dict)
+    evaluation_cache: dict[bytes, CandidateEvaluation] = field(default_factory=dict)
+    cache_hits: int = 0
+    category_borrowed_counts: dict[str, int] = field(default_factory=dict)
+    executor_calls: int = 0
+    matching_calls: int = 0
+    kkt_solver_calls: int = 0
+    elapsed_seconds: float = 0.0
 
     def try_acquire(self, category: str) -> bool:
         if category not in self.category_limits:
             raise KeyError(f"unknown evaluation budget category: {category}")
         count = int(self.category_counts.get(category, 0))
-        if (
-            self.evaluations_used >= int(self.max_total_evaluations)
-            or count >= int(self.category_limits[category])
-        ):
+        if self.evaluations_used >= int(self.max_total_evaluations):
             return False
+        if count >= int(self.category_limits[category]):
+            other_reserved = sum(
+                max(
+                    0,
+                    int(limit) - int(self.category_counts.get(other, 0)),
+                )
+                for other, limit in self.category_limits.items()
+                if other != category
+            )
+            unallocated = max(
+                0,
+                int(self.max_total_evaluations)
+                - sum(int(value) for value in self.category_limits.values()),
+            )
+            if other_reserved + unallocated <= 0:
+                return False
+            self.category_borrowed_counts[category] = (
+                int(self.category_borrowed_counts.get(category, 0)) + 1
+            )
         self.evaluations_used += 1
         self.category_counts[category] = count + 1
         return True
@@ -170,6 +205,10 @@ class CandidateEvaluation:
     evaluation_horizon_slots: tuple[int, ...]
     effective_prediction_scenarios: tuple[str, ...]
     evaluation_count: int
+    executor_call_count: int = 0
+    matching_call_count: int = 0
+    kkt_solver_call_count: int = 0
+    elapsed_seconds: float = 0.0
     failure_reason: str = ""
     error_type: str = ""
     task_assignments: Mapping[str, str] = field(default_factory=dict)
@@ -201,6 +240,11 @@ def _failure(
     *,
     evaluation_count: int = 0,
     error_type: str = "",
+    diagnostics: Mapping[str, Any] | None = None,
+    executor_call_count: int = 0,
+    matching_call_count: int = 0,
+    kkt_solver_call_count: int = 0,
+    elapsed_seconds: float = 0.0,
 ) -> CandidateEvaluation:
     return CandidateEvaluation(
         is_feasible=False,
@@ -215,9 +259,52 @@ def _failure(
         evaluation_horizon_slots=(int(slot_input.slot_id),),
         effective_prediction_scenarios=(str(slot_input.scenario_id),),
         evaluation_count=int(evaluation_count),
+        executor_call_count=int(executor_call_count),
+        matching_call_count=int(matching_call_count),
+        kkt_solver_call_count=int(kkt_solver_call_count),
+        elapsed_seconds=float(elapsed_seconds),
         failure_reason=str(reason),
         error_type=str(error_type),
+        diagnostics=dict(diagnostics or {}),
     )
+
+
+def _evaluation_key(
+    slot_input: SlotInput,
+    previous_cache_state: Any,
+    previous_uav_positions: Mapping[str, Any],
+    candidate_cache_state: Any,
+    candidate_uav_positions: Mapping[str, Any],
+) -> bytes | None:
+    """为状态和输入完全相同的正式 Slot 评价生成内容键。"""
+
+    model = slot_input.model
+    payload = (
+        int(slot_input.slot_id),
+        None if slot_input.time_s is None else float(slot_input.time_s),
+        str(slot_input.source_kind),
+        str(slot_input.scenario_id),
+        slot_input.scenario_slice,
+        list(slot_input.tasks),
+        slot_input.vehicle_positions,
+        slot_input.predicted_vehicle_positions,
+        slot_input.prediction_horizon_mask,
+        dict(slot_input.prediction_metadata),
+        dict(model.service_catalog),
+        dict(model.project_cfg),
+        dict(model.cache_nodes),
+        model.cache_config,
+        tuple(float(value) for value in model.flight_boundary),
+        np.asarray(previous_cache_state, dtype=np.int8),
+        copy_uav_positions(previous_uav_positions),
+        np.asarray(candidate_cache_state, dtype=np.int8),
+        copy_uav_positions(candidate_uav_positions),
+    )
+    try:
+        return hashlib.sha256(pickle.dumps(payload, protocol=5)).digest()
+    except (pickle.PickleError, TypeError, ValueError, AttributeError):
+        # 自定义输入无法序列化时仍可评价，但不进行重复项合并。
+        return None
 
 
 class CandidateEvaluator:
@@ -237,9 +324,34 @@ class CandidateEvaluator:
         """Evaluate a configured cache/UAV pair without mutating caller-owned inputs."""
 
         ledger = budget or EvaluationBudget(1, {budget_category: 1})
-        if not ledger.try_acquire(budget_category):
-            return _failure(slot_input, "evaluation_budget_exhausted")
+        key = _evaluation_key(
+            slot_input,
+            previous_cache_state,
+            previous_uav_positions,
+            candidate_cache_state,
+            candidate_uav_positions,
+        )
+        if key is not None and key in ledger.evaluation_cache:
+            ledger.cache_hits += 1
+            cached = ledger.evaluation_cache[key]
+            return replace(
+                cached,
+                evaluation_count=0,
+                executor_call_count=0,
+                matching_call_count=0,
+                kkt_solver_call_count=0,
+                elapsed_seconds=0.0,
+                diagnostics={
+                    **dict(cached.diagnostics),
+                    "evaluation_cache_hit": True,
+                },
+            )
 
+        executor_called = False
+        executor_started_at: float | None = None
+        performance_profile: dict[str, Any] = {}
+        exact_q_timing_profile: dict[str, float] = {}
+        matching_kkt_cache: Any | None = None
         try:
             old_cache_raw = np.asarray(previous_cache_state)
             target_cache_raw = np.asarray(candidate_cache_state)
@@ -278,8 +390,11 @@ class CandidateEvaluator:
             cache_nodes = copy.deepcopy(dict(model.cache_nodes))
             cache_config = copy.deepcopy(model.cache_config)
             flight_boundary = tuple(float(value) for value in model.flight_boundary)
-            performance_profile: dict[str, Any] = {}
-            exact_q_timing_profile: dict[str, float] = {}
+            matching_kkt_cache = task_allocation.KKTResourceAllocationCache()
+            if not ledger.try_acquire(budget_category):
+                return _failure(slot_input, "evaluation_budget_exhausted")
+            executor_started_at = time.perf_counter()
+            executor_called = True
             result = slot_environment.execute_configured_slot(
                 old_cache,
                 old_uav,
@@ -296,16 +411,53 @@ class CandidateEvaluator:
                 slot_id=int(slot_input.slot_id),
                 time_s=None if slot_input.time_s is None else float(slot_input.time_s),
                 performance_profile=performance_profile,
-                matching_kkt_cache=task_allocation.KKTResourceAllocationCache(),
+                matching_kkt_cache=matching_kkt_cache,
                 node_evaluation_cache=task_allocation.NodeEvaluationCache(),
                 exact_q_timing_profile=exact_q_timing_profile,
             )
+            elapsed_seconds = time.perf_counter() - executor_started_at
+            matching_summary = copy.deepcopy(result.matching_summary)
+            matching_call_count = int(
+                bool(matching_summary)
+                or float(performance_profile.get("matching_kkt_seconds", 0.0)) > 0.0
+            )
+            kkt_solver_call_count = int(matching_kkt_cache.solver_calls)
+            ledger.executor_calls += 1
+            ledger.matching_calls += matching_call_count
+            ledger.kkt_solver_calls += kkt_solver_call_count
+            ledger.elapsed_seconds += elapsed_seconds
+            diagnostics = {
+                "prediction_metadata": copy.deepcopy(
+                    dict(slot_input.prediction_metadata)
+                ),
+                "matching_summary": matching_summary,
+                "configuration_summary": copy.deepcopy(result.configuration_summary),
+                "predictive_configuration_utility": result.predictive_configuration_utility,
+                "predictive_configuration_objective": result.predictive_configuration_objective,
+                "movement_energy": result.movement_energy,
+                "cache_download_delay_s": result.cache_download_delay_s,
+                "performance_profile": copy.deepcopy(performance_profile),
+                "exact_q_timing_profile": copy.deepcopy(exact_q_timing_profile),
+                "final_cache_state": None
+                if result.final_cache_state is None
+                else np.asarray(result.final_cache_state).copy(),
+                "final_uav_positions": copy.deepcopy(result.final_uav_positions),
+                "evaluation_cache_hit": False,
+            }
             if not bool(result.step_feasible):
-                return _failure(
+                evaluation = _failure(
                     slot_input,
                     f"formal_slot_infeasible: {result.infeasible_reason}",
                     evaluation_count=1,
+                    diagnostics=diagnostics,
+                    executor_call_count=1,
+                    matching_call_count=matching_call_count,
+                    kkt_solver_call_count=kkt_solver_call_count,
+                    elapsed_seconds=elapsed_seconds,
                 )
+                if key is not None:
+                    ledger.evaluation_cache[key] = evaluation
+                return evaluation
             values = {
                 "system_utility": result.system_utility,
                 "task_utility": result.actual_task_utility,
@@ -314,12 +466,20 @@ class CandidateEvaluator:
             }
             for name, value in values.items():
                 if value is None or not math.isfinite(float(value)):
-                    return _failure(
+                    evaluation = _failure(
                         slot_input,
                         f"non_finite_{name}",
                         evaluation_count=1,
+                        diagnostics=diagnostics,
+                        executor_call_count=1,
+                        matching_call_count=matching_call_count,
+                        kkt_solver_call_count=kkt_solver_call_count,
+                        elapsed_seconds=elapsed_seconds,
                     )
-            return CandidateEvaluation(
+                    if key is not None:
+                        ledger.evaluation_cache[key] = evaluation
+                    return evaluation
+            evaluation = CandidateEvaluation(
                 is_feasible=True,
                 system_utility=float(result.system_utility),
                 task_utility=float(result.actual_task_utility),
@@ -332,37 +492,54 @@ class CandidateEvaluator:
                 evaluation_horizon_slots=(int(slot_input.slot_id),),
                 effective_prediction_scenarios=(str(slot_input.scenario_id),),
                 evaluation_count=1,
+                executor_call_count=1,
+                matching_call_count=matching_call_count,
+                kkt_solver_call_count=kkt_solver_call_count,
+                elapsed_seconds=elapsed_seconds,
                 task_assignments=copy.deepcopy(result.matching),
                 cpu_allocations=copy.deepcopy(result.cpu_allocations),
                 bandwidth_allocations=copy.deepcopy(result.bandwidth_allocations),
                 per_task_delay_s=copy.deepcopy(result.per_task_delay_s),
                 per_task_utility=copy.deepcopy(result.per_task_utility),
-                diagnostics={
-                    "prediction_metadata": copy.deepcopy(
-                        dict(slot_input.prediction_metadata)
-                    ),
-                    "matching_summary": copy.deepcopy(result.matching_summary),
-                    "configuration_summary": copy.deepcopy(result.configuration_summary),
-                    "predictive_configuration_utility": result.predictive_configuration_utility,
-                    "predictive_configuration_objective": result.predictive_configuration_objective,
-                    "movement_energy": result.movement_energy,
-                    "cache_download_delay_s": result.cache_download_delay_s,
-                    "performance_profile": copy.deepcopy(performance_profile),
-                    "exact_q_timing_profile": copy.deepcopy(exact_q_timing_profile),
-                    "final_cache_state": None
-                    if result.final_cache_state is None
-                    else np.asarray(result.final_cache_state).copy(),
-                    "final_uav_positions": copy.deepcopy(result.final_uav_positions),
-                },
+                diagnostics=diagnostics,
                 slot_result=result,
             )
+            if key is not None:
+                ledger.evaluation_cache[key] = evaluation
+            return evaluation
         except Exception as exc:
-            return _failure(
+            elapsed_seconds = (
+                0.0
+                if executor_started_at is None
+                else time.perf_counter() - executor_started_at
+            )
+            matching_call_count = int(
+                float(performance_profile.get("matching_kkt_seconds", 0.0)) > 0.0
+            )
+            kkt_solver_call_count = int(
+                0 if matching_kkt_cache is None else matching_kkt_cache.solver_calls
+            )
+            if executor_called:
+                ledger.executor_calls += 1
+                ledger.matching_calls += matching_call_count
+                ledger.kkt_solver_calls += kkt_solver_call_count
+                ledger.elapsed_seconds += elapsed_seconds
+            evaluation = _failure(
                 slot_input,
                 f"candidate_evaluation_error: {type(exc).__name__}: {exc}",
-                evaluation_count=1,
+                evaluation_count=int(executor_called),
                 error_type=type(exc).__name__,
+                diagnostics={
+                    "performance_profile": copy.deepcopy(performance_profile),
+                    "exact_q_timing_profile": copy.deepcopy(exact_q_timing_profile),
+                    "evaluation_cache_hit": False,
+                },
+                executor_call_count=int(executor_called),
+                matching_call_count=matching_call_count,
+                kkt_solver_call_count=kkt_solver_call_count,
+                elapsed_seconds=elapsed_seconds,
             )
+            return evaluation
 
 
 __all__ = [

@@ -4,6 +4,7 @@ from .cache_optimizer import (
     CacheCandidateScore,
     CacheOptimizationResult,
     CacheOptimizer,
+    CacheTargetCandidate,
     ForecastTailResult,
 )
 from .candidate_evaluator import (
@@ -21,12 +22,18 @@ from .prediction_adapter import (
     adapt_aligned_rollout_step,
     adapt_prediction_origin,
 )
-from .uav_scheduler import UavCandidateEvaluation, UavScheduleResult, UavScheduler
+from .uav_scheduler import (
+    UavCandidateEvaluation,
+    UavMoveCandidate,
+    UavScheduleResult,
+    UavScheduler,
+)
 
 __all__ = [
     "CacheCandidateScore",
     "CacheOptimizationResult",
     "CacheOptimizer",
+    "CacheTargetCandidate",
     "CandidateEvaluation",
     "CandidateEvaluator",
     "EvaluationBudget",
@@ -39,6 +46,7 @@ __all__ = [
     "SlotInput",
     "SystemModelContext",
     "UavCandidateEvaluation",
+    "UavMoveCandidate",
     "UavScheduleResult",
     "UavScheduler",
     "adapt_aligned_rollout_step",
