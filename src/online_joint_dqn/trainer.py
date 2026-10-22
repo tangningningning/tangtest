@@ -331,6 +331,20 @@ def train_episode(
         else:
             uav_movement_cost = None
             movement_cost_available = False
+        beta_ca = transition.diagnostics.get("beta_ca")
+        beta_q = transition.diagnostics.get("beta_q")
+        beta_ca = None if beta_ca is None else float(beta_ca)
+        beta_q = None if beta_q is None else float(beta_q)
+        cache_cost_weighted = (
+            None
+            if beta_ca is None or cache_update_cost is None
+            else beta_ca * cache_update_cost
+        )
+        uav_movement_cost_weighted = (
+            None
+            if beta_q is None or uav_movement_cost is None
+            else beta_q * uav_movement_cost
+        )
         replay_buffer.add(
             state_features=state,
             action=selected.candidate.action,
@@ -408,8 +422,12 @@ def train_episode(
                 "cache_update_cost": cache_update_cost,
                 "cache_update_cost_available": cache_cost_available,
                 "cache_download_cost": cache_update_cost,
+                "beta_ca": beta_ca,
+                "cache_cost_weighted": cache_cost_weighted,
                 "uav_movement_cost": uav_movement_cost,
                 "uav_movement_cost_available": movement_cost_available,
+                "beta_q": beta_q,
+                "uav_movement_cost_weighted": uav_movement_cost_weighted,
                 "decision_wall_time_s": 0.0,
                 "executor_calls": transition.executor_calls,
                 "matching_calls": transition.matching_calls,
@@ -539,6 +557,11 @@ def train_episode(
                 update = agent.update(
                     replay_buffer.sample(int(settings.batch_size)),
                     candidate_rebuilder=environment.rebuild_candidates,
+                )
+                update["gradient_clip_threshold"] = float(agent.max_grad_norm)
+                update["gradient_was_clipped"] = bool(
+                    float(update["gradient_norm_before_clip"])
+                    > float(agent.max_grad_norm)
                 )
                 update.update(
                     {

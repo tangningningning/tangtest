@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -49,6 +50,14 @@ DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4
 DEFAULT_RUN_NAME_PREFIX = "online_joint_dqn_fixed_input"
+PLOT_REFRESH_INTERVAL_EPISODES = 10
+
+
+def _should_refresh_training_plots(completed_episode_count: int) -> bool:
+    """只在完整 Episode 数达到 10 的倍数时请求一次后台绘图。"""
+
+    count = int(completed_episode_count)
+    return count > 0 and count % PLOT_REFRESH_INTERVAL_EPISODES == 0
 
 _CODE_IDENTITY_REQUIRED_PATHS = (
     "src/common/project_config.py",
@@ -1186,6 +1195,124 @@ def run_training(
         learning_rate=learning_rate,
     )
 
+    plot_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="online-joint-dqn-plot"
+    )
+    plot_jobs: list[tuple[int, Future[dict[str, Any]]]] = []
+    plot_result_history: list[dict[str, Any]] = []
+    plot_result_latest: dict[str, Any] | None = None
+
+    def submit_plot_snapshot(episode_count: int) -> None:
+        nonlocal plot_result_latest
+        def generate_snapshot() -> dict[str, Any]:
+            from online_joint_dqn.plot_training import generate_training_plots
+
+            return generate_training_plots(
+                run_dir,
+                snapshot_episode=int(episode_count),
+            )
+
+        try:
+            future = plot_executor.submit(generate_snapshot)
+        except Exception as exc:
+            result = {
+                "status": "FAILED",
+                "snapshot_episode": int(episode_count),
+                "generated": [],
+                "skipped": {},
+                "failed": {
+                    "plot_job_submit": f"{type(exc).__name__}: {exc}"
+                },
+                "run_dir": str(run_dir),
+                "plot_dir": str(run_dir / "plots"),
+            }
+            plot_result_latest = result
+            plot_result_history.append(
+                {
+                    "snapshot_episode": int(episode_count),
+                    "status": "FAILED",
+                    "generated_count": 0,
+                    "skipped": {},
+                    "failed": dict(result["failed"]),
+                    "data_rows": {},
+                }
+            )
+            print(
+                f"[PLOT][ERROR] EP {episode_count:04d} submit failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+        plot_jobs.append((int(episode_count), future))
+        print(
+            f"[PLOT] EP {episode_count:04d} queued; training continues.",
+            flush=True,
+        )
+
+    def collect_plot_jobs(*, wait_for_all: bool) -> None:
+        nonlocal plot_result_latest
+        pending: list[tuple[int, Future[dict[str, Any]]]] = []
+        for episode_count, future in plot_jobs:
+            if not wait_for_all and not future.done():
+                pending.append((episode_count, future))
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "status": "FAILED",
+                    "snapshot_episode": episode_count,
+                    "generated": [],
+                    "skipped": {},
+                    "failed": {
+                        "plot_job": f"{type(exc).__name__}: {exc}"
+                    },
+                    "run_dir": str(run_dir),
+                    "plot_dir": str(run_dir / "plots"),
+                }
+            plot_result_latest = result
+            plot_result_history.append(
+                {
+                    "snapshot_episode": episode_count,
+                    "status": result.get("status", "UNKNOWN"),
+                    "generated_count": len(result.get("generated", [])),
+                    "skipped": dict(result.get("skipped", {})),
+                    "failed": dict(result.get("failed", {})),
+                    "data_rows": dict(result.get("data_rows", {})),
+                }
+            )
+            print(
+                f"[PLOT] EP {episode_count:04d} | "
+                f"{result.get('status', 'UNKNOWN')} | "
+                f"Generated {len(result.get('generated', []))} | "
+                f"Skipped {len(result.get('skipped', {}))} | "
+                f"Failed {len(result.get('failed', {}))} | "
+                f"Path {run_dir / 'plots'}",
+                flush=True,
+            )
+            for plot_name, error in result.get("failed", {}).items():
+                print(
+                    f"[PLOT][ERROR] EP {episode_count:04d} {plot_name}: {error}",
+                    flush=True,
+                )
+        plot_jobs[:] = pending
+
+    def persist_plot_results() -> None:
+        if plot_result_latest is None:
+            return
+        try:
+            summary_path = run_dir / "run_summary.json"
+            summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary_data["plot_generation"] = plot_result_latest
+            summary_data["plot_generation_history"] = list(plot_result_history)
+            _write_json(summary_path, summary_data, atomic=True)
+        except Exception as exc:
+            print(
+                f"[PLOT][ERROR] run_summary update failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
     stop_requested = False
     previous_signal_handlers: dict[int, Any] = {}
 
@@ -1383,6 +1510,9 @@ def run_training(
                     ),
                     flush=True,
                 )
+                if _should_refresh_training_plots(next_episode_index):
+                    submit_plot_snapshot(next_episode_index)
+                collect_plot_jobs(wait_for_all=False)
                 if stop_requested:
                     break
         status = (
@@ -1418,6 +1548,8 @@ def run_training(
             total_slots=total_slots,
             learning_rate=learning_rate,
         )
+        collect_plot_jobs(wait_for_all=False)
+        plot_executor.shutdown(wait=False, cancel_futures=False)
         raise
     finally:
         for signal_number, previous_handler in previous_signal_handlers.items():
@@ -1442,38 +1574,10 @@ def run_training(
         learning_rate=learning_rate,
     )
     if status == "FORMAL_TRAINING_COMPLETE":
-        plot_result: dict[str, Any]
-        try:
-            from online_joint_dqn.plot_training import generate_training_plots
-
-            plot_result = generate_training_plots(run_dir)
-        except Exception as exc:
-            plot_result = {
-                "status": "FAILED",
-                "generated": [],
-                "skipped": {},
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        try:
-            summary_path = run_dir / "run_summary.json"
-            summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
-            summary_data["plot_generation"] = plot_result
-            _write_json(summary_path, summary_data, atomic=True)
-        except Exception as exc:
-            print(
-                f"[PLOT] {plot_result.get('status', 'FAILED')} | "
-                f"summary update failed: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-        else:
-            generated_count = len(plot_result.get("generated", []))
-            skipped_count = len(plot_result.get("skipped", {}))
-            print(
-                f"[PLOT] {plot_result.get('status', 'UNKNOWN')} | "
-                f"Generated {generated_count} | Skipped {skipped_count} | "
-                f"Path {run_dir / 'plots'}",
-                flush=True,
-            )
+        submit_plot_snapshot(next_episode_index)
+    collect_plot_jobs(wait_for_all=True)
+    persist_plot_results()
+    plot_executor.shutdown(wait=False, cancel_futures=False)
     print(
         f"[DQN] {status} | Episodes {next_episode_index}/{len(episode_order)} "
         f"| Slots {global_step}/{total_slots}",
