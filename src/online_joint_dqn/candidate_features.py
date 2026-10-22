@@ -18,9 +18,9 @@ from online_joint_optimizer.candidate_evaluator import SlotInput, copy_uav_posit
 
 
 OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
-STATE_FEATURE_CONTRACT_VERSION = "formal_observation_horizon_workload_candidate_demand_v3"
-CANDIDATE_FEATURE_CONTRACT_VERSION = "prediction_only_uav_cache_complementarity_v3"
-NETWORK_ARCHITECTURE_VERSION = "legal_candidate_mean_centered_dueling_q_v4"
+STATE_FEATURE_CONTRACT_VERSION = "formal_observation_spatial_role_slots_v4"
+CANDIDATE_FEATURE_CONTRACT_VERSION = "prediction_only_cache_spatial_role_slots_v4"
+NETWORK_ARCHITECTURE_VERSION = "legal_candidate_mean_centered_dueling_q_v5"
 
 
 @dataclass(frozen=True)
@@ -301,31 +301,70 @@ class CandidateFeatureEncoder:
         observation_spec: Any,
         train_origin_start: int,
         train_origin_end: int,
+        canonical_vehicle_ids: Sequence[str] | None = None,
+        canonical_cache_node_ids: Sequence[str] | None = None,
     ) -> None:
-        self.node_ids = tuple(str(value) for value in observation_spec.cache_node_ids)
+        source_node_ids = tuple(str(value) for value in observation_spec.cache_node_ids)
         configured_node_ids = tuple(str(value) for value in slot_input.model.cache_nodes["node_ids"])
         self.service_ids = tuple(int(value) for value in observation_spec.service_ids)
         configured_service_ids = tuple(
             int(value)
             for value in np.asarray(slot_input.model.service_catalog["service_ids"]).tolist()
         )
-        if self.node_ids != configured_node_ids or self.service_ids != configured_service_ids:
+        if source_node_ids != configured_node_ids or self.service_ids != configured_service_ids:
             raise ValueError("DQN 特征顺序必须与正式 observation spec 和服务目录一致")
         self.observation_spec = observation_spec
         self.train_origin_start = int(train_origin_start)
         self.train_origin_end = int(train_origin_end)
+        self.source_node_ids = source_node_ids
+        self.node_ids = tuple(
+            source_node_ids
+            if canonical_cache_node_ids is None
+            else (str(value) for value in canonical_cache_node_ids)
+        )
+        if len(self.node_ids) != len(source_node_ids) or set(self.node_ids) != set(source_node_ids):
+            raise ValueError("规范缓存节点槽位必须与本 Episode 的真实节点一一对应")
+        self.cache_node_reorder_indices = tuple(
+            source_node_ids.index(node_id) for node_id in self.node_ids
+        )
         self.state_feature_contract_version = STATE_FEATURE_CONTRACT_VERSION
         self.candidate_feature_contract_version = CANDIDATE_FEATURE_CONTRACT_VERSION
         self.network_architecture_version = NETWORK_ARCHITECTURE_VERSION
         self.service_index = {service_id: index for index, service_id in enumerate(self.service_ids)}
         self.uav_ids = tuple(str(value) for value in observation_spec.uav_ids)
-        self.vehicle_ids = tuple(str(value) for value in observation_spec.vehicle_ids)
-        self.task_vehicle_ids = tuple(str(value) for value in observation_spec.task_vehicle_ids)
+        self.source_vehicle_ids = tuple(str(value) for value in observation_spec.vehicle_ids)
+        self.source_task_vehicle_ids = tuple(
+            str(value) for value in observation_spec.task_vehicle_ids
+        )
+        self.vehicle_ids = tuple(
+            self.source_vehicle_ids
+            if canonical_vehicle_ids is None
+            else (str(value) for value in canonical_vehicle_ids)
+        )
+        if len(self.vehicle_ids) != len(self.source_vehicle_ids) or set(self.vehicle_ids) != set(self.source_vehicle_ids):
+            raise ValueError("规范车辆槽位必须与本 Episode 的真实车辆一一对应")
+        task_vehicle_set = set(self.source_task_vehicle_ids)
+        if tuple(value for value in self.vehicle_ids if value not in task_vehicle_set) + tuple(
+            value for value in self.vehicle_ids if value in task_vehicle_set
+        ) != self.vehicle_ids:
+            raise ValueError("规范车辆槽位必须先排列 SV，再排列 TV")
+        self.vehicle_reorder_indices = tuple(
+            self.source_vehicle_ids.index(vehicle_id) for vehicle_id in self.vehicle_ids
+        )
+        self.task_vehicle_ids = tuple(
+            value for value in self.vehicle_ids if value in task_vehicle_set
+        )
         configured_uavs = tuple(uav_configuration.uav_ids_from_project(dict(slot_input.model.project_cfg)))
         if self.uav_ids != configured_uavs:
             raise ValueError("正式 observation spec 的 UAV 顺序与配置不一致")
         self.bounds = tuple(float(value) for value in slot_input.model.flight_boundary)
         self.cache_nodes = deepcopy(dict(slot_input.model.cache_nodes))
+        self.cache_nodes["node_ids"] = list(self.node_ids)
+        for field in ("node_roles", "capacities_mb", "cache_backhaul_rate_bps"):
+            values = slot_input.model.cache_nodes[field]
+            self.cache_nodes[field] = [
+                deepcopy(values[index]) for index in self.cache_node_reorder_indices
+            ]
         self.service_catalog = deepcopy(dict(slot_input.model.service_catalog))
         self.cache_config = slot_input.model.cache_config
         self.prediction_demand_beta = float(
@@ -417,16 +456,29 @@ class CandidateFeatureEncoder:
         decision_forecast: DecisionForecast,
         prediction_scenario: Mapping[str, Any],
     ) -> np.ndarray:
-        observation = np.asarray(formal_observation, dtype=np.float32).reshape(-1)
-        if observation.shape != (int(self.observation_spec.observation_dim),):
+        source_observation = np.asarray(formal_observation, dtype=np.float32).reshape(-1)
+        if source_observation.shape != (int(self.observation_spec.observation_dim),):
             raise ValueError("正式 MAPPO observation 维度与 DQN observation spec 不一致")
-        if not np.all(np.isfinite(observation)):
+        if not np.all(np.isfinite(source_observation)):
             raise ValueError("正式观测包含非有限值")
         mask = self._forecast_mask(decision_forecast)
         if self.observation_spec.horizon_mask_slice is not None:
-            observed_mask = observation[self.observation_spec.horizon_mask_slice]
+            observed_mask = source_observation[self.observation_spec.horizon_mask_slice]
             if not np.array_equal(observed_mask.astype(np.int8), mask):
                 raise ValueError("正式观测与预测时域 mask 不一致")
+        observation = source_observation.copy()
+        cache_rows = source_observation[self.observation_spec.cache_slice].reshape(
+            len(self.source_node_ids), len(self.service_ids)
+        )
+        observation[self.observation_spec.cache_slice] = cache_rows[
+            list(self.cache_node_reorder_indices)
+        ].reshape(-1)
+        vehicle_positions = source_observation[
+            self.observation_spec.predicted_vehicle_slice
+        ].reshape(self.horizon_count, len(self.source_vehicle_ids), 2)
+        observation[self.observation_spec.predicted_vehicle_slice] = vehicle_positions[
+            :, list(self.vehicle_reorder_indices), :
+        ].reshape(-1)
         expected_input: list[float] = []
         expected_cycles: list[float] = []
         for horizon_index, valid in enumerate(mask):
@@ -458,6 +510,26 @@ class CandidateFeatureEncoder:
             raise ValueError("状态特征维度或数值无效")
         return result
 
+    def restore_source_formal_observation(self, canonical_observation: Any) -> np.ndarray:
+        """将保存的规范槽位观测还原为正式 ObservationSpec 的源数组顺序。"""
+
+        observation = np.asarray(canonical_observation, dtype=np.float32).reshape(-1).copy()
+        if observation.shape != (int(self.observation_spec.observation_dim),):
+            raise ValueError("规范观测维度与正式 ObservationSpec 不一致")
+        cache_rows = observation[self.observation_spec.cache_slice].reshape(
+            len(self.node_ids), len(self.service_ids)
+        )
+        observation[self.observation_spec.cache_slice] = cache_rows[
+            np.argsort(self.cache_node_reorder_indices).tolist()
+        ].reshape(-1)
+        positions = observation[
+            self.observation_spec.predicted_vehicle_slice
+        ].reshape(self.horizon_count, len(self.vehicle_ids), 2)
+        observation[self.observation_spec.predicted_vehicle_slice] = positions[
+            :, np.argsort(self.vehicle_reorder_indices).tolist(), :
+        ].reshape(-1)
+        return observation
+
     def _encode_candidate_generation_demand(
         self,
         prediction_scenario: Mapping[str, Any],
@@ -473,10 +545,10 @@ class CandidateFeatureEncoder:
             str(value)
             for value in np.asarray(scenario["task_vehicle_ids"]).tolist()
         )
-        if scenario_vehicle_ids != self.vehicle_ids:
-            raise ValueError("预测场景车辆顺序与 DQN 状态顺序不一致")
-        if scenario_task_vehicle_ids != self.task_vehicle_ids:
-            raise ValueError("预测场景任务车辆顺序与 DQN 状态顺序不一致")
+        if scenario_vehicle_ids != self.source_vehicle_ids:
+            raise ValueError("预测场景车辆顺序与正式 ObservationSpec 不一致")
+        if set(scenario_task_vehicle_ids) != set(self.task_vehicle_ids):
+            raise ValueError("预测场景任务车辆身份与正式 ObservationSpec 不一致")
         by_horizon = cache_configuration.predicted_vehicle_service_demand_by_horizon(
             scenario,
             len(self.service_ids),
@@ -490,6 +562,7 @@ class CandidateFeatureEncoder:
         )
         if by_horizon.shape != expected_shape or not np.isfinite(by_horizon).all():
             raise ValueError("预测场景的车辆-服务需求统计维度或数值非法")
+        by_horizon = by_horizon[:, list(self.vehicle_reorder_indices), :]
         vehicle_service_demand = np.sum(by_horizon, axis=0)
         cache_node_demand = np.stack(
             [
@@ -531,8 +604,13 @@ class CandidateFeatureEncoder:
         decision_forecast: DecisionForecast,
         cache_complementarity_context: _CacheComplementarityContext | None = None,
     ) -> np.ndarray:
-        before_cache = np.asarray(previous_cache_state, dtype=np.int8)
-        after_cache = action.cache_array()
+        before_cache_source = np.asarray(previous_cache_state, dtype=np.int8)
+        after_cache_source = action.cache_array()
+        expected_cache_shape = (len(self.source_node_ids), len(self.service_ids))
+        if before_cache_source.shape != expected_cache_shape or after_cache_source.shape != expected_cache_shape:
+            raise ValueError("候选缓存状态与本 Episode 的真实缓存节点顺序不匹配")
+        before_cache = before_cache_source[list(self.cache_node_reorder_indices)].copy()
+        after_cache = after_cache_source[list(self.cache_node_reorder_indices)].copy()
         before_uav = copy_uav_positions(previous_uav_positions)
         after_uav = action.uav_dict()
         if action.operation not in OPERATIONS:
@@ -564,11 +642,14 @@ class CandidateFeatureEncoder:
         features.extend(removed.reshape(-1).tolist())
         features.extend(added.reshape(-1).tolist())
         added_mb = float(added.sum(axis=0) @ self.service_sizes_mb)
-        trigger = np.asarray(changed_node_mask, dtype=np.int8)
+        actual_changed_node_mask = np.asarray(
+            [float(node_id in action.changed_node_ids) for node_id in self.source_node_ids],
+            dtype=np.int8,
+        )
         cache_details = cache_configuration.cache_update_cost_details(
-            before_cache,
-            after_cache,
-            trigger,
+            before_cache_source,
+            after_cache_source,
+            actual_changed_node_mask,
             self.service_sizes_mb,
             dict(slot_input.model.cache_nodes),
             slot_input.model.cache_config,
@@ -651,14 +732,16 @@ class CandidateFeatureEncoder:
             np.asarray(slot_input.prediction_horizon_mask, dtype=np.int8).reshape(-1),
         ):
             raise ValueError("缓存互补性预测 mask 与 SlotInput 不一致")
-        if tuple(
+        scenario_vehicle_ids = tuple(
             str(value) for value in np.asarray(scenario["vehicle_ids"]).tolist()
-        ) != self.vehicle_ids:
-            raise ValueError("缓存互补性预测车辆顺序与 DQN 特征顺序不一致")
-        if tuple(
+        )
+        scenario_task_vehicle_ids = tuple(
             str(value) for value in np.asarray(scenario["task_vehicle_ids"]).tolist()
-        ) != self.task_vehicle_ids:
-            raise ValueError("缓存互补性预测任务车辆顺序与 DQN 特征顺序不一致")
+        )
+        if scenario_vehicle_ids != self.source_vehicle_ids:
+            raise ValueError("缓存互补性预测车辆顺序与正式 ObservationSpec 不一致")
+        if set(scenario_task_vehicle_ids) != set(self.task_vehicle_ids):
+            raise ValueError("缓存互补性预测任务车辆身份与正式 ObservationSpec 不一致")
 
         demand = cache_configuration.predicted_vehicle_service_demand_by_horizon(
             scenario,
@@ -673,6 +756,7 @@ class CandidateFeatureEncoder:
         )
         if demand.shape != expected_demand_shape or not np.isfinite(demand).all():
             raise ValueError("缓存互补性预测需求形状或数值非法")
+        demand = demand[:, list(self.vehicle_reorder_indices), :]
 
         # UAV 使用决策时的当前位置；预测时域内不假设 UAV 已经移动。
         feature_cache_nodes = deepcopy(self.cache_nodes)
@@ -703,7 +787,7 @@ class CandidateFeatureEncoder:
                 or np.any(weights > 1.0)
             ):
                 raise ValueError("缓存互补性节点服务性权重非法")
-            node_weights.append(weights)
+            node_weights.append(weights[:, list(self.vehicle_reorder_indices)])
         node_weights_array = np.stack(node_weights, axis=0)
         uav_indices = tuple(
             index
@@ -732,9 +816,10 @@ class CandidateFeatureEncoder:
                 )
         popularity /= float(np.count_nonzero(mask))
 
-        cache_state = np.asarray(previous_cache_state, dtype=np.int8)
-        if cache_state.shape != (len(self.node_ids), len(self.service_ids)):
+        cache_state_source = np.asarray(previous_cache_state, dtype=np.int8)
+        if cache_state_source.shape != (len(self.source_node_ids), len(self.service_ids)):
             raise ValueError("缓存互补性输入缓存矩阵维度错误")
+        cache_state = cache_state_source[list(self.cache_node_reorder_indices)].copy()
         total_predicted_demand = float(np.sum(demand))
         coverage_available = total_predicted_demand > 1.0e-12
         cache_coverage_before: float | None = None
@@ -917,7 +1002,7 @@ class CandidateFeatureEncoder:
         for horizon, valid in enumerate(mask):
             if valid:
                 positions = forecast.predicted_vehicle_positions_horizon[horizon]
-                missing = set(self.vehicle_ids) - set(str(value) for value in positions)
+                missing = set(self.source_vehicle_ids) - set(str(value) for value in positions)
                 if missing:
                     raise ValueError(f"预测时域 {horizon} 缺少车辆位置：{sorted(missing)}")
                 if not set(self.task_vehicle_ids).issubset(positions):

@@ -11,11 +11,18 @@ from collections import Counter, OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
+from common import project_config
+from decision import (
+    cache_configuration,
+    slot_environment,
+    task_allocation,
+    uav_configuration,
+)
 from online_joint_optimizer.candidate_evaluator import (
     SearchBudget,
     SlotInput,
@@ -39,7 +46,8 @@ DQN_BETA_Q = 0.001
 CANDIDATE_GENERATION_CONTRACT_VERSION = "state_ranked_bounded_pair_cache_replace_v2"
 DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT = 8
 DQN_CROSS_NODE_PAIR_SCAN_LIMIT = 32
-CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v6"
+CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v7"
+EPISODE_REBUILD_SPEC_SCHEMA_VERSION = "dqn_episode_candidate_rebuild_spec_v1"
 
 
 def candidate_generation_contract(
@@ -192,6 +200,14 @@ _CANDIDATE_REBUILD_IDENTITY_FIELDS = (
     "candidate_generation_contract",
     "candidate_capacity_limits",
     "network_architecture_version",
+    "episode_seed",
+    "episode_rebuild_id",
+    "episode_rebuild_spec_sha256",
+    "episode_vehicle_ids",
+    "episode_task_vehicle_ids",
+    "episode_cache_node_ids",
+    "canonical_vehicle_ids",
+    "canonical_cache_node_ids",
     "candidate_count",
     "candidate_ids_sha256",
 )
@@ -233,6 +249,110 @@ def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
         digest.update(candidate.action.candidate_id.encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _episode_rebuild_spec_sha256(payload: Mapping[str, Any]) -> str:
+    """逐字段计算重建规格摘要，避免跨字段对象共享影响 Pickle 图布局。"""
+
+    digest = hashlib.sha256()
+    for key in sorted(payload):
+        key_bytes = str(key).encode("utf-8")
+        value_bytes = pickle.dumps(payload[key], protocol=pickle.HIGHEST_PROTOCOL)
+        digest.update(len(key_bytes).to_bytes(4, "big"))
+        digest.update(key_bytes)
+        digest.update(len(value_bytes).to_bytes(8, "big"))
+        digest.update(value_bytes)
+    return digest.hexdigest()
+
+
+def _canonical_episode_vehicle_slots(
+    slot_input: SlotInput,
+    forecast: DecisionForecast,
+    service_count: int,
+    initial_cache_state: Any,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """用 Episode 首个决策的有效预测和初始缓存建立稳定角色内空间槽位。"""
+
+    scenario = dict(slot_input.scenario_slice)
+    vehicle_ids = tuple(str(value) for value in np.asarray(scenario["vehicle_ids"]).tolist())
+    task_vehicle_ids = tuple(
+        str(value) for value in np.asarray(scenario["task_vehicle_ids"]).tolist()
+    )
+    service_vehicle_ids = tuple(
+        str(value) for value in np.asarray(scenario["service_vehicle_ids"]).tolist()
+    )
+    mask = np.asarray(forecast.prediction_horizon_mask, dtype=np.int8).reshape(-1)
+    valid_horizons = tuple(int(index) for index in np.flatnonzero(mask))
+    if not valid_horizons:
+        raise ValueError("规范车辆槽位需要至少一个有效预测时域")
+    if set(task_vehicle_ids) & set(service_vehicle_ids) or set(task_vehicle_ids) | set(
+        service_vehicle_ids
+    ) != set(vehicle_ids):
+        raise ValueError("规范车辆槽位的 SV/TV 身份集合不完整")
+    demand_by_horizon = cache_configuration.predicted_vehicle_service_demand_by_horizon(
+        scenario,
+        int(service_count),
+        beta_discount=float(
+            project_config.get_config_value(
+                slot_input.model.project_cfg, "cache.discount_beta", 1.0
+            )
+        ),
+        prediction_horizon_mask=mask,
+    )
+    if demand_by_horizon.shape != (
+        len(mask), len(vehicle_ids), int(service_count)
+    ):
+        raise ValueError("规范车辆槽位的预测需求维度与正式预测合同不一致")
+    vehicle_index = {vehicle_id: index for index, vehicle_id in enumerate(vehicle_ids)}
+    cache_node_ids = tuple(
+        str(value) for value in slot_input.model.cache_nodes["node_ids"]
+    )
+    cache_state = np.asarray(initial_cache_state, dtype=np.int8)
+    if cache_state.shape != (len(cache_node_ids), int(service_count)):
+        raise ValueError("规范车辆槽位初始缓存与正式缓存节点顺序不一致")
+    initial_cache_by_node = {
+        node_id: tuple(int(value) for value in cache_state[index])
+        for index, node_id in enumerate(cache_node_ids)
+    }
+
+    def role_order(role_ids: Sequence[str]) -> tuple[str, ...]:
+        def spatial_key(vehicle_id: str) -> tuple[Any, ...]:
+            positions: list[float] = []
+            for horizon_index in valid_horizons:
+                horizon_positions = forecast.predicted_vehicle_positions_horizon[
+                    horizon_index
+                ]
+                if vehicle_id not in horizon_positions:
+                    raise ValueError(
+                        f"规范车辆槽位预测缺少车辆 {vehicle_id} 的时域 {horizon_index} 位置"
+                    )
+                xy = np.asarray(horizon_positions[vehicle_id], dtype=np.float64).reshape(2)
+                if not np.isfinite(xy).all():
+                    raise ValueError("规范车辆槽位预测坐标必须为有限数值")
+                positions.extend(float(value) for value in xy)
+            first_x, first_y = positions[:2]
+            predicted_demand_signature = tuple(
+                float(value)
+                for value in demand_by_horizon[
+                    list(valid_horizons), vehicle_index[vehicle_id], :
+                ].reshape(-1)
+            )
+            # 预测和已有缓存均相同时，车辆在当前可见信息下不可区分，再用本 Episode 源顺序打破并列。
+            episode_order_tiebreak = tuple(role_ids).index(vehicle_id)
+            return (
+                first_x,
+                first_y,
+                *positions,
+                *predicted_demand_signature,
+                initial_cache_by_node.get(vehicle_id, ()),
+                episode_order_tiebreak,
+            )
+
+        return tuple(sorted((str(value) for value in role_ids), key=spatial_key))
+
+    service_order = role_order(service_vehicle_ids)
+    task_order = role_order(task_vehicle_ids)
+    return service_order + task_order, service_order
 
 
 def _bounded_cross_node_pair_cache_targets(
@@ -476,6 +596,34 @@ class ExclusiveDQNEnvironment:
             raise ValueError("正式预测步骤与 Slot 输入未按同一时隙对齐")
         self.model = self.slot_inputs[0].model
         self.search_budget = search_budget or self._candidate_capacity_budget()
+        first_slot_input = self.slot_inputs[0]
+        first_forecast = self.decision_forecasts[0]
+        (
+            self.canonical_vehicle_ids,
+            canonical_service_vehicle_ids,
+        ) = _canonical_episode_vehicle_slots(
+            first_slot_input,
+            first_forecast,
+            len(tuple(self.model.service_catalog["service_ids"])),
+            context.initial_cache,
+        )
+        source_cache_node_ids = tuple(
+            str(value) for value in self.model.cache_nodes["node_ids"]
+        )
+        canonical_cache_node_ids = canonical_service_vehicle_ids + tuple(
+            value
+            for value in source_cache_node_ids
+            if value not in set(canonical_service_vehicle_ids)
+        )
+        if len(canonical_cache_node_ids) != len(source_cache_node_ids) or set(
+            canonical_cache_node_ids
+        ) != set(source_cache_node_ids):
+            raise ValueError("规范缓存节点槽位无法与正式缓存节点一一映射")
+        self.canonical_cache_node_ids = canonical_cache_node_ids
+        self.episode_seed = first_slot_input.prediction_metadata.get("episode_seed")
+        self.episode_seed = (
+            None if self.episode_seed is None else int(self.episode_seed)
+        )
         self.decision_count = len(self.slot_inputs) if decision_count is None else int(decision_count)
         self.terminal_at_end = bool(terminal_at_end)
         if self.decision_count <= 0 or self.decision_count > len(self.slot_inputs):
@@ -490,6 +638,8 @@ class ExclusiveDQNEnvironment:
             observation_spec=context.observation_spec,
             train_origin_start=int(context.train_origin_start),
             train_origin_end=int(context.train_origin_end),
+            canonical_vehicle_ids=self.canonical_vehicle_ids,
+            canonical_cache_node_ids=self.canonical_cache_node_ids,
         )
         self._initial_cache = np.asarray(context.initial_cache, dtype=np.int8).copy()
         self._initial_uav = {
@@ -508,6 +658,10 @@ class ExclusiveDQNEnvironment:
             "bypass_count": 0,
         }
         self.reset()
+        (
+            self._episode_rebuild_id,
+            self._episode_rebuild_spec_sha256,
+        ) = EpisodeCandidateRebuildAdapter.identity_for_environment(self)
 
     def _candidate_capacity_budget(self) -> SearchBudget:
         """将 DQN 适配层上限设为正式候选生成器容量的自然上界。"""
@@ -1053,6 +1207,14 @@ class ExclusiveDQNEnvironment:
         context = {
             "schema_version": CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION,
             "source_state_fingerprint": self._cached_state_fingerprint,
+            "episode_seed": self.episode_seed,
+            "episode_rebuild_id": self._episode_rebuild_id,
+            "episode_rebuild_spec_sha256": self._episode_rebuild_spec_sha256,
+            "episode_vehicle_ids": self.encoder.source_vehicle_ids,
+            "episode_task_vehicle_ids": self.encoder.source_task_vehicle_ids,
+            "episode_cache_node_ids": self.encoder.source_node_ids,
+            "canonical_vehicle_ids": self.canonical_vehicle_ids,
+            "canonical_cache_node_ids": self.canonical_cache_node_ids,
             "state_features": self._cached_state_features.copy(),
             "cache_state": self.cache_state.copy(),
             "uav_positions": {
@@ -1087,6 +1249,11 @@ class ExclusiveDQNEnvironment:
             _candidate_rebuild_payload_sha256(context)
         )
         return context
+
+    def candidate_rebuild_adapter(self) -> "EpisodeCandidateRebuildAdapter":
+        """创建不保留完整 Episode 数据的回放候选重建器。"""
+
+        return EpisodeCandidateRebuildAdapter.from_environment(self)
 
     def rebuild_candidates(
         self,
@@ -1139,7 +1306,12 @@ class ExclusiveDQNEnvironment:
         )
         if rebuilt_fingerprint != fingerprint:
             raise ValueError("回放候选上下文重建的状态指纹不匹配")
-        formal_observation = state_features[: int(self.context.observation_spec.observation_dim)]
+        canonical_observation = state_features[
+            : int(self.context.observation_spec.observation_dim)
+        ]
+        formal_observation = self.encoder.restore_source_formal_observation(
+            canonical_observation
+        )
         reencoded_state = self.encoder.encode_state(
             formal_observation, forecast, scenario_slice
         )
@@ -1238,6 +1410,25 @@ class ExclusiveDQNEnvironment:
             raise ValueError("回放状态特征合同与当前编码器不一致")
         if context.get("network_architecture_version") != self.encoder.network_architecture_version:
             raise ValueError("回放网络架构合同与当前编码器不一致")
+        if context.get("episode_rebuild_id") != self._episode_rebuild_id:
+            raise ValueError("回放候选属于其他 Episode 重建身份")
+        if context.get("episode_rebuild_spec_sha256") != self._episode_rebuild_spec_sha256:
+            raise ValueError("回放 Episode 重建规格摘要不匹配")
+        if context.get("episode_seed") != self.episode_seed:
+            raise ValueError("回放 Episode 种子与重建规格不匹配")
+        if (
+            tuple(context.get("episode_vehicle_ids", ()))
+            != self.encoder.source_vehicle_ids
+            or tuple(context.get("episode_task_vehicle_ids", ()))
+            != self.encoder.source_task_vehicle_ids
+            or tuple(context.get("episode_cache_node_ids", ()))
+            != self.encoder.source_node_ids
+            or tuple(context.get("canonical_vehicle_ids", ()))
+            != self.canonical_vehicle_ids
+            or tuple(context.get("canonical_cache_node_ids", ()))
+            != self.canonical_cache_node_ids
+        ):
+            raise ValueError("回放候选的车辆/缓存节点映射与 Episode 重建规格不匹配")
         if not isinstance(context.get("decision_forecast"), DecisionForecast):
             raise ValueError("回放候选重建缺少正式 DecisionForecast")
         candidate_count = int(context.get("candidate_count", 0))
@@ -1584,4 +1775,179 @@ class ExclusiveDQNEnvironment:
         )
 
 
-__all__ = ["EnvironmentTransition", "ExclusiveDQNEnvironment"]
+class EpisodeCandidateRebuildAdapter:
+    """仅保存一个 Episode 的模型、映射和特征合同，不保留任务或轨迹序列。"""
+
+    def __init__(
+        self,
+        *,
+        model: SystemModelContext,
+        encoder: CandidateFeatureEncoder,
+        observation_spec: Any,
+        train_origin_start: int,
+        train_origin_end: int,
+        search_budget: SearchBudget,
+        episode_seed: int | None,
+        episode_rebuild_id: str,
+        episode_rebuild_spec_sha256: str,
+    ) -> None:
+        self.model = deepcopy(model)
+        self.encoder = deepcopy(encoder)
+        self.context = SimpleNamespace(observation_spec=deepcopy(observation_spec))
+        self.canonical_vehicle_ids = self.encoder.vehicle_ids
+        self.canonical_cache_node_ids = self.encoder.node_ids
+        self.train_origin_start = int(train_origin_start)
+        self.train_origin_end = int(train_origin_end)
+        self.search_budget = deepcopy(search_budget)
+        self.episode_seed = None if episode_seed is None else int(episode_seed)
+        self._episode_rebuild_id = str(episode_rebuild_id)
+        self._episode_rebuild_spec_sha256 = str(episode_rebuild_spec_sha256)
+        self.uav_scheduler = UavScheduler()
+        self.cache_optimizer = CacheOptimizer(self.uav_scheduler)
+        self._candidate_rebuild_cache: OrderedDict[
+            tuple[str, ...], tuple[CandidateOption, ...]
+        ] = OrderedDict()
+        self._candidate_rebuild_cache_candidate_count = 0
+        self._candidate_rebuild_cache_stats = {
+            "hit_count": 0,
+            "miss_count": 0,
+            "generation_count": 0,
+            "eviction_count": 0,
+            "bypass_count": 0,
+        }
+
+    @staticmethod
+    def _identity_payload(environment: ExclusiveDQNEnvironment) -> dict[str, Any]:
+        return {
+            "schema_version": EPISODE_REBUILD_SPEC_SCHEMA_VERSION,
+            "episode_seed": environment.episode_seed,
+            "model": environment.model,
+            "encoder": environment.encoder,
+            "observation_spec": environment.context.observation_spec,
+            "train_origin_start": int(environment.context.train_origin_start),
+            "train_origin_end": int(environment.context.train_origin_end),
+            "search_budget": environment.search_budget,
+            "episode_vehicle_ids": environment.encoder.source_vehicle_ids,
+            "episode_task_vehicle_ids": environment.encoder.source_task_vehicle_ids,
+            "episode_cache_node_ids": environment.encoder.source_node_ids,
+            "canonical_vehicle_ids": environment.canonical_vehicle_ids,
+            "canonical_cache_node_ids": environment.canonical_cache_node_ids,
+            "state_feature_contract_version": environment.encoder.state_feature_contract_version,
+            "candidate_feature_contract_version": environment.encoder.candidate_feature_contract_version,
+            "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
+            "network_architecture_version": environment.encoder.network_architecture_version,
+        }
+
+    @classmethod
+    def identity_for_environment(
+        cls, environment: ExclusiveDQNEnvironment
+    ) -> tuple[str, str]:
+        payload = cls._identity_payload(environment)
+        spec_sha256 = _episode_rebuild_spec_sha256(payload)
+        episode_identity = hashlib.sha256(
+            pickle.dumps(
+                (environment.episode_seed, spec_sha256),
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        ).hexdigest()
+        return episode_identity, spec_sha256
+
+    @classmethod
+    def from_environment(
+        cls, environment: ExclusiveDQNEnvironment
+    ) -> "EpisodeCandidateRebuildAdapter":
+        return cls(
+            model=environment.model,
+            encoder=environment.encoder,
+            observation_spec=environment.context.observation_spec,
+            train_origin_start=environment.context.train_origin_start,
+            train_origin_end=environment.context.train_origin_end,
+            search_budget=environment.search_budget,
+            episode_seed=environment.episode_seed,
+            episode_rebuild_id=environment._episode_rebuild_id,
+            episode_rebuild_spec_sha256=environment._episode_rebuild_spec_sha256,
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        """序列化必要的 Episode 重建规格，不保存完整环境或真实任务。"""
+
+        return {
+            "schema_version": EPISODE_REBUILD_SPEC_SCHEMA_VERSION,
+            "episode_seed": self.episode_seed,
+            "model": self.model,
+            "encoder": self.encoder,
+            "observation_spec": self.context.observation_spec,
+            "train_origin_start": self.train_origin_start,
+            "train_origin_end": self.train_origin_end,
+            "search_budget": self.search_budget,
+            "episode_rebuild_id": self._episode_rebuild_id,
+            "episode_rebuild_spec_sha256": self._episode_rebuild_spec_sha256,
+        }
+
+    @classmethod
+    def from_state_dict(
+        cls, state: Mapping[str, Any]
+    ) -> "EpisodeCandidateRebuildAdapter":
+        if state.get("schema_version") != EPISODE_REBUILD_SPEC_SCHEMA_VERSION:
+            raise ValueError("Replay Episode 重建规格版本不兼容")
+        adapter = cls(
+            model=state["model"],
+            encoder=state["encoder"],
+            observation_spec=state["observation_spec"],
+            train_origin_start=int(state["train_origin_start"]),
+            train_origin_end=int(state["train_origin_end"]),
+            search_budget=state["search_budget"],
+            episode_seed=state.get("episode_seed"),
+            episode_rebuild_id=str(state["episode_rebuild_id"]),
+            episode_rebuild_spec_sha256=str(
+                state["episode_rebuild_spec_sha256"]
+            ),
+        )
+        if adapter._episode_rebuild_spec_sha256 != adapter._calculate_spec_sha256():
+            raise ValueError("Replay Episode 重建规格摘要不匹配")
+        expected_id = hashlib.sha256(
+            pickle.dumps(
+                (adapter.episode_seed, adapter._episode_rebuild_spec_sha256),
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        ).hexdigest()
+        if adapter._episode_rebuild_id != expected_id:
+            raise ValueError("Replay Episode 身份与重建规格不匹配")
+        return adapter
+
+    def _calculate_spec_sha256(self) -> str:
+        payload = {
+            "schema_version": EPISODE_REBUILD_SPEC_SCHEMA_VERSION,
+            "episode_seed": self.episode_seed,
+            "model": self.model,
+            "encoder": self.encoder,
+            "observation_spec": self.context.observation_spec,
+            "train_origin_start": self.train_origin_start,
+            "train_origin_end": self.train_origin_end,
+            "search_budget": self.search_budget,
+            "episode_vehicle_ids": self.encoder.source_vehicle_ids,
+            "episode_task_vehicle_ids": self.encoder.source_task_vehicle_ids,
+            "episode_cache_node_ids": self.encoder.source_node_ids,
+            "canonical_vehicle_ids": self.encoder.vehicle_ids,
+            "canonical_cache_node_ids": self.encoder.node_ids,
+            "state_feature_contract_version": self.encoder.state_feature_contract_version,
+            "candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
+            "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
+            "network_architecture_version": self.encoder.network_architecture_version,
+        }
+        return _episode_rebuild_spec_sha256(payload)
+
+    _candidate_capacity_limits = ExclusiveDQNEnvironment._candidate_capacity_limits
+    _generate_legal_candidates = ExclusiveDQNEnvironment._generate_legal_candidates
+    _decision_state_fingerprint = ExclusiveDQNEnvironment._decision_state_fingerprint
+    validate_candidate_rebuild_context_metadata = (
+        ExclusiveDQNEnvironment.validate_candidate_rebuild_context_metadata
+    )
+    rebuild_candidates = ExclusiveDQNEnvironment.rebuild_candidates
+
+
+__all__ = [
+    "EnvironmentTransition",
+    "EpisodeCandidateRebuildAdapter",
+    "ExclusiveDQNEnvironment",
+]

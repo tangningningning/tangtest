@@ -41,12 +41,22 @@ y = reward + gamma ** duration_slots * Q_target(s_next,a*)
 
 按类别合法集合做均值中心化是为动态候选集所作的 Dueling 结构适配；这不代表相关论文已验证缓存—UAV 任务。候选越多，存在价值估计噪声极值的理论机会通常越大；类别均值中心化不会校正最大值噪声，Double DQN 主要分离 TD bootstrap 的选择与估值，也不消除行为策略贪心选择中的全部偏差。当前没有独立训练/评价数据足以估计各类别的误差分布，因此未添加候选数惩罚或人为 Q 校正。逐 Slot 日志记录各类候选数、完整 Q 与中心化优势的均值/标准差/分位数/极值、类别均值价值、最大 Q 对应候选、探索/贪心来源、实际奖励及实际配置变化；Episode 汇总记录候选总体矩及逐状态最大值/分位数的分布。所有决策排序、TD target、统计和实际贪心选择均采用同一完整 Q 定义；是否提升策略仍需真实训练和独立评价确认。
 
-## Replay、Checkpoint 与指标
+## 跨 Episode 车辆槽位与 Replay 重建
+
+正式 ObservationSpec 将车辆轴按 SV、TV 分组，但组内保留各 Episode 预测 NPZ 的车辆顺序；Training Pool 不保证不同 Episode 的车辆身份或数组序号相同。DQN 在每个 Episode 第一个有效决策预测上分别对 SV、TV 建立稳定空间槽位：先按首个有效预测坐标 `(x, y)`，再按该车辆其余有效预测坐标及预测服务需求向量排序；对 SV 来说，如预测签名也相同，则继续按当前缓存行区分；全部决策可见特征仍相同时，才以该 Episode 的正式组内 NPZ 顺序打破平局。该顺序在整个 Episode 固定，不把不同 Episode 的物理车辆视为同一身份。
+
+状态中的预测车辆轴、缓存节点行、预测候选需求及互补性特征均使用 Episode 规范槽位。缓存动作仍保存并执行正式环境中的真实节点 ID 和源矩阵行顺序；重建前以 Episode 上下文还原对应编码器，动作不通过跨 Episode 车辆名或数组位置重新解释。状态/候选合同和网络架构合同均已更新；旧网络 Checkpoint 因输入语义合同不同而拒绝恢复。
+
+Replay 每条上下文现在包括 Episode 身份、规格摘要、源车辆/任务车辆/缓存节点 ID 顺序及规范槽位映射。Replay Buffer 注册按 Episode 身份隔离的轻量 `EpisodeCandidateRebuildAdapter`，只保存该 Episode 的系统模型、ObservationSpec、编码器、搜索预算及映射，不保存完整环境、任务序列或车辆轨迹；经验引用其上下文时保留对应重建器，环形覆盖后释放未再使用的 Episode 重建器。候选重建按上下文身份派发，并核验状态指纹、状态特征、候选数量和有序 ID、动作真实节点映射、特征维度与数值。Checkpoint 恢复先在暂存对象中校验 Replay schema、每个 Episode 重建器摘要和全部上下文，再一次性替换状态；旧 Replay schema 不兼容时明确拒绝。
+
+Replay 保存语义动作、所选动作特征、实际奖励、时长，以及当前/下一状态的压缩预测重建上下文和候选数量/ID 摘要，不保存完整候选特征矩阵。相邻转移重复的状态上下文通过引用共享，环形淘汰时释放引用；终止转移仍不 bootstrap。
+
+状态合同 `formal_observation_spatial_role_slots_v4`、候选特征合同 `prediction_only_cache_spatial_role_slots_v4`、候选生成合同 `state_ranked_bounded_pair_cache_replace_v2`、网络架构版本 `legal_candidate_mean_centered_dueling_q_v5`、Agent schema 5、Replay schema 7、Manifest v7、Checkpoint schema 8。候选重建上下文采用 v7，Episode 重建规格采用 `dqn_episode_candidate_rebuild_spec_v1`；旧状态特征、候选特征、网络架构、候选上下文或 Replay 合同不会静默迁移。训练身份继续包含特征/架构版本、源码与数据身份。
 
 Replay 保存语义动作、所选动作特征、实际奖励、时长，以及当前/下一状态的压缩预测重建上下文和候选数量/ID 摘要，不保存完整候选特征矩阵。重建当前类别候选用于优势归一化，重建下一候选用于 Double DQN。相邻转移重复的状态上下文通过引用共享，环形淘汰时释放引用，Checkpoint 恢复时重新共享。
 所有候选重建均校验状态指纹、候选 ID、所选目标和特征；上下文只包含决策可见的状态与预测。
 
-候选特征合同为 `prediction_only_uav_cache_complementarity_v3`，候选生成合同为 `state_ranked_bounded_pair_cache_replace_v2`，架构版本为 `legal_candidate_mean_centered_dueling_q_v4`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 5、Replay schema 6、Manifest v7、Checkpoint schema 8。候选重建上下文采用 v6；摘要包含逐项候选规则、扫描/保留限制和有效候选容量上限。旧 v5/v4 上下文和旧训练身份会在恢复校验阶段明确拒绝，不会修改已有智能体、Replay 或运行目录；网络架构合同没有因候选排序变化而升级。学习率、折扣、完整源码身份与数据身份继续参与恢复校验。
+旧候选上下文 v6、Replay schema 6 及更早合同在恢复阶段明确拒绝，不会修改已有智能体、Replay 或运行目录。学习率、折扣、完整源码身份与数据身份继续参与恢复校验。
 
 `selected_category_q` 是类别均值 Q（类别头输出）；`selected_candidate_q` 与 `selected_q_value` 都是所选动作完整 Q；`selected_candidate_advantage` 是类别均值中心化优势，可正可负且类内均值为零。逐 Slot `candidate_q_statistics_by_operation` 统计完整 Q，而 `candidate_advantage_statistics_by_operation` 单独统计中心化优势；类别候选数量和价值也分开记录。`td_loss` 是统一 TD loss。旧的 `category_td_loss` / `candidate_advantage_loss` 字段保留为不可用值 `null`，不伪造两份独立 loss。
 缓存变化、服务增删和 UAV 移动取实际前后状态差；成本和任务执行节点来自正式结果。预测缓存覆盖率独立标记，不能称为实际命中率或据其宣称缓存更新的因果收益。

@@ -215,6 +215,9 @@ def train_episode(
 
     settings = config or TrainerConfig()
     environment.reset()
+    replay_buffer.register_candidate_rebuilder(
+        environment.candidate_rebuild_adapter()
+    )
     global_step = int(global_step_start)
     replay_writes_start = int(replay_buffer.write_count)
     replay_samples_start = int(replay_buffer.sample_count)
@@ -575,7 +578,7 @@ def train_episode(
             for _ in range(int(settings.gradient_updates_per_step)):
                 update = agent.update(
                     replay_buffer.sample(int(settings.batch_size)),
-                    candidate_rebuilder=environment.rebuild_candidates,
+                    candidate_rebuilder=replay_buffer.rebuild_candidates,
                 )
                 update["gradient_clip_threshold"] = float(agent.max_grad_norm)
                 update["gradient_was_clipped"] = bool(

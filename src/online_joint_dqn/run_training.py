@@ -1067,7 +1067,15 @@ def run_training(
     replay_capacity: int = DEFAULT_REPLAY_CAPACITY,
     learning_rate: float = DEFAULT_LEARNING_RATE,
     run_name_prefix: str = DEFAULT_RUN_NAME_PREFIX,
+    max_episodes: int | None = None,
 ) -> int:
+    if max_episodes is not None:
+        if isinstance(max_episodes, bool) or int(max_episodes) != max_episodes:
+            raise ValueError("max_episodes 必须为正整数")
+        max_episodes = int(max_episodes)
+        if max_episodes <= 0:
+            raise ValueError("max_episodes 必须为正整数")
+
     pool_info = _validate_training_pool()
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     runtime_config = project_config.parse_toml_file(config_path)
@@ -1146,6 +1154,7 @@ def run_training(
             "evaluation_blockers": evaluation_gate["blockers"],
             "evaluation_gate": evaluation_gate,
             "training_status": "PREPARED",
+            "episode_limit_this_invocation": max_episodes,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(run_dir / "run_manifest.json", manifest, atomic=True)
@@ -1168,9 +1177,7 @@ def run_training(
             staged_replay = ReplayBuffer(int(replay_capacity), seed=int(seed))
             staged_agent.load_state_dict(payload["agent_state"])
             staged_replay.load_state_dict(payload["replay_state"])
-            staged_replay.validate_rebuild_contexts(
-                first_environment.validate_candidate_rebuild_context_metadata
-            )
+            staged_replay.validate_rebuild_contexts()
 
             restored_episode_order = [
                 int(value) for value in payload["episode_order"]
@@ -1218,6 +1225,8 @@ def run_training(
         manifest["evaluation_status"] = evaluation_gate["status"]
         manifest["evaluation_blockers"] = evaluation_gate["blockers"]
         manifest["evaluation_gate"] = evaluation_gate
+
+    manifest["episode_limit_this_invocation"] = max_episodes
 
     if not np.all(np.isfinite(state)):
         raise FloatingPointError("正式训练初始状态包含非有限值")
@@ -1426,7 +1435,12 @@ def run_training(
         ) as step_stream, (run_dir / "update_metrics.jsonl").open(
             "a", encoding="utf-8", buffering=1
         ) as update_stream:
-            for episode_index in range(next_episode_index, len(episode_order)):
+            episode_stop_index = len(episode_order)
+            if max_episodes is not None:
+                episode_stop_index = min(
+                    episode_stop_index, next_episode_index + max_episodes
+                )
+            for episode_index in range(next_episode_index, episode_stop_index):
                 episode_seed = int(episode_order[episode_index])
                 attempt = attempts_by_seed.get(episode_seed, 0) + 1
                 attempts_by_seed[episode_seed] = attempt
@@ -1606,7 +1620,7 @@ def run_training(
                     break
         status = (
             "STOPPED_AT_EPISODE_BOUNDARY"
-            if stop_requested and next_episode_index < len(episode_order)
+            if next_episode_index < len(episode_order)
             else "FORMAL_TRAINING_COMPLETE"
         )
     except BaseException as exc:
@@ -1676,7 +1690,7 @@ def run_training(
         f"| Slots {global_step}/{total_slots}",
         flush=True,
     )
-    return 130 if status == "STOPPED_AT_EPISODE_BOUNDARY" else 0
+    return 130 if stop_requested else 0
 
 
 def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -1701,9 +1715,17 @@ def main(
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--replay-capacity", type=int, default=DEFAULT_REPLAY_CAPACITY)
+    parser.add_argument(
+        "--max-episodes",
+        type=int,
+        default=None,
+        help="本次运行最多完成的 Episode 数；在 Episode 边界安全停止，Checkpoint 仍按完整训练池记录",
+    )
     args = parser.parse_args()
     if int(args.replay_capacity) <= 0:
         parser.error("--replay-capacity 必须为正整数")
+    if args.max_episodes is not None and args.max_episodes <= 0:
+        parser.error("--max-episodes 必须为正整数")
     return run_training(
         output_dir=args.output_dir,
         resume_checkpoint=args.resume_checkpoint,
@@ -1711,6 +1733,7 @@ def main(
         replay_capacity=args.replay_capacity,
         learning_rate=learning_rate,
         run_name_prefix=run_name_prefix,
+        max_episodes=args.max_episodes,
     )
 
 

@@ -1,4 +1,4 @@
-"""保存转移及可确定性重建的下一状态候选上下文。"""
+"""保存转移及按 Episode 身份重建的当前/下一状态候选上下文。"""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ CandidateRebuilder = Callable[[Mapping[str, Any]], Sequence[CandidateOption]]
 
 @dataclass(frozen=True)
 class ReplayTransition:
-    """经验主体只保留所选动作和下一状态重建上下文，不保留候选特征矩阵。"""
+    """经验只保留所选动作及当前/下一状态重建上下文，不保存候选特征矩阵。"""
 
     state_features: tuple[float, ...]
     action: ActionCandidate
@@ -240,7 +240,7 @@ class ReplayTransition:
 class ReplayBuffer:
     """固定容量环形回放，不按经验重复保存完整候选特征矩阵。"""
 
-    STATE_SCHEMA_VERSION = 6
+    STATE_SCHEMA_VERSION = 7
 
     def __init__(self, capacity: int, *, seed: int = 0) -> None:
         if int(capacity) <= 0:
@@ -255,6 +255,70 @@ class ReplayBuffer:
         # 相邻转移共享同一状态上下文，避免分别保存当前和下一状态的重复字节。
         self._context_pool: dict[str, bytes] = {}
         self._context_refcounts: dict[str, int] = {}
+        self._candidate_rebuilders: dict[str, Any] = {}
+        self._episode_rebuild_refcounts: dict[str, int] = {}
+
+    def register_candidate_rebuilder(self, rebuilder: Any) -> None:
+        """登记与历史 Episode 绑定的轻量候选重建器。"""
+
+        episode_id = str(getattr(rebuilder, "_episode_rebuild_id", ""))
+        spec_sha256 = str(getattr(rebuilder, "_episode_rebuild_spec_sha256", ""))
+        if not episode_id or len(spec_sha256) != 64:
+            raise ValueError("Episode 候选重建器缺少有效身份合同")
+        try:
+            bytes.fromhex(episode_id)
+            bytes.fromhex(spec_sha256)
+        except ValueError:
+            raise ValueError("Episode 重建身份摘要不是有效十六进制") from None
+        expected_episode_id = hashlib.sha256(
+            pickle.dumps(
+                (getattr(rebuilder, "episode_seed", None), spec_sha256),
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        ).hexdigest()
+        if episode_id != expected_episode_id:
+            raise ValueError("Episode 重建器身份与种子/规格摘要不匹配")
+        existing = self._candidate_rebuilders.get(episode_id)
+        if existing is not None:
+            if str(existing._episode_rebuild_spec_sha256) != spec_sha256:
+                raise ValueError("相同 Episode 重建身份对应不同规格")
+            return
+        self._candidate_rebuilders[episode_id] = rebuilder
+        self._episode_rebuild_refcounts.setdefault(episode_id, 0)
+
+    @staticmethod
+    def _context_episode_identity(blob: bytes) -> tuple[str, str]:
+        context = pickle.loads(zlib.decompress(blob))
+        if not isinstance(context, Mapping):
+            raise ValueError("Replay 候选上下文必须是映射")
+        episode_id = str(context.get("episode_rebuild_id", ""))
+        spec_sha256 = str(context.get("episode_rebuild_spec_sha256", ""))
+        if not episode_id or len(spec_sha256) != 64:
+            raise ValueError("Replay 候选上下文缺少 Episode 重建身份")
+        return episode_id, spec_sha256
+
+    def _validate_registered_context(self, blob: bytes) -> tuple[str, Any]:
+        episode_id, spec_sha256 = self._context_episode_identity(blob)
+        rebuilder = self._candidate_rebuilders.get(episode_id)
+        if rebuilder is None:
+            raise ValueError("Replay 中的 Episode 尚未登记候选重建器")
+        if str(rebuilder._episode_rebuild_spec_sha256) != spec_sha256:
+            raise ValueError("Replay 上下文与 Episode 重建器规格不匹配")
+        return episode_id, rebuilder
+
+    def rebuild_candidates(
+        self, context: Mapping[str, Any]
+    ) -> Sequence[CandidateOption]:
+        """按上下文所属 Episode 分派，禁止用当前 Episode 映射重建历史经验。"""
+
+        episode_id = str(context.get("episode_rebuild_id", ""))
+        spec_sha256 = str(context.get("episode_rebuild_spec_sha256", ""))
+        rebuilder = self._candidate_rebuilders.get(episode_id)
+        if rebuilder is None:
+            raise ValueError("Replay 缺少该历史 Episode 的候选重建器")
+        if str(rebuilder._episode_rebuild_spec_sha256) != spec_sha256:
+            raise ValueError("Replay 候选上下文与历史 Episode 规格不匹配")
+        return rebuilder.rebuild_candidates(context)
 
     def _pack_context(
         self, context: Mapping[str, Any], state_features: Any, fingerprint: str
@@ -272,10 +336,14 @@ class ReplayBuffer:
         return existing if existing is not None else blob
 
     def _retain_context(self, fingerprint: str, blob: bytes) -> bytes:
+        episode_id, _ = self._validate_registered_context(blob)
         existing = self._context_pool.setdefault(fingerprint, blob)
         if existing != blob:
             raise ValueError("相同状态的压缩候选上下文不一致")
         self._context_refcounts[fingerprint] = self._context_refcounts.get(fingerprint, 0) + 1
+        self._episode_rebuild_refcounts[episode_id] = self._episode_rebuild_refcounts.get(
+            episode_id, 0
+        ) + 1
         return existing
 
     def _release_contexts(self, transition: ReplayTransition) -> None:
@@ -284,6 +352,12 @@ class ReplayBuffer:
             fingerprints.append(str(transition.next_state_fingerprint))
         for fingerprint in fingerprints:
             remaining = self._context_refcounts[fingerprint] - 1
+            episode_id, _ = self._context_episode_identity(self._context_pool[fingerprint])
+            episode_remaining = self._episode_rebuild_refcounts[episode_id] - 1
+            if episode_remaining:
+                self._episode_rebuild_refcounts[episode_id] = episode_remaining
+            else:
+                del self._episode_rebuild_refcounts[episode_id]
             if remaining:
                 self._context_refcounts[fingerprint] = remaining
             else:
@@ -335,6 +409,7 @@ class ReplayBuffer:
         current_context_zlib = self._pack_context(
             current_candidate_rebuild_context, state_features, source_fingerprint
         )
+        self._validate_registered_context(current_context_zlib)
         candidates = tuple(next_legal_candidates)
         if terminated:
             if (
@@ -374,6 +449,7 @@ class ReplayBuffer:
             context_zlib = self._pack_context(
                 next_candidate_rebuild_context, next_state, str(next_state_fingerprint)
             )
+            self._validate_registered_context(context_zlib)
             candidate_count = len(candidates)
             candidate_ids_sha256 = _candidate_ids_sha256(candidates)
         if not action.source_state_fingerprint:
@@ -417,6 +493,10 @@ class ReplayBuffer:
             self._items[self._position] = transition
         self._position = (self._position + 1) % self.capacity
         self.write_count += 1
+        for episode_id, references in tuple(self._episode_rebuild_refcounts.items()):
+            if references == 0:
+                self._episode_rebuild_refcounts.pop(episode_id, None)
+                self._candidate_rebuilders.pop(episode_id, None)
         return transition
 
     def sample(self, batch_size: int) -> list[ReplayTransition]:
@@ -427,9 +507,7 @@ class ReplayBuffer:
         self.sample_count += int(batch_size)
         return sampled
 
-    def validate_rebuild_contexts(
-        self, validator: Callable[[Mapping[str, Any]], None]
-    ) -> None:
+    def validate_rebuild_contexts(self) -> None:
         """在恢复训练前校验每个唯一候选上下文，不生成候选或运行系统求解。"""
 
         state_features_by_fingerprint: dict[str, tuple[float, ...]] = {}
@@ -487,7 +565,16 @@ class ReplayBuffer:
             expanded_context["state_features"] = np.asarray(
                 state_features_by_fingerprint[fingerprint], dtype=np.float32
             )
-            validator(expanded_context)
+            episode_id = str(expanded_context.get("episode_rebuild_id", ""))
+            spec_sha256 = str(
+                expanded_context.get("episode_rebuild_spec_sha256", "")
+            )
+            rebuilder = self._candidate_rebuilders.get(episode_id)
+            if rebuilder is None:
+                raise ValueError("Checkpoint Replay 缺少历史 Episode 重建器")
+            if str(rebuilder._episode_rebuild_spec_sha256) != spec_sha256:
+                raise ValueError("Checkpoint Replay Episode 重建规格不匹配")
+            rebuilder.validate_candidate_rebuild_context_metadata(expanded_context)
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -501,6 +588,11 @@ class ReplayBuffer:
             "sample_count": self.sample_count,
             "candidate_feature_matrices_persisted": False,
             "unique_candidate_context_count": len(self._context_pool),
+            "episode_candidate_rebuilders": {
+                episode_id: rebuilder.state_dict()
+                for episode_id, rebuilder in self._candidate_rebuilders.items()
+                if self._episode_rebuild_refcounts.get(episode_id, 0) > 0
+            },
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -512,8 +604,21 @@ class ReplayBuffer:
         items = [ReplayTransition.from_compact_dict(item) for item in state["items"]]
         if capacity != self.capacity or len(items) > self.capacity:
             raise ValueError("回放状态容量与当前缓冲区不匹配")
+        raw_rebuilders = state.get("episode_candidate_rebuilders")
+        if not isinstance(raw_rebuilders, Mapping):
+            raise ValueError("Checkpoint Replay 缺少 Episode 候选重建器注册表")
+        from .environment_adapter import EpisodeCandidateRebuildAdapter
+
+        candidate_rebuilders = {
+            str(episode_id): EpisodeCandidateRebuildAdapter.from_state_dict(value)
+            for episode_id, value in raw_rebuilders.items()
+        }
+        for episode_id, rebuilder in candidate_rebuilders.items():
+            if str(rebuilder._episode_rebuild_id) != episode_id:
+                raise ValueError("Checkpoint Replay 重建器身份键不一致")
         context_pool: dict[str, bytes] = {}
         context_refcounts: dict[str, int] = {}
+        episode_refcounts: dict[str, int] = {}
 
         def intern(fingerprint: str, blob: bytes | None) -> bytes:
             if not fingerprint or blob is None:
@@ -521,7 +626,14 @@ class ReplayBuffer:
             existing = context_pool.setdefault(fingerprint, blob)
             if existing != blob:
                 raise ValueError("Checkpoint 相同状态对应不同候选上下文")
+            episode_id, spec_sha256 = self._context_episode_identity(blob)
+            rebuilder = candidate_rebuilders.get(episode_id)
+            if rebuilder is None:
+                raise ValueError("Checkpoint 上下文缺少对应 Episode 候选重建器")
+            if str(rebuilder._episode_rebuild_spec_sha256) != spec_sha256:
+                raise ValueError("Checkpoint 上下文与 Episode 重建规格不匹配")
             context_refcounts[fingerprint] = context_refcounts.get(fingerprint, 0) + 1
+            episode_refcounts[episode_id] = episode_refcounts.get(episode_id, 0) + 1
             return existing
 
         rebuilt_items = [
@@ -543,10 +655,14 @@ class ReplayBuffer:
         restored_position = int(state["position"])
         if not 0 <= restored_position < self.capacity:
             raise ValueError("Checkpoint Replay Buffer 环形写入位置非法")
+        if set(episode_refcounts) != set(candidate_rebuilders):
+            raise ValueError("Checkpoint Replay 重建器与经验上下文集合不一致")
         # 所有身份、上下文与随机状态校验通过后，才替换当前回放状态。
         self._items = rebuilt_items
         self._context_pool = context_pool
         self._context_refcounts = context_refcounts
+        self._candidate_rebuilders = candidate_rebuilders
+        self._episode_rebuild_refcounts = episode_refcounts
         self._position = restored_position
         self._rng = restored_rng
         self.write_count = int(state.get("write_count", len(items)))
