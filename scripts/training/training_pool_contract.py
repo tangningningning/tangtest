@@ -33,7 +33,9 @@ CONFIG_RELATIVE = Path("configs/proposed/alternating_actor_updates_v1.toml")
 POOL_MANIFEST_SOURCE_CONFIG_RELATIVE = Path("configs/proposed/system_config.toml")
 TRAIN_POOL_RELATIVE = Path("environment_data/proposed_joint_training")
 VALIDATION_POOL_RELATIVE = Path("environment_data/proposed_joint_validation")
+TEST_POOL_RELATIVE = Path("environment_data/proposed_joint_test")
 DEFAULT_TRAINING_SEED_START = 20001
+DEFAULT_TEST_SEED_START = 40001
 
 # The training data contract is pinned independently of runtime/reward/MAPPO values.
 FORMAL_TRAINING_POOL_MANIFEST_SHA256 = (
@@ -45,6 +47,7 @@ FORMAL_TRAINING_POOL_INTEGRITY_BASELINE_SHA256 = (
 FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT = 3002
 FORMAL_TRAINING_EPISODE_COUNT = 300
 FORMAL_TRAINING_EPISODE_SLOTS = 300
+FORMAL_TEST_EPISODE_COUNT = 100
 FORMAL_TRAINING_TASK_CONTRACT_SHA256 = (
     "dc7e83d99c69f1c3ea603c18fe9a2606f0bffe477556e75924e1d8dfd24387c3"
 )
@@ -538,9 +541,12 @@ def _validate_episode_snapshot(
             if isinstance(source_provenance, dict)
             else None
         )
-        expected_source_fields = _jsonable(pool_info["generation_config_fields"])
-        expected_source_fields["service"]["generation"]["input_size_max_kb"] = 5000.0
-        if not isinstance(source_fields, dict) or source_fields != expected_source_fields:
+        # Test Pool 的来源是冻结的 v1 清单；逐项字段由下方固定 SHA-256
+        # 精确绑定，不能将 v2 的新字段要求套用到历史 v1，也不能改写其来源。
+        if (
+            not isinstance(source_fields, dict)
+            or source_fields.get("schema") != "episode_manifest_v1"
+        ):
             source_contract_valid = False
         elif hashlib.sha256(
             json.dumps(

@@ -15,40 +15,38 @@ P0 优化固定长度 Episode 的平均期望系统效用。固定长度下，�
 
 ## 信息与候选合同
 
-状态复用正式 `build_step_observation()`：当前缓存、UAV 位置、5 个预测时域的车辆位置及服务流行度、有效 mask、正式时间特征，另加由服务目录计算的预测工作量摘要。真实当前任务及未来真实轨迹不进入网络或候选生成。
+状态复用正式 `build_step_observation()`：当前缓存、UAV 位置、5 个预测时域的车辆位置及服务流行度、有效 mask、正式时间特征，另加由正式预测需求 helper 计算、供候选生成使用的车辆—服务及缓存节点—服务需求摘要。真实当前任务及未来真实轨迹不进入网络或候选生成。
 候选特征保存目标缓存、节点变化、服务增删、正式下载成本、UAV 前后位置、位移成本及预测距离。缓存与 UAV 变化在候选构造、适配器和执行结果三处校验互斥。
 
 ## 两阶段价值与 Double DQN
 
-类别头输出 `V_c(s)`；候选头输出原始优势 `A(s,a)`。对当前合法类别内集合 `L_c(s)`，统一定义：
+类别头输出 `V_c(s)`；候选头输出原始评分 `A(s,a)`。对当前合法类别内集合 `L_c(s)`，统一定义：
 
 ```
-Q(s,a) = V_c(s) + A(s,a) - max_{b in L_c(s)} A(s,b)
+Q(s,a) = V_c(s) + A(s,a) - mean_{b in L_c(s)} A(s,b)
 ```
 
-因此 `max_{a in L_c(s)} Q(s,a) = V_c(s)`。类别头具有类别最佳候选价值的明确含义，不再把随机探索的低价值目标直接当成整个类别的监督目标。
-贪心时先按 `V_c` 在可用类别中选择，再只在选定类别内按优势选择目标。探索仍先均匀选择可用类别，再在该类别内均匀选择候选，KEEP 始终可选。
+因此 `V_c(s)` 等于该类别合法候选的平均 Q 值，而不是类别内最佳候选 Q。贪心时在 `KEEP_STAY`、`CACHE_UPDATE`、`UAV_MOVE` 的全部合法候选间比较完整 `Q(s,a)`；不能只比较类别头。探索仍先均匀选择当前可用类别，再在该类别内均匀选择候选，KEEP 始终可选但不被强制执行。
 
-下一状态在线类别头选择类别，在线候选头选择该类别中的目标；目标双头按相同聚合公式估计这个在线动作的 Q。目标网络的类别内最大优势只用于归一化，不替代在线动作选择：
+下一状态在线网络在全部合法候选间选择最大完整 Q；目标网络只评估同一个候选，并使用该候选类别的合法集合均值归一化：
 
 ```
-c* = argmax_c V_online,c(s_next)
-a* = argmax_{a in L_c*(s_next)} A_online(s_next,a)
+a* = argmax_{a in L(s_next)} Q_online(s_next,a)
 y = reward + gamma ** duration_slots * Q_target(s_next,a*)
 ```
 
-终止目标为实际 reward。两个在线头通过 `Huber(Q_online(s,a), y)` 的同一 TD 误差更新；不再分别将类别值与候选残差回归两个互相移动的目标。目标同步、Adam、学习率、epsilon 调度和梯度裁剪沿用共享入口。非有限 loss/梯度在优化器更新前报错。
+终止目标为实际 reward。两个在线头通过 `Huber(Q_online(s,a), y)` 的同一 TD 误差更新。均值中心化下，所选候选即使是类别内最高分，也具有 `1 - 1/|L_c|` 的直接优势梯度系数；单候选类别的中心化优势恒为零，类别价值头仍学习该动作价值。目标同步、Adam、学习率、epsilon 调度和梯度裁剪沿用共享入口。非有限 loss/梯度在优化器更新前报错。
 
-最大值归一化借鉴 Dueling 论文公式 (8)，并按操作类别扩展；这是本项目的结构适配，不代表该论文验证过缓存—UAV 任务。最大值在排序切换处不光滑，选中类别内最高优势时该动作的优势梯度抵消，其他候选的相对价值主要通过探索样本学习；需要后续短程训练与独立评价检验实际稳定性。
+按类别合法集合做均值中心化是为动态候选集所作的 Dueling 结构适配；这不代表相关论文已验证缓存—UAV 任务。所有决策排序、TD target、候选 Q 统计和实际贪心选择均采用上述同一完整 Q 定义；是否提升策略仍需短程训练和独立评价确认。
 
 ## Replay、Checkpoint 与指标
 
 Replay 保存语义动作、所选动作特征、实际奖励、时长，以及当前/下一状态的压缩预测重建上下文和候选数量/ID 摘要，不保存完整候选特征矩阵。重建当前类别候选用于优势归一化，重建下一候选用于 Double DQN。相邻转移重复的状态上下文通过引用共享，环形淘汰时释放引用，Checkpoint 恢复时重新共享。
 所有候选重建均校验状态指纹、候选 ID、所选目标和特征；上下文只包含决策可见的状态与预测。
 
-架构版本为 `category_max_centered_dueling_q_v2`；Agent schema 3、Replay schema 4、Manifest v6、Checkpoint schema 7。旧架构/旧回放明确拒绝恢复；历史文件保留。学习率、折扣、源码身份与数据身份继续参与恢复校验。
+架构版本为 `legal_candidate_mean_centered_dueling_q_v3`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 4、Replay schema 5、Manifest v7、Checkpoint schema 8。旧架构/旧回放明确拒绝恢复；历史文件保留。学习率、折扣、源码身份与数据身份继续参与恢复校验。
 
-`selected_category_q` 是类别最佳 Q；`selected_candidate_q` 与 `selected_q_value` 都是所选动作完整 Q；`selected_candidate_advantage` 是归一化优势（非正）。类别候选 Q 统计采用完整 Q，`td_loss` 是统一 TD loss。旧的 `category_td_loss` / `candidate_advantage_loss` 字段保留为不可用值 `null`，不伪造两份独立 loss。
+`selected_category_q` 是类别均值 Q（类别头输出）；`selected_candidate_q` 与 `selected_q_value` 都是所选动作完整 Q；`selected_candidate_advantage` 是类别均值中心化优势，可正可负且类内均值为零。类别候选统计采用完整 Q，`td_loss` 是统一 TD loss。旧的 `category_td_loss` / `candidate_advantage_loss` 字段保留为不可用值 `null`，不伪造两份独立 loss。
 缓存变化、服务增删和 UAV 移动取实际前后状态差；成本和任务执行节点来自正式结果。预测缓存覆盖率独立标记，不能称为实际命中率或据其宣称缓存更新的因果收益。
 
 ## 来源

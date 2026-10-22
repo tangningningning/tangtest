@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import pickle
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -88,9 +88,14 @@ _CANDIDATE_REBUILD_IDENTITY_FIELDS = (
     "prediction_scenario",
     "decision_forecast",
     "prediction_horizon_mask",
+    "state_feature_contract_version",
     "candidate_feature_contract_version",
     "network_architecture_version",
+    "candidate_count",
+    "candidate_ids_sha256",
 )
+_CANDIDATE_REBUILD_CACHE_MAX_ENTRIES = 16
+_CANDIDATE_REBUILD_CACHE_MAX_CANDIDATES = 4096
 
 
 def _prediction_scenario_sha256(scenario: Mapping[str, Any]) -> str:
@@ -112,6 +117,14 @@ def _candidate_rebuild_payload_sha256(context: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
     ).hexdigest()
+
+
+def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
+    digest = hashlib.sha256()
+    for candidate in candidates:
+        digest.update(candidate.action.candidate_id.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 class ExclusiveDQNEnvironment:
@@ -166,6 +179,17 @@ class ExclusiveDQNEnvironment:
         self._initial_uav = {
             key: np.asarray(value, dtype=np.float64).copy()
             for key, value in context.initial_uav.items()
+        }
+        self._candidate_rebuild_cache: OrderedDict[
+            tuple[str, ...], tuple[CandidateOption, ...]
+        ] = OrderedDict()
+        self._candidate_rebuild_cache_candidate_count = 0
+        self._candidate_rebuild_cache_stats = {
+            "hit_count": 0,
+            "miss_count": 0,
+            "generation_count": 0,
+            "eviction_count": 0,
+            "bypass_count": 0,
         }
         self.reset()
 
@@ -275,6 +299,22 @@ class ExclusiveDQNEnvironment:
         self.executor_calls = 0
         self.matching_calls = 0
         self.kkt_solver_calls = 0
+        self._candidate_rebuild_cache.clear()
+        self._candidate_rebuild_cache_candidate_count = 0
+        for key in self._candidate_rebuild_cache_stats:
+            self._candidate_rebuild_cache_stats[key] = 0
+
+    @property
+    def candidate_rebuild_cache_metrics(self) -> dict[str, int]:
+        """返回有界回放候选缓存的命中、淘汰及容量统计。"""
+
+        return {
+            **self._candidate_rebuild_cache_stats,
+            "retained_context_count": len(self._candidate_rebuild_cache),
+            "retained_candidate_count": self._candidate_rebuild_cache_candidate_count,
+            "max_context_count": _CANDIDATE_REBUILD_CACHE_MAX_ENTRIES,
+            "max_candidate_count": _CANDIDATE_REBUILD_CACHE_MAX_CANDIDATES,
+        }
 
     @property
     def terminated(self) -> bool:
@@ -299,7 +339,9 @@ class ExclusiveDQNEnvironment:
         slot_input = self.slot_inputs[self.index]
         forecast = self.decision_forecasts[self.index]
         formal_observation = self._formal_observation(forecast)
-        state_features = self.encoder.encode_state(formal_observation, forecast)
+        state_features = self.encoder.encode_state(
+            formal_observation, forecast, slot_input.scenario_slice
+        )
         fingerprint = self._decision_state_fingerprint(
             slot_input, forecast, state_features
         )
@@ -621,7 +663,7 @@ class ExclusiveDQNEnvironment:
                 "候选重建预测输入缺少字段：" + ", ".join(missing_scenario_fields)
             )
         context = {
-            "schema_version": "dqn_candidate_rebuild_context_v2",
+            "schema_version": "dqn_candidate_rebuild_context_v3",
             "source_state_fingerprint": self._cached_state_fingerprint,
             "state_features": self._cached_state_features.copy(),
             "cache_state": self.cache_state.copy(),
@@ -642,8 +684,11 @@ class ExclusiveDQNEnvironment:
                 if slot_input.prediction_horizon_mask is None
                 else np.asarray(slot_input.prediction_horizon_mask, dtype=np.int8).copy()
             ),
+            "state_feature_contract_version": self.encoder.state_feature_contract_version,
             "candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
             "network_architecture_version": self.encoder.network_architecture_version,
+            "candidate_count": len(self._cached_candidates),
+            "candidate_ids_sha256": _candidate_ids_sha256(self._cached_candidates),
         }
         context["candidate_rebuild_payload_sha256"] = (
             _candidate_rebuild_payload_sha256(context)
@@ -656,7 +701,7 @@ class ExclusiveDQNEnvironment:
     ) -> tuple[CandidateOption, ...]:
         """仅由回放中的合法状态上下文和预测输入确定性重建候选。"""
 
-        if context.get("schema_version") != "dqn_candidate_rebuild_context_v2":
+        if context.get("schema_version") != "dqn_candidate_rebuild_context_v3":
             raise ValueError("回放候选重建上下文版本不兼容")
         if context.get("candidate_rebuild_payload_sha256") != (
             _candidate_rebuild_payload_sha256(context)
@@ -664,6 +709,8 @@ class ExclusiveDQNEnvironment:
             raise ValueError("回放候选重建上下文摘要不匹配")
         if context.get("candidate_feature_contract_version") != self.encoder.candidate_feature_contract_version:
             raise ValueError("回放候选特征合同与当前编码器不一致")
+        if context.get("state_feature_contract_version") != self.encoder.state_feature_contract_version:
+            raise ValueError("回放状态特征合同与当前编码器不一致")
         if context.get("network_architecture_version") != self.encoder.network_architecture_version:
             raise ValueError("回放网络架构合同与当前编码器不一致")
         forecast = context.get("decision_forecast")
@@ -712,13 +759,64 @@ class ExclusiveDQNEnvironment:
         )
         if not fingerprint or rebuilt_fingerprint != fingerprint:
             raise ValueError("回放候选上下文重建的状态指纹不匹配")
-        candidates, _ = self._generate_legal_candidates(
-            slot_input,
-            forecast,
-            fingerprint,
-            current_cache_state=cache_state,
-            current_uav_positions=uav_positions,
+        formal_observation = state_features[: int(self.context.observation_spec.observation_dim)]
+        reencoded_state = self.encoder.encode_state(
+            formal_observation, forecast, scenario_slice
         )
+        if not np.array_equal(reencoded_state, state_features):
+            raise ValueError("回放状态向量与保存的预测候选生成上下文不一致")
+        candidate_count = int(context.get("candidate_count", 0))
+        candidate_ids_sha256 = str(context.get("candidate_ids_sha256", ""))
+        if candidate_count <= 0 or len(candidate_ids_sha256) != 64:
+            raise ValueError("回放候选上下文缺少候选数量或顺序指纹")
+        cache_key = (
+            str(context["candidate_rebuild_payload_sha256"]),
+            fingerprint,
+            str(context["state_feature_contract_version"]),
+            str(context["candidate_feature_contract_version"]),
+            str(context["network_architecture_version"]),
+        )
+        candidates = self._candidate_rebuild_cache.get(cache_key)
+        if candidates is None:
+            self._candidate_rebuild_cache_stats["miss_count"] += 1
+            candidates, _ = self._generate_legal_candidates(
+                slot_input,
+                forecast,
+                fingerprint,
+                current_cache_state=cache_state,
+                current_uav_positions=uav_positions,
+            )
+            self._candidate_rebuild_cache_stats["generation_count"] += 1
+        else:
+            self._candidate_rebuild_cache.move_to_end(cache_key)
+            self._candidate_rebuild_cache_stats["hit_count"] += 1
+        if (
+            len(candidates) != candidate_count
+            or _candidate_ids_sha256(candidates) != candidate_ids_sha256
+            or len({item.action.candidate_id for item in candidates}) != len(candidates)
+            or any(
+                item.action.source_state_fingerprint != fingerprint
+                or len(item.features) != self.encoder.candidate_dim
+                or not np.isfinite(np.asarray(item.features, dtype=np.float32)).all()
+                for item in candidates
+            )
+        ):
+            raise ValueError("回放候选集合与经过校验的上下文身份不匹配")
+        if candidates is not None and cache_key not in self._candidate_rebuild_cache:
+            if len(candidates) > _CANDIDATE_REBUILD_CACHE_MAX_CANDIDATES:
+                self._candidate_rebuild_cache_stats["bypass_count"] += 1
+            else:
+                self._candidate_rebuild_cache[cache_key] = candidates
+                self._candidate_rebuild_cache_candidate_count += len(candidates)
+                while (
+                    len(self._candidate_rebuild_cache)
+                    > _CANDIDATE_REBUILD_CACHE_MAX_ENTRIES
+                    or self._candidate_rebuild_cache_candidate_count
+                    > _CANDIDATE_REBUILD_CACHE_MAX_CANDIDATES
+                ):
+                    _, evicted = self._candidate_rebuild_cache.popitem(last=False)
+                    self._candidate_rebuild_cache_candidate_count -= len(evicted)
+                    self._candidate_rebuild_cache_stats["eviction_count"] += 1
         return candidates
 
     def _decision_state_fingerprint(

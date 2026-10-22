@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import pickle
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -17,9 +18,9 @@ from online_joint_optimizer.candidate_evaluator import SlotInput, copy_uav_posit
 
 
 OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
-STATE_FEATURE_CONTRACT_VERSION = "formal_observation_horizon_workload_v2"
+STATE_FEATURE_CONTRACT_VERSION = "formal_observation_horizon_workload_candidate_demand_v3"
 CANDIDATE_FEATURE_CONTRACT_VERSION = "prediction_only_exclusive_candidate_v2"
-NETWORK_ARCHITECTURE_VERSION = "category_max_centered_dueling_q_v2"
+NETWORK_ARCHITECTURE_VERSION = "legal_candidate_mean_centered_dueling_q_v3"
 
 
 @dataclass(frozen=True)
@@ -309,6 +310,16 @@ class CandidateFeatureEncoder:
         if self.uav_ids != configured_uavs:
             raise ValueError("正式 observation spec 的 UAV 顺序与配置不一致")
         self.bounds = tuple(float(value) for value in slot_input.model.flight_boundary)
+        self.cache_nodes = deepcopy(dict(slot_input.model.cache_nodes))
+        self.service_catalog = deepcopy(dict(slot_input.model.service_catalog))
+        self.cache_config = slot_input.model.cache_config
+        self.prediction_demand_beta = float(
+            project_config.get_config_value(
+                slot_input.model.project_cfg, "cache.discount_beta", 1.0
+            )
+        )
+        if not 0.0 < self.prediction_demand_beta <= 1.0:
+            raise ValueError("缓存预测需求折扣必须位于 (0,1]")
         self.horizon_count = int(observation_spec.prediction_horizon)
         configured_horizon = int(
             project_config.get_config_value(slot_input.model.project_cfg, "prediction.vehicle.horizon")
@@ -370,7 +381,15 @@ class CandidateFeatureEncoder:
             1.0, float(search.max_horizontal_speed_mps) * float(search.dt_s)
         )
         node_count, service_count, uav_count = len(self.node_ids), len(self.service_ids), len(self.uav_ids)
-        self.state_dim = int(observation_spec.observation_dim) + 2 * self.horizon_count
+        self.state_prediction_demand_dim = (
+            len(self.vehicle_ids) * len(self.service_ids)
+            + len(self.node_ids) * len(self.service_ids)
+        )
+        self.state_dim = (
+            int(observation_spec.observation_dim)
+            + 2 * self.horizon_count
+            + self.state_prediction_demand_dim
+        )
         self.candidate_dim = (
             3 + 2 + node_count * service_count + node_count
             + 2 * node_count * service_count + 4 + 8 * uav_count
@@ -380,6 +399,7 @@ class CandidateFeatureEncoder:
         self,
         formal_observation: Any,
         decision_forecast: DecisionForecast,
+        prediction_scenario: Mapping[str, Any],
     ) -> np.ndarray:
         observation = np.asarray(formal_observation, dtype=np.float32).reshape(-1)
         if observation.shape != (int(self.observation_spec.observation_dim),):
@@ -407,16 +427,83 @@ class CandidateFeatureEncoder:
             )
             expected_input.append(self._normalize_workload(expected_input_bits, self.max_input_bits, "预测输入大小"))
             expected_cycles.append(self._normalize_workload(expected_cpu_cycles, self.max_cpu_cycles, "预测计算量"))
+        scenario_demand_features = self._encode_candidate_generation_demand(
+            prediction_scenario, mask
+        )
         result = np.concatenate(
             (
                 observation,
                 np.asarray(expected_input, dtype=np.float32),
                 np.asarray(expected_cycles, dtype=np.float32),
+                scenario_demand_features,
             )
         )
         if result.shape != (self.state_dim,) or not np.all(np.isfinite(result)):
             raise ValueError("状态特征维度或数值无效")
         return result
+
+    def _encode_candidate_generation_demand(
+        self,
+        prediction_scenario: Mapping[str, Any],
+        horizon_mask: np.ndarray,
+    ) -> np.ndarray:
+        """编码候选生成器实际使用的预测需求充分统计量。"""
+
+        scenario = dict(prediction_scenario)
+        scenario_vehicle_ids = tuple(
+            str(value) for value in np.asarray(scenario["vehicle_ids"]).tolist()
+        )
+        scenario_task_vehicle_ids = tuple(
+            str(value)
+            for value in np.asarray(scenario["task_vehicle_ids"]).tolist()
+        )
+        if scenario_vehicle_ids != self.vehicle_ids:
+            raise ValueError("预测场景车辆顺序与 DQN 状态顺序不一致")
+        if scenario_task_vehicle_ids != self.task_vehicle_ids:
+            raise ValueError("预测场景任务车辆顺序与 DQN 状态顺序不一致")
+        by_horizon = cache_configuration.predicted_vehicle_service_demand_by_horizon(
+            scenario,
+            len(self.service_ids),
+            beta_discount=self.prediction_demand_beta,
+            prediction_horizon_mask=horizon_mask,
+        )
+        expected_shape = (
+            self.horizon_count,
+            len(self.vehicle_ids),
+            len(self.service_ids),
+        )
+        if by_horizon.shape != expected_shape or not np.isfinite(by_horizon).all():
+            raise ValueError("预测场景的车辆-服务需求统计维度或数值非法")
+        vehicle_service_demand = np.sum(by_horizon, axis=0)
+        cache_node_demand = np.stack(
+            [
+                cache_configuration.node_specific_predicted_demand(
+                    scenario,
+                    node_index,
+                    self.cache_nodes,
+                    self.cache_config,
+                    prediction_horizon_mask=horizon_mask,
+                )
+                for node_index in range(len(self.node_ids))
+            ],
+            axis=0,
+        )
+        max_vehicle_demand = float(self.horizon_count)
+        max_node_demand = float(
+            self.horizon_count * max(1, len(self.task_vehicle_ids))
+        )
+        normalized_vehicle_demand = vehicle_service_demand / max_vehicle_demand
+        normalized_node_demand = cache_node_demand / max_node_demand
+        normalized = np.concatenate(
+            (normalized_vehicle_demand.reshape(-1), normalized_node_demand.reshape(-1))
+        ).astype(np.float32)
+        if normalized.shape != (self.state_prediction_demand_dim,):
+            raise ValueError("候选生成预测需求特征维度错误")
+        if not np.isfinite(normalized).all() or np.any(normalized < 0.0) or np.any(
+            normalized > 1.0 + 1.0e-6
+        ):
+            raise ValueError("候选生成预测需求特征超出固定归一化范围")
+        return normalized
 
     def encode_candidate(
         self,

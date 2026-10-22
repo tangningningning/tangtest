@@ -864,6 +864,7 @@ def train_episode(
             )
             for row in update_rows
         ),
+        "candidate_rebuild_cache": environment.candidate_rebuild_cache_metrics,
     }
     return {
         "episode_reward": episode_reward,
