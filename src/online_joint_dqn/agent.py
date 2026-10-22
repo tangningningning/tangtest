@@ -93,11 +93,62 @@ class ActionSelection:
     epsilon: float
     candidate_counts_by_operation: Mapping[str, int]
     q_statistics_by_operation: Mapping[str, Mapping[str, Any]]
+    advantage_statistics_by_operation: Mapping[str, Mapping[str, Any]]
     q_values_by_action_category: Mapping[str, float | None]
     candidate_advantage: float
 
 
 CandidateRebuilder = Callable[[Mapping[str, Any]], Sequence[CandidateOption]]
+
+
+def _distribution_statistics(values: Any) -> dict[str, float | int | None]:
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    if not array.size:
+        return {
+            "count": 0,
+            "mean": None,
+            "std": None,
+            "min": None,
+            "p10": None,
+            "p25": None,
+            "p50": None,
+            "p75": None,
+            "p90": None,
+            "p95": None,
+            "max": None,
+        }
+    if not np.all(np.isfinite(array)):
+        raise FloatingPointError("候选价值统计包含非有限值")
+    quantiles = np.quantile(array, (0.10, 0.25, 0.50, 0.75, 0.90, 0.95))
+    return {
+        "count": int(array.size),
+        "mean": float(np.mean(array)),
+        "std": float(np.std(array)),
+        "min": float(np.min(array)),
+        "p10": float(quantiles[0]),
+        "p25": float(quantiles[1]),
+        "p50": float(quantiles[2]),
+        "p75": float(quantiles[3]),
+        "p90": float(quantiles[4]),
+        "p95": float(quantiles[5]),
+        "max": float(np.max(array)),
+    }
+
+
+def _stable_argmax(
+    values: Any, candidates: Sequence[CandidateOption]
+) -> int:
+    """用动作 ID 解决精确 Q 并列，避免候选遍历顺序决定动作。"""
+
+    scores = np.asarray(values, dtype=np.float64).reshape(-1)
+    if len(scores) != len(candidates) or not len(scores):
+        raise ValueError("Q 值与候选数量不匹配或候选为空")
+    maximum = float(np.max(scores))
+    tied = np.flatnonzero(scores == maximum)
+    return min(
+        (int(index) for index in tied),
+        key=lambda index: str(candidates[index].action.candidate_id),
+    )
 
 
 class DoubleDQNAgent:
@@ -311,28 +362,31 @@ class DoubleDQNAgent:
             for operation in OPERATIONS
         }
         q_statistics: dict[str, dict[str, Any]] = {}
+        advantage_statistics: dict[str, dict[str, Any]] = {}
         for operation in OPERATIONS:
             indexed_options = candidates_by_operation[operation]
             if not indexed_options:
                 q_statistics[operation] = {
-                    "count": 0,
-                    "mean": None,
-                    "std": None,
-                    "min": None,
-                    "max": None,
+                    **_distribution_statistics(()),
+                    "category_value": None,
                     "max_candidate_id": None,
                 }
+                advantage_statistics[operation] = _distribution_statistics(())
                 continue
             indices = [index for index, _ in indexed_options]
             q_values = action_q_values[indices]
+            category_advantages = centered_advantages[indices]
+            max_local_index = _stable_argmax(
+                q_values, [item for _, item in indexed_options]
+            )
             q_statistics[operation] = {
-                "count": len(indices),
-                "mean": float(np.mean(q_values)),
-                "std": float(np.std(q_values)),
-                "min": float(np.min(q_values)),
-                "max": float(np.max(q_values)),
-                "max_candidate_id": indexed_options[int(np.argmax(q_values))][1].action.candidate_id,
+                **_distribution_statistics(q_values),
+                "category_value": float(category_values[operation]),
+                "max_candidate_id": indexed_options[max_local_index][1].action.candidate_id,
             }
+            advantage_statistics[operation] = _distribution_statistics(
+                category_advantages
+            )
 
         explored = bool(explore and float(self.rng.random()) < chance)
         if explored:
@@ -344,7 +398,7 @@ class DoubleDQNAgent:
                 int(self.rng.integers(0, len(operation_options)))
             ]
         else:
-            selected_index = int(np.argmax(action_q_values))
+            selected_index = _stable_argmax(action_q_values, legal_candidates)
             candidate = legal_candidates[selected_index]
             selected_operation = candidate.action.operation
             operation_options = candidates_by_operation[selected_operation]
@@ -359,6 +413,7 @@ class DoubleDQNAgent:
             epsilon=chance,
             candidate_counts_by_operation=candidate_counts,
             q_statistics_by_operation=q_statistics,
+            advantage_statistics_by_operation=advantage_statistics,
             q_values_by_action_category={
                 operation: (
                     category_values[operation]
@@ -422,7 +477,7 @@ class DoubleDQNAgent:
             raise ValueError("重建的下一状态候选缺少 KEEP_STAY")
         state = np.asarray(transition.next_state_features, dtype=np.float32)
         q_values, _, _ = self.score_q_values(state, candidates)
-        selected_index = int(np.argmax(q_values))
+        selected_index = _stable_argmax(q_values, candidates)
         selected_candidate = candidates[selected_index]
         selected_operation = selected_candidate.action.operation
         category_candidates = candidates_by_operation[selected_operation]

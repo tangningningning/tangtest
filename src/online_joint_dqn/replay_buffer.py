@@ -29,6 +29,16 @@ def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
     return digest.hexdigest()
 
 
+def _validate_candidate_context(
+    context: Mapping[str, Any], candidates: Sequence[CandidateOption], label: str
+) -> None:
+    if int(context.get("candidate_count", -1)) != len(candidates):
+        raise ValueError(f"{label}候选数量与重建上下文不一致")
+    recorded_ids = context.get("candidate_ids_sha256")
+    if recorded_ids != _candidate_ids_sha256(candidates):
+        raise ValueError(f"{label}候选 ID 顺序与重建上下文不一致")
+
+
 CandidateRebuilder = Callable[[Mapping[str, Any]], Sequence[CandidateOption]]
 
 
@@ -319,6 +329,9 @@ class ReplayBuffer:
             np.asarray(selected.features, dtype=np.float32), np.asarray(action_features, dtype=np.float32)
         ):
             raise ValueError("回放所选动作/特征与当前合法候选不一致")
+        _validate_candidate_context(
+            current_candidate_rebuild_context, current_candidates, "当前"
+        )
         current_context_zlib = self._pack_context(
             current_candidate_rebuild_context, state_features, source_fingerprint
         )
@@ -351,6 +364,9 @@ class ReplayBuffer:
                 for item in candidates
             ):
                 raise ValueError("下一状态候选与经验中的下一状态指纹不一致")
+            _validate_candidate_context(
+                next_candidate_rebuild_context, candidates, "下一状态"
+            )
             if next_candidate_rebuild_context.get("source_state_fingerprint") != str(
                 next_state_fingerprint
             ):
@@ -410,6 +426,68 @@ class ReplayBuffer:
         self.sample_calls += 1
         self.sample_count += int(batch_size)
         return sampled
+
+    def validate_rebuild_contexts(
+        self, validator: Callable[[Mapping[str, Any]], None]
+    ) -> None:
+        """在恢复训练前校验每个唯一候选上下文，不生成候选或运行系统求解。"""
+
+        state_features_by_fingerprint: dict[str, tuple[float, ...]] = {}
+        candidate_identity_by_fingerprint: dict[str, tuple[int, str]] = {}
+
+        def retain_state(
+            fingerprint: str,
+            values: tuple[float, ...],
+            candidate_count: int,
+            candidate_ids_sha256: str | None,
+        ) -> None:
+            existing = state_features_by_fingerprint.get(fingerprint)
+            if existing is not None and existing != values:
+                raise ValueError("Replay 中相同状态指纹对应不同状态特征")
+            state_features_by_fingerprint[fingerprint] = values
+            if int(candidate_count) <= 0 or not candidate_ids_sha256:
+                raise ValueError("Replay 状态缺少候选数量或候选 ID 摘要")
+            candidate_identity = (int(candidate_count), str(candidate_ids_sha256))
+            existing_identity = candidate_identity_by_fingerprint.get(fingerprint)
+            if existing_identity is not None and existing_identity != candidate_identity:
+                raise ValueError("Replay 中相同状态指纹对应不同候选身份")
+            candidate_identity_by_fingerprint[fingerprint] = candidate_identity
+
+        for transition in self._items:
+            retain_state(
+                transition.action.source_state_fingerprint,
+                transition.state_features,
+                transition.current_candidate_count,
+                transition.current_candidate_ids_sha256,
+            )
+            if not transition.terminated:
+                if transition.next_state_fingerprint is None or transition.next_state_features is None:
+                    raise ValueError("Replay 非终止转移缺少重建上下文的状态身份")
+                retain_state(
+                    str(transition.next_state_fingerprint),
+                    transition.next_state_features,
+                    transition.next_candidate_count,
+                    transition.next_candidate_ids_sha256,
+                )
+        if set(state_features_by_fingerprint) != set(self._context_pool):
+            raise ValueError("Replay 状态特征与唯一候选上下文索引不一致")
+        for fingerprint, blob in self._context_pool.items():
+            context = pickle.loads(zlib.decompress(blob))
+            if not isinstance(context, Mapping):
+                raise ValueError("Replay 候选上下文必须是映射")
+            if context.get("source_state_fingerprint") != fingerprint:
+                raise ValueError("Replay 候选上下文与状态指纹索引不一致")
+            expected_candidate_identity = candidate_identity_by_fingerprint[fingerprint]
+            if (
+                int(context.get("candidate_count", -1)),
+                str(context.get("candidate_ids_sha256", "")),
+            ) != expected_candidate_identity:
+                raise ValueError("Replay 上下文与状态记录的候选身份不一致")
+            expanded_context = dict(context)
+            expanded_context["state_features"] = np.asarray(
+                state_features_by_fingerprint[fingerprint], dtype=np.float32
+            )
+            validator(expanded_context)
 
     def state_dict(self) -> dict[str, Any]:
         return {

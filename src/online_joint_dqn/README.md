@@ -11,7 +11,7 @@
 
 P0 优化固定长度 Episode 的平均期望系统效用。固定长度下，最大化不折扣的累计效用与该目标等价，所以独立 DQN 默认及共享 Runner 显式使用 `gamma=1.0`；保留 `gamma ** duration_slots` 接口。没有修改正式奖励、成本权重或系统配置。
 
-本项目现行的 `KEEP_STAY` / `CACHE_UPDATE` / `UAV_MOVE` 互斥规则、缓存必须同时移除并新增服务的 REPLACE 规则，是比文档 P0 更严格的动作限制。缓存候选完整保留全部合法单节点替换，并从各节点预测/覆盖锚点中确定性提议最多 8 个双节点替换组合；候选扫描上限为 32，并在诊断中记录截断。较高阶跨节点组合和连续 UAV 位置仍未穷举。本算法因此优化受限动作空间，不能宣称求解了 P0 的完整动作空间或其全局最优解。
+本项目现行的 `KEEP_STAY` / `CACHE_UPDATE` / `UAV_MOVE` 互斥规则、缓存必须同时移除并新增服务的 REPLACE 规则，是比文档 P0 更严格的动作限制。DQN 候选完整保留正式规则枚举出的全部合法单节点替换。另将有界 `CacheOptimizer` 提议加入候选，其中至多包含一个“各活跃节点首个提议”的合并配置，其余单节点提议按 Slot 轮转的节点顺序和提议秩加入；这类提议的生成上限也单独记录。双节点提议先为每个节点按预测/覆盖提议来源优先级选一个代表；同优先级候选以来源状态指纹绑定的 SHA-256 排序打破平局。再对全部代表节点对按状态指纹与规范化节点/服务配置生成稳定优先级，之后才执行最多扫描 32 对、最多保留 8 个新配置的限制。诊断分开记录代表节点对总数、已排名数、实际扫描数、合法通过数、拒绝数、重复数、保留数、保留上限遗漏数及未扫描数；扫描预算与保留预算造成的截断会标记为不完整。`cache_cross_node_candidates_retained_count` 统计所有发生多节点变化的缓存目标，可能包括上述一个合并配置；`cache_cross_node_pair_candidates_retained_count` 只统计双节点提议保留数。排序不依赖节点/服务数组遍历顺序，但每节点仅一个双节点代表，因此该提议空间仍是有界启发式集合。较高阶跨节点组合和连续 UAV 位置仍未穷举。本算法因此优化受限动作空间，不能宣称求解完整动作空间或全局最优解。
 
 ## 信息与候选合同
 
@@ -28,7 +28,7 @@ P0 优化固定长度 Episode 的平均期望系统效用。固定长度下，�
 Q(s,a) = V_c(s) + A(s,a) - mean_{b in L_c(s)} A(s,b)
 ```
 
-因此 `V_c(s)` 等于该类别合法候选的平均 Q 值，而不是类别内最佳候选 Q。贪心时在 `KEEP_STAY`、`CACHE_UPDATE`、`UAV_MOVE` 的全部合法候选间比较完整 `Q(s,a)`；不能只比较类别头。探索仍先均匀选择当前可用类别，再在该类别内均匀选择候选，KEEP 始终可选但不被强制执行。
+因此 `V_c(s)` 等于该类别合法候选的平均 Q 值，而不是类别内最佳候选 Q。贪心时在 `KEEP_STAY`、`CACHE_UPDATE`、`UAV_MOVE` 的全部合法候选间比较完整 `Q(s,a)`；不能只比较类别头。完全相等的 Q 值使用候选 ID 稳定打破并列，避免候选遍历顺序决定动作。探索仍先均匀选择当前可用类别，再在该类别内均匀选择候选，KEEP 始终可选但不被强制执行。
 
 下一状态在线网络在全部合法候选间选择最大完整 Q；目标网络只评估同一个候选，并使用该候选类别的合法集合均值归一化：
 
@@ -39,16 +39,16 @@ y = reward + gamma ** duration_slots * Q_target(s_next,a*)
 
 终止目标为实际 reward。两个在线头通过 `Huber(Q_online(s,a), y)` 的同一 TD 误差更新。均值中心化下，所选候选即使是类别内最高分，也具有 `1 - 1/|L_c|` 的直接优势梯度系数；单候选类别的中心化优势恒为零，类别价值头仍学习该动作价值。目标同步、Adam、学习率、epsilon 调度和梯度裁剪沿用共享入口。非有限 loss/梯度在优化器更新前报错。
 
-按类别合法集合做均值中心化是为动态候选集所作的 Dueling 结构适配；这不代表相关论文已验证缓存—UAV 任务。所有决策排序、TD target、候选 Q 统计和实际贪心选择均采用上述同一完整 Q 定义；是否提升策略仍需短程训练和独立评价确认。
+按类别合法集合做均值中心化是为动态候选集所作的 Dueling 结构适配；这不代表相关论文已验证缓存—UAV 任务。候选越多，存在价值估计噪声极值的理论机会通常越大；类别均值中心化不会校正最大值噪声，Double DQN 主要分离 TD bootstrap 的选择与估值，也不消除行为策略贪心选择中的全部偏差。当前没有独立训练/评价数据足以估计各类别的误差分布，因此未添加候选数惩罚或人为 Q 校正。逐 Slot 日志记录各类候选数、完整 Q 与中心化优势的均值/标准差/分位数/极值、类别均值价值、最大 Q 对应候选、探索/贪心来源、实际奖励及实际配置变化；Episode 汇总记录候选总体矩及逐状态最大值/分位数的分布。所有决策排序、TD target、统计和实际贪心选择均采用同一完整 Q 定义；是否提升策略仍需真实训练和独立评价确认。
 
 ## Replay、Checkpoint 与指标
 
 Replay 保存语义动作、所选动作特征、实际奖励、时长，以及当前/下一状态的压缩预测重建上下文和候选数量/ID 摘要，不保存完整候选特征矩阵。重建当前类别候选用于优势归一化，重建下一候选用于 Double DQN。相邻转移重复的状态上下文通过引用共享，环形淘汰时释放引用，Checkpoint 恢复时重新共享。
 所有候选重建均校验状态指纹、候选 ID、所选目标和特征；上下文只包含决策可见的状态与预测。
 
-候选特征合同为 `prediction_only_uav_cache_complementarity_v3`，候选生成合同为 `bounded_anchor_pair_cache_replace_v1`，架构版本为 `legal_candidate_mean_centered_dueling_q_v4`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 5、Replay schema 6、Manifest v7、Checkpoint schema 8。候选重建上下文采用 v5，并将候选生成合同纳入摘要；旧架构、旧候选上下文或源码身份不同的 Checkpoint 会被恢复门禁拒绝，历史文件保留。学习率、折扣、源码身份与数据身份继续参与恢复校验。
+候选特征合同为 `prediction_only_uav_cache_complementarity_v3`，候选生成合同为 `state_ranked_bounded_pair_cache_replace_v2`，架构版本为 `legal_candidate_mean_centered_dueling_q_v4`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 5、Replay schema 6、Manifest v7、Checkpoint schema 8。候选重建上下文采用 v6；摘要包含逐项候选规则、扫描/保留限制和有效候选容量上限。旧 v5/v4 上下文和旧训练身份会在恢复校验阶段明确拒绝，不会修改已有智能体、Replay 或运行目录；网络架构合同没有因候选排序变化而升级。学习率、折扣、完整源码身份与数据身份继续参与恢复校验。
 
-`selected_category_q` 是类别均值 Q（类别头输出）；`selected_candidate_q` 与 `selected_q_value` 都是所选动作完整 Q；`selected_candidate_advantage` 是类别均值中心化优势，可正可负且类内均值为零。类别候选统计采用完整 Q，`td_loss` 是统一 TD loss。旧的 `category_td_loss` / `candidate_advantage_loss` 字段保留为不可用值 `null`，不伪造两份独立 loss。
+`selected_category_q` 是类别均值 Q（类别头输出）；`selected_candidate_q` 与 `selected_q_value` 都是所选动作完整 Q；`selected_candidate_advantage` 是类别均值中心化优势，可正可负且类内均值为零。逐 Slot `candidate_q_statistics_by_operation` 统计完整 Q，而 `candidate_advantage_statistics_by_operation` 单独统计中心化优势；类别候选数量和价值也分开记录。`td_loss` 是统一 TD loss。旧的 `category_td_loss` / `candidate_advantage_loss` 字段保留为不可用值 `null`，不伪造两份独立 loss。
 缓存变化、服务增删和 UAV 移动取实际前后状态差；成本和任务执行节点来自正式结果。预测缓存覆盖率独立标记，不能称为实际命中率或据其宣称缓存更新的因果收益。
 
 ## 来源

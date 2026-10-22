@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor
+import copy
 import hashlib
 import io
 import json
 import math
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -42,6 +44,7 @@ from online_joint_dqn.environment_adapter import (  # noqa: E402
     DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT,
     DQN_CROSS_NODE_PAIR_SCAN_LIMIT,
     ExclusiveDQNEnvironment,
+    candidate_generation_contract,
 )
 from online_joint_dqn.replay_buffer import ReplayBuffer  # noqa: E402
 from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
@@ -91,6 +94,25 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().tolist()
     return value
+
+
+def _capture_global_rng_state() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def _restore_global_rng_state(state: Mapping[str, Any]) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("torch_cuda") is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
 def _write_json(path: Path, payload: Any, *, atomic: bool = False) -> None:
@@ -677,6 +699,14 @@ def _run_identity(
         "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
         "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
         "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
+        "candidate_generation_contract": candidate_generation_contract(
+            max_cache_candidates_including_keep=int(
+                search_budget["max_cache_candidates_including_keep"]
+            ),
+            max_uav_candidates_per_uav_including_stay=int(
+                search_budget["max_uav_candidates_per_uav_including_stay"]
+            ),
+        ),
         "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
         "seed": int(seed),
         "learning_rate": float(agent.optimizer.param_groups[0]["lr"]),
@@ -1132,28 +1162,58 @@ def run_training(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         _validate_resume_identity(identity, manifest, payload)
-        agent.load_state_dict(payload["agent_state"])
-        replay.load_state_dict(payload["replay_state"])
-        episode_order = [int(value) for value in payload["episode_order"]]
-        if episode_order != list(pool_info["episode_seeds"]):
-            raise ValueError("Checkpoint Episode 顺序与正式 Training Pool 不匹配")
-        next_episode_index = int(payload["next_episode_index"])
-        global_step = int(payload["global_step"])
-        checkpoint_episode_rows = [
-            dict(row) for row in payload.get("completed_episode_rows", [])
-        ]
-        if len(checkpoint_episode_rows) != next_episode_index:
-            raise ValueError("Checkpoint Episode 汇总数与完成进度不一致")
-        expected_indices = list(range(next_episode_index))
-        actual_indices = [int(row.get("episode_index", -1)) for row in checkpoint_episode_rows]
-        actual_seeds = [int(row.get("episode_seed", -1)) for row in checkpoint_episode_rows]
-        if actual_indices != expected_indices or actual_seeds != episode_order[:next_episode_index]:
-            raise ValueError("Checkpoint Episode 汇总与正式训练顺序不一致")
-        expected_global_step = (
-            next_episode_index * pool_contract.FORMAL_TRAINING_EPISODE_SLOTS
-        )
-        if global_step != expected_global_step:
-            raise ValueError("Checkpoint Slot 数与完整 Episode 进度不一致")
+        rng_before_restore = _capture_global_rng_state()
+        try:
+            staged_agent = copy.deepcopy(agent)
+            staged_replay = ReplayBuffer(int(replay_capacity), seed=int(seed))
+            staged_agent.load_state_dict(payload["agent_state"])
+            staged_replay.load_state_dict(payload["replay_state"])
+            staged_replay.validate_rebuild_contexts(
+                first_environment.validate_candidate_rebuild_context_metadata
+            )
+
+            restored_episode_order = [
+                int(value) for value in payload["episode_order"]
+            ]
+            if restored_episode_order != list(pool_info["episode_seeds"]):
+                raise ValueError("Checkpoint Episode 顺序与正式 Training Pool 不匹配")
+            restored_next_episode_index = int(payload["next_episode_index"])
+            restored_global_step = int(payload["global_step"])
+            restored_episode_rows = [
+                dict(row) for row in payload.get("completed_episode_rows", [])
+            ]
+            if len(restored_episode_rows) != restored_next_episode_index:
+                raise ValueError("Checkpoint Episode 汇总数与完成进度不一致")
+            expected_indices = list(range(restored_next_episode_index))
+            actual_indices = [
+                int(row.get("episode_index", -1)) for row in restored_episode_rows
+            ]
+            actual_seeds = [
+                int(row.get("episode_seed", -1)) for row in restored_episode_rows
+            ]
+            if (
+                actual_indices != expected_indices
+                or actual_seeds
+                != restored_episode_order[:restored_next_episode_index]
+            ):
+                raise ValueError("Checkpoint Episode 汇总与正式训练顺序不一致")
+            expected_global_step = (
+                restored_next_episode_index
+                * pool_contract.FORMAL_TRAINING_EPISODE_SLOTS
+            )
+            if restored_global_step != expected_global_step:
+                raise ValueError("Checkpoint Slot 数与完整 Episode 进度不一致")
+        except BaseException:
+            _restore_global_rng_state(rng_before_restore)
+            raise
+
+        # 仅在网络、回放、候选合同和进度全部校验通过后替换本地对象。
+        agent = staged_agent
+        replay = staged_replay
+        episode_order = restored_episode_order
+        next_episode_index = restored_next_episode_index
+        global_step = restored_global_step
+        checkpoint_episode_rows = restored_episode_rows
 
         manifest["evaluation_status"] = evaluation_gate["status"]
         manifest["evaluation_blockers"] = evaluation_gate["blockers"]

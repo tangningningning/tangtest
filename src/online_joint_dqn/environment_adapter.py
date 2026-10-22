@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
+import json
 import pickle
 import sys
 from collections import Counter, OrderedDict
@@ -24,6 +26,7 @@ from online_joint_optimizer.uav_scheduler import UavScheduler
 
 from .candidate_features import (
     ActionCandidate,
+    CANDIDATE_FEATURE_CONTRACT_VERSION,
     CandidateFeatureEncoder,
     CandidateOption,
     DecisionForecast,
@@ -33,10 +36,73 @@ from .candidate_features import (
 
 # DQN 在正式执行器的配置副本中使用独立的 UAV 移动成本权重。
 DQN_BETA_Q = 0.001
-CANDIDATE_GENERATION_CONTRACT_VERSION = "bounded_anchor_pair_cache_replace_v1"
+CANDIDATE_GENERATION_CONTRACT_VERSION = "state_ranked_bounded_pair_cache_replace_v2"
 DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT = 8
 DQN_CROSS_NODE_PAIR_SCAN_LIMIT = 32
-CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v5"
+CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v6"
+
+
+def candidate_generation_contract(
+    *,
+    max_cache_candidates_including_keep: int,
+    max_uav_candidates_per_uav_including_stay: int,
+) -> dict[str, Any]:
+    """返回影响候选集合及其顺序的可序列化合同。"""
+
+    return {
+        "version": CANDIDATE_GENERATION_CONTRACT_VERSION,
+        "single_node_cache": {
+            "enumeration": "formal_exhaustive_legal_replace_per_node_v1",
+            "dqn_single_node_candidate_cap": None,
+            "checks": ["formal_replace", "per_node_capacity"],
+            "unchanged_nodes": "preserve_previous_configuration",
+        },
+        "bounded_cache_optimizer_proposals": {
+            "generator": "CacheOptimizer.generate_candidates",
+            "per_node_proposal_generator": (
+                "formal_generate_bounded_cache_target_configurations"
+            ),
+            "candidate_cap_including_keep": int(
+                max_cache_candidates_including_keep
+            ),
+            "included_in_dqn_pool": True,
+            "composite_proposal": "one_first_proposal_per_active_node",
+            "single_node_selection": "slot_rotated_round_robin_by_proposal_rank",
+            "deduplication": "target_cache_matrix_bytes_v1",
+        },
+        "cross_node_pair_proposals": {
+            "representatives_per_node": 1,
+            "representative_priority": (
+                "proposal_source_priority_then_state_scoped_sha256"
+            ),
+            "pair_priority": "state_scoped_sha256_over_complete_pair_space_v1",
+            "priority_before_scan_truncation": True,
+            "scan_limit": int(DQN_CROSS_NODE_PAIR_SCAN_LIMIT),
+            "retained_limit": int(DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT),
+            "checks": ["formal_replace_per_changed_node", "per_node_capacity"],
+        },
+        "uav_move_proposals": {
+            "generator": "formal_UavScheduler_enumerate_move_candidates",
+            "candidate_cap_per_uav_including_stay": int(
+                max_uav_candidates_per_uav_including_stay
+            ),
+            "proposal_order": "formal_scheduler_order",
+        },
+        "candidate_filtering": {
+            "keep_stay_count": 1,
+            "drop_unchanged_non_keep": True,
+            "deduplicate_cache_targets": "full_node_service_matrix_bytes",
+            "deduplicate_final_actions": "source_state_and_target_action_id",
+            "reject_invalid_shapes_or_contract_mismatch": True,
+        },
+        "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
+        "legality_contract": {
+            "cache": "formal_REPLACE_and_per_node_capacity",
+            "uav": "formal_scheduler_boundary_distance_and_separation_validation",
+        },
+        "cross_operation_constraint": "one_cache_or_uav_operation_per_decision_v1",
+        "candidate_identity": "source_state_and_full_target_configuration_v1",
+    }
 
 
 def _apply_dqn_utility_weights(context: Any) -> None:
@@ -123,6 +189,8 @@ _CANDIDATE_REBUILD_IDENTITY_FIELDS = (
     "state_feature_contract_version",
     "candidate_feature_contract_version",
     "candidate_generation_contract_version",
+    "candidate_generation_contract",
+    "candidate_capacity_limits",
     "network_architecture_version",
     "candidate_count",
     "candidate_ids_sha256",
@@ -147,9 +215,16 @@ def _candidate_rebuild_payload_sha256(context: Mapping[str, Any]) -> str:
     }
     if len(payload) != len(_CANDIDATE_REBUILD_IDENTITY_FIELDS):
         raise ValueError("候选重建上下文缺少身份字段")
-    return hashlib.sha256(
-        pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
-    ).hexdigest()
+    # 逐字段哈希，避免 pickle 对象图中的共享引用布局改变摘要但数据本身相同。
+    digest = hashlib.sha256()
+    for key in _CANDIDATE_REBUILD_IDENTITY_FIELDS:
+        name = key.encode("utf-8")
+        encoded = pickle.dumps(payload[key], protocol=pickle.HIGHEST_PROTOCOL)
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
@@ -164,21 +239,51 @@ def _bounded_cross_node_pair_cache_targets(
     current_cache_state: Any,
     exact_targets_by_node: Mapping[int, Sequence[Any]],
     node_ids: Sequence[str],
+    service_ids: Sequence[int],
     service_sizes_mb: Any,
     capacities_mb: Any,
     *,
-    slot_id: int,
+    source_state_fingerprint: str,
     existing_target_keys: set[bytes],
 ) -> tuple[list[tuple[np.ndarray, str]], dict[str, Any]]:
-    """从已验证的单节点 REPLACE 提议构造少量确定性双节点组合。"""
+    """按状态绑定的稳定优先级扫描有界双节点 REPLACE 提议。"""
 
     cache_state = np.asarray(current_cache_state, dtype=np.int8)
     sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
     capacities = np.asarray(capacities_mb, dtype=np.float64).reshape(-1)
     if cache_state.ndim != 2 or cache_state.shape != (len(node_ids), len(sizes)):
         raise ValueError("双节点缓存提议的状态、节点和服务维度不一致")
+    service_id_values = tuple(int(value) for value in service_ids)
+    if len(service_id_values) != len(sizes) or len(set(service_id_values)) != len(sizes):
+        raise ValueError("双节点缓存提议的服务 ID 与目录维度不一致")
     if capacities.shape != (len(node_ids),) or not np.isfinite(capacities).all():
         raise ValueError("双节点缓存提议的节点容量无效")
+    if not source_state_fingerprint:
+        raise ValueError("双节点提议优先级必须绑定来源状态指纹")
+
+    def canonical_node_target(node_index: int, target: np.ndarray) -> dict[str, Any]:
+        return {
+            "node_id": str(node_ids[node_index]),
+            "service_ids": sorted(
+                service_id_values[index]
+                for index, present in enumerate(target.tolist())
+                if int(present) == 1
+            ),
+        }
+
+    def stable_priority(scope: str, value: Any) -> str:
+        encoded = json.dumps(
+            {
+                "contract": CANDIDATE_GENERATION_CONTRACT_VERSION,
+                "source_state_fingerprint": str(source_state_fingerprint),
+                "scope": scope,
+                "candidate": value,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     source_priority = {
         "prediction": 0,
@@ -210,73 +315,131 @@ def _bounded_cross_node_pair_cache_targets(
                 continue
             key = np.ascontiguousarray(target, dtype=np.int8).tobytes()
             source = str(candidate.proposal_source)
-            by_target.setdefault(key, (target.copy(), source))
+            previous = by_target.get(key)
+            if previous is None or (
+                source_priority.get(source, len(source_priority)), source
+            ) < (
+                source_priority.get(previous[1], len(source_priority)), previous[1]
+            ):
+                by_target[key] = (target.copy(), source)
         if by_target:
             representatives[node_index] = min(
                 by_target.values(),
                 key=lambda item: (
                     source_priority.get(item[1], len(source_priority)),
-                    np.ascontiguousarray(item[0], dtype=np.int8).tobytes(),
+                    stable_priority(
+                        "node_representative",
+                        {
+                            **canonical_node_target(node_index, item[0]),
+                            "proposal_source": item[1],
+                        },
+                    ),
+                    item[1],
                 ),
             )
 
     active_nodes = sorted(representatives)
-    if active_nodes:
-        offset = max(0, int(slot_id)) % len(active_nodes)
-        active_nodes = active_nodes[offset:] + active_nodes[:offset]
     potential_pair_count = len(active_nodes) * (len(active_nodes) - 1) // 2
+    ranked_pairs: list[tuple[str, str, int, int]] = []
+    for left_node, right_node in itertools.combinations(active_nodes, 2):
+        canonical_pair = sorted(
+            (
+                canonical_node_target(left_node, representatives[left_node][0]),
+                canonical_node_target(right_node, representatives[right_node][0]),
+            ),
+            key=lambda item: item["node_id"],
+        )
+        canonical_payload = json.dumps(
+            canonical_pair,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        ranked_pairs.append(
+            (
+                stable_priority("cross_node_pair", canonical_pair),
+                canonical_payload,
+                left_node,
+                right_node,
+            )
+        )
+    ranked_pairs.sort(key=lambda item: (item[0], item[1]))
+    scan_pairs = ranked_pairs[:DQN_CROSS_NODE_PAIR_SCAN_LIMIT]
     retained: list[tuple[np.ndarray, str]] = []
     seen_keys: set[bytes] = set()
     scanned_pair_count = 0
+    legal_pair_count = 0
+    rejected_legality_count = 0
     duplicate_existing_count = 0
-    candidate_limit_omitted_count = 0
-    truncated = False
-    for left_offset, left_node in enumerate(active_nodes):
-        for right_node in active_nodes[left_offset + 1 :]:
-            if scanned_pair_count >= DQN_CROSS_NODE_PAIR_SCAN_LIMIT:
-                truncated = True
-                break
-            scanned_pair_count += 1
-            target_state = cache_state.copy()
-            target_state[left_node] = representatives[left_node][0]
-            target_state[right_node] = representatives[right_node][0]
-            key = np.ascontiguousarray(target_state, dtype=np.int8).tobytes()
-            if key in existing_target_keys or key in seen_keys:
-                duplicate_existing_count += 1
-                continue
-            if len(retained) >= DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT:
-                candidate_limit_omitted_count = 1
-                truncated = True
-                break
-            seen_keys.add(key)
-            retained.append(
-                (
-                    target_state,
-                    "bounded_pair:"
-                    f"{node_ids[left_node]}:{representatives[left_node][1]}+"
-                    f"{node_ids[right_node]}:{representatives[right_node][1]}",
+    duplicate_pair_count = 0
+    retention_omitted_count = 0
+    for _, _, left_node, right_node in scan_pairs:
+        scanned_pair_count += 1
+        target_state = cache_state.copy()
+        target_state[left_node] = representatives[left_node][0]
+        target_state[right_node] = representatives[right_node][0]
+        changed_indices = tuple(
+            int(index)
+            for index in np.flatnonzero(np.any(target_state != cache_state, axis=1))
+        )
+        valid_pair = changed_indices == (left_node, right_node)
+        if valid_pair:
+            for node_index in changed_indices:
+                valid_pair = cache_configuration.is_legal_cache_replacement(
+                    cache_state[node_index], target_state[node_index]
+                ) and cache_configuration.is_node_feasible(
+                    target_state[node_index], sizes, float(capacities[node_index])
                 )
+                if not valid_pair:
+                    break
+        if not valid_pair:
+            rejected_legality_count += 1
+            continue
+        legal_pair_count += 1
+        key = np.ascontiguousarray(target_state, dtype=np.int8).tobytes()
+        if key in existing_target_keys:
+            duplicate_existing_count += 1
+            continue
+        if key in seen_keys:
+            duplicate_pair_count += 1
+            continue
+        seen_keys.add(key)
+        if len(retained) >= DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT:
+            retention_omitted_count += 1
+            continue
+        retained.append(
+            (
+                target_state,
+                "state_ranked_pair:"
+                f"{node_ids[left_node]}:{representatives[left_node][1]}+"
+                f"{node_ids[right_node]}:{representatives[right_node][1]}",
             )
-        if truncated:
-            break
+        )
     unscanned_pair_count = max(0, potential_pair_count - scanned_pair_count)
-    if unscanned_pair_count:
-        truncated = True
+    truncated = bool(unscanned_pair_count or retention_omitted_count)
     return retained, {
         "cache_cross_node_pair_candidate_source_node_count": len(active_nodes),
         "cache_cross_node_pair_potential_representative_count": potential_pair_count,
+        "cache_cross_node_pair_priority_ranked_count": len(ranked_pairs),
         "cache_cross_node_pair_proposals_scanned_count": scanned_pair_count,
+        "cache_cross_node_pair_legality_pass_count": legal_pair_count,
+        "cache_cross_node_pair_legality_rejected_count": rejected_legality_count,
+        "cache_cross_node_pair_deduplicated_existing_count": duplicate_existing_count,
+        "cache_cross_node_pair_deduplicated_pair_count": duplicate_pair_count,
+        "cache_cross_node_pair_new_unique_candidate_count_scanned": max(
+            0, legal_pair_count - duplicate_existing_count - duplicate_pair_count
+        ),
         "cache_cross_node_pair_candidates_retained_count": len(retained),
-        "cache_cross_node_pair_candidates_deduplicated_count": duplicate_existing_count,
+        "cache_cross_node_pair_retention_limit_omitted_count": retention_omitted_count,
         "cache_cross_node_pair_candidate_limit": DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT,
         "cache_cross_node_pair_scan_limit": DQN_CROSS_NODE_PAIR_SCAN_LIMIT,
         "cache_cross_node_pair_unscanned_count": unscanned_pair_count,
-        "cache_cross_node_pair_candidates_omitted_lower_bound": (
-            candidate_limit_omitted_count + unscanned_pair_count
-        ),
         "cache_cross_node_pair_candidates_truncated": bool(truncated),
         "cache_cross_node_pair_generation_complete_within_policy": not truncated,
         "cache_cross_node_pair_combinations_exhaustive": False,
+        "cache_cross_node_pair_priority_contract": (
+            "state_scoped_sha256_over_complete_pair_space_v1"
+        ),
     }
 
 
@@ -361,6 +524,16 @@ class ExclusiveDQNEnvironment:
             max_cache_candidates=2 + cache_node_count * cache_capacity,
             max_uav_candidates_per_uav=uav_capacity + 1,
         )
+
+    def _candidate_capacity_limits(self) -> dict[str, int]:
+        return {
+            "max_cache_candidates_including_keep": int(
+                self.search_budget.max_cache_candidates
+            ),
+            "max_uav_candidates_per_uav_including_stay": int(
+                self.search_budget.max_uav_candidates_per_uav
+            ),
+        }
 
     @classmethod
     def from_formal_training_episode(
@@ -648,9 +821,13 @@ class ExclusiveDQNEnvironment:
             cache_state,
             exact_targets_by_node,
             tuple(str(item) for item in cache_nodes["node_ids"]),
+            tuple(
+                int(item)
+                for item in candidate_input.model.service_catalog["service_ids"]
+            ),
             candidate_input.model.service_catalog["service_sizes_mb"],
             cache_nodes["capacities_mb"],
-            slot_id=int(candidate_input.slot_id),
+            source_state_fingerprint=source_state_fingerprint,
             existing_target_keys=set(cache_targets_by_key),
         )
         for target_state, proposal_source in pair_targets:
@@ -663,9 +840,10 @@ class ExclusiveDQNEnvironment:
             cache_proposal_count
             - len(cache_targets_by_key)
             + int(
-                pair_diagnostics[
-                    "cache_cross_node_pair_candidates_deduplicated_count"
-                ]
+                pair_diagnostics["cache_cross_node_pair_deduplicated_existing_count"]
+            )
+            + int(
+                pair_diagnostics["cache_cross_node_pair_deduplicated_pair_count"]
             )
         )
         for target_state, proposal_source in cache_targets_by_key.values():
@@ -726,10 +904,12 @@ class ExclusiveDQNEnvironment:
                 )
             )
         unique: dict[str, CandidateOption] = {}
+        duplicate_action_id_count = 0
         for option in candidates:
             if option.action.source_state_fingerprint != source_state_fingerprint:
                 raise RuntimeError("候选动作来源状态与当前环境状态不一致")
             if option.action.candidate_id in unique:
+                duplicate_action_id_count += 1
                 continue
             unique[option.action.candidate_id] = option
         if not unique or next(iter(unique.values())).action.operation != "KEEP_STAY":
@@ -744,7 +924,14 @@ class ExclusiveDQNEnvironment:
             "cache_capacity_feasible_count": int(capacity_feasible_count),
             "cache_legal_replace_count": int(legal_replace_count),
             "cache_candidates_retained_count": int(unique_cache_targets),
+            "cache_candidate_target_proposals_materialized_count": int(
+                cache_proposal_count
+            ),
+            "cache_candidate_target_unique_count": int(unique_cache_targets),
             "cache_candidates_deduplicated_count": int(
+                cache_candidates_deduplicated_count
+            ),
+            "cache_candidates_deduplicated_by_target_matrix_count": int(
                 cache_candidates_deduplicated_count
             ),
             # 此字段专指已经枚举的全部合法单节点 REPLACE，要求其截断数为零。
@@ -772,6 +959,9 @@ class ExclusiveDQNEnvironment:
         }
         diagnostics = {
             "candidate_count": len(unique),
+            "candidate_action_id_deduplicated_count": int(
+                duplicate_action_id_count
+            ),
             "candidate_count_by_operation": {
                 operation: sum(item.action.operation == operation for item in unique.values())
                 for operation in ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
@@ -885,6 +1075,10 @@ class ExclusiveDQNEnvironment:
             "state_feature_contract_version": self.encoder.state_feature_contract_version,
             "candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
             "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
+            "candidate_capacity_limits": self._candidate_capacity_limits(),
+            "candidate_generation_contract": candidate_generation_contract(
+                **self._candidate_capacity_limits()
+            ),
             "network_architecture_version": self.encoder.network_architecture_version,
             "candidate_count": len(self._cached_candidates),
             "candidate_ids_sha256": _candidate_ids_sha256(self._cached_candidates),
@@ -900,23 +1094,8 @@ class ExclusiveDQNEnvironment:
     ) -> tuple[CandidateOption, ...]:
         """仅由回放中的合法状态上下文和预测输入确定性重建候选。"""
 
-        if context.get("schema_version") != CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION:
-            raise ValueError("回放候选重建上下文版本不兼容")
-        if context.get("candidate_rebuild_payload_sha256") != (
-            _candidate_rebuild_payload_sha256(context)
-        ):
-            raise ValueError("回放候选重建上下文摘要不匹配")
-        if context.get("candidate_feature_contract_version") != self.encoder.candidate_feature_contract_version:
-            raise ValueError("回放候选特征合同与当前编码器不一致")
-        if context.get("candidate_generation_contract_version") != CANDIDATE_GENERATION_CONTRACT_VERSION:
-            raise ValueError("回放候选生成合同与当前生成器不一致")
-        if context.get("state_feature_contract_version") != self.encoder.state_feature_contract_version:
-            raise ValueError("回放状态特征合同与当前编码器不一致")
-        if context.get("network_architecture_version") != self.encoder.network_architecture_version:
-            raise ValueError("回放网络架构合同与当前编码器不一致")
+        self.validate_candidate_rebuild_context_metadata(context)
         forecast = context.get("decision_forecast")
-        if not isinstance(forecast, DecisionForecast):
-            raise ValueError("回放候选重建缺少正式 DecisionForecast")
         cache_state = np.asarray(context.get("cache_state"), dtype=np.int8).copy()
         uav_positions = {
             str(key): np.asarray(value, dtype=np.float64).copy()
@@ -947,7 +1126,7 @@ class ExclusiveDQNEnvironment:
             source_kind="forecast",
             prediction_metadata={"source": "stored_decision_prediction_context"},
         )
-        fingerprint = str(context.get("source_state_fingerprint", ""))
+        fingerprint = str(context["source_state_fingerprint"])
         rebuilt_fingerprint = self._decision_state_fingerprint(
             slot_input,
             forecast,
@@ -958,7 +1137,7 @@ class ExclusiveDQNEnvironment:
                 context.get("prediction_scenario_sha256", "")
             ),
         )
-        if not fingerprint or rebuilt_fingerprint != fingerprint:
+        if rebuilt_fingerprint != fingerprint:
             raise ValueError("回放候选上下文重建的状态指纹不匹配")
         formal_observation = state_features[: int(self.context.observation_spec.observation_dim)]
         reencoded_state = self.encoder.encode_state(
@@ -966,10 +1145,6 @@ class ExclusiveDQNEnvironment:
         )
         if not np.array_equal(reencoded_state, state_features):
             raise ValueError("回放状态向量与保存的预测候选生成上下文不一致")
-        candidate_count = int(context.get("candidate_count", 0))
-        candidate_ids_sha256 = str(context.get("candidate_ids_sha256", ""))
-        if candidate_count <= 0 or len(candidate_ids_sha256) != 64:
-            raise ValueError("回放候选上下文缺少候选数量或顺序指纹")
         cache_key = (
             str(context["candidate_rebuild_payload_sha256"]),
             fingerprint,
@@ -992,8 +1167,9 @@ class ExclusiveDQNEnvironment:
             self._candidate_rebuild_cache.move_to_end(cache_key)
             self._candidate_rebuild_cache_stats["hit_count"] += 1
         if (
-            len(candidates) != candidate_count
-            or _candidate_ids_sha256(candidates) != candidate_ids_sha256
+            len(candidates) != int(context["candidate_count"])
+            or _candidate_ids_sha256(candidates)
+            != str(context["candidate_ids_sha256"])
             or len({item.action.candidate_id for item in candidates}) != len(candidates)
             or any(
                 item.action.source_state_fingerprint != fingerprint
@@ -1019,6 +1195,68 @@ class ExclusiveDQNEnvironment:
                     self._candidate_rebuild_cache_candidate_count -= len(evicted)
                     self._candidate_rebuild_cache_stats["eviction_count"] += 1
         return candidates
+
+    def validate_candidate_rebuild_context_metadata(
+        self, context: Mapping[str, Any]
+    ) -> None:
+        """在恢复 Replay 前校验候选上下文版本、摘要和生成合同。"""
+
+        if context.get("schema_version") != CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION:
+            raise ValueError(
+                "回放候选重建上下文版本不兼容："
+                f"stored={context.get('schema_version')!r}, "
+                f"required={CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION!r}"
+            )
+        missing_fields = [
+            key for key in _CANDIDATE_REBUILD_IDENTITY_FIELDS if key not in context
+        ]
+        if missing_fields:
+            raise ValueError(
+                "回放候选重建上下文缺少身份字段：" + ", ".join(missing_fields)
+            )
+        if context.get("candidate_rebuild_payload_sha256") != (
+            _candidate_rebuild_payload_sha256(context)
+        ):
+            raise ValueError("回放候选重建上下文摘要不匹配")
+        if context.get("candidate_feature_contract_version") != self.encoder.candidate_feature_contract_version:
+            raise ValueError("回放候选特征合同与当前编码器不一致")
+        if context.get("candidate_generation_contract_version") != CANDIDATE_GENERATION_CONTRACT_VERSION:
+            raise ValueError("回放候选生成合同与当前生成器不一致")
+        expected_capacity_limits = self._candidate_capacity_limits()
+        if context.get("candidate_capacity_limits") != expected_capacity_limits:
+            raise ValueError(
+                "回放候选容量限制与当前训练合同不一致："
+                f"stored={context.get('candidate_capacity_limits')!r}, "
+                f"expected={expected_capacity_limits!r}"
+            )
+        expected_generation_contract = candidate_generation_contract(
+            **expected_capacity_limits
+        )
+        if context.get("candidate_generation_contract") != expected_generation_contract:
+            raise ValueError("回放候选生成详细合同与当前实现不一致")
+        if context.get("state_feature_contract_version") != self.encoder.state_feature_contract_version:
+            raise ValueError("回放状态特征合同与当前编码器不一致")
+        if context.get("network_architecture_version") != self.encoder.network_architecture_version:
+            raise ValueError("回放网络架构合同与当前编码器不一致")
+        if not isinstance(context.get("decision_forecast"), DecisionForecast):
+            raise ValueError("回放候选重建缺少正式 DecisionForecast")
+        candidate_count = int(context.get("candidate_count", 0))
+        candidate_ids_sha256 = str(context.get("candidate_ids_sha256", ""))
+        prediction_scenario_sha256 = str(
+            context.get("prediction_scenario_sha256", "")
+        )
+        try:
+            bytes.fromhex(candidate_ids_sha256)
+            bytes.fromhex(prediction_scenario_sha256)
+        except ValueError:
+            raise ValueError("回放候选上下文哈希字段不是有效十六进制摘要") from None
+        if (
+            not str(context.get("source_state_fingerprint", ""))
+            or candidate_count <= 0
+            or len(candidate_ids_sha256) != 64
+            or len(prediction_scenario_sha256) != 64
+        ):
+            raise ValueError("回放候选上下文缺少候选数量或顺序指纹")
 
     def _decision_state_fingerprint(
         self,
@@ -1338,7 +1576,9 @@ class ExclusiveDQNEnvironment:
         slot_input = self.slot_inputs[self.index]
         forecast = self.decision_forecasts[self.index]
         formal_observation = self._formal_observation(forecast)
-        state_features = self.encoder.encode_state(formal_observation, forecast)
+        state_features = self.encoder.encode_state(
+            formal_observation, forecast, slot_input.scenario_slice
+        )
         return self._decision_state_fingerprint(
             slot_input, forecast, state_features
         )

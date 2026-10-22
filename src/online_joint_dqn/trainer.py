@@ -119,7 +119,10 @@ def _numeric_summary(values: list[Any]) -> dict[str, Any]:
 
 
 def _aggregate_candidate_q_statistics(
-    step_rows: list[dict[str, Any]], operation_names: tuple[str, ...]
+    step_rows: list[dict[str, Any]],
+    operation_names: tuple[str, ...],
+    *,
+    source_field: str = "candidate_q_statistics_by_operation",
 ) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for operation in operation_names:
@@ -129,8 +132,12 @@ def _aggregate_candidate_q_statistics(
         missing_states = 0
         minima: list[float] = []
         maxima: list[float] = []
+        per_state_maxima: list[float] = []
+        per_state_quantiles: dict[str, list[float]] = {
+            key: [] for key in ("p10", "p25", "p50", "p75", "p90", "p95")
+        }
         for row in step_rows:
-            stats = row.get("candidate_q_statistics_by_operation", {}).get(operation)
+            stats = row.get(source_field, {}).get(operation)
             if not isinstance(stats, Mapping) or not int(stats.get("count", 0)):
                 missing_states += 1
                 continue
@@ -142,6 +149,10 @@ def _aggregate_candidate_q_statistics(
             sum_squares += state_count * (std * std + mean * mean)
             minima.append(float(stats["min"]))
             maxima.append(float(stats["max"]))
+            per_state_maxima.append(float(stats["max"]))
+            for key in per_state_quantiles:
+                if stats.get(key) is not None:
+                    per_state_quantiles[key].append(float(stats[key]))
         mean_value = sum_values / count if count else None
         variance = (
             max(0.0, sum_squares / count - mean_value * mean_value)
@@ -155,6 +166,11 @@ def _aggregate_candidate_q_statistics(
             "std": math.sqrt(variance) if variance is not None else None,
             "min": min(minima) if minima else None,
             "max": max(maxima) if maxima else None,
+            "per_state_max_statistics": _numeric_summary(per_state_maxima),
+            "per_state_quantile_statistics": {
+                key: _numeric_summary(values)
+                for key, values in per_state_quantiles.items()
+            },
         }
     return result
 
@@ -388,6 +404,9 @@ def train_episode(
                 "global_step": global_step,
                 "candidate_counts_by_operation": candidate_counts,
                 "candidate_q_statistics_by_operation": selected.q_statistics_by_operation,
+                "candidate_advantage_statistics_by_operation": (
+                    selected.advantage_statistics_by_operation
+                ),
                 "selected_q_value": selected.q_value,
                 "selected_category_q": selected.category_q_value,
                 "selected_candidate_q": selected.candidate_q_value,
@@ -729,6 +748,11 @@ def train_episode(
     candidate_population_q_statistics = _aggregate_candidate_q_statistics(
         step_rows, operation_names
     )
+    candidate_population_advantage_statistics = _aggregate_candidate_q_statistics(
+        step_rows,
+        operation_names,
+        source_field="candidate_advantage_statistics_by_operation",
+    )
     cache_update_action_rows = [
         row for row in step_rows if row["selected_action_type"] == "CACHE_UPDATE"
     ]
@@ -829,6 +853,9 @@ def train_episode(
         "q_values_by_action_category_statistics": category_q_statistics,
         "candidate_q_population_statistics_by_operation": (
             candidate_population_q_statistics
+        ),
+        "centered_candidate_advantage_population_statistics_by_operation": (
+            candidate_population_advantage_statistics
         ),
         "selected_candidate_q_statistics_by_operation": candidate_q_statistics,
         "candidate_count_statistics_by_operation": candidate_count_statistics,
