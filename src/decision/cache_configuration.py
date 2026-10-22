@@ -840,6 +840,47 @@ def node_specific_predicted_demand(
     return np.maximum(result, 0.0).astype(np.float64)
 
 
+def predicted_cache_coverage_ratio(
+    cache_state: Any,
+    origin_scenario: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    config: CacheOptimizationConfig,
+    *,
+    prediction_horizon_mask: Any = None,
+) -> float | None:
+    """计算预测场景中的可服务缓存需求覆盖率，不代表实际任务命中率。"""
+
+    cache = np.asarray(cache_state, dtype=np.int8)
+    service_count = int(np.asarray(origin_scenario["rho_hat"]).shape[-1])
+    if cache.shape != (len(cache_nodes["node_ids"]), service_count) or not np.all(
+        np.isin(cache, [0, 1])
+    ):
+        raise ValueError("缓存状态必须与预测场景节点/服务维度一致")
+    demand = predicted_vehicle_service_demand_by_horizon(
+        origin_scenario,
+        service_count,
+        beta_discount=config.beta_discount,
+        prediction_horizon_mask=prediction_horizon_mask,
+    )
+    if demand.ndim != 3 or demand.shape[-1] != service_count:
+        raise ValueError("预测服务需求张量形状非法")
+    coverage_weight = np.zeros_like(demand, dtype=np.float64)
+    for node_index in range(cache.shape[0]):
+        serviceability = _node_predicted_serviceability_weights(
+            origin_scenario,
+            node_index,
+            cache_nodes,
+            config,
+        )
+        node_weight = serviceability[:, :, None] * cache[node_index][None, None, :]
+        coverage_weight = np.maximum(coverage_weight, node_weight)
+    total_demand = float(np.sum(demand))
+    if total_demand <= 1.0e-12:
+        return None
+    covered_demand = float(np.sum(demand * np.clip(coverage_weight, 0.0, 1.0)))
+    return covered_demand / total_demand
+
+
 def node_local_predicted_service_workload(
     origin_scenario: dict[str, Any],
     cache_nodes: dict[str, Any],
@@ -1102,8 +1143,9 @@ def enumerate_all_cache_target_configurations(
     *,
     prediction_horizon_mask: Any = None,
     locked_services: Any = None,
+    generation_diagnostics: dict[str, Any] | None = None,
 ) -> list[CacheTargetCandidate]:
-    """Enumerate every non-KEEP capacity-feasible binary target configuration.
+    """Enumerate every capacity-feasible, lock-preserving legal REPLACE target.
 
     This routine performs only bit enumeration and capacity checks. It does not
     evaluate the environment, Matching, KKT, or Exact-Q.
@@ -1118,8 +1160,6 @@ def enumerate_all_cache_target_configurations(
     before = current_cache[index].copy()
     capacity = float(cache_nodes["capacities_mb"][index])
     service_count = int(service_catalog["num_services"])
-    if service_count > 20:
-        raise ValueError("exhaustive Cache proposal enumeration is capped at 20 services")
     if locked_services is None:
         locked = np.zeros(before.shape, dtype=bool)
     else:
@@ -1133,19 +1173,38 @@ def enumerate_all_cache_target_configurations(
     # Establish the complete legal target set before demand features, candidate
     # scoring, sorting, or bounded candidate selection are performed.
     legal_targets: dict[bytes, np.ndarray] = {}
+    capacity_feasible_count = 0
+    legal_replace_count = 0
     for bitset in range(1 << service_count):
         target = np.fromiter(
             (((bitset >> service) & 1) for service in range(service_count)),
             dtype=np.int8,
             count=service_count,
         )
+        capacity_feasible = is_node_feasible(target, sizes, capacity)
+        capacity_feasible_count += int(capacity_feasible)
         if (
-            np.array_equal(target, before)
+            not capacity_feasible
             or np.any(locked & (target != 1))
-            or not is_node_feasible(target, sizes, capacity)
+            or not is_legal_cache_replacement(before, target)
         ):
             continue
+        legal_replace_count += 1
         legal_targets[np.ascontiguousarray(target).tobytes()] = target
+    if generation_diagnostics is not None:
+        generation_diagnostics.update(
+            {
+                "raw_combination_count": int(1 << service_count),
+                "capacity_feasible_count": int(capacity_feasible_count),
+                "legal_replace_count": int(legal_replace_count),
+                "unique_legal_replace_count": int(len(legal_targets)),
+                "deduplicated_legal_replace_count": int(
+                    legal_replace_count - len(legal_targets)
+                ),
+                "truncated_legal_replace_count": 0,
+                "enumeration_complete": True,
+            }
+        )
     if not legal_targets:
         return []
 

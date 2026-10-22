@@ -6,13 +6,14 @@ import hashlib
 import pickle
 import sys
 from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from decision import slot_environment, task_allocation, uav_configuration
+from decision import cache_configuration, slot_environment, task_allocation, uav_configuration
 from online_joint_optimizer.candidate_evaluator import (
     SearchBudget,
     SlotInput,
@@ -38,6 +39,7 @@ class EnvironmentTransition:
     next_state_features: np.ndarray | None
     next_state_fingerprint: str | None
     next_legal_candidates: tuple[CandidateOption, ...]
+    next_candidate_rebuild_context: Mapping[str, Any] | None
     terminated: bool
     duration_slots: int
     operation: str
@@ -64,6 +66,52 @@ def _input_fingerprint(slot_input: SlotInput) -> str:
         slot_input.prediction_metadata,
     )
     return hashlib.sha256(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
+
+
+_CANDIDATE_REBUILD_SCENARIO_FIELDS = (
+    "vehicle_ids",
+    "task_vehicle_ids",
+    "positions_xy",
+    "arrival",
+    "service_id",
+    "rho_hat",
+)
+_CANDIDATE_REBUILD_IDENTITY_FIELDS = (
+    "schema_version",
+    "source_state_fingerprint",
+    "state_features",
+    "cache_state",
+    "uav_positions",
+    "slot_id",
+    "time_s",
+    "prediction_scenario_sha256",
+    "prediction_scenario",
+    "decision_forecast",
+    "prediction_horizon_mask",
+    "candidate_feature_contract_version",
+    "network_architecture_version",
+)
+
+
+def _prediction_scenario_sha256(scenario: Mapping[str, Any]) -> str:
+    """对完整预测场景求摘要，避免在回放中重复保存无关预测字段。"""
+
+    return hashlib.sha256(
+        pickle.dumps(dict(scenario), protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
+
+
+def _candidate_rebuild_payload_sha256(context: Mapping[str, Any]) -> str:
+    payload = {
+        key: context[key]
+        for key in _CANDIDATE_REBUILD_IDENTITY_FIELDS
+        if key in context
+    }
+    if len(payload) != len(_CANDIDATE_REBUILD_IDENTITY_FIELDS):
+        raise ValueError("候选重建上下文缺少身份字段")
+    return hashlib.sha256(
+        pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
 
 
 class ExclusiveDQNEnvironment:
@@ -260,8 +308,15 @@ class ExclusiveDQNEnvironment:
             cache_before = self.cache_state.copy()
             uav_before = {key: value.copy() for key, value in self.uav_positions.items()}
             self._cached_state_features = state_features
-            self._cached_candidates = self._generate_legal_candidates(
-                slot_input, forecast, fingerprint
+            (
+                self._cached_candidates,
+                self._candidate_generation_diagnostics,
+            ) = self._generate_legal_candidates(
+                slot_input,
+                forecast,
+                fingerprint,
+                current_cache_state=self.cache_state,
+                current_uav_positions=self.uav_positions,
             )
             generation_isolation = (
                 _input_fingerprint(slot_input) == input_before
@@ -286,17 +341,25 @@ class ExclusiveDQNEnvironment:
         slot_input: SlotInput,
         forecast: DecisionForecast,
         source_state_fingerprint: str,
-    ) -> tuple[CandidateOption, ...]:
+        *,
+        current_cache_state: Any,
+        current_uav_positions: Mapping[str, Any],
+    ) -> tuple[tuple[CandidateOption, ...], dict[str, Any]]:
         # 候选器只接收预测场景及配置，不接触当前真实任务和实际车辆轨迹。
         candidate_input = replace(slot_input, tasks=(), vehicle_positions={})
         if candidate_input.tasks or candidate_input.vehicle_positions:
             raise RuntimeError("候选生成输入未能隔离当前真实任务或车辆位置")
+        cache_state = np.asarray(current_cache_state, dtype=np.int8).copy()
+        uav_positions = {
+            key: np.asarray(value, dtype=np.float64).copy()
+            for key, value in current_uav_positions.items()
+        }
         candidates: list[CandidateOption] = []
         keep = ActionCandidate.from_states(
-            previous_cache_state=self.cache_state,
-            previous_uav_positions=self.uav_positions,
-            target_cache_state=self.cache_state,
-            target_uav_positions=self.uav_positions,
+            previous_cache_state=cache_state,
+            previous_uav_positions=uav_positions,
+            target_cache_state=cache_state,
+            target_uav_positions=uav_positions,
             slot_input=candidate_input,
             source_state_fingerprint=source_state_fingerprint,
             proposal_source="KEEP_STAY",
@@ -306,39 +369,98 @@ class ExclusiveDQNEnvironment:
                 keep,
                 self.encoder.encode_candidate(
                     keep,
-                    previous_cache_state=self.cache_state,
-                    previous_uav_positions=self.uav_positions,
+                    previous_cache_state=cache_state,
+                    previous_uav_positions=uav_positions,
                     slot_input=candidate_input,
                     decision_forecast=forecast,
                 ),
             )
         )
         cache_generation_diagnostics: dict[str, Any] = {}
-        cache_targets, cache_generation_complete = self.cache_optimizer.generate_candidates(
-            current_cache_state=self.cache_state,
+        bounded_cache_targets, bounded_cache_complete = self.cache_optimizer.generate_candidates(
+            current_cache_state=cache_state,
             slot_input=candidate_input,
             search_budget=self.search_budget,
             generation_diagnostics=cache_generation_diagnostics,
         )
-        for target in cache_targets:
-            if not target.changed_node_ids:
+        service_catalog = dict(candidate_input.model.service_catalog)
+        cache_nodes = deepcopy(dict(candidate_input.model.cache_nodes))
+        cache_targets_by_key: dict[bytes, tuple[np.ndarray, str]] = {}
+        cache_proposal_count = 0
+        single_node_diagnostics: dict[str, dict[str, Any]] = {}
+        single_node_counts: dict[str, int] = {}
+        raw_combination_count = 0
+        capacity_feasible_count = 0
+        legal_replace_count = 0
+        for node_index, node_id in enumerate(cache_nodes["node_ids"]):
+            node_diagnostics: dict[str, Any] = {}
+            exact_targets = cache_configuration.enumerate_all_cache_target_configurations(
+                cache_state,
+                node_index,
+                service_catalog,
+                deepcopy(cache_nodes),
+                deepcopy(dict(candidate_input.scenario_slice)),
+                candidate_input.model.cache_config,
+                prediction_horizon_mask=deepcopy(
+                    candidate_input.prediction_horizon_mask
+                ),
+                generation_diagnostics=node_diagnostics,
+            )
+            single_node_diagnostics[str(node_id)] = node_diagnostics
+            single_node_counts[str(node_id)] = len(exact_targets)
+            raw_combination_count += int(node_diagnostics["raw_combination_count"])
+            capacity_feasible_count += int(
+                node_diagnostics["capacity_feasible_count"]
+            )
+            legal_replace_count += int(node_diagnostics["legal_replace_count"])
+            for target in exact_targets:
+                target_state = cache_state.copy()
+                target_state[node_index] = np.asarray(
+                    target.target_node_cache, dtype=np.int8
+                )
+                key = np.ascontiguousarray(target_state, dtype=np.int8).tobytes()
+                cache_proposal_count += 1
+                cache_targets_by_key.setdefault(
+                    key,
+                    (
+                        target_state,
+                        f"single_node_exhaustive:{node_id}:{target.proposal_source}",
+                    ),
+                )
+        bounded_cache_candidate_count = 0
+        for target in bounded_cache_targets:
+            target_state = np.asarray(target.target_state, dtype=np.int8)
+            if np.array_equal(target_state, cache_state):
                 continue
+            bounded_cache_candidate_count += 1
+            cache_proposal_count += 1
+            key = np.ascontiguousarray(target_state, dtype=np.int8).tobytes()
+            cache_targets_by_key.setdefault(
+                key,
+                (target_state.copy(), f"bounded_proposal:{target.proposal_source}"),
+            )
+        cache_candidates_deduplicated_count = (
+            cache_proposal_count - len(cache_targets_by_key)
+        )
+        for target_state, proposal_source in cache_targets_by_key.values():
             action = ActionCandidate.from_states(
-                previous_cache_state=self.cache_state,
-                previous_uav_positions=self.uav_positions,
-                target_cache_state=target.target_state,
-                target_uav_positions=self.uav_positions,
+                previous_cache_state=cache_state,
+                previous_uav_positions=uav_positions,
+                target_cache_state=target_state,
+                target_uav_positions=uav_positions,
                 slot_input=candidate_input,
                 source_state_fingerprint=source_state_fingerprint,
-                proposal_source=target.proposal_source,
+                proposal_source=proposal_source,
             )
+            if action.operation != "CACHE_UPDATE":
+                raise RuntimeError("缓存候选枚举产生了非 REPLACE 或无变化动作")
             candidates.append(
                 CandidateOption.create(
                     action,
                     self.encoder.encode_candidate(
                         action,
-                        previous_cache_state=self.cache_state,
-                        previous_uav_positions=self.uav_positions,
+                        previous_cache_state=cache_state,
+                        previous_uav_positions=uav_positions,
                         slot_input=candidate_input,
                         decision_forecast=forecast,
                     ),
@@ -346,18 +468,18 @@ class ExclusiveDQNEnvironment:
             )
         uav_generation_diagnostics: dict[str, Any] = {}
         moves, uav_generation_complete = self.uav_scheduler.enumerate_move_candidates(
-            previous_cache_state=self.cache_state,
-            current_uav_positions=self.uav_positions,
-            previous_uav_positions=self.uav_positions,
+            previous_cache_state=cache_state,
+            current_uav_positions=uav_positions,
+            previous_uav_positions=uav_positions,
             slot_input=candidate_input,
             search_budget=self.search_budget,
             generation_diagnostics=uav_generation_diagnostics,
         )
         for move in moves:
             action = ActionCandidate.from_states(
-                previous_cache_state=self.cache_state,
-                previous_uav_positions=self.uav_positions,
-                target_cache_state=self.cache_state,
+                previous_cache_state=cache_state,
+                previous_uav_positions=uav_positions,
+                target_cache_state=cache_state,
                 target_uav_positions=move.target_uav_positions,
                 slot_input=candidate_input,
                 source_state_fingerprint=source_state_fingerprint,
@@ -368,8 +490,8 @@ class ExclusiveDQNEnvironment:
                     action,
                     self.encoder.encode_candidate(
                         action,
-                        previous_cache_state=self.cache_state,
-                        previous_uav_positions=self.uav_positions,
+                        previous_cache_state=cache_state,
+                        previous_uav_positions=uav_positions,
                         slot_input=candidate_input,
                         decision_forecast=forecast,
                     ),
@@ -384,16 +506,52 @@ class ExclusiveDQNEnvironment:
             unique[option.action.candidate_id] = option
         if not unique or next(iter(unique.values())).action.operation != "KEEP_STAY":
             raise RuntimeError("合法候选集合必须始终包含 KEEP_STAY")
-        self._candidate_generation_diagnostics = {
+        unique_cache_targets = len(cache_targets_by_key)
+        cache_generation_diagnostics = {
+            **cache_generation_diagnostics,
+            "raw_combination_count": int(raw_combination_count),
+            "capacity_feasible_count": int(capacity_feasible_count),
+            "legal_replace_count": int(legal_replace_count),
+            "cache_raw_combination_count": int(raw_combination_count),
+            "cache_capacity_feasible_count": int(capacity_feasible_count),
+            "cache_legal_replace_count": int(legal_replace_count),
+            "cache_candidates_retained_count": int(unique_cache_targets),
+            "cache_candidates_deduplicated_count": int(
+                cache_candidates_deduplicated_count
+            ),
+            # 此字段专指已经枚举的全部合法单节点 REPLACE，要求其截断数为零。
+            "cache_candidates_truncated_count": 0,
+            "cache_single_node_candidates_truncated_count": 0,
+            "cache_single_node_candidate_counts": single_node_counts,
+            "cache_single_node_generation_diagnostics": single_node_diagnostics,
+            "cache_single_node_enumeration_complete": True,
+            "cache_bounded_proposal_candidate_count": int(
+                bounded_cache_candidate_count
+            ),
+            "cache_bounded_proposal_truncated_count": int(
+                cache_generation_diagnostics.get(
+                    "omitted_generated_proposal_count", 0
+                )
+            ),
+            "cache_cross_node_candidates_retained_count": sum(
+                len(target.changed_node_ids) > 1
+                for target in bounded_cache_targets
+            ),
+            "cache_cross_node_combinations_exhaustive": False,
+            "cache_bounded_generator_complete": bool(bounded_cache_complete),
+        }
+        diagnostics = {
             "candidate_count": len(unique),
             "candidate_count_by_operation": {
                 operation: sum(item.action.operation == operation for item in unique.values())
                 for operation in ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
             },
-            "cache_candidate_generation_complete": bool(cache_generation_complete),
+            "cache_candidate_generation_complete": bool(
+                bounded_cache_complete
+            ),
             "uav_candidate_generation_complete": bool(uav_generation_complete),
             "candidate_generation_complete_within_bounded_proposal_policy": bool(
-                cache_generation_complete and uav_generation_complete
+                bounded_cache_complete and uav_generation_complete
             ),
             "candidate_legal_action_space_exhaustive": False,
             "cache_candidate_generation_diagnostics": cache_generation_diagnostics,
@@ -416,7 +574,7 @@ class ExclusiveDQNEnvironment:
             "prediction_horizon_count": self.encoder.horizon_count,
             "prediction_horizon_mask": self.encoder._forecast_mask(forecast).tolist(),
         }
-        return tuple(unique.values())
+        return tuple(unique.values()), diagnostics
 
     def _formal_observation(self, forecast: DecisionForecast) -> np.ndarray:
         """复用正式 MAPPO 观测构造器，输入对象仅含当前决策可见的预测。"""
@@ -440,11 +598,138 @@ class ExclusiveDQNEnvironment:
             time_to_go_override=single_origin_override,
         )
 
+    def candidate_rebuild_context(self) -> dict[str, Any]:
+        """导出由合法状态和预测输入组成的紧凑候选重建上下文。"""
+
+        if not self.can_act:
+            raise StopIteration("当前状态没有可重建的合法动作集合")
+        self._prepare_observation()
+        if (
+            self._cached_state_features is None
+            or self._cached_state_fingerprint is None
+            or self._cached_candidates is None
+        ):
+            raise RuntimeError("当前状态候选尚未完成生成")
+        slot_input = self.slot_inputs[self.index]
+        forecast = self.decision_forecasts[self.index]
+        scenario_slice = dict(slot_input.scenario_slice)
+        missing_scenario_fields = [
+            key for key in _CANDIDATE_REBUILD_SCENARIO_FIELDS if key not in scenario_slice
+        ]
+        if missing_scenario_fields:
+            raise ValueError(
+                "候选重建预测输入缺少字段：" + ", ".join(missing_scenario_fields)
+            )
+        context = {
+            "schema_version": "dqn_candidate_rebuild_context_v2",
+            "source_state_fingerprint": self._cached_state_fingerprint,
+            "state_features": self._cached_state_features.copy(),
+            "cache_state": self.cache_state.copy(),
+            "uav_positions": {
+                key: value.copy() for key, value in self.uav_positions.items()
+            },
+            "slot_id": int(slot_input.slot_id),
+            "time_s": None if slot_input.time_s is None else float(slot_input.time_s),
+            # 候选生成只读取这些预测字段；完整预测场景仍通过摘要进入状态身份。
+            "prediction_scenario_sha256": _prediction_scenario_sha256(scenario_slice),
+            "prediction_scenario": {
+                key: deepcopy(scenario_slice[key])
+                for key in _CANDIDATE_REBUILD_SCENARIO_FIELDS
+            },
+            "decision_forecast": deepcopy(forecast),
+            "prediction_horizon_mask": (
+                None
+                if slot_input.prediction_horizon_mask is None
+                else np.asarray(slot_input.prediction_horizon_mask, dtype=np.int8).copy()
+            ),
+            "candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
+            "network_architecture_version": self.encoder.network_architecture_version,
+        }
+        context["candidate_rebuild_payload_sha256"] = (
+            _candidate_rebuild_payload_sha256(context)
+        )
+        return context
+
+    def rebuild_candidates(
+        self,
+        context: Mapping[str, Any],
+    ) -> tuple[CandidateOption, ...]:
+        """仅由回放中的合法状态上下文和预测输入确定性重建候选。"""
+
+        if context.get("schema_version") != "dqn_candidate_rebuild_context_v2":
+            raise ValueError("回放候选重建上下文版本不兼容")
+        if context.get("candidate_rebuild_payload_sha256") != (
+            _candidate_rebuild_payload_sha256(context)
+        ):
+            raise ValueError("回放候选重建上下文摘要不匹配")
+        if context.get("candidate_feature_contract_version") != self.encoder.candidate_feature_contract_version:
+            raise ValueError("回放候选特征合同与当前编码器不一致")
+        if context.get("network_architecture_version") != self.encoder.network_architecture_version:
+            raise ValueError("回放网络架构合同与当前编码器不一致")
+        forecast = context.get("decision_forecast")
+        if not isinstance(forecast, DecisionForecast):
+            raise ValueError("回放候选重建缺少正式 DecisionForecast")
+        cache_state = np.asarray(context.get("cache_state"), dtype=np.int8).copy()
+        uav_positions = {
+            str(key): np.asarray(value, dtype=np.float64).copy()
+            for key, value in dict(context.get("uav_positions", {})).items()
+        }
+        state_features = np.asarray(
+            context.get("state_features"), dtype=np.float32
+        ).reshape(-1)
+        scenario_slice = deepcopy(dict(context.get("prediction_scenario", {})))
+        slot_input = SlotInput(
+            slot_id=int(context["slot_id"]),
+            time_s=(
+                None if context.get("time_s") is None else float(context["time_s"])
+            ),
+            scenario_slice=scenario_slice,
+            tasks=(),
+            vehicle_positions={},
+            predicted_vehicle_positions=deepcopy(
+                dict(forecast.predicted_vehicle_positions)
+            ),
+            model=self.model,
+            prediction_horizon_mask=(
+                None
+                if context.get("prediction_horizon_mask") is None
+                else np.asarray(context["prediction_horizon_mask"], dtype=np.int8).copy()
+            ),
+            scenario_id=f"replay:{int(context['slot_id'])}",
+            source_kind="forecast",
+            prediction_metadata={"source": "stored_decision_prediction_context"},
+        )
+        fingerprint = str(context.get("source_state_fingerprint", ""))
+        rebuilt_fingerprint = self._decision_state_fingerprint(
+            slot_input,
+            forecast,
+            state_features,
+            cache_state=cache_state,
+            uav_positions=uav_positions,
+            prediction_scenario_sha256=str(
+                context.get("prediction_scenario_sha256", "")
+            ),
+        )
+        if not fingerprint or rebuilt_fingerprint != fingerprint:
+            raise ValueError("回放候选上下文重建的状态指纹不匹配")
+        candidates, _ = self._generate_legal_candidates(
+            slot_input,
+            forecast,
+            fingerprint,
+            current_cache_state=cache_state,
+            current_uav_positions=uav_positions,
+        )
+        return candidates
+
     def _decision_state_fingerprint(
         self,
         slot_input: SlotInput,
         forecast: DecisionForecast,
         state_features: np.ndarray,
+        *,
+        cache_state: Any | None = None,
+        uav_positions: Mapping[str, Any] | None = None,
+        prediction_scenario_sha256: str | None = None,
     ) -> str:
         prediction_context = {
             "origin_index": int(forecast.origin_index),
@@ -454,14 +739,18 @@ class ExclusiveDQNEnvironment:
                 if forecast.prediction_horizon_mask is None
                 else np.asarray(forecast.prediction_horizon_mask, dtype=np.int8)
             ),
-            # 场景字段由正式预测池提供，候选生成器据此构造有限合法动作。
-            "prediction_scenario": slot_input.scenario_slice,
+            # 完整预测场景摘要保留指纹语义，回放只需保存候选生成必需字段。
+            "prediction_scenario_sha256": (
+                _prediction_scenario_sha256(slot_input.scenario_slice)
+                if prediction_scenario_sha256 is None
+                else str(prediction_scenario_sha256)
+            ),
             "predicted_vehicle_positions_horizon": forecast.predicted_vehicle_positions_horizon,
             "predicted_service_popularity_horizon": forecast.predicted_service_popularity_horizon,
         }
         return _state_fingerprint(
-            self.cache_state,
-            self.uav_positions,
+            self.cache_state if cache_state is None else cache_state,
+            self.uav_positions if uav_positions is None else uav_positions,
             state_features,
             prediction_context,
         )
@@ -595,6 +884,30 @@ class ExclusiveDQNEnvironment:
         )
         if not isolation_pass:
             raise RuntimeError("候选执行意外修改了输入 realization 或执行前状态")
+        predicted_cache_coverage_before: float | None = None
+        predicted_cache_coverage_after: float | None = None
+        predicted_cache_coverage_error: str | None = None
+        try:
+            predicted_cache_coverage_before = (
+                cache_configuration.predicted_cache_coverage_ratio(
+                    previous_cache,
+                    dict(slot_input.scenario_slice),
+                    dict(self.model.cache_nodes),
+                    self.model.cache_config,
+                    prediction_horizon_mask=slot_input.prediction_horizon_mask,
+                )
+            )
+            predicted_cache_coverage_after = (
+                cache_configuration.predicted_cache_coverage_ratio(
+                    final_cache,
+                    dict(slot_input.scenario_slice),
+                    dict(self.model.cache_nodes),
+                    self.model.cache_config,
+                    prediction_horizon_mask=slot_input.prediction_horizon_mask,
+                )
+            )
+        except (KeyError, TypeError, ValueError, IndexError, FloatingPointError) as exc:
+            predicted_cache_coverage_error = f"{type(exc).__name__}: {exc}"
         executor_calls = 1
         matching_calls = int(bool(result.matching_summary))
         kkt_calls = int(kkt_cache.solver_calls)
@@ -611,14 +924,17 @@ class ExclusiveDQNEnvironment:
         next_state: np.ndarray | None = None
         next_state_fingerprint: str | None = None
         next_candidates: tuple[CandidateOption, ...] = ()
+        next_candidate_rebuild_context: Mapping[str, Any] | None = None
         if not done:
             next_state, next_candidates = self._prepare_observation()
             next_state_fingerprint = self._current_state_hash()
+            next_candidate_rebuild_context = self.candidate_rebuild_context()
         return EnvironmentTransition(
             reward=float(result.system_utility),
             next_state_features=next_state,
             next_state_fingerprint=next_state_fingerprint,
             next_legal_candidates=next_candidates,
+            next_candidate_rebuild_context=next_candidate_rebuild_context,
             terminated=done,
             duration_slots=1,
             operation=action.operation,
@@ -632,7 +948,56 @@ class ExclusiveDQNEnvironment:
             mutual_exclusion_pass=mutual_exclusion_pass,
             diagnostics={
                 "slot_id": int(slot_input.slot_id),
-                "actual_task_utility": float(result.actual_task_utility),
+                "actual_system_utility": float(result.system_utility),
+                "actual_task_utility": (
+                    None
+                    if result.actual_task_utility is None
+                    else float(result.actual_task_utility)
+                ),
+                "actual_matching_node_task_counts": result.matching_summary.get(
+                    "node_task_count"
+                ),
+                "actual_task_count": (
+                    len(actual_matching)
+                    if actual_execution_node_data_available
+                    else None
+                ),
+                "per_task_delay_s": dict(result.per_task_delay_s),
+                "per_task_vehicle_energy_j": dict(
+                    result.per_task_vehicle_energy_j
+                ),
+                "per_task_utility": dict(result.per_task_utility),
+                "actual_total_task_delay_s": (
+                    float(sum(result.per_task_delay_s.values()))
+                    if result.per_task_delay_s
+                    else (0.0 if actual_execution_node_data_available else None)
+                ),
+                "actual_total_vehicle_energy_j": (
+                    float(sum(result.per_task_vehicle_energy_j.values()))
+                    if result.per_task_vehicle_energy_j
+                    else (0.0 if actual_execution_node_data_available else None)
+                ),
+                "cache_download_delay_s": (
+                    None
+                    if result.cache_download_delay_s is None
+                    else float(result.cache_download_delay_s)
+                ),
+                "uav_movement_energy_j": (
+                    None
+                    if result.movement_energy is None
+                    else float(result.movement_energy)
+                ),
+                "predicted_cache_coverage_before": predicted_cache_coverage_before,
+                "predicted_cache_coverage_after": predicted_cache_coverage_after,
+                "predicted_cache_coverage_delta": (
+                    None
+                    if predicted_cache_coverage_before is None
+                    or predicted_cache_coverage_after is None
+                    else predicted_cache_coverage_after
+                    - predicted_cache_coverage_before
+                ),
+                "predicted_cache_coverage_metric": True,
+                "predicted_cache_coverage_error": predicted_cache_coverage_error,
                 "cache_cost": (
                     None if result.cache_cost is None else float(result.cache_cost)
                 ),

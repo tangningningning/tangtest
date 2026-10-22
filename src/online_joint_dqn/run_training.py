@@ -43,10 +43,12 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v3"
-CHECKPOINT_SCHEMA_VERSION = 4
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v5"
+CHECKPOINT_SCHEMA_VERSION = 6
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
+DEFAULT_LEARNING_RATE = 2.5e-4
+DEFAULT_RUN_NAME_PREFIX = "online_joint_dqn_fixed_input"
 
 _CODE_IDENTITY_REQUIRED_PATHS = (
     "src/common/project_config.py",
@@ -397,7 +399,11 @@ def _create_unique_run_directory(stem: Path) -> Path:
             suffix += 1
 
 
-def _new_run_directory(requested: Path | None) -> Path:
+def _new_run_directory(
+    requested: Path | None,
+    *,
+    run_name_prefix: str = DEFAULT_RUN_NAME_PREFIX,
+) -> Path:
     if requested is not None:
         target = requested if requested.is_absolute() else PROJECT_ROOT / requested
         target = target.resolve()
@@ -405,7 +411,7 @@ def _new_run_directory(requested: Path | None) -> Path:
         return target
     # 使用本机当地时间，便于直接辨认训练启动时间。
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    stem = PROJECT_ROOT / "runs" / f"online_joint_dqn_fixed_input_{timestamp}"
+    stem = PROJECT_ROOT / "runs" / f"{run_name_prefix}_{timestamp}"
     return _create_unique_run_directory(stem)
 
 
@@ -421,11 +427,12 @@ def _run_identity(
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
     identity = {
-        "algorithm": "candidate_conditioned_double_dqn_exclusive_v2",
+        "algorithm": "two_stage_category_candidate_double_dqn_exclusive_v1",
         "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
         "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
         "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
         "seed": int(seed),
+        "learning_rate": float(agent.optimizer.param_groups[0]["lr"]),
         "config_path": config_path.relative_to(PROJECT_ROOT).as_posix(),
         "config_raw_sha256": project_config.raw_config_sha256(config_path),
         "config_semantic_sha256": project_config.semantic_config_hash(config),
@@ -440,6 +447,8 @@ def _run_identity(
             "state_dim": agent.state_dim,
             "candidate_dim": agent.candidate_dim,
             "gamma": agent.gamma,
+            "learning_rate": float(agent.optimizer.param_groups[0]["lr"]),
+            "optimizer_type": type(agent.optimizer).__name__,
             "target_network_frequency_gradient_updates": agent.target_network_frequency,
             "target_tau": agent.target_tau,
             "target_network_sync_mode": (
@@ -455,6 +464,7 @@ def _run_identity(
             ][:-1],
         },
         "replay_capacity": int(replay_capacity),
+        "replay_buffer_schema_version": ReplayBuffer.STATE_SCHEMA_VERSION,
         "candidate_capacity_limits": dict(search_budget),
         "code_identity": _code_identity(),
     }
@@ -542,6 +552,7 @@ def _write_run_summary(
     last_checkpoint_bytes: int | None,
     elapsed_seconds: float,
     total_slots: int,
+    learning_rate: float,
 ) -> None:
     operation_names = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
     totals = {
@@ -595,6 +606,8 @@ def _write_run_summary(
         "completed_slots": int(global_step),
         "planned_slots": int(total_slots),
         "gradient_updates": int(gradient_steps),
+        "learning_rate": float(learning_rate),
+        "optimizer_type": "Adam",
         "action_execution_counts": totals,
         "mean_episode_cumulative_utility": (
             sum(episode_utilities) / len(episode_utilities) if episode_utilities else None
@@ -741,6 +754,8 @@ def run_training(
     resume_checkpoint: Path | None = None,
     seed: int = DEFAULT_SEED,
     replay_capacity: int = DEFAULT_REPLAY_CAPACITY,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    run_name_prefix: str = DEFAULT_RUN_NAME_PREFIX,
 ) -> int:
     pool_info = _validate_training_pool()
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
@@ -760,6 +775,7 @@ def run_training(
     agent = DoubleDQNAgent(
         len(state),
         len(candidates[0].features),
+        learning_rate=float(learning_rate),
         seed=int(seed),
     )
     replay = ReplayBuffer(int(replay_capacity), seed=int(seed))
@@ -785,7 +801,9 @@ def run_training(
     )
 
     if resume_checkpoint is None:
-        run_dir = _new_run_directory(output_dir)
+        run_dir = _new_run_directory(
+            output_dir, run_name_prefix=run_name_prefix
+        )
         run_dir.joinpath("checkpoints").mkdir()
         run_dir.joinpath("config_snapshot.toml").write_bytes(config_path.read_bytes())
         _write_json(run_dir / "training_pool_identity.json", pool_info)
@@ -923,6 +941,7 @@ def run_training(
         last_checkpoint_bytes=last_checkpoint_bytes,
         elapsed_seconds=0.0,
         total_slots=total_slots,
+        learning_rate=learning_rate,
     )
 
     stop_requested = False
@@ -988,7 +1007,7 @@ def run_training(
                         },
                     )
 
-                def write_update(row: dict[str, float]) -> None:
+                def write_update(row: dict[str, Any]) -> None:
                     _append_jsonl(
                         update_stream,
                         {
@@ -1066,6 +1085,7 @@ def run_training(
                     last_checkpoint_bytes=last_checkpoint_bytes,
                     elapsed_seconds=time.perf_counter() - run_start,
                     total_slots=total_slots,
+                    learning_rate=learning_rate,
                 )
                 elapsed = previous_training_elapsed_seconds + (
                     time.perf_counter() - run_start
@@ -1154,6 +1174,7 @@ def run_training(
             last_checkpoint_bytes=last_checkpoint_bytes,
             elapsed_seconds=time.perf_counter() - run_start,
             total_slots=total_slots,
+            learning_rate=learning_rate,
         )
         raise
     finally:
@@ -1176,6 +1197,7 @@ def run_training(
         last_checkpoint_bytes=last_checkpoint_bytes,
         elapsed_seconds=time.perf_counter() - run_start,
         total_slots=total_slots,
+        learning_rate=learning_rate,
     )
     if status == "FORMAL_TRAINING_COMPLETE":
         plot_result: dict[str, Any]
@@ -1230,7 +1252,11 @@ def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def main() -> int:
+def main(
+    *,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    run_name_prefix: str = DEFAULT_RUN_NAME_PREFIX,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
@@ -1244,6 +1270,8 @@ def main() -> int:
         resume_checkpoint=args.resume_checkpoint,
         seed=args.seed,
         replay_capacity=args.replay_capacity,
+        learning_rate=learning_rate,
+        run_name_prefix=run_name_prefix,
     )
 
 

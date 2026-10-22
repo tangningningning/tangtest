@@ -19,7 +19,7 @@ from online_joint_optimizer.candidate_evaluator import SlotInput, copy_uav_posit
 OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
 STATE_FEATURE_CONTRACT_VERSION = "formal_observation_horizon_workload_v2"
 CANDIDATE_FEATURE_CONTRACT_VERSION = "prediction_only_exclusive_candidate_v2"
-NETWORK_ARCHITECTURE_VERSION = "candidate_conditioned_q_mlp_v2"
+NETWORK_ARCHITECTURE_VERSION = "two_stage_category_candidate_q_v1"
 
 
 @dataclass(frozen=True)

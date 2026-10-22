@@ -1,11 +1,11 @@
-"""面向动态合法候选集合的集中式 Double DQN。"""
+"""面向动态合法候选集合的两阶段 Double DQN。"""
 
 from __future__ import annotations
 
 import copy
 import random
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from torch.nn import functional as F
 from .candidate_features import (
     CANDIDATE_FEATURE_CONTRACT_VERSION,
     NETWORK_ARCHITECTURE_VERSION,
+    OPERATIONS,
     STATE_FEATURE_CONTRACT_VERSION,
     CandidateOption,
 )
@@ -22,7 +23,7 @@ from .replay_buffer import ReplayTransition
 
 
 class CandidateQNetwork(nn.Module):
-    """输入状态与单个候选动作，输出该候选的一个 Q 值。"""
+    """输入状态与类别内候选特征，输出候选优势分数。"""
 
     def __init__(
         self,
@@ -37,31 +38,69 @@ class CandidateQNetwork(nn.Module):
         if any(value <= 0 for value in widths):
             raise ValueError("网络宽度必须为正数")
         layers: list[nn.Module] = []
-        for before, after in zip(widths[:-1], widths[1:]):
+        for before, after in zip(widths[:-1], widths[1:], strict=True):
             layers.extend((nn.Linear(before, after), nn.ReLU()))
         layers.append(nn.Linear(widths[-1], 1))
         self.network = nn.Sequential(*layers)
 
-    def forward(self, state_features: torch.Tensor, candidate_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        state_features: torch.Tensor,
+        candidate_features: torch.Tensor,
+    ) -> torch.Tensor:
         if state_features.ndim != 2 or candidate_features.ndim != 2:
-            raise ValueError("Q 网络输入必须为二维 batch 张量")
+            raise ValueError("候选评分网络输入必须为二维 batch 张量")
         if state_features.shape[0] != candidate_features.shape[0]:
             raise ValueError("状态与候选特征 batch 大小必须一致")
-        return self.network(torch.cat((state_features, candidate_features), dim=1)).squeeze(-1)
+        return self.network(
+            torch.cat((state_features, candidate_features), dim=1)
+        ).squeeze(-1)
+
+
+class ActionCategoryQNetwork(nn.Module):
+    """只根据状态估计 KEEP、缓存更新和 UAV 移动的类别价值。"""
+
+    def __init__(
+        self,
+        state_dim: int,
+        hidden_sizes: Sequence[int] = (256, 128),
+    ) -> None:
+        super().__init__()
+        if int(state_dim) <= 0:
+            raise ValueError("状态特征维度必须为正数")
+        widths = [int(state_dim), *(int(value) for value in hidden_sizes)]
+        if any(value <= 0 for value in widths):
+            raise ValueError("网络宽度必须为正数")
+        layers: list[nn.Module] = []
+        for before, after in zip(widths[:-1], widths[1:], strict=True):
+            layers.extend((nn.Linear(before, after), nn.ReLU()))
+        layers.append(nn.Linear(widths[-1], len(OPERATIONS)))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, state_features: torch.Tensor) -> torch.Tensor:
+        if state_features.ndim != 2:
+            raise ValueError("动作类别网络输入必须为二维 batch 张量")
+        return self.network(state_features)
 
 
 @dataclass(frozen=True)
 class ActionSelection:
     candidate: CandidateOption
-    q_value: float | None
+    q_value: float
+    category_q_value: float
+    candidate_q_value: float
     explored: bool
     epsilon: float
     candidate_counts_by_operation: Mapping[str, int]
     q_statistics_by_operation: Mapping[str, Mapping[str, Any]]
+    q_values_by_action_category: Mapping[str, float | None]
+
+
+CandidateRebuilder = Callable[[Mapping[str, Any]], Sequence[CandidateOption]]
 
 
 class DoubleDQNAgent:
-    """复用 DQN 在线/目标网训练骨架并实现候选条件化 Double DQN。"""
+    """分两阶段选择动作类别与具体目标，并用 Double DQN 更新二者。"""
 
     def __init__(
         self,
@@ -83,9 +122,12 @@ class DoubleDQNAgent:
             raise ValueError("目标网络同步参数非法")
         if float(max_grad_norm) <= 0.0:
             raise ValueError("梯度裁剪上限必须为正数")
+        if not np.isfinite(float(learning_rate)) or float(learning_rate) <= 0.0:
+            raise ValueError("learning_rate 必须为正的有限数值")
         self.state_dim = int(state_dim)
         self.candidate_dim = int(candidate_dim)
         self.gamma = float(gamma)
+        self.learning_rate = float(learning_rate)
         self.target_network_frequency = int(target_network_frequency)
         self.target_tau = float(target_tau)
         self.max_grad_norm = float(max_grad_norm)
@@ -105,7 +147,20 @@ class DoubleDQNAgent:
         ).to(self.device)
         self.target_network = copy.deepcopy(self.online_network).to(self.device)
         self.target_network.eval()
-        self.optimizer = torch.optim.Adam(self.online_network.parameters(), lr=float(learning_rate))
+        self.online_category_network = ActionCategoryQNetwork(
+            self.state_dim, hidden_sizes
+        ).to(self.device)
+        self.target_category_network = copy.deepcopy(
+            self.online_category_network
+        ).to(self.device)
+        self.target_category_network.eval()
+        self.optimizer = torch.optim.Adam(
+            [
+                *self.online_network.parameters(),
+                *self.online_category_network.parameters(),
+            ],
+            lr=self.learning_rate,
+        )
         self.gradient_steps = 0
 
     def score_candidates(
@@ -114,30 +169,62 @@ class DoubleDQNAgent:
         candidates: Sequence[CandidateOption],
         *,
         network: nn.Module | None = None,
+        chunk_size: int = 2048,
     ) -> np.ndarray:
-        """只为调用方提供的当前合法候选打分。"""
+        """分块评分，避免完整枚举候选时构造巨型重复状态张量。"""
 
         if not candidates:
-            raise ValueError("合法候选集合不能为空，KEEP_STAY 应始终存在")
+            raise ValueError("类别内合法候选集合不能为空")
         state = np.asarray(state_features, dtype=np.float32).reshape(-1)
         if state.shape != (self.state_dim,):
             raise ValueError("状态特征维度不匹配")
-        actions = np.asarray([item.features for item in candidates], dtype=np.float32)
-        if actions.shape != (len(candidates), self.candidate_dim):
-            raise ValueError("候选特征维度不匹配")
+        if int(chunk_size) <= 0:
+            raise ValueError("候选评分 chunk_size 必须为正数")
         selected_network = self.online_network if network is None else network
+        was_training = selected_network.training
         selected_network.eval()
-        with torch.no_grad():
-            states = torch.as_tensor(
-                np.repeat(state[None, :], len(candidates), axis=0),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            action_tensor = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
-            scores = selected_network(states, action_tensor).detach().cpu().numpy()
-        if scores.shape != (len(candidates),) or not np.all(np.isfinite(scores)):
-            raise FloatingPointError("Q 网络对合法候选返回了无效分数")
-        return scores.astype(np.float64, copy=False)
+        all_scores = np.empty(len(candidates), dtype=np.float64)
+        try:
+            with torch.no_grad():
+                for start in range(0, len(candidates), int(chunk_size)):
+                    end = min(start + int(chunk_size), len(candidates))
+                    actions = np.asarray(
+                        [item.features for item in candidates[start:end]],
+                        dtype=np.float32,
+                    )
+                    if actions.shape != (end - start, self.candidate_dim):
+                        raise ValueError("候选特征维度不匹配")
+                    states = np.broadcast_to(
+                        state, (end - start, self.state_dim)
+                    ).copy()
+                    values = selected_network(
+                        torch.as_tensor(states, dtype=torch.float32, device=self.device),
+                        torch.as_tensor(actions, dtype=torch.float32, device=self.device),
+                    ).detach().cpu().numpy()
+                    all_scores[start:end] = values
+        finally:
+            selected_network.train(was_training)
+        if not np.all(np.isfinite(all_scores)):
+            raise FloatingPointError("候选评分网络返回了非有限值")
+        return all_scores
+
+    def score_action_categories(self, state_features: Any) -> dict[str, float]:
+        state = np.asarray(state_features, dtype=np.float32).reshape(-1)
+        if state.shape != (self.state_dim,) or not np.all(np.isfinite(state)):
+            raise ValueError("动作类别评分状态维度或数值无效")
+        was_training = self.online_category_network.training
+        self.online_category_network.eval()
+        try:
+            with torch.no_grad():
+                tensor = torch.as_tensor(
+                    state[None, :], dtype=torch.float32, device=self.device
+                )
+                values = self.online_category_network(tensor).squeeze(0).cpu().numpy()
+        finally:
+            self.online_category_network.train(was_training)
+        if values.shape != (len(OPERATIONS),) or not np.all(np.isfinite(values)):
+            raise FloatingPointError("类别价值头返回了非有限值或错误维度")
+        return {operation: float(values[index]) for index, operation in enumerate(OPERATIONS)}
 
     def select_action(
         self,
@@ -147,39 +234,37 @@ class DoubleDQNAgent:
         epsilon: float = 0.0,
         explore: bool = False,
     ) -> ActionSelection:
-        """探索时先均匀抽取动作类别，贪心时比较全部合法候选。"""
+        """先选当前有候选的类别，再只在该类别内选择具体目标。"""
 
         if not legal_candidates:
             raise ValueError("动作选择要求非空合法候选集合")
-        operation_order = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
-        candidates_by_operation: dict[str, list[CandidateOption]] = {
-            operation: [] for operation in operation_order
+        candidates_by_operation: dict[str, list[tuple[int, CandidateOption]]] = {
+            operation: [] for operation in OPERATIONS
         }
-        for candidate in legal_candidates:
+        for index, candidate in enumerate(legal_candidates):
             operation = candidate.action.operation
             if operation not in candidates_by_operation:
                 raise ValueError(f"候选包含未知操作类别：{operation}")
-            candidates_by_operation[operation].append(candidate)
+            candidates_by_operation[operation].append((index, candidate))
         if not candidates_by_operation["KEEP_STAY"]:
             raise ValueError("合法候选集合必须始终包含 KEEP_STAY")
 
         chance = float(epsilon) if explore else 0.0
         if not 0.0 <= chance <= 1.0:
             raise ValueError("epsilon 必须位于 [0, 1]")
-        # 探索时也计算候选 Q 统计，确保每一步可解释；该评分不执行系统求解。
-        scores = self.score_candidates(state_features, legal_candidates)
+        category_values = self.score_action_categories(state_features)
+        available_operations = tuple(
+            operation for operation in OPERATIONS if candidates_by_operation[operation]
+        )
+        candidate_values = self.score_candidates(state_features, legal_candidates)
         candidate_counts = {
             operation: len(candidates_by_operation[operation])
-            for operation in operation_order
+            for operation in OPERATIONS
         }
         q_statistics: dict[str, dict[str, Any]] = {}
-        for operation in operation_order:
-            indices = [
-                index
-                for index, candidate in enumerate(legal_candidates)
-                if candidate.action.operation == operation
-            ]
-            if not indices:
+        for operation in OPERATIONS:
+            indexed_options = candidates_by_operation[operation]
+            if not indexed_options:
                 q_statistics[operation] = {
                     "count": 0,
                     "mean": None,
@@ -189,85 +274,135 @@ class DoubleDQNAgent:
                     "max_candidate_id": None,
                 }
                 continue
-            operation_scores = scores[indices]
-            best_offset = int(np.argmax(operation_scores))
+            indices = [index for index, _ in indexed_options]
+            values = candidate_values[indices]
+            best_offset = int(np.argmax(values))
             q_statistics[operation] = {
                 "count": len(indices),
-                "mean": float(np.mean(operation_scores)),
-                "std": float(np.std(operation_scores)),
-                "min": float(np.min(operation_scores)),
-                "max": float(operation_scores[best_offset]),
-                "max_candidate_id": legal_candidates[
-                    indices[best_offset]
-                ].action.candidate_id,
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "min": float(np.min(values)),
+                "max": float(values[best_offset]),
+                "max_candidate_id": indexed_options[best_offset][1].action.candidate_id,
             }
-        if explore and float(self.rng.random()) < chance:
-            available_operations = tuple(
-                operation
-                for operation in operation_order
-                if candidates_by_operation[operation]
+
+        explored = bool(explore and float(self.rng.random()) < chance)
+        if explored:
+            selected_operation = available_operations[
+                int(self.rng.integers(0, len(available_operations)))
+            ]
+            operation_options = candidates_by_operation[selected_operation]
+            selected_index, candidate = operation_options[
+                int(self.rng.integers(0, len(operation_options)))
+            ]
+        else:
+            selected_operation = max(
+                available_operations,
+                key=lambda operation: category_values[operation],
             )
-            operation_index = int(self.rng.integers(0, len(available_operations)))
-            selected_operation = available_operations[operation_index]
-            operation_candidates = candidates_by_operation[selected_operation]
-            candidate_index = int(self.rng.integers(0, len(operation_candidates)))
-            candidate = operation_candidates[candidate_index]
-            score_index = next(
-                index
-                for index, option in enumerate(legal_candidates)
-                if option.action.candidate_id == candidate.action.candidate_id
+            operation_options = candidates_by_operation[selected_operation]
+            selected_index, candidate = max(
+                operation_options,
+                key=lambda pair: candidate_values[pair[0]],
             )
-            return ActionSelection(
-                candidate,
-                float(scores[score_index]),
-                True,
-                chance,
-                candidate_counts,
-                q_statistics,
-            )
-        index = int(np.argmax(scores))
+        category_q = category_values[selected_operation]
+        candidate_q = float(candidate_values[selected_index])
         return ActionSelection(
-            legal_candidates[index],
-            float(scores[index]),
-            False,
-            chance,
-            candidate_counts,
-            q_statistics,
+            candidate=candidate,
+            q_value=category_q + candidate_q,
+            category_q_value=category_q,
+            candidate_q_value=candidate_q,
+            explored=explored,
+            epsilon=chance,
+            candidate_counts_by_operation=candidate_counts,
+            q_statistics_by_operation=q_statistics,
+            q_values_by_action_category={
+                operation: (
+                    category_values[operation]
+                    if candidates_by_operation[operation]
+                    else None
+                )
+                for operation in OPERATIONS
+            },
         )
 
-    def compute_td_target(self, transition: ReplayTransition) -> torch.Tensor:
-        """按 Double DQN 规则计算一个转移的 TD 目标。"""
-
-        reward = torch.tensor(float(transition.reward), dtype=torch.float32, device=self.device)
+    def _next_action_target(
+        self,
+        transition: ReplayTransition,
+        candidate_rebuilder: CandidateRebuilder | None,
+    ) -> tuple[torch.Tensor, str, str]:
         if transition.terminated:
-            return reward
-        if transition.next_state_features is None or not transition.next_legal_candidates:
-            raise ValueError("非终止转移缺少匹配的下一状态候选")
-        state = torch.as_tensor(
-            np.asarray(transition.next_state_features, dtype=np.float32)[None, :],
+            return (
+                torch.tensor(
+                    float(transition.reward), dtype=torch.float32, device=self.device
+                ),
+                "TERMINAL",
+                "",
+            )
+        if transition.next_state_features is None:
+            raise ValueError("非终止转移缺少下一状态")
+        candidates = transition.materialize_next_candidates(candidate_rebuilder)
+        if not candidates:
+            raise ValueError("非终止转移缺少重建后的合法下一状态候选")
+        candidates_by_operation: dict[str, list[CandidateOption]] = {
+            operation: [] for operation in OPERATIONS
+        }
+        for candidate in candidates:
+            if candidate.action.operation not in candidates_by_operation:
+                raise ValueError("回放重建出未知的下一动作类别")
+            candidates_by_operation[candidate.action.operation].append(candidate)
+        if not candidates_by_operation["KEEP_STAY"]:
+            raise ValueError("重建的下一状态候选缺少 KEEP_STAY")
+        state = np.asarray(transition.next_state_features, dtype=np.float32)
+        available = tuple(
+            operation for operation in OPERATIONS if candidates_by_operation[operation]
+        )
+        online_category = self.score_action_categories(state)
+        selected_operation = max(available, key=lambda operation: online_category[operation])
+        category_candidates = candidates_by_operation[selected_operation]
+        online_candidate = self.score_candidates(state, category_candidates)
+        selected_index = int(np.argmax(online_candidate))
+        selected_candidate = category_candidates[selected_index]
+        state_tensor = torch.as_tensor(
+            state[None, :], dtype=torch.float32, device=self.device
+        )
+        candidate_tensor = torch.as_tensor(
+            np.asarray(selected_candidate.features, dtype=np.float32)[None, :],
             dtype=torch.float32,
             device=self.device,
         )
-        candidate_features = transition.next_candidate_feature_matrix()
-        candidates = torch.as_tensor(
-            candidate_features,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        states = state.expand(len(transition.next_legal_candidates), -1)
+        category_index = OPERATIONS.index(selected_operation)
         with torch.no_grad():
-            online_values = self.online_network(states, candidates)
-            selected_index = int(torch.argmax(online_values).item())
-            target_value = self.target_network(
-                state,
-                candidates[selected_index : selected_index + 1],
+            target_category = self.target_category_network(state_tensor)[
+                0, category_index
+            ]
+            target_candidate = self.target_network(
+                state_tensor, candidate_tensor
             ).squeeze(0)
             discount = self.gamma ** int(transition.duration_slots)
-            return reward + float(discount) * target_value
+            target = torch.tensor(
+                float(transition.reward), dtype=torch.float32, device=self.device
+            ) + float(discount) * (target_category + target_candidate)
+        if not torch.isfinite(target):
+            raise FloatingPointError("Double DQN 两阶段 TD 目标包含非有限值")
+        return target, selected_operation, selected_candidate.action.candidate_id
 
-    def update(self, transitions: Sequence[ReplayTransition]) -> dict[str, float]:
-        """执行一次 Huber TD 更新、梯度裁剪和目标网同步。"""
+    def compute_td_target(
+        self,
+        transition: ReplayTransition,
+        *,
+        candidate_rebuilder: CandidateRebuilder | None = None,
+    ) -> torch.Tensor:
+        """在线类别头与候选头顺序选动作，目标网络估计该动作的价值。"""
 
+        return self._next_action_target(transition, candidate_rebuilder)[0]
+
+    def update(
+        self,
+        transitions: Sequence[ReplayTransition],
+        *,
+        candidate_rebuilder: CandidateRebuilder | None = None,
+    ) -> dict[str, Any]:
         if not transitions:
             raise ValueError("更新批次不能为空")
         states = np.asarray([item.state_features for item in transitions], dtype=np.float32)
@@ -276,44 +411,86 @@ class DoubleDQNAgent:
             raise ValueError("经验状态特征维度不匹配")
         if actions.shape != (len(transitions), self.candidate_dim):
             raise ValueError("经验动作特征维度不匹配")
+        action_categories = np.asarray(
+            [OPERATIONS.index(item.action.operation) for item in transitions],
+            dtype=np.int64,
+        )
         state_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.device)
         action_tensor = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
-        targets = torch.stack([self.compute_td_target(item) for item in transitions]).detach()
-        old_values = self.online_network(state_tensor, action_tensor)
-        loss = F.smooth_l1_loss(old_values, targets)
+        category_tensor = torch.as_tensor(
+            action_categories, dtype=torch.long, device=self.device
+        )
+        target_details = [
+            self._next_action_target(item, candidate_rebuilder)
+            for item in transitions
+        ]
+        targets = torch.stack([item[0] for item in target_details]).detach()
+        category_matrix = self.online_category_network(state_tensor)
+        chosen_category_values = category_matrix.gather(
+            1, category_tensor[:, None]
+        ).squeeze(1)
+        chosen_candidate_values = self.online_network(state_tensor, action_tensor)
+        candidate_advantage_targets = targets - chosen_category_values.detach()
+        category_loss = F.smooth_l1_loss(chosen_category_values, targets)
+        candidate_loss = F.smooth_l1_loss(
+            chosen_candidate_values, candidate_advantage_targets
+        )
+        loss = category_loss + candidate_loss
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         gradient_norm = torch.nn.utils.clip_grad_norm_(
-            self.online_network.parameters(), self.max_grad_norm
+            [
+                *self.online_network.parameters(),
+                *self.online_category_network.parameters(),
+            ],
+            self.max_grad_norm,
         )
         self.optimizer.step()
         self.gradient_steps += 1
         synced = self.gradient_steps % self.target_network_frequency == 0
         if synced:
             self._update_target_network()
+        combined_values = chosen_category_values.detach() + chosen_candidate_values.detach()
         return {
             "td_loss": float(loss.detach().cpu()),
-            "q_value_mean": float(old_values.detach().mean().cpu()),
+            "category_td_loss": float(category_loss.detach().cpu()),
+            "candidate_advantage_loss": float(candidate_loss.detach().cpu()),
+            "q_value_mean": float(combined_values.mean().cpu()),
+            "category_q_value_mean": float(chosen_category_values.detach().mean().cpu()),
+            "candidate_q_value_mean": float(chosen_candidate_values.detach().mean().cpu()),
             "td_target_mean": float(targets.mean().cpu()),
             "gradient_norm_before_clip": float(gradient_norm.detach().cpu()),
             "gradient_step": float(self.gradient_steps),
             "target_network_synced": float(synced),
+            "bootstrap_category_selection": [item[1] for item in target_details],
+            "bootstrap_candidate_selection": [item[2] for item in target_details],
         }
 
     def _update_target_network(self) -> None:
         with torch.no_grad():
             for target_parameter, online_parameter in zip(
-                self.target_network.parameters(), self.online_network.parameters(), strict=True
+                self.target_network.parameters(),
+                self.online_network.parameters(),
+                strict=True,
+            ):
+                target_parameter.lerp_(online_parameter, self.target_tau)
+            for target_parameter, online_parameter in zip(
+                self.target_category_network.parameters(),
+                self.online_category_network.parameters(),
+                strict=True,
             ):
                 target_parameter.lerp_(online_parameter, self.target_tau)
 
     def state_dict(self) -> dict[str, Any]:
         return {
+            "agent_state_schema_version": 2,
             "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
             "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
             "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
             "state_dim": self.state_dim,
             "candidate_dim": self.candidate_dim,
+            "learning_rate": self.learning_rate,
+            "optimizer_type": type(self.optimizer).__name__,
             "gamma": self.gamma,
             "target_network_frequency": self.target_network_frequency,
             "target_tau": self.target_tau,
@@ -329,10 +506,14 @@ class DoubleDQNAgent:
             ),
             "online_network": self.online_network.state_dict(),
             "target_network": self.target_network.state_dict(),
+            "online_category_network": self.online_category_network.state_dict(),
+            "target_category_network": self.target_category_network.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state.get("agent_state_schema_version", -1)) != 2:
+            raise ValueError("旧版单阶段 DQN Checkpoint，缺少双头网络合同，拒绝恢复")
         expected_contract = {
             "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
             "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
@@ -354,10 +535,29 @@ class DoubleDQNAgent:
                 "Checkpoint 的 DQN 特征/网络合同与当前输入不兼容，拒绝恢复："
                 + "; ".join(mismatched)
             )
-        if int(state["state_dim"]) != self.state_dim or int(state["candidate_dim"]) != self.candidate_dim:
-            raise ValueError("模型状态维度与当前候选条件化网络不一致，拒绝补零或截断恢复")
-        self.online_network.load_state_dict(state["online_network"])
-        self.target_network.load_state_dict(state["target_network"])
+        if (
+            int(state["state_dim"]) != self.state_dim
+            or int(state["candidate_dim"]) != self.candidate_dim
+        ):
+            raise ValueError("模型状态维度与当前两阶段网络不一致，拒绝恢复")
+        if float(state.get("learning_rate", float("nan"))) != self.learning_rate:
+            raise ValueError("Checkpoint 学习率与当前实验不一致，拒绝恢复")
+        if state.get("optimizer_type") != type(self.optimizer).__name__:
+            raise ValueError("Checkpoint 优化器类型与当前实验不一致，拒绝恢复")
+        required = (
+            "online_category_network",
+            "target_category_network",
+        )
+        if any(name not in state for name in required):
+            raise ValueError("Checkpoint 缺少动作类别网络参数，拒绝恢复")
+        self.online_network.load_state_dict(state["online_network"], strict=True)
+        self.target_network.load_state_dict(state["target_network"], strict=True)
+        self.online_category_network.load_state_dict(
+            state["online_category_network"], strict=True
+        )
+        self.target_category_network.load_state_dict(
+            state["target_category_network"], strict=True
+        )
         self.optimizer.load_state_dict(state["optimizer"])
         self.gradient_steps = int(state["gradient_steps"])
         if "agent_rng_state" in state:
@@ -393,6 +593,7 @@ def linear_epsilon_schedule(
 
 __all__ = [
     "CandidateQNetwork",
+    "ActionCategoryQNetwork",
     "ActionSelection",
     "DoubleDQNAgent",
     "linear_epsilon_schedule",

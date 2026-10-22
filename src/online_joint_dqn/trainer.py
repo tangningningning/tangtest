@@ -16,14 +16,18 @@ from .replay_buffer import ReplayBuffer
 
 
 def _summarize_update_metrics(
-    update_rows: list[dict[str, float]],
+    update_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """汇总可用的数值指标，并显式保留缺项和非有限值数量。"""
 
     metric_names = (
         "td_loss",
+        "category_td_loss",
+        "candidate_advantage_loss",
         "gradient_norm_before_clip",
         "q_value_mean",
+        "category_q_value_mean",
+        "candidate_q_value_mean",
         "td_target_mean",
     )
     summary: dict[str, Any] = {"update_count": len(update_rows)}
@@ -89,6 +93,71 @@ def _summarize_step_durations(step_rows: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def _numeric_summary(values: list[Any]) -> dict[str, Any]:
+    recorded: list[float] = []
+    missing_count = 0
+    nonfinite_count = 0
+    for raw in values:
+        if raw is None:
+            missing_count += 1
+            continue
+        value = float(raw)
+        if not math.isfinite(value):
+            nonfinite_count += 1
+            continue
+        recorded.append(value)
+    return {
+        "count": len(recorded),
+        "missing_count": missing_count,
+        "nonfinite_count": nonfinite_count,
+        "mean": float(np.mean(recorded)) if recorded else None,
+        "std": float(np.std(recorded)) if recorded else None,
+        "min": min(recorded) if recorded else None,
+        "max": max(recorded) if recorded else None,
+    }
+
+
+def _aggregate_candidate_q_statistics(
+    step_rows: list[dict[str, Any]], operation_names: tuple[str, ...]
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for operation in operation_names:
+        count = 0
+        sum_values = 0.0
+        sum_squares = 0.0
+        missing_states = 0
+        minima: list[float] = []
+        maxima: list[float] = []
+        for row in step_rows:
+            stats = row.get("candidate_q_statistics_by_operation", {}).get(operation)
+            if not isinstance(stats, Mapping) or not int(stats.get("count", 0)):
+                missing_states += 1
+                continue
+            state_count = int(stats["count"])
+            mean = float(stats["mean"])
+            std = float(stats["std"])
+            count += state_count
+            sum_values += state_count * mean
+            sum_squares += state_count * (std * std + mean * mean)
+            minima.append(float(stats["min"]))
+            maxima.append(float(stats["max"]))
+        mean_value = sum_values / count if count else None
+        variance = (
+            max(0.0, sum_squares / count - mean_value * mean_value)
+            if count and mean_value is not None
+            else None
+        )
+        result[operation] = {
+            "candidate_state_count": count,
+            "state_count_without_candidates": missing_states,
+            "mean": mean_value,
+            "std": math.sqrt(variance) if variance is not None else None,
+            "min": min(minima) if minima else None,
+            "max": max(maxima) if maxima else None,
+        }
+    return result
+
+
 @dataclass(frozen=True)
 class TrainerConfig:
     """单独于正式 MAPPO 配置的 DQN 训练控制项。"""
@@ -123,7 +192,7 @@ def train_episode(
     config: TrainerConfig | None = None,
     global_step_start: int = 0,
     on_step: Callable[[dict[str, Any]], None] | None = None,
-    on_update: Callable[[dict[str, float]], None] | None = None,
+    on_update: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """在一个真实 Episode 窗口中采集实际奖励并按回放批次更新。"""
 
@@ -139,7 +208,7 @@ def train_episode(
     exploration_counts = {operation: 0 for operation in operation_names}
     greedy_selection_counts = {operation: 0 for operation in operation_names}
     execution_counts = {operation: 0 for operation in operation_names}
-    update_rows: list[dict[str, float]] = []
+    update_rows: list[dict[str, Any]] = []
     step_rows: list[dict[str, Any]] = []
     while environment.can_act:
         step_started = time.perf_counter()
@@ -268,6 +337,9 @@ def train_episode(
             next_state_features=transition.next_state_features,
             next_state_fingerprint=transition.next_state_fingerprint,
             next_legal_candidates=transition.next_legal_candidates,
+            next_candidate_rebuild_context=(
+                transition.next_candidate_rebuild_context
+            ),
             terminated=transition.terminated,
             duration_slots=transition.duration_slots,
         )
@@ -286,6 +358,8 @@ def train_episode(
                 "slot_id": int(transition.diagnostics["slot_id"]),
                 "operation": transition.operation,
                 "candidate_id": transition.candidate_id,
+                "selected_action_type": transition.operation,
+                "selected_candidate_id": transition.candidate_id,
                 "state_fingerprint": selected.candidate.action.source_state_fingerprint,
                 "next_state_fingerprint": transition.next_state_fingerprint,
                 "next_candidate_counts_by_operation": next_candidate_counts,
@@ -297,10 +371,18 @@ def train_episode(
                 "candidate_counts_by_operation": candidate_counts,
                 "candidate_q_statistics_by_operation": selected.q_statistics_by_operation,
                 "selected_q_value": selected.q_value,
+                "selected_category_q": selected.category_q_value,
+                "selected_candidate_q": selected.candidate_q_value,
+                "q_values_by_action_category": dict(
+                    selected.q_values_by_action_category
+                ),
                 "selected_candidate_action": selected.candidate.action.to_dict(),
                 "explored": bool(selected.explored),
                 "selection_mode": "exploration" if selected.explored else "greedy",
                 "cache_state_changed": cache_state_changed,
+                "actual_state_changed": bool(
+                    cache_state_changed or uav_state_changed
+                ),
                 "cache_changed_node_ids": changed_node_ids,
                 "cache_changed_node_count": len(changed_node_ids),
                 "cache_changes_by_node": cache_changes_by_node,
@@ -335,6 +417,54 @@ def train_episode(
                 ),
                 "actual_execution_node_data_available": transition.diagnostics.get(
                     "actual_execution_node_data_available", False
+                ),
+                "actual_system_utility": transition.diagnostics.get(
+                    "actual_system_utility", transition.reward
+                ),
+                "actual_task_utility": transition.diagnostics.get(
+                    "actual_task_utility"
+                ),
+                "actual_task_count": transition.diagnostics.get(
+                    "actual_task_count"
+                ),
+                "actual_matching_node_task_counts": transition.diagnostics.get(
+                    "actual_matching_node_task_counts"
+                ),
+                "per_task_delay_s": transition.diagnostics.get(
+                    "per_task_delay_s"
+                ),
+                "per_task_vehicle_energy_j": transition.diagnostics.get(
+                    "per_task_vehicle_energy_j"
+                ),
+                "per_task_utility": transition.diagnostics.get(
+                    "per_task_utility"
+                ),
+                "actual_total_task_delay_s": transition.diagnostics.get(
+                    "actual_total_task_delay_s"
+                ),
+                "actual_total_vehicle_energy_j": transition.diagnostics.get(
+                    "actual_total_vehicle_energy_j"
+                ),
+                "cache_download_delay_s": transition.diagnostics.get(
+                    "cache_download_delay_s"
+                ),
+                "uav_movement_energy_j": transition.diagnostics.get(
+                    "uav_movement_energy_j"
+                ),
+                "predicted_cache_coverage_before": transition.diagnostics.get(
+                    "predicted_cache_coverage_before"
+                ),
+                "predicted_cache_coverage_after": transition.diagnostics.get(
+                    "predicted_cache_coverage_after"
+                ),
+                "predicted_cache_coverage_delta": transition.diagnostics.get(
+                    "predicted_cache_coverage_delta"
+                ),
+                "predicted_cache_coverage_metric": transition.diagnostics.get(
+                    "predicted_cache_coverage_metric"
+                ),
+                "predicted_cache_coverage_error": transition.diagnostics.get(
+                    "predicted_cache_coverage_error"
                 ),
                 "executor_performance_profile": transition.diagnostics.get(
                     "executor_performance_profile", {}
@@ -401,7 +531,10 @@ def train_episode(
             and global_step % int(settings.train_frequency) == 0
         ):
             for _ in range(int(settings.gradient_updates_per_step)):
-                update = agent.update(replay_buffer.sample(int(settings.batch_size)))
+                update = agent.update(
+                    replay_buffer.sample(int(settings.batch_size)),
+                    candidate_rebuilder=environment.rebuild_candidates,
+                )
                 update.update(
                     {
                         "global_step": global_step,
@@ -416,8 +549,12 @@ def train_episode(
                     not math.isfinite(float(update[name]))
                     for name in (
                         "td_loss",
+                        "category_td_loss",
+                        "candidate_advantage_loss",
                         "gradient_norm_before_clip",
                         "q_value_mean",
+                        "category_q_value_mean",
+                        "candidate_q_value_mean",
                         "td_target_mean",
                     )
                 ):
@@ -524,6 +661,64 @@ def train_episode(
     actual_uav_total_distance = sum(
         float(row["uav_total_distance"]) for row in step_rows
     )
+    actual_state_change_counts_by_operation = {
+        "KEEP_STAY": sum(
+            row["operation"] == "KEEP_STAY" and not row["actual_state_changed"]
+            for row in step_rows
+        ),
+        "CACHE_UPDATE": sum(
+            row["operation"] == "CACHE_UPDATE" and row["cache_state_changed"]
+            for row in step_rows
+        ),
+        "UAV_MOVE": sum(
+            row["operation"] == "UAV_MOVE" and row["uav_state_changed"]
+            for row in step_rows
+        ),
+    }
+    category_q_statistics: dict[str, dict[str, Any]] = {}
+    candidate_q_statistics: dict[str, dict[str, Any]] = {}
+    candidate_count_statistics: dict[str, dict[str, Any]] = {}
+    for operation in operation_names:
+        category_q_statistics[operation] = _numeric_summary(
+            [
+                row.get("q_values_by_action_category", {}).get(operation)
+                for row in step_rows
+            ]
+        )
+        candidate_q_statistics[operation] = _numeric_summary(
+            [
+                row.get("selected_candidate_q")
+                if row.get("selected_action_type") == operation
+                else None
+                for row in step_rows
+            ]
+        )
+        candidate_count_statistics[operation] = _numeric_summary(
+            [
+                row.get("candidate_counts_by_operation", {}).get(operation)
+                for row in step_rows
+            ]
+        )
+    candidate_population_q_statistics = _aggregate_candidate_q_statistics(
+        step_rows, operation_names
+    )
+    cache_update_action_rows = [
+        row for row in step_rows if row["selected_action_type"] == "CACHE_UPDATE"
+    ]
+    cache_changed_rows = [row for row in step_rows if row["cache_state_changed"]]
+    cache_unchanged_rows = [row for row in step_rows if not row["cache_state_changed"]]
+    predicted_coverage_delta_by_cache_action = _numeric_summary(
+        [row.get("predicted_cache_coverage_delta") for row in cache_update_action_rows]
+    )
+    cache_update_actual_utility = _numeric_summary(
+        [row.get("actual_system_utility") for row in cache_update_action_rows]
+    )
+    cache_changed_actual_utility = _numeric_summary(
+        [row.get("actual_system_utility") for row in cache_changed_rows]
+    )
+    cache_unchanged_actual_utility = _numeric_summary(
+        [row.get("actual_system_utility") for row in cache_unchanged_rows]
+    )
     episode_summary = {
         "cumulative_system_utility": float(episode_reward),
         "mean_system_utility_per_slot": (
@@ -532,6 +727,15 @@ def train_episode(
         "cache_update_count": actual_cache_update_count,
         "actual_cache_update_count": actual_cache_update_count,
         "cache_update_action_count": execution_counts["CACHE_UPDATE"],
+        "cache_update_action_selected_q_statistics": _numeric_summary(
+            [row["selected_q_value"] for row in cache_update_action_rows]
+        ),
+        "cache_update_action_category_q_statistics": _numeric_summary(
+            [row["selected_category_q"] for row in cache_update_action_rows]
+        ),
+        "cache_update_action_candidate_q_statistics": _numeric_summary(
+            [row["selected_candidate_q"] for row in cache_update_action_rows]
+        ),
         "cache_changed_slot_count": actual_cache_update_count,
         "actual_cache_changed_slot_count": actual_cache_update_count,
         "cache_changed_node_count": cache_changed_node_count,
@@ -576,6 +780,31 @@ def train_episode(
         "cache_update_cost_recorded_slot_count": len(cache_cost_values),
         "cache_update_cost_unavailable_slot_count": slot_count - len(cache_cost_values),
         "cache_download_cost": sum(cache_cost_values) if cache_cost_complete else None,
+        "predicted_cache_coverage_delta_by_cache_update_action": (
+            predicted_coverage_delta_by_cache_action
+        ),
+        "predicted_cache_coverage_metric_is_not_actual_hit_rate": True,
+        "cache_update_action_actual_system_utility": cache_update_actual_utility,
+        "cache_changed_actual_system_utility": cache_changed_actual_utility,
+        "cache_unchanged_actual_system_utility": cache_unchanged_actual_utility,
+        "cache_update_action_total_task_delay_s": _numeric_summary(
+            [row.get("actual_total_task_delay_s") for row in cache_update_action_rows]
+        ),
+        "cache_update_action_total_vehicle_energy_j": _numeric_summary(
+            [row.get("actual_total_vehicle_energy_j") for row in cache_update_action_rows]
+        ),
+        "cache_update_action_cache_download_delay_s": _numeric_summary(
+            [row.get("cache_download_delay_s") for row in cache_update_action_rows]
+        ),
+        "actual_state_change_counts_by_operation": (
+            actual_state_change_counts_by_operation
+        ),
+        "q_values_by_action_category_statistics": category_q_statistics,
+        "candidate_q_population_statistics_by_operation": (
+            candidate_population_q_statistics
+        ),
+        "selected_candidate_q_statistics_by_operation": candidate_q_statistics,
+        "candidate_count_statistics_by_operation": candidate_count_statistics,
         "uav_move_count": uav_movement_slot_count,
         "uav_move_action_count": execution_counts["UAV_MOVE"],
         "uav_movement_slot_count": uav_movement_slot_count,
