@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+
+import numpy as np
 
 from .agent import DoubleDQNAgent, linear_epsilon_schedule
 from .environment_adapter import ExclusiveDQNEnvironment
@@ -172,7 +175,6 @@ def train_episode(
         previous_uav = {
             key: value.copy() for key, value in environment.uav_positions.items()
         }
-        action_cache = selected.candidate.action.cache_array()
         action_uav = selected.candidate.action.uav_dict()
         service_ids = tuple(
             int(value) for value in environment.model.service_catalog["service_ids"]
@@ -180,37 +182,84 @@ def train_episode(
         node_ids = tuple(
             str(value) for value in environment.model.cache_nodes["node_ids"]
         )
-        cache_changes_by_node = {}
-        for node_index, node_id in enumerate(node_ids):
-            removed_services = [
-                service_ids[index]
-                for index in range(len(service_ids))
-                if previous_cache[node_index, index] and not action_cache[node_index, index]
-            ]
-            added_services = [
-                service_ids[index]
-                for index in range(len(service_ids))
-                if action_cache[node_index, index] and not previous_cache[node_index, index]
-            ]
-            if removed_services or added_services:
-                cache_changes_by_node[node_id] = {
-                    "removed_service_ids": removed_services,
-                    "added_service_ids": added_services,
-                }
-        cache_removed = int((previous_cache > action_cache).sum())
-        cache_added = int((action_cache > previous_cache).sum())
-        uav_move_distances = {
-            key: float(
-                math.dist(previous_uav[key].tolist(), action_uav[key].tolist())
-            )
-            for key in previous_uav
-        }
         transition = environment.step(selected.candidate)
         if (
             transition.candidate_id != selected.candidate.action.candidate_id
             or transition.operation != selected_operation
         ):
             raise RuntimeError("实际执行转移与选择的合法候选不一致")
+        actual_cache = np.asarray(transition.final_cache_state, dtype=np.int8)
+        cache_changes_by_node: dict[str, dict[str, list[int]]] = {}
+        cache_services_added: dict[str, list[int]] = {}
+        cache_services_removed: dict[str, list[int]] = {}
+        changed_node_ids: list[str] = []
+        for node_index, node_id in enumerate(node_ids):
+            removed_services = [
+                service_ids[index]
+                for index in range(len(service_ids))
+                if previous_cache[node_index, index] and not actual_cache[node_index, index]
+            ]
+            added_services = [
+                service_ids[index]
+                for index in range(len(service_ids))
+                if actual_cache[node_index, index] and not previous_cache[node_index, index]
+            ]
+            if removed_services or added_services:
+                changed_node_ids.append(node_id)
+                cache_services_removed[node_id] = removed_services
+                cache_services_added[node_id] = added_services
+                cache_changes_by_node[node_id] = {
+                    "removed_service_ids": removed_services,
+                    "added_service_ids": added_services,
+                }
+        cache_removed = sum(len(values) for values in cache_services_removed.values())
+        cache_added = sum(len(values) for values in cache_services_added.values())
+        cache_state_changed = not np.array_equal(previous_cache, actual_cache)
+
+        actual_uav_positions = transition.final_uav_positions
+        uav_movement_details: dict[str, dict[str, Any]] = {}
+        uav_move_distances: dict[str, float] = {}
+        for uav_id in previous_uav:
+            before = np.asarray(previous_uav[uav_id], dtype=np.float64)
+            after = np.asarray(actual_uav_positions[uav_id], dtype=np.float64)
+            distance = float(math.dist(before.tolist(), after.tolist()))
+            moved = not np.array_equal(before, after)
+            uav_move_distances[uav_id] = distance
+            uav_movement_details[uav_id] = {
+                "from_position_m": before.tolist(),
+                "to_position_m": after.tolist(),
+                "distance_m": distance,
+                "state_changed": moved,
+            }
+        uav_moved_count = sum(
+            bool(details["state_changed"])
+            for details in uav_movement_details.values()
+        )
+        uav_state_changed = uav_moved_count > 0
+        uav_total_distance = sum(uav_move_distances.values())
+
+        cache_cost_available = bool(
+            transition.diagnostics.get("cache_update_cost_available", False)
+        )
+        cache_update_cost = transition.diagnostics.get("cache_cost")
+        if cache_cost_available and cache_update_cost is not None:
+            cache_update_cost = float(cache_update_cost)
+            if not math.isfinite(cache_update_cost):
+                raise FloatingPointError("正式执行器返回了非有限缓存更新成本")
+        else:
+            cache_update_cost = None
+            cache_cost_available = False
+        movement_cost_available = bool(
+            transition.diagnostics.get("uav_movement_cost_available", False)
+        )
+        uav_movement_cost = transition.diagnostics.get("movement_cost")
+        if movement_cost_available and uav_movement_cost is not None:
+            uav_movement_cost = float(uav_movement_cost)
+            if not math.isfinite(uav_movement_cost):
+                raise FloatingPointError("正式执行器返回了非有限 UAV 移动成本")
+        else:
+            uav_movement_cost = None
+            movement_cost_available = False
         replay_buffer.add(
             state_features=state,
             action=selected.candidate.action,
@@ -251,22 +300,42 @@ def train_episode(
                 "selected_candidate_action": selected.candidate.action.to_dict(),
                 "explored": bool(selected.explored),
                 "selection_mode": "exploration" if selected.explored else "greedy",
-                "cache_changed_node_ids": list(selected.candidate.action.changed_node_ids),
+                "cache_state_changed": cache_state_changed,
+                "cache_changed_node_ids": changed_node_ids,
+                "cache_changed_node_count": len(changed_node_ids),
                 "cache_changes_by_node": cache_changes_by_node,
-                "cache_services_removed": cache_removed,
-                "cache_services_added": cache_added,
+                "cache_services_added": cache_services_added,
+                "cache_services_removed": cache_services_removed,
+                "cache_services_added_count": cache_added,
+                "cache_services_removed_count": cache_removed,
                 "cache_service_replacements": min(cache_removed, cache_added),
                 "uav_move_distances_m": uav_move_distances,
+                "uav_state_changed": uav_state_changed,
+                "uav_movement_details": uav_movement_details,
+                "uav_moved_count": uav_moved_count,
+                "uav_total_distance": uav_total_distance,
                 "selected_target_uav_positions": {
                     key: value.tolist() for key, value in action_uav.items()
                 },
-                "uav_total_move_distance_m": sum(uav_move_distances.values()),
-                "cache_download_cost": float(transition.diagnostics["cache_cost"]),
-                "uav_movement_cost": float(transition.diagnostics["movement_cost"]),
+                "uav_total_move_distance_m": uav_total_distance,
+                "cache_update_cost": cache_update_cost,
+                "cache_update_cost_available": cache_cost_available,
+                "cache_download_cost": cache_update_cost,
+                "uav_movement_cost": uav_movement_cost,
+                "uav_movement_cost_available": movement_cost_available,
                 "decision_wall_time_s": 0.0,
                 "executor_calls": transition.executor_calls,
                 "matching_calls": transition.matching_calls,
                 "kkt_solver_calls": transition.kkt_solver_calls,
+                "actual_execution_node_counts": transition.diagnostics.get(
+                    "actual_execution_node_counts"
+                ),
+                "actual_execution_nodes": transition.diagnostics.get(
+                    "actual_execution_nodes"
+                ),
+                "actual_execution_node_data_available": transition.diagnostics.get(
+                    "actual_execution_node_data_available", False
+                ),
                 "executor_performance_profile": transition.diagnostics.get(
                     "executor_performance_profile", {}
                 ),
@@ -380,40 +449,168 @@ def train_episode(
     update_summary = _summarize_update_metrics(update_rows)
     duration_summary = _summarize_step_durations(step_rows)
     slot_count = len(step_rows)
+    execution_node_counts: Counter[str] = Counter()
+    execution_node_data_available_slots = 0
+    for row in step_rows:
+        counts = row.get("actual_execution_node_counts")
+        if (
+            row.get("actual_execution_node_data_available") is True
+            and isinstance(counts, Mapping)
+        ):
+            execution_node_data_available_slots += 1
+            for node_id, count in counts.items():
+                execution_node_counts[str(node_id)] += int(count)
+    execution_node_total = sum(execution_node_counts.values())
+    execution_node_data_available = (
+        slot_count > 0 and execution_node_data_available_slots == slot_count
+    )
+    execution_node_shares = {
+        node_id: count / execution_node_total
+        for node_id, count in sorted(execution_node_counts.items())
+    } if execution_node_total else {}
+    most_common_execution_node = (
+        min(
+            execution_node_counts,
+            key=lambda node_id: (-execution_node_counts[node_id], node_id),
+        )
+        if execution_node_data_available and execution_node_total
+        else None
+    )
+    cache_node_update_slot_counts: Counter[str] = Counter()
+    cache_services_added_by_service: Counter[str] = Counter()
+    cache_services_removed_by_service: Counter[str] = Counter()
+    cache_services_added_by_node: Counter[str] = Counter()
+    cache_services_removed_by_node: Counter[str] = Counter()
+    uav_distance_by_uav: Counter[str] = Counter()
+    for row in step_rows:
+        for node_id in row["cache_changed_node_ids"]:
+            cache_node_update_slot_counts[str(node_id)] += 1
+        for node_id, service_values in row["cache_services_added"].items():
+            cache_services_added_by_node[str(node_id)] += len(service_values)
+            cache_services_added_by_service.update(
+                str(service_id) for service_id in service_values
+            )
+        for node_id, service_values in row["cache_services_removed"].items():
+            cache_services_removed_by_node[str(node_id)] += len(service_values)
+            cache_services_removed_by_service.update(
+                str(service_id) for service_id in service_values
+            )
+        for uav_id, distance in row["uav_move_distances_m"].items():
+            uav_distance_by_uav[str(uav_id)] += float(distance)
+    actual_cache_update_count = sum(
+        bool(row["cache_state_changed"]) for row in step_rows
+    )
+    cache_changed_node_count = sum(
+        int(row["cache_changed_node_count"]) for row in step_rows
+    )
+    uav_movement_count = sum(int(row["uav_moved_count"]) for row in step_rows)
+    uav_movement_slot_count = sum(
+        bool(row["uav_state_changed"]) for row in step_rows
+    )
+    cache_cost_values = [
+        float(row["cache_update_cost"])
+        for row in step_rows
+        if row["cache_update_cost_available"]
+    ]
+    uav_cost_values = [
+        float(row["uav_movement_cost"])
+        for row in step_rows
+        if row["uav_movement_cost_available"]
+    ]
+    cache_cost_complete = bool(slot_count) and len(cache_cost_values) == slot_count
+    uav_cost_complete = bool(slot_count) and len(uav_cost_values) == slot_count
+    cache_cost_known_subtotal = sum(cache_cost_values) if cache_cost_values else None
+    uav_cost_known_subtotal = sum(uav_cost_values) if uav_cost_values else None
+    actual_uav_total_distance = sum(
+        float(row["uav_total_distance"]) for row in step_rows
+    )
     episode_summary = {
         "cumulative_system_utility": float(episode_reward),
         "mean_system_utility_per_slot": (
             float(episode_reward) / slot_count if slot_count else None
         ),
-        "cache_update_count": execution_counts["CACHE_UPDATE"],
-        "cache_changed_node_count": sum(
-            len(row["cache_changed_node_ids"]) for row in step_rows
+        "cache_update_count": actual_cache_update_count,
+        "actual_cache_update_count": actual_cache_update_count,
+        "cache_update_action_count": execution_counts["CACHE_UPDATE"],
+        "cache_changed_slot_count": actual_cache_update_count,
+        "actual_cache_changed_slot_count": actual_cache_update_count,
+        "cache_changed_node_count": cache_changed_node_count,
+        "actual_cache_changed_node_count": cache_changed_node_count,
+        "cache_unique_changed_node_count": len(cache_node_update_slot_counts),
+        "cache_node_update_slot_counts": dict(
+            sorted(cache_node_update_slot_counts.items())
         ),
+        "cache_node_update_slot_shares": {
+            node_id: count / slot_count
+            for node_id, count in sorted(cache_node_update_slot_counts.items())
+        } if slot_count else {},
         "cache_service_replacement_count": sum(
             int(row["cache_service_replacements"]) for row in step_rows
         ),
         "cache_services_removed": sum(
-            int(row["cache_services_removed"]) for row in step_rows
+            int(row["cache_services_removed_count"]) for row in step_rows
         ),
         "cache_services_added": sum(
-            int(row["cache_services_added"]) for row in step_rows
+            int(row["cache_services_added_count"]) for row in step_rows
         ),
-        "uav_move_count": execution_counts["UAV_MOVE"],
-        "uav_total_move_distance_m": sum(
-            float(row["uav_total_move_distance_m"]) for row in step_rows
+        "actual_cache_services_added_count": sum(
+            int(row["cache_services_added_count"]) for row in step_rows
         ),
-        "cache_download_cost": sum(
-            float(row["cache_download_cost"]) for row in step_rows
+        "actual_cache_services_removed_count": sum(
+            int(row["cache_services_removed_count"]) for row in step_rows
         ),
-        "uav_movement_cost": sum(
-            float(row["uav_movement_cost"]) for row in step_rows
+        "cache_services_added_by_node": dict(
+            sorted(cache_services_added_by_node.items())
         ),
+        "cache_services_removed_by_node": dict(
+            sorted(cache_services_removed_by_node.items())
+        ),
+        "cache_services_added_by_service": dict(
+            sorted(cache_services_added_by_service.items())
+        ),
+        "cache_services_removed_by_service": dict(
+            sorted(cache_services_removed_by_service.items())
+        ),
+        "cache_update_cost": sum(cache_cost_values) if cache_cost_complete else None,
+        "cache_update_cost_known_subtotal": cache_cost_known_subtotal,
+        "cache_update_cost_recorded_slot_count": len(cache_cost_values),
+        "cache_update_cost_unavailable_slot_count": slot_count - len(cache_cost_values),
+        "cache_download_cost": sum(cache_cost_values) if cache_cost_complete else None,
+        "uav_move_count": uav_movement_slot_count,
+        "uav_move_action_count": execution_counts["UAV_MOVE"],
+        "uav_movement_slot_count": uav_movement_slot_count,
+        "actual_uav_movement_slot_count": uav_movement_slot_count,
+        "uav_movement_count": uav_movement_count,
+        "actual_uav_movement_count": uav_movement_count,
+        "uav_moved_uav_count": uav_movement_count,
+        "uav_distance_by_uav_m": dict(sorted(uav_distance_by_uav.items())),
+        "actual_uav_distance_by_uav_m": dict(
+            sorted(uav_distance_by_uav.items())
+        ),
+        "uav_total_distance": actual_uav_total_distance,
+        "actual_uav_total_distance_m": actual_uav_total_distance,
+        "uav_total_move_distance_m": actual_uav_total_distance,
+        "uav_movement_cost": sum(uav_cost_values) if uav_cost_complete else None,
+        "uav_movement_cost_known_subtotal": uav_cost_known_subtotal,
+        "uav_movement_cost_recorded_slot_count": len(uav_cost_values),
+        "uav_movement_cost_unavailable_slot_count": slot_count - len(uav_cost_values),
         "decision_wall_time_s": sum(
             float(row["decision_wall_time_s"]) for row in step_rows
         ),
         "executor_calls": sum(int(row["executor_calls"]) for row in step_rows),
         "matching_calls": sum(int(row["matching_calls"]) for row in step_rows),
         "kkt_solver_calls": sum(int(row["kkt_solver_calls"]) for row in step_rows),
+        "actual_execution_node_data_available": execution_node_data_available,
+        "actual_execution_node_data_available_slot_count": (
+            execution_node_data_available_slots
+        ),
+        "actual_execution_node_data_unavailable_slot_count": (
+            slot_count - execution_node_data_available_slots
+        ),
+        "actual_execution_node_task_count": execution_node_total,
+        "actual_execution_node_counts": dict(sorted(execution_node_counts.items())),
+        "actual_execution_node_shares": execution_node_shares,
+        "most_common_actual_execution_node": most_common_execution_node,
         "mutual_exclusion_violations": sum(
             not bool(row["mutual_exclusion_pass"]) for row in step_rows
         ),

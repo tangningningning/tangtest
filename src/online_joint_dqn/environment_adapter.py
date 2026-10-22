@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import pickle
 import sys
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -538,6 +539,33 @@ class ExclusiveDQNEnvironment:
             )
         if result.next_cache_state is None or result.next_uav_positions is None:
             raise RuntimeError("正式 Slot 执行器未返回下一缓存/UAV 状态")
+        actual_matching = getattr(result, "matching", None)
+        actual_execution_node_data_available = isinstance(actual_matching, Mapping)
+        actual_execution_nodes = (
+            [
+                {
+                    "task_id": str(task_id),
+                    "execution_node": str(execution_node),
+                }
+                for task_id, execution_node in sorted(
+                    actual_matching.items(), key=lambda item: str(item[0])
+                )
+            ]
+            if actual_execution_node_data_available
+            else None
+        )
+        actual_execution_node_counts = (
+            dict(
+                sorted(
+                    Counter(
+                        str(execution_node)
+                        for execution_node in actual_matching.values()
+                    ).items()
+                )
+            )
+            if actual_execution_node_data_available
+            else None
+        )
         final_cache = np.asarray(result.next_cache_state, dtype=np.int8).copy()
         final_uav = {
             key: np.asarray(value, dtype=np.float64).copy()
@@ -605,11 +633,24 @@ class ExclusiveDQNEnvironment:
             diagnostics={
                 "slot_id": int(slot_input.slot_id),
                 "actual_task_utility": float(result.actual_task_utility),
-                "cache_cost": float(result.cache_cost),
-                "movement_cost": float(result.movement_cost),
+                "cache_cost": (
+                    None if result.cache_cost is None else float(result.cache_cost)
+                ),
+                "cache_update_cost_available": result.cache_cost is not None,
+                "movement_cost": (
+                    None
+                    if result.movement_cost is None
+                    else float(result.movement_cost)
+                ),
+                "uav_movement_cost_available": result.movement_cost is not None,
                 "beta_ca": float(result.beta_ca),
                 "beta_q": float(result.beta_q),
                 "matching_summary": result.matching_summary,
+                "actual_execution_node_counts": actual_execution_node_counts,
+                "actual_execution_nodes": actual_execution_nodes,
+                "actual_execution_node_data_available": (
+                    actual_execution_node_data_available
+                ),
                 "executor_performance_profile": performance_profile,
                 "duration_semantics": "每个动作恰好执行一个正式 Slot",
                 **candidate_generation_diagnostics,

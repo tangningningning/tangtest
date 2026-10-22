@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
+import math
 import os
 import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -24,6 +28,7 @@ if str(PROJECT_ROOT / "scripts" / "training") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "training"))
 
 from common import project_config  # noqa: E402
+from decision import uav_configuration  # noqa: E402
 from online_joint_dqn.agent import DoubleDQNAgent  # noqa: E402
 from online_joint_dqn.candidate_features import (  # noqa: E402
     CANDIDATE_FEATURE_CONTRACT_VERSION,
@@ -374,25 +379,34 @@ def _validate_training_pool() -> dict[str, Any]:
     }
 
 
+def _create_unique_run_directory(stem: Path) -> Path:
+    """按原子目录创建分配唯一训练目录；碰撞时递增短序号。"""
+
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    suffix = 0
+    while True:
+        target = (
+            stem
+            if suffix == 0
+            else stem.with_name(f"{stem.name}_{suffix:02d}")
+        )
+        try:
+            target.mkdir(exist_ok=False)
+            return target
+        except FileExistsError:
+            suffix += 1
+
+
 def _new_run_directory(requested: Path | None) -> Path:
     if requested is not None:
         target = requested if requested.is_absolute() else PROJECT_ROOT / requested
         target = target.resolve()
         target.mkdir(parents=True, exist_ok=False)
         return target
-    stem = PROJECT_ROOT / "runs" / (
-        "online_joint_dqn_exclusive_"
-        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    )
-    stem.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in range(1000):
-        target = stem if suffix == 0 else stem.with_name(f"{stem.name}_{suffix:03d}")
-        try:
-            target.mkdir(exist_ok=False)
-            return target
-        except FileExistsError:
-            continue
-    raise FileExistsError("无法分配唯一 DQN 输出目录")
+    # 使用本机当地时间，便于直接辨认训练启动时间。
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    stem = PROJECT_ROOT / "runs" / f"online_joint_dqn_fixed_input_{timestamp}"
+    return _create_unique_run_directory(stem)
 
 
 def _run_identity(
@@ -545,6 +559,35 @@ def _write_run_summary(
         for row in episode_rows
         if row["episode_summary"].get("mean_system_utility_per_slot") is not None
     ]
+    execution_node_counts: Counter[str] = Counter()
+    execution_node_data_available_episodes = 0
+    for row in episode_rows:
+        episode_summary = row.get("episode_summary", {})
+        counts = episode_summary.get("actual_execution_node_counts")
+        if (
+            episode_summary.get("actual_execution_node_data_available") is True
+            and isinstance(counts, Mapping)
+        ):
+            execution_node_data_available_episodes += 1
+            for node_id, count in counts.items():
+                execution_node_counts[str(node_id)] += int(count)
+    execution_node_total = sum(execution_node_counts.values())
+    execution_node_shares = {
+        node_id: count / execution_node_total
+        for node_id, count in sorted(execution_node_counts.items())
+    } if execution_node_total else {}
+    all_episode_node_data_available = (
+        bool(episode_rows)
+        and execution_node_data_available_episodes == len(episode_rows)
+    )
+    most_common_execution_node = (
+        min(
+            execution_node_counts,
+            key=lambda node_id: (-execution_node_counts[node_id], node_id),
+        )
+        if all_episode_node_data_available and execution_node_total
+        else None
+    )
     summary = {
         "status": status,
         "completed_episodes": len(episode_rows),
@@ -570,6 +613,17 @@ def _write_run_summary(
         "total_kkt_solver_calls": sum(
             int(row["episode_summary"]["kkt_solver_calls"]) for row in episode_rows
         ),
+        "actual_execution_node_data_available": all_episode_node_data_available,
+        "actual_execution_node_data_available_episode_count": (
+            execution_node_data_available_episodes
+        ),
+        "actual_execution_node_data_unavailable_episode_count": (
+            len(episode_rows) - execution_node_data_available_episodes
+        ),
+        "actual_execution_node_task_count": execution_node_total,
+        "actual_execution_node_counts": dict(sorted(execution_node_counts.items())),
+        "actual_execution_node_shares": execution_node_shares,
+        "most_common_actual_execution_node": most_common_execution_node,
         "total_decision_wall_time_s": sum(
             float(row["episode_summary"]["decision_wall_time_s"])
             for row in episode_rows
@@ -594,6 +648,93 @@ def _write_run_summary(
     _write_json(path, summary, atomic=True)
 
 
+def _format_eta(seconds: float | None) -> str:
+    """将剩余训练时间统一格式化为 HH:MM:SS。"""
+
+    if seconds is None or not math.isfinite(float(seconds)):
+        return "--:--:--"
+    total_seconds = max(0, int(math.ceil(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds_remainder = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds_remainder:02d}"
+
+
+def _normalization_config_line(config: Mapping[str, Any]) -> str:
+    """从正式配置生成唯一的归一化参数摘要行。"""
+
+    get = project_config.get_config_value
+    cache_reference = float(
+        get(config, "objective.cost_normalization.cache_reference_s_per_node")
+    )
+    beta_ca = float(get(config, "objective.beta_ca"))
+    beta_q = float(get(config, "objective.beta_q"))
+    energy_references = uav_configuration.movement_energy_upper_bounds_by_uav_j(
+        dict(config)
+    )
+    if not energy_references:
+        raise ValueError("正式配置未提供 UAV 能耗归一化参考值")
+    reference_values = tuple(float(value) for value in energy_references.values())
+    first_reference = reference_values[0]
+    if all(
+        math.isclose(value, first_reference, rel_tol=1.0e-12, abs_tol=1.0e-12)
+        for value in reference_values[1:]
+    ):
+        uav_reference = f"{first_reference:g}J/UAV"
+    else:
+        uav_reference = (
+            "["
+            + ",".join(f"{value:g}" for value in reference_values)
+            + "]J/UAV"
+        )
+    return (
+        f"[CONFIG] cache_ref={cache_reference:g}s/node | "
+        f"uav_energy_ref={uav_reference} | beta_ca={beta_ca:g} | beta_q={beta_q:g}"
+    )
+
+
+def _format_episode_progress(
+    *,
+    episode_index: int,
+    total_episodes: int,
+    episode_seed: int,
+    episode_return: float,
+    mean_utility: float,
+    completed_slots: int,
+    total_slots: int,
+    gradient_updates: int,
+    speed_slots_per_second: float,
+    eta_seconds: float | None,
+    cache_updates: int | None,
+    cache_nodes: int | None,
+    uav_moves: int | None,
+    uav_move_slots: int | None,
+    uav_total_distance_m: float | None,
+    top_execution_node: str,
+) -> str:
+    """生成单个已提交 Episode 的一行控制台进度。"""
+
+    format_count = lambda value: "N/A" if value is None else str(int(value))
+    distance_text = (
+        "N/A" if uav_total_distance_m is None else f"{uav_total_distance_m:.1f}m"
+    )
+    return (
+        f"[DQN] EP {episode_index:03d}/{total_episodes} "
+        f"| Seed {episode_seed} "
+        f"| Return {episode_return:.2f} "
+        f"| Mean {mean_utility:.3f} "
+        f"| Slots {completed_slots}/{total_slots} "
+        f"| Updates {gradient_updates} "
+        f"| Speed {speed_slots_per_second:.2f} slot/s "
+        f"| ETA {_format_eta(eta_seconds)}"
+        f" | CacheUpdates {format_count(cache_updates)}"
+        f" | CacheNodes {format_count(cache_nodes)}"
+        f" | UAVMoves {format_count(uav_moves)}"
+        f" | UAVSlots {format_count(uav_move_slots)}"
+        f" | UAVDistance {distance_text}"
+        f" | TopExec {top_execution_node}"
+    )
+
+
 def run_training(
     *,
     output_dir: Path | None = None,
@@ -603,14 +744,18 @@ def run_training(
 ) -> int:
     pool_info = _validate_training_pool()
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
+    runtime_config = project_config.parse_toml_file(config_path)
+    print(_normalization_config_line(runtime_config), flush=True)
 
     first_seed = pool_contract.DEFAULT_TRAINING_SEED_START
-    first_environment = ExclusiveDQNEnvironment.from_formal_training_episode(
-        PROJECT_ROOT,
-        episode_seed=first_seed,
-        origin_start=0,
-        max_steps=pool_contract.FORMAL_TRAINING_EPISODE_SLOTS,
-    )
+    # 环境初始化会打印冗长的逐节点归一化详情；控制台只保留上方摘要行。
+    with contextlib.redirect_stdout(io.StringIO()):
+        first_environment = ExclusiveDQNEnvironment.from_formal_training_episode(
+            PROJECT_ROOT,
+            episode_seed=first_seed,
+            origin_start=0,
+            max_steps=pool_contract.FORMAL_TRAINING_EPISODE_SLOTS,
+        )
     state, candidates = first_environment.observe()
     agent = DoubleDQNAgent(
         len(state),
@@ -735,6 +880,24 @@ def run_training(
         # Checkpoint 是完成进度的提交点；恢复时修复可能落后的派生汇总文件。
         _write_episode_metrics_atomic(episode_metrics_path, episode_rows)
     total_slots = len(episode_order) * pool_contract.FORMAL_TRAINING_EPISODE_SLOTS
+    previous_summary_path = run_dir / "run_summary.json"
+    previous_training_elapsed_seconds = sum(
+        max(0.0, float(row.get("episode_wall_time_s", 0.0)))
+        for row in episode_rows
+        if isinstance(row.get("episode_wall_time_s", 0.0), (int, float))
+        and math.isfinite(float(row.get("episode_wall_time_s", 0.0)))
+    )
+    if resume_checkpoint is not None and previous_summary_path.is_file():
+        previous_summary = json.loads(
+            previous_summary_path.read_text(encoding="utf-8")
+        )
+        recorded_elapsed = previous_summary.get("training_elapsed_seconds", 0.0)
+        if isinstance(recorded_elapsed, (int, float)) and math.isfinite(
+            float(recorded_elapsed)
+        ):
+            previous_training_elapsed_seconds = max(
+                previous_training_elapsed_seconds, float(recorded_elapsed)
+            )
     run_start = time.perf_counter()
     checkpoint_path = run_dir / "checkpoints" / "latest_checkpoint.pt"
     last_checkpoint_bytes: int | None = None
@@ -768,17 +931,7 @@ def run_training(
     def request_episode_boundary_stop(signum: int, _frame: Any) -> None:
         nonlocal stop_requested
         stop_requested = True
-        print(
-            json.dumps(
-                {
-                    "status": "STOP_REQUESTED",
-                    "signal": int(signum),
-                    "message": "将在当前完整 Episode 提交后停止",
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        print("[DQN] Stop requested; will stop after the current Episode.", flush=True)
 
     for signal_number in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
         if signal_number is not None:
@@ -914,25 +1067,57 @@ def run_training(
                     elapsed_seconds=time.perf_counter() - run_start,
                     total_slots=total_slots,
                 )
-                elapsed = time.perf_counter() - run_start
+                elapsed = previous_training_elapsed_seconds + (
+                    time.perf_counter() - run_start
+                )
                 rate = global_step / elapsed if elapsed > 0 else 0.0
                 remaining = max(0, total_slots - global_step)
                 eta = remaining / rate if rate > 0 else None
+                episode_return = float(metrics["episode_reward"])
+                mean_utility = float(
+                    metrics["episode_summary"]["mean_system_utility_per_slot"]
+                )
                 print(
-                    json.dumps(
-                        {
-                            "episode_seed": episode_seed,
-                            "completed_episodes": next_episode_index,
-                            "total_episodes": len(episode_order),
-                            "completed_slots": global_step,
-                            "gradient_updates": agent.gradient_steps,
-                            "episode_seconds": episode_elapsed,
-                            "measured_slots_per_second": rate,
-                            "estimated_remaining_seconds": eta,
-                            "checkpoint_bytes": last_checkpoint_bytes,
-                            "run_dir": str(run_dir),
-                        },
-                        ensure_ascii=False,
+                    _format_episode_progress(
+                        episode_index=next_episode_index,
+                        total_episodes=len(episode_order),
+                        episode_seed=episode_seed,
+                        episode_return=episode_return,
+                        mean_utility=mean_utility,
+                        completed_slots=global_step,
+                        total_slots=total_slots,
+                        gradient_updates=agent.gradient_steps,
+                        speed_slots_per_second=rate,
+                        eta_seconds=eta,
+                        cache_updates=metrics["episode_summary"].get(
+                            "actual_cache_update_count"
+                        ),
+                        cache_nodes=metrics["episode_summary"].get(
+                            "actual_cache_changed_node_count"
+                        ),
+                        uav_moves=metrics["episode_summary"].get(
+                            "uav_movement_count"
+                        ),
+                        uav_move_slots=metrics["episode_summary"].get(
+                            "uav_movement_slot_count"
+                        ),
+                        uav_total_distance_m=metrics["episode_summary"].get(
+                            "uav_total_distance"
+                        ),
+                        top_execution_node=(
+                            str(
+                                metrics["episode_summary"].get(
+                                    "most_common_actual_execution_node"
+                                )
+                            )
+                            if metrics["episode_summary"].get(
+                                "actual_execution_node_data_available"
+                            )
+                            and metrics["episode_summary"].get(
+                                "most_common_actual_execution_node"
+                            )
+                            else "N/A"
+                        ),
                     ),
                     flush=True,
                 )
@@ -992,7 +1177,44 @@ def run_training(
         elapsed_seconds=time.perf_counter() - run_start,
         total_slots=total_slots,
     )
-    print(json.dumps({"status": status, "run_dir": str(run_dir)}, ensure_ascii=False))
+    if status == "FORMAL_TRAINING_COMPLETE":
+        plot_result: dict[str, Any]
+        try:
+            from online_joint_dqn.plot_training import generate_training_plots
+
+            plot_result = generate_training_plots(run_dir)
+        except Exception as exc:
+            plot_result = {
+                "status": "FAILED",
+                "generated": [],
+                "skipped": {},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        try:
+            summary_path = run_dir / "run_summary.json"
+            summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary_data["plot_generation"] = plot_result
+            _write_json(summary_path, summary_data, atomic=True)
+        except Exception as exc:
+            print(
+                f"[PLOT] {plot_result.get('status', 'FAILED')} | "
+                f"summary update failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        else:
+            generated_count = len(plot_result.get("generated", []))
+            skipped_count = len(plot_result.get("skipped", {}))
+            print(
+                f"[PLOT] {plot_result.get('status', 'UNKNOWN')} | "
+                f"Generated {generated_count} | Skipped {skipped_count} | "
+                f"Path {run_dir / 'plots'}",
+                flush=True,
+            )
+    print(
+        f"[DQN] {status} | Episodes {next_episode_index}/{len(episode_order)} "
+        f"| Slots {global_step}/{total_slots}",
+        flush=True,
+    )
     return 130 if status == "STOPPED_AT_EPISODE_BOUNDARY" else 0
 
 
