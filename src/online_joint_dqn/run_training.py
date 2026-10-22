@@ -38,9 +38,23 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-CHECKPOINT_SCHEMA_VERSION = 3
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v3"
+CHECKPOINT_SCHEMA_VERSION = 4
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
+
+_CODE_IDENTITY_REQUIRED_PATHS = (
+    "src/common/project_config.py",
+    "src/common/system_model.py",
+    "src/decision/cache_configuration.py",
+    "src/decision/uav_configuration.py",
+    "src/decision/slot_environment.py",
+    "src/decision/task_allocation.py",
+    "src/ppo_simple/interface.py",
+    "src/scenario/realization.py",
+    "src/scenario/vehicle_order.py",
+    "scripts/training/training_pool_contract.py",
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -113,24 +127,32 @@ def _git_output(*arguments: str) -> str | None:
 
 
 def _code_identity() -> dict[str, Any]:
+    # 哈希在线决策、执行、数据对齐和效用合同的源码，不扫描无关仓库文件。
     paths = sorted(
-        [*PROJECT_ROOT.glob("src/online_joint_dqn/*.py")]
-        + [*PROJECT_ROOT.glob("src/online_joint_optimizer/*.py")]
-        + [
-            PROJECT_ROOT / "src" / "decision" / "cache_configuration.py",
-            PROJECT_ROOT / "src" / "decision" / "uav_configuration.py",
-            PROJECT_ROOT / "src" / "decision" / "slot_environment.py",
-            PROJECT_ROOT / "src" / "decision" / "task_allocation.py",
-            PROJECT_ROOT / "src" / "common" / "project_config.py",
-            PROJECT_ROOT / "src" / "ppo_simple" / "interface.py",
-            PROJECT_ROOT / "scripts" / "training" / "training_pool_contract.py",
-        ]
+        {
+            *PROJECT_ROOT.glob("src/online_joint_dqn/**/*.py"),
+            *PROJECT_ROOT.glob("src/online_joint_optimizer/**/*.py"),
+            *(PROJECT_ROOT / relative_path for relative_path in _CODE_IDENTITY_REQUIRED_PATHS),
+        }
     )
+    missing = [
+        relative_path
+        for relative_path in _CODE_IDENTITY_REQUIRED_PATHS
+        if not (PROJECT_ROOT / relative_path).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "关键训练源码缺失，不能建立源码身份：" + ", ".join(missing)
+        )
     hashes = {
         path.relative_to(PROJECT_ROOT).as_posix(): _sha256(path)
         for path in paths
         if path.is_file()
     }
+    if not any(path.startswith("src/online_joint_dqn/") for path in hashes):
+        raise FileNotFoundError("online_joint_dqn 源码目录中没有可哈希的 Python 文件")
+    if not any(path.startswith("src/online_joint_optimizer/") for path in hashes):
+        raise FileNotFoundError("online_joint_optimizer 源码目录中没有可哈希的 Python 文件")
     status = _git_output("status", "--porcelain")
     return {
         "head": _git_output("rev-parse", "HEAD"),
@@ -138,6 +160,169 @@ def _code_identity() -> dict[str, Any]:
         "worktree_status_porcelain": status.splitlines() if status else [],
         "effective_source_sha256": hashes,
     }
+
+
+def _identity_payload(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """返回参与训练身份摘要的字段，不包含摘要本身。"""
+
+    return {
+        str(key): _jsonable(value)
+        for key, value in identity.items()
+        if str(key) != "identity_sha256"
+    }
+
+
+def _identity_sha256(identity_payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        _jsonable(identity_payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _identity_differences(
+    expected: Any, actual: Any, *, prefix: str = "identity"
+) -> list[str]:
+    """按字段路径列出身份不匹配，便于恢复失败时定位具体项目。"""
+
+    differences: list[str] = []
+    if isinstance(expected, Mapping) and isinstance(actual, Mapping):
+        for key in sorted(set(expected) | set(actual), key=str):
+            field = f"{prefix}.{key}"
+            if key not in expected:
+                differences.append(f"{field}: current identity missing")
+            elif key not in actual:
+                differences.append(f"{field}: stored identity missing")
+            else:
+                differences.extend(
+                    _identity_differences(expected[key], actual[key], prefix=field)
+                )
+        return differences
+    if isinstance(expected, (tuple, list)) and isinstance(actual, (tuple, list)):
+        if len(expected) != len(actual):
+            differences.append(
+                f"{prefix}: length mismatch (current={len(expected)}, stored={len(actual)})"
+            )
+        for index, (expected_item, actual_item) in enumerate(
+            zip(expected, actual, strict=False)
+        ):
+            differences.extend(
+                _identity_differences(
+                    expected_item, actual_item, prefix=f"{prefix}[{index}]"
+                )
+            )
+        return differences
+    if expected != actual:
+        differences.append(f"{prefix}: current={expected!r}, stored={actual!r}")
+    return differences
+
+
+def _validate_resume_identity(
+    current_identity: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+) -> None:
+    """严格验证当前源码、Manifest 与 Checkpoint 的身份字段及摘要。"""
+
+    failures: list[str] = []
+    current_payload = _identity_payload(current_identity)
+    current_digest = str(current_identity.get("identity_sha256", ""))
+
+    if manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
+        failures.append(
+            "Manifest schema 不包含完整源码身份合同 "
+            f"(stored={manifest.get('schema_version')!r}, "
+            f"required={RUN_MANIFEST_SCHEMA_VERSION!r})"
+        )
+    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        failures.append(
+            "Checkpoint schema 不包含完整源码身份合同 "
+            f"(stored={checkpoint.get('schema_version')!r}, "
+            f"required={CHECKPOINT_SCHEMA_VERSION!r})"
+        )
+
+    manifest_payload = manifest.get("identity_payload")
+    if not isinstance(manifest_payload, Mapping):
+        failures.append("Manifest 缺少 identity_payload，拒绝恢复")
+        manifest_payload = {}
+    checkpoint_payload = checkpoint.get("identity_payload")
+    if not isinstance(checkpoint_payload, Mapping):
+        failures.append("Checkpoint 缺少 identity_payload，拒绝恢复")
+        checkpoint_payload = {}
+
+    for label, stored_payload in (
+        ("Manifest", manifest_payload),
+        ("Checkpoint", checkpoint_payload),
+    ):
+        missing_fields = sorted(set(current_payload) - set(stored_payload))
+        extra_fields = sorted(set(stored_payload) - set(current_payload))
+        if missing_fields:
+            failures.append(
+                f"{label} 缺少身份字段：" + ", ".join(missing_fields)
+            )
+        if extra_fields:
+            failures.append(
+                f"{label} 包含当前版本不识别的身份字段：" + ", ".join(extra_fields)
+            )
+
+    manifest_digest = _identity_sha256(manifest_payload) if manifest_payload else ""
+    checkpoint_digest = (
+        _identity_sha256(checkpoint_payload) if checkpoint_payload else ""
+    )
+    if manifest_digest and manifest.get("identity_sha256") != manifest_digest:
+        failures.append("Manifest identity_sha256 与其 identity_payload 不一致")
+    if checkpoint_digest and checkpoint.get("identity_sha256") != checkpoint_digest:
+        failures.append("Checkpoint identity_sha256 与其 identity_payload 不一致")
+
+    if manifest.get("identity_sha256") != current_digest:
+        failures.append("当前训练身份摘要与 Manifest identity_sha256 不一致")
+    if checkpoint.get("identity_sha256") != current_digest:
+        failures.append("当前训练身份摘要与 Checkpoint identity_sha256 不一致")
+
+    failures.extend(
+        _identity_differences(current_payload, manifest_payload, prefix="manifest")
+    )
+    failures.extend(
+        _identity_differences(current_payload, checkpoint_payload, prefix="checkpoint")
+    )
+    failures.extend(
+        _identity_differences(
+            manifest_payload, checkpoint_payload, prefix="manifest_vs_checkpoint"
+        )
+    )
+
+    for field, expected_value in current_payload.items():
+        if field not in manifest:
+            failures.append(f"Manifest 顶层缺少身份字段：{field}")
+            continue
+        failures.extend(
+            _identity_differences(
+                expected_value,
+                manifest[field],
+                prefix=f"manifest.top_level.{field}",
+            )
+        )
+
+    manifest_code_identity = manifest.get("code_identity")
+    if manifest_code_identity is None:
+        failures.append("Manifest 缺少 code_identity 字段")
+    elif manifest_code_identity != manifest_payload.get("code_identity"):
+        failures.extend(
+            _identity_differences(
+                manifest_payload.get("code_identity"),
+                manifest_code_identity,
+                prefix="manifest.code_identity_copy",
+            )
+        )
+
+    # 去重后按顺序报告，避免同一不匹配原因重复出现。
+    failures = list(dict.fromkeys(failures))
+    if failures:
+        detail = "\n - ".join(failures)
+        raise ValueError("Checkpoint 恢复身份校验失败：\n - " + detail)
 
 
 def _validate_training_pool() -> dict[str, Any]:
@@ -257,11 +442,9 @@ def _run_identity(
         },
         "replay_capacity": int(replay_capacity),
         "candidate_capacity_limits": dict(search_budget),
+        "code_identity": _code_identity(),
     }
-    encoded = json.dumps(
-        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    identity["identity_sha256"] = hashlib.sha256(encoded).hexdigest()
+    identity["identity_sha256"] = _identity_sha256(identity)
     return identity
 
 
@@ -270,7 +453,7 @@ def _save_checkpoint(
     *,
     agent: DoubleDQNAgent,
     replay: ReplayBuffer,
-    identity_sha256: str,
+    identity: Mapping[str, Any],
     episode_order: list[int],
     episode_rows: list[dict[str, Any]],
     next_episode_index: int,
@@ -280,7 +463,8 @@ def _save_checkpoint(
     temporary = path.with_name(path.name + ".tmp")
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "identity_sha256": identity_sha256,
+        "identity_sha256": str(identity["identity_sha256"]),
+        "identity_payload": _identity_payload(identity),
         "agent_state": agent.state_dict(),
         "replay_state": replay.state_dict(),
         "episode_order": list(episode_order),
@@ -461,9 +645,10 @@ def run_training(
         run_dir.joinpath("config_snapshot.toml").write_bytes(config_path.read_bytes())
         _write_json(run_dir / "training_pool_identity.json", pool_info)
         manifest = {
-            "schema_version": "online_joint_dqn_run_v2",
+            "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
             **identity,
-            "code_identity": _code_identity(),
+            "identity_payload": _identity_payload(identity),
+            "code_identity": identity["code_identity"],
             "training_pool": {
                 "split": "train",
                 "path": str(PROJECT_ROOT / pool_contract.TRAIN_POOL_RELATIVE),
@@ -498,13 +683,8 @@ def run_training(
         if not manifest_path.is_file():
             raise FileNotFoundError("恢复训练缺少原始 run_manifest.json")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("identity_sha256") != identity["identity_sha256"]:
-            raise ValueError("当前代码/配置/数据/训练参数身份与 Checkpoint 不一致")
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-            raise ValueError("Checkpoint schema 不受支持")
-        if payload.get("identity_sha256") != identity["identity_sha256"]:
-            raise ValueError("Checkpoint 的训练身份不匹配")
+        _validate_resume_identity(identity, manifest, payload)
         agent.load_state_dict(payload["agent_state"])
         replay.load_state_dict(payload["replay_state"])
         episode_order = [int(value) for value in payload["episode_order"]]
@@ -703,7 +883,7 @@ def run_training(
                     checkpoint_path,
                     agent=agent,
                     replay=replay,
-                    identity_sha256=identity["identity_sha256"],
+                    identity=identity,
                     episode_order=episode_order,
                     episode_rows=committed_episode_rows,
                     next_episode_index=committed_episode_index,
