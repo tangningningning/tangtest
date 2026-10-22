@@ -396,6 +396,12 @@ class ExclusiveDQNEnvironment:
             key: np.asarray(value, dtype=np.float64).copy()
             for key, value in current_uav_positions.items()
         }
+        cache_complementarity_context = self.encoder.prepare_cache_complementarity_context(
+            previous_cache_state=cache_state,
+            previous_uav_positions=uav_positions,
+            slot_input=candidate_input,
+            decision_forecast=forecast,
+        )
         candidates: list[CandidateOption] = []
         keep = ActionCandidate.from_states(
             previous_cache_state=cache_state,
@@ -415,6 +421,7 @@ class ExclusiveDQNEnvironment:
                     previous_uav_positions=uav_positions,
                     slot_input=candidate_input,
                     decision_forecast=forecast,
+                    cache_complementarity_context=cache_complementarity_context,
                 ),
             )
         )
@@ -505,6 +512,7 @@ class ExclusiveDQNEnvironment:
                         previous_uav_positions=uav_positions,
                         slot_input=candidate_input,
                         decision_forecast=forecast,
+                        cache_complementarity_context=cache_complementarity_context,
                     ),
                 )
             )
@@ -536,6 +544,7 @@ class ExclusiveDQNEnvironment:
                         previous_uav_positions=uav_positions,
                         slot_input=candidate_input,
                         decision_forecast=forecast,
+                        cache_complementarity_context=cache_complementarity_context,
                     ),
                 )
             )
@@ -663,7 +672,7 @@ class ExclusiveDQNEnvironment:
                 "候选重建预测输入缺少字段：" + ", ".join(missing_scenario_fields)
             )
         context = {
-            "schema_version": "dqn_candidate_rebuild_context_v3",
+            "schema_version": "dqn_candidate_rebuild_context_v4",
             "source_state_fingerprint": self._cached_state_fingerprint,
             "state_features": self._cached_state_features.copy(),
             "cache_state": self.cache_state.copy(),
@@ -701,7 +710,7 @@ class ExclusiveDQNEnvironment:
     ) -> tuple[CandidateOption, ...]:
         """仅由回放中的合法状态上下文和预测输入确定性重建候选。"""
 
-        if context.get("schema_version") != "dqn_candidate_rebuild_context_v3":
+        if context.get("schema_version") != "dqn_candidate_rebuild_context_v4":
             raise ValueError("回放候选重建上下文版本不兼容")
         if context.get("candidate_rebuild_payload_sha256") != (
             _candidate_rebuild_payload_sha256(context)

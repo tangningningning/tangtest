@@ -16,7 +16,9 @@ P0 优化固定长度 Episode 的平均期望系统效用。固定长度下，�
 ## 信息与候选合同
 
 状态复用正式 `build_step_observation()`：当前缓存、UAV 位置、5 个预测时域的车辆位置及服务流行度、有效 mask、正式时间特征，另加由正式预测需求 helper 计算、供候选生成使用的车辆—服务及缓存节点—服务需求摘要。真实当前任务及未来真实轨迹不进入网络或候选生成。
-候选特征保存目标缓存、节点变化、服务增删、正式下载成本、UAV 前后位置、位移成本及预测距离。缓存与 UAV 变化在候选构造、适配器和执行结果三处校验互斥。
+候选特征保存目标缓存、节点变化、服务增删、正式下载成本、UAV 前后位置、位移成本及预测距离。新增的每服务互补性向量依次编码 UAV 局部预测需求、该需求中固定节点的预测加权可覆盖量、固定节点预测覆盖缺口、删除服务对应的 UAV 局部需求、候选的全网预测流行度净变化、变更服务已有副本比例及副本数变化；末尾记录预测缓存覆盖率的可用标记、更新前后值和差值。服务大小、下载量和成本继续复用原候选字段，不重复造特征。
+
+空间需求和固定节点覆盖复用正式 `cache_configuration` 的预测需求与节点服务性权重，使用有效预测时域及预测车辆位置；UAV 位置使用当前决策可见位置，在未来预测时域不假设 UAV 已移动。该权重是正式候选生成/预测覆盖中的软几何信号，不等同于真实 Matching 的可达结果或任务命中率。输入缺失会报错，预测覆盖无有效需求时由显式可用标记区分，不伪造零覆盖。候选集合仍由既有合法 REPLACE 生成器产生，没有额外枚举动作。
 
 ## 两阶段价值与 Double DQN
 
@@ -44,7 +46,7 @@ y = reward + gamma ** duration_slots * Q_target(s_next,a*)
 Replay 保存语义动作、所选动作特征、实际奖励、时长，以及当前/下一状态的压缩预测重建上下文和候选数量/ID 摘要，不保存完整候选特征矩阵。重建当前类别候选用于优势归一化，重建下一候选用于 Double DQN。相邻转移重复的状态上下文通过引用共享，环形淘汰时释放引用，Checkpoint 恢复时重新共享。
 所有候选重建均校验状态指纹、候选 ID、所选目标和特征；上下文只包含决策可见的状态与预测。
 
-架构版本为 `legal_candidate_mean_centered_dueling_q_v3`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 4、Replay schema 5、Manifest v7、Checkpoint schema 8。旧架构/旧回放明确拒绝恢复；历史文件保留。学习率、折扣、源码身份与数据身份继续参与恢复校验。
+候选特征合同为 `prediction_only_uav_cache_complementarity_v3`，架构版本为 `legal_candidate_mean_centered_dueling_q_v4`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 5、Replay schema 6、Manifest v7、Checkpoint schema 8。旧架构/旧回放明确拒绝恢复；历史文件保留。学习率、折扣、源码身份与数据身份继续参与恢复校验。
 
 `selected_category_q` 是类别均值 Q（类别头输出）；`selected_candidate_q` 与 `selected_q_value` 都是所选动作完整 Q；`selected_candidate_advantage` 是类别均值中心化优势，可正可负且类内均值为零。类别候选统计采用完整 Q，`td_loss` 是统一 TD loss。旧的 `category_td_loss` / `candidate_advantage_loss` 字段保留为不可用值 `null`，不伪造两份独立 loss。
 缓存变化、服务增删和 UAV 移动取实际前后状态差；成本和任务执行节点来自正式结果。预测缓存覆盖率独立标记，不能称为实际命中率或据其宣称缓存更新的因果收益。

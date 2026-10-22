@@ -652,7 +652,7 @@ def _run_identity(
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
     identity = {
-        "algorithm": "legal_candidate_mean_centered_dueling_double_dqn_exclusive_v3",
+        "algorithm": "legal_candidate_mean_centered_dueling_double_dqn_exclusive_v4",
         "objective_contract": "finite_episode_undiscounted_system_utility_v1",
         "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
         "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
