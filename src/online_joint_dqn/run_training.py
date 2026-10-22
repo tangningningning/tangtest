@@ -43,8 +43,8 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v5"
-CHECKPOINT_SCHEMA_VERSION = 6
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v6"
+CHECKPOINT_SCHEMA_VERSION = 7
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4
@@ -427,7 +427,8 @@ def _run_identity(
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
     identity = {
-        "algorithm": "two_stage_category_candidate_double_dqn_exclusive_v1",
+        "algorithm": "category_max_centered_dueling_double_dqn_exclusive_v2",
+        "objective_contract": "finite_episode_undiscounted_system_utility_v1",
         "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
         "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
         "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
@@ -776,6 +777,7 @@ def run_training(
         len(state),
         len(candidates[0].features),
         learning_rate=float(learning_rate),
+        gamma=1.0,
         seed=int(seed),
     )
     replay = ReplayBuffer(int(replay_capacity), seed=int(seed))

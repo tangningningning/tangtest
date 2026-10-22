@@ -28,6 +28,7 @@ def _summarize_update_metrics(
         "q_value_mean",
         "category_q_value_mean",
         "candidate_q_value_mean",
+        "candidate_advantage_mean",
         "td_target_mean",
     )
     summary: dict[str, Any] = {"update_count": len(update_rows)}
@@ -241,6 +242,7 @@ def train_episode(
         else:
             greedy_selection_counts[selected_operation] += 1
         previous_cache = environment.cache_state.copy()
+        current_candidate_context = environment.candidate_rebuild_context()
         previous_uav = {
             key: value.copy() for key, value in environment.uav_positions.items()
         }
@@ -333,6 +335,8 @@ def train_episode(
             state_features=state,
             action=selected.candidate.action,
             action_features=selected.candidate.features,
+            current_legal_candidates=candidates,
+            current_candidate_rebuild_context=current_candidate_context,
             reward=transition.reward,
             next_state_features=transition.next_state_features,
             next_state_fingerprint=transition.next_state_fingerprint,
@@ -373,6 +377,7 @@ def train_episode(
                 "selected_q_value": selected.q_value,
                 "selected_category_q": selected.category_q_value,
                 "selected_candidate_q": selected.candidate_q_value,
+                "selected_candidate_advantage": selected.candidate_advantage,
                 "q_values_by_action_category": dict(
                     selected.q_values_by_action_category
                 ),
@@ -549,12 +554,11 @@ def train_episode(
                     not math.isfinite(float(update[name]))
                     for name in (
                         "td_loss",
-                        "category_td_loss",
-                        "candidate_advantage_loss",
                         "gradient_norm_before_clip",
                         "q_value_mean",
                         "category_q_value_mean",
                         "candidate_q_value_mean",
+                        "candidate_advantage_mean",
                         "td_target_mean",
                     )
                 ):

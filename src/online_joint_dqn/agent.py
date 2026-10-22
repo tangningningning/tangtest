@@ -1,4 +1,4 @@
-"""面向动态合法候选集合的两阶段 Double DQN。"""
+"""类别内最大优势归一化的两阶段 Dueling Double DQN。"""
 
 from __future__ import annotations
 
@@ -94,6 +94,7 @@ class ActionSelection:
     candidate_counts_by_operation: Mapping[str, int]
     q_statistics_by_operation: Mapping[str, Mapping[str, Any]]
     q_values_by_action_category: Mapping[str, float | None]
+    candidate_advantage: float
 
 
 CandidateRebuilder = Callable[[Mapping[str, Any]], Sequence[CandidateOption]]
@@ -108,7 +109,7 @@ class DoubleDQNAgent:
         candidate_dim: int,
         *,
         learning_rate: float = 2.5e-4,
-        gamma: float = 0.99,
+        gamma: float = 1.0,
         target_network_frequency: int = 500,
         target_tau: float = 1.0,
         max_grad_norm: float = 10.0,
@@ -257,6 +258,8 @@ class DoubleDQNAgent:
             operation for operation in OPERATIONS if candidates_by_operation[operation]
         )
         candidate_values = self.score_candidates(state_features, legal_candidates)
+        centered_advantages = np.empty_like(candidate_values)
+        action_q_values = np.empty_like(candidate_values)
         candidate_counts = {
             operation: len(candidates_by_operation[operation])
             for operation in OPERATIONS
@@ -276,13 +279,16 @@ class DoubleDQNAgent:
                 continue
             indices = [index for index, _ in indexed_options]
             values = candidate_values[indices]
+            centered_advantages[indices] = values - np.max(values)
+            action_q_values[indices] = category_values[operation] + centered_advantages[indices]
             best_offset = int(np.argmax(values))
+            q_values = action_q_values[indices]
             q_statistics[operation] = {
                 "count": len(indices),
-                "mean": float(np.mean(values)),
-                "std": float(np.std(values)),
-                "min": float(np.min(values)),
-                "max": float(values[best_offset]),
+                "mean": float(np.mean(q_values)),
+                "std": float(np.std(q_values)),
+                "min": float(np.min(q_values)),
+                "max": float(q_values[best_offset]),
                 "max_candidate_id": indexed_options[best_offset][1].action.candidate_id,
             }
 
@@ -306,10 +312,10 @@ class DoubleDQNAgent:
                 key=lambda pair: candidate_values[pair[0]],
             )
         category_q = category_values[selected_operation]
-        candidate_q = float(candidate_values[selected_index])
+        candidate_q = float(action_q_values[selected_index])
         return ActionSelection(
             candidate=candidate,
-            q_value=category_q + candidate_q,
+            q_value=candidate_q,
             category_q_value=category_q,
             candidate_q_value=candidate_q,
             explored=explored,
@@ -324,13 +330,35 @@ class DoubleDQNAgent:
                 )
                 for operation in OPERATIONS
             },
+            candidate_advantage=float(centered_advantages[selected_index]),
         )
+
+    def _maximum_advantage_tensor(
+        self, state: torch.Tensor, candidates: Sequence[CandidateOption],
+        *, chunk_size: int = 2048,
+    ) -> torch.Tensor:
+        """保留类别内最大优势的梯度；只按合法候选归一化。"""
+
+        maxima: list[torch.Tensor] = []
+        for start in range(0, len(candidates), chunk_size):
+            chunk = candidates[start:start + chunk_size]
+            features = torch.as_tensor(
+                np.asarray([item.features for item in chunk], dtype=np.float32),
+                device=self.device,
+            )
+            values = self.online_network(state[None, :].expand(len(chunk), -1), features)
+            maxima.append(values.max())
+        if not maxima:
+            raise ValueError("所选动作类别缺少合法候选")
+        return torch.stack(maxima).max()
 
     def _next_action_target(
         self,
         transition: ReplayTransition,
         candidate_rebuilder: CandidateRebuilder | None,
     ) -> tuple[torch.Tensor, str, str]:
+        if not np.isfinite(transition.reward) or int(transition.duration_slots) <= 0:
+            raise ValueError("TD 转移奖励或持续时长非法")
         if transition.terminated:
             return (
                 torch.tensor(
@@ -366,23 +394,22 @@ class DoubleDQNAgent:
         state_tensor = torch.as_tensor(
             state[None, :], dtype=torch.float32, device=self.device
         )
-        candidate_tensor = torch.as_tensor(
-            np.asarray(selected_candidate.features, dtype=np.float32)[None, :],
-            dtype=torch.float32,
-            device=self.device,
-        )
         category_index = OPERATIONS.index(selected_operation)
         with torch.no_grad():
             target_category = self.target_category_network(state_tensor)[
                 0, category_index
             ]
-            target_candidate = self.target_network(
-                state_tensor, candidate_tensor
-            ).squeeze(0)
+            # 目标网只估计在线网选定动作；目标网的类别内最大值仅用于优势归一化。
+            target_advantages = self.score_candidates(
+                state, category_candidates, network=self.target_network
+            )
+            target_advantage = float(
+                target_advantages[selected_index] - np.max(target_advantages)
+            )
             discount = self.gamma ** int(transition.duration_slots)
             target = torch.tensor(
                 float(transition.reward), dtype=torch.float32, device=self.device
-            ) + float(discount) * (target_category + target_candidate)
+            ) + float(discount) * (target_category + target_advantage)
         if not torch.isfinite(target):
             raise FloatingPointError("Double DQN 两阶段 TD 目标包含非有限值")
         return target, selected_operation, selected_candidate.action.candidate_id
@@ -430,13 +457,30 @@ class DoubleDQNAgent:
             1, category_tensor[:, None]
         ).squeeze(1)
         chosen_candidate_values = self.online_network(state_tensor, action_tensor)
-        candidate_advantage_targets = targets - chosen_category_values.detach()
-        category_loss = F.smooth_l1_loss(chosen_category_values, targets)
-        candidate_loss = F.smooth_l1_loss(
-            chosen_candidate_values, candidate_advantage_targets
-        )
-        loss = category_loss + candidate_loss
+        class_maxima: list[torch.Tensor] = []
+        for index, transition in enumerate(transitions):
+            legal_candidates = transition.materialize_current_candidates(candidate_rebuilder)
+            class_candidates = [
+                item for item in legal_candidates
+                if item.action.operation == transition.action.operation
+            ]
+            recorded = next(
+                (item for item in class_candidates
+                 if item.action.candidate_id == transition.action.candidate_id),
+                None,
+            )
+            if recorded is None or recorded.action.to_dict() != transition.action.to_dict() or not np.array_equal(
+                np.asarray(recorded.features, dtype=np.float32), actions[index]
+            ):
+                raise ValueError("当前回放动作/特征与重建的合法候选不一致")
+            class_maxima.append(self._maximum_advantage_tensor(state_tensor[index], class_candidates))
+        centered_advantages = chosen_candidate_values - torch.stack(class_maxima)
+        combined_values = chosen_category_values + centered_advantages
+        # Q=V_category+A-max(A)：类别值就是类别中最佳候选的 Q，两个头共享同一 TD 误差。
+        loss = F.smooth_l1_loss(combined_values, targets)
         self.optimizer.zero_grad(set_to_none=True)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Dueling Double DQN TD loss 非有限")
         loss.backward()
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             [
@@ -445,19 +489,23 @@ class DoubleDQNAgent:
             ],
             self.max_grad_norm,
         )
+        if not torch.isfinite(gradient_norm):
+            self.optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError("Dueling Double DQN 梯度非有限，未执行优化器更新")
         self.optimizer.step()
         self.gradient_steps += 1
         synced = self.gradient_steps % self.target_network_frequency == 0
         if synced:
             self._update_target_network()
-        combined_values = chosen_category_values.detach() + chosen_candidate_values.detach()
         return {
             "td_loss": float(loss.detach().cpu()),
-            "category_td_loss": float(category_loss.detach().cpu()),
-            "candidate_advantage_loss": float(candidate_loss.detach().cpu()),
-            "q_value_mean": float(combined_values.mean().cpu()),
+            "category_td_loss": None,
+            "candidate_advantage_loss": None,
+            "td_loss_semantics": "joint_category_max_centered_dueling_q_huber",
+            "q_value_mean": float(combined_values.detach().mean().cpu()),
             "category_q_value_mean": float(chosen_category_values.detach().mean().cpu()),
-            "candidate_q_value_mean": float(chosen_candidate_values.detach().mean().cpu()),
+            "candidate_q_value_mean": float(combined_values.detach().mean().cpu()),
+            "candidate_advantage_mean": float(centered_advantages.detach().mean().cpu()),
             "td_target_mean": float(targets.mean().cpu()),
             "gradient_norm_before_clip": float(gradient_norm.detach().cpu()),
             "gradient_step": float(self.gradient_steps),
@@ -483,7 +531,8 @@ class DoubleDQNAgent:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "agent_state_schema_version": 2,
+            "agent_state_schema_version": 3,
+            "q_aggregation_contract": "category_max_centered_dueling_v1",
             "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
             "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
             "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
@@ -512,8 +561,10 @@ class DoubleDQNAgent:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if int(state.get("agent_state_schema_version", -1)) != 2:
-            raise ValueError("旧版单阶段 DQN Checkpoint，缺少双头网络合同，拒绝恢复")
+        if int(state.get("agent_state_schema_version", -1)) != 3:
+            raise ValueError("旧版 DQN Checkpoint 不符合类别内最大优势归一化合同，拒绝恢复")
+        if state.get("q_aggregation_contract") != "category_max_centered_dueling_v1":
+            raise ValueError("Checkpoint Q 聚合语义不兼容，拒绝恢复")
         expected_contract = {
             "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
             "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
@@ -544,6 +595,9 @@ class DoubleDQNAgent:
             raise ValueError("Checkpoint 学习率与当前实验不一致，拒绝恢复")
         if state.get("optimizer_type") != type(self.optimizer).__name__:
             raise ValueError("Checkpoint 优化器类型与当前实验不一致，拒绝恢复")
+        for name in ("gamma", "target_network_frequency", "target_tau", "max_grad_norm"):
+            if state.get(name) != getattr(self, name):
+                raise ValueError(f"Checkpoint {name} 与当前学习合同不一致，拒绝恢复")
         required = (
             "online_category_network",
             "target_category_network",
