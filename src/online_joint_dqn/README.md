@@ -11,7 +11,7 @@
 
 P0 优化固定长度 Episode 的平均期望系统效用。固定长度下，最大化不折扣的累计效用与该目标等价，所以独立 DQN 默认及共享 Runner 显式使用 `gamma=1.0`；保留 `gamma ** duration_slots` 接口。没有修改正式奖励、成本权重或系统配置。
 
-本项目现行的 `KEEP_STAY` / `CACHE_UPDATE` / `UAV_MOVE` 互斥规则、缓存必须同时移除并新增服务的 REPLACE 规则，是比文档 P0 更严格的动作限制。缓存只保证全部合法单节点替换完整保留，跨节点组合和连续 UAV 位置仍为有限候选。本算法因此优化受限动作空间，不能宣称求解了 P0 的完整动作空间或其全局最优解。
+本项目现行的 `KEEP_STAY` / `CACHE_UPDATE` / `UAV_MOVE` 互斥规则、缓存必须同时移除并新增服务的 REPLACE 规则，是比文档 P0 更严格的动作限制。缓存候选完整保留全部合法单节点替换，并从各节点预测/覆盖锚点中确定性提议最多 8 个双节点替换组合；候选扫描上限为 32，并在诊断中记录截断。较高阶跨节点组合和连续 UAV 位置仍未穷举。本算法因此优化受限动作空间，不能宣称求解了 P0 的完整动作空间或其全局最优解。
 
 ## 信息与候选合同
 
@@ -46,7 +46,7 @@ y = reward + gamma ** duration_slots * Q_target(s_next,a*)
 Replay 保存语义动作、所选动作特征、实际奖励、时长，以及当前/下一状态的压缩预测重建上下文和候选数量/ID 摘要，不保存完整候选特征矩阵。重建当前类别候选用于优势归一化，重建下一候选用于 Double DQN。相邻转移重复的状态上下文通过引用共享，环形淘汰时释放引用，Checkpoint 恢复时重新共享。
 所有候选重建均校验状态指纹、候选 ID、所选目标和特征；上下文只包含决策可见的状态与预测。
 
-候选特征合同为 `prediction_only_uav_cache_complementarity_v3`，架构版本为 `legal_candidate_mean_centered_dueling_q_v4`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 5、Replay schema 6、Manifest v7、Checkpoint schema 8。旧架构/旧回放明确拒绝恢复；历史文件保留。学习率、折扣、源码身份与数据身份继续参与恢复校验。
+候选特征合同为 `prediction_only_uav_cache_complementarity_v3`，候选生成合同为 `bounded_anchor_pair_cache_replace_v1`，架构版本为 `legal_candidate_mean_centered_dueling_q_v4`；状态合同 `formal_observation_horizon_workload_candidate_demand_v3`、Agent schema 5、Replay schema 6、Manifest v7、Checkpoint schema 8。候选重建上下文采用 v5，并将候选生成合同纳入摘要；旧架构、旧候选上下文或源码身份不同的 Checkpoint 会被恢复门禁拒绝，历史文件保留。学习率、折扣、源码身份与数据身份继续参与恢复校验。
 
 `selected_category_q` 是类别均值 Q（类别头输出）；`selected_candidate_q` 与 `selected_q_value` 都是所选动作完整 Q；`selected_candidate_advantage` 是类别均值中心化优势，可正可负且类内均值为零。类别候选统计采用完整 Q，`td_loss` 是统一 TD loss。旧的 `category_td_loss` / `candidate_advantage_loss` 字段保留为不可用值 `null`，不伪造两份独立 loss。
 缓存变化、服务增删和 UAV 移动取实际前后状态差；成本和任务执行节点来自正式结果。预测缓存覆盖率独立标记，不能称为实际命中率或据其宣称缓存更新的因果收益。

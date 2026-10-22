@@ -33,6 +33,10 @@ from .candidate_features import (
 
 # DQN 在正式执行器的配置副本中使用独立的 UAV 移动成本权重。
 DQN_BETA_Q = 0.001
+CANDIDATE_GENERATION_CONTRACT_VERSION = "bounded_anchor_pair_cache_replace_v1"
+DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT = 8
+DQN_CROSS_NODE_PAIR_SCAN_LIMIT = 32
+CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v5"
 
 
 def _apply_dqn_utility_weights(context: Any) -> None:
@@ -118,6 +122,7 @@ _CANDIDATE_REBUILD_IDENTITY_FIELDS = (
     "prediction_horizon_mask",
     "state_feature_contract_version",
     "candidate_feature_contract_version",
+    "candidate_generation_contract_version",
     "network_architecture_version",
     "candidate_count",
     "candidate_ids_sha256",
@@ -153,6 +158,126 @@ def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
         digest.update(candidate.action.candidate_id.encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _bounded_cross_node_pair_cache_targets(
+    current_cache_state: Any,
+    exact_targets_by_node: Mapping[int, Sequence[Any]],
+    node_ids: Sequence[str],
+    service_sizes_mb: Any,
+    capacities_mb: Any,
+    *,
+    slot_id: int,
+    existing_target_keys: set[bytes],
+) -> tuple[list[tuple[np.ndarray, str]], dict[str, Any]]:
+    """从已验证的单节点 REPLACE 提议构造少量确定性双节点组合。"""
+
+    cache_state = np.asarray(current_cache_state, dtype=np.int8)
+    sizes = np.asarray(service_sizes_mb, dtype=np.float64).reshape(-1)
+    capacities = np.asarray(capacities_mb, dtype=np.float64).reshape(-1)
+    if cache_state.ndim != 2 or cache_state.shape != (len(node_ids), len(sizes)):
+        raise ValueError("双节点缓存提议的状态、节点和服务维度不一致")
+    if capacities.shape != (len(node_ids),) or not np.isfinite(capacities).all():
+        raise ValueError("双节点缓存提议的节点容量无效")
+
+    source_priority = {
+        "prediction": 0,
+        "coverage_anchor": 1,
+        "intermediate": 2,
+        "low_reconfiguration": 3,
+        "exhaustive_feasible": 4,
+    }
+    representatives: dict[int, tuple[np.ndarray, str]] = {}
+    for node_index, node_id in enumerate(node_ids):
+        by_target: dict[bytes, tuple[np.ndarray, str]] = {}
+        for candidate in exact_targets_by_node.get(node_index, ()):
+            if (
+                int(candidate.node_index) != node_index
+                or str(candidate.node_id) != str(node_id)
+            ):
+                raise ValueError("单节点缓存候选的节点索引与 ID 不一致")
+            target = np.asarray(candidate.target_node_cache, dtype=np.int8).reshape(-1)
+            if (
+                target.shape != (cache_state.shape[1],)
+                or not np.all(np.isin(target, [0, 1]))
+                or not cache_configuration.is_legal_cache_replacement(
+                    cache_state[node_index], target
+                )
+                or not cache_configuration.is_node_feasible(
+                    target, sizes, float(capacities[node_index])
+                )
+            ):
+                continue
+            key = np.ascontiguousarray(target, dtype=np.int8).tobytes()
+            source = str(candidate.proposal_source)
+            by_target.setdefault(key, (target.copy(), source))
+        if by_target:
+            representatives[node_index] = min(
+                by_target.values(),
+                key=lambda item: (
+                    source_priority.get(item[1], len(source_priority)),
+                    np.ascontiguousarray(item[0], dtype=np.int8).tobytes(),
+                ),
+            )
+
+    active_nodes = sorted(representatives)
+    if active_nodes:
+        offset = max(0, int(slot_id)) % len(active_nodes)
+        active_nodes = active_nodes[offset:] + active_nodes[:offset]
+    potential_pair_count = len(active_nodes) * (len(active_nodes) - 1) // 2
+    retained: list[tuple[np.ndarray, str]] = []
+    seen_keys: set[bytes] = set()
+    scanned_pair_count = 0
+    duplicate_existing_count = 0
+    candidate_limit_omitted_count = 0
+    truncated = False
+    for left_offset, left_node in enumerate(active_nodes):
+        for right_node in active_nodes[left_offset + 1 :]:
+            if scanned_pair_count >= DQN_CROSS_NODE_PAIR_SCAN_LIMIT:
+                truncated = True
+                break
+            scanned_pair_count += 1
+            target_state = cache_state.copy()
+            target_state[left_node] = representatives[left_node][0]
+            target_state[right_node] = representatives[right_node][0]
+            key = np.ascontiguousarray(target_state, dtype=np.int8).tobytes()
+            if key in existing_target_keys or key in seen_keys:
+                duplicate_existing_count += 1
+                continue
+            if len(retained) >= DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT:
+                candidate_limit_omitted_count = 1
+                truncated = True
+                break
+            seen_keys.add(key)
+            retained.append(
+                (
+                    target_state,
+                    "bounded_pair:"
+                    f"{node_ids[left_node]}:{representatives[left_node][1]}+"
+                    f"{node_ids[right_node]}:{representatives[right_node][1]}",
+                )
+            )
+        if truncated:
+            break
+    unscanned_pair_count = max(0, potential_pair_count - scanned_pair_count)
+    if unscanned_pair_count:
+        truncated = True
+    return retained, {
+        "cache_cross_node_pair_candidate_source_node_count": len(active_nodes),
+        "cache_cross_node_pair_potential_representative_count": potential_pair_count,
+        "cache_cross_node_pair_proposals_scanned_count": scanned_pair_count,
+        "cache_cross_node_pair_candidates_retained_count": len(retained),
+        "cache_cross_node_pair_candidates_deduplicated_count": duplicate_existing_count,
+        "cache_cross_node_pair_candidate_limit": DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT,
+        "cache_cross_node_pair_scan_limit": DQN_CROSS_NODE_PAIR_SCAN_LIMIT,
+        "cache_cross_node_pair_unscanned_count": unscanned_pair_count,
+        "cache_cross_node_pair_candidates_omitted_lower_bound": (
+            candidate_limit_omitted_count + unscanned_pair_count
+        ),
+        "cache_cross_node_pair_candidates_truncated": bool(truncated),
+        "cache_cross_node_pair_generation_complete_within_policy": not truncated,
+        "cache_cross_node_pair_combinations_exhaustive": False,
+    }
 
 
 class ExclusiveDQNEnvironment:
@@ -467,6 +592,7 @@ class ExclusiveDQNEnvironment:
         cache_proposal_count = 0
         single_node_diagnostics: dict[str, dict[str, Any]] = {}
         single_node_counts: dict[str, int] = {}
+        exact_targets_by_node: dict[int, tuple[Any, ...]] = {}
         raw_combination_count = 0
         capacity_feasible_count = 0
         legal_replace_count = 0
@@ -486,6 +612,7 @@ class ExclusiveDQNEnvironment:
             )
             single_node_diagnostics[str(node_id)] = node_diagnostics
             single_node_counts[str(node_id)] = len(exact_targets)
+            exact_targets_by_node[node_index] = tuple(exact_targets)
             raw_combination_count += int(node_diagnostics["raw_combination_count"])
             capacity_feasible_count += int(
                 node_diagnostics["capacity_feasible_count"]
@@ -517,8 +644,29 @@ class ExclusiveDQNEnvironment:
                 key,
                 (target_state.copy(), f"bounded_proposal:{target.proposal_source}"),
             )
+        pair_targets, pair_diagnostics = _bounded_cross_node_pair_cache_targets(
+            cache_state,
+            exact_targets_by_node,
+            tuple(str(item) for item in cache_nodes["node_ids"]),
+            candidate_input.model.service_catalog["service_sizes_mb"],
+            cache_nodes["capacities_mb"],
+            slot_id=int(candidate_input.slot_id),
+            existing_target_keys=set(cache_targets_by_key),
+        )
+        for target_state, proposal_source in pair_targets:
+            cache_proposal_count += 1
+            key = np.ascontiguousarray(target_state, dtype=np.int8).tobytes()
+            cache_targets_by_key.setdefault(
+                key, (target_state.copy(), proposal_source)
+            )
         cache_candidates_deduplicated_count = (
-            cache_proposal_count - len(cache_targets_by_key)
+            cache_proposal_count
+            - len(cache_targets_by_key)
+            + int(
+                pair_diagnostics[
+                    "cache_cross_node_pair_candidates_deduplicated_count"
+                ]
+            )
         )
         for target_state, proposal_source in cache_targets_by_key.values():
             action = ActionCandidate.from_states(
@@ -614,11 +762,13 @@ class ExclusiveDQNEnvironment:
                 )
             ),
             "cache_cross_node_candidates_retained_count": sum(
-                len(target.changed_node_ids) > 1
-                for target in bounded_cache_targets
+                int(np.count_nonzero(np.any(target_state != cache_state, axis=1))) > 1
+                for target_state, _ in cache_targets_by_key.values()
             ),
             "cache_cross_node_combinations_exhaustive": False,
+            **pair_diagnostics,
             "cache_bounded_generator_complete": bool(bounded_cache_complete),
+            "cache_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
         }
         diagnostics = {
             "candidate_count": len(unique),
@@ -628,15 +778,25 @@ class ExclusiveDQNEnvironment:
             },
             "cache_candidate_generation_complete": bool(
                 bounded_cache_complete
+                and pair_diagnostics[
+                    "cache_cross_node_pair_generation_complete_within_policy"
+                ]
             ),
             "uav_candidate_generation_complete": bool(uav_generation_complete),
             "candidate_generation_complete_within_bounded_proposal_policy": bool(
-                bounded_cache_complete and uav_generation_complete
+                bounded_cache_complete
+                and pair_diagnostics[
+                    "cache_cross_node_pair_generation_complete_within_policy"
+                ]
+                and uav_generation_complete
             ),
             "candidate_legal_action_space_exhaustive": False,
+            "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
             "cache_candidate_generation_diagnostics": cache_generation_diagnostics,
             "uav_candidate_generation_diagnostics": uav_generation_diagnostics,
-            "dqn_adapter_additional_candidate_truncation": False,
+            "dqn_adapter_additional_candidate_truncation": bool(
+                pair_diagnostics["cache_cross_node_pair_candidates_truncated"]
+            ),
             "dqn_adapter_cache_candidate_limit": int(
                 self.search_budget.max_cache_candidates
             ),
@@ -701,7 +861,7 @@ class ExclusiveDQNEnvironment:
                 "候选重建预测输入缺少字段：" + ", ".join(missing_scenario_fields)
             )
         context = {
-            "schema_version": "dqn_candidate_rebuild_context_v4",
+            "schema_version": CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION,
             "source_state_fingerprint": self._cached_state_fingerprint,
             "state_features": self._cached_state_features.copy(),
             "cache_state": self.cache_state.copy(),
@@ -724,6 +884,7 @@ class ExclusiveDQNEnvironment:
             ),
             "state_feature_contract_version": self.encoder.state_feature_contract_version,
             "candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
+            "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
             "network_architecture_version": self.encoder.network_architecture_version,
             "candidate_count": len(self._cached_candidates),
             "candidate_ids_sha256": _candidate_ids_sha256(self._cached_candidates),
@@ -739,7 +900,7 @@ class ExclusiveDQNEnvironment:
     ) -> tuple[CandidateOption, ...]:
         """仅由回放中的合法状态上下文和预测输入确定性重建候选。"""
 
-        if context.get("schema_version") != "dqn_candidate_rebuild_context_v4":
+        if context.get("schema_version") != CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION:
             raise ValueError("回放候选重建上下文版本不兼容")
         if context.get("candidate_rebuild_payload_sha256") != (
             _candidate_rebuild_payload_sha256(context)
@@ -747,6 +908,8 @@ class ExclusiveDQNEnvironment:
             raise ValueError("回放候选重建上下文摘要不匹配")
         if context.get("candidate_feature_contract_version") != self.encoder.candidate_feature_contract_version:
             raise ValueError("回放候选特征合同与当前编码器不一致")
+        if context.get("candidate_generation_contract_version") != CANDIDATE_GENERATION_CONTRACT_VERSION:
+            raise ValueError("回放候选生成合同与当前生成器不一致")
         if context.get("state_feature_contract_version") != self.encoder.state_feature_contract_version:
             raise ValueError("回放状态特征合同与当前编码器不一致")
         if context.get("network_architecture_version") != self.encoder.network_architecture_version:

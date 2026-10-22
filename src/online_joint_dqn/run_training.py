@@ -38,6 +38,9 @@ from online_joint_dqn.candidate_features import (  # noqa: E402
 )
 from online_joint_dqn.environment_adapter import (  # noqa: E402
     DQN_BETA_Q,
+    CANDIDATE_GENERATION_CONTRACT_VERSION,
+    DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT,
+    DQN_CROSS_NODE_PAIR_SCAN_LIMIT,
     ExclusiveDQNEnvironment,
 )
 from online_joint_dqn.replay_buffer import ReplayBuffer  # noqa: E402
@@ -673,6 +676,7 @@ def _run_identity(
         },
         "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
         "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
+        "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
         "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
         "seed": int(seed),
         "learning_rate": float(agent.optimizer.param_groups[0]["lr"]),
@@ -709,6 +713,10 @@ def _run_identity(
         "replay_capacity": int(replay_capacity),
         "replay_buffer_schema_version": ReplayBuffer.STATE_SCHEMA_VERSION,
         "candidate_capacity_limits": dict(search_budget),
+        "candidate_generation_limits": {
+            "cross_node_pair_proposal_limit": DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT,
+            "cross_node_pair_scan_limit": DQN_CROSS_NODE_PAIR_SCAN_LIMIT,
+        },
         "code_identity": _code_identity(),
     }
     identity["identity_sha256"] = _identity_sha256(identity)
