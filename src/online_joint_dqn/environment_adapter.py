@@ -31,6 +31,34 @@ from .candidate_features import (
 )
 
 
+# DQN 在正式执行器的配置副本中使用独立的 UAV 移动成本权重。
+DQN_BETA_Q = 0.001
+
+
+def _apply_dqn_utility_weights(context: Any) -> None:
+    """只覆盖 DQN Episode 配置副本中的系统效用权重。"""
+
+    config = context.cfg
+    objective = config.get("objective")
+    if not isinstance(objective, dict):
+        raise TypeError("DQN Episode 配置缺少可修改的 objective 字典")
+    beta_ca = float(objective["beta_ca"])
+    objective["beta_q"] = DQN_BETA_Q
+
+    metadata = config.get("_meta")
+    if not isinstance(metadata, dict):
+        raise TypeError("DQN Episode 配置缺少元数据字典")
+    normalization = metadata.get("reward_cost_normalization")
+    if not isinstance(normalization, dict):
+        raise TypeError("DQN Episode 配置缺少成本归一化元数据")
+    weights = normalization.get("system_utility_weights")
+    if not isinstance(weights, dict):
+        raise TypeError("DQN Episode 配置缺少系统效用权重元数据")
+    weights["beta_ca"] = beta_ca
+    weights["beta_q"] = DQN_BETA_Q
+    weights["source"] = "DQN-local override; formal shared configuration unchanged"
+
+
 @dataclass(frozen=True)
 class EnvironmentTransition:
     """正式执行器返回的真实单 Slot 奖励及推进后的状态。"""
@@ -238,6 +266,7 @@ class ExclusiveDQNEnvironment:
             expected_episode_count=pool_contract.FORMAL_TRAINING_EPISODE_COUNT,
         )
         context = pool_contract._episode_context(root, pool, int(episode_seed), pool_info)
+        _apply_dqn_utility_weights(context)
         steps = aligned_train_steps(
             context,
             origin_start=int(origin_start),

@@ -37,6 +37,7 @@ from online_joint_dqn.candidate_features import (  # noqa: E402
     STATE_FEATURE_CONTRACT_VERSION,
 )
 from online_joint_dqn.environment_adapter import (  # noqa: E402
+    DQN_BETA_Q,
     ExclusiveDQNEnvironment,
 )
 from online_joint_dqn.replay_buffer import ReplayBuffer  # noqa: E402
@@ -660,9 +661,16 @@ def _run_identity(
 ) -> dict[str, Any]:
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
+    beta_ca = float(project_config.get_config_value(config, "objective.beta_ca"))
     identity = {
         "algorithm": "legal_candidate_mean_centered_dueling_double_dqn_exclusive_v4",
         "objective_contract": "finite_episode_undiscounted_system_utility_v1",
+        "dqn_system_utility": {
+            "formula": "G=Q_task-beta_ca*C_ca-beta_q*C_q",
+            "beta_ca": beta_ca,
+            "beta_q": DQN_BETA_Q,
+            "beta_q_source": "online_joint_dqn.environment_adapter.DQN_BETA_Q",
+        },
         "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
         "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
         "network_architecture_version": NETWORK_ARCHITECTURE_VERSION,
@@ -788,6 +796,8 @@ def _write_run_summary(
     elapsed_seconds: float,
     total_slots: int,
     learning_rate: float,
+    beta_ca: float,
+    beta_q: float,
 ) -> None:
     evaluation_status: dict[str, Any] = {}
     evaluation_status_path = path.parent / "evaluation_status.json"
@@ -854,6 +864,9 @@ def _write_run_summary(
         "gradient_updates": int(gradient_steps),
         "learning_rate": float(learning_rate),
         "optimizer_type": "Adam",
+        "system_utility_formula": "G=Q_task-beta_ca*C_ca-beta_q*C_q",
+        "beta_ca": float(beta_ca),
+        "beta_q": float(beta_q),
         "action_execution_counts": totals,
         "mean_episode_cumulative_utility": (
             sum(episode_utilities) / len(episode_utilities) if episode_utilities else None
@@ -940,7 +953,7 @@ def _normalization_config_line(config: Mapping[str, Any]) -> str:
         get(config, "objective.cost_normalization.cache_reference_s_per_node")
     )
     beta_ca = float(get(config, "objective.beta_ca"))
-    beta_q = float(get(config, "objective.beta_q"))
+    beta_q = DQN_BETA_Q
     energy_references = uav_configuration.movement_energy_upper_bounds_by_uav_j(
         dict(config)
     )
@@ -1020,6 +1033,10 @@ def run_training(
     pool_info = _validate_training_pool()
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     runtime_config = project_config.parse_toml_file(config_path)
+    beta_ca = float(
+        project_config.get_config_value(runtime_config, "objective.beta_ca")
+    )
+    beta_q = DQN_BETA_Q
     evaluation_gate = _independent_evaluation_gate(config_path, runtime_config)
     print(_normalization_config_line(runtime_config), flush=True)
 
@@ -1193,6 +1210,8 @@ def run_training(
         elapsed_seconds=0.0,
         total_slots=total_slots,
         learning_rate=learning_rate,
+        beta_ca=beta_ca,
+        beta_q=beta_q,
     )
 
     plot_executor = ThreadPoolExecutor(
@@ -1455,6 +1474,8 @@ def run_training(
                     elapsed_seconds=time.perf_counter() - run_start,
                     total_slots=total_slots,
                     learning_rate=learning_rate,
+                    beta_ca=beta_ca,
+                    beta_q=beta_q,
                 )
                 elapsed = previous_training_elapsed_seconds + (
                     time.perf_counter() - run_start
@@ -1547,6 +1568,8 @@ def run_training(
             elapsed_seconds=time.perf_counter() - run_start,
             total_slots=total_slots,
             learning_rate=learning_rate,
+            beta_ca=beta_ca,
+            beta_q=beta_q,
         )
         collect_plot_jobs(wait_for_all=False)
         plot_executor.shutdown(wait=False, cancel_futures=False)
@@ -1572,6 +1595,8 @@ def run_training(
         elapsed_seconds=time.perf_counter() - run_start,
         total_slots=total_slots,
         learning_rate=learning_rate,
+        beta_ca=beta_ca,
+        beta_q=beta_q,
     )
     if status == "FORMAL_TRAINING_COMPLETE":
         submit_plot_snapshot(next_episode_index)
