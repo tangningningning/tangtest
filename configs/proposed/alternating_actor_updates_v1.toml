@@ -359,9 +359,9 @@ omega_delay = 0.5
 omega_energy = 0.5
 # 系统效用外部权重：G=Q-beta_ca*C_ca-beta_q*C_q。
 # beta_ca=1.0 保持当前直接扣除归一化 Cache 成本的有效系数。
-# beta_q=0.00225 保持原有效 UAV 系数 (5e-6 J^-1)*(450 J)。
+# 若保留旧成本 lambda_movement*sum_u(E_mov,u)，且当前 C_q=sum_u(E_mov,u/E_ref,u)、每架 E_ref,u=225 J，则等价 beta_q=lambda_movement*225=0.001125。
 beta_ca = 1.0
-beta_q = 0.00225
+beta_q = 0.001125
 # Cache 只惩罚实际新增服务下载时延：T_ca,m=sum_f((8e6*s_f_MB/R_m_back,bps)*max(c_new-c_old,0))。
 # 服务大小为十进制 MB、速率为 bit/s，换算因子 8e6 bit/MB；删除服务不产生下载成本。
 # 环境初始化按每个可在线更新节点固定 T_ca,m_ref=8e6*cache_capacity_m_MB/R_m_back,m_bps；这是容量上界，不声称可由离散服务目录精确达到。
@@ -395,7 +395,7 @@ movement_distance_model = "horizontal_2d_euclidean"
 movement_cost_formula = "C_q=sum_u(E_mov_u_J/E_mov_u_ref_J)"
 system_utility_formula = "G=Q-beta_ca*C_ca-beta_q*C_q"
 beta_ca_source = "explicit objective.beta_ca; preserves previous direct Cache cost deduction"
-beta_q_source = "explicit objective.beta_q; preserves (legacy 5e-6 J^-1)*(sum_u E_mov_u_ref_J=450 J)"
+beta_q_source = "equivalent to legacy lambda_movement*sum_u(E_mov_u_J) under C_q=sum_u(E_mov_u_J/E_mov_u_ref_J) and E_mov_u_ref_J=225 J per UAV"
 
 [prediction.vehicle]
 # 车辆预测 horizon H_p。当前实际值 5；修改需重跑车辆预测、GRU、scenario。
