@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "optimize-for-gpu": {
+      "source": "K-Dense-AI/scientific-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/optimize-for-gpu/SKILL.md",
+      "computedHash": "133228f268cf1474c8acc4b78d9880151eb7850dcb94d3559ae06af41e4e042d"
+    },
+    "stable-baselines3": {
+      "source": "K-Dense-AI/scientific-agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/stable-baselines3/SKILL.md",
+      "computedHash": "070cc7848c613611feed3532aa8947fa570c5a836fa1c1132fde48927eb70d0d"
+    }
+  }
+}

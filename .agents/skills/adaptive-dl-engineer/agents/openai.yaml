@@ -1,0 +1,6 @@
+interface:
+  display_name: "Adaptive Deep Learning Engineer"
+  short_description: "Fix and optimize deep-learning code with evidence"
+  default_prompt: "Use $adaptive-dl-engineer to trace the root cause, implement the smallest correct fix, and run only targeted verification."
+policy:
+  allow_implicit_invocation: true
