@@ -114,6 +114,50 @@ def _candidate_best_q(row: Mapping[str, Any], operation: str) -> float | None:
     return None
 
 
+def _greedy_argmax_result(row: Mapping[str, Any]) -> bool | None:
+    """Reconstruct the logged global-Q choice from per-operation maxima.
+
+    Per-operation statistics preserve each full-Q maximum and its stable
+    candidate ID, so historical rows can be checked even when they predate
+    the explicit ``greedy_global_argmax_pass`` field.
+    """
+
+    if _selection_mode(row) != "greedy":
+        return None
+    selected_q = _selected_q(row)
+    selected_id = _action_id(row)
+    if selected_q is None or selected_id is None:
+        return None
+
+    statistics = _q_statistics(row)
+    best_by_operation = row.get("best_candidate_by_operation")
+    maxima: list[tuple[float, str]] = []
+    for operation in OPERATIONS:
+        best_q = _candidate_best_q(row, operation)
+        if best_q is None:
+            continue
+        candidate_id: Any = None
+        if isinstance(best_by_operation, Mapping):
+            best_record = best_by_operation.get(operation)
+            if isinstance(best_record, Mapping):
+                candidate_id = best_record.get("candidate_id")
+        if candidate_id is None:
+            stat = statistics.get(operation)
+            if isinstance(stat, Mapping):
+                candidate_id = stat.get("max_candidate_id")
+        if candidate_id is None:
+            return None
+        maxima.append((best_q, str(candidate_id)))
+    if not maxima:
+        return None
+
+    maximum_q = max(q_value for q_value, _ in maxima)
+    expected_id = min(
+        candidate_id for q_value, candidate_id in maxima if q_value == maximum_q
+    )
+    return selected_q == maximum_q and selected_id == expected_id
+
+
 def _selected_q(row: Mapping[str, Any]) -> float | None:
     return _number(row.get("selected_q_value", row.get("selected_candidate_q")))
 
@@ -211,6 +255,22 @@ def analyze_step_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     missing_fields: dict[str, int] = {}
     cost_unavailable = {"cache": 0, "movement": 0}
     truncation = {"n": 0, "truncated": 0, "bounded_complete": 0, "exhaustive": 0}
+    search_policy = {
+        "cache_diagnostics_n": 0,
+        "cache_candidate_budget_reached_n": 0,
+        "cache_generated_candidate_counts": [],
+        "cache_candidate_limits": [],
+        "cache_omitted_generated_proposal_total": 0,
+        "cross_node_pair_truncated_n": 0,
+        "cross_node_pair_scan_limit_touched_n": 0,
+        "cross_node_pair_retention_limit_omitted_n": 0,
+        "cross_node_pair_retention_limit_omitted_total": 0,
+        "cross_node_pair_unscanned_total": 0,
+        "cross_node_pair_candidates_retained_total": 0,
+        "uav_diagnostics_n": 0,
+        "uav_candidate_limit_reached_n": 0,
+        "incomplete_reason_counts": Counter(),
+    }
     anomalies = {
         "cache_update_without_cache_change": 0,
         "uav_move_without_uav_change": 0,
@@ -219,8 +279,11 @@ def analyze_step_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "selected_action_not_marked_legal": 0,
         "selected_action_not_marked_constraint_valid": 0,
         "greedy_global_argmax_failure": 0,
+        "greedy_global_argmax_flag_reconstruction_mismatch": 0,
         "reward_recomposition_residual_over_1e-8": 0,
     }
+    greedy_argmax_check_count = 0
+    greedy_argmax_unverifiable_count = 0
     required_fields = (
         "candidate_counts_by_operation",
         "candidate_q_statistics_by_operation",
@@ -396,6 +459,77 @@ def analyze_step_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
         truncation["exhaustive"] += int(row.get("candidate_legal_action_space_exhaustive") is True)
 
+        cache_search = row.get("cache_candidate_generation_diagnostics")
+        if isinstance(cache_search, Mapping):
+            search_policy["cache_diagnostics_n"] += 1
+            search_policy["incomplete_reason_counts"].update(
+                str(reason)
+                for reason in cache_search.get("incomplete_reasons", ())
+            )
+            generated_count = _number(
+                cache_search.get("generated_candidate_count_including_keep")
+            )
+            candidate_limit = _number(
+                cache_search.get("candidate_limit_including_keep")
+            )
+            if generated_count is not None:
+                search_policy["cache_generated_candidate_counts"].append(generated_count)
+            if candidate_limit is not None:
+                search_policy["cache_candidate_limits"].append(candidate_limit)
+            if bool(cache_search.get("per_node_limit_reached")) or (
+                generated_count is not None
+                and candidate_limit is not None
+                and generated_count >= candidate_limit
+            ):
+                search_policy["cache_candidate_budget_reached_n"] += 1
+            search_policy["cache_omitted_generated_proposal_total"] += int(
+                _number(cache_search.get("omitted_generated_proposal_count")) or 0
+            )
+
+            pair_truncated = cache_search.get(
+                "cache_cross_node_pair_candidates_truncated"
+            ) is True
+            search_policy["cross_node_pair_truncated_n"] += int(pair_truncated)
+            scan_limit = _number(cache_search.get("cache_cross_node_pair_scan_limit"))
+            scanned = _number(
+                cache_search.get("cache_cross_node_pair_proposals_scanned_count")
+            )
+            if scan_limit is not None and scanned is not None and scanned >= scan_limit:
+                search_policy["cross_node_pair_scan_limit_touched_n"] += 1
+            retention_omitted = int(
+                _number(
+                    cache_search.get(
+                        "cache_cross_node_pair_retention_limit_omitted_count"
+                    )
+                )
+                or 0
+            )
+            search_policy["cross_node_pair_retention_limit_omitted_n"] += int(
+                retention_omitted > 0
+            )
+            search_policy["cross_node_pair_retention_limit_omitted_total"] += (
+                retention_omitted
+            )
+            search_policy["cross_node_pair_unscanned_total"] += int(
+                _number(cache_search.get("cache_cross_node_pair_unscanned_count"))
+                or 0
+            )
+            search_policy["cross_node_pair_candidates_retained_total"] += int(
+                _number(
+                    cache_search.get("cache_cross_node_pair_candidates_retained_count")
+                )
+                or 0
+            )
+
+        uav_search = row.get("uav_candidate_generation_diagnostics")
+        if isinstance(uav_search, Mapping):
+            search_policy["uav_diagnostics_n"] += 1
+            search_policy["incomplete_reason_counts"].update(
+                str(reason) for reason in uav_search.get("incomplete_reasons", ())
+            )
+            if bool(uav_search.get("per_uav_limit_reached")):
+                search_policy["uav_candidate_limit_reached_n"] += 1
+
         action = row.get("selected_candidate_action")
         target_execution_mismatch = False
         if isinstance(action, Mapping):
@@ -437,8 +571,28 @@ def analyze_step_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             )
         ):
             anomalies["selected_action_not_marked_constraint_valid"] += 1
-        if row.get("greedy_global_argmax_pass") is False:
-            anomalies["greedy_global_argmax_failure"] += 1
+        if _selection_mode(row) == "greedy":
+            reconstructed_argmax_pass = _greedy_argmax_result(row)
+            recorded_argmax_pass = row.get("greedy_global_argmax_pass")
+            if reconstructed_argmax_pass is not None:
+                greedy_argmax_check_count += 1
+                anomalies["greedy_global_argmax_failure"] += int(
+                    not reconstructed_argmax_pass
+                )
+                if (
+                    isinstance(recorded_argmax_pass, bool)
+                    and recorded_argmax_pass != reconstructed_argmax_pass
+                ):
+                    anomalies[
+                        "greedy_global_argmax_flag_reconstruction_mismatch"
+                    ] += 1
+            elif isinstance(recorded_argmax_pass, bool):
+                greedy_argmax_check_count += 1
+                anomalies["greedy_global_argmax_failure"] += int(
+                    not recorded_argmax_pass
+                )
+            else:
+                greedy_argmax_unverifiable_count += 1
 
     action_summary: dict[str, Any] = {}
     outcome_summary: dict[str, Any] = {}
@@ -549,11 +703,9 @@ def analyze_step_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 operation: _summarize(values)
                 for operation, values in q_gaps_by_operation.items()
             },
-            "greedy_argmax_check_n": sum(
-                row.get("greedy_global_argmax_pass") is not None
-                for row in rows
-            ),
+            "greedy_argmax_check_n": greedy_argmax_check_count,
             "greedy_argmax_failure_n": anomalies["greedy_global_argmax_failure"],
+            "greedy_argmax_unverifiable_n": greedy_argmax_unverifiable_count,
         },
         "outcome_summary_by_operation": outcome_summary,
         "reward_decomposition": {
@@ -598,6 +750,27 @@ def analyze_step_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "truncation_rate": truncation["truncated"] / truncation["n"] if truncation["n"] else None,
             "candidate_q_distributions_are_state_weighted_summaries": True,
             "q_values_reconstructed_from_category_value": False,
+            "search_policy_diagnostics": {
+                **{
+                    key: value
+                    for key, value in search_policy.items()
+                    if key
+                    not in {
+                        "cache_generated_candidate_counts",
+                        "cache_candidate_limits",
+                        "incomplete_reason_counts",
+                    }
+                },
+                "cache_generated_candidate_count_including_keep": _summarize(
+                    search_policy["cache_generated_candidate_counts"]
+                ),
+                "cache_candidate_limit_including_keep": _summarize(
+                    search_policy["cache_candidate_limits"]
+                ),
+                "incomplete_reason_counts": dict(
+                    sorted(search_policy["incomplete_reason_counts"].items())
+                ),
+            },
         },
         "anomalies": anomalies,
         "missing_field_row_counts": missing_fields,
@@ -802,6 +975,38 @@ def _render_markdown(analyses: list[dict[str, Any]]) -> str:
             f"{prediction['explicitly_scoped_prediction_task_utility_pair_n']} | "
             f"{_format_number(prediction['pearson_r_between_predicted_coverage_delta_and_actual_task_utility_level'])} | "
             f"{search['truncated']} / {search['n']} | {search['bounded_complete']} | {search['exhaustive']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### Search budget diagnostics",
+            "",
+            "| Run | Cache candidates generated / cap (mean) | Cache cap reached | Cross-node pairs truncated | Scan cap touched | Unscanned pairs total | Pair retention omitted total | UAV cap reached |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for item in analyses:
+        policy = item["analysis"]["candidate_search"]["search_policy_diagnostics"]
+        generated = policy["cache_generated_candidate_count_including_keep"]
+        limit = policy["cache_candidate_limit_including_keep"]
+        lines.append(
+            f"| `{item['run']}` | {_format_number(generated['mean'])} / {_format_number(limit['mean'])} "
+            f"(n={generated['n']}) | {policy['cache_candidate_budget_reached_n']} / {policy['cache_diagnostics_n']} "
+            f"| {policy['cross_node_pair_truncated_n']} / {policy['cache_diagnostics_n']} "
+            f"| {policy['cross_node_pair_scan_limit_touched_n']} / {policy['cache_diagnostics_n']} "
+            f"| {policy['cross_node_pair_unscanned_total']} "
+            f"| {policy['cross_node_pair_retention_limit_omitted_total']} "
+            f"| {policy['uav_candidate_limit_reached_n']} / {policy['uav_diagnostics_n']} |"
+        )
+    for item in analyses:
+        policy = item["analysis"]["candidate_search"]["search_policy_diagnostics"]
+        reasons = policy["incomplete_reason_counts"]
+        lines.append(
+            f"- `{item['run']}` bounded-search reasons: "
+            + (
+                ", ".join(f"`{reason}` {count}" for reason, count in reasons.items())
+                or "unavailable"
+            )
         )
     lines.extend(
         [
