@@ -1,4 +1,4 @@
-"""定义正式环境的状态、动作和 artifact 对齐接口。"""
+"""Shared environment loading, observation, and artifact-alignment interfaces."""
 
 from __future__ import annotations
 
@@ -26,12 +26,6 @@ from scenario.realization import (
 from scenario.vehicle_order import id_axis_indices
 
 
-PROPOSED_POLICY_SCHEMA = project_config.PROPOSED_POLICY_SCHEMA
-MULTI_NODE_FACTORIZED_POLICY_SCHEMA = project_config.MULTI_NODE_FACTORIZED_POLICY_SCHEMA
-SPARSE_COORDINATED_CACHE_POLICY_SCHEMA = project_config.SPARSE_COORDINATED_CACHE_POLICY_SCHEMA
-PROPOSED_CONTROL_MODE = "macro_cache_smdp_micro_uav_candidate"
-PER_SLOT_ANALYTIC_TASK_MODEL = "PER_SLOT_ANALYTIC"
-PER_SLOT_ANALYTIC_OBSERVATION_SCHEMA = "configuration_per_slot_analytic_v1"
 NORMALIZED_COST_CONTRACT_VERSION = "node_level_cost_fixed_reference_explicit_weights_v2"
 _REPORTED_COST_NORMALIZATION_CONTRACTS: set[str] = set()
 
@@ -55,11 +49,6 @@ class EnvironmentContext:
     episode_slots: int
     terminal_origin: int
     configured_rollout_steps: int | None
-    minibatch_size: int
-    configuration_control_mode: str
-    policy_schema: str
-    cache_action_mode: str
-    cache_reconfiguration_model: str
     realization: "RealizationArtifacts | None" = None
     observation_time_to_go: Callable[[int], float] | None = None
 
@@ -67,7 +56,7 @@ def _assert_realization_context_compatible(
     reference: EnvironmentContext,
     candidate: EnvironmentContext,
 ) -> None:
-    """确认新 realization 满足当前 PPO 张量与协议约定。"""
+    """确认新 realization 满足当前环境张量与数据协议。"""
 
     scalar_fields = (
         "data_protocol",
@@ -76,16 +65,11 @@ def _assert_realization_context_compatible(
         "train_origin_end",
         "terminal_origin",
         "configured_rollout_steps",
-        "minibatch_size",
-        "configuration_control_mode",
-        "policy_schema",
-        "cache_action_mode",
-        "cache_reconfiguration_model",
     )
     for field in scalar_fields:
         if getattr(reference, field) != getattr(candidate, field):
             raise ValueError(
-                "PPO episode realization changes the fixed training contract: "
+                "Episode realization changes the fixed environment contract: "
                 f"field={field}, reference={getattr(reference, field)!r}, "
                 f"candidate={getattr(candidate, field)!r}"
             )
@@ -122,7 +106,7 @@ def _assert_realization_context_compatible(
         != (candidate_observation.horizon_mask_slice is None)
     ):
         raise ValueError(
-            "PPO episode realization changes the observation tensor contract: "
+            "Episode realization changes the observation tensor contract: "
             f"reference_dim={reference_observation.observation_dim}, "
             f"candidate_dim={candidate_observation.observation_dim}"
         )
@@ -140,11 +124,11 @@ def _assert_realization_context_compatible(
         or reference_cache_roles != candidate_cache_roles
         or reference.action_spec.uav_ids != candidate.action_spec.uav_ids
     ):
-        raise ValueError("PPO realization changes Cache node role ordering or UAV ID ordering.")
+        raise ValueError("Episode realization changes Cache node role ordering or UAV ID ordering.")
     if np.asarray(reference.initial_cache).shape != np.asarray(candidate.initial_cache).shape:
-        raise ValueError("PPO episode realization changes the initial cache tensor shape")
+        raise ValueError("Episode realization changes the initial cache tensor shape")
     if set(reference.initial_uav) != set(candidate.initial_uav):
-        raise ValueError("PPO episode realization changes the initial UAV ID set")
+        raise ValueError("Episode realization changes the initial UAV ID set")
 
 
 def _validate_episode_vehicle_mapping(
@@ -372,7 +356,7 @@ def _validate_episode_vehicle_mapping(
 
 
 def load_environment_context(
-    config_path: str = "configs/proposed/system_config.toml",
+    config_path: str = "configs/dqn/online_joint_dqn.toml",
     realization_dir: str | Path | None = None,
 ) -> EnvironmentContext:
     cfg = project_config.load_config(config_path)
@@ -388,7 +372,7 @@ def load_environment_context(
             "Unsupported objective.cost_normalization.contract_version: "
             f"{configured_cost_contract!r}"
         )
-    data_protocol = project_config.get_ppo_data_protocol(cfg)
+    data_protocol = project_config.get_episode_data_protocol(cfg)
     root = Path(cfg["_meta"]["project_root"])
     realization = (
         configured_realization_artifacts(cfg, root)
@@ -500,94 +484,17 @@ def load_environment_context(
         )
         _REPORTED_COST_NORMALIZATION_CONTRACTS.add(reference_record)
     action_spec = ConfigurationActionSpec.from_cache_nodes_and_project(cache_nodes, cfg)
-    policy_schema = str(
-        project_config.get_config_value(
-            cfg,
-            "algorithm.ppo.policy_schema",
-            PROPOSED_POLICY_SCHEMA,
-        )
-    )
-    cache_action_mode = str(
-        project_config.get_config_value(
-            cfg,
-            "algorithm.ppo.cache_action_mode",
-            project_config.CACHE_ACTION_MODE_SINGLE_NODE,
-        )
-    )
-    cache_reconfiguration_model = str(
-        project_config.get_config_value(
-            cfg,
-            "algorithm.ppo.cache_reconfiguration_model",
-            "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION",
-        )
-    )
-    expected_schema = {
-        project_config.CACHE_ACTION_MODE_SINGLE_NODE: PROPOSED_POLICY_SCHEMA,
-        project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED: MULTI_NODE_FACTORIZED_POLICY_SCHEMA,
-        project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED: SPARSE_COORDINATED_CACHE_POLICY_SCHEMA,
-    }.get(cache_action_mode)
-    if expected_schema is None:
-        raise ValueError(f"unsupported Cache action mode: {cache_action_mode}")
-    if policy_schema != expected_schema:
+    roles = [str(value).upper() for value in cache_nodes["node_roles"]]
+    if (
+        not action_spec.cache_node_ids
+        or len(set(action_spec.cache_node_ids)) != len(action_spec.cache_node_ids)
+        or len(roles) != len(action_spec.cache_node_ids)
+        or any(role not in {"SV", "RSU", "UAV"} for role in roles)
+        or not action_spec.uav_ids
+    ):
         raise ValueError(
-            "Cache action mode 与 policy schema 不匹配："
-            f"mode={cache_action_mode}, expected_schema={expected_schema}, "
-            f"actual_schema={policy_schema}"
+            "Environment requires unique ordered Cache nodes with supported roles and at least one UAV."
         )
-    if cache_action_mode not in {
-        project_config.CACHE_ACTION_MODE_SINGLE_NODE,
-        project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
-        project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED,
-    }:
-        raise ValueError(f"unsupported Cache action mode: {cache_action_mode}")
-    if cache_action_mode in {
-        project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
-        project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED,
-    }:
-        if cache_reconfiguration_model != project_config.CACHE_RECONFIGURATION_MODEL_ABSTRACT:
-            raise ValueError("multi-node mode requires the explicit abstract reconfiguration model")
-        roles = [str(value).upper() for value in cache_nodes["node_roles"]]
-        if (
-            not action_spec.cache_node_ids
-            or len(set(action_spec.cache_node_ids)) != len(action_spec.cache_node_ids)
-            or len(roles) != len(action_spec.cache_node_ids)
-            or any(role not in {"SV", "RSU", "UAV"} for role in roles)
-            or not action_spec.uav_ids
-        ):
-            raise ValueError(
-                "Multi-node MAPPO requires unique ordered Cache nodes with supported roles and at least one UAV."
-            )
-        if cache_action_mode == project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED:
-            max_updates = project_config.get_config_value(
-                cfg, "algorithm.ppo.max_cache_updates_per_frame", None
-            )
-            if (
-                isinstance(max_updates, bool)
-                or not isinstance(max_updates, int)
-                or max_updates != 1
-            ):
-                raise ValueError(
-                    "sparse coordinated mode requires max_cache_updates_per_frame=1"
-                )
-    elif cache_reconfiguration_model != "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION":
-        raise ValueError("single-node mode has an unsupported cache reconfiguration model")
-    ppo_config = cfg["algorithm"]["ppo"]
-    if ppo_config.get("task_execution_model") != PER_SLOT_ANALYTIC_TASK_MODEL:
-        raise ValueError(
-            "algorithm.ppo.task_execution_model must be PER_SLOT_ANALYTIC"
-        )
-    required_flags = {
-        "macro_cache_enabled": True,
-        "macro_full_batch": True,
-        "exact_q_training_enabled": False,
-        "critic_mc_warmup_required": False,
-        "uav_unified_candidate_policy": True,
-        "uav_autoregressive": True,
-        "uav_group_balance": True,
-    }
-    for key, expected in required_flags.items():
-        if ppo_config.get(key) is not expected:
-            raise ValueError(f"algorithm.ppo.{key} 必须为 {expected!r}。")
     prediction_horizon = int(
         project_config.get_config_value(cfg, "prediction.vehicle.horizon")
     )
@@ -607,18 +514,6 @@ def load_environment_context(
         cache_cfg,
     )
     initial_uav = uav_configuration.initial_uav_positions_from_project(cfg)
-    configuration_control_mode = str(
-        project_config.get_config_value(
-            cfg,
-            "algorithm.ppo.configuration_control_mode",
-            PROPOSED_CONTROL_MODE,
-        )
-    )
-    if configuration_control_mode != PROPOSED_CONTROL_MODE:
-        raise ValueError(
-            "当前训练器仅支持正式 proposed_joint 控制模式："
-            f"{PROPOSED_CONTROL_MODE}"
-        )
     return EnvironmentContext(
         cfg=cfg,
         root=root,
@@ -641,11 +536,6 @@ def load_environment_context(
             if data_protocol["rollout_steps"] is None
             else int(data_protocol["rollout_steps"])
         ),
-        minibatch_size=int(data_protocol["minibatch_size"]),
-        configuration_control_mode=configuration_control_mode,
-        policy_schema=policy_schema,
-        cache_action_mode=cache_action_mode,
-        cache_reconfiguration_model=cache_reconfiguration_model,
         realization=realization,
     )
 
@@ -752,7 +642,7 @@ class ConfigurationActionSpec:
 
 @dataclass(frozen=True)
 class ConfigurationObservationSpec:
-    """PPO configuration observation 的固定结构。"""
+    """Configuration observation layout shared by the environment and DQN."""
 
     cache_node_ids: tuple[str, ...]
     service_ids: tuple[int, ...]
@@ -1209,7 +1099,7 @@ def build_step_observation(
     *,
     time_to_go_override: float | None = None,
 ) -> np.ndarray:
-    """构造 Macro Cache 与 Micro UAV 共用的正式 slot observation。"""
+    """构造由当前配置和预测信息组成的 Slot 观测。"""
 
     time_to_go = (
         float(time_to_go_override)

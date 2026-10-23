@@ -33,10 +33,10 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from common import project_config  # noqa: E402
 from decision import slot_environment, task_allocation  # noqa: E402
-from ppo_simple.interface import aligned_train_steps, load_environment_context  # noqa: E402
+from common.environment_interface import aligned_train_steps, load_environment_context  # noqa: E402
 
 
-CONFIG_PATH = PROJECT_ROOT / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
+CONFIG_PATH = PROJECT_ROOT / "configs" / "dqn" / "online_joint_dqn.toml"
 POOL_ROOT = PROJECT_ROOT / "environment_data" / "proposed_joint_training"
 POOL_MANIFEST_PATH = POOL_ROOT / "formal_pool_manifest.json"
 REPORT_MD = PROJECT_ROOT / "reports" / "matching_kkt_training_efficiency.md"
@@ -194,7 +194,7 @@ def validate_data_contract(cfg: dict[str, Any], pool_manifest: dict[str, Any]) -
         "load_relative_jitter": float(project_config.get_config_value(cfg, "task.load_relative_jitter")),
         "arrival_probability": float(project_config.get_config_value(cfg, "task.arrival_probability")),
         "popularity_zeta": float(project_config.get_config_value(cfg, "task.popularity_zeta")),
-        "episode_slots": int(project_config.get_config_value(cfg, "algorithm.ppo.data_protocol.episode_slots")),
+        "episode_slots": int(project_config.get_config_value(cfg, "data_protocol.episode_slots")),
         "slot_duration_s": float(project_config.get_config_value(cfg, "simulation.dt_s")),
     }
     mismatches = {}
@@ -479,7 +479,7 @@ def build_report(payload: dict[str, Any]) -> str:
         f"- 仅扫描 `{payload['training_pool']['path']}`。未读取 Validation/Test。Pool 声明 `{payload['training_pool']['episode_count']}` 个 Episode、每 Episode `{payload['training_pool']['slots_per_episode']}` Slot；其中经 Pool Manifest 与 Episode Manifest 绑定且任务表覆盖完整的 Episode `{payload['sample_scan']['manifest_attested_complete_episodes_scanned']}` 个。",
         "- Slot 任务数定义为 `tasks.csv` 对该 Slot 的实际行中 `arrival=1` 的数量；每个样本还与正式 `aligned_train_steps()` 的 `len(actual_tasks)` 核对。任务输入字段单位按正式 `Task.input_bits` 处理，汇总以十进制 MB 表示；计算需求以 Gcycle 表示。",
         f"- 选样规则：{payload['sample_scan']['selection_rule']}",
-        f"- Cache/UAV 状态：`FROZEN_INITIAL_CACHE_UAV_REFERENCE`。每次测量使用该 Episode 由正式环境入口加载的初始 Cache/UAV，Slot 内冻结；不是 PPO 在所选 Slot 的策略动作或状态快照。",
+        f"- Cache/UAV 状态：`FROZEN_INITIAL_CACHE_UAV_REFERENCE`。每次测量使用该 Episode 由共享环境入口加载的初始 Cache/UAV，Slot 内冻结；不代表 DQN 策略动作或状态快照。",
         "- 预测文件按正式接口加载并做 Slot 对齐，但因为 Cache/UAV triggers 均为零，执行器跳过配置预测求值；任务匹配只使用该 Slot 实际任务与实际车辆位置。",
         "",
         "## 求解合同与计时口径",
@@ -569,9 +569,9 @@ def build_report(payload: dict[str, Any]) -> str:
             "## 口径与限制",
             "",
             "- 表中任务效用仅解释样本，不是 Matching 最优性差距或跨规模因果结论。不同 Slot 的信道、计算需求、任务服务与可行节点边均不同。",
-            "- 配置为 `FROZEN_INITIAL_CACHE_UAV_REFERENCE`；本结果不表示 PPO 策略的真实 Cache/UAV 动作。任务模型为每 Slot 独立解析式评价，无跨 Slot 执行队列。",
+            "- 配置为 `FROZEN_INITIAL_CACHE_UAV_REFERENCE`；本结果不表示 DQN 策略的真实 Cache/UAV 动作。任务模型为每 Slot 独立解析式评价，无跨 Slot 执行队列。",
             "- KKT 与其 CPU/带宽/Cloud 核心细项是嵌套计时，不作重复求和。Matching 缓存与结果拼装不归类为 KKT solver core。",
-            "- 本轮未训练 PPO、未读取 Validation/Test、未修改正式算法/配置/数据，未运行完整 Episode。",
+            "- 本轮未训练 DQN、未读取 Validation/Test、未修改正式算法/配置/数据，未运行完整 Episode。",
             "",
             "## 最终字段",
             "",
@@ -589,7 +589,7 @@ def build_report(payload: dict[str, Any]) -> str:
             f"MATCHING_SCALING_EVIDENCE = {payload['timing_diagnosis']['matching_scaling_evidence']}",
             f"GNN_SPEEDUP_OPPORTUNITY = {payload['timing_diagnosis']['gnn_speedup_opportunity']}",
             f"RECOMMENDED_NEXT_STEP = {payload['timing_diagnosis']['recommended_next_step']}",
-            "PPO_TRAINING_EXECUTED = NO",
+            "DQN_TRAINING_EXECUTED = NO",
             "FORMAL_ALGORITHM_MODIFIED = NO",
             "FORMAL_CONFIG_MODIFIED = NO",
             "```",
@@ -869,7 +869,7 @@ def main() -> int:
         "method": {
             "state_reference": "FROZEN_INITIAL_CACHE_UAV_REFERENCE",
             "matching_entrypoint": "src/decision/slot_environment.py:execute_configured_slot -> src/decision/task_allocation.py:optimize_task_matching",
-            "sample_api": "src/ppo_simple/interface.py:load_environment_context + aligned_train_steps",
+            "sample_api": "src/common/environment_interface.py:load_environment_context + aligned_train_steps",
             "evaluation_mode": "incremental (formal optimize_task_matching default)",
             "numba_available": task_allocation.numba is not None,
             "numba_warmup_sample": {
@@ -918,7 +918,7 @@ def main() -> int:
             "recommended_next_step": recommended,
             "interpretation": interpretation,
         },
-        "ppo_training_executed": False,
+        "strategy_training_executed": False,
         "formal_algorithm_modified": False,
         "formal_config_modified": False,
         "formal_data_modified": False,

@@ -598,7 +598,7 @@ def task_config_from_catalog(
     if project_config is not None:
         config = task_config_from_project_config(project_config)
         if int(catalog_json["service_count"]) != config.num_services:
-            raise ValueError("service_catalog.json 的 service_count 与 configs/proposed/system_config.toml 不一致。")
+            raise ValueError("service_catalog.json 的 service_count 与 configs/dqn/online_joint_dqn.toml 不一致。")
         return config
     generation = catalog_json.get("generation_config", {})
     return TaskConfig(
@@ -825,7 +825,7 @@ def save_npz(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="为一个正式 episode 生成预测场景。")
-    parser.add_argument("--config", default="configs/proposed/system_config.toml")
+    parser.add_argument("--config", default="configs/dqn/online_joint_dqn.toml")
     parser.add_argument("--episode-seed", type=int, required=True)
     parser.add_argument("--roles-file", default=None)
     parser.add_argument("--trajectory-file", default=None)
@@ -979,7 +979,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_tv,
         ):
             raise ValueError(
-                "vehicle_roles.json 角色数量与 configs/proposed/system_config.toml 的正式数量不一致。"
+                "vehicle_roles.json 角色数量与 configs/dqn/online_joint_dqn.toml 的正式数量不一致。"
             )
         for role_key, config_key in (
             ("dt", "simulation.dt_s"),
@@ -991,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
                 float(roles[role_key]), configured, rel_tol=0.0, abs_tol=1e-9
             ):
                 raise ValueError(
-                    f"vehicle_roles.json 的 {role_key} 与 configs/proposed/system_config.toml 不一致。"
+                    f"vehicle_roles.json 的 {role_key} 与 configs/dqn/online_joint_dqn.toml 不一致。"
                 )
         residual_bank = load_residual_bank(residual_file)
         if int(residual_bank["H_p"]) != config.horizon_steps:
@@ -1000,7 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isclose(
             float(residual_bank["dt"]), configured_dt, rel_tol=0.0, abs_tol=1e-9
         ):
-            raise ValueError("calibration residual bank dt 与 configs/proposed/system_config.toml 不一致。")
+            raise ValueError("calibration residual bank dt 与 configs/dqn/online_joint_dqn.toml 不一致。")
 
         service_catalog = load_json(catalog_file)
         task_config = task_config_from_catalog(service_catalog, formal_config)
@@ -1033,7 +1033,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if num_slots != configured_num_slots:
             raise ValueError(
-                f"formal popularity slots={num_slots} 与 configs/proposed/system_config.toml={configured_num_slots} 不一致。"
+                f"formal popularity slots={num_slots} 与 configs/dqn/online_joint_dqn.toml={configured_num_slots} 不一致。"
             )
         origin_slots = np.arange(num_slots, dtype=np.int64)
         origin_times = np.asarray([times[int(slot)] for slot in origin_slots], dtype=np.float64)

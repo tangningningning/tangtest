@@ -279,7 +279,7 @@ def task_config_from_catalog(
     if project_config is not None:
         config = task_config_from_project_config(project_config)
         if int(catalog["service_count"]) != config.num_services:
-            raise ValueError("service_catalog.json 的 service_count 与 configs/proposed/system_config.toml 不一致。")
+            raise ValueError("service_catalog.json 的 service_count 与 configs/dqn/online_joint_dqn.toml 不一致。")
         return config
     generation = catalog.get("generation_config", {})
     return TaskConfig(
@@ -544,7 +544,7 @@ def verify_outputs(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="使用冻结的服务流行度 GRU 生成 canonical episode 预测。")
-    parser.add_argument("--config", default="configs/proposed/system_config.toml")
+    parser.add_argument("--config", default="configs/dqn/online_joint_dqn.toml")
     parser.add_argument("--popularity-file", default=None)
     parser.add_argument("--popularity-history-file", default=None)
     parser.add_argument("--service-catalog-file", default=None)
@@ -782,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if canonical_rho_star.shape[0] != configured_num_slots:
             raise ValueError(
-                f"formal popularity slots={canonical_rho_star.shape[0]} 与 configs/proposed/system_config.toml="
+                f"formal popularity slots={canonical_rho_star.shape[0]} 与 configs/dqn/online_joint_dqn.toml="
                 f"{configured_num_slots} 不一致。"
             )
         origin_slots = np.arange(canonical_rho_star.shape[0], dtype=np.int64)

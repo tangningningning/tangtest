@@ -51,8 +51,8 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v7"
-CHECKPOINT_SCHEMA_VERSION = 8
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v8"
+CHECKPOINT_SCHEMA_VERSION = 9
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4
@@ -73,7 +73,7 @@ _CODE_IDENTITY_REQUIRED_PATHS = (
     "src/decision/uav_configuration.py",
     "src/decision/slot_environment.py",
     "src/decision/task_allocation.py",
-    "src/ppo_simple/interface.py",
+    "src/common/environment_interface.py",
     "src/scenario/realization.py",
     "src/scenario/vehicle_order.py",
     "scripts/training/training_pool_contract.py",
@@ -173,7 +173,6 @@ def _code_identity() -> dict[str, Any]:
     paths = sorted(
         {
             *PROJECT_ROOT.glob("src/online_joint_dqn/**/*.py"),
-            *PROJECT_ROOT.glob("src/online_joint_optimizer/**/*.py"),
             *(PROJECT_ROOT / relative_path for relative_path in _CODE_IDENTITY_REQUIRED_PATHS),
         }
     )
@@ -193,8 +192,6 @@ def _code_identity() -> dict[str, Any]:
     }
     if not any(path.startswith("src/online_joint_dqn/") for path in hashes):
         raise FileNotFoundError("online_joint_dqn 源码目录中没有可哈希的 Python 文件")
-    if not any(path.startswith("src/online_joint_optimizer/") for path in hashes):
-        raise FileNotFoundError("online_joint_optimizer 源码目录中没有可哈希的 Python 文件")
     status = _git_output("status", "--porcelain")
     return {
         "head": _git_output("rev-parse", "HEAD"),
@@ -370,7 +367,7 @@ def _validate_resume_identity(
 def _validate_training_pool() -> dict[str, Any]:
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
-    info = pool_contract.validate_formal_training_pool_for_run(
+    info = pool_contract.validate_dqn_training_pool_for_run(
         formal_root=PROJECT_ROOT,
         config_path=config_path,
         runtime_config=config,
@@ -472,142 +469,17 @@ def _validate_independent_test_pool(
         }
 
 
-def _mappo_checkpoint_identity_status(
-    config_path: Path,
-    runtime_config: Mapping[str, Any],
-) -> dict[str, Any]:
-    """按正式配置身份筛选可用 MAPPO Checkpoint，不加载不匹配权重。"""
-
-    current_raw_sha256 = project_config.raw_config_sha256(config_path)
-    current_semantic_sha256 = project_config.semantic_config_hash(
-        dict(runtime_config)
-    )
-    manifest_paths = sorted((PROJECT_ROOT / "runs").glob("*/run_manifest.json"))
-    candidates: list[dict[str, Any]] = []
-    for manifest_path in manifest_paths:
-        run_name = manifest_path.parent.name
-        if run_name.startswith("online_joint_dqn"):
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        stored_raw = manifest.get(
-            "config_raw_sha256", manifest.get("config_sha256")
-        )
-        stored_semantic = manifest.get(
-            "config_semantic_sha256", manifest.get("config_semantic_hash")
-        )
-        checkpoint_path = manifest_path.parent / "checkpoints" / "latest_checkpoint.pt"
-        if not checkpoint_path.is_file():
-            continue
-        candidates.append(
-            {
-                "run_name": run_name,
-                "path": str(checkpoint_path),
-                "config_raw_sha256": stored_raw,
-                "config_semantic_sha256": stored_semantic,
-            }
-        )
-    matching_manifests = [
-        item
-        for item in candidates
-        if item["config_raw_sha256"] == current_raw_sha256
-        and item["config_semantic_sha256"] == current_semantic_sha256
-    ]
-    if not matching_manifests:
-        return {
-            "status": (
-                "UNAVAILABLE_NO_CHECKPOINT"
-                if not candidates
-                else "UNAVAILABLE_CONFIG_IDENTITY_MISMATCH"
-            ),
-            "expected_config_raw_sha256": current_raw_sha256,
-            "expected_config_semantic_sha256": current_semantic_sha256,
-            "checkpoint_manifest_count": len(candidates),
-            "matching_checkpoint_count": 0,
-            "mismatched_checkpoint_runs": [
-                {
-                    "run_name": item["run_name"],
-                    "config_raw_sha256": item["config_raw_sha256"],
-                    "config_semantic_sha256": item["config_semantic_sha256"],
-                }
-                for item in candidates
-            ],
-        }
-
-    from ppo_simple import evaluator
-    from ppo_simple.interface import load_environment_context
-
-    reference_context = load_environment_context(str(config_path))
-    expected_cache_mode_by_schema = {
-        evaluator.AdaptiveDualTimescaleActorCritic.architecture_id:
-            project_config.CACHE_ACTION_MODE_SINGLE_NODE,
-        evaluator.AdaptiveMultiNodeFactorizedActorCritic.architecture_id:
-            project_config.CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
-        evaluator.AdaptiveSparseCoordinatedCacheActorCritic.architecture_id:
-            project_config.CACHE_ACTION_MODE_SPARSE_COORDINATED,
-    }
-    failures: list[str] = []
-    for candidate in matching_manifests:
-        checkpoint_path = Path(candidate["path"])
-        try:
-            checkpoint = torch.load(
-                checkpoint_path, map_location="cpu", weights_only=False
-            )
-            if not isinstance(checkpoint, Mapping):
-                raise ValueError("Checkpoint 根对象不是映射")
-            if (
-                checkpoint.get("config_raw_sha256") != current_raw_sha256
-                or checkpoint.get("config_semantic_sha256")
-                != current_semantic_sha256
-            ):
-                raise ValueError("Checkpoint 配置身份与当前正式配置不匹配")
-            metadata = evaluator._load_checkpoint_metadata(checkpoint_path)
-            expected_mode = expected_cache_mode_by_schema.get(
-                str(metadata.get("policy_schema"))
-            )
-            if (
-                expected_mode != reference_context.cache_action_mode
-                or metadata.get("policy_schema") != reference_context.policy_schema
-            ):
-                raise ValueError("Checkpoint 策略架构或 Cache 动作合同与当前配置不匹配")
-            return {
-                "status": "PASS",
-                "path": str(checkpoint_path),
-                "policy_schema": str(metadata.get("policy_schema")),
-                "config_raw_sha256": current_raw_sha256,
-                "config_semantic_sha256": current_semantic_sha256,
-            }
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            failures.append(
-                f"{checkpoint_path}: {type(exc).__name__}: {exc}"
-            )
-    return {
-        "status": "UNAVAILABLE_NO_COMPATIBLE_CHECKPOINT",
-        "expected_config_raw_sha256": current_raw_sha256,
-        "expected_config_semantic_sha256": current_semantic_sha256,
-        "matching_checkpoint_count": len(matching_manifests),
-        "failures": failures,
-    }
-
-
 def _independent_evaluation_gate(
-    config_path: Path,
     runtime_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     test_pool = _validate_independent_test_pool(runtime_config)
-    mappo = _mappo_checkpoint_identity_status(config_path, runtime_config)
     blockers: list[str] = []
     if test_pool.get("status") != "PASS":
         blockers.append("正式独立 Test Pool 未通过当前逐 Episode 数据合同。")
-    if mappo.get("status") != "PASS":
-        blockers.append("没有配置身份与动作合同兼容的正式 MAPPO Checkpoint。")
     return {
         "status": "BLOCKED_BEFORE_EVALUATION" if blockers else "READY_NOT_RUN",
         "blockers": blockers,
         "test_pool": test_pool,
-        "mappo_checkpoint": mappo,
         "evaluation_executed": False,
     }
 
@@ -616,7 +488,6 @@ def _evaluation_status_payload(gate: Mapping[str, Any]) -> dict[str, Any]:
     """把数据和基线门禁的真实结果写入独立评价状态文件。"""
 
     test_pool = gate.get("test_pool", {})
-    mappo = gate.get("mappo_checkpoint", {})
     pool_valid = test_pool.get("status") == "PASS"
     blockers = list(gate.get("blockers", []))
     return {
@@ -630,13 +501,11 @@ def _evaluation_status_payload(gate: Mapping[str, Any]) -> dict[str, Any]:
         "valid_episode_count": int(test_pool.get("valid_episode_count", 0)),
         "invalid_episode_count": int(test_pool.get("invalid_episode_count", 0)),
         "test_pool": _jsonable(test_pool),
-        "mappo_checkpoint_status": str(mappo.get("status", "UNAVAILABLE")),
-        "mappo_checkpoint": _jsonable(mappo),
         "blockers": blockers,
         "reason": (
             "；".join(str(item) for item in blockers)
             if blockers
-            else "Test Pool 与 MAPPO Checkpoint 门禁通过；本次未执行配对评价。"
+            else "独立 Test Pool 通过数据合同；本次未执行 DQN 冻结评价。"
         ),
     }
 
@@ -950,23 +819,20 @@ def _write_run_summary(
         ),
         "last_checkpoint": last_checkpoint,
         "last_checkpoint_bytes": last_checkpoint_bytes,
-        "paired_evaluation_status": "NOT_RUN",
-        "paired_evaluation_reason": (
+        "independent_evaluation_status": "NOT_RUN",
+        "independent_evaluation_reason": (
             str(evaluation_status.get("reason"))
             if evaluation_status.get("reason")
-            else "本运行未执行独立配对评价。"
+            else "本运行未执行独立 DQN 评价。"
         ),
-        "paired_evaluation_gate_status": evaluation_status.get(
+        "independent_evaluation_gate_status": evaluation_status.get(
             "status", "UNAVAILABLE"
         ),
-        "paired_evaluation_test_pool_valid_episode_count": evaluation_status.get(
+        "independent_evaluation_test_pool_valid_episode_count": evaluation_status.get(
             "valid_episode_count"
         ),
-        "paired_evaluation_test_pool_invalid_episode_count": evaluation_status.get(
+        "independent_evaluation_test_pool_invalid_episode_count": evaluation_status.get(
             "invalid_episode_count"
-        ),
-        "paired_evaluation_mappo_checkpoint_status": evaluation_status.get(
-            "mappo_checkpoint_status", "UNAVAILABLE"
         ),
     }
     _write_json(path, summary, atomic=True)
@@ -1083,7 +949,7 @@ def run_training(
         project_config.get_config_value(runtime_config, "objective.beta_ca")
     )
     beta_q = DQN_BETA_Q
-    evaluation_gate = _independent_evaluation_gate(config_path, runtime_config)
+    evaluation_gate = _independent_evaluation_gate(runtime_config)
     print(_normalization_config_line(runtime_config), flush=True)
 
     first_seed = pool_contract.DEFAULT_TRAINING_SEED_START

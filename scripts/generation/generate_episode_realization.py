@@ -455,9 +455,9 @@ def load_and_validate_config(config_file: Path) -> dict[str, Any]:
         config_file,
         require_artifacts=False,
     )
-    protocol = project_config_module.get_ppo_data_protocol(config)
+    protocol = project_config_module.get_episode_data_protocol(config)
     expected = {
-        "protocol": project_config_module.PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
+        "protocol": project_config_module.EPISODE_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
         "physical_episode_slots": EXPECTED_SLOTS,
         "episode_slots": EXPECTED_SLOTS,
         "train_origin_start": 0,
@@ -889,7 +889,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--config",
-        default="configs/proposed/alternating_actor_updates_v1.toml",
+        default="configs/dqn/online_joint_dqn.toml",
     )
     parser.add_argument("--episode-seed", type=int, required=True)
     parser.add_argument("--output-dir", required=True)

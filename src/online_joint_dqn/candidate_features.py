@@ -14,7 +14,7 @@ import numpy as np
 
 from common import project_config
 from decision import cache_configuration, uav_configuration
-from online_joint_optimizer.candidate_evaluator import SlotInput, copy_uav_positions
+from .candidate_evaluator import SlotInput, copy_uav_positions
 
 
 OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
@@ -458,7 +458,7 @@ class CandidateFeatureEncoder:
     ) -> np.ndarray:
         source_observation = np.asarray(formal_observation, dtype=np.float32).reshape(-1)
         if source_observation.shape != (int(self.observation_spec.observation_dim),):
-            raise ValueError("正式 MAPPO observation 维度与 DQN observation spec 不一致")
+            raise ValueError("environment observation 维度与 DQN observation spec 不一致")
         if not np.all(np.isfinite(source_observation)):
             raise ValueError("正式观测包含非有限值")
         mask = self._forecast_mask(decision_forecast)

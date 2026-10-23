@@ -24,10 +24,10 @@ if str(SRC) not in sys.path:
 
 from common import project_config  # noqa: E402
 from decision import task_allocation  # noqa: E402
-from ppo_simple.interface import aligned_train_steps, load_environment_context  # noqa: E402
+from common.environment_interface import aligned_train_steps, load_environment_context  # noqa: E402
 
 
-CONFIG_PATH = ROOT / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
+CONFIG_PATH = ROOT / "configs" / "dqn" / "online_joint_dqn.toml"
 POOL_ROOT = ROOT / "environment_data" / "proposed_joint_training"
 POOL_MANIFEST_PATH = POOL_ROOT / "formal_pool_manifest.json"
 EFFICIENCY_JSON = ROOT / "reports" / "matching_kkt_training_efficiency.json"
@@ -1171,7 +1171,7 @@ def make_report(payload: dict[str, Any]) -> str:
         "## 代码依据与边界",
         "",
         "依据 `task_allocation.py` 的 `build_feasible_targets`、`_edge_path_is_feasible`、`_allocate_phase_resources_kkt`、`_allocate_cloud_cpu_kkt`、`evaluate_matching_with_kkt` 和 `optimize_task_matching`；配置为 independent-per-slot、orthogonal-independent、no-interference 和 RESOURCE_AWARE_FALLBACK。",
-        "只读取 Training 数据；未运行 PPO、Validation、Test 或完整 Episode。未修改正式 Matching/KKT、配置、Reward 或环境数据。",
+        "只读取 Training 数据；未运行策略训练、Validation、Test 或完整 Episode。未修改正式 Matching/KKT、配置、Reward 或环境数据。",
         "",
         "```text",
         f"TRAINING_SLOTS_ANALYZED = {len(cloud)}",
@@ -1192,7 +1192,7 @@ def make_report(payload: dict[str, Any]) -> str:
         f"MATCHING_QUALITY_ASSESSMENT = {quality}",
         f"GNN_NECESSITY_ASSESSMENT = {gnn_judgment}",
         f"RECOMMENDED_NEXT_STEP = {next_step}",
-        "PPO_TRAINING_EXECUTED = NO",
+        "DQN_TRAINING_EXECUTED = NO",
         "FORMAL_ALGORITHM_MODIFIED = NO",
         "FORMAL_CONFIG_MODIFIED = NO",
         "```",
@@ -1468,7 +1468,7 @@ def main() -> int:
         "class_counts": summarize_classes([samples[(seed, slot)]["cloud"] for _, seed, slot in SAMPLES]),
         "exact_time_limit_per_slot_s": DP_TIME_LIMIT_S,
         "exact_analysis": [],
-        "ppo_training_executed": False,
+        "strategy_training_executed": False,
         "formal_algorithm_modified": False,
         "formal_config_modified": False,
         "training_data_modified": False,

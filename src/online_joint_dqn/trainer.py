@@ -177,7 +177,7 @@ def _aggregate_candidate_q_statistics(
 
 @dataclass(frozen=True)
 class TrainerConfig:
-    """单独于正式 MAPPO 配置的 DQN 训练控制项。"""
+    """DQN training controls, separate from the shared system configuration."""
 
     batch_size: int = 64
     learning_starts: int = 1000
@@ -256,6 +256,42 @@ def train_episode(
         }
         if not candidate_counts["KEEP_STAY"]:
             raise RuntimeError("当前合法候选缺少 KEEP_STAY")
+        best_q_by_operation: dict[str, dict[str, Any] | None] = {}
+        selected_q_deltas_by_operation: dict[str, float | None] = {}
+        for operation in operation_names:
+            statistics = selected.q_statistics_by_operation[operation]
+            maximum_q = statistics.get("max")
+            candidate_id = statistics.get("max_candidate_id")
+            if not candidate_counts[operation] or maximum_q is None or candidate_id is None:
+                best_q_by_operation[operation] = None
+                selected_q_deltas_by_operation[operation] = None
+                continue
+            maximum_q = float(maximum_q)
+            best_q_by_operation[operation] = {
+                "candidate_id": str(candidate_id),
+                "q_value": maximum_q,
+            }
+            selected_q_deltas_by_operation[operation] = (
+                float(selected.q_value) - maximum_q
+            )
+        keep_stay_q_value = (
+            None
+            if best_q_by_operation["KEEP_STAY"] is None
+            else float(best_q_by_operation["KEEP_STAY"]["q_value"])
+        )
+        selected_q_minus_keep_stay = (
+            None
+            if keep_stay_q_value is None
+            else float(selected.q_value) - keep_stay_q_value
+        )
+        greedy_global_argmax_pass = (
+            None
+            if selected.explored
+            else all(
+                delta is None or delta <= 0.0
+                for delta in selected_q_deltas_by_operation.values()
+            )
+        )
         if selected.explored:
             exploration_counts[selected_operation] += 1
         else:
@@ -364,6 +400,23 @@ def train_episode(
             if beta_q is None or uav_movement_cost is None
             else beta_q * uav_movement_cost
         )
+        actual_task_utility_for_recomposition = transition.diagnostics.get(
+            "actual_task_utility"
+        )
+        reward_recomposition_residual = (
+            None
+            if actual_task_utility_for_recomposition is None
+            or cache_cost_weighted is None
+            or uav_movement_cost_weighted is None
+            else float(
+                transition.reward
+                - (
+                    float(actual_task_utility_for_recomposition)
+                    - cache_cost_weighted
+                    - uav_movement_cost_weighted
+                )
+            )
+        )
         replay_buffer.add(
             state_features=state,
             action=selected.candidate.action,
@@ -407,6 +460,13 @@ def train_episode(
                 "global_step": global_step,
                 "candidate_counts_by_operation": candidate_counts,
                 "candidate_q_statistics_by_operation": selected.q_statistics_by_operation,
+                "best_candidate_by_operation": best_q_by_operation,
+                "selected_q_minus_best_candidate_q_by_operation": (
+                    selected_q_deltas_by_operation
+                ),
+                "keep_stay_q_value": keep_stay_q_value,
+                "selected_q_minus_keep_stay_q": selected_q_minus_keep_stay,
+                "greedy_global_argmax_pass": greedy_global_argmax_pass,
                 "candidate_advantage_statistics_by_operation": (
                     selected.advantage_statistics_by_operation
                 ),
@@ -420,6 +480,50 @@ def train_episode(
                 "selected_candidate_action": selected.candidate.action.to_dict(),
                 "explored": bool(selected.explored),
                 "selection_mode": "exploration" if selected.explored else "greedy",
+                "exploration_selected_operation": (
+                    selected_operation if selected.explored else None
+                ),
+                "exploration_selected_candidate_id": (
+                    selected.candidate.action.candidate_id if selected.explored else None
+                ),
+                "candidate_source_state_fingerprint": transition.diagnostics.get(
+                    "candidate_source_state_fingerprint"
+                ),
+                "candidate_current_legal_set_membership_pass": transition.diagnostics.get(
+                    "candidate_current_legal_set_membership_pass"
+                ),
+                "candidate_source_state_fingerprint_matches_current_pass": transition.diagnostics.get(
+                    "candidate_source_state_fingerprint_matches_current_pass"
+                ),
+                "candidate_mutual_exclusion_pass": transition.diagnostics.get(
+                    "candidate_mutual_exclusion_pass"
+                ),
+                "candidate_cache_replace_rule_pass": transition.diagnostics.get(
+                    "candidate_cache_replace_rule_pass"
+                ),
+                "candidate_cache_capacity_pass": transition.diagnostics.get(
+                    "candidate_cache_capacity_pass"
+                ),
+                "candidate_uav_boundary_pass": transition.diagnostics.get(
+                    "candidate_uav_boundary_pass"
+                ),
+                "candidate_uav_safety_distance_pass": transition.diagnostics.get(
+                    "candidate_uav_safety_distance_pass"
+                ),
+                "candidate_uav_transition_constraints_pass": transition.diagnostics.get(
+                    "candidate_uav_transition_constraints_pass"
+                ),
+                "candidate_target_matches_execution_pass": transition.diagnostics.get(
+                    "candidate_target_matches_execution_pass"
+                ),
+                "pre_cache_state": transition.diagnostics.get("pre_cache_state"),
+                "post_cache_state": transition.diagnostics.get("post_cache_state"),
+                "pre_uav_positions_m": transition.diagnostics.get(
+                    "pre_uav_positions_m"
+                ),
+                "post_uav_positions_m": transition.diagnostics.get(
+                    "post_uav_positions_m"
+                ),
                 "cache_state_changed": cache_state_changed,
                 "actual_state_changed": bool(
                     cache_state_changed or uav_state_changed
@@ -444,12 +548,25 @@ def train_episode(
                 "cache_update_cost": cache_update_cost,
                 "cache_update_cost_available": cache_cost_available,
                 "cache_download_cost": cache_update_cost,
+                "cache_update_cost_definition": (
+                    "C_ca=sum_m(cache_download_delay_s_m/reference_delay_s_m)"
+                ),
+                "cache_update_cost_unit": "dimensionless normalized delay ratio",
                 "beta_ca": beta_ca,
                 "cache_cost_weighted": cache_cost_weighted,
                 "uav_movement_cost": uav_movement_cost,
                 "uav_movement_cost_available": movement_cost_available,
+                "uav_movement_cost_definition": (
+                    "C_q=sum_u(movement_energy_j_u/reference_energy_j_u)"
+                ),
+                "uav_movement_cost_unit": "dimensionless normalized energy ratio",
                 "beta_q": beta_q,
                 "uav_movement_cost_weighted": uav_movement_cost_weighted,
+                "reward_formula": "G=Q_task-beta_ca*C_ca-beta_q*C_q",
+                "actual_task_utility_unit": (
+                    "sum of per-task dimensionless delay-energy utility scores"
+                ),
+                "reward_unit": "same aggregate utility scale as Q_task",
                 "decision_wall_time_s": 0.0,
                 "executor_calls": transition.executor_calls,
                 "matching_calls": transition.matching_calls,
@@ -508,9 +625,28 @@ def train_episode(
                 "predicted_cache_coverage_metric": transition.diagnostics.get(
                     "predicted_cache_coverage_metric"
                 ),
+                "predicted_cache_coverage_metric_scope": transition.diagnostics.get(
+                    "predicted_cache_coverage_metric_scope"
+                ),
+                "predicted_cache_coverage_available": (
+                    transition.diagnostics.get("predicted_cache_coverage_before")
+                    is not None
+                    and transition.diagnostics.get("predicted_cache_coverage_after")
+                    is not None
+                ),
                 "predicted_cache_coverage_error": transition.diagnostics.get(
                     "predicted_cache_coverage_error"
                 ),
+                "predicted_service_demand_by_service": transition.diagnostics.get(
+                    "predicted_service_demand_by_service"
+                ),
+                "cache_service_demand_details": transition.diagnostics.get(
+                    "cache_service_demand_details"
+                ),
+                "same_slot_matching_alternative_comparison_available": transition.diagnostics.get(
+                    "same_slot_matching_alternative_comparison_available"
+                ),
+                "reward_recomposition_residual": reward_recomposition_residual,
                 "executor_performance_profile": transition.diagnostics.get(
                     "executor_performance_profile", {}
                 ),

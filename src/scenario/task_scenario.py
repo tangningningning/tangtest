@@ -6,7 +6,7 @@
 
     rho_star(t) -> Bernoulli 到达 -> Categorical 服务请求 -> D/L 采样
 
-它不读取任务效用、缓存、PPO 或预测结果，也不把 rho_obs 当成 rho_star。
+它不读取任务效用、缓存、策略或预测结果，也不把 rho_obs 当成 rho_star。
 ``time_s`` 使用 SUMO 的绝对仿真时间，``slot`` 使用正式 episode 内的
 0-based 时隙，因此任务行可以和 trajectory.csv 的正式时刻逐一对齐。
 """
@@ -38,7 +38,7 @@ class TaskConfig:
     """任务环境生成参数。
 
     数值默认值只用于无 TOML 场景下的函数级验证；正式 entrypoint 从
-    configs/proposed/system_config.toml 读取参数，vehicle_roles.json 仅用于检查上游时间轴漂移。
+    configs/dqn/online_joint_dqn.toml 读取参数，vehicle_roles.json 仅用于检查上游时间轴漂移。
     """
 
     num_services: int = 10
@@ -74,7 +74,7 @@ class TaskConfig:
     cycles_per_bit_min: float = 400.0
     cycles_per_bit_max: float = 1000.0
 
-    # 实现层回退默认值：参数范围由 configs/proposed/system_config.toml
+    # 实现层回退默认值：参数范围由 configs/dqn/online_joint_dqn.toml
     # 正式入口统一读取；以下值只用于无 TOML 的函数级回退。
     service_size_unit: str = "GB"
     program_size_unit: str = "MB"
@@ -1068,7 +1068,7 @@ def task_config_from_project_config(
     project_config: dict[str, Any],
     fallback: TaskConfig | None = None,
 ) -> TaskConfig:
-    """把 configs/proposed/system_config.toml 的正式任务参数映射到生成器配置。"""
+    """把 configs/dqn/online_joint_dqn.toml 的正式任务参数映射到生成器配置。"""
     from common.project_config import get_config_value
 
     base = fallback or DEFAULT_CONFIG

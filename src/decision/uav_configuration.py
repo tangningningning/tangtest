@@ -9,7 +9,7 @@ configuration 和同一批 prediction scenarios，选择当前时隙 UAV 二维�
 
 注意：
 
-- 不决定 trigger/WHEN，不训练 PPO，不调用 Matching/KKT；
+- 不决定策略 trigger，不训练智能体，不调用 Matching/KKT；
 - 不做 UAV 轨迹规划，高度固定且只优化 ``[x, y]``；
 - ``z=0`` 时严格保持原位置；
 - ``z=1`` 时允许重新搜索位置，但如果没有严格更优候选则保持原位置；

@@ -15,27 +15,6 @@ from pathlib import Path
 from typing import Any
 
 
-PROPOSED_POLICY_SCHEMA = (
-    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-    "v3_per_slot_analytic_task_model_v1_training_p95_reward_norm_v1"
-)
-MULTI_NODE_FACTORIZED_POLICY_SCHEMA = (
-    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-    "v5_multi_node_cache_factorized_v1_keep_node_identity_v1_"
-    "per_slot_analytic_task_model_v1_"
-    "training_p95_reward_norm_v1"
-)
-SPARSE_COORDINATED_CACHE_POLICY_SCHEMA = (
-    "adaptive_dual_timescale_proposed_cache_economic_features_fixed_lr_horizon_mask_"
-    "v6_sparse_coordinated_cache_v1_keep_node_identity_v1_"
-    "per_slot_analytic_task_model_v1_"
-    "training_p95_reward_norm_v1"
-)
-CACHE_ACTION_MODE_SINGLE_NODE = "SINGLE_NODE_UNIFIED"
-CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED = "MULTI_NODE_FACTORIZED"
-CACHE_ACTION_MODE_SPARSE_COORDINATED = "SPARSE_COORDINATED_SINGLE_NODE_UPDATE"
-CACHE_RECONFIGURATION_MODEL_ABSTRACT = "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION"
-
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - only for Python < 3.11
@@ -49,11 +28,11 @@ def find_project_root() -> Path:
     candidates = (Path(__file__).resolve().parents[2], Path.cwd().resolve())
     for candidate in candidates:
         if (
-            candidate / "configs" / "proposed" / "alternating_actor_updates_v1.toml"
+            candidate / "configs" / "dqn" / "online_joint_dqn.toml"
         ).is_file() and (candidate / "data").is_dir():
             return candidate
     raise FileNotFoundError(
-        "无法找到包含 configs/proposed/alternating_actor_updates_v1.toml 的项目根目录。"
+        "无法找到包含 configs/dqn/online_joint_dqn.toml 的项目根目录。"
     )
 
 
@@ -100,7 +79,7 @@ def raw_config_sha256(path: str | Path) -> str:
 
 
 def load_config(
-    path: str | Path = "configs/proposed/alternating_actor_updates_v1.toml",
+    path: str | Path = "configs/dqn/online_joint_dqn.toml",
     *,
     require_artifacts: bool = True,
 ) -> dict[str, Any]:
@@ -124,19 +103,19 @@ def get_config_value(config: dict[str, Any], dotted_key: str, default: Any = Non
     return current
 
 
-PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED = "full_episode_randomized"
+EPISODE_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED = "full_episode_randomized"
 
 
-def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
+def get_episode_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
     """读取并校验正式的完整 episode 数据协议。"""
 
-    raw_protocol = get_config_value(config, "algorithm.ppo.data_protocol")
+    raw_protocol = get_config_value(config, "data_protocol")
     if not isinstance(raw_protocol, dict):
-        raise ValueError("缺少 algorithm.ppo.data_protocol 配置表。")
+        raise ValueError("缺少 data_protocol 配置表。")
     protocol = str(raw_protocol.get("protocol", ""))
-    if protocol != PPO_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
+    if protocol != EPISODE_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED:
         raise ValueError(
-            "algorithm.ppo.data_protocol.protocol 必须为 full_episode_randomized。"
+            "data_protocol.protocol 必须为 full_episode_randomized。"
         )
 
     dt_s = float(get_config_value(config, "simulation.dt_s"))
@@ -159,13 +138,13 @@ def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
         if key not in raw_protocol:
             if required:
                 raise ValueError(
-                    f"algorithm.ppo.data_protocol 缺少 {key}。"
+                    f"data_protocol 缺少 {key}。"
                 )
             return None
         value = raw_protocol[key]
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(
-                f"algorithm.ppo.data_protocol.{key} 必须是整数。"
+                f"data_protocol.{key} 必须是整数。"
             )
         return int(value)
 
@@ -173,19 +152,8 @@ def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
     assert train_start is not None
     if train_start != 0:
         raise ValueError(
-            "algorithm.ppo.data_protocol.train_origin_start 必须为正式 origin 的起点0。"
+            "data_protocol.train_origin_start 必须为正式 origin 的起点0。"
         )
-
-    num_minibatches_value = get_config_value(
-        config, "algorithm.ppo.num_minibatches"
-    )
-    if (
-        isinstance(num_minibatches_value, bool)
-        or not isinstance(num_minibatches_value, int)
-        or int(num_minibatches_value) <= 0
-    ):
-        raise ValueError("algorithm.ppo.num_minibatches 必须是正整数。")
-    num_minibatches = int(num_minibatches_value)
 
     configured_episode_slots = read_int("episode_slots")
     configured_train_end = read_int("train_origin_end")
@@ -227,33 +195,6 @@ def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
     test_start = None
     test_end = None
 
-    train_origin_count = train_end - train_start + 1
-    if train_origin_count <= 0 or train_origin_count % num_minibatches != 0:
-        raise ValueError(
-            "PPO train origin 数量必须为正并可被 algorithm.ppo.num_minibatches 整除："
-            f"count={train_origin_count}, num_minibatches={num_minibatches}。"
-        )
-    configured_minibatch_size = get_config_value(
-        config, "algorithm.ppo.minibatch_size", None
-    )
-    if configured_minibatch_size is None:
-        minibatch_size = train_origin_count // num_minibatches
-    else:
-        if (
-            isinstance(configured_minibatch_size, bool)
-            or not isinstance(configured_minibatch_size, int)
-            or int(configured_minibatch_size) <= 0
-        ):
-            raise ValueError("algorithm.ppo.minibatch_size 必须是正整数。")
-        minibatch_size = int(configured_minibatch_size)
-        expected_minibatch_size = train_origin_count // num_minibatches
-        if minibatch_size != expected_minibatch_size:
-            raise ValueError(
-                "algorithm.ppo.minibatch_size 必须等于完整 train episode 的 "
-                "transitions / num_minibatches："
-                f"configured={minibatch_size}, expected={expected_minibatch_size}。"
-            )
-
     return {
         "protocol": protocol,
         "physical_episode_slots": physical_episode_slots,
@@ -264,8 +205,6 @@ def get_ppo_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
         "test_origin_end": test_end,
         "rollout_steps": configured_rollout,
         "terminal_origin": terminal_origin,
-        "num_minibatches": num_minibatches,
-        "minibatch_size": minibatch_size,
     }
 
 
@@ -721,7 +660,7 @@ def validate_config(
     if uav_count < 1:
         raise ValueError(
             "nodes.uav.count 必须至少为1，请检查 "
-            "configs/proposed/alternating_actor_updates_v1.toml。"
+            "configs/dqn/online_joint_dqn.toml。"
         )
     if require_artifacts:
         uav_instances = get_config_value(config, "nodes.uav.instances", [])
@@ -767,7 +706,7 @@ def validate_config(
         ):
             raise ValueError(
                 "vehicle_roles.json 车辆数量必须与 "
-                "configs/proposed/alternating_actor_updates_v1.toml 的正式配置一致。"
+                "configs/dqn/online_joint_dqn.toml 的正式配置一致。"
             )
         if len(research) != len(set(research)) or len(sv) != len(set(sv)) or len(tv) != len(set(tv)):
             raise ValueError("vehicle_roles.json 研究车辆角色列表不能包含重复 ID。")
@@ -872,264 +811,6 @@ def validate_config(
         raise ValueError("algorithm.matching.max_updates 必须 >= 1。")
     if float(get_config_value(config, "algorithm.matching.objective_tolerance")) < 0.0:
         raise ValueError("algorithm.matching.objective_tolerance 不能为负。")
-    ppo_method = str(get_config_value(config, "algorithm.ppo.method", ""))
-    if ppo_method != "PROPOSED":
-        raise ValueError("algorithm.ppo.method 必须为 PROPOSED。")
-    configuration_control_mode = str(
-        get_config_value(config, "algorithm.ppo.configuration_control_mode", "")
-    )
-    if configuration_control_mode != "macro_cache_smdp_micro_uav_candidate":
-        raise ValueError(
-            "configuration_control_mode 必须为 macro_cache_smdp_micro_uav_candidate。"
-        )
-    cache_action_mode = str(
-        get_config_value(
-            config,
-            "algorithm.ppo.cache_action_mode",
-            CACHE_ACTION_MODE_SINGLE_NODE,
-        )
-    )
-    if cache_action_mode not in {
-        CACHE_ACTION_MODE_SINGLE_NODE,
-        CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED,
-        CACHE_ACTION_MODE_SPARSE_COORDINATED,
-    }:
-        raise ValueError("algorithm.ppo.cache_action_mode 不受支持。")
-    policy_schema = str(get_config_value(config, "algorithm.ppo.policy_schema", ""))
-    if cache_action_mode == CACHE_ACTION_MODE_SINGLE_NODE:
-        if policy_schema != PROPOSED_POLICY_SCHEMA:
-            raise ValueError(
-                "SINGLE_NODE_UNIFIED 必须使用当前单节点正式策略 schema。"
-            )
-        reconfiguration_model = str(
-            get_config_value(
-                config,
-                "algorithm.ppo.cache_reconfiguration_model",
-                "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION",
-            )
-        )
-        if reconfiguration_model != "SINGLE_NODE_MACRO_BOUNDARY_RECONFIGURATION":
-            raise ValueError(
-                "SINGLE_NODE_UNIFIED 的 cache_reconfiguration_model 不受支持。"
-            )
-    elif cache_action_mode == CACHE_ACTION_MODE_MULTI_NODE_FACTORIZED:
-        if policy_schema != MULTI_NODE_FACTORIZED_POLICY_SCHEMA:
-            raise ValueError(
-                "MULTI_NODE_FACTORIZED 必须使用独立的多节点策略 schema。"
-            )
-        reconfiguration_model = str(
-            get_config_value(config, "algorithm.ppo.cache_reconfiguration_model", "")
-        )
-        if reconfiguration_model != CACHE_RECONFIGURATION_MODEL_ABSTRACT:
-            raise ValueError(
-                "MULTI_NODE_FACTORIZED 必须显式启用 "
-                "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION。"
-            )
-    else:
-        if policy_schema != SPARSE_COORDINATED_CACHE_POLICY_SCHEMA:
-            raise ValueError(
-                "SPARSE_COORDINATED_SINGLE_NODE_UPDATE 必须使用独立稀疏策略 schema。"
-            )
-        max_cache_updates = get_config_value(
-            config, "algorithm.ppo.max_cache_updates_per_frame", None
-        )
-        if (
-            isinstance(max_cache_updates, bool)
-            or not isinstance(max_cache_updates, int)
-            or max_cache_updates != 1
-        ):
-            raise ValueError(
-                "SPARSE_COORDINATED_SINGLE_NODE_UPDATE 固定每个 Macro 帧最多更新一个节点。"
-            )
-        reconfiguration_model = str(
-            get_config_value(config, "algorithm.ppo.cache_reconfiguration_model", "")
-        )
-        if reconfiguration_model != CACHE_RECONFIGURATION_MODEL_ABSTRACT:
-            raise ValueError(
-                "SPARSE_COORDINATED_SINGLE_NODE_UPDATE 必须显式启用 "
-                "ABSTRACT_MACRO_BOUNDARY_RECONFIGURATION。"
-            )
-    required_flags = {
-        "macro_cache_enabled": True,
-        "macro_full_batch": True,
-        "exact_q_training_enabled": False,
-        "critic_mc_warmup_required": False,
-        "uav_unified_candidate_policy": True,
-        "uav_autoregressive": True,
-        "uav_group_balance": True,
-    }
-    for key, expected in required_flags.items():
-        actual = get_config_value(config, f"algorithm.ppo.{key}", None)
-        if actual is not expected:
-            raise ValueError(f"algorithm.ppo.{key} 必须为 {expected!r}。")
-    prediction_horizon = int(get_config_value(config, "prediction.vehicle.horizon"))
-    adaptive_holding_enabled = get_config_value(
-        config, "algorithm.ppo.adaptive_holding_enabled", None
-    )
-    if not isinstance(adaptive_holding_enabled, bool):
-        raise ValueError("algorithm.ppo.adaptive_holding_enabled 必须为布尔值。")
-    adaptive_holding_min_slots = get_config_value(
-        config, "algorithm.ppo.adaptive_holding_min_slots", None
-    )
-    adaptive_holding_max_slots = get_config_value(
-        config, "algorithm.ppo.adaptive_holding_max_slots", None
-    )
-    for key, value in {
-        "adaptive_holding_min_slots": adaptive_holding_min_slots,
-        "adaptive_holding_max_slots": adaptive_holding_max_slots,
-    }.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"algorithm.ppo.{key} 必须为正整数。")
-    if adaptive_holding_min_slots > adaptive_holding_max_slots:
-        raise ValueError(
-            "algorithm.ppo.adaptive_holding_min_slots 不得大于 adaptive_holding_max_slots。"
-        )
-    if adaptive_holding_max_slots > prediction_horizon:
-        raise ValueError("adaptive_holding_max_slots 不得超过当前预测 horizon。")
-    if adaptive_holding_enabled:
-        if adaptive_holding_min_slots != 1 or adaptive_holding_max_slots != 5:
-            raise ValueError(
-                "自适应 Holding 合同固定为 min_slots=1、max_slots=5。"
-            )
-    elif adaptive_holding_min_slots != 2 or adaptive_holding_max_slots != 2:
-        raise ValueError(
-            "fixed2 兼容模式必须使用 adaptive_holding_enabled=false 且 min_slots=max_slots=2。"
-        )
-
-    if "target_kl" in get_config_value(config, "algorithm.ppo", {}):
-        raise ValueError(
-            "algorithm.ppo.target_kl 已废弃；请分别配置 macro_target_kl 和 micro_target_kl。"
-        )
-    macro_target_kl = get_config_value(config, "algorithm.ppo.macro_target_kl", None)
-    micro_target_kl = get_config_value(config, "algorithm.ppo.micro_target_kl", None)
-    for key, value in {
-        "macro_target_kl": macro_target_kl,
-        "micro_target_kl": micro_target_kl,
-    }.items():
-        if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
-            raise ValueError(f"algorithm.ppo.{key} 必须为正的有限数。")
-    if not math.isclose(float(macro_target_kl), 0.10, rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError("PROPOSED algorithm.ppo.macro_target_kl 必须固定为 0.10。")
-    if not math.isclose(float(micro_target_kl), 0.02, rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError("PROPOSED algorithm.ppo.micro_target_kl 必须固定为 0.02。")
-    group_probability_soft_cap = get_config_value(
-        config, "algorithm.ppo.micro_group_probability_soft_cap", None
-    )
-    if (
-        group_probability_soft_cap is None
-        or not math.isfinite(float(group_probability_soft_cap))
-        or not 0.5 < float(group_probability_soft_cap) < 1.0
-    ):
-        raise ValueError(
-            "algorithm.ppo.micro_group_probability_soft_cap 必须为 (0.5,1) 内的有限数。"
-        )
-    if not math.isclose(
-        float(group_probability_soft_cap), 0.90, rel_tol=0.0, abs_tol=1e-12
-    ):
-        raise ValueError(
-            "PROPOSED algorithm.ppo.micro_group_probability_soft_cap 必须固定为 0.90。"
-        )
-    group_entropy_floor_coefficient = get_config_value(
-        config, "algorithm.ppo.micro_group_entropy_floor_coefficient", None
-    )
-    if (
-        group_entropy_floor_coefficient is None
-        or not math.isfinite(float(group_entropy_floor_coefficient))
-        or float(group_entropy_floor_coefficient) < 0.0
-    ):
-        raise ValueError(
-            "algorithm.ppo.micro_group_entropy_floor_coefficient 必须为非负有限数。"
-        )
-    if not math.isclose(
-        float(group_entropy_floor_coefficient), 0.05, rel_tol=0.0, abs_tol=1e-12
-    ):
-        raise ValueError(
-            "PROPOSED algorithm.ppo.micro_group_entropy_floor_coefficient 必须固定为 0.05。"
-        )
-    ppo_hidden_sizes = get_config_value(config, "algorithm.ppo.hidden_sizes", [])
-    if not isinstance(ppo_hidden_sizes, list) or not ppo_hidden_sizes:
-        raise ValueError("algorithm.ppo.hidden_sizes 必须是非空列表。")
-    if any(isinstance(value, bool) or int(value) != value or int(value) <= 0 for value in ppo_hidden_sizes):
-        raise ValueError("algorithm.ppo.hidden_sizes 必须全部为正整数。")
-    ppo_gamma = float(get_config_value(config, "algorithm.ppo.gamma"))
-    ppo_gae_lambda = float(get_config_value(config, "algorithm.ppo.gae_lambda"))
-    if not 0.0 <= ppo_gamma <= 1.0 or not 0.0 <= ppo_gae_lambda <= 1.0:
-        raise ValueError("gamma 和 gae_lambda 必须位于 [0,1]。")
-    ppo_clip_epsilon = float(get_config_value(config, "algorithm.ppo.clip_epsilon"))
-    ppo_learning_rate = float(get_config_value(config, "algorithm.ppo.learning_rate"))
-    ppo_actor_learning_rate = float(
-        get_config_value(config, "algorithm.ppo.actor_learning_rate", ppo_learning_rate)
-    )
-    ppo_critic_learning_rate = float(
-        get_config_value(config, "algorithm.ppo.critic_learning_rate", ppo_learning_rate)
-    )
-    ppo_value_coef = float(get_config_value(config, "algorithm.ppo.value_loss_coefficient"))
-    ppo_entropy_coef = float(get_config_value(config, "algorithm.ppo.entropy_coefficient"))
-    ppo_max_grad_norm = float(get_config_value(config, "algorithm.ppo.max_grad_norm"))
-    ppo_update_epochs = int(get_config_value(config, "algorithm.ppo.update_epochs"))
-    ppo_num_minibatches = int(get_config_value(config, "algorithm.ppo.num_minibatches"))
-    if not 0.0 < ppo_clip_epsilon < 1.0:
-        raise ValueError("algorithm.ppo.clip_epsilon 必须位于 (0,1)。")
-    for key, value in {
-        "learning_rate": ppo_learning_rate,
-        "actor_learning_rate": ppo_actor_learning_rate,
-        "critic_learning_rate": ppo_critic_learning_rate,
-        "max_grad_norm": ppo_max_grad_norm,
-    }.items():
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(f"algorithm.ppo.{key} 必须为正的有限数。")
-    realizations_per_policy_update = get_config_value(
-        config, "algorithm.ppo.realizations_per_policy_update", None
-    )
-    if (
-        isinstance(realizations_per_policy_update, bool)
-        or not isinstance(realizations_per_policy_update, int)
-        or int(realizations_per_policy_update) != 4
-    ):
-        raise ValueError("algorithm.ppo.realizations_per_policy_update 必须固定为 4。")
-    macro_actor_learning_rate = float(
-        get_config_value(config, "algorithm.ppo.macro_actor_learning_rate", math.nan)
-    )
-    macro_actor_final_learning_rate = float(
-        get_config_value(config, "algorithm.ppo.macro_actor_final_learning_rate", math.nan)
-    )
-    macro_actor_learning_rate_schedule = str(
-        get_config_value(config, "algorithm.ppo.macro_actor_learning_rate_schedule", "")
-    )
-    macro_actor_learning_rate = float(
-        get_config_value(config, "algorithm.ppo.macro_actor_learning_rate", math.nan)
-    )
-    macro_actor_final_learning_rate = float(
-        get_config_value(config, "algorithm.ppo.macro_actor_final_learning_rate", math.nan)
-    )
-    optimizer_learning_rate_schedule = str(
-        get_config_value(config, "algorithm.ppo.optimizer_learning_rate_schedule", "")
-    )
-    if (
-        not math.isfinite(macro_actor_learning_rate)
-        or not math.isfinite(macro_actor_final_learning_rate)
-        or macro_actor_learning_rate <= 0.0
-        or macro_actor_final_learning_rate <= 0.0
-        or not math.isclose(
-            macro_actor_final_learning_rate,
-            macro_actor_learning_rate,
-            rel_tol=0.0,
-            abs_tol=1.0e-15,
-        )
-        or macro_actor_learning_rate_schedule != "constant"
-        or optimizer_learning_rate_schedule != "constant"
-    ):
-        raise ValueError(
-            "PROPOSED Macro Actor endpoints and all optimizer schedules must be constant."
-        )
-    if ppo_value_coef < 0.0 or ppo_entropy_coef < 0.0:
-        raise ValueError("value_loss_coefficient 和 entropy_coefficient 不能为负。")
-    if not math.isclose(ppo_entropy_coef, 0.0, rel_tol=0.0, abs_tol=0.0):
-        raise ValueError("PROPOSED algorithm.ppo.entropy_coefficient 必须固定为 0。")
-    if ppo_update_epochs < 1 or ppo_num_minibatches < 1:
-        raise ValueError("update_epochs 和 num_minibatches 必须为正整数。")
-    if int(get_config_value(config, "algorithm.ppo.minibatch_size")) <= 0:
-        raise ValueError("algorithm.ppo.minibatch_size 必须为正整数。")
     prediction_batch_parallel_workers = get_config_value(
         config,
         "algorithm.configuration.prediction_batch_parallel_workers",
@@ -1162,9 +843,9 @@ def validate_config(
         if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
             raise ValueError(f"simulation.{label} 必须是 dt_s 的整数倍。")
 
-    # 当前 PPO 使用完整 episode 随机化协议，
+    # 当前系统使用完整 episode 随机化协议，
     # 并在协议校验中验证 episode 终止位置。
-    get_ppo_data_protocol(config)
+    get_episode_data_protocol(config)
     research_count = int(get_config_value(config, "simulation.num_research_vehicles"))
     service_count = int(get_config_value(config, "simulation.num_service_vehicles"))
     task_count = int(get_config_value(config, "simulation.num_task_vehicles"))

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """统一系统物理模型公式。
 
-本文件只放纯公式函数，不读取数据文件，不做 cache/UAV/Matching/KKT/PPO 搜索。
+本文件只放纯公式函数，不读取数据文件，也不执行策略搜索或 Matching/KKT。
 单位约定：
 
 * D / input_bits: bit

@@ -12,12 +12,17 @@ dependencies = [
 ]
 
 [project.scripts]
-ppo-eval = "ppo_simple.evaluator:main"
+online-joint-dqn = "online_joint_dqn.run_training:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["common*", "scenario*", "decision*", "ppo_simple*"]
+include = [
+    "common*",
+    "scenario*",
+    "decision*",
+    "online_joint_dqn*",
+]
 namespaces = true

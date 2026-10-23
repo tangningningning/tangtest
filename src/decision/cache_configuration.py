@@ -4,7 +4,7 @@
 
 本阶段只解决：给定上一时隙缓存状态、cache trigger 和预测场景后，选择新的
 动态缓存配置。预测候选复用实际执行侧的 Matching/KKT 和所配置的 Cloud 资源合同，
-但不训练 PPO，也不读取任何未来真实 trajectory/tasks/popularity 标签；正式
+但不训练智能体，也不读取任何未来真实 trajectory/tasks/popularity 标签；
 episode 初始缓存只使用 service catalog 中的 service size、节点容量和显式 seed。
 """
 
@@ -28,7 +28,7 @@ from common import project_config, system_model
 
 @dataclass(frozen=True)
 class CacheOptimizationConfig:
-    # 所有系统物理参数必须由 system_config.toml 构造，不在算法文件中另设一套。
+    # 所有系统物理参数必须由 DQN 系统配置构造，不在算法文件中另设一套。
     num_rsu: int
     num_uav: int
     rsu_instances: tuple[tuple[str, float, float], ...]
@@ -202,7 +202,7 @@ DEFAULT_CONFIG: CacheOptimizationConfig | None = None
 
 
 def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig:
-    """从 system_config.toml 的解析结果构造 cache optimizer 内部配置。"""
+    """从解析后的系统配置构造 cache optimizer 内部配置。"""
     get = project_config.get_config_value
     rsu_instances = tuple(
         (

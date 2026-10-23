@@ -22,13 +22,13 @@ if str(GENERATION_ROOT) not in sys.path:
 
 from common import project_config  # noqa: E402
 import generate_episode_realization  # noqa: E402
-from ppo_simple.interface import (  # noqa: E402
+from common.environment_interface import (  # noqa: E402
     load_environment_context,
     prepare_aligned_rollout_steps,
 )
 
 
-CONFIG_RELATIVE = Path("configs/proposed/alternating_actor_updates_v1.toml")
+CONFIG_RELATIVE = Path("configs/dqn/online_joint_dqn.toml")
 # Frozen pool manifests retain their original source-path provenance.
 POOL_MANIFEST_SOURCE_CONFIG_RELATIVE = Path("configs/proposed/system_config.toml")
 TRAIN_POOL_RELATIVE = Path("environment_data/proposed_joint_training")
@@ -37,7 +37,7 @@ TEST_POOL_RELATIVE = Path("environment_data/proposed_joint_test")
 DEFAULT_TRAINING_SEED_START = 20001
 DEFAULT_TEST_SEED_START = 40001
 
-# The training data contract is pinned independently of runtime/reward/MAPPO values.
+# The training data contract is pinned independently of runtime and reward values.
 FORMAL_TRAINING_POOL_MANIFEST_SHA256 = (
     "b6cae236b029f4d24c7488a91f0825247a20f475ec76b2d80737de44ae491bd3"
 )
@@ -333,7 +333,7 @@ def _validate_training_integrity_baseline(
     }
 
 
-def validate_formal_training_pool_for_run(
+def validate_dqn_training_pool_for_run(
     *,
     formal_root: str | Path,
     config_path: str | Path,
@@ -343,46 +343,35 @@ def validate_formal_training_pool_for_run(
     episode_count: int,
     generate_missing: bool,
 ) -> dict[str, Any]:
-    """Run the lightweight generation-contract gate for a new formal run."""
+    """Validate the frozen Training Pool against the DQN system configuration."""
 
     root = Path(formal_root).expanduser().resolve(strict=True)
-    alternating_config = (root / CONFIG_RELATIVE).resolve(strict=True)
+    dqn_config = (root / CONFIG_RELATIVE).resolve(strict=True)
     actual_config = Path(config_path).expanduser().resolve(strict=True)
-    if actual_config != alternating_config:
+    if actual_config != dqn_config:
         raise ValueError(
-            "Formal Training requires the reviewed "
-            "ALTERNATING_ACTOR_UPDATES_V1 config: "
-            f"expected={alternating_config}, actual={actual_config}"
-        )
-    actor_update_config = runtime_config["algorithm"]["ppo"]
-    if (
-        actor_update_config.get("actor_update_mode") != "ALTERNATING"
-        or actor_update_config.get("actor_update_first") != "MICRO"
-        or actor_update_config.get("actor_update_period") != 1
-    ):
-        raise ValueError(
-            "ALTERNATING_ACTOR_UPDATES_V1 requires mode=ALTERNATING, "
-            "first=MICRO, and period=1."
+            "DQN training requires configs/dqn/online_joint_dqn.toml: "
+            f"expected={dqn_config}, actual={actual_config}"
         )
     expected_pool = (root / TRAIN_POOL_RELATIVE).resolve(strict=True)
     actual_pool = project_config.resolve_path(root, episode_pool).resolve(strict=True)
     if actual_pool != expected_pool:
         raise ValueError(
-            "Formal Training requires the frozen proposed_joint_training pool: "
+            "DQN training requires the frozen proposed_joint_training pool: "
             f"expected={expected_pool}, actual={actual_pool}"
         )
     if episode_seed_start != DEFAULT_TRAINING_SEED_START:
         raise ValueError(
-            "Formal Training seed start must be "
+            "DQN Training Pool seed start must be "
             f"{DEFAULT_TRAINING_SEED_START}, actual={episode_seed_start!r}"
         )
     if int(episode_count) != FORMAL_TRAINING_EPISODE_COUNT:
         raise ValueError(
-            "Formal Training requires the complete frozen Pool episode count: "
+            "DQN Training requires the complete frozen Pool episode count: "
             f"expected={FORMAL_TRAINING_EPISODE_COUNT}, actual={episode_count}"
         )
     if bool(generate_missing):
-        raise ValueError("Formal Training Pool gate does not permit generating missing Episodes.")
+        raise ValueError("DQN Training Pool validation does not generate missing Episodes.")
 
     cfg = copy.deepcopy(runtime_config)
     cfg["_meta"] = {
@@ -390,7 +379,7 @@ def validate_formal_training_pool_for_run(
         "project_root": str(root),
     }
     project_config.validate_for_formal_experiment(cfg)
-    protocol = project_config.get_ppo_data_protocol(cfg)
+    protocol = project_config.get_episode_data_protocol(cfg)
     expected_protocol = {
         "protocol": "full_episode_randomized",
         "physical_episode_slots": FORMAL_TRAINING_EPISODE_SLOTS,
@@ -407,7 +396,7 @@ def validate_formal_training_pool_for_run(
     }
     if protocol_mismatches:
         raise ValueError(
-            "Formal Training Episode protocol mismatch: "
+            "DQN Training Episode protocol mismatch: "
             f"{json.dumps(protocol_mismatches, ensure_ascii=False, sort_keys=True)}"
         )
 

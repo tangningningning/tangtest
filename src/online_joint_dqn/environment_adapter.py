@@ -23,13 +23,13 @@ from decision import (
     task_allocation,
     uav_configuration,
 )
-from online_joint_optimizer.candidate_evaluator import (
+from .candidate_evaluator import (
     SearchBudget,
     SlotInput,
     SystemModelContext,
 )
-from online_joint_optimizer.cache_optimizer import CacheOptimizer
-from online_joint_optimizer.uav_scheduler import UavScheduler
+from .cache_optimizer import CacheOptimizer
+from .uav_scheduler import UavScheduler
 
 from .candidate_features import (
     ActionCandidate,
@@ -172,6 +172,30 @@ def _input_fingerprint(slot_input: SlotInput) -> str:
         slot_input.prediction_metadata,
     )
     return hashlib.sha256(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
+
+
+def _cache_nodes_at_uav_positions(
+    cache_nodes: Mapping[str, Any],
+    uav_positions: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy cache-node geometry and place each UAV at the supplied XY position."""
+
+    result = deepcopy(dict(cache_nodes))
+    node_ids = tuple(str(value) for value in result["node_ids"])
+    node_roles = tuple(str(value).upper() for value in result["node_roles"])
+    fixed_positions = result["fixed_positions"]
+    if not isinstance(fixed_positions, dict):
+        raise TypeError("cache node fixed_positions must be a mapping")
+    for node_id, role in zip(node_ids, node_roles, strict=True):
+        if role != "UAV":
+            continue
+        if node_id not in uav_positions:
+            raise KeyError(f"UAV cache node {node_id} has no state position")
+        position = np.asarray(uav_positions[node_id], dtype=np.float64).reshape(-1)
+        if position.shape != (2,) or not np.all(np.isfinite(position)):
+            raise ValueError(f"UAV {node_id} position must be a finite XY pair")
+        fixed_positions[node_id] = position.copy()
+    return result
 
 
 _CANDIDATE_REBUILD_SCENARIO_FIELDS = (
@@ -708,7 +732,7 @@ class ExclusiveDQNEnvironment:
         if str(training_scripts) not in sys.path:
             sys.path.insert(0, str(training_scripts))
         import training_pool_contract as pool_contract
-        from ppo_simple.interface import aligned_train_steps
+        from common.environment_interface import aligned_train_steps
 
         pool, pool_info = pool_contract._validate_pool(
             root,
@@ -1161,9 +1185,9 @@ class ExclusiveDQNEnvironment:
         return tuple(unique.values()), diagnostics
 
     def _formal_observation(self, forecast: DecisionForecast) -> np.ndarray:
-        """复用正式 MAPPO 观测构造器，输入对象仅含当前决策可见的预测。"""
+        """复用共享系统观测构造器，输入对象仅含当前决策可见的预测。"""
 
-        from ppo_simple.interface import build_step_observation
+        from common.environment_interface import build_step_observation
 
         single_origin_override = None
         if (
@@ -1507,8 +1531,15 @@ class ExclusiveDQNEnvironment:
         previous_uav = {key: value.copy() for key, value in self.uav_positions.items()}
         target_cache = action.cache_array()
         target_uav = action.uav_dict()
-        changed_cache = bool(action.changed_node_ids)
-        moved_uav = bool(action.moved_uav_ids)
+        changed_cache = not np.array_equal(previous_cache, target_cache)
+        moved_uav = any(
+            not np.array_equal(previous_uav[uav_id], target_uav[uav_id])
+            for uav_id in previous_uav
+        )
+        if changed_cache != bool(action.changed_node_ids):
+            raise RuntimeError("候选 changed_node_ids 与缓存目标差异不一致")
+        if moved_uav != bool(action.moved_uav_ids):
+            raise RuntimeError("候选 moved_uav_ids 与 UAV 目标差异不一致")
         if changed_cache and moved_uav:
             raise ValueError("候选动作违反缓存与 UAV 互斥约束")
         slot_input = self.slot_inputs[self.index]
@@ -1528,6 +1559,50 @@ class ExclusiveDQNEnvironment:
             uav_id: int(float(np.linalg.norm(target_uav[uav_id] - previous_uav[uav_id])) > tolerance)
             for uav_id in previous_uav
         }
+        cache_configuration.validate_cache_shape_and_capacity(
+            target_cache,
+            dict(self.model.service_catalog),
+            dict(self.model.cache_nodes),
+        )
+        cache_replace_pass = all(
+            cache_configuration.is_legal_cache_replacement(
+                previous_cache[node_index], target_cache[node_index]
+            )
+            for node_index, node_id in enumerate(self.model.cache_nodes["node_ids"])
+            if str(node_id) in action.changed_node_ids
+        )
+        if not cache_replace_pass:
+            raise ValueError("候选缓存差异违反正式 REPLACE 规则")
+        flight_boundary = tuple(float(value) for value in self.model.flight_boundary)
+        uav_boundary_pass = all(
+            uav_configuration._inside_boundary(
+                np.asarray(position, dtype=np.float64), flight_boundary
+            )
+            for position in target_uav.values()
+        )
+        uav_search_config = uav_configuration.uav_search_config_from_project(
+            dict(self.model.project_cfg)
+        )
+        uav_safety_distance_pass = all(
+            uav_configuration._satisfies_min_safety_distance(
+                uav_id,
+                target_uav[uav_id],
+                target_uav,
+                uav_search_config,
+            )
+            for uav_id in target_uav
+        )
+        if not uav_boundary_pass:
+            raise ValueError("候选 UAV 目标越过正式飞行边界")
+        if not uav_safety_distance_pass:
+            raise ValueError("候选 UAV 目标违反正式安全距离")
+        uav_configuration.validate_uav_configuration_transition(
+            previous_uav,
+            target_uav,
+            uav_triggers,
+            dict(self.model.project_cfg),
+            flight_boundary,
+        )
         kkt_cache = task_allocation.KKTResourceAllocationCache()
         performance_profile: dict[str, float] = {}
         result = slot_environment.execute_configured_slot(
@@ -1542,7 +1617,7 @@ class ExclusiveDQNEnvironment:
             dict(self.model.project_cfg),
             dict(self.model.cache_nodes),
             self.model.cache_config,
-            tuple(self.model.flight_boundary),
+            flight_boundary,
             slot_id=int(slot_input.slot_id),
             time_s=slot_input.time_s,
             performance_profile=performance_profile,
@@ -1615,12 +1690,20 @@ class ExclusiveDQNEnvironment:
         predicted_cache_coverage_before: float | None = None
         predicted_cache_coverage_after: float | None = None
         predicted_cache_coverage_error: str | None = None
+        predicted_service_demand_by_service: dict[int, float] | None = None
+        cache_service_demand_details: dict[str, dict[str, list[dict[str, Any]]]] = {}
         try:
+            cache_nodes_before = _cache_nodes_at_uav_positions(
+                self.model.cache_nodes, previous_uav
+            )
+            cache_nodes_after = _cache_nodes_at_uav_positions(
+                self.model.cache_nodes, final_uav
+            )
             predicted_cache_coverage_before = (
                 cache_configuration.predicted_cache_coverage_ratio(
                     previous_cache,
                     dict(slot_input.scenario_slice),
-                    dict(self.model.cache_nodes),
+                    cache_nodes_before,
                     self.model.cache_config,
                     prediction_horizon_mask=slot_input.prediction_horizon_mask,
                 )
@@ -1629,13 +1712,72 @@ class ExclusiveDQNEnvironment:
                 cache_configuration.predicted_cache_coverage_ratio(
                     final_cache,
                     dict(slot_input.scenario_slice),
-                    dict(self.model.cache_nodes),
+                    cache_nodes_after,
                     self.model.cache_config,
                     prediction_horizon_mask=slot_input.prediction_horizon_mask,
                 )
             )
+            predicted_demand = cache_configuration.predicted_vehicle_service_demand_by_horizon(
+                dict(slot_input.scenario_slice),
+                len(tuple(self.model.service_catalog["service_ids"])),
+                beta_discount=float(self.model.cache_config.beta_discount),
+                prediction_horizon_mask=slot_input.prediction_horizon_mask,
+            )
+            demand_by_service = np.sum(predicted_demand, axis=(0, 1))
+            predicted_service_demand_by_service = {
+                int(service_id): float(demand_by_service[index])
+                for index, service_id in enumerate(
+                    self.model.service_catalog["service_ids"]
+                )
+            }
+            replicas_before = np.sum(previous_cache, axis=0).astype(int)
+            replicas_after = np.sum(final_cache, axis=0).astype(int)
+            for node_index, node_id in enumerate(self.model.cache_nodes["node_ids"]):
+                node_id = str(node_id)
+                if node_id not in cache_services_added and node_id not in cache_services_removed:
+                    continue
+                node_demand = cache_configuration.node_specific_predicted_demand(
+                    dict(slot_input.scenario_slice),
+                    node_index,
+                    cache_nodes_before,
+                    self.model.cache_config,
+                    prediction_horizon_mask=slot_input.prediction_horizon_mask,
+                )
+
+                def changed_service_details(service_values: Sequence[int]) -> list[dict[str, Any]]:
+                    details: list[dict[str, Any]] = []
+                    for service_id in service_values:
+                        service_index = tuple(
+                            int(value)
+                            for value in self.model.service_catalog["service_ids"]
+                        ).index(int(service_id))
+                        details.append(
+                            {
+                                "service_id": int(service_id),
+                                "predicted_demand_for_node": float(node_demand[service_index]),
+                                "predicted_demand_system_total": predicted_service_demand_by_service[
+                                    int(service_id)
+                                ],
+                                "replicas_before": int(replicas_before[service_index]),
+                                "replicas_after": int(replicas_after[service_index]),
+                            }
+                        )
+                    return details
+
+                cache_service_demand_details[node_id] = {
+                    "removed_services": changed_service_details(
+                        cache_services_removed.get(node_id, [])
+                    ),
+                    "added_services": changed_service_details(
+                        cache_services_added.get(node_id, [])
+                    ),
+                }
         except (KeyError, TypeError, ValueError, IndexError, FloatingPointError) as exc:
             predicted_cache_coverage_error = f"{type(exc).__name__}: {exc}"
+            predicted_cache_coverage_before = None
+            predicted_cache_coverage_after = None
+            predicted_service_demand_by_service = None
+            cache_service_demand_details = {}
         executor_calls = 1
         matching_calls = int(bool(result.matching_summary))
         kkt_calls = int(kkt_cache.solver_calls)
@@ -1676,6 +1818,24 @@ class ExclusiveDQNEnvironment:
             mutual_exclusion_pass=mutual_exclusion_pass,
             diagnostics={
                 "slot_id": int(slot_input.slot_id),
+                "candidate_source_state_fingerprint": action.source_state_fingerprint,
+                "candidate_current_legal_set_membership_pass": True,
+                "candidate_source_state_fingerprint_matches_current_pass": True,
+                "candidate_mutual_exclusion_pass": not (changed_cache and moved_uav),
+                "candidate_cache_replace_rule_pass": cache_replace_pass,
+                "candidate_cache_capacity_pass": True,
+                "candidate_uav_boundary_pass": uav_boundary_pass,
+                "candidate_uav_safety_distance_pass": uav_safety_distance_pass,
+                "candidate_uav_transition_constraints_pass": True,
+                "candidate_target_matches_execution_pass": True,
+                "pre_cache_state": previous_cache.tolist(),
+                "post_cache_state": final_cache.tolist(),
+                "pre_uav_positions_m": {
+                    key: value.tolist() for key, value in previous_uav.items()
+                },
+                "post_uav_positions_m": {
+                    key: value.tolist() for key, value in final_uav.items()
+                },
                 "actual_system_utility": float(result.system_utility),
                 "actual_task_utility": (
                     None
@@ -1725,7 +1885,12 @@ class ExclusiveDQNEnvironment:
                     - predicted_cache_coverage_before
                 ),
                 "predicted_cache_coverage_metric": True,
+                "predicted_cache_coverage_metric_scope": (
+                    "predicted demand weighted cache serviceability; UAV nodes use state positions"
+                ),
                 "predicted_cache_coverage_error": predicted_cache_coverage_error,
+                "predicted_service_demand_by_service": predicted_service_demand_by_service,
+                "cache_service_demand_details": cache_service_demand_details,
                 "cache_cost": (
                     None if result.cache_cost is None else float(result.cache_cost)
                 ),
@@ -1744,6 +1909,7 @@ class ExclusiveDQNEnvironment:
                 "actual_execution_node_data_available": (
                     actual_execution_node_data_available
                 ),
+                "same_slot_matching_alternative_comparison_available": False,
                 "executor_performance_profile": performance_profile,
                 "duration_semantics": "每个动作恰好执行一个正式 Slot",
                 **candidate_generation_diagnostics,

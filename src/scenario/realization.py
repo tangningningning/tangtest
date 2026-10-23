@@ -75,7 +75,7 @@ def _realization_artifacts_from_directory(directory: Path) -> RealizationArtifac
     realization_dir = Path(directory).expanduser().resolve(strict=False)
     if not realization_dir.is_dir():
         raise FileNotFoundError(
-            f"PPO episode realization directory does not exist: {realization_dir}"
+            f"environment episode realization directory does not exist: {realization_dir}"
         )
     paths = {
         field: realization_dir / filename
@@ -88,7 +88,7 @@ def _realization_artifacts_from_directory(directory: Path) -> RealizationArtifac
     ]
     if missing:
         raise FileNotFoundError(
-            "PPO episode realization is missing required artifacts: "
+            "environment episode realization is missing required artifacts: "
             f"directory={realization_dir}, missing={missing}"
         )
     return RealizationArtifacts(

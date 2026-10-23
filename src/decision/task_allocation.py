@@ -5,7 +5,7 @@
 本模块只做实际时隙内的任务 -> 执行节点 matching。每个 candidate matching
 默认 candidate 路径使用 affected-node incremental evaluator；
 ``evaluate_matching_candidate()`` 保留为 full-recompute reference，二者都求
-KKT 连续资源分配和 ``J(mu)=sum_v Q_v``。本模块不实现 PPO、不扣 Cache/UAV configuration cost、
+KKT 连续资源分配和 ``J(mu)=sum_v Q_v``。本模块不实现策略、不扣 Cache/UAV configuration cost、
 不读取 prediction_scenarios 作为调度输入；每个 slot 的任务独立完成评价。
 
 TV 不执行任务。正式 Matching 目标仅包含满足缓存与链路约束的 Edge 节点以及

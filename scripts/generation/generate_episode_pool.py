@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Generate a recoverable pool of complete randomized PPO episodes.
+"""Generate a recoverable pool of complete randomized environment episodes.
 
 This is intentionally only a batch loop around the existing single-episode
 generator.  It does not duplicate SUMO, task, prediction, or scenario
@@ -201,11 +201,11 @@ def generate_pool(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate a recoverable pool of randomized PPO episode realizations."
+        description="Generate a recoverable pool of randomized environment episode realizations."
     )
     parser.add_argument(
         "--config",
-        default="configs/proposed/alternating_actor_updates_v1.toml",
+        default="configs/dqn/online_joint_dqn.toml",
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start-seed", type=int, required=True)

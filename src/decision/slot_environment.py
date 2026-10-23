@@ -11,7 +11,7 @@ previous configuration state + external trigger Z(t) + prediction scenario slice
 -> system utility G(t)
 -> next configuration state
 
-本模块不实现 PPO、不定义 observation/action distribution、不跑 episode。
+本模块不实现策略、不定义 observation/action distribution、不跑 episode。
 """
 
 from __future__ import annotations
