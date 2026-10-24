@@ -39,7 +39,6 @@ from online_joint_dqn.candidate_features import (  # noqa: E402
     STATE_FEATURE_CONTRACT_VERSION,
 )
 from online_joint_dqn.environment_adapter import (  # noqa: E402
-    DQN_BETA_Q,
     CANDIDATE_GENERATION_CONTRACT_VERSION,
     DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT,
     DQN_CROSS_NODE_PAIR_SCAN_LIMIT,
@@ -51,8 +50,8 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v8"
-CHECKPOINT_SCHEMA_VERSION = 9
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v10_active_task_state_terminal_reward"
+CHECKPOINT_SCHEMA_VERSION = 11
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4
@@ -73,6 +72,7 @@ _CODE_IDENTITY_REQUIRED_PATHS = (
     "src/decision/uav_configuration.py",
     "src/decision/slot_environment.py",
     "src/decision/task_allocation.py",
+    "src/decision/task_lifecycle.py",
     "src/common/environment_interface.py",
     "src/scenario/realization.py",
     "src/scenario/vehicle_order.py",
@@ -555,15 +555,15 @@ def _run_identity(
 ) -> dict[str, Any]:
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
-    beta_ca = float(project_config.get_config_value(config, "objective.beta_ca"))
     identity = {
-        "algorithm": "legal_candidate_mean_centered_dueling_double_dqn_exclusive_v4",
-        "objective_contract": "finite_episode_undiscounted_system_utility_v1",
+        "algorithm": "legal_candidate_mean_centered_dueling_double_dqn_exclusive_v6_active_task_state",
+        "objective_contract": "finite_episode_undiscounted_terminal_utility_v2",
         "dqn_system_utility": {
-            "formula": "G=Q_task-beta_ca*C_ca-beta_q*C_q",
-            "beta_ca": beta_ca,
-            "beta_q": DQN_BETA_Q,
-            "beta_q_source": "online_joint_dqn.environment_adapter.DQN_BETA_Q",
+            "formula": "G(t)=Q(t)-C_ca(t)-C_q(t)",
+            "task_utility": "PDF terminal utility for tasks terminating after this slot",
+            "cache_cost_coefficient": 1.0,
+            "uav_movement_cost_coefficient": 1.0,
+            "legacy_objective_beta_fields_applied": False,
         },
         "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
         "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
@@ -771,9 +771,10 @@ def _write_run_summary(
         "gradient_updates": int(gradient_steps),
         "learning_rate": float(learning_rate),
         "optimizer_type": "Adam",
-        "system_utility_formula": "G=Q_task-beta_ca*C_ca-beta_q*C_q",
-        "beta_ca": float(beta_ca),
-        "beta_q": float(beta_q),
+        "system_utility_formula": "G(t)=Q(t)-C_ca(t)-C_q(t)",
+        "legacy_objective_beta_fields_applied": False,
+        "legacy_objective_beta_ca_config_not_applied": float(beta_ca),
+        "legacy_objective_beta_q_config_not_applied": float(beta_q),
         "action_execution_counts": totals,
         "mean_episode_cumulative_utility": (
             sum(episode_utilities) / len(episode_utilities) if episode_utilities else None
@@ -857,7 +858,7 @@ def _normalization_config_line(config: Mapping[str, Any]) -> str:
         get(config, "objective.cost_normalization.cache_reference_s_per_node")
     )
     beta_ca = float(get(config, "objective.beta_ca"))
-    beta_q = DQN_BETA_Q
+    beta_q = float(get(config, "objective.beta_q"))
     energy_references = uav_configuration.movement_energy_upper_bounds_by_uav_j(
         dict(config)
     )
@@ -878,7 +879,8 @@ def _normalization_config_line(config: Mapping[str, Any]) -> str:
         )
     return (
         f"[CONFIG] cache_ref={cache_reference:g}s/node | "
-        f"uav_energy_ref={uav_reference} | beta_ca={beta_ca:g} | beta_q={beta_q:g}"
+        f"uav_energy_ref={uav_reference} | "
+        f"legacy_beta_ca_unused={beta_ca:g} | legacy_beta_q_unused={beta_q:g}"
     )
 
 
@@ -948,7 +950,9 @@ def run_training(
     beta_ca = float(
         project_config.get_config_value(runtime_config, "objective.beta_ca")
     )
-    beta_q = DQN_BETA_Q
+    beta_q = float(
+        project_config.get_config_value(runtime_config, "objective.beta_q")
+    )
     evaluation_gate = _independent_evaluation_gate(runtime_config)
     print(_normalization_config_line(runtime_config), flush=True)
 

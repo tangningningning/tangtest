@@ -47,7 +47,8 @@ class CacheOptimizationConfig:
     sv_cpu_cycles_per_s: float
     rsu_cpu_cycles_per_s: float
     uav_cpu_cycles_per_s: float
-    # Legacy Cloud CPU aliases remain available for frozen run configs.
+    # Paper Cloud model uses cloud_cpu_cycles_per_s as per-task fixed Fc.
+    # Remaining total/capacity fields are legacy configuration aliases only.
     cloud_cpu_cycles_per_s: float
     cloud_total_cpu_cycles_per_s: float
     cloud_resource_mode: str
@@ -66,13 +67,14 @@ class CacheOptimizationConfig:
     air_beta_nlos: float
     air_alpha_los: float
     air_alpha_nlos: float
-    # Compatibility fields: Matching uses cloud_total_bandwidth_bps as the
-    # shared per-slot equivalent rate cap; cloud_uplink_rate_bps is its alias.
+    # Paper Cloud model: each task receives this fixed Rc independently.
+    # cloud_total_bandwidth_bps remains an equality-checked legacy alias only.
     cloud_uplink_rate_bps: float
     cloud_total_bandwidth_bps: float
+    # Legacy config field; the PDF Cloud model uses Rc directly without this factor.
     cloud_delay_factor: float
-    # Retained as a legacy config field; the shared total-rate constraint is
-    # enforced regardless of this flag's value.
+    # Legacy compatibility fields. Physical lifecycle execution uses fixed
+    # per-task Rc/Fc and does not allocate an aggregate Cloud pool.
     cloud_resource_sharing: bool
     cloud_fallback_mode: str
     sv_range_m: float
@@ -146,7 +148,7 @@ class CacheOptimizationConfig:
             raise ValueError("UAV instance 数量必须等于 num_uav。")
         if self.cloud_uplink_rate_bps != self.cloud_total_bandwidth_bps:
             raise ValueError(
-                "Cloud uplink alias 必须与每时隙共享总速率上限保持数值一致。"
+                "Cloud uplink alias 必须与固定 per-task Rc 保持数值一致。"
             )
         if not isinstance(self.cloud_resource_sharing, bool):
             raise ValueError("cloud_resource_sharing 必须是显式 bool。")
@@ -224,7 +226,7 @@ def cache_config_from_project(config: dict[str, Any]) -> CacheOptimizationConfig
     if not isinstance(cloud_resource_sharing, bool):
         raise ValueError(
             "缺少或非法的兼容字段 nodes.cloud.resource_sharing；"
-            "Cloud 上行总池始终按共享容量分配，该字段不控制上行共享。"
+            "该字段仅为配置兼容元数据，不控制当前固定 per-task Rc/Fc 模型。"
         )
     backhaul_rates = {}
     for role, key in (

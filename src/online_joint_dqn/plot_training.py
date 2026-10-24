@@ -1070,8 +1070,8 @@ def generate_training_plots(
 
     cost_series: dict[str, list[tuple[int, float]]] = {
         "task_utility": [],
-        "cache_cost_weighted": [],
-        "uav_movement_cost_weighted": [],
+        "cache_cost_penalty": [],
+        "uav_movement_cost_penalty": [],
         "system_utility": [],
         "training_reward": [],
     }
@@ -1105,43 +1105,54 @@ def generate_training_plots(
         if training_reward is not None:
             cost_series["training_reward"].append((episode_number, training_reward))
 
-        for field, availability_field, beta_field, destination in (
+        for field, availability_field, beta_field, old_destination, destination in (
             (
                 "cache_update_cost",
                 "cache_update_cost_available",
                 "beta_ca",
                 "cache_cost_weighted",
+                "cache_cost_penalty",
             ),
             (
                 "uav_movement_cost",
                 "uav_movement_cost_available",
                 "beta_q",
                 "uav_movement_cost_weighted",
+                "uav_movement_cost_penalty",
             ),
         ):
-            weighted_values: list[float] = []
+            penalty_values: list[float] = []
             complete = True
             for row in rows:
                 raw_cost = _finite_number(row.get(field))
                 beta = _finite_number(row.get(beta_field))
-                weighted = _finite_number(row.get(destination))
-                if weighted is None:
+                penalty = _finite_number(row.get(destination))
+                if penalty is None and row.get("reward_formula") == "G(t)=Q(t)-C_ca(t)-C_q(t)":
+                    penalty = raw_cost
+                old_weighted = _finite_number(row.get(old_destination))
+                if penalty is None:
                     if (
+                        row.get(availability_field) is True
+                        and raw_cost is not None
+                        and old_weighted is not None
+                    ):
+                        penalty = old_weighted
+                    elif (
                         row.get(availability_field) is True
                         and raw_cost is not None
                         and beta is not None
                     ):
-                        weighted = beta * raw_cost
+                        penalty = beta * raw_cost
                 if (
                     row.get(availability_field) is not True
-                    or weighted is None
+                    or penalty is None
                 ):
                     complete = False
                     break
-                weighted_values.append(weighted)
+                penalty_values.append(penalty)
             if complete:
                 cost_series[destination].append(
-                    (episode_number, math.fsum(weighted_values))
+                    (episode_number, math.fsum(penalty_values))
                 )
 
     if any(cost_series.values()):
@@ -1198,8 +1209,8 @@ def generate_training_plots(
             else:
                 utility_axis.text(0.5, 0.5, "Utility records unavailable", ha="center", va="center")
             for field, label, color in (
-                ("cache_cost_weighted", "Weighted cache cost beta_ca * C_ca", "#ff7f0e"),
-                ("uav_movement_cost_weighted", "Weighted UAV cost beta_q * C_q", "#9467bd"),
+                ("cache_cost_penalty", "Cache cost C_ca", "#ff7f0e"),
+                ("uav_movement_cost_penalty", "UAV movement cost C_q", "#9467bd"),
             ):
                 points = cost_series[field]
                 if points:
@@ -1211,7 +1222,7 @@ def generate_training_plots(
                         color=color,
                     )
             cost_axis.set_xlabel("Episode")
-            cost_axis.set_ylabel("Weighted cost penalty")
+            cost_axis.set_ylabel("Cost penalty")
             cost_axis.set_title("Recorded cost penalties (missing values omitted)")
             cost_axis.grid(alpha=0.2)
             if cost_axis.lines:
@@ -1381,8 +1392,8 @@ def generate_training_plots(
             "completed_episode_attempts": len(completed_attempts),
             "complete_slot_record_episodes": len(cost_complete_episode_ids),
             "task_utility_points": len(cost_series["task_utility"]),
-            "weighted_cache_cost_points": len(cost_series["cache_cost_weighted"]),
-            "weighted_uav_cost_points": len(cost_series["uav_movement_cost_weighted"]),
+            "cache_cost_penalty_points": len(cost_series["cache_cost_penalty"]),
+            "uav_movement_cost_penalty_points": len(cost_series["uav_movement_cost_penalty"]),
             "cost_metric_missing_episode_points": {
                 key: max(0, len(cost_complete_episode_ids) - len(points))
                 for key, points in cost_series.items()

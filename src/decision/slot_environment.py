@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Single-slot system execution.
+"""One-slot configuration plus cross-slot task execution.
 
-本模块把一个时隙内已经完成的模块按 12.pdf 时间语义串起来：
+本模块把一个时隙内的配置决策、Matching/KKT 和生命周期物理执行串起来：
 
 previous configuration state + external trigger Z(t) + prediction scenario slice
 -> trigger-conditioned configuration
 -> actual-state Transfer-Exchange Matching + KKT
--> actual task utility Q(t)
--> system utility G(t)
+-> per-slot realized task work
+-> next configuration state and task lifecycle events
 -> next configuration state
 
-本模块不实现策略、不定义 observation/action distribution、不跑 episode。
+本模块不实现策略、不定义 observation/action distribution、不管理 Episode 生命周期。
 """
 
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -60,6 +60,9 @@ class SlotExecutionResult:
     next_uav_positions: dict[str, tuple[float, float]] | None
     beta_ca: float | None = None
     beta_q: float | None = None
+    per_task_upload_bits: dict[str, float] = field(default_factory=dict)
+    per_task_compute_cycles: dict[str, float] = field(default_factory=dict)
+    per_task_slot_upload_energy_j: dict[str, float] = field(default_factory=dict)
 
 
 def _position_tuples(positions: dict[str, Any]) -> dict[str, tuple[float, float]]:
@@ -67,6 +70,122 @@ def _position_tuples(positions: dict[str, Any]) -> dict[str, tuple[float, float]
         str(node_id): (float(np.asarray(xy)[0]), float(np.asarray(xy)[1]))
         for node_id, xy in positions.items()
     }
+
+
+def _assert_active_task_cache_protection(
+    cache_state: np.ndarray,
+    service_catalog: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    protected_services_by_node: dict[str, tuple[int, ...]] | None,
+) -> None:
+    """Fail closed if an edge active task's required service is not cached."""
+
+    if not protected_services_by_node:
+        return
+    node_indices = {
+        str(node_id): index
+        for index, node_id in enumerate(cache_nodes["node_ids"])
+    }
+    service_indices = {
+        int(service_id): index
+        for index, service_id in enumerate(service_catalog["service_ids"])
+    }
+    cache = np.asarray(cache_state, dtype=np.int8)
+    for node_id, service_ids in protected_services_by_node.items():
+        if node_id not in node_indices:
+            raise ValueError(f"active task references missing edge node {node_id}")
+        for service_id in service_ids:
+            if service_id not in service_indices:
+                raise ValueError(f"active task references missing service {service_id}")
+            if int(cache[node_indices[node_id], service_indices[service_id]]) != 1:
+                raise ValueError(
+                    "cache update removed an active task's required service: "
+                    f"node={node_id}, service={service_id}"
+                )
+
+
+def _realized_lifecycle_work(
+    tasks: list[task_allocation.Task],
+    matching: task_allocation.TransferExchangeMatchingResult,
+    vehicle_positions: dict[str, np.ndarray],
+    service_node_positions: dict[str, np.ndarray],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    dt_s: float,
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """Calculate actual one-slot work from KKT shares and the PDF link model."""
+
+    uploaded_bits: dict[str, float] = {}
+    computed_cycles: dict[str, float] = {}
+    upload_energy_j: dict[str, float] = {}
+    for task in tasks:
+        node_id = matching.matching[task.task_id]
+        uploaded_bits[task.task_id] = 0.0
+        computed_cycles[task.task_id] = 0.0
+        upload_energy_j[task.task_id] = 0.0
+        if task.execution_stage == "UPLOADING":
+            if task.input_bits <= 0.0:
+                raise ValueError(f"uploading task {task.task_id} has no remaining data")
+            if node_id == task_allocation.CLOUD:
+                rate_bps = float(cache_config.cloud_uplink_rate_bps)
+            else:
+                role = task_allocation._edge_node_role(node_id, cache_nodes)
+                if role is None:
+                    raise ValueError(f"task {task.task_id} references unknown node {node_id}")
+                bandwidth_fraction = float(
+                    matching.bandwidth_allocations.get(node_id, {}).get(task.task_id, 0.0)
+                )
+                gain = task_allocation._channel_gain(
+                    role,
+                    vehicle_positions[task.vehicle_id],
+                    service_node_positions[node_id],
+                    cache_config,
+                )
+                rate_bps = float(
+                    system_model.uplink_rate(
+                        task_allocation._node_bandwidth(role, cache_config),
+                        bandwidth_fraction,
+                        cache_config.tx_power_w,
+                        gain,
+                        cache_config.noise_power_w,
+                        noise_model=cache_config.noise_model,
+                        noise_psd_w_per_hz=cache_config.noise_psd_w_per_hz,
+                        receiver_noise_figure_db=cache_config.receiver_noise_figure_db,
+                    )
+                )
+            if not math.isfinite(rate_bps) or rate_bps < 0.0:
+                raise ValueError(f"task {task.task_id} has invalid uplink rate")
+            actual_upload = min(float(task.input_bits), rate_bps * dt_s)
+            uploaded_bits[task.task_id] = actual_upload
+            if rate_bps > 0.0:
+                upload_energy_j[task.task_id] = (
+                    cache_config.tx_power_w * actual_upload / rate_bps
+                )
+        elif task.execution_stage == "COMPUTING":
+            if task.cpu_cycles <= 0.0:
+                raise ValueError(f"computing task {task.task_id} has no remaining work")
+            if node_id == task_allocation.CLOUD:
+                compute_rate = float(cache_config.cloud_cpu_cycles_per_s)
+            else:
+                role = task_allocation._edge_node_role(node_id, cache_nodes)
+                if role is None:
+                    raise ValueError(f"task {task.task_id} references unknown node {node_id}")
+                cpu_fraction = float(
+                    matching.cpu_allocations.get(node_id, {}).get(task.task_id, 0.0)
+                )
+                compute_rate = (
+                    cpu_fraction * task_allocation._node_cpu(role, cache_config)
+                )
+            if not math.isfinite(compute_rate) or compute_rate < 0.0:
+                raise ValueError(f"task {task.task_id} has invalid compute rate")
+            computed_cycles[task.task_id] = min(
+                float(task.cpu_cycles), compute_rate * dt_s
+            )
+        else:
+            raise ValueError(
+                f"cross-slot lifecycle does not accept stage {task.execution_stage!r}"
+            )
+    return uploaded_bits, computed_cycles, upload_energy_j
 
 
 def _finite_allocation_total(values: Any) -> tuple[float | None, bool]:
@@ -144,15 +263,7 @@ def _matching_summary(
         _finite_allocation_total(result.cloud_uplink_rate_allocations_bps.values())
     )
     cloud_uplink_capacity = result.cloud_uplink_rate_capacity_bps
-    if cloud_uplink_capacity is None:
-        cloud_uplink_capacity = cache_config.cloud_total_bandwidth_bps
     cloud_cpu_capacity = result.cloud_cpu_capacity_cycles_per_s
-    if (
-        cloud_cpu_capacity is None
-        and cache_config.cloud_resource_mode
-        == task_allocation.FINITE_CLOUD_RESOURCE_MODE
-    ):
-        cloud_cpu_capacity = cache_config.cloud_cpu_capacity_cycles_per_s
     cloud_uplink_capacity = (
         float(cloud_uplink_capacity)
         if cloud_uplink_capacity is not None
@@ -180,6 +291,21 @@ def _matching_summary(
     )
     summary = {
         "resource_feasible": bool(result.resource_feasible),
+        "matching_assignment": dict(result.matching),
+        "matching_candidate_task_utility_sum": float(result.task_utility_sum),
+        "matching_assignment_complete_pass": bool(result.resource_feasible),
+        "matching_solution_scope": "transfer_exchange_local_stability",
+        "matching_global_optimality_claimed": False,
+        "matching_stability_claim": (
+            "no improving enumerated transfer/exchange candidates under current-slot objective"
+            if result.transfer_exchange_stable
+            else "transfer/exchange search stopped before local stability"
+        ),
+        "candidate_evaluation_objective": (
+            "current_slot_terminal_utility_only for lifecycle; legacy delay-energy proxy otherwise"
+        ),
+        "kkt_objective_scope": "per-slot reciprocal delay-energy resource surrogate",
+        "kkt_optimal_for_terminal_finite_horizon_objective": False,
         "updates": result.updates,
         "transfer_updates": result.transfer_updates,
         "exchange_updates": result.exchange_updates,
@@ -238,7 +364,8 @@ def _matching_summary(
         "max_remaining_delta": result.max_remaining_delta,
         "history": result.history,
         "tie_break_count": result.tie_break_count,
-        "cloud_resource_mode": cache_config.cloud_resource_mode,
+        "cloud_resource_model": "independent_per_task_fixed_Rc_Fc",
+        "cloud_configured_legacy_resource_mode": cache_config.cloud_resource_mode,
         "cloud_fallback_mode": cache_config.cloud_fallback_mode,
         "cloud_task_count": int(cloud_count),
         "cloud_uplink_allocated_bps": cloud_uplink_allocated,
@@ -329,8 +456,10 @@ def _matching_summary(
         "performance": {
             "mean_delay_s": mean_delay,
             "mean_energy_j": mean_energy,
-            "task_utility_sum": float(result.task_utility_sum),
-            "mean_task_utility": mean_utility,
+            "matching_candidate_terminal_utility_sum": float(
+                result.task_utility_sum
+            ),
+            "mean_matching_delay_energy_proxy_utility": mean_utility,
         },
     }
     return summary
@@ -488,13 +617,29 @@ def execute_slot(
     matching_kkt_cache: task_allocation.KKTResourceAllocationCache | None = None,
     node_evaluation_cache: task_allocation.NodeEvaluationCache | None = None,
     exact_q_timing_profile: dict[str, float] | None = None,
+    lifecycle_mode: bool = False,
+    fixed_matching: dict[str, str] | None = None,
+    mutable_task_ids: set[str] | None = None,
+    protected_services_by_node: dict[str, tuple[int, ...]] | None = None,
 ) -> SlotExecutionResult:
-    """Execute one slot from external trigger to actual system utility.
+    """Execute one configured slot and realize only the current task phase.
 
     Core API does not read disk. The caller supplies prediction scenario slice for
-    configuration and actual current state for scheduling. Reward/system utility
-    uses actual Matching/KKT output, not predictive configuration utility.
+    configuration and actual current state for scheduling. Cross-slot work requires
+    an explicit lifecycle manager and never falls back to independent-slot service.
     """
+
+    lifecycle_parameters = project_config.get_cross_slot_task_parameters(project_cfg)
+    if not lifecycle_mode:
+        raise ValueError(
+            "independent_per_slot execution is disabled; use cross_slot_lifecycle"
+        )
+    execution_horizon_slots = int(lifecycle_parameters["execution_horizon_slots"])
+    if slot_id is None or int(slot_id) < 0 or int(slot_id) >= execution_horizon_slots:
+        raise ValueError(
+            "cross-slot execution requires a zero-based slot_id inside the extended "
+            f"horizon 0..{execution_horizon_slots - 1}"
+        )
 
     if exact_q_timing_profile is not None:
         for key in (
@@ -642,6 +787,22 @@ def execute_slot(
     matching_started_at = time.perf_counter() if performance_profile is not None else 0.0
     final_cache = np.asarray(configuration.final_cache_state, dtype=np.int8).copy()
     final_uav = dict(configuration.final_uav_positions)
+    if int(slot_id) + 1 > int(lifecycle_parameters["arrival_horizon_slots"]):
+        if np.any(final_cache != previous_cache):
+            raise ValueError("cache updates are forbidden after the task-arrival horizon")
+    _assert_active_task_cache_protection(
+        final_cache,
+        service_catalog,
+        cache_nodes,
+        protected_services_by_node,
+    )
+    if lifecycle_mode and any(
+        task.execution_stage not in {"UPLOADING", "COMPUTING"}
+        for task in actual_tasks
+    ):
+        raise ValueError(
+            "cross-slot lifecycle accepts only UPLOADING or COMPUTING tasks"
+        )
     service_positions = task_allocation.build_service_node_positions(
         cache_nodes,
         actual_vehicle_positions,
@@ -674,7 +835,19 @@ def execute_slot(
         node_evaluation_cache=node_evaluation_cache,
         timing_profile=exact_q_timing_profile,
         cloud_fallback_mode=cache_config.cloud_fallback_mode,
+        fixed_matching=fixed_matching,
+        mutable_task_ids=mutable_task_ids,
     )
+    if lifecycle_mode:
+        expected_task_ids = {str(task.task_id) for task in actual_tasks}
+        fixed = {str(key): str(value) for key, value in (fixed_matching or {}).items()}
+        mutable = {str(value) for value in (mutable_task_ids or set())}
+        if set(matching.matching) != expected_task_ids:
+            raise RuntimeError("Matching result does not contain exactly the active task set")
+        if set(fixed) & mutable or set(fixed) | mutable != expected_task_ids:
+            raise RuntimeError("lifecycle Matching fixed/mutable task partition is invalid")
+        if any(matching.matching.get(task_id) != node for task_id, node in fixed.items()):
+            raise RuntimeError("Matching changed a previously fixed active-task node")
     if exact_q_timing_profile is not None:
         exact_q_matching_elapsed = time.perf_counter() - exact_q_matching_started_at
         exact_q_timing_profile["matching_total_runtime"] += exact_q_matching_elapsed
@@ -743,7 +916,31 @@ def execute_slot(
             next_uav_positions=None,
         )
 
-    actual_q = float(matching.task_utility_sum)
+    if lifecycle_mode:
+        dt_s = float(project_config.get_config_value(project_cfg, "simulation.dt_s"))
+        if not math.isclose(dt_s, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("cross-slot lifecycle requires one-second slots")
+        (
+            per_task_upload_bits,
+            per_task_compute_cycles,
+            per_task_upload_energy_j,
+        ) = _realized_lifecycle_work(
+            actual_tasks,
+            matching,
+            actual_vehicle_positions,
+            service_positions,
+            cache_nodes,
+            cache_config,
+            dt_s,
+        )
+    else:
+        per_task_upload_bits = {}
+        per_task_compute_cycles = {}
+        per_task_upload_energy_j = {}
+
+    # Matching's current-slot terminal score is only a candidate diagnostic.
+    # The lifecycle manager below the adapter is the single source of actual Q(t).
+    actual_q = None
     reward_cost_started_at = (
         time.perf_counter() if exact_q_timing_profile is not None else 0.0
     )
@@ -759,11 +956,7 @@ def execute_slot(
     reward_final_started_at = (
         time.perf_counter() if exact_q_timing_profile is not None else 0.0
     )
-    # Both costs are unweighted normalized quantities. Apply the external
-    # system-utility weights exactly once here.
-    system_utility = system_model.aggregate_system_utility(
-        actual_q, cache_cost, movement_cost, beta_ca, beta_q
-    )
+    system_utility = None
     if exact_q_timing_profile is not None:
         exact_q_timing_profile["reward_final_combination_runtime"] += (
             time.perf_counter() - reward_final_started_at
@@ -798,8 +991,8 @@ def execute_slot(
         cache_download_delay_s=cache_download_delay_s,
         movement_energy=float(configuration.movement_energy),
         movement_cost=movement_cost,
-        actual_task_utility=actual_q,
-        system_utility=float(system_utility),
+        actual_task_utility=None,
+        system_utility=None,
         matching=matching.matching,
         cpu_allocations=matching.cpu_allocations,
         bandwidth_allocations=matching.bandwidth_allocations,
@@ -814,15 +1007,20 @@ def execute_slot(
                 1.0e-6,
             )),
         ),
-        matching_summary=_matching_summary(
-            matching,
-            cache_nodes,
-            cache_config,
-        ),
+        matching_summary={
+            **_matching_summary(matching, cache_nodes, cache_config),
+            "fixed_matching_preservation_pass": True,
+            "matching_task_set_complete_pass": True,
+            "matching_candidate_objective": "current_slot_terminal_utility_only",
+            "matching_global_optimality_claimed": False,
+        },
         next_cache_state=final_cache.copy(),
         next_uav_positions=final_uav,
         beta_ca=beta_ca,
         beta_q=beta_q,
+        per_task_upload_bits=per_task_upload_bits,
+        per_task_compute_cycles=per_task_compute_cycles,
+        per_task_slot_upload_energy_j=per_task_upload_energy_j,
     )
 
 
@@ -1047,11 +1245,27 @@ def execute_configured_slot(
     matching_kkt_cache: task_allocation.KKTResourceAllocationCache | None = None,
     node_evaluation_cache: task_allocation.NodeEvaluationCache | None = None,
     exact_q_timing_profile: dict[str, float] | None = None,
+    lifecycle_mode: bool = False,
+    fixed_matching: dict[str, str] | None = None,
+    mutable_task_ids: set[str] | None = None,
+    protected_services_by_node: dict[str, tuple[int, ...]] | None = None,
 ) -> SlotExecutionResult:
     """执行确定的 Cache/UAV 配置及 Matching/KKT。"""
 
+    lifecycle_parameters = project_config.get_cross_slot_task_parameters(project_cfg)
+    if not lifecycle_mode:
+        raise ValueError(
+            "independent_per_slot execution is disabled; use cross_slot_lifecycle"
+        )
     previous_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
     final_cache = np.asarray(final_cache_state, dtype=np.int8).copy()
+    if slot_id is None or int(slot_id) < 0 or int(slot_id) >= int(
+        lifecycle_parameters["execution_horizon_slots"]
+    ):
+        raise ValueError("execute_configured_slot requires a slot inside the extended horizon")
+    if int(slot_id) + 1 > int(lifecycle_parameters["arrival_horizon_slots"]):
+        if np.any(final_cache != previous_cache):
+            raise ValueError("cache updates are forbidden after the task-arrival horizon")
     previous_uav = _position_tuples(previous_uav_positions)
     final_uav = _position_tuples(final_uav_positions)
     if previous_cache.shape != final_cache.shape:
@@ -1115,6 +1329,10 @@ def execute_configured_slot(
         matching_kkt_cache=matching_kkt_cache,
         node_evaluation_cache=node_evaluation_cache,
         exact_q_timing_profile=exact_q_timing_profile,
+        lifecycle_mode=lifecycle_mode,
+        fixed_matching=fixed_matching,
+        mutable_task_ids=mutable_task_ids,
+        protected_services_by_node=protected_services_by_node,
     )
 
 def _validated_configuration_override(

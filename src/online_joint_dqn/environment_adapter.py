@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import pickle
 import sys
 from collections import Counter, OrderedDict
@@ -16,10 +17,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from common import project_config
+from common import project_config, system_model
 from decision import (
     cache_configuration,
     slot_environment,
+    task_lifecycle,
     task_allocation,
     uav_configuration,
 )
@@ -41,13 +43,11 @@ from .candidate_features import (
 )
 
 
-# DQN 在正式执行器的配置副本中使用独立的 UAV 移动成本权重。
-DQN_BETA_Q = 0.001
-CANDIDATE_GENERATION_CONTRACT_VERSION = "state_ranked_bounded_pair_cache_replace_v2"
+CANDIDATE_GENERATION_CONTRACT_VERSION = "state_ranked_bounded_pair_cache_replace_v3_lifecycle"
 DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT = 8
 DQN_CROSS_NODE_PAIR_SCAN_LIMIT = 32
-CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v7"
-EPISODE_REBUILD_SPEC_SCHEMA_VERSION = "dqn_episode_candidate_rebuild_spec_v1"
+CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v10_active_task_state"
+EPISODE_REBUILD_SPEC_SCHEMA_VERSION = "dqn_episode_candidate_rebuild_spec_v3_active_task_state"
 
 
 def candidate_generation_contract(
@@ -78,6 +78,8 @@ def candidate_generation_contract(
             "single_node_selection": "slot_rotated_round_robin_by_proposal_rank",
             "deduplication": "target_cache_matrix_bytes_v1",
         },
+        "active_task_cache_protection": "retain_assigned_edge_services_until_termination",
+        "cache_updates_after_arrival_horizon": "forbidden",
         "cross_node_pair_proposals": {
             "representatives_per_node": 1,
             "representative_priority": (
@@ -111,30 +113,6 @@ def candidate_generation_contract(
         "cross_operation_constraint": "one_cache_or_uav_operation_per_decision_v1",
         "candidate_identity": "source_state_and_full_target_configuration_v1",
     }
-
-
-def _apply_dqn_utility_weights(context: Any) -> None:
-    """只覆盖 DQN Episode 配置副本中的系统效用权重。"""
-
-    config = context.cfg
-    objective = config.get("objective")
-    if not isinstance(objective, dict):
-        raise TypeError("DQN Episode 配置缺少可修改的 objective 字典")
-    beta_ca = float(objective["beta_ca"])
-    objective["beta_q"] = DQN_BETA_Q
-
-    metadata = config.get("_meta")
-    if not isinstance(metadata, dict):
-        raise TypeError("DQN Episode 配置缺少元数据字典")
-    normalization = metadata.get("reward_cost_normalization")
-    if not isinstance(normalization, dict):
-        raise TypeError("DQN Episode 配置缺少成本归一化元数据")
-    weights = normalization.get("system_utility_weights")
-    if not isinstance(weights, dict):
-        raise TypeError("DQN Episode 配置缺少系统效用权重元数据")
-    weights["beta_ca"] = beta_ca
-    weights["beta_q"] = DQN_BETA_Q
-    weights["source"] = "DQN-local override; formal shared configuration unchanged"
 
 
 @dataclass(frozen=True)
@@ -218,6 +196,9 @@ _CANDIDATE_REBUILD_IDENTITY_FIELDS = (
     "prediction_scenario",
     "decision_forecast",
     "prediction_horizon_mask",
+    "protected_services_by_node",
+    "active_task_states",
+    "cache_updates_allowed",
     "state_feature_contract_version",
     "candidate_feature_contract_version",
     "candidate_generation_contract_version",
@@ -619,6 +600,52 @@ class ExclusiveDQNEnvironment:
         ):
             raise ValueError("正式预测步骤与 Slot 输入未按同一时隙对齐")
         self.model = self.slot_inputs[0].model
+        lifecycle_parameters = project_config.get_cross_slot_task_parameters(
+            dict(self.model.project_cfg)
+        )
+        self.arrival_horizon_slots = int(
+            lifecycle_parameters["arrival_horizon_slots"]
+        )
+        self.k_max_slots = int(lifecycle_parameters["k_max_slots"])
+        self.execution_horizon_slots = int(
+            lifecycle_parameters["execution_horizon_slots"]
+        )
+        self.task_lifecycle = task_lifecycle.TaskLifecycleManager(
+            arrival_horizon_slots=self.arrival_horizon_slots,
+            k_max_slots=self.k_max_slots,
+            dt_s=float(lifecycle_parameters["dt_s"]),
+        )
+        self.terminal_utility_parameters = (
+            project_config.get_terminal_task_utility_parameters(
+                dict(self.model.project_cfg)
+            )
+        )
+        if len(self.slot_inputs) < self.execution_horizon_slots:
+            raise ValueError(
+                "扩展执行轨迹覆盖不足："
+                f"required={self.execution_horizon_slots} slots "
+                f"(T={self.arrival_horizon_slots}, K_max={self.k_max_slots}), "
+                f"available={len(self.slot_inputs)} slots, "
+                f"missing={self.execution_horizon_slots - len(self.slot_inputs)} tail slots。"
+            )
+        if int(self.slot_inputs[0].slot_id) != 0 or any(
+            int(item.slot_id) != index
+            for index, item in enumerate(self.slot_inputs[: self.execution_horizon_slots])
+        ):
+            raise ValueError("跨时隙执行输入必须按零基连续时隙从 slot 0 开始")
+        trajectory_times = [
+            item.time_s for item in self.slot_inputs[: self.execution_horizon_slots]
+        ]
+        if any(value is None for value in trajectory_times) or any(
+            not np.isclose(
+                float(trajectory_times[index + 1]) - float(trajectory_times[index]),
+                1.0,
+                rtol=0.0,
+                atol=1e-9,
+            )
+            for index in range(len(trajectory_times) - 1)
+        ):
+            raise ValueError("扩展执行轨迹时间戳必须按 1 秒连续对齐")
         self.search_budget = search_budget or self._candidate_capacity_budget()
         first_slot_input = self.slot_inputs[0]
         first_forecast = self.decision_forecasts[0]
@@ -654,6 +681,12 @@ class ExclusiveDQNEnvironment:
             raise ValueError("决策 Slot 数量与对齐输入长度不匹配")
         if not self.terminal_at_end and self.decision_count >= len(self.slot_inputs):
             raise ValueError("截断窗口需要额外的下一 Slot 观测用于 Double DQN bootstrap")
+        if self.decision_count != self.execution_horizon_slots or not self.terminal_at_end:
+            raise ValueError(
+                "跨时隙物理 Episode 必须执行完整扩展时域并在末尾终止："
+                f"required={self.execution_horizon_slots}, "
+                f"decision_count={self.decision_count}, terminal_at_end={self.terminal_at_end}"
+            )
         self.evaluator = None
         self.uav_scheduler = UavScheduler()
         self.cache_optimizer = CacheOptimizer(self.uav_scheduler)
@@ -662,6 +695,7 @@ class ExclusiveDQNEnvironment:
             observation_spec=context.observation_spec,
             train_origin_start=int(context.train_origin_start),
             train_origin_end=int(context.train_origin_end),
+            k_max_slots=self.k_max_slots,
             canonical_vehicle_ids=self.canonical_vehicle_ids,
             canonical_cache_node_ids=self.canonical_cache_node_ids,
         )
@@ -720,12 +754,12 @@ class ExclusiveDQNEnvironment:
         *,
         episode_seed: int,
         origin_start: int = 0,
-        max_steps: int = 2,
+        max_steps: int | None = None,
         search_budget: SearchBudget | None = None,
     ) -> "ExclusiveDQNEnvironment":
-        """读取并验证当前正式 Training Pool 的一个短窗口。"""
+        """读取当前正式 Training Pool 的一个完整生命周期 Episode。"""
 
-        if int(max_steps) <= 0:
+        if max_steps is not None and int(max_steps) <= 0:
             raise ValueError("max_steps 必须大于 0")
         root = Path(project_root).resolve()
         training_scripts = root / "scripts" / "training"
@@ -742,16 +776,31 @@ class ExclusiveDQNEnvironment:
             expected_episode_count=pool_contract.FORMAL_TRAINING_EPISODE_COUNT,
         )
         context = pool_contract._episode_context(root, pool, int(episode_seed), pool_info)
-        _apply_dqn_utility_weights(context)
+        lifecycle_parameters = project_config.get_cross_slot_task_parameters(
+            dict(context.cfg)
+        )
+        arrival_horizon = int(lifecycle_parameters["arrival_horizon_slots"])
+        execution_horizon = int(lifecycle_parameters["execution_horizon_slots"])
+        if int(origin_start) != 0:
+            raise ValueError(
+                "跨时隙生命周期必须从完整 Episode 的 slot 0 开始；"
+                f"received origin_start={origin_start}"
+            )
+        if max_steps is not None and int(max_steps) not in {
+            arrival_horizon,
+            execution_horizon,
+        }:
+            raise ValueError(
+                "跨时隙生命周期不接受截断窗口："
+                f"requested max_steps={max_steps}, T={arrival_horizon}, "
+                f"required execution horizon={execution_horizon}"
+            )
         steps = aligned_train_steps(
             context,
-            origin_start=int(origin_start),
-            max_steps=int(max_steps) + 1,
+            origin_start=0,
         )
-        decision_count = min(int(max_steps), len(steps))
-        terminal_at_end = (
-            int(origin_start) + decision_count - 1 >= int(context.train_origin_end)
-        )
+        decision_count = len(steps)
+        terminal_at_end = decision_count == execution_horizon
         model = SystemModelContext(
             service_catalog=context.service_catalog,
             project_cfg=context.cfg,
@@ -794,6 +843,8 @@ class ExclusiveDQNEnvironment:
 
         self.index = 0
         self.cache_state = self._initial_cache.copy()
+        self.task_lifecycle.reset()
+        self._settled_task_ids: set[str] = set()
         self.uav_positions = {
             key: value.copy() for key, value in self._initial_uav.items()
         }
@@ -845,10 +896,21 @@ class ExclusiveDQNEnvironment:
         forecast = self.decision_forecasts[self.index]
         formal_observation = self._formal_observation(forecast)
         state_features = self.encoder.encode_state(
-            formal_observation, forecast, slot_input.scenario_slice
+            formal_observation,
+            forecast,
+            slot_input.scenario_slice,
+            self._active_task_state_snapshots(),
+        )
+        protected_services = self.task_lifecycle.protected_services_by_node
+        cache_updates_allowed = (
+            int(slot_input.slot_id) + 1 <= self.arrival_horizon_slots
         )
         fingerprint = self._decision_state_fingerprint(
-            slot_input, forecast, state_features
+            slot_input,
+            forecast,
+            state_features,
+            protected_services_by_node=protected_services,
+            cache_updates_allowed=cache_updates_allowed,
         )
         if fingerprint != self._cached_state_fingerprint:
             input_before = _input_fingerprint(slot_input)
@@ -864,6 +926,8 @@ class ExclusiveDQNEnvironment:
                 fingerprint,
                 current_cache_state=self.cache_state,
                 current_uav_positions=self.uav_positions,
+                protected_services_by_node=protected_services,
+                cache_updates_allowed=cache_updates_allowed,
             )
             generation_isolation = (
                 _input_fingerprint(slot_input) == input_before
@@ -883,6 +947,71 @@ class ExclusiveDQNEnvironment:
         assert self._cached_candidates is not None
         return self._cached_state_features.copy(), self._cached_candidates
 
+    def _active_task_state_snapshots(self) -> tuple[dict[str, Any], ...]:
+        """Return existing work plus current requests visible before the action."""
+
+        snapshots = [
+            state.snapshot() for state in self.task_lifecycle.active_tasks.values()
+        ]
+        if self.index < len(self.slot_inputs):
+            slot_input = self.slot_inputs[self.index]
+            arrival_slot = int(slot_input.slot_id) + 1
+            if arrival_slot > self.arrival_horizon_slots and slot_input.tasks:
+                raise ValueError("new task requests appear beyond the arrival horizon")
+            seen_current_vehicles: set[str] = set()
+            active_ids = {str(state["task_id"]) for state in snapshots}
+            for task in slot_input.tasks:
+                if str(task.execution_stage).upper() != "NEW":
+                    raise ValueError("current task requests must enter as NEW")
+                vehicle_id = str(task.vehicle_id)
+                if vehicle_id in seen_current_vehicles:
+                    raise ValueError(
+                        f"multiple current requests for TV {vehicle_id} in slot {arrival_slot}"
+                    )
+                seen_current_vehicles.add(vehicle_id)
+                task_id = f"{vehicle_id}@{arrival_slot}"
+                input_bits = float(task.input_bits)
+                cpu_cycles = float(task.cpu_cycles)
+                if (
+                    not math.isfinite(input_bits)
+                    or input_bits <= 0.0
+                    or not math.isfinite(cpu_cycles)
+                    or cpu_cycles <= 0.0
+                ):
+                    raise ValueError(f"current request {task_id} has invalid demand")
+                if task_id in active_ids:
+                    raise ValueError(f"current request {task_id} already exists in lifecycle")
+                snapshots.append(
+                    {
+                        "task_id": task_id,
+                        "vehicle_id": vehicle_id,
+                        "arrival_slot": arrival_slot,
+                        "service_id": int(task.service_id),
+                        "input_bits": input_bits,
+                        "compute_density_cycles_per_bit": cpu_cycles / input_bits,
+                        "cpu_cycles": cpu_cycles,
+                        "remaining_upload_bits": input_bits,
+                        "remaining_compute_cycles": cpu_cycles,
+                        "remaining_slots": self.k_max_slots,
+                        "execution_node": None,
+                        "cumulative_upload_energy_j": 0.0,
+                        "execution_stage": "UPLOADING",
+                        "status": "ACTIVE",
+                        "terminal_slot": None,
+                    }
+                )
+                active_ids.add(task_id)
+        return tuple(
+            sorted(
+                snapshots,
+                key=lambda item: (
+                    str(item["vehicle_id"]),
+                    int(item["arrival_slot"]),
+                    str(item["task_id"]),
+                ),
+            )
+        )
+
     def _generate_legal_candidates(
         self,
         slot_input: SlotInput,
@@ -891,6 +1020,8 @@ class ExclusiveDQNEnvironment:
         *,
         current_cache_state: Any,
         current_uav_positions: Mapping[str, Any],
+        protected_services_by_node: Mapping[str, Sequence[int]] | None = None,
+        cache_updates_allowed: bool = True,
     ) -> tuple[tuple[CandidateOption, ...], dict[str, Any]]:
         # 候选器只接收预测场景及配置，不接触当前真实任务和实际车辆轨迹。
         candidate_input = replace(slot_input, tasks=(), vehicle_positions={})
@@ -1024,6 +1155,38 @@ class ExclusiveDQNEnvironment:
                 pair_diagnostics["cache_cross_node_pair_deduplicated_pair_count"]
             )
         )
+        protected = {
+            str(node_id): {int(service_id) for service_id in service_ids}
+            for node_id, service_ids in (protected_services_by_node or {}).items()
+        }
+        node_indices = {
+            str(node_id): index
+            for index, node_id in enumerate(cache_nodes["node_ids"])
+        }
+        service_indices = {
+            int(service_id): index
+            for index, service_id in enumerate(service_catalog["service_ids"])
+        }
+        protection_rejected_count = 0
+        for key, (target_state, _) in tuple(cache_targets_by_key.items()):
+            violates_protection = any(
+                node_id not in node_indices
+                or service_id not in service_indices
+                or int(
+                    target_state[
+                        node_indices[node_id], service_indices[service_id]
+                    ]
+                ) != 1
+                for node_id, service_ids in protected.items()
+                for service_id in service_ids
+            )
+            if violates_protection:
+                cache_targets_by_key.pop(key)
+                protection_rejected_count += 1
+        forbidden_tail_candidate_count = 0
+        if not cache_updates_allowed:
+            forbidden_tail_candidate_count = len(cache_targets_by_key)
+            cache_targets_by_key.clear()
         for target_state, proposal_source in cache_targets_by_key.values():
             action = ActionCandidate.from_states(
                 previous_cache_state=cache_state,
@@ -1134,6 +1297,13 @@ class ExclusiveDQNEnvironment:
             **pair_diagnostics,
             "cache_bounded_generator_complete": bool(bounded_cache_complete),
             "cache_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
+            "cache_updates_allowed": bool(cache_updates_allowed),
+            "cache_candidates_rejected_active_task_protection": int(
+                protection_rejected_count
+            ),
+            "cache_candidates_removed_after_arrival_horizon": int(
+                forbidden_tail_candidate_count
+            ),
         }
         diagnostics = {
             "candidate_count": len(unique),
@@ -1174,7 +1344,9 @@ class ExclusiveDQNEnvironment:
             "candidate_generation_used_matching_or_kkt": False,
             "candidate_generation_received_actual_tasks": False,
             "candidate_generation_received_actual_vehicle_positions": False,
-            "state_features_used_current_actual_task_data": False,
+            "state_features_used_current_actual_task_data": bool(
+                self._active_task_state_snapshots()
+            ),
             "state_features_used_current_actual_vehicle_positions": False,
             "candidate_features_used_current_actual_vehicle_positions": False,
             "decision_state_feature_contract_version": self.encoder.state_feature_contract_version,
@@ -1189,12 +1361,20 @@ class ExclusiveDQNEnvironment:
 
         from common.environment_interface import build_step_observation
 
-        single_origin_override = None
-        if (
-            self.context.observation_spec.time_to_go_slice is not None
-            and int(self.context.train_origin_end) == int(self.context.train_origin_start)
-        ):
-            single_origin_override = 0.0
+        time_to_go_override = None
+        if self.context.observation_spec.time_to_go_slice is not None:
+            final_origin = self.execution_horizon_slots - 1
+            current_origin = int(forecast.origin_index)
+            if current_origin < 0 or current_origin > final_origin:
+                raise ValueError(
+                    "decision forecast origin is outside the extended execution "
+                    f"horizon: origin={current_origin}, final={final_origin}"
+                )
+            time_to_go_override = (
+                0.0
+                if final_origin == 0
+                else (final_origin - current_origin) / final_origin
+            )
         return build_step_observation(
             self.cache_state,
             self.uav_positions,
@@ -1203,7 +1383,7 @@ class ExclusiveDQNEnvironment:
             tuple(self.model.flight_boundary),
             int(self.context.train_origin_start),
             int(self.context.train_origin_end),
-            time_to_go_override=single_origin_override,
+            time_to_go_override=time_to_go_override,
         )
 
     def candidate_rebuild_context(self) -> dict[str, Any]:
@@ -1257,6 +1437,14 @@ class ExclusiveDQNEnvironment:
                 None
                 if slot_input.prediction_horizon_mask is None
                 else np.asarray(slot_input.prediction_horizon_mask, dtype=np.int8).copy()
+            ),
+            "protected_services_by_node": {
+                str(node_id): tuple(int(value) for value in service_ids)
+                for node_id, service_ids in self.task_lifecycle.protected_services_by_node.items()
+            },
+            "active_task_states": self._active_task_state_snapshots(),
+            "cache_updates_allowed": bool(
+                int(slot_input.slot_id) + 1 <= self.arrival_horizon_slots
             ),
             "state_feature_contract_version": self.encoder.state_feature_contract_version,
             "candidate_feature_contract_version": self.encoder.candidate_feature_contract_version,
@@ -1318,6 +1506,13 @@ class ExclusiveDQNEnvironment:
             prediction_metadata={"source": "stored_decision_prediction_context"},
         )
         fingerprint = str(context["source_state_fingerprint"])
+        protected_services = {
+            str(node_id): tuple(int(value) for value in service_ids)
+            for node_id, service_ids in dict(
+                context["protected_services_by_node"]
+            ).items()
+        }
+        cache_updates_allowed = bool(context["cache_updates_allowed"])
         rebuilt_fingerprint = self._decision_state_fingerprint(
             slot_input,
             forecast,
@@ -1327,6 +1522,8 @@ class ExclusiveDQNEnvironment:
             prediction_scenario_sha256=str(
                 context.get("prediction_scenario_sha256", "")
             ),
+            protected_services_by_node=protected_services,
+            cache_updates_allowed=cache_updates_allowed,
         )
         if rebuilt_fingerprint != fingerprint:
             raise ValueError("回放候选上下文重建的状态指纹不匹配")
@@ -1337,7 +1534,10 @@ class ExclusiveDQNEnvironment:
             canonical_observation
         )
         reencoded_state = self.encoder.encode_state(
-            formal_observation, forecast, scenario_slice
+            formal_observation,
+            forecast,
+            scenario_slice,
+            tuple(dict(item) for item in context["active_task_states"]),
         )
         if not np.array_equal(reencoded_state, state_features):
             raise ValueError("回放状态向量与保存的预测候选生成上下文不一致")
@@ -1357,6 +1557,8 @@ class ExclusiveDQNEnvironment:
                 fingerprint,
                 current_cache_state=cache_state,
                 current_uav_positions=uav_positions,
+                protected_services_by_node=protected_services,
+                cache_updates_allowed=cache_updates_allowed,
             )
             self._candidate_rebuild_cache_stats["generation_count"] += 1
         else:
@@ -1482,7 +1684,21 @@ class ExclusiveDQNEnvironment:
         cache_state: Any | None = None,
         uav_positions: Mapping[str, Any] | None = None,
         prediction_scenario_sha256: str | None = None,
+        protected_services_by_node: Mapping[str, Sequence[int]] | None = None,
+        cache_updates_allowed: bool | None = None,
     ) -> str:
+        if protected_services_by_node is None and hasattr(self, "task_lifecycle"):
+            protected_services_by_node = self.task_lifecycle.protected_services_by_node
+        protected = {
+            str(node_id): tuple(sorted(int(value) for value in service_ids))
+            for node_id, service_ids in (protected_services_by_node or {}).items()
+        }
+        if cache_updates_allowed is None:
+            cache_updates_allowed = (
+                int(slot_input.slot_id) + 1 <= int(self.arrival_horizon_slots)
+                if hasattr(self, "arrival_horizon_slots")
+                else True
+            )
         prediction_context = {
             "origin_index": int(forecast.origin_index),
             "slot": int(forecast.slot),
@@ -1499,6 +1715,8 @@ class ExclusiveDQNEnvironment:
             ),
             "predicted_vehicle_positions_horizon": forecast.predicted_vehicle_positions_horizon,
             "predicted_service_popularity_horizon": forecast.predicted_service_popularity_horizon,
+            "protected_services_by_node": protected,
+            "cache_updates_allowed": bool(cache_updates_allowed),
         }
         return _state_fingerprint(
             self.cache_state if cache_state is None else cache_state,
@@ -1543,6 +1761,10 @@ class ExclusiveDQNEnvironment:
         if changed_cache and moved_uav:
             raise ValueError("候选动作违反缓存与 UAV 互斥约束")
         slot_input = self.slot_inputs[self.index]
+        decision_task_state_count = len(self._active_task_state_snapshots())
+        prepared_task_slot = self.task_lifecycle.prepare_slot(
+            int(slot_input.slot_id), tuple(slot_input.tasks)
+        )
         input_hash = _input_fingerprint(slot_input)
         context_cache_before = np.asarray(self.context.initial_cache, dtype=np.int8).copy()
         context_uav_before = {
@@ -1611,7 +1833,7 @@ class ExclusiveDQNEnvironment:
             target_cache,
             target_uav,
             dict(slot_input.scenario_slice),
-            list(slot_input.tasks),
+            list(prepared_task_slot.tasks),
             dict(slot_input.vehicle_positions),
             dict(self.model.service_catalog),
             dict(self.model.project_cfg),
@@ -1623,14 +1845,51 @@ class ExclusiveDQNEnvironment:
             performance_profile=performance_profile,
             matching_kkt_cache=kkt_cache,
             node_evaluation_cache=task_allocation.NodeEvaluationCache(),
+            lifecycle_mode=True,
+            fixed_matching=dict(prepared_task_slot.fixed_matching),
+            mutable_task_ids=set(prepared_task_slot.mutable_task_ids),
+            protected_services_by_node=dict(
+                prepared_task_slot.protected_services_by_node
+            ),
         )
-        if not result.step_feasible or result.system_utility is None:
+        if not result.step_feasible:
             raise RuntimeError(
                 "正式 Slot 执行未产生可用转移："
                 f"slot={slot_input.slot_id}, reason={result.infeasible_reason}"
             )
         if result.next_cache_state is None or result.next_uav_positions is None:
             raise RuntimeError("正式 Slot 执行器未返回下一缓存/UAV 状态")
+        lifecycle_result = self.task_lifecycle.advance_slot(
+            int(slot_input.slot_id),
+            result.matching,
+            result.per_task_upload_bits,
+            result.per_task_compute_cycles,
+            result.per_task_slot_upload_energy_j,
+        )
+        terminal_task_utility_by_id: dict[str, float] = {}
+        terminal_task_events: list[dict[str, Any]] = []
+        for raw_event in lifecycle_result.termination_events:
+            event = dict(raw_event)
+            task_id = str(event["task_id"])
+            if task_id in self._settled_task_ids:
+                raise RuntimeError(f"terminal utility was already settled for task {task_id}")
+            utility = system_model.terminal_task_utility(
+                event, **self.terminal_utility_parameters
+            )
+            self._settled_task_ids.add(task_id)
+            terminal_task_utility_by_id[task_id] = float(utility)
+            event["terminal_utility"] = float(utility)
+            terminal_task_events.append(event)
+        actual_task_utility = float(
+            math.fsum(terminal_task_utility_by_id.values())
+        )
+        if result.cache_cost is None or result.movement_cost is None:
+            raise RuntimeError("lifecycle system reward requires both normalized system costs")
+        slot_reward = system_model.lifecycle_system_reward(
+            actual_task_utility,
+            float(result.cache_cost),
+            float(result.movement_cost),
+        )
         actual_matching = getattr(result, "matching", None)
         actual_execution_node_data_available = isinstance(actual_matching, Mapping)
         actual_execution_nodes = (
@@ -1791,6 +2050,11 @@ class ExclusiveDQNEnvironment:
         self._cached_state_features = None
         self._cached_candidates = None
         done = self.terminated
+        if done and self.task_lifecycle.active_tasks:
+            raise RuntimeError(
+                "扩展执行时域结束时仍有活动任务："
+                f"count={len(self.task_lifecycle.active_tasks)}"
+            )
         next_state: np.ndarray | None = None
         next_state_fingerprint: str | None = None
         next_candidates: tuple[CandidateOption, ...] = ()
@@ -1800,7 +2064,7 @@ class ExclusiveDQNEnvironment:
             next_state_fingerprint = self._current_state_hash()
             next_candidate_rebuild_context = self.candidate_rebuild_context()
         return EnvironmentTransition(
-            reward=float(result.system_utility),
+            reward=slot_reward,
             next_state_features=next_state,
             next_state_fingerprint=next_state_fingerprint,
             next_legal_candidates=next_candidates,
@@ -1836,12 +2100,15 @@ class ExclusiveDQNEnvironment:
                 "post_uav_positions_m": {
                     key: value.tolist() for key, value in final_uav.items()
                 },
-                "actual_system_utility": float(result.system_utility),
-                "actual_task_utility": (
-                    None
-                    if result.actual_task_utility is None
-                    else float(result.actual_task_utility)
-                ),
+                "actual_system_utility": slot_reward,
+                "actual_task_utility": actual_task_utility,
+                "system_utility_formula": "G(t)=Q(t)-C_ca(t)-C_q(t)",
+                "system_utility_is_lifecycle_terminal_utility": True,
+                "terminal_task_utility_by_task": terminal_task_utility_by_id,
+                "terminal_task_cumulative_upload_energy_j": {
+                    str(event["task_id"]): float(event["cumulative_upload_energy_j"])
+                    for event in terminal_task_events
+                },
                 "actual_matching_node_task_counts": result.matching_summary.get(
                     "node_task_count"
                 ),
@@ -1850,20 +2117,43 @@ class ExclusiveDQNEnvironment:
                     if actual_execution_node_data_available
                     else None
                 ),
+                "arrived_task_count": len(lifecycle_result.arrived_task_ids),
+                "arrived_task_ids": list(lifecycle_result.arrived_task_ids),
+                "completed_task_count": lifecycle_result.completed_task_count,
+                "timed_out_task_count": lifecycle_result.timed_out_task_count,
+                "active_task_count": lifecycle_result.active_task_count,
+                "active_task_states": [
+                    dict(state) for state in lifecycle_result.active_tasks
+                ],
+                "task_termination_events": terminal_task_events,
+                "per_task_slot_execution": {
+                    task_id: dict(metrics)
+                    for task_id, metrics in lifecycle_result.per_task_slot_metrics.items()
+                },
+                "per_task_slot_upload_energy_j": dict(
+                    result.per_task_slot_upload_energy_j
+                ),
+                "episode_vehicle_upload_energy_j": (
+                    lifecycle_result.episode_upload_energy_j
+                ),
+                "lifecycle_task_arrivals_closed": (
+                    int(slot_input.slot_id) + 1 > self.arrival_horizon_slots
+                ),
+                "cache_updates_allowed": (
+                    int(slot_input.slot_id) + 1 <= self.arrival_horizon_slots
+                ),
                 "per_task_delay_s": dict(result.per_task_delay_s),
                 "per_task_vehicle_energy_j": dict(
+                    result.per_task_slot_upload_energy_j
+                ),
+                "matching_utility_per_task_vehicle_energy_j": dict(
                     result.per_task_vehicle_energy_j
                 ),
-                "per_task_utility": dict(result.per_task_utility),
-                "actual_total_task_delay_s": (
-                    float(sum(result.per_task_delay_s.values()))
-                    if result.per_task_delay_s
-                    else (0.0 if actual_execution_node_data_available else None)
-                ),
-                "actual_total_vehicle_energy_j": (
-                    float(sum(result.per_task_vehicle_energy_j.values()))
-                    if result.per_task_vehicle_energy_j
-                    else (0.0 if actual_execution_node_data_available else None)
+                "per_task_utility": terminal_task_utility_by_id,
+                "matching_proxy_per_task_utility": dict(result.per_task_utility),
+                "actual_total_task_delay_s": None,
+                "actual_total_vehicle_energy_j": float(
+                    lifecycle_result.slot_upload_energy_j
                 ),
                 "cache_download_delay_s": (
                     None
@@ -1914,7 +2204,9 @@ class ExclusiveDQNEnvironment:
                 "duration_semantics": "每个动作恰好执行一个正式 Slot",
                 **candidate_generation_diagnostics,
                 "state_features_used_future_actual_data": False,
-                "state_features_used_current_actual_task_data": False,
+                "state_features_used_current_actual_task_data": (
+                    decision_task_state_count > 0
+                ),
                 "candidate_generation_received_actual_tasks": False,
                 "candidate_generation_received_actual_vehicle_positions": False,
                 "candidate_features_used_current_actual_vehicle_positions": False,
@@ -1934,7 +2226,10 @@ class ExclusiveDQNEnvironment:
         forecast = self.decision_forecasts[self.index]
         formal_observation = self._formal_observation(forecast)
         state_features = self.encoder.encode_state(
-            formal_observation, forecast, slot_input.scenario_slice
+            formal_observation,
+            forecast,
+            slot_input.scenario_slice,
+            self._active_task_state_snapshots(),
         )
         return self._decision_state_fingerprint(
             slot_input, forecast, state_features

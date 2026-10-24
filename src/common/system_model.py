@@ -223,32 +223,28 @@ def cloud_execution(
     cpu_cycles: float,
     cloud_rate_bps: float,
     cloud_cpu_cycles_per_s: float,
-    cloud_delay_factor: float,
     transmit_power_w: float,
 ) -> dict[str, float]:
     """Evaluate one task using its assigned CPU service rate and uplink rate.
 
-    The caller is responsible for allocating these per-task rates from any
-    shared Cloud pools. Communication delay uses ``cloud_delay_factor`` while
-    vehicle radio energy uses only the base airtime ``input_bits / rate``.
+    The PDF assigns independent fixed per-task Cloud uplink and CPU rates.
+    Communication delay is ``input_bits / rate``; vehicle radio energy uses
+    the same uplink airtime.
     """
     bits = _require_finite("input_bits", input_bits)
     cycles = _require_finite("cpu_cycles", cpu_cycles)
     rate = _require_finite("cloud_rate_bps", cloud_rate_bps)
     cpu = _require_finite("cloud_cpu_cycles_per_s", cloud_cpu_cycles_per_s)
-    factor = _require_finite("cloud_delay_factor", cloud_delay_factor)
     power = _require_finite("transmit_power_w", transmit_power_w)
     if bits < 0.0 or cycles < 0.0:
         raise ValueError("input_bits/cpu_cycles 不能为负数。")
     if rate <= 0.0 or cpu <= 0.0:
         raise ValueError("cloud_rate_bps/cloud_cpu_cycles_per_s 必须大于 0。")
-    if factor < 1.0:
-        raise ValueError("cloud_delay_factor/psi_c 必须不小于 1。")
     if power < 0.0:
         raise ValueError("transmit_power_w 不能为负数。")
     allocated_rate = rate
     allocated_cpu = cpu
-    upload_delay = factor * bits / allocated_rate
+    upload_delay = bits / allocated_rate
     compute_delay = cycles / allocated_cpu
     return {
         "allocated_bandwidth_bps": allocated_rate,
@@ -577,3 +573,63 @@ def task_utility(
     if not math.isclose(wt + we, 1.0, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("omega_T 和 omega_E 的总和必须等于 1。")
     return wt * (1.0 - delay / t_ref) + we * (1.0 - energy / e_ref)
+
+
+def terminal_task_utility(
+    termination_event: dict[str, Any],
+    *,
+    t_ref_s: float,
+    e_ref_j: float,
+    omega_t: float,
+    omega_e: float,
+    phi_fail: float,
+) -> float:
+    """Return the PDF's one-time utility for a successful or timed-out task."""
+
+    reason = str(termination_event.get("termination_reason", "")).upper()
+    energy = _require_finite(
+        "cumulative_upload_energy_j",
+        termination_event.get("cumulative_upload_energy_j", float("nan")),
+    )
+    if energy < 0.0:
+        raise ValueError("cumulative task energy cannot be negative")
+    penalty = _require_finite("Phi_fail", phi_fail)
+    if penalty <= 0.0:
+        raise ValueError("Phi_fail must be positive")
+    t_ref = _require_finite("T_ref_s", t_ref_s)
+    e_ref = _require_finite("E_ref_j", e_ref_j)
+    wt = _require_finite("omega_T", omega_t)
+    we = _require_finite("omega_E", omega_e)
+    if t_ref <= 0.0 or e_ref <= 0.0:
+        raise ValueError("T_ref/E_ref must be positive")
+    if not 0.0 <= wt <= 1.0 or not 0.0 <= we <= 1.0:
+        raise ValueError("omega_T/omega_E must lie in [0,1]")
+    if not math.isclose(wt + we, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("omega_T + omega_E must equal 1")
+    if reason == "SUCCESS":
+        actual_time = _require_finite(
+            "actual_execution_time_s",
+            termination_event.get("actual_execution_time_s", float("nan")),
+        )
+        return float(task_utility(actual_time, energy, t_ref, e_ref, wt, we))
+    if reason == "TIMEOUT":
+        return float(-penalty - we * energy / e_ref)
+    raise ValueError(f"unknown task termination reason: {reason!r}")
+
+
+def lifecycle_system_reward(
+    terminal_task_utility_sum: float,
+    cache_cost: float,
+    movement_cost: float,
+) -> float:
+    """Return G(t)=Q(t)-C_ca(t)-C_q(t), without external beta weights."""
+
+    task_value = _require_finite("terminal_task_utility_sum", terminal_task_utility_sum)
+    cache_value = _require_finite("cache_cost", cache_cost)
+    movement_value = _require_finite("movement_cost", movement_cost)
+    if cache_value < 0.0 or movement_value < 0.0:
+        raise ValueError("normalized system costs must be non-negative")
+    reward = math.fsum((task_value, -cache_value, -movement_value))
+    if not math.isfinite(reward):
+        raise FloatingPointError("lifecycle system reward is not finite")
+    return float(reward)

@@ -390,30 +390,22 @@ def train_episode(
         beta_q = transition.diagnostics.get("beta_q")
         beta_ca = None if beta_ca is None else float(beta_ca)
         beta_q = None if beta_q is None else float(beta_q)
-        cache_cost_weighted = (
-            None
-            if beta_ca is None or cache_update_cost is None
-            else beta_ca * cache_update_cost
-        )
-        uav_movement_cost_weighted = (
-            None
-            if beta_q is None or uav_movement_cost is None
-            else beta_q * uav_movement_cost
-        )
+        cache_cost_penalty = cache_update_cost
+        uav_movement_cost_penalty = uav_movement_cost
         actual_task_utility_for_recomposition = transition.diagnostics.get(
             "actual_task_utility"
         )
         reward_recomposition_residual = (
             None
             if actual_task_utility_for_recomposition is None
-            or cache_cost_weighted is None
-            or uav_movement_cost_weighted is None
+            or cache_cost_penalty is None
+            or uav_movement_cost_penalty is None
             else float(
                 transition.reward
                 - (
                     float(actual_task_utility_for_recomposition)
-                    - cache_cost_weighted
-                    - uav_movement_cost_weighted
+                    - cache_cost_penalty
+                    - uav_movement_cost_penalty
                 )
             )
         )
@@ -552,19 +544,23 @@ def train_episode(
                     "C_ca=sum_m(cache_download_delay_s_m/reference_delay_s_m)"
                 ),
                 "cache_update_cost_unit": "dimensionless normalized delay ratio",
-                "beta_ca": beta_ca,
-                "cache_cost_weighted": cache_cost_weighted,
+                "legacy_beta_ca_config_not_applied": beta_ca,
+                "cache_cost_penalty": cache_cost_penalty,
                 "uav_movement_cost": uav_movement_cost,
                 "uav_movement_cost_available": movement_cost_available,
                 "uav_movement_cost_definition": (
                     "C_q=sum_u(movement_energy_j_u/reference_energy_j_u)"
                 ),
                 "uav_movement_cost_unit": "dimensionless normalized energy ratio",
-                "beta_q": beta_q,
-                "uav_movement_cost_weighted": uav_movement_cost_weighted,
-                "reward_formula": "G=Q_task-beta_ca*C_ca-beta_q*C_q",
+                "legacy_beta_q_config_not_applied": beta_q,
+                "uav_movement_cost_penalty": uav_movement_cost_penalty,
+                "reward_formula": "G(t)=Q(t)-C_ca(t)-C_q(t)",
+                "terminal_reward_formula": (
+                    "SUCCESS: omega_T*(1-T_act/T_ref)+omega_E*(1-E_life/E_ref); "
+                    "TIMEOUT: -Phi_fail-omega_E*E_life/E_ref"
+                ),
                 "actual_task_utility_unit": (
-                    "sum of per-task dimensionless delay-energy utility scores"
+                    "sum of terminal task utility for tasks ending this slot"
                 ),
                 "reward_unit": "same aggregate utility scale as Q_task",
                 "decision_wall_time_s": 0.0,

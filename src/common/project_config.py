@@ -208,6 +208,76 @@ def get_episode_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def get_cross_slot_task_parameters(config: dict[str, Any]) -> dict[str, int | float]:
+    """Return required lifecycle timing parameters without inventing K_max."""
+
+    k_max_slots = get_config_value(config, "execution.k_max_slots")
+    if k_max_slots is None:
+        raise ValueError(
+            "缺少必需配置 execution.k_max_slots（正整数，单位 slot）；"
+            "论文未给出数值，禁止回退到单时隙执行。"
+        )
+    if (
+        isinstance(k_max_slots, bool)
+        or not isinstance(k_max_slots, int)
+        or k_max_slots <= 0
+    ):
+        raise ValueError("execution.k_max_slots 必须是正整数，单位 slot。")
+
+    model = get_config_value(config, "execution.cross_slot_task_model")
+    if model != "cross_slot_lifecycle":
+        raise ValueError(
+            "execution.cross_slot_task_model 必须设为 cross_slot_lifecycle；"
+            f"当前值为 {model!r}。"
+        )
+
+    dt_s = float(get_config_value(config, "simulation.dt_s"))
+    if not math.isclose(dt_s, 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            "跨时隙任务生命周期要求 simulation.dt_s=1 秒，"
+            f"当前值为 {dt_s!r}。"
+        )
+    protocol = get_episode_data_protocol(config)
+    arrival_horizon = int(protocol["episode_slots"])
+    return {
+        "arrival_horizon_slots": arrival_horizon,
+        "k_max_slots": int(k_max_slots),
+        "execution_horizon_slots": arrival_horizon + int(k_max_slots) - 1,
+        "dt_s": dt_s,
+    }
+
+
+def get_terminal_task_utility_parameters(config: dict[str, Any]) -> dict[str, float]:
+    """Read the paper-defined terminal-utility parameters without defaults."""
+
+    values = {
+        "t_ref_s": float(get_config_value(config, "objective.T_ref")),
+        "e_ref_j": float(get_config_value(config, "objective.E_ref")),
+        "omega_t": float(get_config_value(config, "objective.omega_delay")),
+        "omega_e": float(get_config_value(config, "objective.omega_energy")),
+    }
+    phi_fail_value = get_config_value(config, "objective.failure_penalty")
+    if phi_fail_value is None:
+        raise ValueError(
+            "缺少必需配置 objective.failure_penalty（论文符号 Phi_fail，正数）；"
+            "不得为超时效用设置默认值。"
+        )
+    values["phi_fail"] = float(phi_fail_value)
+    if (
+        not all(math.isfinite(value) for value in values.values())
+        or values["t_ref_s"] <= 0.0
+        or values["e_ref_j"] <= 0.0
+        or values["phi_fail"] <= 0.0
+        or not 0.0 <= values["omega_t"] <= 1.0
+        or not 0.0 <= values["omega_e"] <= 1.0
+        or not math.isclose(
+            values["omega_t"] + values["omega_e"], 1.0, rel_tol=0.0, abs_tol=1e-12
+        )
+    ):
+        raise ValueError("终止任务效用配置违反论文定义或包含非有限参数")
+    return values
+
+
 def _node_positions_path(config: dict[str, Any]) -> Path:
     project_root = Path(
         config.get("_meta", {}).get("project_root", find_project_root())
@@ -834,10 +904,7 @@ def validate_config(
     episode_s = float(get_config_value(config, "simulation.episode_time_s"))
     if dt_s <= 0.0 or warmup_s < 0.0 or episode_s <= 0.0:
         raise ValueError("simulation.dt_s/warmup_time_s/episode_time_s 数值范围无效。")
-    if str(get_config_value(config, "execution.cross_slot_task_model")) != "independent_per_slot":
-        raise ValueError(
-            "execution.cross_slot_task_model 必须为 independent_per_slot。"
-        )
+    get_cross_slot_task_parameters(config)
     for label, duration in (("warmup_time_s", warmup_s), ("episode_time_s", episode_s)):
         steps = duration / dt_s
         if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9):
@@ -952,15 +1019,14 @@ def validate_config(
     cloud_delay_factor = float(get_config_value(config, "nodes.cloud.cloud_delay_factor"))
     if cloud_delay_factor < 1.0:
         raise ValueError(
-            "Cloud传输扩展系数psi_c必须不小于1，"
-            "因为其用于表示蜂窝接入基础上传时延之外的"
-            "回传网络和核心网附加时延。"
+            "遗留字段 nodes.cloud.cloud_delay_factor 必须不小于 1；"
+            "该字段不参与《13.pdf》的固定 Rc/Fc Cloud 物理模型。"
         )
     cloud_resource_sharing = get_config_value(config, "nodes.cloud.resource_sharing")
     if not isinstance(cloud_resource_sharing, bool):
         raise ValueError(
             "nodes.cloud.resource_sharing 必须显式配置为 true/false，"
-            "该兼容字段不控制 Cloud 总速率池，模型始终按总容量共享分配。"
+            "该兼容字段不控制当前每任务固定 Rc/Fc Cloud 模型。"
         )
     cloud_resource_mode = str(
         get_config_value(config, "nodes.cloud.resource_mode", "legacy_unlimited")
@@ -1044,7 +1110,7 @@ def validate_config(
     ):
         raise ValueError(
             "nodes.cloud.total_bandwidth_bps 与 nodes.cloud.uplink_rate_bps "
-            "必须相等；前者是每时隙共享总速率上限，后者是兼容别名。"
+            "必须相等；前者仅是每任务固定 Rc 的遗留兼容别名，不是共享池上限。"
         )
 
     for key, status in config.get("parameter_status", {}).items():

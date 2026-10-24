@@ -624,7 +624,7 @@ class DoubleDQNAgent:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "agent_state_schema_version": 5,
+            "agent_state_schema_version": 7,
             "q_aggregation_contract": "legal_candidate_mean_centered_dueling_v1",
             "state_feature_contract_version": STATE_FEATURE_CONTRACT_VERSION,
             "candidate_feature_contract_version": CANDIDATE_FEATURE_CONTRACT_VERSION,
@@ -654,8 +654,10 @@ class DoubleDQNAgent:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if int(state.get("agent_state_schema_version", -1)) != 5:
-            raise ValueError("旧版 DQN Checkpoint 不符合当前缓存互补性候选合同，拒绝恢复")
+        if int(state.get("agent_state_schema_version", -1)) != 7:
+            raise ValueError(
+                "旧版 DQN Checkpoint 的状态维度、活动任务观测或终止奖励合同不兼容，拒绝恢复"
+            )
         if state.get("q_aggregation_contract") != "legal_candidate_mean_centered_dueling_v1":
             raise ValueError("Checkpoint Q 聚合语义不兼容，拒绝恢复")
         expected_contract = {

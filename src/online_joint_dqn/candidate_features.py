@@ -18,9 +18,9 @@ from .candidate_evaluator import SlotInput, copy_uav_positions
 
 
 OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
-STATE_FEATURE_CONTRACT_VERSION = "formal_observation_spatial_role_slots_v4"
+STATE_FEATURE_CONTRACT_VERSION = "formal_observation_spatial_role_slots_active_task_state_v6"
 CANDIDATE_FEATURE_CONTRACT_VERSION = "prediction_only_cache_spatial_role_slots_v4"
-NETWORK_ARCHITECTURE_VERSION = "legal_candidate_mean_centered_dueling_q_v5"
+NETWORK_ARCHITECTURE_VERSION = "legal_candidate_mean_centered_dueling_q_active_task_state_v7"
 
 
 @dataclass(frozen=True)
@@ -301,6 +301,7 @@ class CandidateFeatureEncoder:
         observation_spec: Any,
         train_origin_start: int,
         train_origin_end: int,
+        k_max_slots: int,
         canonical_vehicle_ids: Sequence[str] | None = None,
         canonical_cache_node_ids: Sequence[str] | None = None,
     ) -> None:
@@ -316,6 +317,13 @@ class CandidateFeatureEncoder:
         self.observation_spec = observation_spec
         self.train_origin_start = int(train_origin_start)
         self.train_origin_end = int(train_origin_end)
+        if (
+            isinstance(k_max_slots, bool)
+            or int(k_max_slots) != k_max_slots
+            or int(k_max_slots) <= 0
+        ):
+            raise ValueError("K_max must be a positive integer for active-task features")
+        self.k_max_slots = int(k_max_slots)
         self.source_node_ids = source_node_ids
         self.node_ids = tuple(
             source_node_ids
@@ -354,6 +362,7 @@ class CandidateFeatureEncoder:
         self.task_vehicle_ids = tuple(
             value for value in self.vehicle_ids if value in task_vehicle_set
         )
+        self.execution_node_ids = (*self.node_ids, "CLOUD", "UNASSIGNED")
         configured_uavs = tuple(uav_configuration.uav_ids_from_project(dict(slot_input.model.project_cfg)))
         if self.uav_ids != configured_uavs:
             raise ValueError("正式 observation spec 的 UAV 顺序与配置不一致")
@@ -439,10 +448,30 @@ class CandidateFeatureEncoder:
             len(self.vehicle_ids) * len(self.service_ids)
             + len(self.node_ids) * len(self.service_ids)
         )
+        self.active_task_feature_order = (
+            "active",
+            "stage_uploading",
+            "stage_computing",
+            "remaining_upload_bits",
+            "remaining_compute_cycles",
+            "remaining_deadline_slots",
+            "remaining_upload_fraction",
+            "remaining_compute_fraction",
+            "remaining_deadline_fraction",
+            *(f"service_id={value}" for value in self.service_ids),
+            *(f"execution_node={value}" for value in self.execution_node_ids),
+        )
+        self.active_task_feature_width = len(self.active_task_feature_order)
+        self.active_task_state_dim = (
+            len(self.task_vehicle_ids)
+            * self.k_max_slots
+            * self.active_task_feature_width
+        )
         self.state_dim = (
             int(observation_spec.observation_dim)
             + 2 * self.horizon_count
             + self.state_prediction_demand_dim
+            + self.active_task_state_dim
         )
         self.candidate_dim = (
             3 + 2 + node_count * service_count + node_count
@@ -455,6 +484,7 @@ class CandidateFeatureEncoder:
         formal_observation: Any,
         decision_forecast: DecisionForecast,
         prediction_scenario: Mapping[str, Any],
+        active_task_states: Sequence[Mapping[str, Any]],
     ) -> np.ndarray:
         source_observation = np.asarray(formal_observation, dtype=np.float32).reshape(-1)
         if source_observation.shape != (int(self.observation_spec.observation_dim),):
@@ -498,16 +528,110 @@ class CandidateFeatureEncoder:
         scenario_demand_features = self._encode_candidate_generation_demand(
             prediction_scenario, mask
         )
+        active_task_features = self._encode_active_task_states(active_task_states)
         result = np.concatenate(
             (
                 observation,
                 np.asarray(expected_input, dtype=np.float32),
                 np.asarray(expected_cycles, dtype=np.float32),
                 scenario_demand_features,
+                active_task_features,
             )
         )
         if result.shape != (self.state_dim,) or not np.all(np.isfinite(result)):
             raise ValueError("状态特征维度或数值无效")
+        return result
+
+    def _encode_active_task_states(
+        self, active_task_states: Sequence[Mapping[str, Any]]
+    ) -> np.ndarray:
+        """Encode tasks by canonical TV then arrival order, with K_max padded slots."""
+
+        if isinstance(active_task_states, (str, bytes)):
+            raise TypeError("active_task_states must be a sequence of task snapshots")
+        snapshots = [dict(state) for state in active_task_states]
+        by_vehicle: dict[str, list[dict[str, Any]]] = {
+            vehicle_id: [] for vehicle_id in self.task_vehicle_ids
+        }
+        for state in snapshots:
+            vehicle_id = str(state.get("vehicle_id", ""))
+            if vehicle_id not in by_vehicle:
+                raise ValueError(f"active task has unknown or non-TV vehicle {vehicle_id!r}")
+            by_vehicle[vehicle_id].append(state)
+
+        features: list[float] = []
+        service_index = self.service_index
+        node_index = {node_id: index for index, node_id in enumerate(self.execution_node_ids)}
+        for vehicle_id in self.task_vehicle_ids:
+            tasks = sorted(
+                by_vehicle[vehicle_id],
+                key=lambda item: (int(item["arrival_slot"]), str(item["task_id"])),
+            )
+            if len(tasks) > self.k_max_slots:
+                raise ValueError(
+                    f"TV {vehicle_id} has {len(tasks)} active tasks, exceeding K_max="
+                    f"{self.k_max_slots}"
+                )
+            for state in tasks:
+                service_id = int(state["service_id"])
+                execution_node = state.get("execution_node")
+                stage = str(state.get("execution_stage", "")).upper()
+                original_bits = float(state["input_bits"])
+                remaining_bits = float(state["remaining_upload_bits"])
+                original_cycles = float(state["cpu_cycles"])
+                remaining_cycles = float(state["remaining_compute_cycles"])
+                remaining_slots = int(state["remaining_slots"])
+                if service_id not in service_index:
+                    raise ValueError(f"active task references unknown service {service_id}")
+                node_key = (
+                    "UNASSIGNED" if execution_node is None else str(execution_node)
+                )
+                if node_key not in node_index:
+                    raise ValueError(
+                        f"active task {state.get('task_id')!r} has unknown execution node "
+                        f"{execution_node!r}"
+                    )
+                if stage not in {"UPLOADING", "COMPUTING"}:
+                    raise ValueError(f"unsupported active task stage {stage!r}")
+                numeric = (original_bits, remaining_bits, original_cycles, remaining_cycles)
+                if (
+                    not all(math.isfinite(value) for value in numeric)
+                    or original_bits <= 0.0
+                    or original_cycles <= 0.0
+                    or not 0.0 <= remaining_bits <= original_bits
+                    or not 0.0 <= remaining_cycles <= original_cycles
+                    or not 0 < remaining_slots <= self.k_max_slots
+                ):
+                    raise ValueError(f"active task {state.get('task_id')!r} has invalid work/deadline")
+                if (stage == "UPLOADING") != (remaining_bits > 0.0):
+                    raise ValueError(
+                        f"active task {state.get('task_id')!r} stage disagrees with remaining upload"
+                    )
+                record = [
+                    1.0,
+                    float(stage == "UPLOADING"),
+                    float(stage == "COMPUTING"),
+                    remaining_bits,
+                    remaining_cycles,
+                    float(remaining_slots),
+                    remaining_bits / original_bits,
+                    remaining_cycles / original_cycles,
+                    remaining_slots / self.k_max_slots,
+                ]
+                record.extend(
+                    float(index == service_index[service_id])
+                    for index in range(len(self.service_ids))
+                )
+                record.extend(
+                    float(index == node_index[node_key])
+                    for index in range(len(self.execution_node_ids))
+                )
+                features.extend(record)
+            for _ in range(self.k_max_slots - len(tasks)):
+                features.extend([0.0] * self.active_task_feature_width)
+        result = np.asarray(features, dtype=np.float32)
+        if result.shape != (self.active_task_state_dim,) or not np.isfinite(result).all():
+            raise ValueError("active-task features have invalid shape or non-finite values")
         return result
 
     def restore_source_formal_observation(self, canonical_observation: Any) -> np.ndarray:
