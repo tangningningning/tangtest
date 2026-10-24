@@ -8,7 +8,9 @@ plugins/
 # Python cache
 # =========================
 .runs/
+
 .agents/
+
 .codex/
 adaptive_cache_mec.zip
 # Generated environment data
@@ -16,7 +18,7 @@ adaptive_cache_mec.zip
 
 .data/episode_pools/
 
-.reports/
+reports/
 
 __pycache__/
 *.pyc

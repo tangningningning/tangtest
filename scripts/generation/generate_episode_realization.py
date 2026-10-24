@@ -456,14 +456,20 @@ def load_and_validate_config(config_file: Path) -> dict[str, Any]:
         require_artifacts=False,
     )
     protocol = project_config_module.get_episode_data_protocol(config)
+    execution_horizon = EXPECTED_SLOTS + int(
+        project_config_module.get_config_value(config, "execution.k_max_slots")
+    ) - 1
     expected = {
         "protocol": project_config_module.EPISODE_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED,
         "physical_episode_slots": EXPECTED_SLOTS,
         "episode_slots": EXPECTED_SLOTS,
+        "arrival_horizon_slots": EXPECTED_SLOTS,
+        "execution_horizon_slots": execution_horizon,
         "train_origin_start": 0,
         "train_origin_end": EXPECTED_SLOTS - 1,
         "terminal_origin": EXPECTED_SLOTS - 1,
-        "rollout_steps": EXPECTED_SLOTS,
+        "rollout_steps": execution_horizon,
+        "terminal_execution_slot": execution_horizon - 1,
         "test_origin_start": None,
         "test_origin_end": None,
     }

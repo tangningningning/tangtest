@@ -107,7 +107,7 @@ EPISODE_DATA_PROTOCOL_FULL_EPISODE_RANDOMIZED = "full_episode_randomized"
 
 
 def get_episode_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
-    """读取并校验正式的完整 episode 数据协议。"""
+    """Validate separate task-arrival and complete-execution horizons."""
 
     raw_protocol = get_config_value(config, "data_protocol")
     if not isinstance(raw_protocol, dict):
@@ -134,37 +134,32 @@ def get_episode_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("simulation.episode_time_s / simulation.dt_s 必须是正整数。")
 
-    def read_int(key: str, *, required: bool = True) -> int | None:
+    def read_int(key: str) -> int:
         if key not in raw_protocol:
-            if required:
-                raise ValueError(
-                    f"data_protocol 缺少 {key}。"
-                )
-            return None
+            raise ValueError(f"data_protocol 缺少 {key}。")
         value = raw_protocol[key]
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(
-                f"data_protocol.{key} 必须是整数。"
-            )
+            raise ValueError(f"data_protocol.{key} 必须是整数。")
         return int(value)
 
-    train_start = read_int("train_origin_start")
-    assert train_start is not None
-    if train_start != 0:
-        raise ValueError(
-            "data_protocol.train_origin_start 必须为正式 origin 的起点0。"
-        )
-
+    arrival_horizon = read_int("arrival_horizon_slots")
     configured_episode_slots = read_int("episode_slots")
+    execution_horizon = read_int("execution_horizon_slots")
+    train_start = read_int("train_origin_start")
     configured_train_end = read_int("train_origin_end")
     configured_rollout_steps = read_int("rollout_steps")
-    configured_terminal = read_int("terminal_origin")
-    assert (
-        configured_episode_slots is not None
-        and configured_train_end is not None
-        and configured_rollout_steps is not None
-        and configured_terminal is not None
-    )
+    terminal_origin = read_int("terminal_origin")
+    terminal_execution_slot = read_int("terminal_execution_slot")
+
+    k_max_slots = get_config_value(config, "execution.k_max_slots")
+    if (
+        isinstance(k_max_slots, bool)
+        or not isinstance(k_max_slots, int)
+        or k_max_slots <= 0
+    ):
+        raise ValueError("execution.k_max_slots 必须是正整数，单位 slot。")
+    expected_execution_horizon = arrival_horizon + int(k_max_slots) - 1
+
     if configured_episode_slots != physical_episode_slots:
         raise ValueError(
             "full_episode_randomized episode_slots 必须等于 "
@@ -172,39 +167,57 @@ def get_episode_data_protocol(config: dict[str, Any]) -> dict[str, Any]:
             f"configured={configured_episode_slots}, "
             f"expected={physical_episode_slots}。"
         )
-    if configured_train_end != configured_episode_slots - 1:
+    if arrival_horizon != configured_episode_slots:
         raise ValueError(
-            "full_episode_randomized train_origin_end 必须等于 episode_slots-1。"
+            "arrival_horizon_slots 必须等于 episode_slots；"
+            "它表示允许新任务到达的零基 slot 数。"
         )
-    if configured_rollout_steps != configured_episode_slots:
+    if train_start != 0:
         raise ValueError(
-            "full_episode_randomized rollout_steps 必须等于 episode_slots。"
+            "data_protocol.train_origin_start 必须为正式 origin 的起点0。"
         )
-    if configured_terminal != configured_episode_slots - 1:
+    if configured_train_end != arrival_horizon - 1:
         raise ValueError(
-            "full_episode_randomized terminal_origin 必须等于 episode_slots-1。"
+            "full_episode_randomized train_origin_end 必须等于 "
+            "arrival_horizon_slots-1。"
+        )
+    if execution_horizon != expected_execution_horizon:
+        raise ValueError(
+            "execution_horizon_slots 必须等于 arrival_horizon_slots+K_max-1："
+            f"configured={execution_horizon}, expected={expected_execution_horizon}。"
+        )
+    if configured_rollout_steps != execution_horizon:
+        raise ValueError(
+            "rollout_steps 必须等于完整 execution_horizon_slots："
+            f"configured={configured_rollout_steps}, expected={execution_horizon}。"
+        )
+    if terminal_origin != arrival_horizon - 1:
+        raise ValueError(
+            "terminal_origin 必须保持为最后一个任务到达/origin slot："
+            f"configured={terminal_origin}, expected={arrival_horizon - 1}。"
+        )
+    if terminal_execution_slot != execution_horizon - 1:
+        raise ValueError(
+            "terminal_execution_slot 必须等于 execution_horizon_slots-1："
+            f"configured={terminal_execution_slot}, expected={execution_horizon - 1}。"
         )
     if "test_origin_start" in raw_protocol or "test_origin_end" in raw_protocol:
         raise ValueError(
             "full_episode_randomized 不允许设置同一 realization 内的 test split。"
         )
-    train_end = configured_train_end
-    episode_slots = configured_episode_slots
-    configured_rollout = configured_rollout_steps
-    terminal_origin = configured_terminal
-    test_start = None
-    test_end = None
-
     return {
         "protocol": protocol,
         "physical_episode_slots": physical_episode_slots,
-        "episode_slots": episode_slots,
+        "episode_slots": configured_episode_slots,
+        "arrival_horizon_slots": arrival_horizon,
+        "execution_horizon_slots": execution_horizon,
         "train_origin_start": train_start,
-        "train_origin_end": train_end,
-        "test_origin_start": test_start,
-        "test_origin_end": test_end,
-        "rollout_steps": configured_rollout,
+        "train_origin_end": configured_train_end,
+        "test_origin_start": None,
+        "test_origin_end": None,
+        "rollout_steps": configured_rollout_steps,
         "terminal_origin": terminal_origin,
+        "terminal_execution_slot": terminal_execution_slot,
     }
 
 
@@ -238,11 +251,22 @@ def get_cross_slot_task_parameters(config: dict[str, Any]) -> dict[str, int | fl
             f"当前值为 {dt_s!r}。"
         )
     protocol = get_episode_data_protocol(config)
-    arrival_horizon = int(protocol["episode_slots"])
+    arrival_horizon = int(protocol["arrival_horizon_slots"])
+    execution_horizon = int(protocol["execution_horizon_slots"])
+    expected_execution_horizon = arrival_horizon + int(k_max_slots) - 1
+    if execution_horizon != expected_execution_horizon:
+        raise ValueError(
+            "cross-slot horizon contract mismatch: "
+            f"arrival={arrival_horizon}, K_max={k_max_slots}, "
+            f"execution={execution_horizon}, expected={expected_execution_horizon}"
+        )
     return {
         "arrival_horizon_slots": arrival_horizon,
         "k_max_slots": int(k_max_slots),
-        "execution_horizon_slots": arrival_horizon + int(k_max_slots) - 1,
+        "execution_horizon_slots": execution_horizon,
+        "terminal_origin": int(protocol["terminal_origin"]),
+        "terminal_execution_slot": int(protocol["terminal_execution_slot"]),
+        "rollout_steps": int(protocol["rollout_steps"]),
         "dt_s": dt_s,
     }
 
@@ -997,8 +1021,8 @@ def validate_config(
     ):
         if get_config_value(config, obsolete_path) is not None:
             raise ValueError(
-                f"{obsolete_path} 已废弃；正式系统效用使用 objective.beta_ca "
-                "和 objective.beta_q 显式配置外部成本权重。"
+                f"{obsolete_path} 已废弃；Online Joint DQN 生命周期奖励为 "
+                "G(t)=Q(t)-C_ca(t)-C_q(t)，objective.beta_ca/beta_q 保留给兼容聚合路径。"
             )
     for weight_path in ("objective.beta_ca", "objective.beta_q"):
         raw_weight = get_config_value(config, weight_path)

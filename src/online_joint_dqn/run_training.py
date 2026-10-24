@@ -50,8 +50,8 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v10_active_task_state_terminal_reward"
-CHECKPOINT_SCHEMA_VERSION = 11
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v11_arrival_execution_horizon"
+CHECKPOINT_SCHEMA_VERSION = 12
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4
@@ -379,11 +379,7 @@ def _validate_training_pool() -> dict[str, Any]:
     pool = Path(info["pool_path"])
     valid: list[int] = []
     invalid: list[dict[str, Any]] = []
-    for seed in range(
-        pool_contract.DEFAULT_TRAINING_SEED_START,
-        pool_contract.DEFAULT_TRAINING_SEED_START
-        + pool_contract.FORMAL_TRAINING_EPISODE_COUNT,
-    ):
+    for seed in info["active_episode_seeds"]:
         try:
             pool_contract._validate_episode_snapshot(pool, seed, info)
             valid.append(seed)
@@ -430,11 +426,7 @@ def _validate_independent_test_pool(
         )
         valid_seeds: list[int] = []
         invalid_episodes: list[dict[str, Any]] = []
-        for seed in range(
-            pool_contract.DEFAULT_TEST_SEED_START,
-            pool_contract.DEFAULT_TEST_SEED_START
-            + pool_contract.FORMAL_TEST_EPISODE_COUNT,
-        ):
+        for seed in info["active_episode_seeds"]:
             try:
                 pool_contract._validate_episode_snapshot(pool, seed, info)
                 valid_seeds.append(seed)
@@ -446,12 +438,9 @@ def _validate_independent_test_pool(
             "status": "PASS" if not invalid_episodes else "BLOCKED",
             "path": str(pool_path),
             "split": "test",
-            "seed_start": pool_contract.DEFAULT_TEST_SEED_START,
-            "seed_end": (
-                pool_contract.DEFAULT_TEST_SEED_START
-                + pool_contract.FORMAL_TEST_EPISODE_COUNT
-                - 1
-            ),
+            "seed_start": min(info["active_episode_seeds"]),
+            "seed_end": max(info["active_episode_seeds"]),
+            "active_episode_seeds": info["active_episode_seeds"],
             "manifest_sha256": info["manifest_sha256"],
             "config_compatibility": info["config_compatibility"],
             "valid_episode_count": len(valid_seeds),
@@ -555,9 +544,20 @@ def _run_identity(
 ) -> dict[str, Any]:
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     config = project_config.parse_toml_file(config_path)
+    time_horizon = project_config.get_cross_slot_task_parameters(config)
     identity = {
         "algorithm": "legal_candidate_mean_centered_dueling_double_dqn_exclusive_v6_active_task_state",
-        "objective_contract": "finite_episode_undiscounted_terminal_utility_v2",
+        "objective_contract": "finite_episode_undiscounted_terminal_utility_extended_horizon_v3",
+        "time_horizon_contract": {
+            "arrival_horizon_slots": int(time_horizon["arrival_horizon_slots"]),
+            "execution_horizon_slots": int(time_horizon["execution_horizon_slots"]),
+            "k_max_slots": int(time_horizon["k_max_slots"]),
+            "dt_s": float(time_horizon["dt_s"]),
+            "terminal_origin": int(time_horizon["terminal_origin"]),
+            "terminal_execution_slot": int(time_horizon["terminal_execution_slot"]),
+            "formula": "execution_horizon_slots=arrival_horizon_slots+k_max_slots-1",
+            "indexing": "zero_based",
+        },
         "dqn_system_utility": {
             "formula": "G(t)=Q(t)-C_ca(t)-C_q(t)",
             "task_utility": "PDF terminal utility for tasks terminating after this slot",
@@ -956,14 +956,14 @@ def run_training(
     evaluation_gate = _independent_evaluation_gate(runtime_config)
     print(_normalization_config_line(runtime_config), flush=True)
 
-    first_seed = pool_contract.DEFAULT_TRAINING_SEED_START
+    first_seed = int(pool_info["episode_seeds"][0])
     # 环境初始化会打印冗长的逐节点归一化详情；控制台只保留上方摘要行。
     with contextlib.redirect_stdout(io.StringIO()):
         first_environment = ExclusiveDQNEnvironment.from_formal_training_episode(
             PROJECT_ROOT,
             episode_seed=first_seed,
             origin_start=0,
-            max_steps=pool_contract.FORMAL_TRAINING_EPISODE_SLOTS,
+            max_steps=pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
         )
     state, candidates = first_environment.observe()
     agent = DoubleDQNAgent(
@@ -1012,6 +1012,10 @@ def run_training(
                 "path": str(PROJECT_ROOT / pool_contract.TRAIN_POOL_RELATIVE),
                 "episode_count": pool_info["validated_episode_count"],
                 "episode_slots": pool_contract.FORMAL_TRAINING_EPISODE_SLOTS,
+                "arrival_horizon_slots": pool_contract.FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS,
+                "execution_horizon_slots": pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
+                "terminal_origin": pool_contract.FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS - 1,
+                "terminal_execution_slot": pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS - 1,
                 "manifest_sha256": pool_info["manifest_sha256"],
                 "integrity_baseline_sha256": pool_info[
                     "integrity_baseline_sha256"
@@ -1076,7 +1080,7 @@ def run_training(
                 raise ValueError("Checkpoint Episode 汇总与正式训练顺序不一致")
             expected_global_step = (
                 restored_next_episode_index
-                * pool_contract.FORMAL_TRAINING_EPISODE_SLOTS
+                * pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
             )
             if restored_global_step != expected_global_step:
                 raise ValueError("Checkpoint Slot 数与完整 Episode 进度不一致")
@@ -1112,7 +1116,7 @@ def run_training(
     if _read_episode_metrics(episode_metrics_path) != episode_rows:
         # Checkpoint 是完成进度的提交点；恢复时修复可能落后的派生汇总文件。
         _write_episode_metrics_atomic(episode_metrics_path, episode_rows)
-    total_slots = len(episode_order) * pool_contract.FORMAL_TRAINING_EPISODE_SLOTS
+    total_slots = len(episode_order) * pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
     previous_summary_path = run_dir / "run_summary.json"
     previous_training_elapsed_seconds = sum(
         max(0.0, float(row.get("episode_wall_time_s", 0.0)))
@@ -1321,7 +1325,7 @@ def run_training(
                         PROJECT_ROOT,
                         episode_seed=episode_seed,
                         origin_start=0,
-                        max_steps=pool_contract.FORMAL_TRAINING_EPISODE_SLOTS,
+                        max_steps=pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
                     )
                 if (
                     environment.encoder.state_dim != agent.state_dim
@@ -1368,7 +1372,7 @@ def run_training(
                     on_update=write_update,
                 )
                 episode_elapsed = time.perf_counter() - episode_started
-                if metrics["step_count"] != pool_contract.FORMAL_TRAINING_EPISODE_SLOTS:
+                if metrics["step_count"] != pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS:
                     raise RuntimeError(
                         f"Episode {episode_seed} 实际执行 {metrics['step_count']} Slot，"
                         "与正式 Episode 长度不一致"

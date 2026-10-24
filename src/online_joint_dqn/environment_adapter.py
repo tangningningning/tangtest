@@ -568,6 +568,34 @@ def _bounded_cross_node_pair_cache_targets(
     }
 
 
+def _validate_active_task_vehicle_positions(
+    *,
+    slot_id: int,
+    arrival_horizon_slots: int,
+    active_vehicle_ids: Sequence[str],
+    vehicle_positions: Mapping[str, Any],
+) -> None:
+    """Require current physical positions for active task links without inventing a departure policy."""
+
+    missing = sorted(
+        {str(vehicle_id) for vehicle_id in active_vehicle_ids}
+        - {str(vehicle_id) for vehicle_id in vehicle_positions}
+    )
+    if not missing:
+        return
+    if int(slot_id) >= int(arrival_horizon_slots):
+        raise RuntimeError(
+            "UNRESOLVED_VEHICLE_DEPARTURE_SEMANTICS: "
+            f"execution slot={slot_id}, active task vehicles lack current physical "
+            f"positions={missing}; no continuation, migration, failure, or "
+            "trajectory-fill policy is configured."
+        )
+    raise ValueError(
+        "MISSING_CURRENT_ACTIVE_TASK_VEHICLE_POSITION: "
+        f"slot={slot_id}, vehicles={missing}"
+    )
+
+
 class ExclusiveDQNEnvironment:
     """按真实 Episode 顺序推进，每次只执行一个合法互斥配置。"""
 
@@ -610,6 +638,7 @@ class ExclusiveDQNEnvironment:
         self.execution_horizon_slots = int(
             lifecycle_parameters["execution_horizon_slots"]
         )
+        self.terminal_execution_slot = self.execution_horizon_slots - 1
         self.task_lifecycle = task_lifecycle.TaskLifecycleManager(
             arrival_horizon_slots=self.arrival_horizon_slots,
             k_max_slots=self.k_max_slots,
@@ -622,17 +651,29 @@ class ExclusiveDQNEnvironment:
         )
         if len(self.slot_inputs) < self.execution_horizon_slots:
             raise ValueError(
-                "扩展执行轨迹覆盖不足："
-                f"required={self.execution_horizon_slots} slots "
+                "MISSING_CAUSAL_EXECUTION_TAIL_INPUTS: "
+                f"need {self.execution_horizon_slots} aligned physical/decision slots "
                 f"(T={self.arrival_horizon_slots}, K_max={self.k_max_slots}), "
-                f"available={len(self.slot_inputs)} slots, "
-                f"missing={self.execution_horizon_slots - len(self.slot_inputs)} tail slots。"
+                f"available={len(self.slot_inputs)}, "
+                f"missing={self.execution_horizon_slots - len(self.slot_inputs)} tail slots; "
+                "future ground-truth positions cannot substitute for decision forecasts."
             )
         if int(self.slot_inputs[0].slot_id) != 0 or any(
             int(item.slot_id) != index
             for index, item in enumerate(self.slot_inputs[: self.execution_horizon_slots])
         ):
             raise ValueError("跨时隙执行输入必须按零基连续时隙从 slot 0 开始")
+        tail_arrivals = [
+            (int(item.slot_id), len(item.tasks))
+            for item in self.slot_inputs[: self.execution_horizon_slots]
+            if int(item.slot_id) >= self.arrival_horizon_slots and item.tasks
+        ]
+        if tail_arrivals:
+            raise ValueError(
+                "task arrivals are forbidden in execution tail slots "
+                f"{self.arrival_horizon_slots}..{self.execution_horizon_slots - 1}: "
+                f"found={tail_arrivals[:10]}"
+            )
         trajectory_times = [
             item.time_s for item in self.slot_inputs[: self.execution_horizon_slots]
         ]
@@ -766,7 +807,7 @@ class ExclusiveDQNEnvironment:
         if str(training_scripts) not in sys.path:
             sys.path.insert(0, str(training_scripts))
         import training_pool_contract as pool_contract
-        from common.environment_interface import aligned_train_steps
+        from common.environment_interface import aligned_execution_steps
 
         pool, pool_info = pool_contract._validate_pool(
             root,
@@ -786,19 +827,14 @@ class ExclusiveDQNEnvironment:
                 "跨时隙生命周期必须从完整 Episode 的 slot 0 开始；"
                 f"received origin_start={origin_start}"
             )
-        if max_steps is not None and int(max_steps) not in {
-            arrival_horizon,
-            execution_horizon,
-        }:
+        if max_steps is not None and int(max_steps) != execution_horizon:
             raise ValueError(
-                "跨时隙生命周期不接受截断窗口："
-                f"requested max_steps={max_steps}, T={arrival_horizon}, "
-                f"required execution horizon={execution_horizon}"
+                "跨时隙生命周期必须使用完整执行时域，不能用到达时域长度代替："
+                f"requested max_steps={max_steps}, "
+                f"arrival_horizon={arrival_horizon}, "
+                f"required execution_horizon={execution_horizon}"
             )
-        steps = aligned_train_steps(
-            context,
-            origin_start=0,
-        )
+        steps = aligned_execution_steps(context)
         decision_count = len(steps)
         terminal_at_end = decision_count == execution_horizon
         model = SystemModelContext(
@@ -821,7 +857,7 @@ class ExclusiveDQNEnvironment:
                 scenario_id=f"formal_train:{int(episode_seed)}:{int(step.slot)}",
                 source_kind="current_actual",
                 prediction_metadata={
-                    "source": "formal_aligned_train_steps",
+                    "source": "formal_aligned_execution_steps",
                     "episode_seed": int(episode_seed),
                     "origin_slot": int(step.slot),
                     "future_ground_truth_used_for_candidate_features": False,
@@ -1762,6 +1798,16 @@ class ExclusiveDQNEnvironment:
             raise ValueError("候选动作违反缓存与 UAV 互斥约束")
         slot_input = self.slot_inputs[self.index]
         decision_task_state_count = len(self._active_task_state_snapshots())
+        active_vehicle_ids = {
+            str(state["vehicle_id"])
+            for state in self._active_task_state_snapshots()
+        } | {str(task.vehicle_id) for task in slot_input.tasks}
+        _validate_active_task_vehicle_positions(
+            slot_id=int(slot_input.slot_id),
+            arrival_horizon_slots=self.arrival_horizon_slots,
+            active_vehicle_ids=tuple(active_vehicle_ids),
+            vehicle_positions=slot_input.vehicle_positions,
+        )
         prepared_task_slot = self.task_lifecycle.prepare_slot(
             int(slot_input.slot_id), tuple(slot_input.tasks)
         )

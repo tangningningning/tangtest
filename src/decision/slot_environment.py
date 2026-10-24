@@ -297,13 +297,20 @@ def _matching_summary(
         "matching_solution_scope": "transfer_exchange_local_stability",
         "matching_global_optimality_claimed": False,
         "matching_stability_claim": (
-            "no improving enumerated transfer/exchange candidates under current-slot objective"
+            "no improving enumerated transfer/exchange candidates under predicted-terminal-utility objective"
             if result.transfer_exchange_stable
             else "transfer/exchange search stopped before local stability"
         ),
         "candidate_evaluation_objective": (
-            "current_slot_terminal_utility_only for lifecycle; legacy delay-energy proxy otherwise"
+            "predicted_terminal_utility_under_current_resource_estimates"
         ),
+        "candidate_evaluation_is_prediction_only": True,
+        "candidate_prediction_assumption": (
+            "hold current candidate rates and shares constant; an uploading Edge task uses full node CPU "
+            "for its projected future compute stage; round upload and compute slots separately; "
+            "do not simulate future mobility or arrivals"
+        ),
+        "candidate_score_is_actual_reward": False,
         "kkt_objective_scope": "per-slot reciprocal delay-energy resource surrogate",
         "kkt_optimal_for_terminal_finite_horizon_objective": False,
         "updates": result.updates,
@@ -1011,7 +1018,11 @@ def execute_slot(
             **_matching_summary(matching, cache_nodes, cache_config),
             "fixed_matching_preservation_pass": True,
             "matching_task_set_complete_pass": True,
-            "matching_candidate_objective": "current_slot_terminal_utility_only",
+            "matching_candidate_objective": (
+                "predicted_terminal_utility_under_current_resource_estimates"
+            ),
+            "candidate_evaluation_is_prediction_only": True,
+            "candidate_score_is_actual_reward": False,
             "matching_global_optimality_claimed": False,
         },
         next_cache_state=final_cache.copy(),

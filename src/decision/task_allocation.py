@@ -3590,19 +3590,6 @@ def _evaluate_edge_node(
         per_utility[task.task_id] = utility
         total_utility += utility
 
-    if any(task.lifecycle_k_max_slots is not None for task in tasks):
-        total_utility = _lifecycle_terminal_utility_sum_after_slot(
-            tasks,
-            matching,
-            cpu_allocations,
-            bandwidth_allocations,
-            vehicle_positions,
-            service_node_positions,
-            cache_nodes,
-            cache_config,
-            project_cfg,
-        )
-
     return KKTMatchingEvaluation(
         True,
         "",
@@ -3620,7 +3607,130 @@ def _evaluate_edge_node(
 
 
 
-def _lifecycle_terminal_utility_sum_after_slot(
+def _minimum_slots_for_work(work: float, rate_per_s: float, dt_s: float) -> int:
+    """Round a continuous work estimate up to whole execution slots."""
+
+    demand = float(work)
+    rate = float(rate_per_s)
+    duration = float(dt_s)
+    if not math.isfinite(demand) or demand < 0.0:
+        raise ValueError("lifecycle prediction work must be finite and non-negative")
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise ValueError("lifecycle prediction dt_s must be finite and positive")
+    if demand == 0.0:
+        return 0
+    if not math.isfinite(rate) or rate <= 0.0:
+        raise ValueError("lifecycle prediction rate must be finite and positive")
+    capacity = rate * duration
+    if not math.isfinite(capacity) or capacity <= 0.0:
+        raise ValueError("lifecycle prediction per-slot capacity is invalid")
+    slot_ratio = demand / capacity
+    if not math.isfinite(slot_ratio):
+        raise ValueError("lifecycle prediction slot count is not finite")
+    nearest_integer = round(slot_ratio)
+    if nearest_integer > 0 and math.isclose(
+        slot_ratio, float(nearest_integer), rel_tol=1e-12, abs_tol=1e-12
+    ):
+        return int(nearest_integer)
+    return max(1, int(math.ceil(slot_ratio)))
+
+
+def _predict_lifecycle_terminal_utility(
+    task: Task,
+    *,
+    upload_rate_bps: float | None,
+    compute_rate_cycles_per_s: float,
+    dt_s: float,
+    transmit_power_w: float,
+    utility_parameters: dict[str, float],
+) -> float:
+    """Score a synthetic terminal forecast without emitting a lifecycle event.
+
+    Candidate rates are held constant over the remaining work. Upload and
+    compute are rounded separately because the paper starts computation in the
+    slot after upload completes. A forecasted timeout is only a candidate score;
+    actual task state and rewards are changed solely by TaskLifecycleManager.
+    """
+
+    if task.lifecycle_k_max_slots is None or task.lifecycle_remaining_slots is None:
+        raise ValueError(f"task {task.task_id} is missing lifecycle deadline metadata")
+    k_max = int(task.lifecycle_k_max_slots)
+    remaining_slots = int(task.lifecycle_remaining_slots)
+    if k_max <= 0 or remaining_slots <= 0 or remaining_slots > k_max:
+        raise ValueError(f"task {task.task_id} has invalid remaining deadline")
+    if not math.isclose(
+        float(task.transmit_time_share), 1.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "lifecycle prediction requires transmit_time_share=1, matching physical execution"
+        )
+    if task.execution_stage not in {"UPLOADING", "COMPUTING"}:
+        raise ValueError(
+            f"unsupported lifecycle prediction stage {task.execution_stage!r}"
+        )
+
+    remaining_upload = float(task.input_bits)
+    remaining_compute = float(task.cpu_cycles)
+    if (
+        not math.isfinite(remaining_upload)
+        or remaining_upload < 0.0
+        or not math.isfinite(remaining_compute)
+        or remaining_compute <= 0.0
+    ):
+        raise ValueError(f"task {task.task_id} has invalid predicted remaining work")
+
+    if task.execution_stage == "UPLOADING":
+        if remaining_upload <= 0.0 or upload_rate_bps is None:
+            raise ValueError(f"uploading task {task.task_id} has no predicted upload work/rate")
+        upload_rate = float(upload_rate_bps)
+        upload_slots = _minimum_slots_for_work(remaining_upload, upload_rate, dt_s)
+        upload_slots_before_termination = min(upload_slots, remaining_slots)
+        predicted_uploaded_bits = min(
+            remaining_upload,
+            upload_rate * float(dt_s) * upload_slots_before_termination,
+        )
+        predicted_upload_energy = (
+            float(transmit_power_w) * predicted_uploaded_bits / upload_rate
+        )
+    else:
+        if remaining_upload != 0.0:
+            raise ValueError(
+                f"computing task {task.task_id} still has upload work"
+            )
+        upload_rate = 0.0
+        upload_slots = 0
+        predicted_upload_energy = 0.0
+
+    compute_slots = _minimum_slots_for_work(
+        remaining_compute, compute_rate_cycles_per_s, dt_s
+    )
+    predicted_remaining_slots = upload_slots + compute_slots
+    predicted_success = predicted_remaining_slots <= remaining_slots
+    predicted_reason = "SUCCESS" if predicted_success else "TIMEOUT"
+    slots_until_predicted_terminal = min(predicted_remaining_slots, remaining_slots)
+    predicted_lifetime_time_s = (
+        k_max - remaining_slots + slots_until_predicted_terminal
+    ) * float(dt_s)
+    cumulative_upload_energy = (
+        float(task.lifecycle_cumulative_upload_energy_j) + predicted_upload_energy
+    )
+
+    # This synthetic event exists only to reuse the canonical terminal utility
+    # formula. It is never appended to lifecycle state or used as actual reward.
+    predicted_event = {
+        "termination_reason": predicted_reason,
+        "actual_execution_time_s": predicted_lifetime_time_s,
+        "cumulative_upload_energy_j": cumulative_upload_energy,
+    }
+    return float(
+        system_model.terminal_task_utility(
+            predicted_event,
+            **utility_parameters,
+        )
+    )
+
+
+def _lifecycle_predicted_terminal_utilities(
     tasks: list[Task],
     matching: dict[str, str],
     cpu_allocations: dict[str, dict[str, float]],
@@ -3630,30 +3740,56 @@ def _lifecycle_terminal_utility_sum_after_slot(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     project_cfg: dict[str, Any],
-) -> float:
-    """Score only terminal events caused by this physical one-second slot."""
+) -> dict[str, float]:
+    """Forecast terminal utilities for one fixed candidate and its current rates."""
 
     utility_parameters = project_config.get_terminal_task_utility_parameters(project_cfg)
     dt_s = float(project_config.get_config_value(project_cfg, "simulation.dt_s"))
-    if not math.isclose(dt_s, 1.0, rel_tol=0.0, abs_tol=1e-9):
-        raise ValueError("lifecycle matching evaluation requires one-second slots")
-    terminal_values: list[float] = []
+    lifecycle_tasks = [
+        task
+        for task in tasks
+        if task.lifecycle_k_max_slots is not None
+        or task.lifecycle_remaining_slots is not None
+    ]
+    if not lifecycle_tasks:
+        return {}
+    if len(lifecycle_tasks) != len(tasks) or any(
+        task.lifecycle_k_max_slots is None
+        or task.lifecycle_remaining_slots is None
+        for task in lifecycle_tasks
+    ):
+        raise ValueError("lifecycle candidate scoring requires complete task metadata")
+
+    predicted_utilities: dict[str, float] = {}
     for task in tasks:
-        if task.lifecycle_k_max_slots is None or task.lifecycle_remaining_slots is None:
-            raise ValueError(f"task {task.task_id} is missing lifecycle scoring state")
         if task.task_id not in matching:
             raise ValueError(f"matching omitted lifecycle task {task.task_id}")
         node_id = str(matching[task.task_id])
-        uploaded = 0.0
-        computed = 0.0
-        energy = 0.0
+        upload_rate: float | None = None
+        if node_id == CLOUD:
+            compute_rate = float(cache_config.cloud_cpu_cycles_per_s)
+            if task.execution_stage == "UPLOADING":
+                upload_rate = float(cache_config.cloud_uplink_rate_bps)
+        else:
+            role = _edge_node_role(node_id, cache_nodes)
+            if role is None:
+                raise ValueError(f"unknown edge execution node {node_id}")
+            node_cpu_allocations = cpu_allocations.get(node_id, {})
+            if (
+                task.execution_stage == "COMPUTING"
+                and task.task_id not in node_cpu_allocations
+            ):
+                raise ValueError(
+                    f"computing task {task.task_id} has no candidate CPU allocation"
+                )
+            cpu_fraction = float(
+                node_cpu_allocations.get(task.task_id, 1.0)
+            )
+            compute_rate = cpu_fraction * _node_cpu(role, cache_config)
         if task.execution_stage == "UPLOADING":
-            if node_id == CLOUD:
-                rate = float(cache_config.cloud_uplink_rate_bps)
-            else:
+            if node_id != CLOUD:
                 role = _edge_node_role(node_id, cache_nodes)
-                if role is None:
-                    raise ValueError(f"unknown edge execution node {node_id}")
+                assert role is not None
                 fraction = float(
                     bandwidth_allocations.get(node_id, {}).get(task.task_id, 0.0)
                 )
@@ -3663,7 +3799,7 @@ def _lifecycle_terminal_utility_sum_after_slot(
                     service_node_positions[node_id],
                     cache_config,
                 )
-                rate = float(
+                upload_rate = float(
                     system_model.uplink_rate(
                         _node_bandwidth(role, cache_config),
                         fraction,
@@ -3675,50 +3811,15 @@ def _lifecycle_terminal_utility_sum_after_slot(
                         receiver_noise_figure_db=cache_config.receiver_noise_figure_db,
                     )
                 )
-            if not math.isfinite(rate) or rate <= 0.0:
-                raise ValueError(f"task {task.task_id} has no positive realized upload rate")
-            uploaded = min(float(task.input_bits), rate * dt_s)
-            energy = cache_config.tx_power_w * uploaded / rate
-        elif task.execution_stage == "COMPUTING":
-            if node_id == CLOUD:
-                rate = float(cache_config.cloud_cpu_cycles_per_s)
-            else:
-                role = _edge_node_role(node_id, cache_nodes)
-                if role is None:
-                    raise ValueError(f"unknown edge execution node {node_id}")
-                fraction = float(
-                    cpu_allocations.get(node_id, {}).get(task.task_id, 0.0)
-                )
-                rate = fraction * _node_cpu(role, cache_config)
-            if not math.isfinite(rate) or rate <= 0.0:
-                raise ValueError(f"task {task.task_id} has no positive realized CPU rate")
-            computed = min(float(task.cpu_cycles), rate * dt_s)
-        else:
-            raise ValueError(f"unsupported lifecycle stage {task.execution_stage!r}")
-
-        remaining_upload = max(0.0, float(task.input_bits) - uploaded)
-        remaining_compute = max(0.0, float(task.cpu_cycles) - computed)
-        remaining_slots = max(0, int(task.lifecycle_remaining_slots) - 1)
-        reason = None
-        if remaining_upload == 0.0 and remaining_compute == 0.0:
-            reason = "SUCCESS"
-        elif remaining_slots == 0:
-            reason = "TIMEOUT"
-        if reason is None:
-            continue
-        event = {
-            "termination_reason": reason,
-            "actual_execution_time_s": (
-                int(task.lifecycle_k_max_slots) - remaining_slots
-            ) * dt_s,
-            "cumulative_upload_energy_j": (
-                float(task.lifecycle_cumulative_upload_energy_j) + energy
-            ),
-        }
-        terminal_values.append(
-            system_model.terminal_task_utility(event, **utility_parameters)
+        predicted_utilities[task.task_id] = _predict_lifecycle_terminal_utility(
+            task,
+            upload_rate_bps=upload_rate,
+            compute_rate_cycles_per_s=compute_rate,
+            dt_s=dt_s,
+            transmit_power_w=cache_config.tx_power_w,
+            utility_parameters=utility_parameters,
         )
-    return float(math.fsum(terminal_values))
+    return predicted_utilities
 
 
 def evaluate_matching_with_kkt(
@@ -3947,6 +4048,21 @@ def evaluate_matching_with_kkt(
         per_energy[task.task_id] = energy
         per_utility[task.task_id] = utility
         total_utility += utility
+
+    predicted_lifecycle_utilities = _lifecycle_predicted_terminal_utilities(
+        tasks,
+        matching,
+        cpu_allocations,
+        bandwidth_allocations,
+        vehicle_positions,
+        service_node_positions,
+        cache_nodes,
+        cache_config,
+        project_cfg,
+    )
+    if predicted_lifecycle_utilities:
+        per_utility.update(predicted_lifecycle_utilities)
+        total_utility = math.fsum(per_utility.values())
 
     return KKTMatchingEvaluation(
         True,
@@ -4326,18 +4442,20 @@ def evaluate_matching_candidate_incremental(
     task_utility_sum = 0.0
     for task in tasks:
         task_utility_sum += float(per_task_utility[task.task_id])
-    if any(task.lifecycle_k_max_slots is not None for task in tasks):
-        task_utility_sum = _lifecycle_terminal_utility_sum_after_slot(
-            tasks,
-            candidate_matching,
-            cpu_allocations,
-            bandwidth_allocations,
-            vehicle_positions,
-            service_node_positions,
-            cache_nodes,
-            cache_config,
-            project_cfg,
-        )
+    predicted_lifecycle_utilities = _lifecycle_predicted_terminal_utilities(
+        tasks,
+        candidate_matching,
+        cpu_allocations,
+        bandwidth_allocations,
+        vehicle_positions,
+        service_node_positions,
+        cache_nodes,
+        cache_config,
+        project_cfg,
+    )
+    if predicted_lifecycle_utilities:
+        per_task_utility.update(predicted_lifecycle_utilities)
+        task_utility_sum = math.fsum(per_task_utility.values())
     _profile_add(
         timing_profile,
         "exact_eval_utility_sum_runtime",

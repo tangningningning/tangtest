@@ -26,7 +26,7 @@ from scenario.realization import (
 from scenario.vehicle_order import id_axis_indices
 
 
-NORMALIZED_COST_CONTRACT_VERSION = "node_level_cost_fixed_reference_explicit_weights_v2"
+NORMALIZED_COST_CONTRACT_VERSION = "node_level_cost_fixed_reference_unweighted_lifecycle_reward_v3"
 _REPORTED_COST_NORMALIZATION_CONTRACTS: set[str] = set()
 
 
@@ -47,7 +47,10 @@ class EnvironmentContext:
     train_origin_end: int
     data_protocol: str
     episode_slots: int
+    arrival_horizon_slots: int
+    execution_horizon_slots: int
     terminal_origin: int
+    terminal_execution_slot: int
     configured_rollout_steps: int | None
     realization: "RealizationArtifacts | None" = None
     observation_time_to_go: Callable[[int], float] | None = None
@@ -61,9 +64,12 @@ def _assert_realization_context_compatible(
     scalar_fields = (
         "data_protocol",
         "episode_slots",
+        "arrival_horizon_slots",
+        "execution_horizon_slots",
         "train_origin_start",
         "train_origin_end",
         "terminal_origin",
+        "terminal_execution_slot",
         "configured_rollout_steps",
     )
     for field in scalar_fields:
@@ -387,6 +393,20 @@ def load_environment_context(
     scenarios = cache_configuration.load_prediction_scenarios(
         realization.prediction_scenarios
     )
+    scenario_origin_count = int(scenarios["origin_slots"].shape[0])
+    required_execution_origins = int(data_protocol["execution_horizon_slots"])
+    if scenario_origin_count < required_execution_origins:
+        raise ValueError(
+            "MISSING_CAUSAL_EXECUTION_TAIL_INPUTS: "
+            f"prediction_scenarios has {scenario_origin_count} origins, "
+            f"but the complete execution contract requires "
+            f"{required_execution_origins} (slots 0..{required_execution_origins - 1})."
+        )
+    if scenario_origin_count != required_execution_origins:
+        raise ValueError(
+            "execution scenario origin count differs from the configured contract: "
+            f"found={scenario_origin_count}, required={required_execution_origins}"
+        )
     scenarios = _validate_episode_vehicle_mapping(
         realization,
         scenarios,
@@ -399,7 +419,7 @@ def load_environment_context(
         expected_catalog_service_count=int(
             project_config.get_config_value(cfg, "service.count")
         ),
-        expected_origin_count=int(data_protocol["physical_episode_slots"]),
+        expected_origin_count=int(data_protocol["execution_horizon_slots"]),
         expected_horizon_count=int(
             project_config.get_config_value(cfg, "prediction.vehicle.horizon")
         ),
@@ -456,10 +476,13 @@ def load_environment_context(
         "contract_version": NORMALIZED_COST_CONTRACT_VERSION,
         "cache": cache_cost_reference,
         "movement": movement_cost_reference,
-        "system_utility_weights": {
+        "legacy_system_utility_beta_config": {
             "beta_ca": beta_ca,
             "beta_q": beta_q,
-            "source": "explicit objective.beta_ca and objective.beta_q",
+            "source": (
+                "retained compatibility/other aggregation fields; not applied by "
+                "Online Joint DQN lifecycle_system_reward"
+            ),
         },
     }
     reference_record = json.dumps(
@@ -479,7 +502,8 @@ def load_environment_context(
             f"E_mov_u_ref_j_by_uav={movement_reference_by_uav} "
             f"(sum={movement_cost_reference['reference_j']:.12g} J) "
             f"({movement_cost_reference['reference_kind']}), "
-            f"beta_ca={beta_ca:.12g}, beta_q={beta_q:.12g}",
+            f"legacy_beta_ca_config_not_applied={beta_ca:.12g}, "
+            f"legacy_beta_q_config_not_applied={beta_q:.12g}",
             flush=True,
         )
         _REPORTED_COST_NORMALIZATION_CONTRACTS.add(reference_record)
@@ -530,7 +554,10 @@ def load_environment_context(
         train_origin_end=train_end,
         data_protocol=str(data_protocol["protocol"]),
         episode_slots=int(data_protocol["episode_slots"]),
+        arrival_horizon_slots=int(data_protocol["arrival_horizon_slots"]),
+        execution_horizon_slots=int(data_protocol["execution_horizon_slots"]),
         terminal_origin=int(data_protocol["terminal_origin"]),
+        terminal_execution_slot=int(data_protocol["terminal_execution_slot"]),
         configured_rollout_steps=(
             None
             if data_protocol["rollout_steps"] is None
@@ -612,6 +639,51 @@ def aligned_train_steps(
         include_prediction_horizon_mask=(
             context.observation_spec.horizon_mask_slice is not None
         ),
+    )
+
+
+def aligned_execution_steps(context: EnvironmentContext) -> list[Any]:
+    """Load all causal decision inputs for a complete, extended Training Episode."""
+
+    if context.realization is None:
+        raise ValueError("完整生命周期执行要求显式的 Training realization。")
+    if (
+        context.train_origin_start != 0
+        or context.train_origin_end != context.arrival_horizon_slots - 1
+    ):
+        raise ValueError(
+            "完整生命周期执行要求任务到达 origins 为零基 0..T-1。"
+        )
+    available_origins = int(context.scenarios["origin_slots"].shape[0])
+    if available_origins < context.execution_horizon_slots:
+        raise ValueError(
+            "MISSING_CAUSAL_EXECUTION_TAIL_INPUTS: "
+            f"need {context.execution_horizon_slots} decision origins, "
+            f"found {available_origins}"
+        )
+    return prepare_aligned_rollout_steps(
+        context.root,
+        context.scenarios,
+        0,
+        context.execution_horizon_slots,
+        context.realization.vehicle_predictions,
+        context.realization.popularity_predictions,
+        context.realization.tasks,
+        context.realization.trajectory,
+        include_bootstrap_step=False,
+        prediction_horizon=int(context.observation_spec.prediction_horizon),
+        prediction_dt_s=float(
+            project_config.get_config_value(context.cfg, "simulation.dt_s")
+        ),
+        prediction_terminal_origin=context.terminal_execution_slot,
+        expected_vehicle_ids=context.observation_spec.vehicle_ids,
+        expected_task_vehicle_ids=context.observation_spec.task_vehicle_ids,
+        expected_service_ids=context.observation_spec.service_ids,
+        include_prediction_horizon_mask=(
+            context.observation_spec.horizon_mask_slice is not None
+        ),
+        arrival_horizon_slots=context.arrival_horizon_slots,
+        require_full_step_count=True,
     )
 
 
@@ -1173,6 +1245,12 @@ def _load_vehicle_prediction_h0(
             origin = int(row["origin_slot"])
             if allowed_origins is not None and origin not in allowed_origins:
                 continue
+            cutoff = int(row["observation_cutoff_slot"])
+            if cutoff != origin - 1:
+                raise ValueError(
+                    "CAUSAL_CUTOFF_MISMATCH: vehicle prediction must use observations "
+                    f"through origin_slot-1; origin={origin}, cutoff={cutoff}"
+                )
             vehicle_id = str(row["vehicle_id"])
             if vehicle_id in by_origin.setdefault(origin, {}):
                 raise ValueError(
@@ -1211,6 +1289,12 @@ def _load_popularity_prediction_h0(
             origin = int(row["origin_slot"])
             if allowed_origins is not None and origin not in allowed_origins:
                 continue
+            cutoff = int(row["observation_cutoff_slot"])
+            if cutoff != origin - 1:
+                raise ValueError(
+                    "CAUSAL_CUTOFF_MISMATCH: popularity prediction must use request "
+                    f"history through origin_slot-1; origin={origin}, cutoff={cutoff}"
+                )
             service_id = int(row["service_id"])
             by_origin.setdefault(origin, {})[service_id] = (
                 float(row["rho_pred"]),
@@ -1240,6 +1324,12 @@ def _load_vehicle_prediction_horizon(
             origin = int(row["origin_slot"])
             if allowed_origins is not None and origin not in allowed_origins:
                 continue
+            cutoff = int(row["observation_cutoff_slot"])
+            if cutoff != origin - 1:
+                raise ValueError(
+                    "CAUSAL_CUTOFF_MISMATCH: prediction must use observations "
+                    f"through origin_slot-1; origin={origin}, cutoff={cutoff}"
+                )
             horizon_index = int(row["horizon"])
             if not 0 <= horizon_index < horizon:
                 continue
@@ -1291,6 +1381,12 @@ def _load_popularity_prediction_horizon(
             origin = int(row["origin_slot"])
             if allowed_origins is not None and origin not in allowed_origins:
                 continue
+            cutoff = int(row["observation_cutoff_slot"])
+            if cutoff != origin - 1:
+                raise ValueError(
+                    "CAUSAL_CUTOFF_MISMATCH: prediction must use request history "
+                    f"through origin_slot-1; origin={origin}, cutoff={cutoff}"
+                )
             horizon_index = int(row["horizon"])
             if not 0 <= horizon_index < horizon:
                 continue
@@ -1370,6 +1466,8 @@ def prepare_aligned_rollout_steps(
     expected_task_vehicle_ids: tuple[str, ...] | list[str] | None = None,
     expected_service_ids: tuple[int, ...] | list[int] | None = None,
     include_prediction_horizon_mask: bool = False,
+    arrival_horizon_slots: int | None = None,
+    require_full_step_count: bool = False,
 ) -> list[AlignedRolloutStep]:
     """从正式 artifact 构造已对齐 steps；不重新预测或生成场景。"""
 
@@ -1395,15 +1493,30 @@ def prepare_aligned_rollout_steps(
         raise IndexError("origin_start_index 越界。")
 
     extra_step = 1 if include_bootstrap_step else 0
-    stop = min(n_origin, origin_start_index + max_steps + extra_step)
+    requested_stop = origin_start_index + max_steps + extra_step
+    if require_full_step_count and requested_stop > n_origin:
+        raise ValueError(
+            "MISSING_CAUSAL_EXECUTION_TAIL_INPUTS: "
+            f"requested origins {origin_start_index}..{requested_stop - 1}, "
+            f"available scenario origins 0..{n_origin - 1}"
+        )
+    stop = min(n_origin, requested_stop)
     selected_origin_indices = list(range(origin_start_index, stop))
     selected_origin_slots = {
         int(cache_configuration.scenario_at_origin(scenarios, index)["origin_slot"])
         for index in selected_origin_indices
     }
+    task_slots_for_alignment = selected_origin_slots
+    if arrival_horizon_slots is not None:
+        if int(arrival_horizon_slots) <= 0:
+            raise ValueError("arrival_horizon_slots must be positive")
+        task_slots_for_alignment = {
+            slot for slot in selected_origin_slots
+            if slot < int(arrival_horizon_slots)
+        }
     task_time_by_slot = _load_task_time_by_slot(
         tasks_file,
-        allowed_slots=selected_origin_slots,
+        allowed_slots=task_slots_for_alignment,
         expected_vehicle_ids=expected_task_vehicle_ids,
     )
     if horizon > 1:
@@ -1452,12 +1565,20 @@ def prepare_aligned_rollout_steps(
     for origin_index in selected_origin_indices:
         scenario = cache_configuration.scenario_at_origin(scenarios, origin_index)
         slot = int(scenario["origin_slot"])
+        if require_full_step_count and slot != origin_index:
+            raise ValueError(
+                "complete lifecycle origins must be contiguous zero-based slots: "
+                f"origin_index={origin_index}, scenario_slot={slot}"
+            )
         time_s = float(scenario["origin_time_s"])
-        if not math.isclose(
-            float(task_time_by_slot.get(slot, float("nan"))),
-            time_s,
-            rel_tol=0.0,
-            abs_tol=1e-9,
+        task_time = task_time_by_slot.get(slot)
+        if task_time is None:
+            if arrival_horizon_slots is None or slot < int(arrival_horizon_slots):
+                raise ValueError(
+                    f"origin_index={origin_index} 的正式到达 slot 缺少 tasks.csv 时间记录。"
+                )
+        elif not math.isclose(
+            float(task_time), time_s, rel_tol=0.0, abs_tol=1e-9
         ):
             raise ValueError(f"origin_index={origin_index} 的 scenario slot/time 与 tasks.csv 不一致。")
         if int(scenario["horizons"][0]) != 0:
@@ -1545,6 +1666,16 @@ def prepare_aligned_rollout_steps(
                 expected_time = time_s + horizon_index * prediction_dt
                 raw_vehicle = origin_vehicle_rows.get(horizon_index)
                 if raw_vehicle is None or set(raw_vehicle) != set(vehicle_ids):
+                    if (
+                        arrival_horizon_slots is not None
+                        and slot >= int(arrival_horizon_slots)
+                    ):
+                        raise ValueError(
+                            "MISSING_CAUSAL_EXECUTION_TAIL_INPUTS: "
+                            "vehicle_predictions.csv lacks decision-time forecasts "
+                            f"for execution slot={slot}, horizon={horizon_index}; "
+                            "future trajectory labels are not valid substitutes."
+                        )
                     raise ValueError(
                         "vehicle_predictions.csv 缺少完整 horizon 预测："
                         f"origin slot={slot}, horizon={horizon_index}"
@@ -1569,6 +1700,15 @@ def prepare_aligned_rollout_steps(
 
                 raw_popularity = origin_popularity_rows.get(horizon_index)
                 if raw_popularity is None or set(raw_popularity) != set(service_ids):
+                    if (
+                        arrival_horizon_slots is not None
+                        and slot >= int(arrival_horizon_slots)
+                    ):
+                        raise ValueError(
+                            "MISSING_CAUSAL_EXECUTION_TAIL_INPUTS: "
+                            "popularity_predictions.csv lacks decision-time forecasts "
+                            f"for execution slot={slot}, horizon={horizon_index}."
+                        )
                     raise ValueError(
                         "popularity_predictions.csv 缺少完整 horizon 预测："
                         f"origin slot={slot}, horizon={horizon_index}"
@@ -1647,6 +1787,15 @@ def prepare_aligned_rollout_steps(
             prediction_horizon_mask = None
 
         actual_tasks = task_allocation.load_actual_tasks(tasks_file, slot)
+        if (
+            arrival_horizon_slots is not None
+            and slot >= int(arrival_horizon_slots)
+            and actual_tasks
+        ):
+            raise ValueError(
+                "new task arrivals are forbidden after arrival_horizon_slots: "
+                f"slot={slot}, T={int(arrival_horizon_slots)}, arrivals={len(actual_tasks)}"
+            )
         if expected_task_vehicle_ids_t is not None:
             unexpected_task_vehicles = {
                 str(task.vehicle_id) for task in actual_tasks
@@ -1670,6 +1819,17 @@ def prepare_aligned_rollout_steps(
         required_current = sv_ids | {task.vehicle_id for task in actual_tasks}
         missing_required = required_current - set(actual_positions)
         if missing_required:
+            if (
+                arrival_horizon_slots is not None
+                and slot >= int(arrival_horizon_slots)
+            ):
+                raise ValueError(
+                    "UNRESOLVED_VEHICLE_DEPARTURE_SEMANTICS: "
+                    f"trajectory.csv lacks required current physical positions at "
+                    f"execution slot={slot}, time_s={time_s}: "
+                    f"{sorted(missing_required)}; no hold, extrapolation, migration, "
+                    "automatic failure, or fill policy is configured."
+                )
             raise ValueError(
                 f"trajectory.csv 缺少当前 time_s={time_s} 的服务车辆/到达任务位置："
                 f"{sorted(missing_required)}"

@@ -435,7 +435,7 @@ def aggregate_system_utility(
     beta_ca: float,
     beta_q: float,
 ) -> float:
-    """Combine Q and the two unweighted normalized costs exactly once."""
+    """Legacy beta-weighted aggregation; Online Joint DQN uses lifecycle_system_reward."""
 
     task_value = _require_finite("task_utility", task_utility)
     cache_value = _require_finite("cache_cost", cache_cost)

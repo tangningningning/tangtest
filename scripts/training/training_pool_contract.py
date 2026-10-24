@@ -39,14 +39,16 @@ DEFAULT_TEST_SEED_START = 40001
 
 # The training data contract is pinned independently of runtime and reward values.
 FORMAL_TRAINING_POOL_MANIFEST_SHA256 = (
-    "b6cae236b029f4d24c7488a91f0825247a20f475ec76b2d80737de44ae491bd3"
+    "9393eee43d1eb87dfd09c36eca149a43cf139162965cc735da50cb1180667ba6"
 )
 FORMAL_TRAINING_POOL_INTEGRITY_BASELINE_SHA256 = (
-    "43e82e19a1231ea2719541080c8b16b2137a7df5166a9a94a1ca19b9b7e01538"
+    "6c2309f0cc5c82e265e5c49d559b03e1ac1e9bbb32fe3cecb2f68c04251abe33"
 )
-FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT = 3002
+FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT = 3015
 FORMAL_TRAINING_EPISODE_COUNT = 300
 FORMAL_TRAINING_EPISODE_SLOTS = 300
+FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS = FORMAL_TRAINING_EPISODE_SLOTS
+FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS = 314
 FORMAL_TEST_EPISODE_COUNT = 100
 FORMAL_TRAINING_TASK_CONTRACT_SHA256 = (
     "dc7e83d99c69f1c3ea603c18fe9a2606f0bffe477556e75924e1d8dfd24387c3"
@@ -99,6 +101,104 @@ def _write_json(path: Path, payload: Any, *, exclusive: bool = False) -> None:
             allow_nan=False,
         )
         stream.write("\n")
+
+
+def _canonical_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        _jsonable(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _active_episode_seeds(
+    manifest: dict[str, Any],
+    *,
+    expected_seed_start: int,
+    expected_episode_count: int,
+) -> tuple[list[int], dict[str, Any]]:
+    """Return the exact formal episode order, honoring explicit replacements."""
+
+    selection = manifest.get("episode_selection")
+    original = list(
+        range(int(expected_seed_start), int(expected_seed_start) + int(expected_episode_count))
+    )
+    if selection is None:
+        return original, {
+            "active_episode_seeds": original,
+            "replacement_episode_seeds": [],
+            "excluded_episode_seeds": [],
+            "trajectory_slots": FORMAL_TRAINING_EPISODE_SLOTS,
+            "arrival_slots": FORMAL_TRAINING_EPISODE_SLOTS,
+        }
+    if not isinstance(selection, dict) or selection.get("schema_version") != "active_episode_seed_selection_v1":
+        raise ValueError("Formal pool episode_selection schema is invalid.")
+    expected_source_range = [
+        int(expected_seed_start),
+        int(expected_seed_start) + int(expected_episode_count) - 1,
+    ]
+    if selection.get("source_seed_range") != expected_source_range:
+        raise ValueError("Formal pool episode_selection source seed range changed.")
+    active = selection.get("active_episode_seeds")
+    replacements = selection.get("replacement_episode_seeds")
+    excluded = selection.get("excluded_episode_seeds")
+    if not all(isinstance(value, list) for value in (active, replacements, excluded)):
+        raise ValueError("Formal pool active/replacement/excluded seed lists are invalid.")
+    try:
+        active_int = [int(seed) for seed in active]
+        replacements_int = [int(seed) for seed in replacements]
+        excluded_int = [int(seed) for seed in excluded]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Formal pool seed lists must contain integer IDs.") from exc
+    if (
+        active_int != sorted(set(active_int))
+        or replacements_int != sorted(set(replacements_int))
+        or excluded_int != sorted(set(excluded_int))
+        or len(active_int) != int(expected_episode_count)
+    ):
+        raise ValueError("Formal pool active seed list is not unique, ordered, and complete.")
+    original_set = set(original)
+    replacement_set = set(replacements_int)
+    excluded_set = set(excluded_int)
+    if (
+        not excluded_set.issubset(original_set)
+        or replacement_set & original_set
+        or replacement_set & excluded_set
+        or set(active_int) != (original_set - excluded_set) | replacement_set
+    ):
+        raise ValueError("Formal pool replacement selection does not balance its source range.")
+    return active_int, {
+        **selection,
+        "active_episode_seeds": active_int,
+        "replacement_episode_seeds": replacements_int,
+        "excluded_episode_seeds": excluded_int,
+    }
+
+
+def _scene_identity_sha256(
+    episode_dir: Path,
+    *,
+    split: str,
+    seed: int,
+    file_hashes: dict[str, str] | None = None,
+) -> str:
+    files = file_hashes or {
+        path.name: _sha256(path)
+        for path in sorted(episode_dir.iterdir(), key=lambda item: item.name)
+        if path.is_file()
+    }
+    return _canonical_sha256(
+        {
+            "schema_version": "formal_scene_identity_v1",
+            "scene_id": f"{split}:{int(seed)}",
+            "split": split,
+            "episode_seed": int(seed),
+            "files": files,
+        }
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -194,6 +294,72 @@ def _validate_pool(
                 f"Formal {expected_split} pool manifest mismatch for {key}: "
                 f"expected={value!r}, actual={manifest.get(key)!r}"
             )
+    active_seeds, episode_selection = _active_episode_seeds(
+        manifest,
+        expected_seed_start=expected_seed_start,
+        expected_episode_count=expected_episode_count,
+    )
+    split_manifest_path = formal_root / "environment_data" / "data_split_manifest.json"
+    split_manifest = json.loads(split_manifest_path.read_text(encoding="utf-8"))
+    split_manifest_hash = _sha256(split_manifest_path)
+    if manifest.get("data_split_manifest_sha256") != split_manifest_hash:
+        raise ValueError(
+            f"Formal {expected_split} pool points to a different data split manifest: "
+            f"expected_sha256={split_manifest_hash}, "
+            f"actual={manifest.get('data_split_manifest_sha256')!r}"
+        )
+    split_payload = split_manifest.get(expected_split)
+    if not isinstance(split_payload, dict):
+        raise ValueError(f"Central data split manifest is missing {expected_split}.")
+    if split_payload.get("active_episode_seeds") != active_seeds:
+        raise ValueError(
+            f"Formal {expected_split} active episode list differs from the central dataset identity."
+        )
+    if split_payload.get("dataset_identity_sha256") != manifest.get(
+        "dataset_identity_sha256"
+    ):
+        raise ValueError(
+            f"Formal {expected_split} dataset identity differs from the central manifest."
+        )
+    identity_payload = {
+        "schema_version": "formal_episode_dataset_identity_v1",
+        "split": expected_split,
+        "network_sha256": split_manifest.get("sumo_network_sha256"),
+        "slot_duration_s": float(manifest["task_data_contract"]["slot_duration_s"]),
+        "arrival_slots": int(episode_selection["arrival_slots"]),
+        "trajectory_slots": int(episode_selection["trajectory_slots"]),
+        "active_episode_seeds": active_seeds,
+        "active_episode_scene_sha256": manifest.get("active_episode_scene_sha256"),
+    }
+    if _canonical_sha256(identity_payload) != manifest.get("dataset_identity_sha256"):
+        raise ValueError(f"Formal {expected_split} dataset identity hash is invalid.")
+    scene_hashes = manifest.get("active_episode_scene_sha256")
+    if not isinstance(scene_hashes, dict) or set(scene_hashes) != {
+        str(seed) for seed in active_seeds
+    }:
+        raise ValueError(
+            f"Formal {expected_split} scene hash index does not match its active episode list."
+        )
+    if split_payload.get("active_episode_scene_sha256") != scene_hashes:
+        raise ValueError(
+            f"Formal {expected_split} scene hash index differs from the central manifest."
+        )
+    if split_payload.get("active_episode_count") != expected_episode_count:
+        raise ValueError(f"Central {expected_split} active episode count is invalid.")
+    all_split_seeds = [
+        int(seed)
+        for split_name in ("train", "validation", "test")
+        for seed in split_manifest.get(split_name, {}).get("active_episode_seeds", [])
+    ]
+    if len(all_split_seeds) != len(set(all_split_seeds)):
+        raise ValueError("Formal Train/Validation/Test active seeds overlap.")
+    if (
+        int(episode_selection.get("arrival_slots", FORMAL_TRAINING_EPISODE_SLOTS))
+        != FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS
+        or int(episode_selection.get("trajectory_slots", FORMAL_TRAINING_EPISODE_SLOTS))
+        != FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+    ):
+        raise ValueError("Formal cross-slot pool must define 300 arrival and 314 physical slots.")
     config_path = formal_root / CONFIG_RELATIVE
     cfg = (
         copy.deepcopy(runtime_config)
@@ -275,6 +441,16 @@ def _validate_pool(
         "generation_config_fields": generate_episode_realization._generation_config_payload(cfg),
         "service_catalog_sha256": catalog_hash,
         "task_data_model": manifest["task_data_model"],
+        "active_episode_seeds": active_seeds,
+        "episode_selection": episode_selection,
+        "active_episode_scene_sha256": scene_hashes,
+        "dataset_identity_sha256": manifest.get("dataset_identity_sha256"),
+        "data_split_manifest_sha256": split_manifest_hash,
+        "arrival_slots": int(episode_selection["arrival_slots"]),
+        "trajectory_slots": int(episode_selection["trajectory_slots"]),
+        "arrival_horizon_slots": int(episode_selection["arrival_slots"]),
+        "execution_horizon_slots": int(episode_selection["trajectory_slots"]),
+        "terminal_execution_slot": int(episode_selection["trajectory_slots"]) - 1,
     }
 
 
@@ -294,8 +470,8 @@ def _validate_training_integrity_baseline(
         )
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     expected = {
-        "schema_version": "formal_task_data_integrity_baseline_v1",
-        "integrity_baseline_type": "CURRENT_SNAPSHOT",
+        "schema_version": "formal_task_data_integrity_baseline_v2",
+        "integrity_baseline_type": "ACTIVE_EPISODE_SNAPSHOT",
         "task_data_model": "500_1000_KB",
         "pool_manifest_sha256": pool_info["manifest_sha256"],
         "task_data_contract_sha256": pool_info["task_data_contract_sha256"],
@@ -313,6 +489,7 @@ def _validate_training_integrity_baseline(
         - 1,
         "episode_count": FORMAL_TRAINING_EPISODE_COUNT,
         "episode_file_count": FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT,
+        "active_episode_seeds": pool_info["active_episode_seeds"],
     }
     mismatches = {
         key: {"baseline": baseline.get(key), "expected": value}
@@ -324,10 +501,18 @@ def _validate_training_integrity_baseline(
             "Training Pool integrity baseline metadata mismatch: "
             f"{json.dumps(mismatches, ensure_ascii=False, sort_keys=True)}"
         )
+    episode_entries = baseline.get("episodes")
+    if (
+        not isinstance(episode_entries, list)
+        or [int(row.get("episode_seed", -1)) for row in episode_entries]
+        != pool_info["active_episode_seeds"]
+    ):
+        raise ValueError("Training Pool active integrity baseline episode list is invalid.")
     return {
         "path": str(baseline_path),
         "sha256": baseline_hash,
         "file_count": FORMAL_TRAINING_POOL_EPISODE_FILE_COUNT,
+        "active_episode_count": len(episode_entries),
         "previous_integrity_validation_reused": True,
         "episode_files_rehashed_at_startup": False,
     }
@@ -384,10 +569,13 @@ def validate_dqn_training_pool_for_run(
         "protocol": "full_episode_randomized",
         "physical_episode_slots": FORMAL_TRAINING_EPISODE_SLOTS,
         "episode_slots": FORMAL_TRAINING_EPISODE_SLOTS,
+        "arrival_horizon_slots": FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS,
+        "execution_horizon_slots": FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
         "train_origin_start": 0,
-        "train_origin_end": FORMAL_TRAINING_EPISODE_SLOTS - 1,
-        "rollout_steps": FORMAL_TRAINING_EPISODE_SLOTS,
-        "terminal_origin": FORMAL_TRAINING_EPISODE_SLOTS - 1,
+        "train_origin_end": FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS - 1,
+        "rollout_steps": FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
+        "terminal_origin": FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS - 1,
+        "terminal_execution_slot": FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS - 1,
     }
     protocol_mismatches = {
         key: {"current": protocol.get(key), "expected": value}
@@ -445,12 +633,15 @@ def validate_dqn_training_pool_for_run(
                 "source_provenance", {}
             ).get("historical_source_status", "UNRESOLVED"),
         },
-        "episode_seed_start": DEFAULT_TRAINING_SEED_START,
-        "episode_seed_end": DEFAULT_TRAINING_SEED_START
-        + FORMAL_TRAINING_EPISODE_COUNT
-        - 1,
+        "episode_seed_start": min(pool_info["active_episode_seeds"]),
+        "episode_seed_end": max(pool_info["active_episode_seeds"]),
         "episode_count": FORMAL_TRAINING_EPISODE_COUNT,
+        "episode_seeds": pool_info["active_episode_seeds"],
         "episode_slots": FORMAL_TRAINING_EPISODE_SLOTS,
+        "arrival_horizon_slots": FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS,
+        "execution_horizon_slots": FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
+        "terminal_origin": FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS - 1,
+        "terminal_execution_slot": FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS - 1,
         "protocol": protocol,
     }
 
@@ -470,6 +661,17 @@ def _validate_episode_snapshot(
     pool_manifest = json.loads(
         Path(pool_info["manifest_path"]).read_text(encoding="utf-8")
     )
+    supplement = episode_manifest.get("formal_pool_supplement")
+    if supplement is not None:
+        _validate_supplement_episode_snapshot(
+            episode_dir=episode_dir,
+            episode_manifest=episode_manifest,
+            pool_manifest=pool_manifest,
+            pool_info=pool_info,
+            seed=int(seed),
+            split=str(pool_info["split"]),
+        )
+        return
     expected_episode_values = {
         "schema_version": "formal_task_transform_v1",
         "task_data_model": pool_info["task_data_model"],
@@ -647,6 +849,11 @@ def _validate_episode_snapshot(
             "Transformed episode artifact file set differs from its frozen manifest: "
             f"episode_seed={seed}"
         )
+    legacy_required = pool_manifest.get("required_artifacts_by_episode_schema", {}).get(
+        "formal_task_transform_v1", pool_manifest.get("required_artifacts", [])
+    )
+    if not isinstance(legacy_required, list) or not set(legacy_required).issubset(actual_names):
+        raise ValueError(f"Transformed episode is missing its contracted artifacts: seed={seed}")
     for artifact_path in actual_paths:
         expected_hash = stored_artifact_hashes.get(artifact_path.name)
         if not isinstance(expected_hash, str) or _sha256(artifact_path) != expected_hash:
@@ -654,6 +861,146 @@ def _validate_episode_snapshot(
                 "Transformed episode artifact hash mismatch: "
                 f"episode_seed={seed}, artifact={artifact_path.name}"
             )
+    scene_files = {
+        path.name: _sha256(path)
+        for path in actual_paths
+    }
+    scene_files[manifest_path.name] = _sha256(manifest_path)
+    expected_scene_hash = pool_info["active_episode_scene_sha256"].get(str(seed))
+    actual_scene_hash = _scene_identity_sha256(
+        episode_dir,
+        split=str(pool_info["split"]),
+        seed=int(seed),
+        file_hashes=scene_files,
+    )
+    if expected_scene_hash != actual_scene_hash:
+        raise ValueError(
+            "Formal scene identity hash mismatch: "
+            f"episode_seed={seed}, expected={expected_scene_hash!r}, actual={actual_scene_hash}"
+        )
+
+
+def _validate_supplement_episode_snapshot(
+    *,
+    episode_dir: Path,
+    episode_manifest: dict[str, Any],
+    pool_manifest: dict[str, Any],
+    pool_info: dict[str, Any],
+    seed: int,
+    split: str,
+) -> None:
+    supplement = episode_manifest.get("formal_pool_supplement")
+    extension = episode_manifest.get("cross_slot_trajectory_extension")
+    selection = pool_info["episode_selection"]
+    if seed not in selection["replacement_episode_seeds"]:
+        raise ValueError(f"Non-replacement episode unexpectedly has supplement metadata: {seed}")
+    expected_supplement = {
+        "schema_version": "formal_pool_supplement_v1",
+        "split": split,
+        "scene_id": f"{split}:{seed}",
+        "episode_seed": seed,
+        "task_arrival_slots": pool_info["arrival_slots"],
+        "physical_trajectory_slots": pool_info["trajectory_slots"],
+        "task_randomness_streams": [
+            "task_arrival_seed",
+            "service_request_seed",
+            "workload_seed",
+            "popularity_seed",
+        ],
+        "traffic_randomness_streams": ["traffic_seed", "sumo_seed"],
+    }
+    if not isinstance(supplement, dict) or any(
+        supplement.get(key) != value for key, value in expected_supplement.items()
+    ):
+        raise ValueError(f"Supplemental episode identity metadata is invalid: seed={seed}")
+    if supplement.get("shared_network_sha256") != episode_manifest.get("sumo_network_sha256"):
+        raise ValueError(f"Supplemental episode network identity is invalid: seed={seed}")
+    expected_extension = {
+        "schema_version": "sumo_same_route_trajectory_extension_v1",
+        "split": split,
+        "scene_id": f"{split}:{seed}",
+        "episode_seed": seed,
+        "dt_s": pool_info["task_data_contract"]["slot_duration_s"],
+        "arrival_slots": pool_info["arrival_slots"],
+        "trajectory_slots": pool_info["trajectory_slots"],
+        "tail_slots": pool_info["trajectory_slots"] - pool_info["arrival_slots"],
+        "network_sha256": episode_manifest.get("sumo_network_sha256"),
+        "sumo_demand_sha256": episode_manifest.get("generated_artifact_sha256", {}).get(
+            "sumo_demand.rou.xml"
+        ),
+        "roles_sha256": episode_manifest.get("generated_artifact_sha256", {}).get(
+            "vehicle_roles.json"
+        ),
+        "trajectory_sha256": episode_manifest.get("generated_artifact_sha256", {}).get(
+            "trajectory.csv"
+        ),
+        "prefix_exact_match": True,
+        "end_boundary_exact_match": True,
+        "fixed_research_ids_present_in_every_tail_slot": True,
+    }
+    if not isinstance(extension, dict) or any(
+        extension.get(key) != value for key, value in expected_extension.items()
+    ):
+        raise ValueError(f"Supplemental trajectory extension metadata is invalid: seed={seed}")
+    if extension.get("original_prefix_canonical_sha256") != extension.get(
+        "replayed_prefix_canonical_sha256"
+    ):
+        raise ValueError(f"Supplemental trajectory prefix digest differs: seed={seed}")
+    if episode_manifest.get("generation_config_fingerprint") != pool_info[
+        "generation_config_fingerprint"
+    ]:
+        raise ValueError(f"Supplemental generation config differs from runtime: seed={seed}")
+    if episode_manifest.get("service_catalog_sha256") != pool_info["service_catalog_sha256"]:
+        raise ValueError(f"Supplemental service catalog differs from formal pool: seed={seed}")
+    derived_seeds = generate_episode_realization.derive_episode_seeds(seed)
+    if episode_manifest.get("derived_episode_seed_streams") != derived_seeds:
+        raise ValueError(f"Supplemental episode seed streams are invalid: seed={seed}")
+
+    generated_artifacts = episode_manifest.get("generated_artifacts")
+    stored_hashes = episode_manifest.get("generated_artifact_sha256")
+    if not isinstance(generated_artifacts, list) or not isinstance(stored_hashes, dict):
+        raise ValueError(f"Supplemental artifact inventory is missing: seed={seed}")
+    actual_paths = sorted(
+        path
+        for path in episode_dir.iterdir()
+        if path.is_file() and path.name != "episode_manifest.json"
+    )
+    supplemental_required = pool_manifest.get("required_artifacts_by_episode_schema", {}).get(
+        "episode_manifest_v2+formal_pool_supplement_v1"
+    )
+    if not isinstance(supplemental_required, list) or set(supplemental_required) != {
+        path.name for path in actual_paths
+    }:
+        raise ValueError(f"Supplemental episode does not satisfy its artifact schema: seed={seed}")
+    if {path.name for path in actual_paths} != set(generated_artifacts) or set(
+        generated_artifacts
+    ) != set(stored_hashes):
+        raise ValueError(f"Supplemental artifact file set differs: seed={seed}")
+    scene_files = {}
+    for artifact_path in actual_paths:
+        actual_hash = _sha256(artifact_path)
+        if stored_hashes.get(artifact_path.name) != actual_hash:
+            raise ValueError(
+                f"Supplemental artifact hash mismatch: seed={seed}, file={artifact_path.name}"
+            )
+        scene_files[artifact_path.name] = actual_hash
+    if extension.get("trajectory_sha256") != stored_hashes.get("trajectory.csv"):
+        raise ValueError(f"Supplemental trajectory hash is invalid: seed={seed}")
+    scene_files["episode_manifest.json"] = _sha256(
+        episode_dir / "episode_manifest.json"
+    )
+    actual_scene_hash = _scene_identity_sha256(
+        episode_dir,
+        split=split,
+        seed=seed,
+        file_hashes=scene_files,
+    )
+    expected_scene_hash = pool_info["active_episode_scene_sha256"].get(str(seed))
+    if actual_scene_hash != expected_scene_hash:
+        raise ValueError(
+            f"Supplemental scene identity hash mismatch: seed={seed}, "
+            f"expected={expected_scene_hash!r}, actual={actual_scene_hash}"
+        )
 
 
 def _episode_context(
@@ -663,6 +1010,10 @@ def _episode_context(
     pool_info: dict[str, Any],
 ) -> Any:
     episode_dir = pool / f"episode_{int(seed)}"
+    if int(seed) not in set(pool_info["active_episode_seeds"]):
+        raise ValueError(
+            f"Episode seed is not in the formal active set for {pool_info['split']}: {seed}"
+        )
     _validate_episode_snapshot(pool, seed, pool_info)
     return load_environment_context(
         str((formal_root / CONFIG_RELATIVE).resolve()),

@@ -585,6 +585,30 @@ def train_episode(
                 "actual_task_count": transition.diagnostics.get(
                     "actual_task_count"
                 ),
+                "arrived_task_count": int(
+                    transition.diagnostics.get("arrived_task_count", 0)
+                ),
+                "arrived_task_ids": list(
+                    transition.diagnostics.get("arrived_task_ids", [])
+                ),
+                "completed_task_count": int(
+                    transition.diagnostics.get("completed_task_count", 0)
+                ),
+                "timed_out_task_count": int(
+                    transition.diagnostics.get("timed_out_task_count", 0)
+                ),
+                "active_task_count": int(
+                    transition.diagnostics.get("active_task_count", 0)
+                ),
+                "terminal_task_ids": [
+                    str(event["task_id"])
+                    for event in transition.diagnostics.get(
+                        "task_termination_events", []
+                    )
+                ],
+                "lifecycle_task_arrivals_closed": bool(
+                    transition.diagnostics.get("lifecycle_task_arrivals_closed", False)
+                ),
                 "actual_matching_node_task_counts": transition.diagnostics.get(
                     "actual_matching_node_task_counts"
                 ),
@@ -764,6 +788,45 @@ def train_episode(
         + greedy_selection_counts[operation]
         for operation in operation_names
     }
+    expected_execution_slots = int(environment.execution_horizon_slots)
+    terminal_execution_slot = int(environment.terminal_execution_slot)
+    observed_slots = [int(row["slot_id"]) for row in step_rows]
+    if observed_slots != list(range(expected_execution_slots)):
+        raise RuntimeError(
+            "Episode did not execute the complete contiguous execution horizon: "
+            f"expected=0..{expected_execution_slots - 1}, observed={observed_slots[:3]}..."
+        )
+    arrival_horizon_slots = int(environment.arrival_horizon_slots)
+    tail_arrivals = [
+        int(row["slot_id"])
+        for row in step_rows
+        if int(row["slot_id"]) >= arrival_horizon_slots
+        and int(row["arrived_task_count"]) != 0
+    ]
+    if tail_arrivals:
+        raise RuntimeError(
+            "New tasks arrived after the configured arrival horizon: "
+            f"execution_slots={tail_arrivals}"
+        )
+    terminal_task_ids = [
+        task_id for row in step_rows for task_id in row["terminal_task_ids"]
+    ]
+    if len(terminal_task_ids) != len(set(terminal_task_ids)):
+        raise RuntimeError("A task emitted more than one terminal event in the Episode")
+    if not environment.terminated or observed_slots[-1] != terminal_execution_slot:
+        raise RuntimeError(
+            "Episode termination does not match the configured execution horizon: "
+            f"terminated={environment.terminated}, last_slot={observed_slots[-1]}, "
+            f"terminal_execution_slot={terminal_execution_slot}"
+        )
+    reward_sum = math.fsum(float(row["reward"]) for row in step_rows)
+    if not math.isclose(
+        float(episode_reward), reward_sum, rel_tol=1e-12, abs_tol=1e-9
+    ):
+        raise RuntimeError(
+            "Episode Return differs from the sum of actual per-slot rewards: "
+            f"episode_return={episode_reward}, slot_reward_sum={reward_sum}"
+        )
     update_summary = _summarize_update_metrics(update_rows)
     duration_summary = _summarize_step_durations(step_rows)
     slot_count = len(step_rows)
@@ -907,6 +970,20 @@ def train_episode(
     )
     episode_summary = {
         "cumulative_system_utility": float(episode_reward),
+        "actual_slot_reward_sum": float(reward_sum),
+        "episode_return_equals_actual_slot_reward_sum": True,
+        "arrival_horizon_slots": arrival_horizon_slots,
+        "execution_horizon_slots": expected_execution_slots,
+        "terminal_origin": arrival_horizon_slots - 1,
+        "terminal_execution_slot": terminal_execution_slot,
+        "episode_terminated": bool(environment.terminated),
+        "task_arrivals_enabled_slot_count": arrival_horizon_slots,
+        "tail_arrival_task_count": sum(
+            int(row["arrived_task_count"])
+            for row in step_rows
+            if int(row["slot_id"]) >= arrival_horizon_slots
+        ),
+        "terminal_task_count": len(terminal_task_ids),
         "mean_system_utility_per_slot": (
             float(episode_reward) / slot_count if slot_count else None
         ),
@@ -1100,6 +1177,11 @@ def train_episode(
         ),
         "episode_terminated": environment.terminated,
         "window_truncated": not environment.terminated,
+        "arrival_horizon_slots": arrival_horizon_slots,
+        "execution_horizon_slots": expected_execution_slots,
+        "terminal_origin": int(environment.arrival_horizon_slots) - 1,
+        "terminal_execution_slot": terminal_execution_slot,
+        "episode_return_equals_actual_slot_reward_sum": True,
     }
 
 

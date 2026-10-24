@@ -98,6 +98,10 @@ class TaskLifecycleManager:
             raise ValueError("task lifecycle requires a one-second time slot")
         self.arrival_horizon_slots = int(arrival_horizon_slots)
         self.k_max_slots = int(k_max_slots)
+        self.execution_horizon_slots = (
+            self.arrival_horizon_slots + self.k_max_slots - 1
+        )
+        self.terminal_execution_slot = self.execution_horizon_slots - 1
         self.dt_s = float(dt_s)
         self.reset()
 
@@ -133,6 +137,11 @@ class TaskLifecycleManager:
             raise ValueError(
                 "task lifecycle requires contiguous zero-based slots: "
                 f"expected={self.next_slot_index}, received={slot_index}"
+            )
+        if int(slot_index) >= self.execution_horizon_slots:
+            raise ValueError(
+                "task lifecycle execution horizon is exhausted: "
+                f"slot={slot_index}, terminal_execution_slot={self.terminal_execution_slot}"
             )
         arrival_slot = int(slot_index) + 1
         if arrival_slot > self.arrival_horizon_slots and arrivals:
