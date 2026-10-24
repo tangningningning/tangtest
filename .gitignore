@@ -7,7 +7,8 @@
 # Python cache
 # =========================
 .runs/
-
+.agents/
+.codex/
 adaptive_cache_mec.zip
 # Generated environment data
 /environment_data/
