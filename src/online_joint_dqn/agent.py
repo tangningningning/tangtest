@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import random
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -475,7 +476,11 @@ class DoubleDQNAgent:
             candidates_by_operation[candidate.action.operation].append(candidate)
         if not candidates_by_operation["KEEP_STAY"]:
             raise ValueError("重建的下一状态候选缺少 KEEP_STAY")
-        state = np.asarray(transition.next_state_features, dtype=np.float32)
+        # Replay keeps interned, read-only float32 vectors; create one writable
+        # batch-local copy before NumPy-to-Torch conversion.
+        state = np.array(
+            transition.next_state_features, dtype=np.float32, copy=True
+        ).reshape(-1)
         q_values, _, _ = self.score_q_values(state, candidates)
         selected_index = _stable_argmax(q_values, candidates)
         selected_candidate = candidates[selected_index]
@@ -522,9 +527,25 @@ class DoubleDQNAgent:
         transitions: Sequence[ReplayTransition],
         *,
         candidate_rebuilder: CandidateRebuilder | None = None,
+        on_phase: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         if not transitions:
             raise ValueError("更新批次不能为空")
+        phase_timings: dict[str, float] = {}
+
+        def phase(name: str, event: str, **details: Any) -> None:
+            if on_phase is not None:
+                on_phase(
+                    {
+                        "phase": name,
+                        "event": event,
+                        "batch_size": len(transitions),
+                        **details,
+                    }
+                )
+
+        batch_started = time.perf_counter()
+        phase("agent.update.batch_materialization", "started")
         states = np.asarray([item.state_features for item in transitions], dtype=np.float32)
         actions = np.asarray([item.action_features for item in transitions], dtype=np.float32)
         if states.shape != (len(transitions), self.state_dim):
@@ -540,19 +561,73 @@ class DoubleDQNAgent:
         category_tensor = torch.as_tensor(
             action_categories, dtype=torch.long, device=self.device
         )
-        target_details = [
-            self._next_action_target(item, candidate_rebuilder)
+        phase_timings["batch_materialization"] = float(
+            time.perf_counter() - batch_started
+        )
+        phase(
+            "agent.update.batch_materialization",
+            "completed",
+            duration_s=phase_timings["batch_materialization"],
+            state_shape=tuple(states.shape),
+            action_shape=tuple(actions.shape),
+        )
+        expected_nonterminal = sum(not item.terminated for item in transitions)
+        expected_next_candidates = sum(
+            int(item.next_candidate_count)
             for item in transitions
-        ]
+            if not item.terminated
+        )
+        next_rebuild_started = time.perf_counter()
+        phase(
+            "agent.update.next_candidate_rebuild_and_double_dqn_targets",
+            "started",
+            expected_nonterminal_count=expected_nonterminal,
+            stored_candidate_count=expected_next_candidates,
+        )
+        target_details = []
+        for index, item in enumerate(transitions):
+            target_details.append(
+                self._next_action_target(item, candidate_rebuilder)
+            )
+            if on_phase is not None and (
+                (index + 1) % 8 == 0 or index + 1 == len(transitions)
+            ):
+                phase(
+                    "agent.update.next_candidate_rebuild_and_double_dqn_targets",
+                    "progress",
+                    processed_transitions=index + 1,
+                    expected_nonterminal_count=expected_nonterminal,
+                )
         targets = torch.stack([item[0] for item in target_details]).detach()
+        phase_timings["next_candidate_rebuild_and_double_dqn_targets"] = float(
+            time.perf_counter() - next_rebuild_started
+        )
+        phase(
+            "agent.update.next_candidate_rebuild_and_double_dqn_targets",
+            "completed",
+            duration_s=phase_timings["next_candidate_rebuild_and_double_dqn_targets"],
+            processed_transitions=len(target_details),
+            stored_candidate_count=expected_next_candidates,
+        )
         category_matrix = self.online_category_network(state_tensor)
         chosen_category_values = category_matrix.gather(
             1, category_tensor[:, None]
         ).squeeze(1)
         chosen_candidate_values = self.online_network(state_tensor, action_tensor)
         class_means: list[torch.Tensor] = []
+        expected_current_candidates = sum(
+            int(item.current_candidate_count) for item in transitions
+        )
+        current_rebuild_started = time.perf_counter()
+        rebuilt_current_candidate_count = 0
+        phase(
+            "agent.update.current_candidate_rebuild_and_advantage_centering",
+            "started",
+            stored_candidate_count=expected_current_candidates,
+        )
         for index, transition in enumerate(transitions):
             legal_candidates = transition.materialize_current_candidates(candidate_rebuilder)
+            rebuilt_current_candidate_count += len(legal_candidates)
             class_candidates = [
                 item for item in legal_candidates
                 if item.action.operation == transition.action.operation
@@ -567,10 +642,31 @@ class DoubleDQNAgent:
             ):
                 raise ValueError("当前回放动作/特征与重建的合法候选不一致")
             class_means.append(self._mean_advantage_tensor(state_tensor[index], class_candidates))
+            if on_phase is not None and (
+                (index + 1) % 8 == 0 or index + 1 == len(transitions)
+            ):
+                phase(
+                    "agent.update.current_candidate_rebuild_and_advantage_centering",
+                    "progress",
+                    processed_transitions=index + 1,
+                    rebuilt_candidate_count=rebuilt_current_candidate_count,
+                )
+        phase_timings["current_candidate_rebuild_and_advantage_centering"] = float(
+            time.perf_counter() - current_rebuild_started
+        )
+        phase(
+            "agent.update.current_candidate_rebuild_and_advantage_centering",
+            "completed",
+            duration_s=phase_timings["current_candidate_rebuild_and_advantage_centering"],
+            processed_transitions=len(transitions),
+            rebuilt_candidate_count=rebuilt_current_candidate_count,
+        )
         centered_advantages = chosen_candidate_values - torch.stack(class_means)
         combined_values = chosen_category_values + centered_advantages
         # 按类别均值中心化后，V 表示合法候选平均 Q；贪心必须比较完整 Q。
         loss = F.smooth_l1_loss(combined_values, targets)
+        optimization_started = time.perf_counter()
+        phase("agent.update.backward_optimizer_and_target_sync", "started")
         self.optimizer.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):
             raise FloatingPointError("Dueling Double DQN TD loss 非有限")
@@ -590,6 +686,19 @@ class DoubleDQNAgent:
         synced = self.gradient_steps % self.target_network_frequency == 0
         if synced:
             self._update_target_network()
+        phase_timings["backward_optimizer_and_target_sync"] = float(
+            time.perf_counter() - optimization_started
+        )
+        phase(
+            "agent.update.backward_optimizer_and_target_sync",
+            "completed",
+            duration_s=phase_timings["backward_optimizer_and_target_sync"],
+            gradient_step=self.gradient_steps,
+            target_network_synced=bool(synced),
+            loss=float(loss.detach().cpu()),
+            td_target_mean=float(targets.mean().detach().cpu()),
+            gradient_norm=float(gradient_norm.detach().cpu()),
+        )
         return {
             "td_loss": float(loss.detach().cpu()),
             "category_td_loss": None,
@@ -601,6 +710,9 @@ class DoubleDQNAgent:
             "candidate_advantage_mean": float(centered_advantages.detach().mean().cpu()),
             "td_target_mean": float(targets.mean().cpu()),
             "gradient_norm_before_clip": float(gradient_norm.detach().cpu()),
+            "phase_timings_s": phase_timings,
+            "next_candidate_count_total": expected_next_candidates,
+            "current_candidate_count_total": rebuilt_current_candidate_count,
             "gradient_step": float(self.gradient_steps),
             "target_network_synced": float(synced),
             "bootstrap_category_selection": [item[1] for item in target_details],

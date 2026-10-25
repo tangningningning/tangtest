@@ -21,6 +21,19 @@ def _vector_tuple(value: Any, name: str) -> tuple[float, ...]:
     return tuple(float(item) for item in array)
 
 
+def _state_vector(value: Any, name: str, *, copy: bool = True) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim != 1:
+        array = array.reshape(-1)
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} 必须为有限数值")
+    if copy:
+        array = array.copy()
+    if array.flags.writeable:
+        array.setflags(write=False)
+    return array
+
+
 def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
     digest = hashlib.sha256()
     for candidate in candidates:
@@ -46,11 +59,11 @@ CandidateRebuilder = Callable[[Mapping[str, Any]], Sequence[CandidateOption]]
 class ReplayTransition:
     """经验只保留所选动作及当前/下一状态重建上下文，不保存候选特征矩阵。"""
 
-    state_features: tuple[float, ...]
+    state_features: np.ndarray
     action: ActionCandidate
     action_features: tuple[float, ...]
     reward: float
-    next_state_features: tuple[float, ...] | None
+    next_state_features: np.ndarray | None
     next_state_fingerprint: str | None
     next_legal_candidates: Sequence[CandidateOption]
     terminated: bool
@@ -151,14 +164,18 @@ class ReplayTransition:
         """序列化回放；只保存一份状态/预测上下文，不保存候选特征矩阵。"""
 
         return {
-            "state_features": list(self.state_features),
+            "state_features": _state_vector(
+                self.state_features, "state_features", copy=False
+            ),
             "action": self.action.to_dict(),
             "action_features": list(self.action_features),
             "reward": self.reward,
             "next_state_features": (
                 None
                 if self.next_state_features is None
-                else list(self.next_state_features)
+                else _state_vector(
+                    self.next_state_features, "next_state_features", copy=False
+                )
             ),
             "next_state_fingerprint": self.next_state_fingerprint,
             "next_candidate_rebuild_context_zlib": (
@@ -211,14 +228,18 @@ class ReplayTransition:
         ):
             raise ValueError("非终止转移必须保留完整下一状态候选重建合同")
         return cls(
-            state_features=_vector_tuple(value["state_features"], "state_features"),
+            state_features=_state_vector(
+                value["state_features"], "state_features", copy=False
+            ),
             action=ActionCandidate.from_dict(value["action"]),
             action_features=_vector_tuple(value["action_features"], "action_features"),
             reward=reward,
             next_state_features=(
                 None
                 if next_state_raw is None
-                else _vector_tuple(next_state_raw, "next_state_features")
+                else _state_vector(
+                    next_state_raw, "next_state_features", copy=False
+                )
             ),
             next_state_fingerprint=None if done else str(next_fingerprint),
             next_legal_candidates=(),
@@ -240,7 +261,7 @@ class ReplayTransition:
 class ReplayBuffer:
     """固定容量环形回放，不按经验重复保存完整候选特征矩阵。"""
 
-    STATE_SCHEMA_VERSION = 9
+    STATE_SCHEMA_VERSION = 10
 
     def __init__(self, capacity: int, *, seed: int = 0) -> None:
         if int(capacity) <= 0:
@@ -252,6 +273,8 @@ class ReplayBuffer:
         self.write_count = 0
         self.sample_calls = 0
         self.sample_count = 0
+        self._state_feature_pool: dict[str, np.ndarray] = {}
+        self._state_feature_refcounts: dict[str, int] = {}
         # 相邻转移共享同一状态上下文，避免分别保存当前和下一状态的重复字节。
         self._context_pool: dict[str, bytes] = {}
         self._context_refcounts: dict[str, int] = {}
@@ -364,6 +387,50 @@ class ReplayBuffer:
                 del self._context_refcounts[fingerprint]
                 del self._context_pool[fingerprint]
 
+    def _validate_state_feature_pairs(
+        self, pairs: Sequence[tuple[str, np.ndarray]]
+    ) -> None:
+        pending: dict[str, np.ndarray] = {}
+        for fingerprint, values in pairs:
+            key = str(fingerprint)
+            if not key:
+                raise ValueError("Replay 状态向量缺少状态指纹")
+            existing = self._state_feature_pool.get(key, pending.get(key))
+            if existing is not None and not np.array_equal(existing, values):
+                raise ValueError("相同 Replay 状态指纹对应不同状态向量")
+            pending[key] = values if existing is None else existing
+
+    def _retain_state_feature_pairs(
+        self, pairs: Sequence[tuple[str, np.ndarray]]
+    ) -> tuple[np.ndarray, ...]:
+        self._validate_state_feature_pairs(pairs)
+        retained: list[np.ndarray] = []
+        for fingerprint, values in pairs:
+            key = str(fingerprint)
+            existing = self._state_feature_pool.get(key)
+            if existing is None:
+                existing = values
+                self._state_feature_pool[key] = existing
+            self._state_feature_refcounts[key] = (
+                self._state_feature_refcounts.get(key, 0) + 1
+            )
+            retained.append(existing)
+        return tuple(retained)
+
+    def _release_state_features(self, transition: ReplayTransition) -> None:
+        fingerprints = [transition.action.source_state_fingerprint]
+        if not transition.terminated:
+            if transition.next_state_fingerprint is None:
+                raise ValueError("Replay 非终止转移缺少下一状态指纹")
+            fingerprints.append(str(transition.next_state_fingerprint))
+        for fingerprint in fingerprints:
+            remaining = self._state_feature_refcounts[fingerprint] - 1
+            if remaining:
+                self._state_feature_refcounts[fingerprint] = remaining
+            else:
+                del self._state_feature_refcounts[fingerprint]
+                del self._state_feature_pool[fingerprint]
+
     def __len__(self) -> int:
         return len(self._items)
 
@@ -431,7 +498,7 @@ class ReplayBuffer:
                 or next_candidate_rebuild_context is None
             ):
                 raise ValueError("非终止转移必须提供下一观测、候选及可重建上下文")
-            next_state = _vector_tuple(next_state_features, "next_state_features")
+            next_state = _state_vector(next_state_features, "next_state_features")
             if any(not np.all(np.isfinite(np.asarray(item.features))) for item in candidates):
                 raise ValueError("下一状态候选特征必须为有限数值")
             if any(
@@ -454,6 +521,13 @@ class ReplayBuffer:
             candidate_ids_sha256 = _candidate_ids_sha256(candidates)
         if not action.source_state_fingerprint:
             raise ValueError("回放动作缺少其来源状态指纹")
+        state_vector = _state_vector(state_features, "state_features")
+        state_feature_pairs = [(source_fingerprint, state_vector)]
+        if not terminated:
+            state_feature_pairs.append(
+                (str(next_state_fingerprint), next_state)
+            )
+        self._validate_state_feature_pairs(state_feature_pairs)
         current_ids_sha256 = _candidate_ids_sha256(current_candidates)
         if not terminated and source_fingerprint == str(next_state_fingerprint):
             if (
@@ -462,7 +536,7 @@ class ReplayBuffer:
             ):
                 raise ValueError("相同当前/下一状态身份对应不一致的候选合同")
         transition = ReplayTransition(
-            state_features=_vector_tuple(state_features, "state_features"),
+            state_features=state_vector,
             action=ActionCandidate.from_dict(action.to_dict()),
             action_features=_vector_tuple(action_features, "action_features"),
             reward=float(reward),
@@ -479,9 +553,18 @@ class ReplayBuffer:
             current_candidate_ids_sha256=current_ids_sha256,
         )
         if len(self._items) == self.capacity:
-            self._release_contexts(self._items[self._position])
+            evicted = self._items[self._position]
+            self._release_contexts(evicted)
+            self._release_state_features(evicted)
+        retained_state_vectors = self._retain_state_feature_pairs(
+            state_feature_pairs
+        )
         transition = replace(
             transition,
+            state_features=retained_state_vectors[0],
+            next_state_features=(
+                None if terminated else retained_state_vectors[1]
+            ),
             current_candidate_rebuild_context_zlib=self._retain_context(source_fingerprint, current_context_zlib),
             next_candidate_rebuild_context_zlib=(
                 None if terminated else self._retain_context(str(next_state_fingerprint), context_zlib)
@@ -510,19 +593,26 @@ class ReplayBuffer:
     def validate_rebuild_contexts(self) -> None:
         """在恢复训练前校验每个唯一候选上下文，不生成候选或运行系统求解。"""
 
-        state_features_by_fingerprint: dict[str, tuple[float, ...]] = {}
+        state_features_by_fingerprint: dict[str, np.ndarray] = {}
+        state_refcounts_by_fingerprint: dict[str, int] = {}
         candidate_identity_by_fingerprint: dict[str, tuple[int, str]] = {}
 
         def retain_state(
             fingerprint: str,
-            values: tuple[float, ...],
+            values: Any,
             candidate_count: int,
             candidate_ids_sha256: str | None,
         ) -> None:
+            state_vector = _state_vector(
+                values, "Replay rebuild state_features", copy=False
+            )
             existing = state_features_by_fingerprint.get(fingerprint)
-            if existing is not None and existing != values:
+            if existing is not None and not np.array_equal(existing, state_vector):
                 raise ValueError("Replay 中相同状态指纹对应不同状态特征")
-            state_features_by_fingerprint[fingerprint] = values
+            state_features_by_fingerprint[fingerprint] = state_vector
+            state_refcounts_by_fingerprint[fingerprint] = (
+                state_refcounts_by_fingerprint.get(fingerprint, 0) + 1
+            )
             if int(candidate_count) <= 0 or not candidate_ids_sha256:
                 raise ValueError("Replay 状态缺少候选数量或候选 ID 摘要")
             candidate_identity = (int(candidate_count), str(candidate_ids_sha256))
@@ -547,8 +637,17 @@ class ReplayBuffer:
                     transition.next_candidate_count,
                     transition.next_candidate_ids_sha256,
                 )
-        if set(state_features_by_fingerprint) != set(self._context_pool):
+        if (
+            set(state_features_by_fingerprint) != set(self._context_pool)
+            or set(state_features_by_fingerprint) != set(self._state_feature_pool)
+            or state_refcounts_by_fingerprint != self._state_feature_refcounts
+        ):
             raise ValueError("Replay 状态特征与唯一候选上下文索引不一致")
+        if any(
+            not np.array_equal(self._state_feature_pool[fingerprint], values)
+            for fingerprint, values in state_features_by_fingerprint.items()
+        ):
+            raise ValueError("Replay 状态向量池与转移中保存的状态特征不一致")
         for fingerprint, blob in self._context_pool.items():
             context = pickle.loads(zlib.decompress(blob))
             if not isinstance(context, Mapping):
@@ -579,6 +678,7 @@ class ReplayBuffer:
     def state_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.STATE_SCHEMA_VERSION,
+            "state_feature_storage_contract": "float32_fingerprint_interned_v1",
             "capacity": self.capacity,
             "position": self._position,
             "items": [item.to_compact_dict() for item in self._items],
@@ -588,6 +688,7 @@ class ReplayBuffer:
             "sample_count": self.sample_count,
             "candidate_feature_matrices_persisted": False,
             "unique_candidate_context_count": len(self._context_pool),
+            "unique_state_feature_count": len(self._state_feature_pool),
             "episode_candidate_rebuilders": {
                 episode_id: rebuilder.state_dict()
                 for episode_id, rebuilder in self._candidate_rebuilders.items()
@@ -598,6 +699,10 @@ class ReplayBuffer:
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         if int(state.get("schema_version", -1)) != self.STATE_SCHEMA_VERSION:
             raise ValueError("Checkpoint Replay Buffer 格式过旧或不兼容，拒绝恢复")
+        if state.get("state_feature_storage_contract") != (
+            "float32_fingerprint_interned_v1"
+        ):
+            raise ValueError("Checkpoint Replay 状态向量存储合同不兼容，拒绝恢复")
         if bool(state.get("candidate_feature_matrices_persisted", True)):
             raise ValueError("Checkpoint Replay Buffer 保存了旧的候选特征矩阵")
         capacity = int(state["capacity"])
@@ -619,6 +724,8 @@ class ReplayBuffer:
         context_pool: dict[str, bytes] = {}
         context_refcounts: dict[str, int] = {}
         episode_refcounts: dict[str, int] = {}
+        state_feature_pool: dict[str, np.ndarray] = {}
+        state_feature_refcounts: dict[str, int] = {}
 
         def intern(fingerprint: str, blob: bytes | None) -> bytes:
             if not fingerprint or blob is None:
@@ -636,20 +743,57 @@ class ReplayBuffer:
             episode_refcounts[episode_id] = episode_refcounts.get(episode_id, 0) + 1
             return existing
 
-        rebuilt_items = [
-            replace(
-                item,
-                current_candidate_rebuild_context_zlib=intern(
-                    item.action.source_state_fingerprint, item.current_candidate_rebuild_context_zlib
-                ),
-                next_candidate_rebuild_context_zlib=(
-                    None if item.terminated else intern(
-                        str(item.next_state_fingerprint), item.next_candidate_rebuild_context_zlib
-                    )
-                ),
+        def intern_state_vector(
+            fingerprint: str, values: np.ndarray | None
+        ) -> np.ndarray:
+            if values is None or not fingerprint:
+                raise ValueError("Checkpoint Replay 状态特征或指纹缺失")
+            state_vector = _state_vector(
+                values, "checkpoint state_features", copy=False
             )
-            for item in items
-        ]
+            existing = state_feature_pool.get(fingerprint)
+            if existing is not None and not np.array_equal(existing, state_vector):
+                raise ValueError("Checkpoint 相同状态指纹对应不同状态特征")
+            if existing is None:
+                existing = state_vector
+                state_feature_pool[fingerprint] = existing
+            state_feature_refcounts[fingerprint] = (
+                state_feature_refcounts.get(fingerprint, 0) + 1
+            )
+            return existing
+
+        rebuilt_items: list[ReplayTransition] = []
+        for item in items:
+            source_fingerprint = item.action.source_state_fingerprint
+            current_state = intern_state_vector(
+                source_fingerprint, item.state_features
+            )
+            next_state = (
+                None
+                if item.terminated
+                else intern_state_vector(
+                    str(item.next_state_fingerprint), item.next_state_features
+                )
+            )
+            rebuilt_items.append(
+                replace(
+                    item,
+                    state_features=current_state,
+                    next_state_features=next_state,
+                    current_candidate_rebuild_context_zlib=intern(
+                        source_fingerprint,
+                        item.current_candidate_rebuild_context_zlib,
+                    ),
+                    next_candidate_rebuild_context_zlib=(
+                        None
+                        if item.terminated
+                        else intern(
+                            str(item.next_state_fingerprint),
+                            item.next_candidate_rebuild_context_zlib,
+                        )
+                    ),
+                )
+            )
         restored_rng = random.Random()
         restored_rng.setstate(state["rng_state"])
         restored_position = int(state["position"])
@@ -657,10 +801,16 @@ class ReplayBuffer:
             raise ValueError("Checkpoint Replay Buffer 环形写入位置非法")
         if set(episode_refcounts) != set(candidate_rebuilders):
             raise ValueError("Checkpoint Replay 重建器与经验上下文集合不一致")
+        if len(state_feature_pool) != int(
+            state.get("unique_state_feature_count", -1)
+        ):
+            raise ValueError("Checkpoint Replay 唯一状态向量数量不一致")
         # 所有身份、上下文与随机状态校验通过后，才替换当前回放状态。
         self._items = rebuilt_items
         self._context_pool = context_pool
         self._context_refcounts = context_refcounts
+        self._state_feature_pool = state_feature_pool
+        self._state_feature_refcounts = state_feature_refcounts
         self._candidate_rebuilders = candidate_rebuilders
         self._episode_rebuild_refcounts = episode_refcounts
         self._position = restored_position

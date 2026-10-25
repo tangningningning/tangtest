@@ -291,6 +291,7 @@ def train_episode(
     global_step_start: int = 0,
     on_step: Callable[[dict[str, Any]], None] | None = None,
     on_update: Callable[[dict[str, Any]], None] | None = None,
+    on_phase: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """在一个真实 Episode 窗口中采集实际奖励并按回放批次更新。"""
 
@@ -311,20 +312,92 @@ def train_episode(
     execution_counts = {operation: 0 for operation in operation_names}
     update_rows: list[dict[str, Any]] = []
     step_rows: list[dict[str, Any]] = []
+
+    def emit_phase(event: Mapping[str, Any], *, slot_id: int | None = None) -> None:
+        if on_phase is None:
+            return
+        payload = dict(event)
+        payload.setdefault("episode_seed", int(environment.episode_seed))
+        payload.setdefault("global_step", global_step)
+        if slot_id is not None:
+            payload.setdefault("trainer_slot_id", int(slot_id))
+        on_phase(payload)
+
     while environment.can_act:
         step_started = time.perf_counter()
-        state, candidates = environment.observe()
+        slot_id = int(environment.slot_inputs[environment.index].slot_id)
+        phase_timings: dict[str, float] = {}
+
+        def run_phase(
+            name: str,
+            operation: Callable[[], Any],
+            *,
+            details: Callable[[Any], Mapping[str, Any]] | None = None,
+        ) -> Any:
+            if on_phase is None:
+                return operation()
+            emit_phase(
+                {"phase": name, "event": "started"},
+                slot_id=slot_id,
+            )
+            started = time.perf_counter()
+            try:
+                result = operation()
+            except BaseException as exc:
+                elapsed = time.perf_counter() - started
+                phase_timings[name] = float(elapsed)
+                emit_phase(
+                    {
+                        "phase": name,
+                        "event": "failed",
+                        "duration_s": float(elapsed),
+                        "error_type": type(exc).__name__,
+                    },
+                    slot_id=slot_id,
+                )
+                raise
+            elapsed = time.perf_counter() - started
+            phase_timings[name] = float(elapsed)
+            extra = {} if details is None else dict(details(result))
+            emit_phase(
+                {
+                    "phase": name,
+                    "event": "completed",
+                    "duration_s": float(elapsed),
+                    **extra,
+                },
+                slot_id=slot_id,
+            )
+            return result
+
+        state, candidates = run_phase(
+            "trainer.observe",
+            environment.observe,
+            details=lambda result: {
+                "candidate_count": len(result[1]),
+                "candidate_counts_by_operation": {
+                    operation: sum(
+                        item.action.operation == operation for item in result[1]
+                    )
+                    for operation in ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
+                },
+            },
+        )
         epsilon = linear_epsilon_schedule(
             settings.epsilon_start,
             settings.epsilon_end,
             settings.epsilon_decay_steps,
             global_step,
         )
-        selected = agent.select_action(
-            state,
-            candidates,
-            epsilon=epsilon,
-            explore=True,
+        selected = run_phase(
+            "trainer.action_selection",
+            lambda: agent.select_action(
+                state,
+                candidates,
+                epsilon=epsilon,
+                explore=True,
+            ),
+            details=lambda _: {"candidate_count": len(candidates)},
         )
         selected_operation = selected.candidate.action.operation
         if selected_operation not in action_counts:
@@ -378,7 +451,13 @@ def train_episode(
         else:
             greedy_selection_counts[selected_operation] += 1
         previous_cache = environment.cache_state.copy()
-        current_candidate_context = environment.candidate_rebuild_context()
+        current_candidate_context = run_phase(
+            "trainer.capture_current_candidate_context",
+            environment.candidate_rebuild_context,
+            details=lambda context: {
+                "candidate_count": int(context.get("candidate_count", -1))
+            },
+        )
         previous_uav = {
             key: value.copy() for key, value in environment.uav_positions.items()
         }
@@ -389,7 +468,17 @@ def train_episode(
         node_ids = tuple(
             str(value) for value in environment.model.cache_nodes["node_ids"]
         )
-        transition = environment.step(selected.candidate)
+        transition = run_phase(
+            "trainer.environment_step",
+            lambda: environment.step(
+                selected.candidate,
+                on_phase=(
+                    None
+                    if on_phase is None
+                    else lambda event: emit_phase(event, slot_id=slot_id)
+                ),
+            ),
+        )
         matching_summary = transition.diagnostics.get("matching_summary", {})
         resource_summary = (
             matching_summary.get("resource", {})
@@ -505,21 +594,30 @@ def train_episode(
                 )
             )
         )
-        replay_buffer.add(
-            state_features=state,
-            action=selected.candidate.action,
-            action_features=selected.candidate.features,
-            current_legal_candidates=candidates,
-            current_candidate_rebuild_context=current_candidate_context,
-            reward=transition.reward,
-            next_state_features=transition.next_state_features,
-            next_state_fingerprint=transition.next_state_fingerprint,
-            next_legal_candidates=transition.next_legal_candidates,
-            next_candidate_rebuild_context=(
-                transition.next_candidate_rebuild_context
+        run_phase(
+            "trainer.replay_append",
+            lambda: replay_buffer.add(
+                state_features=state,
+                action=selected.candidate.action,
+                action_features=selected.candidate.features,
+                current_legal_candidates=candidates,
+                current_candidate_rebuild_context=current_candidate_context,
+                reward=transition.reward,
+                next_state_features=transition.next_state_features,
+                next_state_fingerprint=transition.next_state_fingerprint,
+                next_legal_candidates=transition.next_legal_candidates,
+                next_candidate_rebuild_context=(
+                    transition.next_candidate_rebuild_context
+                ),
+                terminated=transition.terminated,
+                duration_slots=transition.duration_slots,
             ),
-            terminated=transition.terminated,
-            duration_slots=transition.duration_slots,
+            details=lambda _: {
+                "replay_size": len(replay_buffer),
+                "replay_write_count": replay_buffer.write_count,
+                "current_candidate_count": len(candidates),
+                "next_candidate_count": len(transition.next_legal_candidates),
+            },
         )
         next_candidate_counts = {
             operation: sum(
@@ -874,15 +972,36 @@ def train_episode(
                 "illegal_action_detected": False,
             }
         )
+        if on_phase is not None:
+            step_rows[-1]["phase_timings_s"] = dict(phase_timings)
         if (
             global_step >= int(settings.learning_starts)
             and len(replay_buffer) >= int(settings.batch_size)
             and global_step % int(settings.train_frequency) == 0
         ):
             for _ in range(int(settings.gradient_updates_per_step)):
-                update = agent.update(
-                    replay_buffer.sample(int(settings.batch_size)),
-                    candidate_rebuilder=replay_buffer.rebuild_candidates,
+                batch = run_phase(
+                    "trainer.replay_sample",
+                    lambda: replay_buffer.sample(int(settings.batch_size)),
+                    details=lambda sampled: {"sampled_transition_count": len(sampled)},
+                )
+                update = run_phase(
+                    "trainer.agent_update",
+                    lambda: agent.update(
+                        batch,
+                        candidate_rebuilder=replay_buffer.rebuild_candidates,
+                        on_phase=(
+                            None
+                            if on_phase is None
+                            else lambda event: emit_phase(event, slot_id=slot_id)
+                        ),
+                    ),
+                    details=lambda metrics: {
+                        "gradient_step": int(metrics.get("gradient_step", -1)),
+                        "target_network_synced": bool(
+                            metrics.get("target_network_synced", False)
+                        ),
+                    },
                 )
                 update["gradient_clip_threshold"] = float(agent.max_grad_norm)
                 update["gradient_was_clipped"] = bool(

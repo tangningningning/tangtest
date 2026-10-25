@@ -8,12 +8,13 @@ import json
 import math
 import pickle
 import sys
+import time
 from collections import Counter, OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -240,7 +241,15 @@ def _candidate_rebuild_payload_sha256(context: Mapping[str, Any]) -> str:
     digest = hashlib.sha256()
     for key in _CANDIDATE_REBUILD_IDENTITY_FIELDS:
         name = key.encode("utf-8")
-        encoded = pickle.dumps(payload[key], protocol=pickle.HIGHEST_PROTOCOL)
+        value = payload[key]
+        if key == "state_features":
+            # Replay stores shared state vectors as read-only float32 arrays,
+            # then restores that same value into the compact candidate context.
+            # NumPy pickles array writeability/layout flags, so hash a writable,
+            # contiguous copy to keep the context digest stable across that
+            # storage boundary while still hashing the full feature values.
+            value = np.array(value, dtype=np.float32, copy=True, order="C").reshape(-1)
+        encoded = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
         digest.update(len(name).to_bytes(4, "big"))
         digest.update(name)
         digest.update(len(encoded).to_bytes(8, "big"))
@@ -1823,9 +1832,33 @@ class ExclusiveDQNEnvironment:
             prediction_context,
         )
 
-    def step(self, option: CandidateOption) -> EnvironmentTransition:
+    def step(
+        self,
+        option: CandidateOption,
+        *,
+        on_phase: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> EnvironmentTransition:
         """只把所选候选送入正式执行器，并推进一个真实 Slot。"""
 
+        slot_id = (
+            int(self.slot_inputs[self.index].slot_id)
+            if self.can_act and self.index < len(self.slot_inputs)
+            else None
+        )
+
+        def phase(name: str, event: str, **details: Any) -> None:
+            if on_phase is not None:
+                on_phase(
+                    {
+                        "phase": name,
+                        "event": event,
+                        "slot_id": slot_id,
+                        **details,
+                    }
+                )
+
+        validation_started = time.perf_counter()
+        phase("environment.step.action_validation", "started")
         state, legal_candidates = self.observe()
         if not isinstance(option, CandidateOption):
             raise TypeError("step 只接受当前状态的 CandidateOption")
@@ -1843,6 +1876,14 @@ class ExclusiveDQNEnvironment:
         action = match.action
         if action.source_state_fingerprint != self._current_state_hash():
             raise ValueError("候选动作属于其他状态，拒绝执行")
+        phase(
+            "environment.step.action_validation",
+            "completed",
+            duration_s=time.perf_counter() - validation_started,
+            legal_candidate_count=len(legal_candidates),
+        )
+        preparation_started = time.perf_counter()
+        phase("environment.step.prepare_execution", "started")
         previous_cache = self.cache_state.copy()
         previous_uav = {key: value.copy() for key, value in self.uav_positions.items()}
         target_cache = action.cache_array()
@@ -1933,8 +1974,23 @@ class ExclusiveDQNEnvironment:
             dict(self.model.project_cfg),
             flight_boundary,
         )
+        phase(
+            "environment.step.prepare_execution",
+            "completed",
+            duration_s=time.perf_counter() - preparation_started,
+            prepared_task_count=len(prepared_task_slot.tasks),
+            mutable_task_count=len(prepared_task_slot.mutable_task_ids),
+        )
         kkt_cache = task_allocation.KKTResourceAllocationCache()
         performance_profile: dict[str, float] = {}
+        execution_started = time.perf_counter()
+        phase(
+            "environment.step.matching_kkt_execution",
+            "started",
+            prepared_task_count=len(prepared_task_slot.tasks),
+            mutable_task_count=len(prepared_task_slot.mutable_task_ids),
+            legal_candidate_count=len(legal_candidates),
+        )
         result = slot_environment.execute_configured_slot(
             previous_cache,
             previous_uav,
@@ -1960,6 +2016,13 @@ class ExclusiveDQNEnvironment:
                 prepared_task_slot.protected_services_by_node
             ),
         )
+        phase(
+            "environment.step.matching_kkt_execution",
+            "completed",
+            duration_s=time.perf_counter() - execution_started,
+            kkt_solver_calls=int(kkt_cache.solver_calls),
+            matching_produced=bool(result.matching_summary),
+        )
         if not result.step_feasible:
             raise RuntimeError(
                 "正式 Slot 执行未产生可用转移："
@@ -1967,6 +2030,8 @@ class ExclusiveDQNEnvironment:
             )
         if result.next_cache_state is None or result.next_uav_positions is None:
             raise RuntimeError("正式 Slot 执行器未返回下一缓存/UAV 状态")
+        postprocess_started = time.perf_counter()
+        phase("environment.step.lifecycle_and_postprocess", "started")
         lifecycle_result = self.task_lifecycle.advance_slot(
             int(slot_input.slot_id),
             result.matching,
@@ -2165,6 +2230,13 @@ class ExclusiveDQNEnvironment:
             predicted_cache_coverage_after = None
             predicted_service_demand_by_service = None
             cache_service_demand_details = {}
+        phase(
+            "environment.step.lifecycle_and_postprocess",
+            "completed",
+            duration_s=time.perf_counter() - postprocess_started,
+            termination_event_count=len(lifecycle_result.termination_events),
+            active_task_count=len(self.task_lifecycle.active_tasks),
+        )
         executor_calls = 1
         matching_calls = int(bool(result.matching_summary))
         kkt_calls = int(kkt_cache.solver_calls)
@@ -2187,10 +2259,31 @@ class ExclusiveDQNEnvironment:
         next_state_fingerprint: str | None = None
         next_candidates: tuple[CandidateOption, ...] = ()
         next_candidate_rebuild_context: Mapping[str, Any] | None = None
+        next_observation_started = time.perf_counter()
+        phase("environment.step.next_observation_and_candidates", "started")
         if not done:
             next_state, next_candidates = self._prepare_observation()
             next_state_fingerprint = self._current_state_hash()
             next_candidate_rebuild_context = self.candidate_rebuild_context()
+        next_candidate_counts = {
+            operation: sum(
+                candidate.action.operation == operation for candidate in next_candidates
+            )
+            for operation in ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
+        }
+        phase(
+            "environment.step.next_observation_and_candidates",
+            "completed",
+            duration_s=time.perf_counter() - next_observation_started,
+            next_slot_id=(
+                None
+                if done
+                else int(self.slot_inputs[self.index].slot_id)
+            ),
+            next_candidate_count=len(next_candidates),
+            next_candidate_counts_by_operation=next_candidate_counts,
+            terminated=bool(done),
+        )
         return EnvironmentTransition(
             reward=slot_reward,
             next_state_features=next_state,
@@ -2404,6 +2497,18 @@ class EpisodeCandidateRebuildAdapter:
             "eviction_count": 0,
             "bypass_count": 0,
         }
+
+    @staticmethod
+    def _active_task_state_snapshots() -> tuple[dict[str, Any], ...]:
+        """Candidate rebuilding has no live task state to expose to generation.
+
+        The shared candidate generator calls this only to populate a diagnostic
+        flag. Replay reconstruction uses the task snapshots stored in its
+        validated context when re-encoding the observation, while candidate
+        generation receives an input with tasks stripped.
+        """
+
+        return ()
 
     @staticmethod
     def _identity_payload(environment: ExclusiveDQNEnvironment) -> dict[str, Any]:

@@ -1420,6 +1420,9 @@ def run_training(
         agent=agent,
         search_budget=search_budget,
     )
+    # Agent dimensions and the formal candidate limits are now captured as
+    # scalars. Keep the first environment only when it will serve Episode 0.
+    del state, candidates
 
     if resume_checkpoint is None:
         run_dir = _new_run_directory(
@@ -1558,6 +1561,10 @@ def run_training(
         replay = staged_replay
         episode_order = restored_episode_order
         next_episode_index = restored_next_episode_index
+        # A resumed run constructs its next Episode from the checkpoint order;
+        # the bootstrap environment above is no longer needed.
+        if next_episode_index > 0:
+            first_environment = None
         global_step = restored_global_step
         checkpoint_episode_rows = restored_episode_rows
 
@@ -1908,9 +1915,9 @@ def run_training(
                     environment.encoder.state_dim != agent.state_dim
                     or environment.encoder.candidate_dim != agent.candidate_dim
                     or environment.search_budget.max_cache_candidates
-                    != first_environment.search_budget.max_cache_candidates
+                    != search_budget["max_cache_candidates_including_keep"]
                     or environment.search_budget.max_uav_candidates_per_uav
-                    != first_environment.search_budget.max_uav_candidates_per_uav
+                    != search_budget["max_uav_candidates_per_uav_including_stay"]
                 ):
                     raise ValueError(
                         f"Episode {episode_seed} 的状态/候选维度或候选上限不一致"
@@ -2115,6 +2122,14 @@ def run_training(
                 if _should_refresh_training_plots(next_episode_index):
                     submit_plot_snapshot(next_episode_index)
                 collect_plot_jobs(wait_for_all=False)
+                # train_episode returns per-Slot diagnostic rows in metrics;
+                # the compact Episode row is already committed above.
+                metrics = None
+                # Release the just-finished full Episode before constructing
+                # the next one; only its compact Replay rebuild adapter remains.
+                if episode_index == 0:
+                    first_environment = None
+                environment = None
                 if stop_requested:
                     break
         status = (
