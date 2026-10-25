@@ -705,10 +705,35 @@ class ReplayBuffer:
             raise ValueError("Checkpoint Replay 状态向量存储合同不兼容，拒绝恢复")
         if bool(state.get("candidate_feature_matrices_persisted", True)):
             raise ValueError("Checkpoint Replay Buffer 保存了旧的候选特征矩阵")
+
+        def nonnegative_integer(field: str, *, default: Any = None) -> int:
+            if field in state:
+                value = state[field]
+            elif default is not None:
+                value = default
+            else:
+                raise ValueError(f"Checkpoint Replay 缺少 {field}")
+            if isinstance(value, (bool, np.bool_)) or not isinstance(
+                value, (int, np.integer)
+            ):
+                raise ValueError(f"Checkpoint Replay {field} 必须是非负整数")
+            result = int(value)
+            if result < 0:
+                raise ValueError(f"Checkpoint Replay {field} 必须是非负整数")
+            return result
+
         capacity = int(state["capacity"])
         items = [ReplayTransition.from_compact_dict(item) for item in state["items"]]
         if capacity != self.capacity or len(items) > self.capacity:
             raise ValueError("回放状态容量与当前缓冲区不匹配")
+        restored_write_count = nonnegative_integer("write_count")
+        restored_position = nonnegative_integer("position")
+        restored_sample_calls = nonnegative_integer("sample_calls", default=0)
+        restored_sample_count = nonnegative_integer("sample_count", default=0)
+        if len(items) != min(restored_write_count, self.capacity):
+            raise ValueError("Checkpoint Replay 写入计数与经验数量不一致")
+        if restored_position != restored_write_count % self.capacity:
+            raise ValueError("Checkpoint Replay 写入位置与写入计数不一致")
         raw_rebuilders = state.get("episode_candidate_rebuilders")
         if not isinstance(raw_rebuilders, Mapping):
             raise ValueError("Checkpoint Replay 缺少 Episode 候选重建器注册表")
@@ -796,7 +821,6 @@ class ReplayBuffer:
             )
         restored_rng = random.Random()
         restored_rng.setstate(state["rng_state"])
-        restored_position = int(state["position"])
         if not 0 <= restored_position < self.capacity:
             raise ValueError("Checkpoint Replay Buffer 环形写入位置非法")
         if set(episode_refcounts) != set(candidate_rebuilders):
@@ -815,9 +839,9 @@ class ReplayBuffer:
         self._episode_rebuild_refcounts = episode_refcounts
         self._position = restored_position
         self._rng = restored_rng
-        self.write_count = int(state.get("write_count", len(items)))
-        self.sample_calls = int(state.get("sample_calls", 0))
-        self.sample_count = int(state.get("sample_count", 0))
+        self.write_count = restored_write_count
+        self.sample_calls = restored_sample_calls
+        self.sample_count = restored_sample_count
 
 
 __all__ = ["ReplayTransition", "ReplayBuffer"]
