@@ -261,7 +261,7 @@ class ReplayTransition:
 class ReplayBuffer:
     """固定容量环形回放，不按经验重复保存完整候选特征矩阵。"""
 
-    STATE_SCHEMA_VERSION = 10
+    STATE_SCHEMA_VERSION = 11
 
     def __init__(self, capacity: int, *, seed: int = 0) -> None:
         if int(capacity) <= 0:

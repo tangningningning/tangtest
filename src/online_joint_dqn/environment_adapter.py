@@ -47,8 +47,8 @@ from .candidate_features import (
 CANDIDATE_GENERATION_CONTRACT_VERSION = "state_ranked_bounded_pair_cache_replace_v3_lifecycle"
 DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT = 8
 DQN_CROSS_NODE_PAIR_SCAN_LIMIT = 32
-CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v10_active_task_state"
-EPISODE_REBUILD_SPEC_SCHEMA_VERSION = "dqn_episode_candidate_rebuild_spec_v3_active_task_state"
+CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v11_normalized_episode_identity"
+EPISODE_REBUILD_SPEC_SCHEMA_VERSION = "dqn_episode_candidate_rebuild_spec_v4_normalized_object_identity"
 
 
 def candidate_generation_contract(
@@ -2512,24 +2512,32 @@ class EpisodeCandidateRebuildAdapter:
 
     @staticmethod
     def _identity_payload(environment: ExclusiveDQNEnvironment) -> dict[str, Any]:
+        # Hash the same independent objects the adapter persists. Hashing the
+        # live environment objects here and deep-copying them in the adapter
+        # can produce different pickle representations for equivalent NumPy-
+        # backed model/encoder state, making a valid Replay fail after reload.
+        model = deepcopy(environment.model)
+        encoder = deepcopy(environment.encoder)
+        observation_spec = deepcopy(environment.context.observation_spec)
+        search_budget = deepcopy(environment.search_budget)
         return {
             "schema_version": EPISODE_REBUILD_SPEC_SCHEMA_VERSION,
             "episode_seed": environment.episode_seed,
-            "model": environment.model,
-            "encoder": environment.encoder,
-            "observation_spec": environment.context.observation_spec,
+            "model": model,
+            "encoder": encoder,
+            "observation_spec": observation_spec,
             "train_origin_start": int(environment.context.train_origin_start),
             "train_origin_end": int(environment.context.train_origin_end),
-            "search_budget": environment.search_budget,
-            "episode_vehicle_ids": environment.encoder.source_vehicle_ids,
-            "episode_task_vehicle_ids": environment.encoder.source_task_vehicle_ids,
-            "episode_cache_node_ids": environment.encoder.source_node_ids,
-            "canonical_vehicle_ids": environment.canonical_vehicle_ids,
-            "canonical_cache_node_ids": environment.canonical_cache_node_ids,
-            "state_feature_contract_version": environment.encoder.state_feature_contract_version,
-            "candidate_feature_contract_version": environment.encoder.candidate_feature_contract_version,
+            "search_budget": search_budget,
+            "episode_vehicle_ids": encoder.source_vehicle_ids,
+            "episode_task_vehicle_ids": encoder.source_task_vehicle_ids,
+            "episode_cache_node_ids": encoder.source_node_ids,
+            "canonical_vehicle_ids": encoder.vehicle_ids,
+            "canonical_cache_node_ids": encoder.node_ids,
+            "state_feature_contract_version": encoder.state_feature_contract_version,
+            "candidate_feature_contract_version": encoder.candidate_feature_contract_version,
             "candidate_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
-            "network_architecture_version": environment.encoder.network_architecture_version,
+            "network_architecture_version": encoder.network_architecture_version,
         }
 
     @classmethod

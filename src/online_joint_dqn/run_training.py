@@ -59,7 +59,7 @@ import training_pool_contract as pool_contract  # noqa: E402
 
 
 RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v13_validation_selection"
-CHECKPOINT_SCHEMA_VERSION = 14
+CHECKPOINT_SCHEMA_VERSION = 15
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4
