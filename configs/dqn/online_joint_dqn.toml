@@ -76,7 +76,7 @@ popularity_gru = "data/generated/popularity_gru.pt"
 # SUMO 基础时间步，同时也是 MEC 基础 slot，单位 s。当前实际值来自已生成数据。
 dt_s = 1.0
 # warm-up 时间，单位 s。只用于建立历史状态，不计入正式系统效用。
-warmup_time_s = 100.0
+warmup_time_s = 60.0
 # 正式优化 episode 长度，单位 s。当前正式数据覆盖 300 个 slot。
 episode_time_s = 300.0
 # 研究车辆数量。正式固定值为 5 SV + 20 TV；ID 从 vehicle_roles.json 读取。
@@ -92,6 +92,8 @@ traffic_seed = 4401
 # randomTrips 出发窗口的实际边界，单位 s；metadata 会记录这两个值。
 random_trips_departure_begin_s = 0.0
 random_trips_departure_end_s = 60.0
+# Candidate departures are generated only in [0, 60) seconds for each independent Episode.
+# This is not a continuous-stream traffic demand rate.
 random_trips_period_s = 1.0
 random_trips_min_distance_m = 4000.0
 random_trips_intermediate = 2
@@ -118,6 +120,8 @@ input_size_max_kb = 1000.0
 # Table I 校准的计算密度范围，单位 cycle/bit。
 cycles_per_bit_min = 400.0
 cycles_per_bit_max = 1000.0
+# Shared service catalog RNG seed; independent from all episode streams.
+catalog_seed = 20261024
 
 [task]
 # Bernoulli 任务到达概率 lambda。正式固定值为 0.7；修改需要重生成任务。

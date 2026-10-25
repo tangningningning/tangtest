@@ -64,7 +64,7 @@ class ScenarioConfig:
     service_vehicle_role_seed: int | None = None
 
     # 仅在 data/ 下没有可直接运行的交通需求时使用官方 randomTrips.py。
-    random_trips_period_s: float = 1.0
+    random_trips_period_s: float = 6.0
     random_trips_departure_begin_s: float = 0.0
     random_trips_departure_end_s: float = 60.0
     random_trips_min_distance_m: float = 4000.0

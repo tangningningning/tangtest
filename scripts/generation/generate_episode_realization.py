@@ -15,6 +15,7 @@ import json
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -67,10 +68,14 @@ def protected_output_directories() -> dict[str, set[Path]]:
         if manifest.is_file()
     } if run_root.is_dir() else set()
     pool_root = PROJECT_ROOT / "environment_data"
+    managed_staging_root = (
+        PROJECT_ROOT / "environment_data" / ".formal_vehicle_environment_staging"
+    ).resolve(strict=False)
     episode_directories = {
         manifest.parent.resolve(strict=False)
         for manifest in pool_root.rglob(EPISODE_MANIFEST_FILENAME)
         if manifest.is_file() and manifest.parent.name.startswith("episode_")
+        and not is_within(manifest.parent.resolve(strict=False), managed_staging_root)
     } if pool_root.is_dir() else set()
     pool_directories = {directory.parent for directory in episode_directories}
     return {
@@ -160,7 +165,7 @@ def _generation_config_payload(config: dict[str, Any]) -> dict[str, Any]:
         "schema": EPISODE_MANIFEST_SCHEMA_VERSION,
         "episode_seed_protocol": "adaptive_cache_mec_episode_seed_v1",
         "residual_sampling_contract": RESIDUAL_SAMPLING_CONTRACT,
-        "simulation": {
+    "simulation": {
             key: get(config, f"simulation.{key}")
             for key in (
                 "dt_s",
@@ -177,6 +182,7 @@ def _generation_config_payload(config: dict[str, Any]) -> dict[str, Any]:
                 "random_trips_maxtries",
             )
         },
+        "episode_time_contract": project_config_module.get_episode_data_protocol(config),
         "service": {
             "count": get(config, "service.count"),
             "generation": {
@@ -262,10 +268,17 @@ def _source_artifact_hashes(config: dict[str, Any]) -> dict[str, str]:
 
 
 def build_episode_manifest(
-    config: dict[str, Any], episode_seed: int, output_dir: Path
+    config: dict[str, Any],
+    episode_seed: int,
+    output_dir: Path,
+    traffic_source_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_git_sha, source_git_dirty = _git_identity()
     get = project_config_module.get_config_value
+    time_protocol = project_config_module.get_episode_data_protocol(config)
+    k_max_slots = project_config_module.get_cross_slot_task_parameters(config)[
+        "k_max_slots"
+    ]
     seeds = derive_episode_seeds(int(episode_seed))
     artifact_paths = sorted(
         path
@@ -291,7 +304,10 @@ def build_episode_manifest(
         "simulation": {
             "dt": float(get(config, "simulation.dt_s")),
             "warmup": float(get(config, "simulation.warmup_time_s")),
-            "episode_slots": EXPECTED_SLOTS,
+            "episode_slots": int(time_protocol["arrival_horizon_slots"]),
+            "arrival_horizon_slots": int(time_protocol["arrival_horizon_slots"]),
+            "execution_horizon_slots": int(time_protocol["execution_horizon_slots"]),
+            "k_max_slots": int(k_max_slots),
         },
         "vehicle_counts": {
             "research": int(get(config, "simulation.num_research_vehicles")),
@@ -325,13 +341,23 @@ def build_episode_manifest(
         "generated_artifacts": sorted(artifact_hashes),
         "generated_artifact_sha256": artifact_hashes,
     }
+    if traffic_source_provenance is not None:
+        manifest["traffic_source_provenance"] = traffic_source_provenance
     return manifest
 
 
 def write_episode_manifest(
-    config: dict[str, Any], episode_seed: int, output_dir: Path
+    config: dict[str, Any],
+    episode_seed: int,
+    output_dir: Path,
+    traffic_source_provenance: dict[str, Any] | None = None,
 ) -> Path:
-    manifest = build_episode_manifest(config, episode_seed, output_dir)
+    manifest = build_episode_manifest(
+        config,
+        episode_seed,
+        output_dir,
+        traffic_source_provenance=traffic_source_provenance,
+    )
     path = output_dir / EPISODE_MANIFEST_FILENAME
     with path.open("w", encoding="utf-8", newline="\n") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -499,7 +525,7 @@ def build_sumo_config(
         research_vehicle_role_seed=int(seeds["research_role_seed"]),
         service_vehicle_role_seed=int(seeds["service_role_seed"]),
         random_trips_period_s=float(
-            get(config, "simulation.random_trips_period_s", 1.0)
+            get(config, "simulation.random_trips_period_s", 6.0)
         ),
         random_trips_departure_begin_s=float(
             get(config, "simulation.random_trips_departure_begin_s", 0.0)
@@ -524,6 +550,7 @@ def validate_written_outputs(
     task_vehicle_count: int,
     research_vehicle_count: int,
     horizon_steps: int,
+    origin_count: int = EXPECTED_SLOTS,
 ) -> None:
     popularity_file = output_dir / "popularity.csv"
     popularity_history_file = output_dir / "popularity_history.csv"
@@ -572,18 +599,22 @@ def validate_written_outputs(
     with prediction_file.open("r", encoding="utf-8", newline="") as stream:
         prediction_rows = list(csv.DictReader(stream))
     prediction_origins = {int(row["origin_slot"]) for row in prediction_rows}
-    if prediction_origins != set(range(EXPECTED_SLOTS)):
-        raise AssertionError("popularity_predictions.csv does not cover origins 0..299")
+    if prediction_origins != set(range(origin_count)):
+        raise AssertionError(
+            f"popularity_predictions.csv does not cover origins 0..{origin_count - 1}"
+        )
 
     with vehicle_prediction_file.open(
         "r", encoding="utf-8", newline=""
     ) as stream:
         vehicle_rows = list(csv.DictReader(stream))
     vehicle_origins = {int(row["origin_slot"]) for row in vehicle_rows}
-    if vehicle_origins != set(range(EXPECTED_SLOTS)):
-        raise AssertionError("vehicle_predictions.csv does not cover origins 0..299")
+    if vehicle_origins != set(range(origin_count)):
+        raise AssertionError(
+            f"vehicle_predictions.csv does not cover origins 0..{origin_count - 1}"
+        )
     expected_vehicle_rows = (
-        EXPECTED_SLOTS * horizon_steps * research_vehicle_count
+        origin_count * horizon_steps * research_vehicle_count
     )
     if len(vehicle_rows) != expected_vehicle_rows:
         raise AssertionError("vehicle_predictions.csv has an unexpected row count")
@@ -593,7 +624,7 @@ def validate_written_outputs(
         prediction_ids.setdefault(key, []).append(str(row["vehicle_id"]))
     expected_prediction_keys = {
         (origin, horizon)
-        for origin in range(EXPECTED_SLOTS)
+        for origin in range(origin_count)
         for horizon in range(horizon_steps)
     }
     if set(prediction_ids) != expected_prediction_keys or any(
@@ -608,10 +639,12 @@ def validate_written_outputs(
 
     with np.load(scenario_file, allow_pickle=False) as payload:
         origins = np.asarray(payload["origin_slots"], dtype=np.int64)
-        if not np.array_equal(origins, np.arange(EXPECTED_SLOTS, dtype=np.int64)):
-            raise AssertionError("prediction_scenarios.npz origins are not 0..299")
+        if not np.array_equal(origins, np.arange(origin_count, dtype=np.int64)):
+            raise AssertionError(
+                f"prediction_scenarios.npz origins are not 0..{origin_count - 1}"
+            )
         positions = np.asarray(payload["positions_xy"])
-        if positions.shape[0] != EXPECTED_SLOTS:
+        if positions.shape[0] != origin_count:
             raise AssertionError("prediction_scenarios.npz is not a full episode")
         vehicle_ids = tuple(np.asarray(payload["vehicle_ids"]).astype(str).tolist())
         role_ids = np.asarray(payload["vehicle_roles"]).astype(str).tolist()
@@ -659,6 +692,12 @@ def run_episode(
     output_dir: Path,
     sumo_home_arg: str | None,
     device_name: str,
+    *,
+    observed_trajectory_rows: list[dict[str, Any]] | None = None,
+    observed_route_cache: dict[str, dict[str, Any]] | None = None,
+    observed_vehicle_ids: set[str] | None = None,
+    traffic_source_provenance: dict[str, Any] | None = None,
+    origin_count: int = EXPECTED_SLOTS,
 ) -> dict[str, float | int | str]:
     config = load_and_validate_config(config_file)
     seeds = derive_episode_seeds(episode_seed)
@@ -703,31 +742,65 @@ def run_episode(
 
     total_start = time.perf_counter()
 
+    protocol = project_config_module.get_episode_data_protocol(config)
+    execution_slots = int(protocol["execution_horizon_slots"])
+    arrival_slots = int(protocol["arrival_horizon_slots"])
+    if arrival_slots != EXPECTED_SLOTS:
+        raise ValueError(
+            f"formal task-arrival horizon must be {EXPECTED_SLOTS}, got {arrival_slots}"
+        )
+    if not EXPECTED_SLOTS <= int(origin_count) <= execution_slots:
+        raise ValueError(
+            f"origin_count must be in [{EXPECTED_SLOTS}, {execution_slots}], got {origin_count}"
+        )
+
     sumo_start = time.perf_counter()
-    sumo_config = build_sumo_config(config, seeds)
+    arrival_sumo_config = build_sumo_config(config, seeds)
+    sumo_config = replace(
+        arrival_sumo_config,
+        episode_time_s=execution_slots * float(arrival_sumo_config.dt_s),
+    )
     sumo_config.validate()
     sumo_home = sumo.find_sumo_home(sumo_home_arg)
-    sumolib, traci = sumo.load_sumo_modules(sumo_home)
-    source = sumo.generate_random_trips(
-        project_root=PROJECT_ROOT,
-        sumo_home=sumo_home,
-        network_file=network_file,
-        output_dir=output_dir,
-        config=sumo_config,
-    )
-    binary = sumo.find_sumo_binary(sumolib, gui=False)
-    command = sumo.build_sumo_command(binary, source, sumo_config)
-    rows, route_cache, seen_ids, _ = sumo.collect_trajectories(
-        traci,
-        command,
-        sumo_config,
-    )
+    if observed_trajectory_rows is None:
+        if any(
+            value is not None
+            for value in (observed_route_cache, observed_vehicle_ids)
+        ):
+            raise ValueError("precomputed traffic provenance requires trajectory rows")
+        sumolib, traci = sumo.load_sumo_modules(sumo_home)
+        source = sumo.generate_random_trips(
+            project_root=PROJECT_ROOT,
+            sumo_home=sumo_home,
+            network_file=network_file,
+            output_dir=output_dir,
+            config=sumo_config,
+        )
+        binary = sumo.find_sumo_binary(sumolib, gui=False)
+        command = sumo.build_sumo_command(binary, source, sumo_config)
+        rows, route_cache, seen_ids, _ = sumo.collect_trajectories(
+            traci,
+            command,
+            sumo_config,
+        )
+        role_config = sumo_config
+    else:
+        if observed_route_cache is None or observed_vehicle_ids is None:
+            raise ValueError("precomputed traffic requires route metadata and observed IDs")
+        rows = observed_trajectory_rows
+        route_cache = observed_route_cache
+        seen_ids = observed_vehicle_ids
+        role_config = replace(
+            sumo_config,
+            episode_time_s=execution_slots * float(sumo_config.dt_s),
+        )
+        role_config.validate()
     if not rows:
         raise RuntimeError("SUMO produced no trajectory rows")
     complete_ids, route_metadata, formal_steps = sumo.find_complete_vehicles(
         rows,
         route_cache,
-        sumo_config,
+        role_config,
     )
     if len(complete_ids) < sumo_config.num_research_vehicles:
         raise RuntimeError(
@@ -738,15 +811,22 @@ def run_episode(
         complete_ids,
         route_metadata,
         seen_ids,
-        sumo_config,
+        role_config,
     )
     if not selection_reproducible:
         raise AssertionError("role assignment is not reproducible")
+    roles["episode_time"] = execution_slots * float(sumo_config.dt_s)
+    roles["simulation_end_time"] = float(sumo_config.warmup_time_s) + (
+        execution_slots * float(sumo_config.dt_s)
+    )
+    roles["arrival_horizon_slots"] = arrival_slots
+    roles["execution_horizon_slots"] = execution_slots
+    roles["formal_time_slot_count"] = len(formal_steps)
     trajectory_file = output_dir / "trajectory.csv"
     roles_file = output_dir / "vehicle_roles.json"
     sumo.write_trajectory_csv(rows, trajectory_file)
     sumo.write_roles_json(roles, roles_file)
-    sumo.validate_outputs(trajectory_file, roles_file, complete_ids, sumo_config)
+    sumo.validate_outputs(trajectory_file, roles_file, complete_ids, role_config)
     sumo_runtime = time.perf_counter() - sumo_start
 
     task_start = time.perf_counter()
@@ -804,6 +884,8 @@ def run_episode(
             str(gru_file),
             "--prediction-file",
             str(prediction_file),
+            "--origin-count",
+            str(origin_count),
             "--device",
             device_name,
         ]
@@ -843,6 +925,8 @@ def run_episode(
             str(network_file),
             "--sumo-home",
             str(sumo_home),
+            "--origin-count",
+            str(origin_count),
             "--device",
             device_name,
         ]
@@ -856,15 +940,26 @@ def run_episode(
         task_vehicle_count=len(tv_ids),
         research_vehicle_count=len(roles["research_vehicles"]),
         horizon_steps=horizon_steps,
+        origin_count=origin_count,
     )
-    manifest_path = write_episode_manifest(config, int(episode_seed), output_dir)
+    manifest_path = write_episode_manifest(
+        config,
+        int(episode_seed),
+        output_dir,
+        traffic_source_provenance=traffic_source_provenance,
+    )
     assert_snapshot_unchanged("data/generated", protected_data, protected_before)
     total_runtime = time.perf_counter() - total_start
 
     print("单 Episode realization 生成完成：")
     print(f"  episode_seed={episode_seed}")
     print(f"  derived_stream_count={len(EPISODE_SEED_STREAMS)}")
-    print(f"  episode_slots={len(formal_steps)}; origin_range=0..{len(formal_steps) - 1}")
+    print(f"  physical_slots={len(formal_steps)}; origin_count={origin_count}")
+    print(
+        "  complete_candidate_count="
+        f"{len(complete_ids)}; selected_research_count={len(roles['research_vehicles'])}; "
+        f"SV={len(roles['service_vehicles'])}; TV={len(roles['task_vehicles'])}"
+    )
     print("  shared_service_catalog_reused=True")
     print("  frozen_gru_reused=True; gru_trained=False")
     print("  frozen_calibration_reused=True; calibration_updated=False")

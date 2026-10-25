@@ -10,6 +10,7 @@ generation logic, and it never writes the shared ``data/generated`` assets.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -61,6 +62,8 @@ def _validate_complete_realization(
     *,
     config: dict[str, Any],
     episode_seed: int,
+    origin_count: int = realization_generator.EXPECTED_SLOTS,
+    split: str | None = None,
 ) -> None:
     missing = _missing_artifacts(directory)
     if missing:
@@ -76,12 +79,54 @@ def _validate_complete_realization(
         task_vehicle_count=int(get(config, "simulation.num_task_vehicles")),
         research_vehicle_count=int(get(config, "simulation.num_research_vehicles")),
         horizon_steps=int(get(config, "prediction.vehicle.horizon")),
+        origin_count=int(origin_count),
     )
     realization_generator.validate_episode_provenance(
         directory,
         config,
         int(episode_seed),
     )
+    if split is not None:
+        manifest = json.loads(
+            (directory / realization_generator.EPISODE_MANIFEST_FILENAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        if manifest.get("traffic_source_provenance") != independent_episode_traffic_provenance(
+            config, split, int(episode_seed)
+        ):
+            raise RuntimeError(
+                f"independent Episode traffic identity mismatch: split={split}, seed={episode_seed}"
+            )
+
+
+def independent_episode_traffic_provenance(
+    config: dict[str, Any],
+    split: str,
+    seed: int,
+) -> dict[str, Any]:
+    streams = realization_generator.derive_episode_seeds(int(seed))
+    get = project_config.get_config_value
+    protocol = project_config.get_episode_data_protocol(config)
+    return {
+        "schema_version": "independent_episode_sumo_v1",
+        "split": split,
+        "episode_seed": int(seed),
+        "sumo_seed": int(streams["sumo_seed"]),
+        "traffic_seed": int(streams["traffic_seed"]),
+        "warmup_time_s": float(get(config, "simulation.warmup_time_s")),
+        "arrival_horizon_slots": int(protocol["arrival_horizon_slots"]),
+        "execution_horizon_slots": int(protocol["execution_horizon_slots"]),
+        "simulation_end_time_s": float(get(config, "simulation.warmup_time_s"))
+        + int(protocol["execution_horizon_slots"])
+        * float(get(config, "simulation.dt_s")),
+        "random_trips_period_s": float(get(config, "simulation.random_trips_period_s")),
+        "random_trips_departure_begin_s": float(get(config, "simulation.random_trips_departure_begin_s")),
+        "random_trips_departure_end_s": float(get(config, "simulation.random_trips_departure_end_s")),
+        "random_trips_min_distance_m": float(get(config, "simulation.random_trips_min_distance_m")),
+        "random_trips_intermediate": int(get(config, "simulation.random_trips_intermediate")),
+        "random_trips_maxtries": int(get(config, "simulation.random_trips_maxtries")),
+    }
 
 
 def _episode_directory(pool_dir: Path, seed: int) -> Path:
@@ -121,6 +166,9 @@ def generate_pool(
     count: int,
     sumo_home: str | None,
     device: str,
+    *,
+    origin_count: int = realization_generator.EXPECTED_SLOTS,
+    split: str | None = None,
 ) -> None:
     if int(count) <= 0:
         raise ValueError("count must be greater than zero")
@@ -135,6 +183,13 @@ def generate_pool(
         )
 
     config = realization_generator.load_and_validate_config(config_file)
+    protocol = project_config.get_episode_data_protocol(config)
+    if not int(protocol["arrival_horizon_slots"]) <= int(origin_count) <= int(
+        protocol["execution_horizon_slots"]
+    ):
+        raise ValueError(
+            "origin_count must cover the arrival horizon and not exceed the execution horizon"
+        )
     output_dir = realization_generator.prepare_output_dir(pool_dir)
     started_at = time.perf_counter()
     for index, seed in enumerate(seeds):
@@ -150,6 +205,8 @@ def generate_pool(
                 destination,
                 config=config,
                 episode_seed=seed,
+                origin_count=origin_count,
+                split=split,
             )
             validation_runtime = time.perf_counter() - validation_started_at
             print(
@@ -174,16 +231,25 @@ def generate_pool(
                 destination,
                 sumo_home,
                 device,
+                origin_count=origin_count,
+                traffic_source_provenance=(
+                    independent_episode_traffic_provenance(config, split, seed)
+                    if split is not None
+                    else None
+                ),
             )
             _validate_complete_realization(
                 destination,
                 config=config,
                 episode_seed=seed,
+                origin_count=origin_count,
+                split=split,
             )
         except Exception as exc:
             raise RuntimeError(
-                "episode realization generation failed; remove the partial "
-                f"directory before retrying: seed={seed}, directory={destination}"
+                "episode realization generation failed; partial output is preserved and "
+                "will not be overwritten: "
+                f"seed={seed}, directory={destination}, cause={type(exc).__name__}: {exc}"
             ) from exc
         runtime = time.perf_counter() - episode_started_at
         print(
@@ -212,6 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count", type=int, required=True)
     parser.add_argument("--sumo-home", default=None)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--origin-count", type=int, default=realization_generator.EXPECTED_SLOTS)
+    parser.add_argument("--split", choices=("train", "validation", "test"), default=None)
     return parser
 
 
@@ -229,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
             args.count,
             args.sumo_home,
             args.device,
+            origin_count=args.origin_count,
+            split=args.split,
         )
         return 0
     except Exception as exc:

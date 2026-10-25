@@ -249,11 +249,16 @@ def build_vehicle_nominal_predictions(
     horizon_steps: int,
     prediction_rows: list[dict[str, Any]] | None = None,
     observation_noise_seed: int | None = None,
+    execution_horizon_slots: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, veh.RouteGeometry], dict[str, dict[int, veh.TruthSample]]]:
     dt_s = float(roles.get("dt", residual_bank["dt"]))
     warmup_s = float(roles.get("warmup_time", 100.0))
     episode_s = float(roles.get("episode_time", 300.0))
-    num_slots = int(round(episode_s / dt_s))
+    num_slots = (
+        int(round(episode_s / dt_s))
+        if execution_horizon_slots is None
+        else int(execution_horizon_slots)
+    )
 
     pred_config = veh.PredictionConfig(
         horizon_steps=horizon_steps,
@@ -271,7 +276,7 @@ def build_vehicle_nominal_predictions(
         truth,
         research_ids,
         warmup_s,
-        episode_s,
+        num_slots * dt_s,
         dt_s,
     )
 
@@ -633,9 +638,22 @@ def sample_tasks(
     task_config: TaskConfig,
     config: ScenarioConfig,
     rngs_by_origin: list[dict[str, np.random.Generator]],
+    *,
+    origin_slots: np.ndarray | None = None,
+    arrival_horizon_slots: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
     services = catalog_by_id(catalog_json["services"])
     n_origin, horizon_steps, num_services = rho_hat.shape
+    origins = (
+        np.arange(n_origin, dtype=np.int64)
+        if origin_slots is None
+        else np.asarray(origin_slots, dtype=np.int64)
+    )
+    if origins.shape != (n_origin,):
+        raise ValueError("origin_slots shape does not match rho_hat.")
+    arrival_limit = n_origin if arrival_horizon_slots is None else int(arrival_horizon_slots)
+    if arrival_limit < 0:
+        raise ValueError("arrival_horizon_slots cannot be negative.")
     n_tv = len(tv_ids)
     arrival = np.zeros(
         (n_origin, config.num_scenarios, horizon_steps, n_tv),
@@ -651,6 +669,9 @@ def sample_tasks(
         workload_rng = rngs_by_origin[origin_index]["workload"]
         for scenario_index in range(config.num_scenarios):
             for horizon in range(horizon_steps):
+                target_slot = int(origins[origin_index]) + horizon
+                if target_slot >= arrival_limit:
+                    continue
                 probabilities = rho_hat[origin_index, horizon].astype(np.float64)
                 probabilities = probabilities / probabilities.sum()
                 arrivals = (
@@ -688,9 +709,26 @@ def sample_tasks(
                         sampled_cycles
                     )
 
+    valid_targets = (
+        origins[:, None] + np.arange(horizon_steps, dtype=np.int64)[None, :]
+    ) < arrival_limit
+    valid_arrivals = arrival[
+        np.broadcast_to(
+            valid_targets[:, None, :, None],
+            (n_origin, config.num_scenarios, horizon_steps, n_tv),
+        )
+    ]
     stats = {
-        "predicted_arrival_empirical_rate": float(np.mean(arrival)),
+        "predicted_arrival_empirical_rate": float(np.mean(valid_arrivals))
+        if valid_arrivals.size
+        else 0.0,
         "arrival_probability_lambda": float(task_config.arrival_probability),
+        "arrival_samples_after_arrival_horizon": int(
+            np.count_nonzero(arrival[~np.broadcast_to(
+                valid_targets[:, None, :, None],
+                (n_origin, config.num_scenarios, horizon_steps, n_tv),
+            )])
+        ),
     }
     return arrival, service_id, input_size, cpu_cycles, stats
 
@@ -771,6 +809,7 @@ def verify_scenarios(
     rho_hat: np.ndarray,
     task_config: TaskConfig,
     num_services: int,
+    arrival_horizon_slots: int | None = None,
 ) -> None:
     arrays = (positions_xy, arrival, service_id, input_size, cpu_cycles, rho_hat)
     if not all(np.all(np.isfinite(array)) for array in arrays):
@@ -796,7 +835,17 @@ def verify_scenarios(
             cpu_cycles[has_arrival] <= 0.0
         ):
             raise AssertionError("arrival=1 时 D/L 必须大于 0。")
-    empirical = float(np.mean(arrival))
+    arrival_limit = arrival.shape[0] if arrival_horizon_slots is None else int(arrival_horizon_slots)
+    origin_slots = np.arange(arrival.shape[0], dtype=np.int64)
+    valid_targets = (
+        origin_slots[:, None] + np.arange(arrival.shape[2], dtype=np.int64)[None, :]
+    ) < arrival_limit
+    valid_mask = np.broadcast_to(
+        valid_targets[:, None, :, None], arrival.shape
+    )
+    if np.any(arrival[~valid_mask]):
+        raise AssertionError("execution-tail scenario arrivals must be zero.")
+    empirical = float(np.mean(arrival[valid_mask])) if np.any(valid_mask) else 0.0
     tolerance = max(
         0.05,
         4.0
@@ -838,6 +887,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vehicle-prediction-file", default=None)
     parser.add_argument("--net-file", default=None)
     parser.add_argument("--sumo-home", default=None)
+    parser.add_argument(
+        "--origin-count",
+        type=int,
+        default=None,
+        help="formal decision origins; can include the no-arrival execution tail",
+    )
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
     return parser
 
@@ -981,10 +1036,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "vehicle_roles.json 角色数量与 configs/dqn/online_joint_dqn.toml 的正式数量不一致。"
             )
+        protocol = project_config_module.get_episode_data_protocol(formal_config)
+        execution_slots = int(protocol["execution_horizon_slots"])
+        arrival_slots = int(protocol["arrival_horizon_slots"])
         for role_key, config_key in (
             ("dt", "simulation.dt_s"),
             ("warmup_time", "simulation.warmup_time_s"),
-            ("episode_time", "simulation.episode_time_s"),
         ):
             configured = float(get_value(formal_config, config_key))
             if role_key in roles and not math.isclose(
@@ -993,6 +1050,32 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     f"vehicle_roles.json 的 {role_key} 与 configs/dqn/online_joint_dqn.toml 不一致。"
                 )
+        expected_execution_time_s = execution_slots * float(
+            get_value(formal_config, "simulation.dt_s")
+        )
+        if "execution_horizon_slots" in roles:
+            if (
+                int(roles.get("arrival_horizon_slots", -1)) != arrival_slots
+                or int(roles.get("execution_horizon_slots", -1)) != execution_slots
+                or not math.isclose(
+                    float(roles.get("episode_time", math.nan)),
+                    expected_execution_time_s,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError(
+                    "vehicle_roles.json arrival/execution time contract differs from formal config."
+                )
+        elif "episode_time" in roles and not math.isclose(
+            float(roles["episode_time"]),
+            float(get_value(formal_config, "simulation.episode_time_s")),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "vehicle_roles.json 的 episode_time 与 configs/dqn/online_joint_dqn.toml 不一致。"
+            )
         residual_bank = load_residual_bank(residual_file)
         if int(residual_bank["H_p"]) != config.horizon_steps:
             raise ValueError("residual_blocks H_p 与 scenario H_p 不一致。")
@@ -1035,8 +1118,37 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 f"formal popularity slots={num_slots} 与 configs/dqn/online_joint_dqn.toml={configured_num_slots} 不一致。"
             )
-        origin_slots = np.arange(num_slots, dtype=np.int64)
-        origin_times = np.asarray([times[int(slot)] for slot in origin_slots], dtype=np.float64)
+        origin_count = num_slots if args.origin_count is None else int(args.origin_count)
+        if not num_slots <= origin_count <= execution_slots:
+            raise ValueError(
+                "origin-count must cover the arrival horizon and not exceed execution horizon: "
+                f"arrival={num_slots}, requested={origin_count}, execution={execution_slots}"
+            )
+        prediction_request_counts = request_counts
+        if origin_count > num_slots:
+            # No tasks arrive in the execution tail, so zero counts are known
+            # causal observations; no rho_star labels are appended.
+            prediction_request_counts = np.concatenate(
+                (
+                    request_counts,
+                    np.zeros(
+                        (origin_count - num_slots, request_counts.shape[1]),
+                        dtype=request_counts.dtype,
+                    ),
+                ),
+                axis=0,
+            )
+        origin_slots = np.arange(origin_count, dtype=np.int64)
+        dt_s = float(get_value(formal_config, "simulation.dt_s"))
+        origin_times = np.asarray(
+            [
+                times[int(slot)]
+                if int(slot) < len(times)
+                else float(times[-1] + (int(slot) - len(times) + 1) * dt_s)
+                for slot in origin_slots
+            ],
+            dtype=np.float64,
+        )
         scenario_ids = np.arange(config.num_scenarios, dtype=np.int64)
         horizons = np.arange(config.horizon_steps, dtype=np.int64)
 
@@ -1062,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
             config.horizon_steps,
             formal_vehicle_prediction_rows,
             config.vehicle_observation_seed,
+            execution_horizon_slots=execution_slots,
         )
         expected_vehicle_prediction_rows = (
             len(origin_slots)
@@ -1076,7 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
         rho_hat, checkpoint_metadata = predict_rho_hat(
             checkpoint_file,
             history_request_counts,
-            request_counts,
+            prediction_request_counts,
             origin_slots,
             config,
             device,
@@ -1103,6 +1216,8 @@ def main(argv: list[str] | None = None) -> int:
             task_config,
             config,
             rngs_by_origin,
+            origin_slots=origin_slots,
+            arrival_horizon_slots=num_slots,
         )
         distance_stats = relative_distance_sanity(
             positions_xy,
@@ -1122,6 +1237,7 @@ def main(argv: list[str] | None = None) -> int:
             rho_hat,
             task_config,
             int(service_catalog["service_count"]),
+            arrival_horizon_slots=num_slots,
         )
 
         # 同 seed 完全重放：重新生成 residual 和任务随机过程，检查 CRN 接口稳定。
@@ -1146,6 +1262,8 @@ def main(argv: list[str] | None = None) -> int:
             task_config,
             config,
             repeat_rngs_by_origin,
+            origin_slots=origin_slots,
+            arrival_horizon_slots=num_slots,
         )
         if not np.array_equal(positions_xy, repeat_positions):
             raise AssertionError("相同 scenario_seed 未复现 positions_xy。")
@@ -1173,8 +1291,15 @@ def main(argv: list[str] | None = None) -> int:
             "vehicle_observation_seed": config.vehicle_observation_seed,
             "lambda": task_config.arrival_probability,
             "residual_bank_source": "independent_calibration_artifact",
-            "formal_time_slot_count": int(num_slots),
+            "arrival_horizon_slots": int(num_slots),
+            "execution_horizon_slots": int(execution_slots),
+            "formal_time_slot_count": int(origin_count),
             "formal_origin_count": int(len(origin_slots)),
+            "execution_tail_request_observation": (
+                "known_zero_counts_under_no_new_task_arrivals_contract"
+                if origin_count > num_slots
+                else "not_requested"
+            ),
             "prediction_tail_origins": [
                 int(origin)
                 for origin in origin_slots

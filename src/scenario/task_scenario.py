@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -254,6 +255,141 @@ def stratified_uniform_samples(
     return np.clip(samples, lower, upper).astype(np.float64, copy=False)
 
 
+SERVICE_CATALOG_GENERATOR_VERSION = "shared_service_catalog_v1"
+SERVICE_CATALOG_RNG_STREAMS = ("service_catalog",)
+
+
+def make_rngs(
+    master_seed: int,
+    stream_names: tuple[str, ...],
+) -> tuple[dict[str, np.random.Generator], dict[str, int]]:
+    """Derive independent, reproducible NumPy streams from one catalog seed."""
+    if isinstance(master_seed, (bool, np.bool_)) or int(master_seed) != master_seed:
+        raise ValueError("master_seed 必须是整数。")
+    if len(stream_names) != len(set(stream_names)) or not stream_names:
+        raise ValueError("stream_names 必须非空且不能重复。")
+    root = np.random.SeedSequence(int(master_seed))
+    children = root.spawn(len(stream_names))
+    rngs: dict[str, np.random.Generator] = {}
+    child_seeds: dict[str, int] = {}
+    for name, child in zip(stream_names, children, strict=True):
+        rngs[str(name)] = np.random.default_rng(child)
+        child_seeds[str(name)] = int(child.generate_state(1, dtype=np.uint64)[0])
+    return rngs, child_seeds
+
+
+def make_service_catalog(
+    config: TaskConfig,
+    rng: np.random.Generator,
+) -> list[dict[str, Any]]:
+    """Build the shared catalog with independently stratified dimensions."""
+    # Catalog generation is independent of any episode's actual TV identities;
+    # one placeholder is sufficient for TaskConfig's non-empty-TV validation.
+    config.validate(num_tv=1)
+    service_size_samples_gb = stratified_uniform_samples(
+        rng,
+        config.num_services,
+        config.service_size_min_gb,
+        config.service_size_max_gb,
+    )
+    input_size_samples_kb = stratified_uniform_samples(
+        rng,
+        config.num_services,
+        config.input_size_min_kb,
+        config.input_size_max_kb,
+    )
+    cycle_samples = stratified_uniform_samples(
+        rng,
+        config.num_services,
+        config.cycles_per_bit_min,
+        config.cycles_per_bit_max,
+    )
+    permutations = tuple(rng.permutation(config.num_services) for _ in range(3))
+
+    catalog: list[dict[str, Any]] = []
+    for service_id in range(config.num_services):
+        service_size_gb = float(service_size_samples_gb[permutations[0][service_id]])
+        input_size_kb = float(input_size_samples_kb[permutations[1][service_id]])
+        catalog.append(
+            {
+                "service_id": service_id,
+                "program_size": service_size_gb * SERVICE_SIZE_MB_PER_GB,
+                "service_size": service_size_gb,
+                "service_size_gb": service_size_gb,
+                "mean_input_size": input_size_kb * INPUT_SIZE_BITS_PER_KB,
+                "input_size_kb": input_size_kb,
+                "cycles_per_bit": float(cycle_samples[permutations[2][service_id]]),
+            }
+        )
+    catalog_by_id(catalog)
+    service_parameter_stratum_summary(catalog, config)
+    return catalog
+
+
+def make_shared_service_catalog_output(
+    config: TaskConfig,
+    master_seed: int,
+) -> dict[str, Any]:
+    """Create a globally shared catalog without episode-specific metadata."""
+    rngs, child_seeds = make_rngs(master_seed, SERVICE_CATALOG_RNG_STREAMS)
+    services = make_service_catalog(config, rngs["service_catalog"])
+    generation_contract = {
+        "generator_version": SERVICE_CATALOG_GENERATOR_VERSION,
+        "master_seed": int(master_seed),
+        "child_seeds": child_seeds,
+        "service_count": int(config.num_services),
+        "parameter_ranges": {
+            "service_size_gb": [
+                float(config.service_size_min_gb),
+                float(config.service_size_max_gb),
+            ],
+            "input_size_kb": [
+                float(config.input_size_min_kb),
+                float(config.input_size_max_kb),
+            ],
+            "cycles_per_bit": [
+                float(config.cycles_per_bit_min),
+                float(config.cycles_per_bit_max),
+            ],
+        },
+        "units": {
+            "service_size": "GB",
+            "program_size": "MB",
+            "input_size_range": "KB",
+            "mean_input_size": "bit",
+            "cycles_per_bit": "cycle/bit",
+        },
+        "sampling": {
+            "mode": SERVICE_GENERATION_MODE,
+            "parameter_assignment": SERVICE_PARAMETER_ASSIGNMENT,
+            "stratified_sample_count_per_dimension": int(config.num_services),
+        },
+    }
+    identity_json = json.dumps(
+        generation_contract,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    generation_contract["configuration_identity_sha256"] = hashlib.sha256(
+        identity_json.encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "service_count": int(config.num_services),
+        "units": generation_contract["units"],
+        "provisional_defaults": False,
+        "task_type_definition": TASK_TYPE_DEFINITION,
+        "service_generation_mode": SERVICE_GENERATION_MODE,
+        "parameter_assignment": SERVICE_PARAMETER_ASSIGNMENT,
+        "parameter_ranges": generation_contract["parameter_ranges"],
+        "strata_count": int(config.num_services),
+        "generator_version": SERVICE_CATALOG_GENERATOR_VERSION,
+        "generation_contract": generation_contract,
+        "validation_summary": service_parameter_stratum_summary(services, config),
+        "services": services,
+    }
 
 
 def catalog_by_id(catalog: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:

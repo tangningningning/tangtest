@@ -52,6 +52,9 @@ PROGRESS_SCHEMA_VERSION = "continuous_sumo_progress_v1"
 TRAJECTORY_FORMAT_VERSION = "sumo_fcd_xml_gzip_v1"
 ACTIVITY_FORMAT_VERSION = "vehicle_activity_csv_gzip_v1"
 CHECKPOINT_PERIOD_S = 600.0
+FORMAL_RANDOM_TRIPS_PERIOD_S = 6.0
+FCD_SIZE_BENCHMARK_PERIOD_S = 1.0
+FCD_SIZE_BENCHMARK_BYTES_PER_SIM_SECOND = 38_000
 DEFAULT_CONFIG = "configs/dqn/online_joint_dqn.toml"
 DEFAULT_SPLIT_MANIFEST = "environment_data/data_split_manifest.json"
 DEFAULT_OUTPUT_DIR = "environment_data/continuous_v1"
@@ -99,6 +102,30 @@ def _canonical_json(value: Any) -> str:
 
 def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def configured_random_trips_period_s(config: dict[str, Any]) -> float:
+    """Read and enforce the formal vehicle-departure interval."""
+    value = project_config.get_config_value(
+        config,
+        "simulation.random_trips_period_s",
+    )
+    if isinstance(value, bool) or value is None:
+        raise ValueError("simulation.random_trips_period_s must be explicitly configured")
+    period_s = float(value)
+    if not math.isfinite(period_s) or period_s <= 0.0:
+        raise ValueError("simulation.random_trips_period_s must be finite and positive")
+    if not math.isclose(
+        period_s,
+        FORMAL_RANDOM_TRIPS_PERIOD_S,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "formal generation requires random_trips_period_s="
+            f"{FORMAL_RANDOM_TRIPS_PERIOD_S:.1f}; actual={period_s}"
+        )
+    return period_s
 
 
 def _sha256_file(path: Path) -> str:
@@ -215,6 +242,19 @@ def _load_source_contract(
     dt_s = float(simulation["dt_s"])
     warmup_s = float(simulation["warmup_time_s"])
     episode_s = float(simulation["episode_time_s"])
+    random_trips_period_s = configured_random_trips_period_s(config)
+    episode_protocol = project_config.get_episode_data_protocol(config)
+    task_timing = project_config.get_cross_slot_task_parameters(config)
+    arrival_slots = int(episode_protocol["arrival_horizon_slots"])
+    execution_slots = int(episode_protocol["execution_horizon_slots"])
+    k_max_slots = int(task_timing["k_max_slots"])
+    if execution_slots != arrival_slots + k_max_slots - 1:
+        raise ValueError(
+            "execution horizon must equal arrival horizon + K_max - 1: "
+            f"arrival={arrival_slots}, K_max={k_max_slots}, execution={execution_slots}"
+        )
+    if not math.isclose(episode_s / dt_s, arrival_slots, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("simulation.episode_time_s must equal the configured arrival horizon.")
     for label, value in (("dt_s", dt_s), ("episode_time_s", episode_s)):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"simulation.{label} must be finite and positive.")
@@ -241,6 +281,10 @@ def _load_source_contract(
         "dt_s": dt_s,
         "warmup_s": warmup_s,
         "episode_s": episode_s,
+        "random_trips_period_s": random_trips_period_s,
+        "arrival_slots": arrival_slots,
+        "execution_slots": execution_slots,
+        "k_max_slots": k_max_slots,
         "network_path": network_path,
         "network_sha256": network_hash,
     }
@@ -255,6 +299,9 @@ def _make_specs(
     dt_s = float(physical["dt_s"])
     warmup_s = float(physical["warmup_s"])
     episode_s = float(physical["episode_s"])
+    execution_tail_s = (
+        int(physical["execution_slots"]) - int(physical["arrival_slots"])
+    ) * dt_s
     slots_per_realization = int(split_manifest["slots_per_realization"])
     specs: list[EpisodeSpec] = []
     for split in selected_splits:
@@ -263,10 +310,10 @@ def _make_specs(
         if split == "train":
             # One stateful SUMO stream spans the 300 sequential DQN episodes.
             seed_values = (start_seed,)
-            duration_s = warmup_s + episode_s * slots_per_realization
+            duration_s = warmup_s + episode_s * slots_per_realization + execution_tail_s
         else:
             seed_values = range(start_seed, int(source["seed_end"]) + 1)
-            duration_s = warmup_s + episode_s
+            duration_s = warmup_s + episode_s + execution_tail_s
         if not math.isclose(duration_s / dt_s, round(duration_s / dt_s), abs_tol=1e-9):
             raise ValueError(f"{split} duration is not aligned to the SUMO time grid.")
         for episode_seed in seed_values:
@@ -326,9 +373,7 @@ def _random_trips_parameters(config: dict[str, Any], spec: EpisodeSpec) -> dict[
             )
         ),
         "departure_end_s": float(spec.departure_end_s),
-        "period_s": float(
-            project_config.get_config_value(config, "simulation.random_trips_period_s", 1.0)
-        ),
+        "period_s": configured_random_trips_period_s(config),
         "min_distance_m": float(
             project_config.get_config_value(config, "simulation.random_trips_min_distance_m", 4000.0)
         ),
@@ -1586,7 +1631,7 @@ def _prepare_dataset_manifest(
                 project_config.get_config_value(config, "simulation.random_trips_departure_end_s", 60.0)
             ),
             "randomTrips_period_s": float(
-                project_config.get_config_value(config, "simulation.random_trips_period_s", 1.0)
+                configured_random_trips_period_s(config)
             ),
             "randomTrips_min_distance_m": float(
                 project_config.get_config_value(config, "simulation.random_trips_min_distance_m", 4000.0)
@@ -1803,11 +1848,49 @@ def _semantic_fcd_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _estimate_resources(specs: list[EpisodeSpec]) -> dict[str, Any]:
+def nominal_departure_count_for_interval(
+    departure_begin_s: float,
+    departure_end_s: float,
+    period_s: float,
+) -> int:
+    """Count equidistant departures at begin + n*period before end."""
+    begin = float(departure_begin_s)
+    end = float(departure_end_s)
+    period = float(period_s)
+    if not all(math.isfinite(value) for value in (begin, end, period)):
+        raise ValueError("randomTrips departure bounds and period must be finite")
+    if begin < 0.0 or end < begin or period <= 0.0:
+        raise ValueError("randomTrips departure interval or period is invalid")
+    if end == begin:
+        return 0
+    # randomTrips emits begin, begin+period, ... while each time is < end.
+    return int(math.ceil((end - begin) / period))
+
+
+def _estimate_resources(
+    specs: list[EpisodeSpec],
+    *,
+    random_trips_period_s: float,
+) -> dict[str, Any]:
+    period_s = float(random_trips_period_s)
+    if not math.isfinite(period_s) or period_s <= 0.0:
+        raise ValueError("randomTrips_period_s must be finite and positive for resource estimation")
     total_sim_s = sum(spec.duration_s for spec in specs)
-    total_vehicle_departures = total_sim_s  # period=1 s under the active configuration
-    conservative_fcd_bytes_per_second = 38_000
-    estimated_fcd_bytes = int(total_sim_s * conservative_fcd_bytes_per_second)
+    total_vehicle_departures = sum(
+        nominal_departure_count_for_interval(
+            spec.departure_begin_s,
+            spec.departure_end_s,
+            random_trips_period_s,
+        )
+        for spec in specs
+    )
+    nominal_departure_rate_per_s = 1.0 / period_s
+    benchmark_departure_rate_per_s = 1.0 / FCD_SIZE_BENCHMARK_PERIOD_S
+    fcd_traffic_scale = nominal_departure_rate_per_s / benchmark_departure_rate_per_s
+    estimated_fcd_bytes_per_sim_second = (
+        FCD_SIZE_BENCHMARK_BYTES_PER_SIM_SECOND * fcd_traffic_scale
+    )
+    estimated_fcd_bytes = int(total_sim_s * estimated_fcd_bytes_per_sim_second)
     estimated_other_bytes = int(total_vehicle_departures * 900)
     estimated_final_bytes = estimated_fcd_bytes + estimated_other_bytes
     train_seconds = sum(spec.duration_s for spec in specs if spec.split == "train")
@@ -1821,8 +1904,13 @@ def _estimate_resources(specs: list[EpisodeSpec]) -> dict[str, Any]:
         "formal_observation_seconds": sum(
             spec.formal_end_s - spec.formal_start_s for spec in specs
         ),
-        "nominal_departure_count_at_period_1_s": int(total_vehicle_departures),
-        "observed_benchmark_fcd_bytes_per_sim_second": conservative_fcd_bytes_per_second,
+        "randomTrips_period_s": period_s,
+        "nominal_departure_rate_per_s": nominal_departure_rate_per_s,
+        "nominal_vehicle_departure_count": int(total_vehicle_departures),
+        "fcd_size_benchmark_period_s": FCD_SIZE_BENCHMARK_PERIOD_S,
+        "observed_benchmark_fcd_bytes_per_sim_second": FCD_SIZE_BENCHMARK_BYTES_PER_SIM_SECOND,
+        "estimated_fcd_bytes_per_sim_second": round(estimated_fcd_bytes_per_sim_second, 3),
+        "estimated_fcd_bytes": estimated_fcd_bytes,
         "estimated_final_bytes": estimated_final_bytes,
         "estimated_peak_working_bytes": 2 * estimated_final_bytes,
         "estimated_sumo_compute_minutes": round(simulated_wall_s / 60.0, 1),
@@ -1833,7 +1921,13 @@ def _estimate_resources(specs: list[EpisodeSpec]) -> dict[str, Any]:
             (simulated_wall_s + route_wall_s + episode_start_overhead_s + validation_wall_s) / 60.0,
             1,
         ),
-        "estimate_note": "Extrapolated from a fixed-end 3600 s SUMO benchmark at the unchanged period=1 s traffic demand; congestion can increase compute and output size.",
+        "estimate_note": (
+            "Nominal departures use the configured equidistant randomTrips period "
+            f"of {period_s:g} s over each [departure_begin_s, departure_end_s) interval. "
+            "FCD byte rate is scaled linearly from the measured 1 s-period benchmark "
+            "by scheduled departure rate; this is an estimate. Route validation may "
+            "discard trips and congestion can change compute and output size."
+        ),
     }
 
 
@@ -1964,7 +2058,18 @@ def main(argv: list[str] | None = None) -> int:
         specs=specs,
         resume=args.resume,
     )
-    dataset_manifest["resource_estimate"] = _estimate_resources(specs)
+    random_trips_period_s = configured_random_trips_period_s(config)
+    if not math.isclose(
+        random_trips_period_s,
+        float(physical["random_trips_period_s"]),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise RuntimeError("traffic interval changed after continuous dataset contract validation")
+    dataset_manifest["resource_estimate"] = _estimate_resources(
+        specs,
+        random_trips_period_s=random_trips_period_s,
+    )
     _atomic_json(output_root / "dataset_manifest.json", dataset_manifest)
     print(
         "[ContinuousSUMO] resource estimate: "

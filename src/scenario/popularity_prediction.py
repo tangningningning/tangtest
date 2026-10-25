@@ -434,7 +434,11 @@ def canonical_prediction_rows(
                 rows.append(
                     {
                         "origin_slot": origin,
-                        "origin_time_s": times[origin],
+                        "origin_time_s": (
+                            float(times[origin])
+                            if origin < len(times)
+                            else float(times[-1] + (origin - len(times) + 1) * dt_s)
+                        ),
                         "observation_cutoff_slot": cutoff,
                         "horizon": horizon,
                         "target_slot": target_slot,
@@ -552,6 +556,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--prediction-file", default=None)
+    parser.add_argument(
+        "--origin-count",
+        type=int,
+        default=None,
+        help="prediction origins to emit; execution-tail observations are zero requests by contract",
+    )
     parser.add_argument("--device", default=None, choices=("cpu", "cuda"))
     return parser
 
@@ -785,10 +795,36 @@ def main(argv: list[str] | None = None) -> int:
                 f"formal popularity slots={canonical_rho_star.shape[0]} 与 configs/dqn/online_joint_dqn.toml="
                 f"{configured_num_slots} 不一致。"
             )
-        origin_slots = np.arange(canonical_rho_star.shape[0], dtype=np.int64)
+        protocol = project_config_module.get_episode_data_protocol(formal_config)
+        execution_slots = int(protocol["execution_horizon_slots"])
+        origin_count = (
+            canonical_rho_star.shape[0]
+            if args.origin_count is None
+            else int(args.origin_count)
+        )
+        if not canonical_rho_star.shape[0] <= origin_count <= execution_slots:
+            raise ValueError(
+                "origin-count must cover the arrival horizon and not exceed the execution horizon: "
+                f"arrival={canonical_rho_star.shape[0]}, requested={origin_count}, execution={execution_slots}"
+            )
+        formal_request_counts = canonical_request_counts
+        if origin_count > len(formal_request_counts):
+            # The task-arrival contract forbids new tasks in the execution tail;
+            # zero request counts are therefore known observations, not labels.
+            formal_request_counts = np.concatenate(
+                (
+                    formal_request_counts,
+                    np.zeros(
+                        (origin_count - len(formal_request_counts), formal_request_counts.shape[1]),
+                        dtype=formal_request_counts.dtype,
+                    ),
+                ),
+                axis=0,
+            )
+        origin_slots = np.arange(origin_count, dtype=np.int64)
         x_can, _ = build_causal_formal_inputs(
             history_request_counts,
-            canonical_request_counts,
+            formal_request_counts,
             config.history_length,
             origin_slots,
         )

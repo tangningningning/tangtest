@@ -1,4 +1,4 @@
-# 车辆环境与任务数据核查报告（2026-10-24）
+# 车辆环境与任务数据核查报告（2026-10-24；2026-10-25 补充）
 
 **结论：`ENVIRONMENT_BLOCKED_MISSING_PARAMETERS`**
 
@@ -36,3 +36,28 @@
 - 后续需提供《13.pdf》中的权威 `K_max` 数值及单位（秒或 slot）。确认前无法验收扩展执行时域或决定最小轨迹补充量。若之后要求端到端跨时隙执行，还需在其他任务中确定活动任务及车辆离场语义。
 
 本结论仅描述环境资产对当前配置的可读性和已核验范围，不代表整个求解系统已满足论文模型。
+
+## 2026-10-25：新环境生成状态与真实 Episode 验证
+
+本节更新新环境重建后的当前状态；上文描述的是 2026-10-24 的旧环境，不代表当前数据池状态。
+
+### 生成状态和身份
+
+- 全量生成仍在 staging 中运行，未发布为正式训练池。核查时 Train 有 **4/300** 个完整 Episode，Validation **0/30**，Test **0/100**；生成进度为 `generating`，当前正在处理 Train seed `20005`。进度文件计数与各 Episode 目录中 `episode_manifest.json` 的实际数量一致。
+- staging split manifest 为 `formal_vehicle_environment_split_manifest_v2`，状态仍是 `generating`；正式目录 `environment_data/proposed_joint_training/` 尚未发布。该清单记录的正式配置 SHA-256 与当前 `configs/dqn/online_joint_dqn.toml` 一致。
+- seed `20001` 的 Episode manifest 列出 10 个生成 artifact；逐项 SHA-256 均匹配。其 314-origin `prediction_scenarios.npz`、车辆/流行度预测、轨迹、任务和角色文件均通过哈希核验。任务输入只覆盖到达 origins 0–299；预测场景 origins 为 0–313。
+- 服务目录当前只在 staging 的 Train 目录中。其 SHA-256=`ae2b4c2cb7122c3ac6b2bc64d789554495e6158a3467aca3f9019a4cee1162d4`，与 split manifest 和 seed `20001` Episode manifest 一致。正式配置指向的 `environment_data/proposed_joint_training/service_catalog_500_1000.json` 尚未出现；单 Episode 加载使用 staging 的 `generation_config.toml`，其中服务目录路径指向同一哈希文件。
+- 使用项目 `load_environment_context` 和 `aligned_execution_steps` 加载 seed `20001`，得到 25 辆研究车辆、20 辆任务车辆、10 种服务和 314 个执行 origins；到达 origins 为 0–299。全池 `training_pool_contract` 尚不能验收，因为完整 300/30/100 数据集和正式路径还未发布。
+
+### Seed 20001 真实执行
+
+- 首次真实执行在 slot 0 报 `NameError: cache_services_added is not defined`。`src/online_joint_dqn/environment_adapter.py` 的缓存服务需求诊断路径引用了未定义的前后服务集合。最小修正为从当前 slot 的执行前后缓存矩阵计算新增/移除服务 ID；该修正只影响诊断信息，不改变 Matching、资源分配或奖励。修正后从 slot 0 重跑。
+- 使用正式对齐输入和 `ExclusiveDQNEnvironment`，每个时隙选择现有合法 `KEEP+STAY`。执行完成 314 个连续时隙，最后 slot 为 313。slots 0–299 到达 4,190 个任务，slots 300–313 到达数为 0。
+- **任务结算：**成功 4,160，超时 30，末尾活动任务 0；唯一终止任务 ID 共 4,190 个，未发现重复结算。跨时隙执行节点对所有 4,190 个任务保持固定。
+- **奖励：**Episode Return=`3940.6937459379133`；逐时隙奖励直接求和=`3940.693745937913`，差约 `3e-13`。314 个时隙均核对 `G(t)=Q(t)-C_ca(t)-C_q(t)`；候选预测评分没有进入实际奖励。KEEP+STAY 下缓存成本和 UAV 移动成本合计均为 0。
+- **资源：**314 次 Matching 调用、19,580 次 KKT 求解调用。301 个有任务的时隙通过资源可行性检查。最大 Edge CPU 利用率为 `1.0000000000009714`，最大 RSU 带宽份额和为 `1.000000000000338`，均只超出 1 约 `1e-12`，在本次 `1e-8` 浮点容差内；未发现非有限或负工作量/资源。Cloud 资源使用为 0，因此本次 KEEP+STAY Episode 没有覆盖 Cloud 实际执行负载。
+- **因果与隔离：**314 个预测 origins 由已生成预测输入加载；逐 slot 诊断均表明状态特征未使用未来真实数据，候选生成未接收当前真实任务或真实车辆位置。执行过程只读 seed `20001`，没有写入其正式 artifacts。场景生成进程仍在运行；验证期间 staging 完整 Episode 数从 2 增至 4，当前处理 seed `20005`。
+
+### 结论
+
+seed `20001` 的单 Episode 314-slot 端到端执行通过。**当前尚不具备启动 Online Joint DQN 正式训练的条件**：Train/Validation/Test 仅完成 4/300、0/30、0/100，split manifest 仍为 `generating`，正式池及正式服务目录路径未发布。Cloud 实际执行负载也未在本次固定 KEEP+STAY rollout 中覆盖。上文关于旧环境 430 个 Episode 的描述是历史记录，不能作为新环境生成完成的证据。

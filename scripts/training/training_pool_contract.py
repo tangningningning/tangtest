@@ -250,7 +250,15 @@ def _validate_pool_config_compatibility(
             "the loader joins explicit IDs and preserves their within-role NPZ order; all "
             "generation config fields remain equal"
         )
-    if manifest.get("config_path") != POOL_MANIFEST_SOURCE_CONFIG_RELATIVE.as_posix():
+    expected_config_path = (
+        CONFIG_RELATIVE.as_posix()
+        if manifest.get("schema_version") in {
+            "formal_episode_pool_v2",
+            "formal_episode_pool_v3",
+        }
+        else POOL_MANIFEST_SOURCE_CONFIG_RELATIVE.as_posix()
+    )
+    if manifest.get("config_path") != expected_config_path:
         raise ValueError(
             "Training Pool config_path does not identify the formal config."
         )
@@ -462,6 +470,55 @@ def _validate_training_integrity_baseline(
     if not baseline_path.is_file():
         raise FileNotFoundError(f"Training Pool integrity baseline is missing: {baseline_path}")
     baseline_hash = _sha256(baseline_path)
+    pool_manifest = json.loads(
+        Path(pool_info["manifest_path"]).read_text(encoding="utf-8")
+    )
+    if pool_manifest.get("schema_version") in {
+        "formal_episode_pool_v2",
+        "formal_episode_pool_v3",
+    }:
+        if baseline_hash != pool_manifest.get("integrity_baseline_sha256"):
+            raise ValueError("New formal pool integrity baseline hash differs from its pool manifest.")
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        expected_new = {
+            "schema_version": "formal_task_data_integrity_baseline_v3",
+            "integrity_baseline_type": "ACTIVE_EPISODE_SNAPSHOT",
+            "task_data_model": "500_1000_KB",
+            "split": "train",
+            "seed_start": DEFAULT_TRAINING_SEED_START,
+            "seed_end": DEFAULT_TRAINING_SEED_START + FORMAL_TRAINING_EPISODE_COUNT - 1,
+            "episode_count": FORMAL_TRAINING_EPISODE_COUNT,
+            "active_episode_seeds": pool_info["active_episode_seeds"],
+            "data_split_manifest_sha256": pool_info["data_split_manifest_sha256"],
+            "dataset_identity_sha256": pool_info["dataset_identity_sha256"],
+            "service_catalog_sha256": pool_info["service_catalog_sha256"],
+        }
+        mismatches = {
+            key: {"baseline": baseline.get(key), "expected": value}
+            for key, value in expected_new.items()
+            if baseline.get(key) != value
+        }
+        entries = baseline.get("episodes")
+        if (
+            mismatches
+            or not isinstance(entries, list)
+            or [int(row.get("episode_seed", -1)) for row in entries]
+            != pool_info["active_episode_seeds"]
+            or int(baseline.get("episode_file_count", -1))
+            != int(pool_manifest.get("episode_file_count", -2))
+        ):
+            raise ValueError(
+                "New formal pool integrity baseline metadata mismatch: "
+                + json.dumps(mismatches, ensure_ascii=False, sort_keys=True)
+            )
+        return {
+            "path": str(baseline_path),
+            "sha256": baseline_hash,
+            "file_count": int(baseline["episode_file_count"]),
+            "active_episode_count": len(entries),
+            "previous_integrity_validation_reused": False,
+            "episode_files_rehashed_at_startup": False,
+        }
     if baseline_hash != FORMAL_TRAINING_POOL_INTEGRITY_BASELINE_SHA256:
         raise ValueError(
             "Training Pool integrity baseline identity changed: "
@@ -596,18 +653,28 @@ def validate_dqn_training_pool_for_run(
         expected_episode_count=FORMAL_TRAINING_EPISODE_COUNT,
         runtime_config=cfg,
     )
-    if pool_info["manifest_sha256"] != FORMAL_TRAINING_POOL_MANIFEST_SHA256:
+    pool_manifest = json.loads(
+        Path(pool_info["manifest_path"]).read_text(encoding="utf-8")
+    )
+    is_new_formal_pool = pool_manifest.get("schema_version") in {
+        "formal_episode_pool_v2",
+        "formal_episode_pool_v3",
+    }
+    if (
+        not is_new_formal_pool
+        and pool_info["manifest_sha256"] != FORMAL_TRAINING_POOL_MANIFEST_SHA256
+    ):
         raise ValueError(
             "Training Pool Manifest identity changed: "
             f"expected={FORMAL_TRAINING_POOL_MANIFEST_SHA256}, "
             f"actual={pool_info['manifest_sha256']}"
         )
-    if pool_info["task_data_contract_sha256"] != FORMAL_TRAINING_TASK_CONTRACT_SHA256:
+    if (
+        not is_new_formal_pool
+        and pool_info["task_data_contract_sha256"] != FORMAL_TRAINING_TASK_CONTRACT_SHA256
+    ):
         raise ValueError("Training Pool task-data contract is not the reviewed contract.")
     baseline_info = _validate_training_integrity_baseline(pool, pool_info)
-    pool_manifest = json.loads(
-        Path(pool_info["manifest_path"]).read_text(encoding="utf-8")
-    )
     return {
         **pool_info,
         "pool_path": str(pool),
@@ -661,6 +728,110 @@ def _validate_episode_snapshot(
     pool_manifest = json.loads(
         Path(pool_info["manifest_path"]).read_text(encoding="utf-8")
     )
+    if pool_manifest.get("schema_version") in {
+        "formal_episode_pool_v2",
+        "formal_episode_pool_v3",
+    }:
+        if (
+            episode_manifest.get("schema_version") != "episode_manifest_v2"
+            or int(episode_manifest.get("episode_seed", -1)) != int(seed)
+            or episode_manifest.get("generation_config_fingerprint")
+            != pool_info["generation_config_fingerprint"]
+            or episode_manifest.get("service_catalog_sha256")
+            != pool_info["service_catalog_sha256"]
+            or episode_manifest.get("derived_episode_seed_streams")
+            != generate_episode_realization.derive_episode_seeds(int(seed))
+        ):
+            raise ValueError(f"Native formal episode provenance mismatch: episode_seed={seed}")
+        stored_names = episode_manifest.get("generated_artifacts")
+        stored_hashes = episode_manifest.get("generated_artifact_sha256")
+        actual_paths = sorted(
+            path
+            for path in episode_dir.iterdir()
+            if path.is_file() and path.name != manifest_path.name
+        )
+        if (
+            not isinstance(stored_names, list)
+            or not isinstance(stored_hashes, dict)
+            or set(stored_names) != {path.name for path in actual_paths}
+            or set(stored_hashes) != set(stored_names)
+        ):
+            raise ValueError(f"Native formal episode artifact inventory mismatch: episode_seed={seed}")
+        for artifact_path in actual_paths:
+            if _sha256(artifact_path) != stored_hashes.get(artifact_path.name):
+                raise ValueError(
+                    f"Native formal episode artifact hash mismatch: episode_seed={seed}, artifact={artifact_path.name}"
+                )
+        actual_scene_hash = _sha256(manifest_path)
+        expected_scene_hash = pool_info["active_episode_scene_sha256"].get(str(seed))
+        if actual_scene_hash != expected_scene_hash:
+            raise ValueError(f"Native formal episode scene identity mismatch: episode_seed={seed}")
+        if pool_manifest.get("schema_version") == "formal_episode_pool_v3":
+            source = episode_manifest.get("traffic_source_provenance")
+            streams = generate_episode_realization.derive_episode_seeds(int(seed))
+            simulation = generation_fields.get("simulation", {})
+            expected_source = {
+                "schema_version": "independent_episode_sumo_v1",
+                "split": pool_info["split"],
+                "episode_seed": int(seed),
+                "sumo_seed": int(streams["sumo_seed"]),
+                "traffic_seed": int(streams["traffic_seed"]),
+                "warmup_time_s": float(simulation["warmup_time_s"]),
+                "arrival_horizon_slots": FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS,
+                "execution_horizon_slots": FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
+                "simulation_end_time_s": float(simulation["warmup_time_s"])
+                + FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+                * float(simulation["dt_s"]),
+                "random_trips_period_s": float(simulation["random_trips_period_s"]),
+                "random_trips_departure_begin_s": float(simulation["random_trips_departure_begin_s"]),
+                "random_trips_departure_end_s": float(simulation["random_trips_departure_end_s"]),
+                "random_trips_min_distance_m": float(simulation["random_trips_min_distance_m"]),
+                "random_trips_intermediate": int(simulation["random_trips_intermediate"]),
+                "random_trips_maxtries": int(simulation["random_trips_maxtries"]),
+            }
+            time_contract = episode_manifest.get("simulation", {})
+            if (
+                source != expected_source
+                or int(time_contract.get("arrival_horizon_slots", -1))
+                != FORMAL_TRAINING_ARRIVAL_HORIZON_SLOTS
+                or int(time_contract.get("execution_horizon_slots", -1))
+                != FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+            ):
+                raise ValueError(
+                    f"Independent Episode traffic/time identity mismatch: split={pool_info['split']}, seed={seed}"
+                )
+        elif pool_info["split"] == "train":
+            source = episode_manifest.get("traffic_source_provenance")
+            if (
+                not isinstance(source, dict)
+                or source.get("schema_version") != "continuous_train_window_source_v1"
+                or int(source.get("window_index", -1)) != int(seed) - DEFAULT_TRAINING_SEED_START
+                or int(source.get("physical_trajectory_slots", -1))
+                != FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+            ):
+                raise ValueError(f"Native Train episode is missing its continuous-window source identity: {seed}")
+        else:
+            extension = episode_manifest.get("cross_slot_trajectory_extension")
+            tail_predictions = episode_manifest.get("prediction_tail_regeneration")
+            if (
+                not isinstance(extension, dict)
+                or int(extension.get("trajectory_slots", -1))
+                != FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+                or not isinstance(tail_predictions, dict)
+                or int(tail_predictions.get("execution_horizon_slots", -1))
+                != FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+            ):
+                raise ValueError(f"Native evaluation episode is missing its 314-slot extension/prediction identity: {seed}")
+        generation_fields = pool_info["generation_config_fields"]
+        prediction_identity = generation_fields.get("prediction_identity", {})
+        generate_episode_realization.validate_written_outputs(
+            episode_dir,
+            task_vehicle_count=int(generation_fields["simulation"].get("num_task_vehicles", 20)),
+            research_vehicle_count=int(generation_fields["simulation"].get("num_research_vehicles", 25)),
+            horizon_steps=int(prediction_identity.get("vehicle_horizon", 0)),
+            origin_count=FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
+        )
+        return
     supplement = episode_manifest.get("formal_pool_supplement")
     if supplement is not None:
         _validate_supplement_episode_snapshot(

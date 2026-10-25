@@ -1997,6 +1997,26 @@ class ExclusiveDQNEnvironment:
         predicted_cache_coverage_error: str | None = None
         predicted_service_demand_by_service: dict[int, float] | None = None
         cache_service_demand_details: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        cache_services_added: dict[str, list[int]] = {}
+        cache_services_removed: dict[str, list[int]] = {}
+        service_ids = tuple(
+            int(value) for value in self.model.service_catalog["service_ids"]
+        )
+        for node_index, node_id in enumerate(self.model.cache_nodes["node_ids"]):
+            before_services = {
+                service_ids[index]
+                for index in np.flatnonzero(previous_cache[node_index])
+            }
+            after_services = {
+                service_ids[index]
+                for index in np.flatnonzero(final_cache[node_index])
+            }
+            removed_services = sorted(before_services - after_services)
+            added_services = sorted(after_services - before_services)
+            if removed_services:
+                cache_services_removed[str(node_id)] = removed_services
+            if added_services:
+                cache_services_added[str(node_id)] = added_services
         try:
             cache_nodes_before = _cache_nodes_at_uav_positions(
                 self.model.cache_nodes, previous_uav
