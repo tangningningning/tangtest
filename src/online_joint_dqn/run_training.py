@@ -58,8 +58,8 @@ from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v13_validation_selection"
-CHECKPOINT_SCHEMA_VERSION = 15
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v14_semantic_replay_identity"
+CHECKPOINT_SCHEMA_VERSION = 16
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4

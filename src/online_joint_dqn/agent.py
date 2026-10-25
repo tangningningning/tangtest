@@ -20,7 +20,7 @@ from .candidate_features import (
     STATE_FEATURE_CONTRACT_VERSION,
     CandidateOption,
 )
-from .replay_buffer import ReplayTransition
+from .replay_buffer import ReplayCandidateBatchReuseCache, ReplayTransition
 
 
 class CandidateQNetwork(nn.Module):
@@ -451,6 +451,7 @@ class DoubleDQNAgent:
         self,
         transition: ReplayTransition,
         candidate_rebuilder: CandidateRebuilder | None,
+        batch_candidate_cache: ReplayCandidateBatchReuseCache | None = None,
     ) -> tuple[torch.Tensor, str, str]:
         if not np.isfinite(transition.reward) or int(transition.duration_slots) <= 0:
             raise ValueError("TD 转移奖励或持续时长非法")
@@ -464,7 +465,9 @@ class DoubleDQNAgent:
             )
         if transition.next_state_features is None:
             raise ValueError("非终止转移缺少下一状态")
-        candidates = transition.materialize_next_candidates(candidate_rebuilder)
+        candidates = transition.materialize_next_candidates(
+            candidate_rebuilder, batch_cache=batch_candidate_cache
+        )
         if not candidates:
             raise ValueError("非终止转移缺少重建后的合法下一状态候选")
         candidates_by_operation: dict[str, list[CandidateOption]] = {
@@ -577,6 +580,20 @@ class DoubleDQNAgent:
             for item in transitions
             if not item.terminated
         )
+        current_context_keys = {
+            key
+            for item in transitions
+            if (key := item.candidate_rebuild_context_key(current=True)) is not None
+        }
+        next_context_keys = {
+            key
+            for item in transitions
+            if not item.terminated
+            and (key := item.candidate_rebuild_context_key(current=False)) is not None
+        }
+        batch_candidate_cache = ReplayCandidateBatchReuseCache(
+            current_context_keys & next_context_keys
+        )
         next_rebuild_started = time.perf_counter()
         phase(
             "agent.update.next_candidate_rebuild_and_double_dqn_targets",
@@ -587,7 +604,9 @@ class DoubleDQNAgent:
         target_details = []
         for index, item in enumerate(transitions):
             target_details.append(
-                self._next_action_target(item, candidate_rebuilder)
+                self._next_action_target(
+                    item, candidate_rebuilder, batch_candidate_cache
+                )
             )
             if on_phase is not None and (
                 (index + 1) % 8 == 0 or index + 1 == len(transitions)
@@ -626,12 +645,13 @@ class DoubleDQNAgent:
             stored_candidate_count=expected_current_candidates,
         )
         for index, transition in enumerate(transitions):
-            legal_candidates = transition.materialize_current_candidates(candidate_rebuilder)
+            legal_candidates = transition.materialize_current_candidates(
+                candidate_rebuilder, batch_cache=batch_candidate_cache
+            )
             rebuilt_current_candidate_count += len(legal_candidates)
-            class_candidates = [
-                item for item in legal_candidates
-                if item.action.operation == transition.action.operation
-            ]
+            # Replay's exact current-action rebuild already returns only the
+            # recorded operation category; do not allocate/filter a second list.
+            class_candidates = legal_candidates
             recorded = next(
                 (item for item in class_candidates
                  if item.action.candidate_id == transition.action.candidate_id),
@@ -717,6 +737,7 @@ class DoubleDQNAgent:
             "target_network_synced": float(synced),
             "bootstrap_category_selection": [item[1] for item in target_details],
             "bootstrap_candidate_selection": [item[2] for item in target_details],
+            "candidate_batch_reuse": batch_candidate_cache.metrics,
         }
 
     def _update_target_network(self) -> None:

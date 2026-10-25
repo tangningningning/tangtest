@@ -11,7 +11,8 @@ import sys
 import time
 from collections import Counter, OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
@@ -40,15 +41,16 @@ from .candidate_features import (
     CandidateFeatureEncoder,
     CandidateOption,
     DecisionForecast,
+    OPERATIONS,
     _state_fingerprint,
 )
 
 
-CANDIDATE_GENERATION_CONTRACT_VERSION = "state_ranked_bounded_pair_cache_replace_v3_lifecycle"
+CANDIDATE_GENERATION_CONTRACT_VERSION = "state_ranked_bounded_pair_cache_replace_v4_category_rebuild"
 DQN_CROSS_NODE_PAIR_PROPOSAL_LIMIT = 8
 DQN_CROSS_NODE_PAIR_SCAN_LIMIT = 32
-CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v11_normalized_episode_identity"
-EPISODE_REBUILD_SPEC_SCHEMA_VERSION = "dqn_episode_candidate_rebuild_spec_v4_normalized_object_identity"
+CANDIDATE_REBUILD_CONTEXT_SCHEMA_VERSION = "dqn_candidate_rebuild_context_v12_semantic_identity_category_rebuild"
+EPISODE_REBUILD_SPEC_SCHEMA_VERSION = "dqn_episode_candidate_rebuild_spec_v5_canonical_semantic_identity"
 
 
 def candidate_generation_contract(
@@ -113,6 +115,9 @@ def candidate_generation_contract(
         },
         "cross_operation_constraint": "one_cache_or_uav_operation_per_decision_v1",
         "candidate_identity": "source_state_and_full_target_configuration_v1",
+        "replay_current_action_class_rebuild": (
+            "selected_operation_subset_with_full_category_identity_v1"
+        ),
     }
 
 
@@ -216,17 +221,244 @@ _CANDIDATE_REBUILD_IDENTITY_FIELDS = (
     "canonical_cache_node_ids",
     "candidate_count",
     "candidate_ids_sha256",
+    "candidate_identity_by_operation",
 )
 _CANDIDATE_REBUILD_CACHE_MAX_ENTRIES = 16
 _CANDIDATE_REBUILD_CACHE_MAX_CANDIDATES = 4096
 
 
+def _canonical_pack(tag: str, *parts: bytes) -> bytes:
+    tag_bytes = tag.encode("utf-8")
+    result = bytearray(len(tag_bytes).to_bytes(4, "big"))
+    result.extend(tag_bytes)
+    for part in parts:
+        result.extend(len(part).to_bytes(8, "big"))
+        result.extend(part)
+    return bytes(result)
+
+
+def _canonical_identity_bytes(value: Any, _active: set[int] | None = None) -> bytes:
+    """Encode semantic state deterministically, independent of pickle memo/layout."""
+
+    if _active is None:
+        _active = set()
+    if value is None:
+        return _canonical_pack("none")
+    if isinstance(value, np.generic):
+        dtype = value.dtype
+        if dtype.fields:
+            content = _canonical_identity_bytes(
+                tuple((name, value[name]) for name in dtype.names or ()), _active
+            )
+        elif dtype.hasobject:
+            content = _canonical_identity_bytes(value.item(), _active)
+        else:
+            content = np.asarray(value).tobytes()
+        return _canonical_pack("numpy.scalar", _canonical_identity_bytes(dtype, _active), content)
+    if isinstance(value, bool):
+        return _canonical_pack("bool", b"1" if value else b"0")
+    if isinstance(value, (int, np.integer)):
+        return _canonical_pack("integer", str(int(value)).encode("ascii"))
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        encoded = (
+            number.hex()
+            if math.isfinite(number)
+            else "nan" if math.isnan(number) else "+inf" if number > 0 else "-inf"
+        )
+        return _canonical_pack("float", encoded.encode("ascii"))
+    if isinstance(value, (complex, np.complexfloating)):
+        number = complex(value)
+        return _canonical_pack(
+            "complex",
+            _canonical_identity_bytes(number.real, _active),
+            _canonical_identity_bytes(number.imag, _active),
+        )
+    if isinstance(value, str):
+        return _canonical_pack("str", value.encode("utf-8"))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _canonical_pack(
+            "bytes", _qualified_type_name(value).encode("utf-8"), bytes(value)
+        )
+    if isinstance(value, Path):
+        return _canonical_pack(
+            "path", _qualified_type_name(value).encode("utf-8"), value.as_posix().encode("utf-8")
+        )
+    if isinstance(value, slice):
+        return _canonical_pack(
+            "slice",
+            _canonical_identity_bytes(value.start, _active),
+            _canonical_identity_bytes(value.stop, _active),
+            _canonical_identity_bytes(value.step, _active),
+        )
+    if isinstance(value, Enum):
+        return _canonical_pack(
+            "enum",
+            _qualified_type_name(value).encode("utf-8"),
+            value.name.encode("utf-8"),
+            _canonical_identity_bytes(value.value, _active),
+        )
+    if isinstance(value, np.dtype):
+        return _canonical_pack(
+            "numpy.dtype",
+            value.str.encode("utf-8"),
+            _canonical_identity_bytes(value.descr if value.fields else None, _active),
+            _canonical_identity_bytes(dict(value.metadata or {}), _active),
+        )
+    if isinstance(value, np.ndarray):
+        dtype = value.dtype
+        if dtype.fields:
+            content = _canonical_identity_bytes(
+                {
+                    name: value[name]
+                    for name in dtype.names or ()
+                },
+                _active,
+            )
+        elif dtype.hasobject:
+            content = _canonical_identity_bytes(value.reshape(-1).tolist(), _active)
+        else:
+            content = np.ascontiguousarray(value).tobytes()
+        return _canonical_pack(
+            "numpy.ndarray",
+            _qualified_type_name(value).encode("utf-8"),
+            _canonical_identity_bytes(dtype, _active),
+            _canonical_identity_bytes(tuple(int(item) for item in value.shape), _active),
+            content,
+        )
+    if type(value).__module__.startswith("torch") and hasattr(value, "detach"):
+        try:
+            import torch
+
+            if isinstance(value, torch.Tensor):
+                if value.layout != torch.strided or value.is_quantized:
+                    raise TypeError("spec identity only supports dense, non-quantized Torch tensors")
+                tensor = value.detach().cpu().contiguous()
+                try:
+                    content = tensor.numpy().tobytes()
+                except (TypeError, RuntimeError):
+                    content = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+                return _canonical_pack(
+                    "torch.Tensor",
+                    _qualified_type_name(value).encode("utf-8"),
+                    str(tensor.dtype).encode("ascii"),
+                    _canonical_identity_bytes(tuple(int(item) for item in tensor.shape), _active),
+                    content,
+                )
+        except ImportError:
+            pass
+
+    object_id = id(value)
+    if object_id in _active:
+        raise TypeError(
+            f"cyclic object is unsupported in stable identity: {_qualified_type_name(value)}"
+        )
+    _active.add(object_id)
+    try:
+        if isinstance(value, Mapping):
+            encoded_pairs = [
+                (
+                    _canonical_identity_bytes(key, _active),
+                    _canonical_identity_bytes(item, _active),
+                )
+                for key, item in value.items()
+            ]
+            encoded_pairs.sort(key=lambda pair: pair[0])
+            return _canonical_pack(
+                "mapping",
+                _qualified_type_name(value).encode("utf-8"),
+                *(
+                    _canonical_pack("entry", key_bytes, value_bytes)
+                    for key_bytes, value_bytes in encoded_pairs
+                ),
+            )
+        if isinstance(value, tuple):
+            return _canonical_pack(
+                "tuple",
+                _qualified_type_name(value).encode("utf-8"),
+                *(_canonical_identity_bytes(item, _active) for item in value),
+            )
+        if isinstance(value, list):
+            return _canonical_pack(
+                "list",
+                _qualified_type_name(value).encode("utf-8"),
+                *(_canonical_identity_bytes(item, _active) for item in value),
+            )
+        if isinstance(value, (set, frozenset)):
+            encoded_items = sorted(
+                _canonical_identity_bytes(item, _active) for item in value
+            )
+            return _canonical_pack(
+                "set" if isinstance(value, set) else "frozenset",
+                _qualified_type_name(value).encode("utf-8"),
+                *encoded_items,
+            )
+        if is_dataclass(value) and not isinstance(value, type):
+            state = {
+                item.name: getattr(value, item.name)
+                for item in fields(value)
+            }
+            if hasattr(value, "__dict__"):
+                state.update(
+                    {
+                        str(key): item
+                        for key, item in vars(value).items()
+                        if key not in state
+                    }
+                )
+            return _canonical_pack(
+                "dataclass",
+                _qualified_type_name(value).encode("utf-8"),
+                _canonical_identity_bytes(state, _active),
+            )
+        state: dict[str, Any] = {}
+        if hasattr(value, "__dict__"):
+            state["__dict__"] = vars(value)
+        slot_values: dict[str, Any] = {}
+        for cls in type(value).__mro__:
+            slots = cls.__dict__.get("__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for name in slots:
+                if name in {"__dict__", "__weakref__"} or not hasattr(value, name):
+                    continue
+                slot_values[name] = getattr(value, name)
+        if slot_values:
+            state["__slots__"] = slot_values
+        if not state:
+            raise TypeError(
+                f"unsupported value in stable identity: {_qualified_type_name(value)}"
+            )
+        return _canonical_pack(
+            "object",
+            _qualified_type_name(value).encode("utf-8"),
+            _canonical_identity_bytes(state, _active),
+        )
+    finally:
+        _active.remove(object_id)
+
+
+def _qualified_type_name(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _stable_semantic_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_identity_bytes(value)).hexdigest()
+
+
+def episode_rebuild_identity(episode_seed: int | None, spec_sha256: str) -> str:
+    """Return the stable Episode identity used by Replay and its checkpoint."""
+
+    return _stable_semantic_sha256(
+        ("dqn-episode-rebuild-identity-v1", episode_seed, str(spec_sha256))
+    )
+
+
 def _prediction_scenario_sha256(scenario: Mapping[str, Any]) -> str:
     """对完整预测场景求摘要，避免在回放中重复保存无关预测字段。"""
 
-    return hashlib.sha256(
-        pickle.dumps(dict(scenario), protocol=pickle.HIGHEST_PROTOCOL)
-    ).hexdigest()
+    return _stable_semantic_sha256(dict(scenario))
 
 
 def _candidate_rebuild_payload_sha256(context: Mapping[str, Any]) -> str:
@@ -237,19 +469,11 @@ def _candidate_rebuild_payload_sha256(context: Mapping[str, Any]) -> str:
     }
     if len(payload) != len(_CANDIDATE_REBUILD_IDENTITY_FIELDS):
         raise ValueError("候选重建上下文缺少身份字段")
-    # 逐字段哈希，避免 pickle 对象图中的共享引用布局改变摘要但数据本身相同。
-    digest = hashlib.sha256()
+    # 逐字段使用语义规范编码，忽略 pickle 的对象图 memo/alias 布局。
+    digest = hashlib.sha256(b"dqn-candidate-rebuild-context-semantic-v2\0")
     for key in _CANDIDATE_REBUILD_IDENTITY_FIELDS:
         name = key.encode("utf-8")
-        value = payload[key]
-        if key == "state_features":
-            # Replay stores shared state vectors as read-only float32 arrays,
-            # then restores that same value into the compact candidate context.
-            # NumPy pickles array writeability/layout flags, so hash a writable,
-            # contiguous copy to keep the context digest stable across that
-            # storage boundary while still hashing the full feature values.
-            value = np.array(value, dtype=np.float32, copy=True, order="C").reshape(-1)
-        encoded = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        encoded = _canonical_identity_bytes(payload[key])
         digest.update(len(name).to_bytes(4, "big"))
         digest.update(name)
         digest.update(len(encoded).to_bytes(8, "big"))
@@ -265,13 +489,28 @@ def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
     return digest.hexdigest()
 
 
+def _candidate_identity_by_operation(
+    candidates: Sequence[CandidateOption],
+) -> dict[str, dict[str, Any]]:
+    return {
+        operation: {
+            "count": len(selected := tuple(
+                item for item in candidates if item.action.operation == operation
+            )),
+            "ids_sha256": _candidate_ids_sha256(selected),
+        }
+        for operation in OPERATIONS
+    }
+
+
 def _episode_rebuild_spec_sha256(payload: Mapping[str, Any]) -> str:
-    """逐字段计算重建规格摘要，避免跨字段对象共享影响 Pickle 图布局。"""
+    """根据带类型标记的语义字段生成稳定 Episode 规格摘要。"""
 
     digest = hashlib.sha256()
+    digest.update(b"dqn-episode-rebuild-spec-semantic-v1\0")
     for key in sorted(payload):
         key_bytes = str(key).encode("utf-8")
-        value_bytes = pickle.dumps(payload[key], protocol=pickle.HIGHEST_PROTOCOL)
+        value_bytes = _canonical_identity_bytes(payload[key])
         digest.update(len(key_bytes).to_bytes(4, "big"))
         digest.update(key_bytes)
         digest.update(len(value_bytes).to_bytes(8, "big"))
@@ -1129,8 +1368,14 @@ class ExclusiveDQNEnvironment:
         current_uav_positions: Mapping[str, Any],
         protected_services_by_node: Mapping[str, Sequence[int]] | None = None,
         cache_updates_allowed: bool = True,
+        operation_filter: str | None = None,
     ) -> tuple[tuple[CandidateOption, ...], dict[str, Any]]:
         # 候选器只接收预测场景及配置，不接触当前真实任务和实际车辆轨迹。
+        if operation_filter is not None and operation_filter not in OPERATIONS:
+            raise ValueError(f"unknown candidate operation filter: {operation_filter!r}")
+        include_keep = operation_filter in (None, "KEEP_STAY")
+        include_cache = operation_filter in (None, "CACHE_UPDATE")
+        include_uav = operation_filter in (None, "UAV_MOVE")
         candidate_input = replace(slot_input, tasks=(), vehicle_positions={})
         if candidate_input.tasks or candidate_input.vehicle_positions:
             raise RuntimeError("候选生成输入未能隔离当前真实任务或车辆位置")
@@ -1146,35 +1391,39 @@ class ExclusiveDQNEnvironment:
             decision_forecast=forecast,
         )
         candidates: list[CandidateOption] = []
-        keep = ActionCandidate.from_states(
-            previous_cache_state=cache_state,
-            previous_uav_positions=uav_positions,
-            target_cache_state=cache_state,
-            target_uav_positions=uav_positions,
-            slot_input=candidate_input,
-            source_state_fingerprint=source_state_fingerprint,
-            proposal_source="KEEP_STAY",
-        )
-        candidates.append(
-            CandidateOption.create(
-                keep,
-                self.encoder.encode_candidate(
-                    keep,
-                    previous_cache_state=cache_state,
-                    previous_uav_positions=uav_positions,
-                    slot_input=candidate_input,
-                    decision_forecast=forecast,
-                    cache_complementarity_context=cache_complementarity_context,
-                ),
+        if include_keep:
+            keep = ActionCandidate.from_states(
+                previous_cache_state=cache_state,
+                previous_uav_positions=uav_positions,
+                target_cache_state=cache_state,
+                target_uav_positions=uav_positions,
+                slot_input=candidate_input,
+                source_state_fingerprint=source_state_fingerprint,
+                proposal_source="KEEP_STAY",
             )
-        )
+            candidates.append(
+                CandidateOption.create(
+                    keep,
+                    self.encoder.encode_candidate(
+                        keep,
+                        previous_cache_state=cache_state,
+                        previous_uav_positions=uav_positions,
+                        slot_input=candidate_input,
+                        decision_forecast=forecast,
+                        cache_complementarity_context=cache_complementarity_context,
+                    ),
+                )
+            )
         cache_generation_diagnostics: dict[str, Any] = {}
-        bounded_cache_targets, bounded_cache_complete = self.cache_optimizer.generate_candidates(
-            current_cache_state=cache_state,
-            slot_input=candidate_input,
-            search_budget=self.search_budget,
-            generation_diagnostics=cache_generation_diagnostics,
-        )
+        if include_cache:
+            bounded_cache_targets, bounded_cache_complete = self.cache_optimizer.generate_candidates(
+                current_cache_state=cache_state,
+                slot_input=candidate_input,
+                search_budget=self.search_budget,
+                generation_diagnostics=cache_generation_diagnostics,
+            )
+        else:
+            bounded_cache_targets, bounded_cache_complete = (), True
         service_catalog = dict(candidate_input.model.service_catalog)
         cache_nodes = deepcopy(dict(candidate_input.model.cache_nodes))
         cache_targets_by_key: dict[bytes, tuple[np.ndarray, str]] = {}
@@ -1185,7 +1434,9 @@ class ExclusiveDQNEnvironment:
         raw_combination_count = 0
         capacity_feasible_count = 0
         legal_replace_count = 0
-        for node_index, node_id in enumerate(cache_nodes["node_ids"]):
+        for node_index, node_id in enumerate(
+            cache_nodes["node_ids"] if include_cache else ()
+        ):
             node_diagnostics: dict[str, Any] = {}
             exact_targets = cache_configuration.enumerate_all_cache_target_configurations(
                 cache_state,
@@ -1233,19 +1484,28 @@ class ExclusiveDQNEnvironment:
                 key,
                 (target_state.copy(), f"bounded_proposal:{target.proposal_source}"),
             )
-        pair_targets, pair_diagnostics = _bounded_cross_node_pair_cache_targets(
-            cache_state,
-            exact_targets_by_node,
-            tuple(str(item) for item in cache_nodes["node_ids"]),
-            tuple(
-                int(item)
-                for item in candidate_input.model.service_catalog["service_ids"]
-            ),
-            candidate_input.model.service_catalog["service_sizes_mb"],
-            cache_nodes["capacities_mb"],
-            source_state_fingerprint=source_state_fingerprint,
-            existing_target_keys=set(cache_targets_by_key),
-        )
+        if include_cache:
+            pair_targets, pair_diagnostics = _bounded_cross_node_pair_cache_targets(
+                cache_state,
+                exact_targets_by_node,
+                tuple(str(item) for item in cache_nodes["node_ids"]),
+                tuple(
+                    int(item)
+                    for item in candidate_input.model.service_catalog["service_ids"]
+                ),
+                candidate_input.model.service_catalog["service_sizes_mb"],
+                cache_nodes["capacities_mb"],
+                source_state_fingerprint=source_state_fingerprint,
+                existing_target_keys=set(cache_targets_by_key),
+            )
+        else:
+            pair_targets = ()
+            pair_diagnostics = {
+                "cache_cross_node_pair_generation_complete_within_policy": True,
+                "cache_cross_node_pair_candidates_truncated": False,
+                "cache_cross_node_pair_deduplicated_existing_count": 0,
+                "cache_cross_node_pair_deduplicated_pair_count": 0,
+            }
         for target_state, proposal_source in pair_targets:
             cache_proposal_count += 1
             key = np.ascontiguousarray(target_state, dtype=np.int8).tobytes()
@@ -1320,14 +1580,17 @@ class ExclusiveDQNEnvironment:
                 )
             )
         uav_generation_diagnostics: dict[str, Any] = {}
-        moves, uav_generation_complete = self.uav_scheduler.enumerate_move_candidates(
-            previous_cache_state=cache_state,
-            current_uav_positions=uav_positions,
-            previous_uav_positions=uav_positions,
-            slot_input=candidate_input,
-            search_budget=self.search_budget,
-            generation_diagnostics=uav_generation_diagnostics,
-        )
+        if include_uav:
+            moves, uav_generation_complete = self.uav_scheduler.enumerate_move_candidates(
+                previous_cache_state=cache_state,
+                current_uav_positions=uav_positions,
+                previous_uav_positions=uav_positions,
+                slot_input=candidate_input,
+                search_budget=self.search_budget,
+                generation_diagnostics=uav_generation_diagnostics,
+            )
+        else:
+            moves, uav_generation_complete = (), True
         for move in moves:
             action = ActionCandidate.from_states(
                 previous_cache_state=cache_state,
@@ -1360,8 +1623,14 @@ class ExclusiveDQNEnvironment:
                 duplicate_action_id_count += 1
                 continue
             unique[option.action.candidate_id] = option
-        if not unique or next(iter(unique.values())).action.operation != "KEEP_STAY":
+        if not unique:
+            raise RuntimeError("候选筛选后合法候选集合为空")
+        if operation_filter is None and next(iter(unique.values())).action.operation != "KEEP_STAY":
             raise RuntimeError("合法候选集合必须始终包含 KEEP_STAY")
+        if operation_filter is not None and any(
+            item.action.operation != operation_filter for item in unique.values()
+        ):
+            raise RuntimeError("按动作类别过滤后的候选包含其他操作类型")
         unique_cache_targets = len(cache_targets_by_key)
         cache_generation_diagnostics = {
             **cache_generation_diagnostics,
@@ -1563,6 +1832,9 @@ class ExclusiveDQNEnvironment:
             "network_architecture_version": self.encoder.network_architecture_version,
             "candidate_count": len(self._cached_candidates),
             "candidate_ids_sha256": _candidate_ids_sha256(self._cached_candidates),
+            "candidate_identity_by_operation": _candidate_identity_by_operation(
+                self._cached_candidates
+            ),
         }
         context["candidate_rebuild_payload_sha256"] = (
             _candidate_rebuild_payload_sha256(context)
@@ -1577,10 +1849,15 @@ class ExclusiveDQNEnvironment:
     def rebuild_candidates(
         self,
         context: Mapping[str, Any],
+        *,
+        operation_filter: str | None = None,
+        batch_cache: Any | None = None,
     ) -> tuple[CandidateOption, ...]:
-        """仅由回放中的合法状态上下文和预测输入确定性重建候选。"""
+        """重建全部动作，或精确重建一个操作类别的候选子集。"""
 
         self.validate_candidate_rebuild_context_metadata(context)
+        if operation_filter is not None and operation_filter not in OPERATIONS:
+            raise ValueError(f"unknown candidate operation filter: {operation_filter!r}")
         forecast = context.get("decision_forecast")
         cache_state = np.asarray(context.get("cache_state"), dtype=np.int8).copy()
         uav_positions = {
@@ -1654,36 +1931,73 @@ class ExclusiveDQNEnvironment:
             str(context["state_feature_contract_version"]),
             str(context["candidate_feature_contract_version"]),
             str(context["network_architecture_version"]),
+            "ALL" if operation_filter is None else str(operation_filter),
         )
         candidates = self._candidate_rebuild_cache.get(cache_key)
         if candidates is None:
-            self._candidate_rebuild_cache_stats["miss_count"] += 1
-            candidates, _ = self._generate_legal_candidates(
-                slot_input,
-                forecast,
-                fingerprint,
-                current_cache_state=cache_state,
-                current_uav_positions=uav_positions,
-                protected_services_by_node=protected_services,
-                cache_updates_allowed=cache_updates_allowed,
+            shared_full_candidates = (
+                None if batch_cache is None else batch_cache.get(context)
             )
-            self._candidate_rebuild_cache_stats["generation_count"] += 1
+            if shared_full_candidates is not None:
+                candidates = (
+                    shared_full_candidates
+                    if operation_filter is None
+                    else tuple(
+                        item
+                        for item in shared_full_candidates
+                        if item.action.operation == operation_filter
+                    )
+                )
+                self._candidate_rebuild_cache_stats["hit_count"] += 1
+            else:
+                self._candidate_rebuild_cache_stats["miss_count"] += 1
+                candidates, _ = self._generate_legal_candidates(
+                    slot_input,
+                    forecast,
+                    fingerprint,
+                    current_cache_state=cache_state,
+                    current_uav_positions=uav_positions,
+                    protected_services_by_node=protected_services,
+                    cache_updates_allowed=cache_updates_allowed,
+                    operation_filter=operation_filter,
+                )
+                self._candidate_rebuild_cache_stats["generation_count"] += 1
         else:
             self._candidate_rebuild_cache.move_to_end(cache_key)
             self._candidate_rebuild_cache_stats["hit_count"] += 1
+        expected_identity = (
+            None
+            if operation_filter is None
+            else context["candidate_identity_by_operation"][operation_filter]
+        )
+        expected_count = (
+            int(context["candidate_count"])
+            if expected_identity is None
+            else int(expected_identity["count"])
+        )
+        expected_ids_sha256 = (
+            str(context["candidate_ids_sha256"])
+            if expected_identity is None
+            else str(expected_identity["ids_sha256"])
+        )
         if (
-            len(candidates) != int(context["candidate_count"])
-            or _candidate_ids_sha256(candidates)
-            != str(context["candidate_ids_sha256"])
+            len(candidates) != expected_count
+            or _candidate_ids_sha256(candidates) != expected_ids_sha256
             or len({item.action.candidate_id for item in candidates}) != len(candidates)
             or any(
                 item.action.source_state_fingerprint != fingerprint
+                or (
+                    operation_filter is not None
+                    and item.action.operation != operation_filter
+                )
                 or len(item.features) != self.encoder.candidate_dim
                 or not np.isfinite(np.asarray(item.features, dtype=np.float32)).all()
                 for item in candidates
             )
         ):
             raise ValueError("回放候选集合与经过校验的上下文身份不匹配")
+        if batch_cache is not None and operation_filter is None:
+            batch_cache.put(context, candidates)
         if candidates is not None and cache_key not in self._candidate_rebuild_cache:
             if len(candidates) > _CANDIDATE_REBUILD_CACHE_MAX_CANDIDATES:
                 self._candidate_rebuild_cache_stats["bypass_count"] += 1
@@ -1700,6 +2014,17 @@ class ExclusiveDQNEnvironment:
                     self._candidate_rebuild_cache_candidate_count -= len(evicted)
                     self._candidate_rebuild_cache_stats["eviction_count"] += 1
         return candidates
+
+    def rebuild_candidates_for_operation(
+        self,
+        context: Mapping[str, Any],
+        operation: str,
+        *,
+        batch_cache: Any | None = None,
+    ) -> tuple[CandidateOption, ...]:
+        return self.rebuild_candidates(
+            context, operation_filter=operation, batch_cache=batch_cache
+        )
 
     def validate_candidate_rebuild_context_metadata(
         self, context: Mapping[str, Any]
@@ -1723,6 +2048,29 @@ class ExclusiveDQNEnvironment:
             _candidate_rebuild_payload_sha256(context)
         ):
             raise ValueError("回放候选重建上下文摘要不匹配")
+        operation_identity = context.get("candidate_identity_by_operation")
+        if not isinstance(operation_identity, Mapping) or set(operation_identity) != set(OPERATIONS):
+            raise ValueError("回放候选上下文缺少按动作类别划分的身份合同")
+        category_total = 0
+        for operation in OPERATIONS:
+            item = operation_identity[operation]
+            if not isinstance(item, Mapping):
+                raise ValueError(f"回放候选类别身份无效：{operation}")
+            count = item.get("count")
+            ids_sha256 = item.get("ids_sha256")
+            if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or int(count) < 0:
+                raise ValueError(f"回放候选类别数量无效：{operation}")
+            if not isinstance(ids_sha256, str) or len(ids_sha256) != 64:
+                raise ValueError(f"回放候选类别 ID 摘要无效：{operation}")
+            try:
+                bytes.fromhex(ids_sha256)
+            except ValueError:
+                raise ValueError(f"回放候选类别 ID 摘要无效：{operation}") from None
+            if int(count) == 0 and ids_sha256 != _candidate_ids_sha256(()):
+                raise ValueError(f"空候选类别摘要不一致：{operation}")
+            category_total += int(count)
+        if category_total != int(context.get("candidate_count", -1)):
+            raise ValueError("回放候选类别数量与完整候选数量不一致")
         if context.get("candidate_feature_contract_version") != self.encoder.candidate_feature_contract_version:
             raise ValueError("回放候选特征合同与当前编码器不一致")
         if context.get("candidate_generation_contract_version") != CANDIDATE_GENERATION_CONTRACT_VERSION:
@@ -1812,7 +2160,12 @@ class ExclusiveDQNEnvironment:
             "prediction_horizon_mask": (
                 None
                 if forecast.prediction_horizon_mask is None
-                else np.asarray(forecast.prediction_horizon_mask, dtype=np.int8)
+                else tuple(
+                    int(value)
+                    for value in np.asarray(
+                        forecast.prediction_horizon_mask, dtype=np.int8
+                    ).reshape(-1)
+                )
             ),
             # 完整预测场景摘要保留指纹语义，回放只需保存候选生成必需字段。
             "prediction_scenario_sha256": (
@@ -2546,12 +2899,9 @@ class EpisodeCandidateRebuildAdapter:
     ) -> tuple[str, str]:
         payload = cls._identity_payload(environment)
         spec_sha256 = _episode_rebuild_spec_sha256(payload)
-        episode_identity = hashlib.sha256(
-            pickle.dumps(
-                (environment.episode_seed, spec_sha256),
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-        ).hexdigest()
+        episode_identity = episode_rebuild_identity(
+            environment.episode_seed, spec_sha256
+        )
         return episode_identity, spec_sha256
 
     @classmethod
@@ -2607,12 +2957,9 @@ class EpisodeCandidateRebuildAdapter:
         )
         if adapter._episode_rebuild_spec_sha256 != adapter._calculate_spec_sha256():
             raise ValueError("Replay Episode 重建规格摘要不匹配")
-        expected_id = hashlib.sha256(
-            pickle.dumps(
-                (adapter.episode_seed, adapter._episode_rebuild_spec_sha256),
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-        ).hexdigest()
+        expected_id = episode_rebuild_identity(
+            adapter.episode_seed, adapter._episode_rebuild_spec_sha256
+        )
         if adapter._episode_rebuild_id != expected_id:
             raise ValueError("Replay Episode 身份与重建规格不匹配")
         return adapter
@@ -2646,6 +2993,9 @@ class EpisodeCandidateRebuildAdapter:
         ExclusiveDQNEnvironment.validate_candidate_rebuild_context_metadata
     )
     rebuild_candidates = ExclusiveDQNEnvironment.rebuild_candidates
+    rebuild_candidates_for_operation = (
+        ExclusiveDQNEnvironment.rebuild_candidates_for_operation
+    )
 
 
 __all__ = [

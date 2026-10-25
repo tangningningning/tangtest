@@ -6,6 +6,7 @@ import hashlib
 import pickle
 import random
 import zlib
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
 
@@ -42,6 +43,32 @@ def _candidate_ids_sha256(candidates: Sequence[CandidateOption]) -> str:
     return digest.hexdigest()
 
 
+def _candidate_operation_identity(
+    candidates: Sequence[CandidateOption],
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for operation in _ACTION_OPERATIONS:
+        selected = tuple(
+            item for item in candidates if item.action.operation == operation
+        )
+        result[operation] = {
+            "count": len(selected),
+            "ids_sha256": _candidate_ids_sha256(selected),
+        }
+    return result
+
+
+def _validate_candidate_operation_context(
+    context: Mapping[str, Any],
+    candidates: Sequence[CandidateOption],
+    label: str,
+) -> None:
+    recorded = context.get("candidate_identity_by_operation")
+    expected = _candidate_operation_identity(candidates)
+    if recorded != expected:
+        raise ValueError(f"{label}候选类别数量/ID 顺序身份不一致")
+
+
 def _validate_candidate_context(
     context: Mapping[str, Any], candidates: Sequence[CandidateOption], label: str
 ) -> None:
@@ -50,6 +77,121 @@ def _validate_candidate_context(
     recorded_ids = context.get("candidate_ids_sha256")
     if recorded_ids != _candidate_ids_sha256(candidates):
         raise ValueError(f"{label}候选 ID 顺序与重建上下文不一致")
+
+
+_ACTION_OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
+_BATCH_REUSE_MAX_CONTEXTS = 16
+_BATCH_REUSE_MAX_CANDIDATES = 4096
+
+
+def _candidate_context_cache_key(context: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        str(context.get("episode_rebuild_id", "")),
+        str(context.get("episode_rebuild_spec_sha256", "")),
+        str(context.get("candidate_rebuild_payload_sha256", "")),
+        str(context.get("source_state_fingerprint", "")),
+        str(context.get("state_feature_contract_version", "")),
+        str(context.get("candidate_feature_contract_version", "")),
+        str(context.get("network_architecture_version", "")),
+    )
+
+
+def _context_from_blob(
+    blob: bytes, state_features: Any, fingerprint: str, label: str
+) -> dict[str, Any]:
+    context = pickle.loads(zlib.decompress(blob))
+    if not isinstance(context, Mapping):
+        raise ValueError(f"{label}候选重建上下文必须是映射")
+    if context.get("source_state_fingerprint") != str(fingerprint):
+        raise ValueError(f"{label}候选上下文与状态指纹不匹配")
+    if "state_features" in context:
+        raise ValueError("紧凑回放上下文不得重复保存状态特征")
+    expanded = dict(context)
+    expanded["state_features"] = np.asarray(state_features, dtype=np.float32)
+    return expanded
+
+
+def _validate_candidate_operation_subset(
+    candidates: Sequence[CandidateOption],
+    context: Mapping[str, Any],
+    operation: str,
+    fingerprint: str,
+) -> None:
+    identities = context.get("candidate_identity_by_operation")
+    if not isinstance(identities, Mapping) or operation not in identities:
+        raise ValueError("回放上下文缺少当前动作类别的候选身份")
+    expected = identities[operation]
+    if not isinstance(expected, Mapping):
+        raise ValueError("当前动作类别候选身份无效")
+    if len(candidates) != int(expected.get("count", -1)):
+        raise ValueError("当前动作类别候选数量与上下文不一致")
+    if _candidate_ids_sha256(candidates) != expected.get("ids_sha256"):
+        raise ValueError("当前动作类别候选 ID/顺序与上下文不一致")
+    if any(
+        item.action.operation != operation
+        or item.action.source_state_fingerprint != str(fingerprint)
+        or not np.isfinite(np.asarray(item.features, dtype=np.float32)).all()
+        for item in candidates
+    ):
+        raise ValueError("当前动作类别候选包含非法动作、状态或特征")
+    if len({item.action.candidate_id for item in candidates}) != len(candidates):
+        raise ValueError("当前动作类别候选包含重复动作 ID")
+
+
+class ReplayCandidateBatchReuseCache:
+    """只暂存本 Batch 内确实跨 next/current 复用的完整候选集合。"""
+
+    def __init__(self, reusable_context_keys: set[tuple[str, ...]]) -> None:
+        self._reusable_context_keys = frozenset(reusable_context_keys)
+        self._items: OrderedDict[tuple[str, ...], tuple[CandidateOption, ...]] = OrderedDict()
+        self._candidate_count = 0
+        self._stats = {"hit_count": 0, "retained_context_count": 0, "retained_candidate_count": 0,
+                       "eviction_count": 0, "bypass_count": 0}
+
+    @staticmethod
+    def key(context: Mapping[str, Any]) -> tuple[str, ...]:
+        return _candidate_context_cache_key(context)
+
+    def get(self, context: Mapping[str, Any]) -> tuple[CandidateOption, ...] | None:
+        key = self.key(context)
+        if key not in self._reusable_context_keys:
+            return None
+        candidates = self._items.get(key)
+        if candidates is not None:
+            self._items.move_to_end(key)
+            self._stats["hit_count"] += 1
+        return candidates
+
+    def put(
+        self, context: Mapping[str, Any], candidates: Sequence[CandidateOption]
+    ) -> None:
+        key = self.key(context)
+        if key not in self._reusable_context_keys or key in self._items:
+            return
+        candidate_tuple = tuple(candidates)
+        if len(candidate_tuple) > _BATCH_REUSE_MAX_CANDIDATES:
+            self._stats["bypass_count"] += 1
+            return
+        self._items[key] = candidate_tuple
+        self._candidate_count += len(candidate_tuple)
+        while (
+            len(self._items) > _BATCH_REUSE_MAX_CONTEXTS
+            or self._candidate_count > _BATCH_REUSE_MAX_CANDIDATES
+        ):
+            _, evicted = self._items.popitem(last=False)
+            self._candidate_count -= len(evicted)
+            self._stats["eviction_count"] += 1
+        self._stats["retained_context_count"] = len(self._items)
+        self._stats["retained_candidate_count"] = self._candidate_count
+
+    @property
+    def metrics(self) -> dict[str, int]:
+        return {
+            **self._stats,
+            "eligible_context_count": len(self._reusable_context_keys),
+            "max_context_count": _BATCH_REUSE_MAX_CONTEXTS,
+            "max_candidate_count": _BATCH_REUSE_MAX_CANDIDATES,
+        }
 
 
 CandidateRebuilder = Callable[[Mapping[str, Any]], Sequence[CandidateOption]]
@@ -76,27 +218,89 @@ class ReplayTransition:
     current_candidate_count: int = 0
     current_candidate_ids_sha256: str | None = None
 
+    def candidate_rebuild_context_key(self, *, current: bool) -> tuple[str, ...] | None:
+        blob = (
+            self.current_candidate_rebuild_context_zlib
+            if current
+            else self.next_candidate_rebuild_context_zlib
+        )
+        if blob is None:
+            return None
+        context = pickle.loads(zlib.decompress(blob))
+        if not isinstance(context, Mapping):
+            raise ValueError("回放候选重建上下文必须是映射")
+        return _candidate_context_cache_key(context)
+
     def materialize_current_candidates(
         self,
         candidate_rebuilder: CandidateRebuilder | None,
+        *,
+        batch_cache: ReplayCandidateBatchReuseCache | None = None,
     ) -> tuple[CandidateOption, ...]:
-        """用当前状态合同重建候选，供类别内优势归一化使用。"""
+        """精确重建已执行动作类别，供 Dueling 类别内优势均值使用。"""
 
-        current_view = replace(
-            self,
-            next_state_features=self.state_features,
-            next_state_fingerprint=self.action.source_state_fingerprint,
-            next_legal_candidates=self.current_legal_candidates,
-            terminated=False,
-            next_candidate_rebuild_context_zlib=self.current_candidate_rebuild_context_zlib,
-            next_candidate_count=self.current_candidate_count,
-            next_candidate_ids_sha256=self.current_candidate_ids_sha256,
+        fingerprint = self.action.source_state_fingerprint
+        operation = self.action.operation
+        if self.current_legal_candidates:
+            full_candidates = tuple(self.current_legal_candidates)
+            if (
+                len(full_candidates) != self.current_candidate_count
+                or _candidate_ids_sha256(full_candidates) != self.current_candidate_ids_sha256
+            ):
+                raise ValueError("当前状态候选与 Replay 完整候选身份不一致")
+            candidates = tuple(
+                item for item in full_candidates if item.action.operation == operation
+            )
+            _validate_candidate_operation_subset(
+                candidates,
+                {"candidate_identity_by_operation": _candidate_operation_identity(full_candidates)},
+                operation,
+                fingerprint,
+            )
+            return candidates
+
+        if self.current_candidate_rebuild_context_zlib is None:
+            raise ValueError("回放转移缺少当前候选重建上下文")
+        context = _context_from_blob(
+            self.current_candidate_rebuild_context_zlib,
+            self.state_features,
+            fingerprint,
+            "当前状态",
         )
-        return current_view.materialize_next_candidates(candidate_rebuilder)
+        if (
+            int(context.get("candidate_count", -1)) != self.current_candidate_count
+            or str(context.get("candidate_ids_sha256", ""))
+            != str(self.current_candidate_ids_sha256)
+        ):
+            raise ValueError("当前 Replay 与重建上下文的完整候选身份不一致")
+        if candidate_rebuilder is None:
+            raise ValueError("回放转移缺少当前候选重建器")
+        owner = getattr(candidate_rebuilder, "__self__", None)
+        operation_rebuilder = getattr(owner, "rebuild_candidates_for_operation", None)
+        if callable(operation_rebuilder):
+            candidates = tuple(
+                operation_rebuilder(context, operation, batch_cache=batch_cache)
+            )
+        else:
+            full_candidates = tuple(candidate_rebuilder(context))
+            if (
+                len(full_candidates) != self.current_candidate_count
+                or _candidate_ids_sha256(full_candidates) != self.current_candidate_ids_sha256
+            ):
+                raise ValueError("当前状态完整候选与 Replay 身份不一致")
+            candidates = tuple(
+                item for item in full_candidates if item.action.operation == operation
+            )
+        _validate_candidate_operation_subset(
+            candidates, context, operation, fingerprint
+        )
+        return candidates
 
     def materialize_next_candidates(
         self,
         candidate_rebuilder: CandidateRebuilder | None,
+        *,
+        batch_cache: ReplayCandidateBatchReuseCache | None = None,
     ) -> tuple[CandidateOption, ...]:
         """从预测上下文重建候选并校验动作集合身份。"""
 
@@ -110,24 +314,26 @@ class ReplayTransition:
                 or self.next_candidate_rebuild_context_zlib is None
             ):
                 raise ValueError("回放转移缺少下一候选重建器或合法上下文")
-            context = pickle.loads(
-                zlib.decompress(self.next_candidate_rebuild_context_zlib)
-            )
-            if not isinstance(context, Mapping):
-                raise ValueError("回放候选重建上下文必须是映射")
-            if context.get("source_state_fingerprint") != str(
-                self.next_state_fingerprint
-            ):
-                raise ValueError("回放候选上下文与下一状态指纹不匹配")
-            if "state_features" in context:
-                raise ValueError("紧凑回放上下文不得重复保存下一状态特征")
             if self.next_state_features is None:
                 raise ValueError("候选重建缺少已保存的下一状态特征")
-            context = dict(context)
-            context["state_features"] = np.asarray(
-                self.next_state_features, dtype=np.float32
+            context = _context_from_blob(
+                self.next_candidate_rebuild_context_zlib,
+                self.next_state_features,
+                str(self.next_state_fingerprint),
+                "下一状态",
             )
-            candidates = tuple(candidate_rebuilder(context))
+            if (
+                int(context.get("candidate_count", -1)) != self.next_candidate_count
+                or str(context.get("candidate_ids_sha256", ""))
+                != str(self.next_candidate_ids_sha256)
+            ):
+                raise ValueError("下一 Replay 与重建上下文的完整候选身份不一致")
+            owner = getattr(candidate_rebuilder, "__self__", None)
+            replay_rebuilder = getattr(owner, "rebuild_candidates", None)
+            if batch_cache is not None and callable(replay_rebuilder):
+                candidates = tuple(replay_rebuilder(context, batch_cache=batch_cache))
+            else:
+                candidates = tuple(candidate_rebuilder(context))
         if not candidates:
             raise ValueError("重建的下一状态候选集合不能为空")
         if self.next_candidate_count and len(candidates) != self.next_candidate_count:
@@ -261,7 +467,7 @@ class ReplayTransition:
 class ReplayBuffer:
     """固定容量环形回放，不按经验重复保存完整候选特征矩阵。"""
 
-    STATE_SCHEMA_VERSION = 11
+    STATE_SCHEMA_VERSION = 12
 
     def __init__(self, capacity: int, *, seed: int = 0) -> None:
         if int(capacity) <= 0:
@@ -293,12 +499,11 @@ class ReplayBuffer:
             bytes.fromhex(spec_sha256)
         except ValueError:
             raise ValueError("Episode 重建身份摘要不是有效十六进制") from None
-        expected_episode_id = hashlib.sha256(
-            pickle.dumps(
-                (getattr(rebuilder, "episode_seed", None), spec_sha256),
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-        ).hexdigest()
+        from .environment_adapter import episode_rebuild_identity
+
+        expected_episode_id = episode_rebuild_identity(
+            getattr(rebuilder, "episode_seed", None), spec_sha256
+        )
         if episode_id != expected_episode_id:
             raise ValueError("Episode 重建器身份与种子/规格摘要不匹配")
         existing = self._candidate_rebuilders.get(episode_id)
@@ -330,7 +535,10 @@ class ReplayBuffer:
         return episode_id, rebuilder
 
     def rebuild_candidates(
-        self, context: Mapping[str, Any]
+        self,
+        context: Mapping[str, Any],
+        *,
+        batch_cache: ReplayCandidateBatchReuseCache | None = None,
     ) -> Sequence[CandidateOption]:
         """按上下文所属 Episode 分派，禁止用当前 Episode 映射重建历史经验。"""
 
@@ -341,7 +549,27 @@ class ReplayBuffer:
             raise ValueError("Replay 缺少该历史 Episode 的候选重建器")
         if str(rebuilder._episode_rebuild_spec_sha256) != spec_sha256:
             raise ValueError("Replay 候选上下文与历史 Episode 规格不匹配")
-        return rebuilder.rebuild_candidates(context)
+        return rebuilder.rebuild_candidates(context, batch_cache=batch_cache)
+
+    def rebuild_candidates_for_operation(
+        self,
+        context: Mapping[str, Any],
+        operation: str,
+        *,
+        batch_cache: ReplayCandidateBatchReuseCache | None = None,
+    ) -> Sequence[CandidateOption]:
+        """按 Episode 身份只重建一个当前动作类别。"""
+
+        episode_id = str(context.get("episode_rebuild_id", ""))
+        spec_sha256 = str(context.get("episode_rebuild_spec_sha256", ""))
+        rebuilder = self._candidate_rebuilders.get(episode_id)
+        if rebuilder is None:
+            raise ValueError("Replay 缺少该历史 Episode 的候选重建器")
+        if str(rebuilder._episode_rebuild_spec_sha256) != spec_sha256:
+            raise ValueError("Replay 候选上下文与历史 Episode 规格不匹配")
+        return rebuilder.rebuild_candidates_for_operation(
+            context, operation, batch_cache=batch_cache
+        )
 
     def _pack_context(
         self, context: Mapping[str, Any], state_features: Any, fingerprint: str
@@ -473,6 +701,9 @@ class ReplayBuffer:
         _validate_candidate_context(
             current_candidate_rebuild_context, current_candidates, "当前"
         )
+        _validate_candidate_operation_context(
+            current_candidate_rebuild_context, current_candidates, "当前"
+        )
         current_context_zlib = self._pack_context(
             current_candidate_rebuild_context, state_features, source_fingerprint
         )
@@ -507,6 +738,9 @@ class ReplayBuffer:
             ):
                 raise ValueError("下一状态候选与经验中的下一状态指纹不一致")
             _validate_candidate_context(
+                next_candidate_rebuild_context, candidates, "下一状态"
+            )
+            _validate_candidate_operation_context(
                 next_candidate_rebuild_context, candidates, "下一状态"
             )
             if next_candidate_rebuild_context.get("source_state_fingerprint") != str(

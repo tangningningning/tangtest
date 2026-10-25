@@ -289,6 +289,10 @@ class _CacheComplementarityContext:
     demand_normalizer: float
     cache_coverage_before: float | None
     cache_coverage_available: bool
+    prediction_forecast: DecisionForecast
+    task_vehicle_predicted_positions: tuple[np.ndarray, ...]
+    current_uav_positions: Mapping[str, tuple[float, float]]
+    current_uav_mean_task_distance_normalized: Mapping[str, float]
 
 
 class CandidateFeatureEncoder:
@@ -448,6 +452,7 @@ class CandidateFeatureEncoder:
             math.hypot(self.bounds[2] - self.bounds[0], self.bounds[3] - self.bounds[1]),
         )
         search = uav_configuration.uav_search_config_from_project(dict(slot_input.model.project_cfg))
+        self.uav_search_config = search
         self.max_move_distance_m = max(
             1.0, float(search.max_horizontal_speed_mps) * float(search.dt_s)
         )
@@ -821,29 +826,81 @@ class CandidateFeatureEncoder:
         ]
         features.extend(moved_mask)
         features.extend([min(distance / self.max_move_distance_m, 1.0) for distance in distances])
-        search = uav_configuration.uav_search_config_from_project(dict(slot_input.model.project_cfg))
         uav_triggers = {uav_id: int(uav_id in action.moved_uav_ids) for uav_id in self.uav_ids}
-        movement = uav_configuration.movement_summary(before_uav, after_uav, uav_triggers, search)
-        features.append(float(movement[1]))
-        horizon_mask = self._forecast_mask(decision_forecast)
-        demand_xy = [
-            np.asarray(decision_forecast.predicted_vehicle_positions_horizon[horizon][vehicle_id], dtype=np.float64)
-            for horizon, valid in enumerate(horizon_mask)
-            if valid
-            for vehicle_id in self.task_vehicle_ids
-            if vehicle_id in decision_forecast.predicted_vehicle_positions_horizon[horizon]
-        ]
+        unchanged_uav_positions = not action.moved_uav_ids and all(
+            np.array_equal(before_uav[uav_id], after_uav[uav_id])
+            for uav_id in self.uav_ids
+        )
+        if unchanged_uav_positions:
+            movement_cost = 0.0
+        else:
+            movement = uav_configuration.movement_summary(
+                before_uav, after_uav, uav_triggers, self.uav_search_config
+            )
+            movement_cost = float(movement[1])
+        features.append(movement_cost)
+        forecast_matches_context = (
+            decision_forecast is complementarity.prediction_forecast
+        )
+        horizon_mask = (
+            None
+            if forecast_matches_context
+            else self._forecast_mask(decision_forecast)
+        )
+        demand_xy = (
+            complementarity.task_vehicle_predicted_positions
+            if forecast_matches_context
+            else tuple(
+                np.asarray(
+                    decision_forecast.predicted_vehicle_positions_horizon[horizon][vehicle_id],
+                    dtype=np.float64,
+                )
+                for horizon, valid in enumerate(horizon_mask)
+                if valid
+                for vehicle_id in self.task_vehicle_ids
+                if vehicle_id in decision_forecast.predicted_vehicle_positions_horizon[horizon]
+            )
+        )
         if not demand_xy:
             raise ValueError("合法预测时域中缺少任务车辆预测位置")
-        for positions in (before_uav, after_uav):
+        cached_positions_match = forecast_matches_context and all(
+            tuple(float(value) for value in before_uav[uav_id])
+            == complementarity.current_uav_positions[uav_id]
+            for uav_id in self.uav_ids
+        )
+        for position_index, positions in enumerate((before_uav, after_uav)):
             for uav_id in self.uav_ids:
-                mean_distance = float(
-                    np.mean([np.linalg.norm(positions[uav_id] - vehicle_xy) for vehicle_xy in demand_xy])
-                )
-                normalized_distance = mean_distance / self.map_diagonal_m
-                if not np.isfinite(normalized_distance) or normalized_distance > 1.0 + 1.0e-6:
-                    raise ValueError("预测需求距离超出地图对角线归一化范围")
-                features.append(min(normalized_distance, 1.0))
+                if (
+                    cached_positions_match
+                    and position_index == 0
+                ):
+                    normalized_distance = complementarity.current_uav_mean_task_distance_normalized[
+                        uav_id
+                    ]
+                elif (
+                    cached_positions_match
+                    and np.array_equal(positions[uav_id], before_uav[uav_id])
+                ):
+                    normalized_distance = complementarity.current_uav_mean_task_distance_normalized[
+                        uav_id
+                    ]
+                else:
+                    mean_distance = float(
+                        np.mean(
+                            [
+                                np.linalg.norm(positions[uav_id] - vehicle_xy)
+                                for vehicle_xy in demand_xy
+                            ]
+                        )
+                    )
+                    normalized_distance = mean_distance / self.map_diagonal_m
+                    if (
+                        not np.isfinite(normalized_distance)
+                        or normalized_distance > 1.0 + 1.0e-6
+                    ):
+                        raise ValueError("预测需求距离超出地图对角线归一化范围")
+                    normalized_distance = min(normalized_distance, 1.0)
+                features.append(float(normalized_distance))
         features.extend(
             self._encode_cache_complementarity_candidate(
                 before_cache, after_cache, complementarity
@@ -984,9 +1041,41 @@ class CandidateFeatureEncoder:
             cache_coverage_before = float(
                 np.sum(demand * np.clip(coverage, 0.0, 1.0)) / total_predicted_demand
             )
+        task_predicted_positions = tuple(
+            np.asarray(
+                decision_forecast.predicted_vehicle_positions_horizon[horizon][vehicle_id],
+                dtype=np.float64,
+            ).reshape(2).copy()
+            for horizon, valid in enumerate(mask)
+            if valid
+            for vehicle_id in self.task_vehicle_ids
+            if vehicle_id in decision_forecast.predicted_vehicle_positions_horizon[horizon]
+        )
+        if not task_predicted_positions:
+            raise ValueError("合法预测时域中缺少任务车辆预测位置")
+        uav_position_tuples = {
+            uav_id: tuple(float(value) for value in current_uav[uav_id])
+            for uav_id in self.uav_ids
+        }
+        uav_mean_distance_normalized: dict[str, float] = {}
+        for uav_id in self.uav_ids:
+            mean_distance = float(
+                np.mean(
+                    [
+                        np.linalg.norm(current_uav[uav_id] - vehicle_xy)
+                        for vehicle_xy in task_predicted_positions
+                    ]
+                )
+            )
+            normalized_distance = mean_distance / self.map_diagonal_m
+            if not np.isfinite(normalized_distance) or normalized_distance > 1.0 + 1.0e-6:
+                raise ValueError("预测需求距离超出地图对角线归一化范围")
+            uav_mean_distance_normalized[uav_id] = min(normalized_distance, 1.0)
         task_vehicle_count = max(1, len(self.task_vehicle_ids))
         demand_normalizer = float(max(1, self.horizon_count * task_vehicle_count))
         for array in (demand, node_weights_array, uav_local_demand, popularity):
+            array.setflags(write=False)
+        for array in task_predicted_positions:
             array.setflags(write=False)
         return _CacheComplementarityContext(
             predicted_demand_by_horizon=demand,
@@ -998,6 +1087,10 @@ class CandidateFeatureEncoder:
             demand_normalizer=demand_normalizer,
             cache_coverage_before=cache_coverage_before,
             cache_coverage_available=coverage_available,
+            prediction_forecast=decision_forecast,
+            task_vehicle_predicted_positions=task_predicted_positions,
+            current_uav_positions=uav_position_tuples,
+            current_uav_mean_task_distance_normalized=uav_mean_distance_normalized,
         )
 
     def _encode_cache_complementarity_candidate(
