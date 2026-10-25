@@ -61,3 +61,13 @@
 ### 结论
 
 seed `20001` 的单 Episode 314-slot 端到端执行通过。**当前尚不具备启动 Online Joint DQN 正式训练的条件**：Train/Validation/Test 仅完成 4/300、0/30、0/100，split manifest 仍为 `generating`，正式池及正式服务目录路径未发布。Cloud 实际执行负载也未在本次固定 KEEP+STAY rollout 中覆盖。上文关于旧环境 430 个 Episode 的描述是历史记录，不能作为新环境生成完成的证据。
+
+## 2026-10-25：Checkpoint、Validation 选模与 Test 入口
+
+本节只记录运行时代码合同；上文的数据生成计数是当时的状态快照，本次没有重写或重新验收数据池。
+
+- Checkpoint 合同版本提升为 14。每个完整 Episode 原子更新 `latest_checkpoint.pt`；Episode 50、100、150、200、250、300 生成身份校验后的不可变里程碑；`best_checkpoint.pt` 只由固定 Validation 池的平均 Episode 累计系统效用严格改善时更新，并列保留原 best。恢复训练限定使用同一 Run 的 `latest_checkpoint.pt`，校验源码/配置/训练池/Validation 池身份、Episode 与 Slot 进度、探索率进度、Replay 写入进度及优化器/目标网络/RNG 状态。
+- 每完成 50 个 Episode，通过正式 Validation 池的 30 个固定场景运行冻结贪心策略。验证不接收 Replay，不执行优化器更新，不改变探索率或 Agent 随机状态；场景失败时整体中止，不跳过样本。每次结果记录 Episode 边界、策略权重摘要、Validation 场景身份、平均系统效用及成功/超时、生命周期时延、上传能耗和系统成本指标。
+- 新增 `scripts/evaluation/evaluate_online_joint_dqn.py`，读取训练完成 Run 中的 best Checkpoint 和正式 Test Manifest，在全部 100 个 Test 场景上以同一环境适配器、执行器和合法动作集合运行 DQN 贪心、KEEP+STAY 与均匀随机合法动作。入口记录 Checkpoint、配置和场景身份，写出逐场景汇总与逐时隙指标；Test 不参与选模。
+- 定向检查通过：四个 Python 文件 AST 解析及模块导入；内存 Checkpoint 保存/恢复；不可变里程碑重复保存只复用相同快照；Validation 主指标只在严格改善时更新；内存冻结执行核对未改变梯度步、探索 RNG 或 Replay 写入计数；`git diff --check` 通过。未运行正式 Validation/Test、训练或场景生成。
+- 本次没有改写环境生成器及其依赖文件，也没有修改正式配置、数据、Manifest、生成日志或现有 Checkpoint 文件；生成期间的运行进程未停止或重启。由于完整 Train/Validation/Test 池仍需按正式合同验收，且 Cloud `finite_pool` 配置对齐仍是既有待办事项，**本节不宣称正式训练或 Test 评价现在已具备启动条件**。

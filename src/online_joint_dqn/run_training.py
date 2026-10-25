@@ -15,6 +15,7 @@ import random
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -45,18 +46,27 @@ from online_joint_dqn.environment_adapter import (  # noqa: E402
     ExclusiveDQNEnvironment,
     candidate_generation_contract,
 )
+from online_joint_dqn.evaluation import (  # noqa: E402
+    evaluate_formal_split,
+    evaluation_pool_identity,
+    policy_state_sha256,
+    should_update_best,
+    validate_formal_evaluation_pool,
+)
 from online_joint_dqn.replay_buffer import ReplayBuffer  # noqa: E402
 from online_joint_dqn.trainer import TrainerConfig, train_episode  # noqa: E402
 import training_pool_contract as pool_contract  # noqa: E402
 
 
-RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v11_arrival_execution_horizon"
-CHECKPOINT_SCHEMA_VERSION = 12
+RUN_MANIFEST_SCHEMA_VERSION = "online_joint_dqn_run_v13_validation_selection"
+CHECKPOINT_SCHEMA_VERSION = 14
 DEFAULT_SEED = 20261022
 DEFAULT_REPLAY_CAPACITY = 10000
 DEFAULT_LEARNING_RATE = 2.5e-4
 DEFAULT_RUN_NAME_PREFIX = "online_joint_dqn_fixed_input"
 PLOT_REFRESH_INTERVAL_EPISODES = 10
+VALIDATION_INTERVAL_EPISODES = 50
+MILESTONE_EPISODES = (50, 100, 150, 200, 250, 300)
 
 
 def _should_refresh_training_plots(completed_episode_count: int) -> bool:
@@ -77,6 +87,7 @@ _CODE_IDENTITY_REQUIRED_PATHS = (
     "src/scenario/realization.py",
     "src/scenario/vehicle_order.py",
     "scripts/training/training_pool_contract.py",
+    "scripts/evaluation/evaluate_online_joint_dqn.py",
 )
 
 
@@ -409,6 +420,18 @@ def _validate_training_pool() -> dict[str, Any]:
     }
 
 
+def _validate_independent_validation_pool() -> dict[str, Any]:
+    """训练前冻结 Validation 场景身份，并拒绝不完整或损坏的场景。"""
+
+    pool, info = validate_formal_evaluation_pool(PROJECT_ROOT, "validation")
+    return {
+        **info,
+        "pool_path": str(pool),
+        "validated_episode_count": len(info["active_episode_seeds"]),
+        "validation_pool_identity": evaluation_pool_identity(info),
+    }
+
+
 def _validate_independent_test_pool(
     runtime_config: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -535,6 +558,7 @@ def _new_run_directory(
 
 def _run_identity(
     pool_info: Mapping[str, Any],
+    validation_pool_info: Mapping[str, Any],
     trainer_config: TrainerConfig,
     *,
     seed: int,
@@ -588,6 +612,9 @@ def _run_identity(
         ],
         "training_task_contract_sha256": pool_info["task_data_contract_sha256"],
         "service_catalog_sha256": pool_info["service_catalog_sha256"],
+        "validation_pool_identity": dict(
+            validation_pool_info["validation_pool_identity"]
+        ),
         "trainer_config": _jsonable(trainer_config.__dict__),
         "agent_config": {
             "state_dim": agent.state_dim,
@@ -622,6 +649,125 @@ def _run_identity(
     return identity
 
 
+def _checkpoint_payload(
+    path: Path,
+    *,
+    agent: DoubleDQNAgent,
+    replay: ReplayBuffer,
+    identity: Mapping[str, Any],
+    episode_order: list[int],
+    episode_rows: list[dict[str, Any]],
+    next_episode_index: int,
+    global_step: int,
+    checkpoint_role: str = "latest",
+    training_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if checkpoint_role not in {"latest", "milestone", "best"}:
+        raise ValueError(f"Unsupported checkpoint role: {checkpoint_role!r}")
+    episode_index = int(next_episode_index)
+    step = int(global_step)
+    if not 0 <= episode_index <= len(episode_order):
+        raise ValueError("Checkpoint Episode progress is outside the formal order")
+    if len(episode_rows) != episode_index:
+        raise ValueError("Checkpoint Episode summaries do not match its progress")
+    identity_payload = _identity_payload(identity)
+    if _identity_sha256(identity_payload) != str(identity.get("identity_sha256", "")):
+        raise ValueError("Cannot save a Checkpoint with an invalid run identity digest")
+    time_contract = identity_payload.get("time_horizon_contract", {})
+    execution_horizon = int(time_contract.get("execution_horizon_slots", 0))
+    if execution_horizon and step != episode_index * execution_horizon:
+        raise ValueError("Checkpoint global step is inconsistent with complete Episode progress")
+    if checkpoint_role == "milestone" and episode_index not in MILESTONE_EPISODES:
+        raise ValueError("A milestone Checkpoint must match a formal milestone Episode")
+    if checkpoint_role == "best" and not isinstance(
+        (training_metadata or {}).get("best_checkpoint"), Mapping
+    ):
+        raise ValueError("A best Checkpoint requires Validation selection metadata")
+    return {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_role": checkpoint_role,
+        "identity_sha256": str(identity["identity_sha256"]),
+        "identity_payload": identity_payload,
+        "agent_state": agent.state_dict(),
+        "replay_state": replay.state_dict(),
+        "episode_order": list(episode_order),
+        "completed_episode_rows": list(episode_rows),
+        "next_episode_index": episode_index,
+        "completed_episode_count": episode_index,
+        "global_step": step,
+        "epsilon_progress_global_step": step,
+        "gradient_update_count": int(agent.gradient_steps),
+        "training_metadata": _jsonable(training_metadata or {}),
+        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            torch.save(dict(payload), stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return int(path.stat().st_size)
+
+
+def _checkpoint_values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and left.dtype == right.dtype
+            and tuple(left.shape) == tuple(right.shape)
+            and torch.equal(left.cpu(), right.cpu())
+        )
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        if not (
+            isinstance(left, np.ndarray)
+            and isinstance(right, np.ndarray)
+            and left.dtype == right.dtype
+            and left.shape == right.shape
+        ):
+            return False
+        try:
+            return bool(np.array_equal(left, right, equal_nan=True))
+        except TypeError:
+            return bool(np.array_equal(left, right))
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        return (
+            isinstance(left, Mapping)
+            and isinstance(right, Mapping)
+            and set(left) == set(right)
+            and all(_checkpoint_values_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (tuple, list)) or isinstance(right, (tuple, list)):
+        return (
+            isinstance(left, (tuple, list))
+            and isinstance(right, (tuple, list))
+            and len(left) == len(right)
+            and all(
+                _checkpoint_values_equal(a, b)
+                for a, b in zip(left, right, strict=True)
+            )
+        )
+    try:
+        result = left == right
+        return bool(result) if not isinstance(result, np.ndarray) else bool(result.all())
+    except Exception:
+        return False
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -632,30 +778,46 @@ def _save_checkpoint(
     episode_rows: list[dict[str, Any]],
     next_episode_index: int,
     global_step: int,
+    checkpoint_role: str = "latest",
+    training_metadata: Mapping[str, Any] | None = None,
 ) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    payload = {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "identity_sha256": str(identity["identity_sha256"]),
-        "identity_payload": _identity_payload(identity),
-        "agent_state": agent.state_dict(),
-        "replay_state": replay.state_dict(),
-        "episode_order": list(episode_order),
-        "completed_episode_rows": list(episode_rows),
-        "next_episode_index": int(next_episode_index),
-        "completed_episode_count": int(next_episode_index),
-        "global_step": int(global_step),
-        "epsilon_progress_global_step": int(global_step),
-        "gradient_update_count": int(agent.gradient_steps),
-        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    with temporary.open("wb") as stream:
-        torch.save(payload, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    return int(path.stat().st_size)
+    payload = _checkpoint_payload(
+        path,
+        agent=agent,
+        replay=replay,
+        identity=identity,
+        episode_order=episode_order,
+        episode_rows=episode_rows,
+        next_episode_index=next_episode_index,
+        global_step=global_step,
+        checkpoint_role=checkpoint_role,
+        training_metadata=training_metadata,
+    )
+    return _atomic_torch_save(path, payload)
+
+
+def _save_immutable_checkpoint(
+    path: Path,
+    **checkpoint_arguments: Any,
+) -> int:
+    """写一次性里程碑；重复续跑仅允许精确复用相同快照。"""
+
+    payload = _checkpoint_payload(path, **checkpoint_arguments)
+    if path.exists():
+        existing = torch.load(path, map_location="cpu", weights_only=False)
+        comparable_existing = {
+            key: value for key, value in existing.items() if key != "saved_at_utc"
+        }
+        comparable_payload = {
+            key: value for key, value in payload.items() if key != "saved_at_utc"
+        }
+        if not _checkpoint_values_equal(comparable_existing, comparable_payload):
+            raise FileExistsError(
+                "Existing milestone checkpoint has different identity or state; "
+                f"refusing to overwrite: {path}"
+            )
+        return int(path.stat().st_size)
+    return _atomic_torch_save(path, payload)
 
 
 def _read_episode_metrics(path: Path) -> list[dict[str, Any]]:
@@ -689,6 +851,258 @@ def _write_episode_metrics_atomic(
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def _validation_artifact(
+    run_dir: Path,
+    *,
+    completed_episode_count: int,
+    identity: Mapping[str, Any],
+    agent: DoubleDQNAgent,
+    validation_pool_info: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path, str]:
+    """读取或原子创建一个完整且身份固定的 Validation 结果文件。"""
+
+    from online_joint_dqn.evaluation import EVALUATION_SCHEMA_VERSION
+
+    pool_identity = dict(validation_pool_info["validation_pool_identity"])
+    policy_hash = policy_state_sha256(agent)
+    checkpoint_identity = {
+        "run_identity_sha256": str(identity["identity_sha256"]),
+        "completed_episode_count": int(completed_episode_count),
+        "policy_state_sha256": policy_hash,
+        "checkpoint_role": "latest_policy_at_validation_boundary",
+    }
+    path = run_dir / "validation" / f"validation_episode_{completed_episode_count:03d}.json"
+    if path.is_file():
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            artifact.get("schema_version") != EVALUATION_SCHEMA_VERSION
+            or artifact.get("status") != "COMPLETE"
+            or artifact.get("completed_episode_count") != completed_episode_count
+            or artifact.get("run_identity_sha256") != identity["identity_sha256"]
+            or artifact.get("checkpoint_identity") != checkpoint_identity
+            or artifact.get("validation_pool_identity") != pool_identity
+        ):
+            raise ValueError(
+                "Existing Validation artifact has a different checkpoint or scene identity; "
+                f"refusing to reuse or overwrite: {path}"
+            )
+        expected_seeds = list(pool_identity["active_episode_seeds"])
+        rows = artifact.get("episode_summaries")
+        if (
+            not isinstance(rows, list)
+            or [int(row.get("episode_seed", -1)) for row in rows] != expected_seeds
+            or [row.get("scene_sha256") for row in rows]
+            != [pool_identity["active_episode_scene_sha256"][str(seed)] for seed in expected_seeds]
+        ):
+            raise ValueError("Existing Validation artifact is missing scenes or scene identities")
+        metric = float(artifact["selection_metric_value"])
+        if not math.isfinite(metric):
+            raise ValueError("Existing Validation artifact has a non-finite selection metric")
+        return artifact, path, _sha256(path)
+
+    result = evaluate_formal_split(
+        PROJECT_ROOT,
+        split="validation",
+        policies=("dqn_greedy",),
+        agent=agent,
+        validated_pool=(Path(validation_pool_info["pool_path"]), validation_pool_info),
+    )
+    if result.get("status") != "COMPLETE" or result.get("pool_identity") != pool_identity:
+        raise RuntimeError("Validation did not complete against the pinned formal pool")
+    policy_summary = result["policy_summaries"]["dqn_greedy"]
+    metric = float(policy_summary["mean_episode_system_utility"])
+    if not math.isfinite(metric):
+        raise FloatingPointError("Validation mean Episode utility is non-finite")
+    episode_summaries = [
+        {
+            key: value
+            for key, value in row.items()
+            if key != "per_slot"
+        }
+        for row in result["episode_results"]
+    ]
+    expected_seeds = list(pool_identity["active_episode_seeds"])
+    if [int(row["episode_seed"]) for row in episode_summaries] != expected_seeds:
+        raise RuntimeError("Validation did not evaluate the full active seed order")
+    artifact = {
+        "schema_version": EVALUATION_SCHEMA_VERSION,
+        "status": "COMPLETE",
+        "split": "validation",
+        "completed_episode_count": int(completed_episode_count),
+        "run_identity_sha256": str(identity["identity_sha256"]),
+        "checkpoint_identity": checkpoint_identity,
+        "validation_pool_identity": pool_identity,
+        "selection_metric": "mean_episode_system_utility",
+        "selection_metric_value": metric,
+        "policy_summary": policy_summary,
+        "episode_summaries": episode_summaries,
+    }
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite a Validation artifact: {path}")
+    _write_json(path, artifact, atomic=True)
+    return artifact, path, _sha256(path)
+
+
+def _finish_validation_checkpoint_boundary(
+    run_dir: Path,
+    *,
+    completed_episode_count: int,
+    agent: DoubleDQNAgent,
+    replay: ReplayBuffer,
+    identity: Mapping[str, Any],
+    episode_order: list[int],
+    episode_rows: list[dict[str, Any]],
+    global_step: int,
+    training_metadata: dict[str, Any],
+    validation_pool_info: Mapping[str, Any],
+) -> tuple[dict[str, Any], int, int | None]:
+    if completed_episode_count not in MILESTONE_EPISODES:
+        raise ValueError("Validation/checkpoint boundary is not a formal milestone")
+    artifact, artifact_path, artifact_sha = _validation_artifact(
+        run_dir,
+        completed_episode_count=completed_episode_count,
+        identity=identity,
+        agent=agent,
+        validation_pool_info=validation_pool_info,
+    )
+    metric = float(artifact["selection_metric_value"])
+    checkpoint_identity = dict(artifact["checkpoint_identity"])
+    pool_identity = dict(artifact["validation_pool_identity"])
+    validation_history = list(training_metadata.get("validation_history", []))
+    record = {
+        "episode_count": int(completed_episode_count),
+        "checkpoint_identity": checkpoint_identity,
+        "validation_pool_identity": pool_identity,
+        "selection_metric": "mean_episode_system_utility",
+        "selection_metric_value": metric,
+        "policy_summary": dict(artifact["policy_summary"]),
+        "scene_identities": [
+            {
+                "episode_seed": int(row["episode_seed"]),
+                "scene_sha256": str(row["scene_sha256"]),
+            }
+            for row in artifact["episode_summaries"]
+        ],
+        "artifact_path": artifact_path.relative_to(run_dir).as_posix(),
+        "artifact_sha256": artifact_sha,
+    }
+    matching_records = [
+        item for item in validation_history
+        if int(item.get("episode_count", -1)) == completed_episode_count
+    ]
+    if matching_records:
+        if len(matching_records) != 1 or matching_records[0] != record:
+            raise ValueError(
+                "Checkpoint Validation history conflicts with its immutable result artifact"
+            )
+    else:
+        validation_history.append(record)
+        validation_history.sort(key=lambda item: int(item["episode_count"]))
+
+    best_metadata = training_metadata.get("best_checkpoint")
+    if best_metadata is not None and not isinstance(best_metadata, Mapping):
+        raise ValueError("Checkpoint best-selection metadata is malformed")
+    best_score = (
+        None
+        if best_metadata is None
+        else float(best_metadata["selection_metric_value"])
+    )
+    best_path = run_dir / "checkpoints" / "best_checkpoint.pt"
+    best_file_sha = training_metadata.get("best_checkpoint_file_sha256")
+    if best_path.is_file():
+        actual_best_sha = _sha256(best_path)
+        if best_file_sha is not None and best_file_sha != actual_best_sha:
+            raise ValueError("best_checkpoint.pt SHA-256 differs from latest checkpoint metadata")
+        best_file_sha = actual_best_sha
+        best_payload = torch.load(best_path, map_location="cpu", weights_only=False)
+        if (
+            best_payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+            or best_payload.get("identity_sha256") != identity["identity_sha256"]
+            or best_payload.get("checkpoint_role") != "best"
+        ):
+            raise ValueError("Existing best checkpoint has an incompatible run identity")
+        stored_best_metadata = best_payload.get("training_metadata", {}).get(
+            "best_checkpoint"
+        )
+        if best_metadata is None or not _checkpoint_values_equal(
+            dict(best_metadata), stored_best_metadata
+        ):
+            raise ValueError("Existing best checkpoint differs from latest selection metadata")
+    elif best_metadata is not None:
+        raise FileNotFoundError("Latest Checkpoint names a best model whose file is missing")
+
+    improved = should_update_best(best_score, metric)
+    if improved:
+        best_metadata = {
+            "episode_count": int(completed_episode_count),
+            "selection_metric": "mean_episode_system_utility",
+            "selection_metric_value": metric,
+            "policy_state_sha256": str(checkpoint_identity["policy_state_sha256"]),
+            "checkpoint_identity": checkpoint_identity,
+        }
+        best_training_metadata = {
+            "validation_history": validation_history,
+            "best_checkpoint": best_metadata,
+        }
+        _save_checkpoint(
+            best_path,
+            agent=agent,
+            replay=replay,
+            identity=identity,
+            episode_order=episode_order,
+            episode_rows=episode_rows,
+            next_episode_index=completed_episode_count,
+            global_step=global_step,
+            checkpoint_role="best",
+            training_metadata=best_training_metadata,
+        )
+        best_file_sha = _sha256(best_path)
+    training_metadata["validation_history"] = validation_history
+    training_metadata["best_checkpoint"] = (
+        None if best_metadata is None else dict(best_metadata)
+    )
+    training_metadata["best_checkpoint_file_sha256"] = best_file_sha
+    latest_path = run_dir / "checkpoints" / "latest_checkpoint.pt"
+    latest_bytes = _save_checkpoint(
+        latest_path,
+        agent=agent,
+        replay=replay,
+        identity=identity,
+        episode_order=episode_order,
+        episode_rows=episode_rows,
+        next_episode_index=completed_episode_count,
+        global_step=global_step,
+        checkpoint_role="latest",
+        training_metadata=training_metadata,
+    )
+    milestone_path = (
+        run_dir
+        / "checkpoints"
+        / f"milestone_episode_{completed_episode_count:03d}.pt"
+    )
+    milestone_bytes = _save_immutable_checkpoint(
+        milestone_path,
+        agent=agent,
+        replay=replay,
+        identity=identity,
+        episode_order=episode_order,
+        episode_rows=episode_rows,
+        next_episode_index=completed_episode_count,
+        global_step=global_step,
+        checkpoint_role="milestone",
+        training_metadata=training_metadata,
+    )
+    return {
+        "record": record,
+        "best_checkpoint": (
+            None
+            if best_metadata is None
+            else {**dict(best_metadata), "file_sha256": best_file_sha}
+        ),
+        "best_updated": improved,
+    }, latest_bytes, milestone_bytes
 
 
 def _write_run_summary(
@@ -947,6 +1361,7 @@ def run_training(
     pool_info = _validate_training_pool()
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
     runtime_config = project_config.parse_toml_file(config_path)
+    validation_pool_info = _validate_independent_validation_pool()
     beta_ca = float(
         project_config.get_config_value(runtime_config, "objective.beta_ca")
     )
@@ -974,7 +1389,17 @@ def run_training(
         seed=int(seed),
     )
     replay = ReplayBuffer(int(replay_capacity), seed=int(seed))
-    trainer_config = TrainerConfig()
+    # The formal exploration schedule spans the full planned finite-horizon
+    # training run.  Keep the schedule global across Episodes and resume from
+    # the checkpointed global_step rather than reaching epsilon_min after only
+    # a small fraction of the 300-Episode pool.
+    formal_training_decision_steps = (
+        len(pool_info["episode_seeds"])
+        * pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+    )
+    trainer_config = TrainerConfig(
+        epsilon_decay_steps=formal_training_decision_steps
+    )
     search_budget = {
         "max_total_evaluations_per_sample": int(
             first_environment.search_budget.max_total_evaluations
@@ -988,6 +1413,7 @@ def run_training(
     }
     identity = _run_identity(
         pool_info,
+        validation_pool_info,
         trainer_config,
         seed=seed,
         replay_capacity=replay_capacity,
@@ -1024,6 +1450,17 @@ def run_training(
                 "service_catalog_sha256": pool_info["service_catalog_sha256"],
             },
             "training_episode_order": pool_info["episode_seeds"],
+            "validation_pool": validation_pool_info["validation_pool_identity"],
+            "validation_interval_episodes": VALIDATION_INTERVAL_EPISODES,
+            "validation_selection_metric": "mean_episode_system_utility",
+            "validation_history": [],
+            "best_checkpoint": None,
+            "checkpoint_contract": {
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "latest_each_completed_episode": True,
+                "milestone_episode_counts": list(MILESTONE_EPISODES),
+                "best_updated_only_on_strict_validation_improvement": True,
+            },
             "evaluation_status": evaluation_gate["status"],
             "evaluation_blockers": evaluation_gate["blockers"],
             "evaluation_gate": evaluation_gate,
@@ -1036,15 +1473,27 @@ def run_training(
         next_episode_index = 0
         global_step = 0
         checkpoint_episode_rows: list[dict[str, Any]] = []
+        training_metadata: dict[str, Any] = {
+            "validation_history": [],
+            "best_checkpoint": None,
+        }
     else:
         checkpoint_path = resume_checkpoint.resolve(strict=True)
         run_dir = checkpoint_path.parent.parent
+        expected_latest_path = (run_dir / "checkpoints" / "latest_checkpoint.pt").resolve()
+        if checkpoint_path != expected_latest_path:
+            raise ValueError(
+                "恢复训练必须从本 Run 的 latest_checkpoint.pt 继续；"
+                "使用里程碑或 best 会回退训练进度并覆盖更晚的 latest。"
+            )
         manifest_path = run_dir / "run_manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError("恢复训练缺少原始 run_manifest.json")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         _validate_resume_identity(identity, manifest, payload)
+        if payload.get("checkpoint_role") != "latest":
+            raise ValueError("恢复路径中的 Checkpoint 角色不是 latest")
         rng_before_restore = _capture_global_rng_state()
         try:
             staged_agent = copy.deepcopy(agent)
@@ -1060,6 +1509,10 @@ def run_training(
                 raise ValueError("Checkpoint Episode 顺序与正式 Training Pool 不匹配")
             restored_next_episode_index = int(payload["next_episode_index"])
             restored_global_step = int(payload["global_step"])
+            if int(payload.get("completed_episode_count", -1)) != restored_next_episode_index:
+                raise ValueError("Checkpoint completed Episode count differs from its resume index")
+            if not 0 <= restored_next_episode_index <= len(pool_info["episode_seeds"]):
+                raise ValueError("Checkpoint Episode 进度超出正式训练计划")
             restored_episode_rows = [
                 dict(row) for row in payload.get("completed_episode_rows", [])
             ]
@@ -1084,6 +1537,18 @@ def run_training(
             )
             if restored_global_step != expected_global_step:
                 raise ValueError("Checkpoint Slot 数与完整 Episode 进度不一致")
+            if int(payload.get("epsilon_progress_global_step", -1)) != restored_global_step:
+                raise ValueError("Checkpoint 探索率进度与全局 Slot 数不一致")
+            if int(payload.get("gradient_update_count", -1)) != int(staged_agent.gradient_steps):
+                raise ValueError("Checkpoint 梯度更新数与 Agent 状态不一致")
+            if int(staged_replay.write_count) != restored_global_step:
+                raise ValueError("Checkpoint Replay 写入进度与全局 Slot 数不一致")
+            raw_training_metadata = payload.get("training_metadata")
+            if not isinstance(raw_training_metadata, Mapping):
+                raise ValueError("Checkpoint 缺少训练/Validation 进度元数据")
+            training_metadata = dict(raw_training_metadata)
+            if not isinstance(training_metadata.get("validation_history"), list):
+                raise ValueError("Checkpoint Validation 历史格式非法")
         except BaseException:
             _restore_global_rng_state(rng_before_restore)
             raise
@@ -1096,9 +1561,69 @@ def run_training(
         global_step = restored_global_step
         checkpoint_episode_rows = restored_episode_rows
 
+        # A crash after the atomic best write but before the subsequent latest
+        # write must not lose the validated best selection. Reconcile that
+        # strictly identity-matched best snapshot into the latest metadata.
+        best_path = run_dir / "checkpoints" / "best_checkpoint.pt"
+        if best_path.is_file():
+            best_payload = torch.load(best_path, map_location="cpu", weights_only=False)
+            _validate_resume_identity(identity, manifest, best_payload)
+            if best_payload.get("checkpoint_role") != "best":
+                raise ValueError("best_checkpoint.pt has an invalid checkpoint role")
+            best_metadata = best_payload.get("training_metadata", {}).get(
+                "best_checkpoint"
+            )
+            if not isinstance(best_metadata, Mapping):
+                raise ValueError("best Checkpoint lacks its Validation selection identity")
+            current_best = training_metadata.get("best_checkpoint")
+            current_count = (
+                -1 if not isinstance(current_best, Mapping)
+                else int(current_best.get("episode_count", -1))
+            )
+            best_count = int(best_metadata.get("episode_count", -1))
+            if best_count > current_count:
+                training_metadata["best_checkpoint"] = dict(best_metadata)
+            elif best_count == current_count and not _checkpoint_values_equal(
+                dict(current_best), dict(best_metadata)
+            ):
+                raise ValueError("latest and best Checkpoints disagree on the selected model")
+            merged_history: dict[int, dict[str, Any]] = {}
+            for history_source in (
+                training_metadata.get("validation_history", []),
+                best_payload.get("training_metadata", {}).get("validation_history", []),
+            ):
+                if not isinstance(history_source, list):
+                    raise ValueError("best/latest Checkpoint Validation history is malformed")
+                for validation_record in history_source:
+                    count = int(validation_record.get("episode_count", -1))
+                    previous = merged_history.get(count)
+                    if previous is not None and previous != validation_record:
+                        raise ValueError(
+                            "best/latest Checkpoints contain conflicting Validation records"
+                        )
+                    merged_history[count] = dict(validation_record)
+            training_metadata["validation_history"] = [
+                merged_history[count] for count in sorted(merged_history)
+            ]
+            training_metadata["best_checkpoint_file_sha256"] = _sha256(best_path)
+
         manifest["evaluation_status"] = evaluation_gate["status"]
         manifest["evaluation_blockers"] = evaluation_gate["blockers"]
         manifest["evaluation_gate"] = evaluation_gate
+        manifest["validation_history"] = list(
+            training_metadata.get("validation_history", [])
+        )
+        restored_best = training_metadata.get("best_checkpoint")
+        manifest["best_checkpoint"] = (
+            None
+            if restored_best is None
+            else {
+                **dict(restored_best),
+                "file_sha256": training_metadata.get(
+                    "best_checkpoint_file_sha256"
+                ),
+            }
+        )
 
     manifest["episode_limit_this_invocation"] = max_episodes
 
@@ -1117,6 +1642,11 @@ def run_training(
         # Checkpoint 是完成进度的提交点；恢复时修复可能落后的派生汇总文件。
         _write_episode_metrics_atomic(episode_metrics_path, episode_rows)
     total_slots = len(episode_order) * pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
+    if trainer_config.epsilon_decay_steps != total_slots:
+        raise RuntimeError(
+            "Formal epsilon schedule must span the complete training decision horizon: "
+            f"decay_steps={trainer_config.epsilon_decay_steps}, total_slots={total_slots}"
+        )
     previous_summary_path = run_dir / "run_summary.json"
     previous_training_elapsed_seconds = sum(
         max(0.0, float(row.get("episode_wall_time_s", 0.0)))
@@ -1149,6 +1679,10 @@ def run_training(
     manifest["completed_episodes"] = next_episode_index
     manifest["completed_slots"] = global_step
     manifest["gradient_update_count"] = checkpointed_gradient_steps
+    manifest["validation_history"] = list(
+        training_metadata.get("validation_history", [])
+    )
+    manifest["best_checkpoint"] = training_metadata.get("best_checkpoint")
     _write_json(run_dir / "run_manifest.json", manifest, atomic=True)
     _write_run_summary(
         run_dir / "run_summary.json",
@@ -1164,6 +1698,49 @@ def run_training(
         beta_ca=beta_ca,
         beta_q=beta_q,
     )
+
+    if next_episode_index in MILESTONE_EPISODES:
+        boundary, last_checkpoint_bytes, milestone_bytes = (
+            _finish_validation_checkpoint_boundary(
+                run_dir,
+                completed_episode_count=next_episode_index,
+                agent=agent,
+                replay=replay,
+                identity=identity,
+                episode_order=episode_order,
+                episode_rows=episode_rows,
+                global_step=global_step,
+                training_metadata=training_metadata,
+                validation_pool_info=validation_pool_info,
+            )
+        )
+        manifest["validation_history"] = list(
+            training_metadata.get("validation_history", [])
+        )
+        manifest["best_checkpoint"] = boundary["best_checkpoint"]
+        manifest["last_checkpoint"] = str(checkpoint_path)
+        manifest["last_checkpoint_bytes"] = last_checkpoint_bytes
+        manifest["latest_milestone_checkpoint"] = str(
+            run_dir
+            / "checkpoints"
+            / f"milestone_episode_{next_episode_index:03d}.pt"
+        )
+        manifest["latest_milestone_checkpoint_bytes"] = milestone_bytes
+        _write_json(run_dir / "run_manifest.json", manifest, atomic=True)
+        _write_run_summary(
+            run_dir / "run_summary.json",
+            status="RUNNING",
+            episode_rows=episode_rows,
+            global_step=global_step,
+            gradient_steps=checkpointed_gradient_steps,
+            last_checkpoint=str(checkpoint_path),
+            last_checkpoint_bytes=last_checkpoint_bytes,
+            elapsed_seconds=0.0,
+            total_slots=total_slots,
+            learning_rate=learning_rate,
+            beta_ca=beta_ca,
+            beta_q=beta_q,
+        )
 
     plot_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="online-joint-dqn-plot"
@@ -1404,6 +1981,8 @@ def run_training(
                     episode_rows=committed_episode_rows,
                     next_episode_index=committed_episode_index,
                     global_step=committed_global_step,
+                    checkpoint_role="latest",
+                    training_metadata=training_metadata,
                 )
                 # Checkpoint 成功替换后才提交对应的内存进度与派生日志。
                 episode_rows = committed_episode_rows
@@ -1418,6 +1997,52 @@ def run_training(
                 manifest["last_checkpoint"] = str(checkpoint_path)
                 manifest["last_checkpoint_bytes"] = last_checkpoint_bytes
                 manifest["last_completed_episode_seed"] = episode_seed
+                _write_json(run_dir / "run_manifest.json", manifest, atomic=True)
+                boundary: dict[str, Any] | None = None
+                milestone_bytes: int | None = None
+                if next_episode_index in MILESTONE_EPISODES:
+                    boundary, last_checkpoint_bytes, milestone_bytes = (
+                        _finish_validation_checkpoint_boundary(
+                            run_dir,
+                            completed_episode_count=next_episode_index,
+                            agent=agent,
+                            replay=replay,
+                            identity=identity,
+                            episode_order=episode_order,
+                            episode_rows=episode_rows,
+                            global_step=global_step,
+                            training_metadata=training_metadata,
+                            validation_pool_info=validation_pool_info,
+                        )
+                    )
+                manifest["training_status"] = "RUNNING"
+                manifest["completed_episodes"] = next_episode_index
+                manifest["completed_slots"] = global_step
+                manifest["gradient_update_count"] = checkpointed_gradient_steps
+                manifest["last_checkpoint"] = str(checkpoint_path)
+                manifest["last_checkpoint_bytes"] = last_checkpoint_bytes
+                manifest["last_completed_episode_seed"] = episode_seed
+                manifest["validation_history"] = list(
+                    training_metadata.get("validation_history", [])
+                )
+                best_manifest = training_metadata.get("best_checkpoint")
+                manifest["best_checkpoint"] = (
+                    None
+                    if best_manifest is None
+                    else {
+                        **dict(best_manifest),
+                        "file_sha256": training_metadata.get(
+                            "best_checkpoint_file_sha256"
+                        ),
+                    }
+                )
+                if next_episode_index in MILESTONE_EPISODES:
+                    manifest["latest_milestone_checkpoint"] = str(
+                        run_dir
+                        / "checkpoints"
+                        / f"milestone_episode_{next_episode_index:03d}.pt"
+                    )
+                    manifest["latest_milestone_checkpoint_bytes"] = milestone_bytes
                 _write_json(run_dir / "run_manifest.json", manifest, atomic=True)
                 _write_run_summary(
                     run_dir / "run_summary.json",

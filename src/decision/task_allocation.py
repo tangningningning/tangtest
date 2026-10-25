@@ -17,7 +17,7 @@ from __future__ import annotations
 import csv
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -3730,6 +3730,106 @@ def _predict_lifecycle_terminal_utility(
     )
 
 
+def _lifecycle_future_edge_compute_allocations(
+    tasks: list[Task],
+    matching: dict[str, str],
+    vehicle_positions: dict[str, np.ndarray],
+    service_node_positions: dict[str, np.ndarray],
+    project_cfg: dict[str, Any],
+    cache_nodes: dict[str, Any],
+    cache_config: cache_configuration.CacheOptimizationConfig,
+    kkt_cache: KKTResourceAllocationCache | None,
+    timing_profile: dict[str, float] | None,
+) -> dict[str, dict[str, float]]:
+    """Estimate future CPU shares for uploaders under the candidate's node load.
+
+    Current compute-stage tasks and current uploaders assigned to each affected
+    Edge node are copied into a counterfactual compute-stage set. The ordinary
+    KKT allocator then estimates a feasible share for that set. This is a
+    one-shot concurrent-load approximation; it does not advance task state or
+    model future arrivals and changing upload completion times.
+    """
+
+    missing = [task.task_id for task in tasks if task.task_id not in matching]
+    if missing:
+        raise ValueError(
+            "future CPU forecast matching omitted task(s): "
+            + ", ".join(sorted(missing))
+        )
+    edge_nodes = {str(value) for value in cache_nodes["node_ids"]}
+    uploading_nodes = {
+        str(matching[task.task_id])
+        for task in tasks
+        if task.execution_stage == "UPLOADING"
+        and str(matching[task.task_id]) in edge_nodes
+    }
+    if not uploading_nodes:
+        return {}
+
+    forecast_tasks: list[Task] = []
+    forecast_matching: dict[str, str] = {}
+    for task in tasks:
+        target = str(matching[task.task_id])
+        if target not in uploading_nodes:
+            continue
+        if task.execution_stage not in {"UPLOADING", "COMPUTING"}:
+            raise ValueError(
+                f"future CPU forecast does not support task stage {task.execution_stage!r}"
+            )
+        forecast_tasks.append(replace(task, execution_stage="COMPUTING"))
+        forecast_matching[task.task_id] = target
+
+    started_at = time.perf_counter() if timing_profile is not None else 0.0
+    allocation = allocate_resources_kkt(
+        forecast_tasks,
+        forecast_matching,
+        vehicle_positions,
+        service_node_positions,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+        kkt_cache=kkt_cache,
+        timing_profile=timing_profile,
+    )
+    if timing_profile is not None:
+        _profile_add(
+            timing_profile,
+            "kkt_runtime",
+            time.perf_counter() - started_at,
+        )
+    if not allocation.feasible:
+        raise ValueError(
+            "candidate future compute-stage KKT forecast is infeasible: "
+            + allocation.infeasible_reason
+        )
+
+    kkt_cfg = kkt_config_from_project(project_cfg)
+    tolerance = max(float(kkt_cfg.bisection_tolerance), 1e-9)
+    for node_id, shares_by_task in allocation.cpu_allocations.items():
+        shares = [float(value) for value in shares_by_task.values()]
+        if (
+            not all(math.isfinite(value) for value in shares)
+            or any(
+                value < float(kkt_cfg.min_cpu_fraction) - tolerance
+                or value > 1.0 + tolerance
+                for value in shares
+            )
+            or math.fsum(shares) > 1.0 + tolerance
+        ):
+            raise RuntimeError(
+                f"future CPU forecast returned illegal KKT shares for node {node_id}"
+            )
+    for task in forecast_tasks:
+        task_shares = allocation.cpu_allocations.get(
+            forecast_matching[task.task_id], {}
+        )
+        if task.task_id not in task_shares:
+            raise RuntimeError(
+                f"future CPU forecast omitted task {task.task_id}"
+            )
+    return allocation.cpu_allocations
+
+
 def _lifecycle_predicted_terminal_utilities(
     tasks: list[Task],
     matching: dict[str, str],
@@ -3740,6 +3840,8 @@ def _lifecycle_predicted_terminal_utilities(
     cache_nodes: dict[str, Any],
     cache_config: cache_configuration.CacheOptimizationConfig,
     project_cfg: dict[str, Any],
+    kkt_cache: KKTResourceAllocationCache | None = None,
+    timing_profile: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Forecast terminal utilities for one fixed candidate and its current rates."""
 
@@ -3760,6 +3862,18 @@ def _lifecycle_predicted_terminal_utilities(
     ):
         raise ValueError("lifecycle candidate scoring requires complete task metadata")
 
+    future_edge_cpu_allocations = _lifecycle_future_edge_compute_allocations(
+        tasks,
+        matching,
+        vehicle_positions,
+        service_node_positions,
+        project_cfg,
+        cache_nodes,
+        cache_config,
+        kkt_cache,
+        timing_profile,
+    )
+
     predicted_utilities: dict[str, float] = {}
     for task in tasks:
         if task.task_id not in matching:
@@ -3775,16 +3889,19 @@ def _lifecycle_predicted_terminal_utilities(
             if role is None:
                 raise ValueError(f"unknown edge execution node {node_id}")
             node_cpu_allocations = cpu_allocations.get(node_id, {})
-            if (
-                task.execution_stage == "COMPUTING"
-                and task.task_id not in node_cpu_allocations
-            ):
-                raise ValueError(
-                    f"computing task {task.task_id} has no candidate CPU allocation"
-                )
-            cpu_fraction = float(
-                node_cpu_allocations.get(task.task_id, 1.0)
-            )
+            if task.execution_stage == "UPLOADING":
+                future_node_allocations = future_edge_cpu_allocations.get(node_id, {})
+                if task.task_id not in future_node_allocations:
+                    raise ValueError(
+                        f"uploading task {task.task_id} has no future KKT CPU allocation"
+                    )
+                cpu_fraction = float(future_node_allocations[task.task_id])
+            else:
+                if task.task_id not in node_cpu_allocations:
+                    raise ValueError(
+                        f"computing task {task.task_id} has no candidate CPU allocation"
+                    )
+                cpu_fraction = float(node_cpu_allocations[task.task_id])
             compute_rate = cpu_fraction * _node_cpu(role, cache_config)
         if task.execution_stage == "UPLOADING":
             if node_id != CLOUD:
@@ -4010,7 +4127,7 @@ def evaluate_matching_with_kkt(
                 or upload_rate_bps <= 0.0
             ):
                 raise RuntimeError(
-                    f"Cloud task {task.task_id} has no positive shared uplink allocation"
+                    f"Cloud task {task.task_id} has no positive fixed per-task Rc"
                 )
             upload_wall_s = (
                 remaining_upload / float(upload_rate_bps)
@@ -4059,6 +4176,8 @@ def evaluate_matching_with_kkt(
         cache_nodes,
         cache_config,
         project_cfg,
+        kkt_cache=kkt_cache,
+        timing_profile=timing_profile,
     )
     if predicted_lifecycle_utilities:
         per_utility.update(predicted_lifecycle_utilities)
@@ -4452,6 +4571,8 @@ def evaluate_matching_candidate_incremental(
         cache_nodes,
         cache_config,
         project_cfg,
+        kkt_cache=kkt_cache,
+        timing_profile=timing_profile,
     )
     if predicted_lifecycle_utilities:
         per_task_utility.update(predicted_lifecycle_utilities)

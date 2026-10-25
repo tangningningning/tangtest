@@ -18,9 +18,9 @@ from .candidate_evaluator import SlotInput, copy_uav_positions
 
 
 OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
-STATE_FEATURE_CONTRACT_VERSION = "formal_observation_spatial_role_slots_active_task_state_v6"
+STATE_FEATURE_CONTRACT_VERSION = "formal_observation_spatial_role_slots_active_task_energy_state_v7"
 CANDIDATE_FEATURE_CONTRACT_VERSION = "prediction_only_cache_spatial_role_slots_v4"
-NETWORK_ARCHITECTURE_VERSION = "legal_candidate_mean_centered_dueling_q_active_task_state_v7"
+NETWORK_ARCHITECTURE_VERSION = "legal_candidate_mean_centered_dueling_q_active_task_energy_state_v8"
 
 
 @dataclass(frozen=True)
@@ -431,6 +431,14 @@ class CandidateFeatureEncoder:
             * (1.0 + self.input_relative_jitter)
             * (1.0 + self.load_relative_jitter)
         )
+        self.upload_energy_reference_j = float(
+            project_config.get_config_value(slot_input.model.project_cfg, "objective.E_ref")
+        )
+        if (
+            not math.isfinite(self.upload_energy_reference_j)
+            or self.upload_energy_reference_j <= 0.0
+        ):
+            raise ValueError("正式上传能耗参考尺度 objective.E_ref 必须为正且有限")
         self.service_sizes_mb = np.asarray(
             slot_input.model.service_catalog["service_sizes_mb"], dtype=np.float64
         ).reshape(-1)
@@ -452,9 +460,10 @@ class CandidateFeatureEncoder:
             "active",
             "stage_uploading",
             "stage_computing",
-            "remaining_upload_bits",
-            "remaining_compute_cycles",
+            "remaining_upload_workload_over_configured_max",
+            "remaining_compute_workload_over_configured_max",
             "remaining_deadline_slots",
+            "cumulative_upload_energy_over_E_ref",
             "remaining_upload_fraction",
             "remaining_compute_fraction",
             "remaining_deadline_fraction",
@@ -581,6 +590,7 @@ class CandidateFeatureEncoder:
                 original_cycles = float(state["cpu_cycles"])
                 remaining_cycles = float(state["remaining_compute_cycles"])
                 remaining_slots = int(state["remaining_slots"])
+                cumulative_upload_energy = float(state["cumulative_upload_energy_j"])
                 if service_id not in service_index:
                     raise ValueError(f"active task references unknown service {service_id}")
                 node_key = (
@@ -593,11 +603,18 @@ class CandidateFeatureEncoder:
                     )
                 if stage not in {"UPLOADING", "COMPUTING"}:
                     raise ValueError(f"unsupported active task stage {stage!r}")
-                numeric = (original_bits, remaining_bits, original_cycles, remaining_cycles)
+                numeric = (
+                    original_bits,
+                    remaining_bits,
+                    original_cycles,
+                    remaining_cycles,
+                    cumulative_upload_energy,
+                )
                 if (
                     not all(math.isfinite(value) for value in numeric)
                     or original_bits <= 0.0
                     or original_cycles <= 0.0
+                    or cumulative_upload_energy < 0.0
                     or not 0.0 <= remaining_bits <= original_bits
                     or not 0.0 <= remaining_cycles <= original_cycles
                     or not 0 < remaining_slots <= self.k_max_slots
@@ -611,9 +628,18 @@ class CandidateFeatureEncoder:
                     1.0,
                     float(stage == "UPLOADING"),
                     float(stage == "COMPUTING"),
-                    remaining_bits,
-                    remaining_cycles,
+                    self._normalize_workload(
+                        remaining_bits,
+                        self.max_input_bits,
+                        "活动任务剩余上传量",
+                    ),
+                    self._normalize_workload(
+                        remaining_cycles,
+                        self.max_cpu_cycles,
+                        "活动任务剩余计算量",
+                    ),
                     float(remaining_slots),
+                    cumulative_upload_energy / self.upload_energy_reference_j,
                     remaining_bits / original_bits,
                     remaining_cycles / original_cycles,
                     remaining_slots / self.k_max_slots,

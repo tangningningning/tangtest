@@ -240,6 +240,19 @@ def _matching_summary(
             * task_allocation._node_cpu(role, cache_config)
         )
     edge_cpu_total = float(math.fsum(edge_cpu_by_node.values()))
+    edge_cpu_fraction_sum_by_node = {
+        node_id: float(math.fsum(result.cpu_allocations.get(node_id, {}).values()))
+        for node_id in node_ids
+    }
+    edge_bandwidth_fraction_sum_by_node = {
+        node_id: float(math.fsum(result.bandwidth_allocations.get(node_id, {}).values()))
+        for node_id in node_ids
+    }
+    edge_bandwidth_usage_hz_by_node = {
+        node_id: edge_bandwidth_fraction_sum_by_node[node_id]
+        * task_allocation._node_bandwidth(node_roles[node_id], cache_config)
+        for node_id in node_ids
+    }
     task_count = len(result.matching)
     mean_delay = (
         float(math.fsum(result.per_task_delay_s.values()) / task_count)
@@ -306,9 +319,10 @@ def _matching_summary(
         ),
         "candidate_evaluation_is_prediction_only": True,
         "candidate_prediction_assumption": (
-            "hold current candidate rates and shares constant; an uploading Edge task uses full node CPU "
-            "for its projected future compute stage; round upload and compute slots separately; "
-            "do not simulate future mobility or arrivals"
+            "hold current candidate upload rates; current computing Edge tasks use their candidate KKT CPU shares; "
+            "uploading Edge tasks on affected nodes use a one-shot KKT forecast that promotes the current "
+            "candidate task set to the compute stage; round upload and compute slots separately; "
+            "do not model staggered upload completion, future arrivals, or future mobility"
         ),
         "candidate_score_is_actual_reward": False,
         "kkt_objective_scope": "per-slot reciprocal delay-energy resource surrogate",
@@ -457,6 +471,9 @@ def _matching_summary(
                 for node_id in node_ids
                 if node_roles[node_id] == "RSU"
             },
+            "edge_cpu_fraction_sum_by_node": edge_cpu_fraction_sum_by_node,
+            "edge_bandwidth_fraction_sum_by_node": edge_bandwidth_fraction_sum_by_node,
+            "edge_bandwidth_usage_hz_by_node": edge_bandwidth_usage_hz_by_node,
             "edge_cpu_usage_cycles_per_s": edge_cpu_total,
             "edge_cpu_usage_by_node_cycles_per_s": edge_cpu_by_node,
         },

@@ -800,6 +800,29 @@ class ExclusiveDQNEnvironment:
     ) -> "ExclusiveDQNEnvironment":
         """读取当前正式 Training Pool 的一个完整生命周期 Episode。"""
 
+        return cls.from_formal_split_episode(
+            project_root,
+            split="train",
+            episode_seed=episode_seed,
+            origin_start=origin_start,
+            max_steps=max_steps,
+            search_budget=search_budget,
+        )
+
+    @classmethod
+    def from_formal_split_episode(
+        cls,
+        project_root: str | Path,
+        *,
+        split: str,
+        episode_seed: int,
+        origin_start: int = 0,
+        max_steps: int | None = None,
+        search_budget: SearchBudget | None = None,
+        validated_pool: tuple[Path, Mapping[str, Any]] | None = None,
+    ) -> "ExclusiveDQNEnvironment":
+        """读取正式 Train/Validation/Test 池中的一个完整 Episode。"""
+
         if max_steps is not None and int(max_steps) <= 0:
             raise ValueError("max_steps 必须大于 0")
         root = Path(project_root).resolve()
@@ -809,13 +832,52 @@ class ExclusiveDQNEnvironment:
         import training_pool_contract as pool_contract
         from common.environment_interface import aligned_execution_steps
 
-        pool, pool_info = pool_contract._validate_pool(
-            root,
-            pool_contract.TRAIN_POOL_RELATIVE,
-            expected_split="train",
-            expected_seed_start=pool_contract.DEFAULT_TRAINING_SEED_START,
-            expected_episode_count=pool_contract.FORMAL_TRAINING_EPISODE_COUNT,
-        )
+        split_contracts = {
+            "train": (
+                pool_contract.TRAIN_POOL_RELATIVE,
+                pool_contract.DEFAULT_TRAINING_SEED_START,
+                pool_contract.FORMAL_TRAINING_EPISODE_COUNT,
+            ),
+            "validation": (
+                pool_contract.VALIDATION_POOL_RELATIVE,
+                30001,
+                30,
+            ),
+            "test": (
+                pool_contract.TEST_POOL_RELATIVE,
+                pool_contract.DEFAULT_TEST_SEED_START,
+                pool_contract.FORMAL_TEST_EPISODE_COUNT,
+            ),
+        }
+        split = str(split).strip().lower()
+        if split not in split_contracts:
+            raise ValueError(f"Unsupported formal split: {split!r}")
+        relative_pool, expected_seed_start, expected_episode_count = split_contracts[split]
+        if validated_pool is None:
+            runtime_config = project_config.parse_toml_file(
+                root / pool_contract.CONFIG_RELATIVE
+            )
+            pool, pool_info = pool_contract._validate_pool(
+                root,
+                relative_pool,
+                expected_split=split,
+                expected_seed_start=expected_seed_start,
+                expected_episode_count=expected_episode_count,
+                runtime_config=runtime_config,
+            )
+        else:
+            pool, pool_info = validated_pool
+            if str(pool_info.get("split")) != split:
+                raise ValueError(
+                    "Validated pool split does not match requested Episode split: "
+                    f"requested={split!r}, validated={pool_info.get('split')!r}"
+                )
+            if Path(pool).resolve() != (root / relative_pool).resolve():
+                raise ValueError("Validated pool path does not match formal split path")
+            if list(pool_info.get("active_episode_seeds", ())) != list(
+                range(expected_seed_start, expected_seed_start + expected_episode_count)
+            ):
+                raise ValueError(f"Validated {split} active seed set is not the formal set")
         context = pool_contract._episode_context(root, pool, int(episode_seed), pool_info)
         lifecycle_parameters = project_config.get_cross_slot_task_parameters(
             dict(context.cfg)

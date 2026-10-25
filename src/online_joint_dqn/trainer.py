@@ -118,6 +118,87 @@ def _numeric_summary(values: list[Any]) -> dict[str, Any]:
     }
 
 
+def _summarize_task_lifecycle(step_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """汇总唯一任务、任务时隙、真实终止时延与生命周期上传能耗。"""
+
+    arrived_ids = [
+        str(task_id)
+        for row in step_rows
+        for task_id in row.get("arrived_task_ids", ())
+    ]
+    if len(arrived_ids) != len(set(arrived_ids)):
+        raise RuntimeError("Episode contains duplicate task arrival IDs")
+
+    terminal_events = [
+        dict(event)
+        for row in step_rows
+        for event in row.get("task_termination_events", ())
+    ]
+    terminal_ids = [str(event.get("task_id", "")) for event in terminal_events]
+    if any(not task_id for task_id in terminal_ids):
+        raise RuntimeError("A task termination event is missing its task ID")
+    if len(terminal_ids) != len(set(terminal_ids)):
+        raise RuntimeError("A task emitted more than one terminal event in the Episode")
+    if set(terminal_ids) != set(arrived_ids):
+        raise RuntimeError(
+            "Episode task arrivals and terminal events differ: "
+            f"arrived={len(arrived_ids)}, terminal={len(terminal_ids)}"
+        )
+
+    reasons = [
+        str(event.get("termination_reason", "")).upper()
+        for event in terminal_events
+    ]
+    if any(reason not in {"SUCCESS", "TIMEOUT"} for reason in reasons):
+        raise RuntimeError("Episode contains an unknown task termination reason")
+    delays = [
+        float(event["actual_execution_time_s"])
+        for event in terminal_events
+        if event.get("actual_execution_time_s") is not None
+    ]
+    energies = [
+        float(event["cumulative_upload_energy_j"])
+        for event in terminal_events
+        if event.get("cumulative_upload_energy_j") is not None
+    ]
+    if len(delays) != len(terminal_events) or len(energies) != len(terminal_events):
+        raise RuntimeError("A terminal event is missing actual lifetime delay or energy")
+    if any(not math.isfinite(value) or value < 0.0 for value in (*delays, *energies)):
+        raise RuntimeError("Episode terminal delay or cumulative upload energy is invalid")
+
+    task_slot_count = sum(int(row.get("task_slot_count", 0)) for row in step_rows)
+    slot_upload_energy = math.fsum(
+        float(row.get("slot_upload_energy_j", 0.0)) for row in step_rows
+    )
+    terminal_upload_energy = math.fsum(energies)
+    if not math.isclose(
+        terminal_upload_energy, slot_upload_energy, rel_tol=1e-10, abs_tol=1e-8
+    ):
+        raise RuntimeError(
+            "Terminal task upload energies differ from actual per-slot upload energy: "
+            f"terminal={terminal_upload_energy}, per_slot={slot_upload_energy}"
+        )
+
+    success_count = sum(reason == "SUCCESS" for reason in reasons)
+    timeout_count = sum(reason == "TIMEOUT" for reason in reasons)
+    denominator = len(arrived_ids)
+    return {
+        "unique_task_count": denominator,
+        "task_arrival_record_count": len(arrived_ids),
+        "task_slot_count": task_slot_count,
+        "successful_task_count": success_count,
+        "timed_out_task_count": timeout_count,
+        "unfinished_task_count": denominator - len(terminal_ids),
+        "task_success_rate": success_count / denominator if denominator else None,
+        "task_timeout_rate": timeout_count / denominator if denominator else None,
+        "task_lifetime_delay_s": _numeric_summary(delays),
+        "total_task_lifetime_delay_s": math.fsum(delays),
+        "task_cumulative_upload_energy_j": _numeric_summary(energies),
+        "total_cumulative_upload_energy_j": terminal_upload_energy,
+        "per_slot_upload_energy_sum_j": slot_upload_energy,
+    }
+
+
 def _aggregate_candidate_q_statistics(
     step_rows: list[dict[str, Any]],
     operation_names: tuple[str, ...],
@@ -309,6 +390,21 @@ def train_episode(
             str(value) for value in environment.model.cache_nodes["node_ids"]
         )
         transition = environment.step(selected.candidate)
+        matching_summary = transition.diagnostics.get("matching_summary", {})
+        resource_summary = (
+            matching_summary.get("resource", {})
+            if isinstance(matching_summary, Mapping)
+            else {}
+        )
+        per_task_slot_execution = transition.diagnostics.get(
+            "per_task_slot_execution", {}
+        )
+        per_task_slot_upload_energy = transition.diagnostics.get(
+            "per_task_slot_upload_energy_j", {}
+        )
+        task_termination_events = transition.diagnostics.get(
+            "task_termination_events", ()
+        )
         if (
             transition.candidate_id != selected.candidate.action.candidate_id
             or transition.operation != selected_operation
@@ -591,6 +687,22 @@ def train_episode(
                 "arrived_task_ids": list(
                     transition.diagnostics.get("arrived_task_ids", [])
                 ),
+                "task_slot_count": (
+                    len(per_task_slot_execution)
+                    if isinstance(per_task_slot_execution, Mapping)
+                    else 0
+                ),
+                "slot_upload_energy_j": float(
+                    math.fsum(
+                        float(value)
+                        for value in per_task_slot_upload_energy.values()
+                    )
+                )
+                if isinstance(per_task_slot_upload_energy, Mapping)
+                else 0.0,
+                "task_termination_events": [
+                    dict(event) for event in task_termination_events
+                ],
                 "completed_task_count": int(
                     transition.diagnostics.get("completed_task_count", 0)
                 ),
@@ -612,6 +724,42 @@ def train_episode(
                 "actual_matching_node_task_counts": transition.diagnostics.get(
                     "actual_matching_node_task_counts"
                 ),
+                "matching_resource_summary": {
+                    "resource_feasible": matching_summary.get("resource_feasible"),
+                    "edge_cpu_fraction_sum_by_node": resource_summary.get(
+                        "edge_cpu_fraction_sum_by_node"
+                    ),
+                    "edge_cpu_usage_cycles_per_s": resource_summary.get(
+                        "edge_cpu_usage_cycles_per_s"
+                    ),
+                    "edge_cpu_usage_by_node_cycles_per_s": resource_summary.get(
+                        "edge_cpu_usage_by_node_cycles_per_s"
+                    ),
+                    "edge_bandwidth_fraction_sum_by_node": resource_summary.get(
+                        "edge_bandwidth_fraction_sum_by_node"
+                    ),
+                    "edge_bandwidth_usage_hz_by_node": resource_summary.get(
+                        "edge_bandwidth_usage_hz_by_node"
+                    ),
+                    "cloud_resource_model": matching_summary.get(
+                        "cloud_resource_model"
+                    ),
+                    "cloud_cpu_usage_cycles_per_s": resource_summary.get(
+                        "cloud_cpu_usage_cycles_per_s"
+                    ),
+                    "cloud_cpu_capacity_cycles_per_s": resource_summary.get(
+                        "cloud_cpu_capacity_cycles_per_s"
+                    ),
+                    "cloud_uplink_rate_usage_bps": resource_summary.get(
+                        "cloud_uplink_rate_usage_bps"
+                    ),
+                    "cloud_uplink_rate_capacity_bps": resource_summary.get(
+                        "cloud_uplink_rate_capacity_bps"
+                    ),
+                    "kkt_resource_residual_max": matching_summary.get(
+                        "KKT_RESOURCE_RESIDUAL_MAX"
+                    ),
+                },
                 "per_task_delay_s": transition.diagnostics.get(
                     "per_task_delay_s"
                 ),
@@ -813,6 +961,7 @@ def train_episode(
     ]
     if len(terminal_task_ids) != len(set(terminal_task_ids)):
         raise RuntimeError("A task emitted more than one terminal event in the Episode")
+    lifecycle_summary = _summarize_task_lifecycle(step_rows)
     if not environment.terminated or observed_slots[-1] != terminal_execution_slot:
         raise RuntimeError(
             "Episode termination does not match the configured execution horizon: "
@@ -984,6 +1133,7 @@ def train_episode(
             if int(row["slot_id"]) >= arrival_horizon_slots
         ),
         "terminal_task_count": len(terminal_task_ids),
+        **lifecycle_summary,
         "mean_system_utility_per_slot": (
             float(episode_reward) / slot_count if slot_count else None
         ),
