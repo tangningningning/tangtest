@@ -139,7 +139,7 @@ def _validate_candidate_operation_subset(
 
 
 class ReplayCandidateBatchReuseCache:
-    """只暂存本 Batch 内确实跨 next/current 复用的完整候选集合。"""
+    """只暂存本 Batch 内重复语义请求的有界候选集合。"""
 
     def __init__(self, reusable_context_keys: set[tuple[str, ...]]) -> None:
         self._reusable_context_keys = frozenset(reusable_context_keys)
@@ -149,23 +149,53 @@ class ReplayCandidateBatchReuseCache:
                        "eviction_count": 0, "bypass_count": 0}
 
     @staticmethod
-    def key(context: Mapping[str, Any]) -> tuple[str, ...]:
-        return _candidate_context_cache_key(context)
+    def key(
+        context: Mapping[str, Any], *, operation_filter: str | None = None
+    ) -> tuple[str, ...]:
+        scope = "ALL" if operation_filter is None else str(operation_filter)
+        return (*_candidate_context_cache_key(context), scope)
 
-    def get(self, context: Mapping[str, Any]) -> tuple[CandidateOption, ...] | None:
-        key = self.key(context)
-        if key not in self._reusable_context_keys:
-            return None
-        candidates = self._items.get(key)
+    @staticmethod
+    def key_from_context_key(
+        context_key: tuple[str, ...], *, operation_filter: str | None = None
+    ) -> tuple[str, ...]:
+        scope = "ALL" if operation_filter is None else str(operation_filter)
+        return (*context_key, scope)
+
+    def get(
+        self,
+        context: Mapping[str, Any],
+        *,
+        operation_filter: str | None = None,
+    ) -> tuple[CandidateOption, ...] | None:
+        key = self.key(context, operation_filter=operation_filter)
+        candidates = (
+            self._items.get(key)
+            if key in self._reusable_context_keys
+            else None
+        )
+        if candidates is None and operation_filter is not None:
+            # A complete next-state set is an exact superset of a current
+            # operation subset for the same semantic context. The adapter
+            # filters it and applies the ordinary identity checks afterward.
+            full_key = self.key(context)
+            if full_key in self._reusable_context_keys:
+                candidates = self._items.get(full_key)
+                if candidates is not None:
+                    key = full_key
         if candidates is not None:
             self._items.move_to_end(key)
             self._stats["hit_count"] += 1
         return candidates
 
     def put(
-        self, context: Mapping[str, Any], candidates: Sequence[CandidateOption]
+        self,
+        context: Mapping[str, Any],
+        candidates: Sequence[CandidateOption],
+        *,
+        operation_filter: str | None = None,
     ) -> None:
-        key = self.key(context)
+        key = self.key(context, operation_filter=operation_filter)
         if key not in self._reusable_context_keys or key in self._items:
             return
         candidate_tuple = tuple(candidates)
@@ -188,7 +218,10 @@ class ReplayCandidateBatchReuseCache:
     def metrics(self) -> dict[str, int]:
         return {
             **self._stats,
-            "eligible_context_count": len(self._reusable_context_keys),
+            "eligible_context_count": len(
+                {key[:-1] for key in self._reusable_context_keys}
+            ),
+            "eligible_scope_count": len(self._reusable_context_keys),
             "max_context_count": _BATCH_REUSE_MAX_CONTEXTS,
             "max_candidate_count": _BATCH_REUSE_MAX_CANDIDATES,
         }

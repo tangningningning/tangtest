@@ -452,6 +452,7 @@ class CacheOptimizer:
         current_cache_state: Any,
         slot_input: SlotInput,
         search_budget: SearchBudget | None = None,
+        precomputed_node_demands: Sequence[Any] | None = None,
         generation_diagnostics: dict[str, Any] | None = None,
     ) -> tuple[tuple[CacheTargetCandidate, ...], bool]:
         """生成有界合法缓存目标。
@@ -468,6 +469,7 @@ class CacheOptimizer:
             current.astype(np.int8, copy=True),
             slot_input,
             settings,
+            precomputed_node_demands=precomputed_node_demands,
             generation_diagnostics=generation_diagnostics,
         )
         return tuple(targets), complete
@@ -477,25 +479,40 @@ class CacheOptimizer:
         current: np.ndarray,
         slot_input: SlotInput,
         settings: SearchBudget,
+        precomputed_node_demands: Sequence[Any] | None = None,
         generation_diagnostics: dict[str, Any] | None = None,
     ) -> tuple[list[CacheTargetCandidate], bool]:
         node_ids = tuple(str(item) for item in slot_input.model.cache_nodes["node_ids"])
         if current.shape[0] != len(node_ids):
             raise ValueError("current Cache rows do not align with configured cache nodes")
+        if precomputed_node_demands is not None and len(precomputed_node_demands) != len(node_ids):
+            raise ValueError("precomputed node demand count does not align with cache nodes")
         targets = [CacheTargetCandidate(current.copy(), (), "KEEP")]
         per_node: list[list[Any]] = []
         proposals_per_node_limit = max(1, int(settings.max_cache_candidates) - 1)
         generation_complete = True
         node_limits_reached: list[str] = []
+        # These inputs are read-only in the proposal helper. Keep one defensive
+        # snapshot for the whole node sweep instead of deep-copying the same
+        # catalog, scenario arrays, node metadata, and horizon mask per node.
+        service_catalog = dict(slot_input.model.service_catalog)
+        cache_nodes = copy.deepcopy(dict(slot_input.model.cache_nodes))
+        scenario_slice = copy.deepcopy(dict(slot_input.scenario_slice))
+        prediction_horizon_mask = copy.deepcopy(slot_input.prediction_horizon_mask)
         for node_index, node_id in enumerate(node_ids):
             proposals = cache_configuration.generate_bounded_cache_target_configurations(
                 current,
                 node_index,
-                dict(slot_input.model.service_catalog),
-                copy.deepcopy(dict(slot_input.model.cache_nodes)),
-                copy.deepcopy(dict(slot_input.scenario_slice)),
+                service_catalog,
+                cache_nodes,
+                scenario_slice,
                 slot_input.model.cache_config,
-                prediction_horizon_mask=copy.deepcopy(slot_input.prediction_horizon_mask),
+                prediction_horizon_mask=prediction_horizon_mask,
+                precomputed_node_demand=(
+                    None
+                    if precomputed_node_demands is None
+                    else precomputed_node_demands[node_index]
+                ),
                 max_candidates=proposals_per_node_limit,
             )
             for proposal in proposals:

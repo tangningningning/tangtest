@@ -1374,7 +1374,13 @@ class ExclusiveDQNEnvironment:
         if operation_filter is not None and operation_filter not in OPERATIONS:
             raise ValueError(f"unknown candidate operation filter: {operation_filter!r}")
         include_keep = operation_filter in (None, "KEEP_STAY")
-        include_cache = operation_filter in (None, "CACHE_UPDATE")
+        # Cache changes are illegal after the arrival horizon. The previous
+        # path enumerated all cache targets and discarded them below; skip that
+        # work while preserving the same empty CACHE_UPDATE action set.
+        include_cache = (
+            operation_filter in (None, "CACHE_UPDATE")
+            and bool(cache_updates_allowed)
+        )
         include_uav = operation_filter in (None, "UAV_MOVE")
         candidate_input = replace(slot_input, tasks=(), vehicle_positions={})
         if candidate_input.tasks or candidate_input.vehicle_positions:
@@ -1389,6 +1395,26 @@ class ExclusiveDQNEnvironment:
             previous_uav_positions=uav_positions,
             slot_input=candidate_input,
             decision_forecast=forecast,
+        )
+        service_catalog = dict(candidate_input.model.service_catalog)
+        cache_nodes = deepcopy(dict(candidate_input.model.cache_nodes))
+        cache_scenario = deepcopy(dict(candidate_input.scenario_slice))
+        cache_prediction_horizon_mask = deepcopy(
+            candidate_input.prediction_horizon_mask
+        )
+        node_predicted_demands = (
+            tuple(
+                cache_configuration.node_specific_predicted_demand(
+                    cache_scenario,
+                    node_index,
+                    cache_nodes,
+                    candidate_input.model.cache_config,
+                    prediction_horizon_mask=cache_prediction_horizon_mask,
+                )
+                for node_index in range(len(cache_nodes["node_ids"]))
+            )
+            if include_cache
+            else None
         )
         candidates: list[CandidateOption] = []
         if include_keep:
@@ -1420,12 +1446,11 @@ class ExclusiveDQNEnvironment:
                 current_cache_state=cache_state,
                 slot_input=candidate_input,
                 search_budget=self.search_budget,
+                precomputed_node_demands=node_predicted_demands,
                 generation_diagnostics=cache_generation_diagnostics,
             )
         else:
             bounded_cache_targets, bounded_cache_complete = (), True
-        service_catalog = dict(candidate_input.model.service_catalog)
-        cache_nodes = deepcopy(dict(candidate_input.model.cache_nodes))
         cache_targets_by_key: dict[bytes, tuple[np.ndarray, str]] = {}
         cache_proposal_count = 0
         single_node_diagnostics: dict[str, dict[str, Any]] = {}
@@ -1442,11 +1467,14 @@ class ExclusiveDQNEnvironment:
                 cache_state,
                 node_index,
                 service_catalog,
-                deepcopy(cache_nodes),
-                deepcopy(dict(candidate_input.scenario_slice)),
+                cache_nodes,
+                cache_scenario,
                 candidate_input.model.cache_config,
-                prediction_horizon_mask=deepcopy(
-                    candidate_input.prediction_horizon_mask
+                prediction_horizon_mask=cache_prediction_horizon_mask,
+                precomputed_node_demand=(
+                    None
+                    if node_predicted_demands is None
+                    else node_predicted_demands[node_index]
                 ),
                 generation_diagnostics=node_diagnostics,
             )
@@ -1674,6 +1702,9 @@ class ExclusiveDQNEnvironment:
             "cache_bounded_generator_complete": bool(bounded_cache_complete),
             "cache_generation_contract_version": CANDIDATE_GENERATION_CONTRACT_VERSION,
             "cache_updates_allowed": bool(cache_updates_allowed),
+            "cache_candidate_generation_skipped_by_arrival_horizon": bool(
+                not cache_updates_allowed
+            ),
             "cache_candidates_rejected_active_task_protection": int(
                 protection_rejected_count
             ),
@@ -1936,7 +1967,9 @@ class ExclusiveDQNEnvironment:
         candidates = self._candidate_rebuild_cache.get(cache_key)
         if candidates is None:
             shared_full_candidates = (
-                None if batch_cache is None else batch_cache.get(context)
+                None
+                if batch_cache is None
+                else batch_cache.get(context, operation_filter=operation_filter)
             )
             if shared_full_candidates is not None:
                 candidates = (
@@ -1996,8 +2029,10 @@ class ExclusiveDQNEnvironment:
             )
         ):
             raise ValueError("回放候选集合与经过校验的上下文身份不匹配")
-        if batch_cache is not None and operation_filter is None:
-            batch_cache.put(context, candidates)
+        if batch_cache is not None:
+            batch_cache.put(
+                context, candidates, operation_filter=operation_filter
+            )
         if candidates is not None and cache_key not in self._candidate_rebuild_cache:
             if len(candidates) > _CANDIDATE_REBUILD_CACHE_MAX_CANDIDATES:
                 self._candidate_rebuild_cache_stats["bypass_count"] += 1

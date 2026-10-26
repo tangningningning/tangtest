@@ -580,20 +580,41 @@ class DoubleDQNAgent:
             for item in transitions
             if not item.terminated
         )
-        current_context_keys = {
-            key
-            for item in transitions
-            if (key := item.candidate_rebuild_context_key(current=True)) is not None
+        next_context_counts: dict[tuple[str, ...], int] = {}
+        current_context_counts: dict[tuple[str, ...], int] = {}
+        for item in transitions:
+            next_key = (
+                None
+                if item.terminated
+                else item.candidate_rebuild_context_key(current=False)
+            )
+            if next_key is not None:
+                next_context_counts[next_key] = next_context_counts.get(next_key, 0) + 1
+            current_key = item.candidate_rebuild_context_key(current=True)
+            if current_key is not None:
+                scoped_current_key = ReplayCandidateBatchReuseCache.key_from_context_key(
+                    current_key, operation_filter=item.action.operation
+                )
+                current_context_counts[scoped_current_key] = (
+                    current_context_counts.get(scoped_current_key, 0) + 1
+                )
+        reusable_context_keys = {
+            ReplayCandidateBatchReuseCache.key_from_context_key(key)
+            for key, count in next_context_counts.items()
+            if count > 1
         }
-        next_context_keys = {
-            key
-            for item in transitions
-            if not item.terminated
-            and (key := item.candidate_rebuild_context_key(current=False)) is not None
+        current_base_keys = {
+            key[:-1] for key in current_context_counts
         }
-        batch_candidate_cache = ReplayCandidateBatchReuseCache(
-            current_context_keys & next_context_keys
+        reusable_context_keys.update(
+            ReplayCandidateBatchReuseCache.key_from_context_key(key)
+            for key in next_context_counts
+            if key in current_base_keys
         )
+        reusable_context_keys.update(
+            key for key, count in current_context_counts.items() if count > 1
+        )
+        batch_candidate_cache = ReplayCandidateBatchReuseCache(reusable_context_keys)
         next_rebuild_started = time.perf_counter()
         phase(
             "agent.update.next_candidate_rebuild_and_double_dqn_targets",

@@ -1144,6 +1144,7 @@ def enumerate_all_cache_target_configurations(
     config: CacheOptimizationConfig,
     *,
     prediction_horizon_mask: Any = None,
+    precomputed_node_demand: Any = None,
     locked_services: Any = None,
     generation_diagnostics: dict[str, Any] | None = None,
 ) -> list[CacheTargetCandidate]:
@@ -1210,13 +1211,22 @@ def enumerate_all_cache_target_configurations(
     if not legal_targets:
         return []
 
-    demand = node_specific_predicted_demand(
-        origin_scenario,
-        index,
-        cache_nodes,
-        config,
-        prediction_horizon_mask=prediction_horizon_mask,
-    )
+    if precomputed_node_demand is None:
+        demand = node_specific_predicted_demand(
+            origin_scenario,
+            index,
+            cache_nodes,
+            config,
+            prediction_horizon_mask=prediction_horizon_mask,
+        )
+    else:
+        demand = np.asarray(precomputed_node_demand, dtype=np.float64).reshape(-1)
+        if (
+            demand.shape != (service_count,)
+            or not np.all(np.isfinite(demand))
+            or np.any(demand < 0.0)
+        ):
+            raise ValueError("precomputed node demand is invalid")
     replica_counts = np.sum(current_cache, axis=0).astype(np.float64)
     mean_demand = float(np.mean(demand)) if len(demand) else 0.0
     prediction_target = _greedy_target_configuration(demand, sizes, capacity)
@@ -1270,6 +1280,7 @@ def generate_bounded_cache_target_configurations(
     config: CacheOptimizationConfig,
     *,
     prediction_horizon_mask: Any = None,
+    precomputed_node_demand: Any = None,
     locked_services: Any = None,
     max_candidates: int | None = None,
 ) -> list[CacheTargetCandidate]:
@@ -1308,16 +1319,19 @@ def generate_bounded_cache_target_configurations(
     if np.any(locked & (before != 1)):
         raise ValueError("an active service lock is absent from the current Cache row")
 
-    demand = np.asarray(
-        node_specific_predicted_demand(
-            origin_scenario,
-            index,
-            cache_nodes,
-            config,
-            prediction_horizon_mask=prediction_horizon_mask,
-        ),
-        dtype=np.float64,
-    ).reshape(-1)
+    if precomputed_node_demand is None:
+        demand = np.asarray(
+            node_specific_predicted_demand(
+                origin_scenario,
+                index,
+                cache_nodes,
+                config,
+                prediction_horizon_mask=prediction_horizon_mask,
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
+    else:
+        demand = np.asarray(precomputed_node_demand, dtype=np.float64).reshape(-1)
     if demand.shape != (service_count,) or not np.isfinite(demand).all() or np.any(demand < 0.0):
         raise ValueError("predicted per-service demand is invalid")
     replica_counts = np.sum(current, axis=0).astype(np.float64)
@@ -1664,48 +1678,82 @@ def popularity_aware_initial_cache(
     cache_nodes: dict[str, Any],
     config: CacheOptimizationConfig,
 ) -> np.ndarray:
-    """生成正式 episode 的 uniform feasible 初始缓存 C(0)。
+    """Create the fixed Train-derived initial cache layout used by every split.
 
-    保留该函数名以兼容现有 formal caller；其当前语义是均匀可行初始化，
-    不再读取 popularity、prediction 或 request。每个节点使用 seed 驱动的
-    局部 RNG 对全部 service 做均匀随机排列，然后按容量逐个装入；因此每
-    个 service 在选择顺序中具有相同概率，并且最终 cache 严格满足容量约束。
+    The plan was selected from completed Train seeds 20002--20238 only (237
+    Episodes, 995542 arrivals), excluding the held-out seed 20001 and the
+    active writer. It maximizes Train task service coverage under the current
+    per-node capacities, then uses remaining space for useful replicas. The
+    numeric service-size guard prevents silently applying this fitted layout to
+    a different catalog. DQN cache updates and UAV movement remain available
+    after reset.
     """
 
     config.validate()
     num_services = int(service_catalog["num_services"])
+    service_ids = np.asarray(service_catalog["service_ids"], dtype=np.int64)
     service_sizes = np.asarray(service_catalog["service_sizes_mb"], dtype=np.float64)
-    if service_sizes.shape != (num_services,) or np.any(~np.isfinite(service_sizes)):
-        raise ValueError("service_catalog service_sizes_mb 形状或数值非法。")
-    if np.any(service_sizes < 0.0):
-        raise ValueError("service_sizes_mb 不能为负。")
-    if len(cache_nodes["node_ids"]) != len(cache_nodes["capacities_mb"]):
-        raise ValueError("cache_nodes node_ids/capacities_mb 长度不一致。")
-
-    rng = np.random.default_rng(int(config.initial_cache_seed))
-    cache = np.zeros(
-        (len(cache_nodes["node_ids"]), num_services),
-        dtype=np.int8,
+    expected_sizes_mb = np.asarray(
+        [
+            5398.051076686398,
+            12220.487502037204,
+            5871.463843676132,
+            3587.8767465435085,
+            7537.483141450452,
+            10713.495424805198,
+            15752.609846832633,
+            17000.241927692416,
+            18653.796374955255,
+            14183.975071617378,
+        ],
+        dtype=np.float64,
     )
-    for node_index, capacity in enumerate(cache_nodes["capacities_mb"]):
-        remaining = float(capacity)
-        for service_id in rng.permutation(num_services).tolist():
-            size = float(service_sizes[service_id])
-            if size <= remaining + 1.0e-9:
-                cache[node_index, service_id] = 1
-                remaining -= size
+    if (
+        num_services != len(expected_sizes_mb)
+        or service_ids.shape != (num_services,)
+        or not np.array_equal(service_ids, np.arange(num_services, dtype=np.int64))
+        or service_sizes.shape != (num_services,)
+        or not np.all(np.isfinite(service_sizes))
+        or not np.allclose(service_sizes, expected_sizes_mb, rtol=0.0, atol=1.0e-6)
+    ):
+        raise ValueError(
+            "Train-derived initial cache plan requires its pinned 10-service catalog."
+        )
 
-        used = node_used_capacity_mb(cache[node_index], service_sizes)
-        remaining_capacity = float(capacity) - used
-        for service_id in range(num_services):
-            if (
-                cache[node_index, service_id] == 0
-                and service_sizes[service_id] <= remaining_capacity + 1.0e-9
-            ):
-                raise AssertionError(
-                    f"node {cache_nodes['node_ids'][node_index]} "
-                    "uniform initial cache is not maximal feasible"
-                )
+    planned_service_ids = {
+        "SV": ((5,), (3, 4), (0, 2), (0, 2), (2, 3)),
+        "RSU": ((2, 8), (2, 7)),
+        "UAV": ((0, 9), (1, 2)),
+    }
+    node_ids = [str(value) for value in cache_nodes["node_ids"]]
+    node_roles = [str(value).upper() for value in cache_nodes["node_roles"]]
+    capacities = np.asarray(cache_nodes["capacities_mb"], dtype=np.float64)
+    if (
+        len(node_ids) != len(node_roles)
+        or len(node_ids) != len(capacities)
+        or len(set(node_ids)) != len(node_ids)
+        or not np.all(np.isfinite(capacities))
+    ):
+        raise ValueError("cache_nodes IDs, roles, and capacities are malformed.")
+
+    role_offsets = {role: 0 for role in planned_service_ids}
+    cache = np.zeros((len(node_ids), num_services), dtype=np.int8)
+    for node_index, role in enumerate(node_roles):
+        if role not in planned_service_ids:
+            raise ValueError(f"Unsupported cache-node role in initial plan: {role!r}")
+        role_index = role_offsets[role]
+        role_offsets[role] += 1
+        role_plan = planned_service_ids[role]
+        if role_index >= len(role_plan):
+            raise ValueError(f"Too many {role} nodes for the pinned initial cache plan.")
+        for service_id in role_plan[role_index]:
+            cache[node_index, int(service_id)] = 1
+
+    if any(
+        role_offsets[role] != len(role_plan)
+        for role, role_plan in planned_service_ids.items()
+    ):
+        raise ValueError("Cache-node role counts differ from the pinned initial cache plan.")
 
     validate_cache_shape_and_capacity(cache, service_catalog, cache_nodes)
     return cache
