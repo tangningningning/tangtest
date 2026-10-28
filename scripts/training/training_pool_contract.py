@@ -732,6 +732,7 @@ def _validate_episode_snapshot(
         "formal_episode_pool_v2",
         "formal_episode_pool_v3",
     }:
+        generation_fields = pool_info["generation_config_fields"]
         if (
             episode_manifest.get("schema_version") != "episode_manifest_v2"
             or int(episode_manifest.get("episode_seed", -1)) != int(seed)
@@ -822,13 +823,14 @@ def _validate_episode_snapshot(
                 != FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
             ):
                 raise ValueError(f"Native evaluation episode is missing its 314-slot extension/prediction identity: {seed}")
-        generation_fields = pool_info["generation_config_fields"]
-        prediction_identity = generation_fields.get("prediction_identity", {})
+        vehicle_prediction_config = generation_fields.get("prediction", {}).get(
+            "vehicle", {}
+        )
         generate_episode_realization.validate_written_outputs(
             episode_dir,
             task_vehicle_count=int(generation_fields["simulation"].get("num_task_vehicles", 20)),
             research_vehicle_count=int(generation_fields["simulation"].get("num_research_vehicles", 25)),
-            horizon_steps=int(prediction_identity.get("vehicle_horizon", 0)),
+            horizon_steps=int(vehicle_prediction_config.get("horizon", 0)),
             origin_count=FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
         )
         return

@@ -118,12 +118,15 @@ class TransferExchangeMatchingResult:
     kkt_iteration_mean: float = 0.0
     kkt_iteration_p95: float = 0.0
     kkt_iteration_max: int = 0
-    kkt_resource_residual_mean: float = math.nan
-    kkt_resource_residual_max: float = math.nan
-    kkt_stationarity_residual_mean: float = math.nan
-    kkt_stationarity_residual_max: float = math.nan
-    kkt_complementary_slackness_residual_mean: float = math.nan
-    kkt_complementary_slackness_residual_max: float = math.nan
+    kkt_resource_residual_sample_count: int = 0
+    kkt_stationarity_residual_sample_count: int = 0
+    kkt_complementary_slackness_residual_sample_count: int = 0
+    kkt_resource_residual_mean: float | None = None
+    kkt_resource_residual_max: float | None = None
+    kkt_stationarity_residual_mean: float | None = None
+    kkt_stationarity_residual_max: float | None = None
+    kkt_complementary_slackness_residual_mean: float | None = None
+    kkt_complementary_slackness_residual_max: float | None = None
     kkt_solve_diagnostics: tuple[dict[str, Any], ...] = ()
     cloud_cpu_allocations_cycles_per_s: dict[str, float] = field(default_factory=dict)
     cloud_cpu_capacity_cycles_per_s: float | None = None
@@ -174,11 +177,15 @@ def _kkt_diagnostics_summary(
         dtype=np.float64,
     )
 
-    def _mean(values: np.ndarray) -> float:
-        return 0.0 if values.size == 0 else float(np.mean(values))
+    def _mean(values: np.ndarray) -> float | None:
+        return None if values.size == 0 else float(np.mean(values))
 
-    def _max(values: np.ndarray) -> float:
-        return math.nan if values.size == 0 else float(np.max(values))
+    def _max(values: np.ndarray) -> float | None:
+        return None if values.size == 0 else float(np.max(values))
+
+    def _finite_or_none(value: Any) -> float | None:
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
 
     return {
         "solve_count": int(len(typed_records)),
@@ -189,11 +196,18 @@ def _kkt_diagnostics_summary(
             sum(bool(record.hit_max_bisection_iterations) for record in typed_records)
         ),
         "finite_count": int(sum(bool(record.finite) for record in typed_records)),
-        "iteration_mean": _mean(iterations),
+        "iteration_mean": (
+            0.0 if iterations.size == 0 else float(np.mean(iterations))
+        ),
         "iteration_p95": (
             0.0 if iterations.size == 0 else float(np.percentile(iterations, 95.0))
         ),
         "iteration_max": int(np.max(iterations)) if iterations.size else 0,
+        "resource_residual_sample_count": int(resource_residuals.size),
+        "stationarity_residual_sample_count": int(stationarity_residuals.size),
+        "complementary_slackness_residual_sample_count": int(
+            complementary_residuals.size
+        ),
         "resource_residual_mean": _mean(resource_residuals),
         "resource_residual_max": _max(resource_residuals),
         "stationarity_residual_mean": _mean(stationarity_residuals),
@@ -208,11 +222,24 @@ def _kkt_diagnostics_summary(
                     record.hit_max_bisection_iterations
                 ),
                 "final_resource_sum": float(record.final_resource_sum),
-                "resource_sum_residual": float(record.resource_sum_residual),
+                "resource_sum_residual": _finite_or_none(
+                    record.resource_sum_residual
+                ),
+                "resource_sum_residual_available": math.isfinite(
+                    float(record.resource_sum_residual)
+                ),
                 "finite": bool(record.finite),
-                "stationarity_residual": float(record.stationarity_residual),
-                "complementary_slackness_residual": float(
+                "stationarity_residual": _finite_or_none(
+                    record.stationarity_residual
+                ),
+                "stationarity_residual_available": math.isfinite(
+                    float(record.stationarity_residual)
+                ),
+                "complementary_slackness_residual": _finite_or_none(
                     record.complementary_slackness_residual
+                ),
+                "complementary_slackness_residual_available": math.isfinite(
+                    float(record.complementary_slackness_residual)
                 ),
             }
             for record in typed_records
@@ -1128,22 +1155,29 @@ def optimize_task_matching(
             kkt_iteration_mean=float(kkt_summary["iteration_mean"]),
             kkt_iteration_p95=float(kkt_summary["iteration_p95"]),
             kkt_iteration_max=int(kkt_summary["iteration_max"]),
-            kkt_resource_residual_mean=float(
-                kkt_summary["resource_residual_mean"]
+            kkt_resource_residual_sample_count=int(
+                kkt_summary["resource_residual_sample_count"]
             ),
-            kkt_resource_residual_max=float(kkt_summary["resource_residual_max"]),
-            kkt_stationarity_residual_mean=float(
-                kkt_summary["stationarity_residual_mean"]
+            kkt_stationarity_residual_sample_count=int(
+                kkt_summary["stationarity_residual_sample_count"]
             ),
-            kkt_stationarity_residual_max=float(
-                kkt_summary["stationarity_residual_max"]
+            kkt_complementary_slackness_residual_sample_count=int(
+                kkt_summary["complementary_slackness_residual_sample_count"]
             ),
-            kkt_complementary_slackness_residual_mean=float(
-                kkt_summary["complementary_slackness_residual_mean"]
-            ),
-            kkt_complementary_slackness_residual_max=float(
-                kkt_summary["complementary_slackness_residual_max"]
-            ),
+            kkt_resource_residual_mean=kkt_summary["resource_residual_mean"],
+            kkt_resource_residual_max=kkt_summary["resource_residual_max"],
+            kkt_stationarity_residual_mean=kkt_summary[
+                "stationarity_residual_mean"
+            ],
+            kkt_stationarity_residual_max=kkt_summary[
+                "stationarity_residual_max"
+            ],
+            kkt_complementary_slackness_residual_mean=kkt_summary[
+                "complementary_slackness_residual_mean"
+            ],
+            kkt_complementary_slackness_residual_max=kkt_summary[
+                "complementary_slackness_residual_max"
+            ],
             kkt_solve_diagnostics=tuple(kkt_summary["solve_diagnostics"]),
         )
 
@@ -1504,20 +1538,29 @@ def optimize_task_matching(
         kkt_iteration_mean=float(kkt_summary["iteration_mean"]),
         kkt_iteration_p95=float(kkt_summary["iteration_p95"]),
         kkt_iteration_max=int(kkt_summary["iteration_max"]),
-        kkt_resource_residual_mean=float(kkt_summary["resource_residual_mean"]),
-        kkt_resource_residual_max=float(kkt_summary["resource_residual_max"]),
-        kkt_stationarity_residual_mean=float(
-            kkt_summary["stationarity_residual_mean"]
+        kkt_resource_residual_sample_count=int(
+            kkt_summary["resource_residual_sample_count"]
         ),
-        kkt_stationarity_residual_max=float(
-            kkt_summary["stationarity_residual_max"]
+        kkt_stationarity_residual_sample_count=int(
+            kkt_summary["stationarity_residual_sample_count"]
         ),
-        kkt_complementary_slackness_residual_mean=float(
-            kkt_summary["complementary_slackness_residual_mean"]
+        kkt_complementary_slackness_residual_sample_count=int(
+            kkt_summary["complementary_slackness_residual_sample_count"]
         ),
-        kkt_complementary_slackness_residual_max=float(
-            kkt_summary["complementary_slackness_residual_max"]
-        ),
+        kkt_resource_residual_mean=kkt_summary["resource_residual_mean"],
+        kkt_resource_residual_max=kkt_summary["resource_residual_max"],
+        kkt_stationarity_residual_mean=kkt_summary[
+            "stationarity_residual_mean"
+        ],
+        kkt_stationarity_residual_max=kkt_summary[
+            "stationarity_residual_max"
+        ],
+        kkt_complementary_slackness_residual_mean=kkt_summary[
+            "complementary_slackness_residual_mean"
+        ],
+        kkt_complementary_slackness_residual_max=kkt_summary[
+            "complementary_slackness_residual_max"
+        ],
         kkt_solve_diagnostics=tuple(kkt_summary["solve_diagnostics"]),
         stop_reason=stop_reason,
         transfer_exchange_stable=transfer_exchange_stable,

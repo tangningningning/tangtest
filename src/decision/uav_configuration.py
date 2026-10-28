@@ -374,15 +374,25 @@ def _service_aware_uav_demand_weights(
     uav_id: str,
     beta_discount: float = 1.0,
     prediction_horizon_mask: Any = None,
+    precomputed_vehicle_service_demand: Any = None,
 ) -> tuple[tuple[str, ...], np.ndarray]:
     service_count = int(np.asarray(cache_state).shape[1])
     vehicle_ids = tuple(str(value) for value in scenario_slice["vehicle_ids"].tolist())
-    demand = cache_configuration.predicted_vehicle_service_demand(
-        scenario_slice,
-        service_count,
-        beta_discount=float(beta_discount),
-        prediction_horizon_mask=prediction_horizon_mask,
-    )
+    if precomputed_vehicle_service_demand is None:
+        demand = cache_configuration.predicted_vehicle_service_demand(
+            scenario_slice,
+            service_count,
+            beta_discount=float(beta_discount),
+            prediction_horizon_mask=prediction_horizon_mask,
+        )
+    else:
+        demand = np.asarray(precomputed_vehicle_service_demand, dtype=np.float64)
+        if (
+            demand.shape != (len(vehicle_ids), service_count)
+            or not np.all(np.isfinite(demand))
+            or np.any(demand < 0.0)
+        ):
+            raise ValueError("precomputed UAV vehicle/service demand is invalid")
     node_ids = [str(value) for value in cache_nodes["node_ids"]]
     if str(uav_id) not in node_ids:
         raise KeyError(f"UAV cache node not found for demand-aware proposal: {uav_id}")
@@ -407,6 +417,7 @@ def enumerate_uav_target_candidates(
     cache_nodes: dict[str, Any],
     predicted_vehicle_positions: dict[str, Any],
     prediction_horizon_mask: Any = None,
+    precomputed_vehicle_service_demand: Any = None,
 ) -> list[UavTargetCandidate]:
     """Return demand-aware MOVE targets plus a small deterministic geometry set.
 
@@ -437,6 +448,7 @@ def enumerate_uav_target_candidates(
             project_config.get_config_value(project_cfg, "cache.discount_beta", 1.0)
         ),
         prediction_horizon_mask=prediction_horizon_mask,
+        precomputed_vehicle_service_demand=precomputed_vehicle_service_demand,
     )
     ordered_positions = np.asarray(
         [predicted_vehicle_positions[vehicle_id] for vehicle_id in vehicle_ids],

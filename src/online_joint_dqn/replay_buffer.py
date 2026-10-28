@@ -8,6 +8,7 @@ import random
 import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -82,6 +83,10 @@ def _validate_candidate_context(
 _ACTION_OPERATIONS = ("KEEP_STAY", "CACHE_UPDATE", "UAV_MOVE")
 _BATCH_REUSE_MAX_CONTEXTS = 16
 _BATCH_REUSE_MAX_CANDIDATES = 4096
+_VERIFIED_CONTEXT_MARKER_KEY = "_replay_verified_candidate_payload_digest"
+_VERIFIED_CONTEXT_MARKER = object()
+_VERIFIED_CONTEXT_DIGEST_CACHE_MAX_ENTRIES = 128
+_VERIFIED_CONTEXT_DIGEST_CACHE_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _candidate_context_cache_key(context: Mapping[str, Any]) -> tuple[str, ...]:
@@ -97,8 +102,13 @@ def _candidate_context_cache_key(context: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def _context_from_blob(
-    blob: bytes, state_features: Any, fingerprint: str, label: str
-) -> dict[str, Any]:
+    blob: bytes,
+    state_features: Any,
+    fingerprint: str,
+    label: str,
+    *,
+    verified_payload_digests: OrderedDict[bytes, str] | None = None,
+) -> Mapping[str, Any]:
     context = pickle.loads(zlib.decompress(blob))
     if not isinstance(context, Mapping):
         raise ValueError(f"{label}候选重建上下文必须是映射")
@@ -108,7 +118,62 @@ def _context_from_blob(
         raise ValueError("紧凑回放上下文不得重复保存状态特征")
     expanded = dict(context)
     expanded["state_features"] = np.asarray(state_features, dtype=np.float32)
-    return expanded
+    verified_digest: str | None = None
+    if verified_payload_digests is not None:
+        verified_digest = verified_payload_digests.get(blob)
+        if verified_digest is not None:
+            verified_payload_digests.move_to_end(blob)
+            if expanded.get("candidate_rebuild_payload_sha256") != verified_digest:
+                raise ValueError("回放候选上下文摘要与已验证的 Replay 字节块不一致")
+    if verified_digest is None:
+        from .environment_adapter import _candidate_rebuild_payload_sha256
+
+        verified_digest = _candidate_rebuild_payload_sha256(expanded)
+        if expanded.get("candidate_rebuild_payload_sha256") != verified_digest:
+            raise ValueError("回放候选重建上下文摘要不匹配")
+        if verified_payload_digests is not None:
+            _remember_verified_context_payload_digest(
+                verified_payload_digests, blob, verified_digest
+            )
+    expanded[_VERIFIED_CONTEXT_MARKER_KEY] = (
+        _VERIFIED_CONTEXT_MARKER,
+        verified_digest,
+    )
+    return MappingProxyType(expanded)
+
+
+def _remember_verified_context_payload_digest(
+    cache: OrderedDict[bytes, str], blob: bytes, digest: str
+) -> None:
+    existing = cache.pop(blob, None)
+    if existing is not None and existing != digest:
+        raise ValueError("相同 Replay 上下文字节块对应不同候选摘要")
+    if existing is None:
+        cache[blob] = str(digest)
+        retained_bytes = sum(len(item) for item in cache)
+    else:
+        cache[blob] = existing
+        retained_bytes = sum(len(item) for item in cache)
+    while (
+        len(cache) > _VERIFIED_CONTEXT_DIGEST_CACHE_MAX_ENTRIES
+        or retained_bytes > _VERIFIED_CONTEXT_DIGEST_CACHE_MAX_BYTES
+    ):
+        evicted_blob, _ = cache.popitem(last=False)
+        retained_bytes -= len(evicted_blob)
+
+
+def _verified_candidate_rebuild_payload_digest(
+    context: Mapping[str, Any],
+) -> str | None:
+    marker = context.get(_VERIFIED_CONTEXT_MARKER_KEY)
+    if (
+        isinstance(marker, tuple)
+        and len(marker) == 2
+        and marker[0] is _VERIFIED_CONTEXT_MARKER
+        and isinstance(marker[1], str)
+    ):
+        return marker[1]
+    return None
 
 
 def _validate_candidate_operation_subset(
@@ -294,11 +359,15 @@ class ReplayTransition:
 
         if self.current_candidate_rebuild_context_zlib is None:
             raise ValueError("回放转移缺少当前候选重建上下文")
+        owner = getattr(candidate_rebuilder, "__self__", None)
         context = _context_from_blob(
             self.current_candidate_rebuild_context_zlib,
             self.state_features,
             fingerprint,
             "当前状态",
+            verified_payload_digests=getattr(
+                owner, "_verified_candidate_payload_digests", None
+            ),
         )
         if (
             int(context.get("candidate_count", -1)) != self.current_candidate_count
@@ -308,7 +377,6 @@ class ReplayTransition:
             raise ValueError("当前 Replay 与重建上下文的完整候选身份不一致")
         if candidate_rebuilder is None:
             raise ValueError("回放转移缺少当前候选重建器")
-        owner = getattr(candidate_rebuilder, "__self__", None)
         operation_rebuilder = getattr(owner, "rebuild_candidates_for_operation", None)
         if callable(operation_rebuilder):
             candidates = tuple(
@@ -349,11 +417,15 @@ class ReplayTransition:
                 raise ValueError("回放转移缺少下一候选重建器或合法上下文")
             if self.next_state_features is None:
                 raise ValueError("候选重建缺少已保存的下一状态特征")
+            owner = getattr(candidate_rebuilder, "__self__", None)
             context = _context_from_blob(
                 self.next_candidate_rebuild_context_zlib,
                 self.next_state_features,
                 str(self.next_state_fingerprint),
                 "下一状态",
+                verified_payload_digests=getattr(
+                    owner, "_verified_candidate_payload_digests", None
+                ),
             )
             if (
                 int(context.get("candidate_count", -1)) != self.next_candidate_count
@@ -361,7 +433,6 @@ class ReplayTransition:
                 != str(self.next_candidate_ids_sha256)
             ):
                 raise ValueError("下一 Replay 与重建上下文的完整候选身份不一致")
-            owner = getattr(candidate_rebuilder, "__self__", None)
             replay_rebuilder = getattr(owner, "rebuild_candidates", None)
             if batch_cache is not None and callable(replay_rebuilder):
                 candidates = tuple(replay_rebuilder(context, batch_cache=batch_cache))
@@ -517,6 +588,9 @@ class ReplayBuffer:
         # 相邻转移共享同一状态上下文，避免分别保存当前和下一状态的重复字节。
         self._context_pool: dict[str, bytes] = {}
         self._context_refcounts: dict[str, int] = {}
+        self._verified_candidate_payload_digests: OrderedDict[bytes, str] = (
+            OrderedDict()
+        )
         self._candidate_rebuilders: dict[str, Any] = {}
         self._episode_rebuild_refcounts: dict[str, int] = {}
 
@@ -941,6 +1015,11 @@ class ReplayBuffer:
             if str(rebuilder._episode_rebuild_spec_sha256) != spec_sha256:
                 raise ValueError("Checkpoint Replay Episode 重建规格不匹配")
             rebuilder.validate_candidate_rebuild_context_metadata(expanded_context)
+            _remember_verified_context_payload_digest(
+                self._verified_candidate_payload_digests,
+                blob,
+                str(expanded_context["candidate_rebuild_payload_sha256"]),
+            )
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -1100,6 +1179,7 @@ class ReplayBuffer:
         self._items = rebuilt_items
         self._context_pool = context_pool
         self._context_refcounts = context_refcounts
+        self._verified_candidate_payload_digests.clear()
         self._state_feature_pool = state_feature_pool
         self._state_feature_refcounts = state_feature_refcounts
         self._candidate_rebuilders = candidate_rebuilders

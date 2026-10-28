@@ -6,6 +6,7 @@ import argparse
 import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor
 import copy
+import ctypes
 import hashlib
 import io
 import json
@@ -710,7 +711,10 @@ def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> int:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            torch.save(dict(payload), stream)
+            # Protocol 5 lets NumPy arrays serialize through PickleBuffer rather
+            # than first materializing a bytes copy of each state vector.
+            # The checkpoint payload is already a dict, so keep it by reference.
+            torch.save(payload, stream, pickle_protocol=5)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -721,6 +725,85 @@ def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> int:
             pass
         raise
     return int(path.stat().st_size)
+
+
+def _process_memory_snapshot() -> dict[str, int | None]:
+    """Return current and process-lifetime peak memory from the Windows API."""
+
+    if os.name != "nt":
+        return {
+            "working_set_bytes": None,
+            "private_bytes": None,
+            "peak_working_set_bytes": None,
+            "peak_private_bytes": None,
+        }
+
+    class _ProcessMemoryCountersEx(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_ulong),
+            ("page_fault_count", ctypes.c_ulong),
+            ("peak_working_set_size", ctypes.c_size_t),
+            ("working_set_size", ctypes.c_size_t),
+            ("quota_peak_paged_pool_usage", ctypes.c_size_t),
+            ("quota_paged_pool_usage", ctypes.c_size_t),
+            ("quota_peak_nonpaged_pool_usage", ctypes.c_size_t),
+            ("quota_nonpaged_pool_usage", ctypes.c_size_t),
+            ("pagefile_usage", ctypes.c_size_t),
+            ("peak_pagefile_usage", ctypes.c_size_t),
+            ("private_usage", ctypes.c_size_t),
+        ]
+
+    try:
+        kernel32 = ctypes.WinDLL("Kernel32.dll")
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi = ctypes.WinDLL("Psapi.dll")
+        psapi.GetProcessMemoryInfo.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_ProcessMemoryCountersEx),
+            ctypes.c_ulong,
+        ]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        counters = _ProcessMemoryCountersEx()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            raise ctypes.WinError()
+        return {
+            "working_set_bytes": int(counters.working_set_size),
+            "private_bytes": int(counters.private_usage),
+            "peak_working_set_bytes": int(counters.peak_working_set_size),
+            "peak_private_bytes": int(counters.peak_pagefile_usage),
+        }
+    except Exception:
+        return {
+            "working_set_bytes": None,
+            "private_bytes": None,
+            "peak_working_set_bytes": None,
+            "peak_private_bytes": None,
+        }
+
+
+def _append_checkpoint_metric(run_dir: Path, record: Mapping[str, Any]) -> None:
+    """Best-effort compact log; a diagnostic write must not fail training."""
+
+    try:
+        with (run_dir / "checkpoint_metrics.jsonl").open(
+            "a", encoding="utf-8", newline="\n"
+        ) as stream:
+            stream.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+            stream.flush()
+    except BaseException:
+        pass
 
 
 def _checkpoint_values_equal(left: Any, right: Any) -> bool:
@@ -781,19 +864,65 @@ def _save_checkpoint(
     checkpoint_role: str = "latest",
     training_metadata: Mapping[str, Any] | None = None,
 ) -> int:
-    payload = _checkpoint_payload(
-        path,
-        agent=agent,
-        replay=replay,
-        identity=identity,
-        episode_order=episode_order,
-        episode_rows=episode_rows,
-        next_episode_index=next_episode_index,
-        global_step=global_step,
-        checkpoint_role=checkpoint_role,
-        training_metadata=training_metadata,
+    started = time.perf_counter()
+    memory_before = _process_memory_snapshot()
+    episode_index = int(next_episode_index)
+    episode_seed = (
+        int(episode_order[episode_index - 1]) if episode_index > 0 else None
     )
-    return _atomic_torch_save(path, payload)
+    common_record = {
+        "checkpoint_path": str(path),
+        "checkpoint_role": checkpoint_role,
+        "completed_episodes": episode_index,
+        "last_completed_episode_seed": episode_seed,
+        "global_step": int(global_step),
+        "gradient_step": int(agent.gradient_steps),
+        "memory_before": memory_before,
+    }
+    try:
+        payload = _checkpoint_payload(
+            path,
+            agent=agent,
+            replay=replay,
+            identity=identity,
+            episode_order=episode_order,
+            episode_rows=episode_rows,
+            next_episode_index=episode_index,
+            global_step=global_step,
+            checkpoint_role=checkpoint_role,
+            training_metadata=training_metadata,
+        )
+        saved_bytes = _atomic_torch_save(path, payload)
+    except BaseException as exc:
+        memory_after = _process_memory_snapshot()
+        existing_bytes = path.stat().st_size if path.is_file() else None
+        _append_checkpoint_metric(
+            path.parent.parent,
+            {
+                **common_record,
+                "status": "FAILED",
+                "checkpoint_bytes": None,
+                "existing_checkpoint_bytes": existing_bytes,
+                "elapsed_seconds": float(time.perf_counter() - started),
+                "memory_after": memory_after,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:500],
+            },
+        )
+        raise
+    memory_after = _process_memory_snapshot()
+    _append_checkpoint_metric(
+        path.parent.parent,
+        {
+            **common_record,
+            "status": "SUCCEEDED",
+            "checkpoint_bytes": int(saved_bytes),
+            "existing_checkpoint_bytes": int(saved_bytes),
+            "elapsed_seconds": float(time.perf_counter() - started),
+            "memory_after": memory_after,
+        },
+    )
+    return saved_bytes
 
 
 def _save_immutable_checkpoint(
@@ -1350,6 +1479,8 @@ def run_training(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     run_name_prefix: str = DEFAULT_RUN_NAME_PREFIX,
     max_episodes: int | None = None,
+    train_frequency: int = 1,
+    target_network_frequency: int = 500,
 ) -> int:
     if max_episodes is not None:
         if isinstance(max_episodes, bool) or int(max_episodes) != max_episodes:
@@ -1357,6 +1488,12 @@ def run_training(
         max_episodes = int(max_episodes)
         if max_episodes <= 0:
             raise ValueError("max_episodes 必须为正整数")
+    for name, value in (
+        ("train_frequency", train_frequency),
+        ("target_network_frequency", target_network_frequency),
+    ):
+        if isinstance(value, bool) or int(value) != value or int(value) <= 0:
+            raise ValueError(f"{name} 必须为正整数")
 
     pool_info = _validate_training_pool()
     config_path = PROJECT_ROOT / pool_contract.CONFIG_RELATIVE
@@ -1381,11 +1518,14 @@ def run_training(
             max_steps=pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS,
         )
     state, candidates = first_environment.observe()
+    if not np.all(np.isfinite(state)):
+        raise FloatingPointError("正式训练初始状态包含非有限值")
     agent = DoubleDQNAgent(
         len(state),
         len(candidates[0].features),
         learning_rate=float(learning_rate),
         gamma=1.0,
+        target_network_frequency=int(target_network_frequency),
         seed=int(seed),
     )
     replay = ReplayBuffer(int(replay_capacity), seed=int(seed))
@@ -1398,7 +1538,8 @@ def run_training(
         * pool_contract.FORMAL_TRAINING_EXECUTION_HORIZON_SLOTS
     )
     trainer_config = TrainerConfig(
-        epsilon_decay_steps=formal_training_decision_steps
+        epsilon_decay_steps=formal_training_decision_steps,
+        train_frequency=int(train_frequency),
     )
     search_budget = {
         "max_total_evaluations_per_sample": int(
@@ -1634,8 +1775,6 @@ def run_training(
 
     manifest["episode_limit_this_invocation"] = max_episodes
 
-    if not np.all(np.isfinite(state)):
-        raise FloatingPointError("正式训练初始状态包含非有限值")
     _write_json(
         run_dir / "evaluation_status.json",
         _evaluation_status_payload(evaluation_gate),
@@ -2229,6 +2368,8 @@ def main(
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--replay-capacity", type=int, default=DEFAULT_REPLAY_CAPACITY)
+    parser.add_argument("--train-frequency", type=int, default=1)
+    parser.add_argument("--target-network-frequency", type=int, default=500)
     parser.add_argument(
         "--max-episodes",
         type=int,
@@ -2240,6 +2381,8 @@ def main(
         parser.error("--replay-capacity 必须为正整数")
     if args.max_episodes is not None and args.max_episodes <= 0:
         parser.error("--max-episodes 必须为正整数")
+    if args.train_frequency <= 0 or args.target_network_frequency <= 0:
+        parser.error("--train-frequency 和 --target-network-frequency 必须为正整数")
     return run_training(
         output_dir=args.output_dir,
         resume_checkpoint=args.resume_checkpoint,
@@ -2248,6 +2391,8 @@ def main(
         learning_rate=learning_rate,
         run_name_prefix=run_name_prefix,
         max_episodes=args.max_episodes,
+        train_frequency=args.train_frequency,
+        target_network_frequency=args.target_network_frequency,
     )
 
 

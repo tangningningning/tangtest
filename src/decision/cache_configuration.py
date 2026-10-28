@@ -820,20 +820,43 @@ def node_specific_predicted_demand(
     config: CacheOptimizationConfig,
     *,
     prediction_horizon_mask: Any = None,
+    precomputed_vehicle_service_demand_by_horizon: Any = None,
+    precomputed_serviceability_weights: Any = None,
 ) -> np.ndarray:
     """Estimate ``D_pred[m,f]`` using predicted vehicles serviceable by node m."""
 
     num_services = int(origin_scenario["rho_hat"].shape[-1])
     arrival = np.asarray(origin_scenario["arrival"], dtype=np.float64)
-    demand = predicted_vehicle_service_demand_by_horizon(
-        origin_scenario,
-        num_services,
-        beta_discount=config.beta_discount,
-        prediction_horizon_mask=prediction_horizon_mask,
-    )
-    weights = _node_predicted_serviceability_weights(
-        origin_scenario, node_index, cache_nodes, config
-    )
+    if precomputed_vehicle_service_demand_by_horizon is None:
+        demand = predicted_vehicle_service_demand_by_horizon(
+            origin_scenario,
+            num_services,
+            beta_discount=config.beta_discount,
+            prediction_horizon_mask=prediction_horizon_mask,
+        )
+    else:
+        demand = np.asarray(
+            precomputed_vehicle_service_demand_by_horizon, dtype=np.float64
+        )
+        if demand.ndim != 3 or demand.shape[-1] != num_services:
+            raise ValueError("precomputed predicted demand has invalid dimensions")
+        if not np.isfinite(demand).all() or np.any(demand < 0.0):
+            raise ValueError("precomputed predicted demand must be finite and nonnegative")
+    if precomputed_serviceability_weights is None:
+        weights = _node_predicted_serviceability_weights(
+            origin_scenario, node_index, cache_nodes, config
+        )
+    else:
+        weights = np.asarray(
+            precomputed_serviceability_weights, dtype=np.float64
+        )
+        if (
+            weights.ndim != 2
+            or not np.isfinite(weights).all()
+            or np.any(weights < 0.0)
+            or np.any(weights > 1.0)
+        ):
+            raise ValueError("precomputed serviceability weights are invalid")
     if weights.shape != demand.shape[:2]:
         raise ValueError("predicted demand and serviceability horizons do not align")
     result = np.einsum("hv,hvf->f", weights, demand)
@@ -1050,10 +1073,20 @@ def is_legal_cache_replacement(before_node_cache: Any, target_node_cache: Any) -
 
     before = np.asarray(before_node_cache)
     target = np.asarray(target_node_cache)
+    if before.shape != target.shape:
+        return False
+    if before.dtype.kind in "biu" and target.dtype.kind in "biu":
+        # Cache candidates use compact integer arrays. Direct comparisons are
+        # exactly the same binary-membership test as np.isin here, without the
+        # sorting/search setup repeated for every changed candidate row.
+        before_is_binary = np.all((before == 0) | (before == 1))
+        target_is_binary = np.all((target == 0) | (target == 1))
+    else:
+        # Preserve np.isin's established behavior for other array dtypes.
+        before_is_binary = np.all(np.isin(before, [0, 1]))
+        target_is_binary = np.all(np.isin(target, [0, 1]))
     if (
-        before.shape != target.shape
-        or not np.all(np.isin(before, [0, 1]))
-        or not np.all(np.isin(target, [0, 1]))
+        not before_is_binary or not target_is_binary
     ):
         return False
     removed = np.any((before == 1) & (target == 0))
@@ -1178,22 +1211,68 @@ def enumerate_all_cache_target_configurations(
     legal_targets: dict[bytes, np.ndarray] = {}
     capacity_feasible_count = 0
     legal_replace_count = 0
-    for bitset in range(1 << service_count):
-        target = np.fromiter(
-            (((bitset >> service) & 1) for service in range(service_count)),
-            dtype=np.int8,
-            count=service_count,
+    total_combinations = 1 << service_count
+    batch_limit = 4096
+    if service_count <= 63:
+        bit_positions = np.arange(service_count, dtype=np.uint64)
+        boundary = capacity + 1.0e-9
+        rounding_guard = (
+            8.0
+            * np.finfo(np.float64).eps
+            * max(
+                1,
+                service_count + 1,
+            )
+            * max(1.0, float(np.sum(np.abs(sizes))), abs(capacity))
         )
-        capacity_feasible = is_node_feasible(target, sizes, capacity)
-        capacity_feasible_count += int(capacity_feasible)
-        if (
-            not capacity_feasible
-            or np.any(locked & (target != 1))
-            or not is_legal_cache_replacement(before, target)
-        ):
-            continue
-        legal_replace_count += 1
-        legal_targets[np.ascontiguousarray(target).tobytes()] = target
+        for batch_start in range(0, total_combinations, batch_limit):
+            bitsets = np.arange(
+                batch_start,
+                min(batch_start + batch_limit, total_combinations),
+                dtype=np.uint64,
+            )
+            targets = (
+                (bitsets[:, None] >> bit_positions[None, :]) & np.uint64(1)
+            ).astype(np.int8)
+            used_capacity = targets @ sizes
+            capacity_feasible = used_capacity <= boundary
+            uncertain = np.flatnonzero(
+                np.abs(used_capacity - boundary) <= rounding_guard
+            )
+            for row_index in uncertain:
+                capacity_feasible[row_index] = is_node_feasible(
+                    targets[row_index], sizes, capacity
+                )
+            capacity_feasible_count += int(np.count_nonzero(capacity_feasible))
+            removed = np.any((before[None, :] == 1) & (targets == 0), axis=1)
+            added = np.any((before[None, :] == 0) & (targets == 1), axis=1)
+            preserves_locks = ~np.any(locked[None, :] & (targets != 1), axis=1)
+            legal = capacity_feasible & removed & added & preserves_locks
+            legal_indices = np.flatnonzero(legal)
+            legal_replace_count += int(legal_indices.size)
+            for row_index in legal_indices:
+                target = targets[int(row_index)]
+                legal_targets[np.ascontiguousarray(target).tobytes()] = target.copy()
+    else:
+        # The current exact enumerator is retained for catalogs wider than the
+        # uint64 bit-mask representation. Such catalogs are not materialized
+        # into an unbounded intermediate matrix.
+        for bitset in range(total_combinations):
+            target = np.fromiter(
+                (((bitset >> service) & 1) for service in range(service_count)),
+                dtype=np.int8,
+                count=service_count,
+            )
+            capacity_feasible = is_node_feasible(target, sizes, capacity)
+            capacity_feasible_count += int(capacity_feasible)
+            if (
+                not capacity_feasible
+                or np.any(locked & (target != 1))
+                or not is_legal_cache_replacement(before, target)
+            ):
+                continue
+            legal_replace_count += 1
+            legal_targets[np.ascontiguousarray(target).tobytes()] = target
     if generation_diagnostics is not None:
         generation_diagnostics.update(
             {

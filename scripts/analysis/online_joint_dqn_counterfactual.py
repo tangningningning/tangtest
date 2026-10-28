@@ -28,17 +28,19 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from online_joint_dqn.candidate_features import CandidateOption  # noqa: E402
-from online_joint_dqn.candidate_features import ActionCandidate  # noqa: E402
 from online_joint_dqn.environment_adapter import (  # noqa: E402
     ExclusiveDQNEnvironment,
     _input_fingerprint,
 )
-from decision import cache_configuration  # noqa: E402
-from common import project_config  # noqa: E402
+from common import system_model  # noqa: E402
 
 
 class CounterfactualInputError(ValueError):
     """The frozen state record and current legal candidate set do not align."""
+
+
+class CounterfactualStateNotReconstructable(CounterfactualInputError):
+    """The logged data is insufficient to restore the requested Slot state."""
 
 
 def _candidate_id(record: Mapping[str, Any]) -> str | None:
@@ -143,14 +145,33 @@ def build_counterfactual_plan(
                 f"logged={parsed_count}, frozen={actual_counts[operation]}"
             )
 
-    selected_q = step_record.get("selected_q_value", step_record.get("selected_candidate_q"))
+    selected_q = step_record.get(
+        "selected_q_value", step_record.get("selected_candidate_q")
+    )
     try:
         parsed_selected_q = float(selected_q)
         selected_q = parsed_selected_q if math.isfinite(parsed_selected_q) else None
     except (TypeError, ValueError):
         selected_q = None
     keep_best = _best_candidate_record(step_record, "KEEP_STAY")
-    keep_q_value = None if keep_best is None else keep_best.get("q_value")
+    keep_q_candidate_id = None
+    if keep_best is not None:
+        logged_keep_id = _candidate_id(keep_best) or keep_best.get("max_candidate_id")
+        if (
+            logged_keep_id is not None
+            and str(logged_keep_id) != keep_candidates[0].action.candidate_id
+        ):
+            raise CounterfactualInputError(
+                "logged KEEP_STAY Q record refers to a different candidate ID"
+            )
+        if logged_keep_id is not None:
+            keep_q_candidate_id = str(logged_keep_id)
+    keep_q_value = (
+        keep_best.get("q_value")
+        if keep_best is not None
+        and keep_q_candidate_id == keep_candidates[0].action.candidate_id
+        else None
+    )
     requested: list[tuple[str, str | None, float | None]] = [
         ("KEEP_STAY", keep_candidates[0].action.candidate_id, keep_q_value),
         ("DQN_SELECTED", _candidate_id(step_record), selected_q),
@@ -165,7 +186,13 @@ def build_counterfactual_plan(
                 q_value = parsed_q if math.isfinite(parsed_q) else None
             except (TypeError, ValueError):
                 q_value = None
-        requested.append((f"BEST_{operation}_Q", None if candidate_id is None else str(candidate_id), q_value))
+        requested.append(
+            (
+                f"BEST_{operation}_Q",
+                None if candidate_id is None else str(candidate_id),
+                q_value,
+            )
+        )
 
     plan: list[dict[str, Any]] = []
     index_by_candidate_id: dict[str, int] = {}
@@ -220,7 +247,7 @@ def build_counterfactual_plan(
         if candidate_id in index_by_candidate_id:
             existing = plan[index_by_candidate_id[candidate_id]]
             existing["roles"].append(role)
-            existing.setdefault("q_value_by_role", {})[role] = q_value
+            existing.setdefault("logged_q_value_by_role", {})[role] = q_value
             continue
         index_by_candidate_id[candidate_id] = len(plan)
         plan.append(
@@ -229,9 +256,12 @@ def build_counterfactual_plan(
                 "roles": [role],
                 "candidate_id": candidate_id,
                 "operation": candidate.action.operation,
-                "q_value": q_value,
-                "q_value_by_role": {role: q_value},
+                "logged_q_value_by_role": {role: q_value},
                 "candidate_action": candidate.action.to_dict(),
+                "logged_q_value_semantics": (
+                    "logged Dueling DQN estimate for the original frozen state; "
+                    "not a realized reward or long-horizon return"
+                ),
                 "status": "PLANNED",
             }
         )
@@ -265,6 +295,37 @@ def _environment_signature(environment: ExclusiveDQNEnvironment) -> dict[str, An
         "state_fingerprint": environment._current_state_hash(),
         "slot_input_fingerprint": _input_fingerprint(slot_input),
         "system_configuration_sha256": hashlib.sha256(config_payload).hexdigest(),
+        "task_lifecycle": {
+            "active_task_states": [
+                state.snapshot()
+                for _, state in sorted(
+                    environment.task_lifecycle.active_tasks.items()
+                )
+            ],
+            "terminal_events": [
+                dict(event) for event in environment.task_lifecycle.terminal_events
+            ],
+            "episode_upload_energy_j": float(
+                environment.task_lifecycle.episode_upload_energy_j
+            ),
+            "next_slot_index": int(environment.task_lifecycle.next_slot_index),
+            "prepared_slot_index": (
+                None
+                if environment.task_lifecycle._prepared is None
+                else int(environment.task_lifecycle._prepared.slot_index)
+            ),
+            "prepared_slot_sha256": (
+                None
+                if environment.task_lifecycle._prepared is None
+                else hashlib.sha256(
+                    pickle.dumps(
+                        environment.task_lifecycle._prepared,
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
+                ).hexdigest()
+            ),
+            "settled_task_ids": sorted(environment._settled_task_ids),
+        },
         "cache_state": np.asarray(environment.cache_state, dtype=np.int8).tolist(),
         "uav_positions": {
             key: np.asarray(value, dtype=np.float64).tolist()
@@ -273,23 +334,15 @@ def _environment_signature(environment: ExclusiveDQNEnvironment) -> dict[str, An
     }
 
 
-def _clear_observation_cache(environment: ExclusiveDQNEnvironment) -> None:
-    environment._cached_state_fingerprint = None
-    environment._cached_state_features = None
-    environment._cached_candidates = None
-
-
 def restore_pre_action_state_from_step_records(
     environment: ExclusiveDQNEnvironment,
     episode_step_records: Sequence[Mapping[str, Any]],
     target_step_record: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Restore a frozen pre-action state from logged targets without executing Slots.
+    """Restore only an exact initial Slot state; reject cross-Slot reconstruction.
 
-    ``environment`` must be a freshly constructed formal Episode at its initial
-    state. Prior logged target configurations are replayed as state assignments;
-    the recorded source fingerprints and formal configuration constraints are
-    checked at every step. Matching and KKT are never called here.
+    Existing step logs do not serialize the full lifecycle manager state needed
+    to restore later Slots, including residual task work and terminal accounting.
     """
 
     if int(environment.index) != 0:
@@ -316,14 +369,32 @@ def restore_pre_action_state_from_step_records(
         )
     target_index = target_indices[0]
     if target_index >= int(environment.decision_count):
-        raise CounterfactualInputError("target Slot is outside the environment decision window")
+        raise CounterfactualInputError(
+            "target Slot is outside the environment decision window"
+        )
+    if target_index != 0:
+        raise CounterfactualStateNotReconstructable(
+            "cross-Slot state is not reconstructable from the available logs: "
+            "they do not contain a complete active-task lifecycle snapshot "
+            "(remaining upload/compute work, execution node, cumulative task energy, "
+            "terminal ledger and next lifecycle Slot)"
+        )
     episode_index = target_step_record.get("episode_index")
+    if episode_index is None:
+        raise CounterfactualInputError("target step record has no episode_index")
     episode_seed = target_step_record.get("episode_seed")
-    if (
-        episode_seed is not None
-        and environment.episode_seed is not None
-        and int(episode_seed) != int(environment.episode_seed)
-    ):
+    if episode_seed is None or environment.episode_seed is None:
+        raise CounterfactualInputError(
+            "target step and formal Episode must both provide an episode seed"
+        )
+    try:
+        target_seed = int(episode_seed)
+        environment_seed = int(environment.episode_seed)
+    except (TypeError, ValueError) as exc:
+        raise CounterfactualInputError(
+            "target or formal Episode seed is invalid"
+        ) from exc
+    if target_seed != environment_seed:
         raise CounterfactualInputError("target step and formal Episode seeds differ")
 
     rows_by_slot: dict[int, Mapping[str, Any]] = {}
@@ -338,85 +409,40 @@ def restore_pre_action_state_from_step_records(
             raise CounterfactualInputError(f"duplicate logged row for Slot {slot_id}")
         rows_by_slot[slot_id] = row
     if target_slot_id not in rows_by_slot:
-        raise CounterfactualInputError("target Slot record is absent from supplied Episode logs")
+        raise CounterfactualInputError(
+            "target Slot record is absent from supplied Episode logs"
+        )
     target_log_row = rows_by_slot[target_slot_id]
+    target_log_seed = target_log_row.get("episode_seed")
+    if target_log_seed is None:
+        raise CounterfactualInputError("matching target log row has no episode_seed")
+    try:
+        target_log_seed = int(target_log_seed)
+    except (TypeError, ValueError) as exc:
+        raise CounterfactualInputError(
+            "matching target log row has an invalid episode_seed"
+        ) from exc
+    if target_log_seed != target_seed:
+        raise CounterfactualInputError(
+            "target step and matching log row episode seeds differ"
+        )
+    if _candidate_id(target_step_record) is None or _candidate_id(target_log_row) is None:
+        raise CounterfactualInputError(
+            "target step or matching log row has no selected candidate identity"
+        )
     if (
-        target_log_row.get("state_fingerprint") != target_step_record.get("state_fingerprint")
+        target_log_row.get("episode_index") != episode_index
+        or target_log_row.get("state_fingerprint")
+        != target_step_record.get("state_fingerprint")
         or _candidate_id(target_log_row) != _candidate_id(target_step_record)
     ):
         raise CounterfactualInputError(
             "target step record differs from the matching row in the supplied Episode log"
         )
 
+    if target_step_record.get("state_fingerprint") is None:
+        raise CounterfactualInputError("target step record has no state_fingerprint")
     environment.reset()
-    for index in range(target_index):
-        slot_input = environment.slot_inputs[index]
-        slot_id = int(slot_input.slot_id)
-        row = rows_by_slot.get(slot_id)
-        if row is None:
-            raise CounterfactualInputError(
-                f"missing prior action record for Episode Slot {slot_id}"
-            )
-        current_fingerprint = environment._current_state_hash()
-        action_payload = row.get("selected_candidate_action")
-        if not isinstance(action_payload, Mapping):
-            raise CounterfactualInputError(
-                f"prior Slot {slot_id} lacks selected_candidate_action"
-            )
-        if str(row.get("state_fingerprint", "")) != current_fingerprint:
-            raise CounterfactualInputError(
-                f"prior Slot {slot_id} state fingerprint does not match reconstructed state"
-            )
-        if str(action_payload.get("source_state_fingerprint", "")) != current_fingerprint:
-            raise CounterfactualInputError(
-                f"prior Slot {slot_id} action belongs to a different source state"
-            )
-        try:
-            target_cache = np.asarray(
-                action_payload["target_cache_state"], dtype=np.int8
-            )
-            target_uav = {
-                str(item[0]): np.asarray((float(item[1]), float(item[2])), dtype=np.float64)
-                for item in action_payload["target_uav_positions"]
-            }
-            action = ActionCandidate.from_states(
-                previous_cache_state=environment.cache_state,
-                previous_uav_positions=environment.uav_positions,
-                target_cache_state=target_cache,
-                target_uav_positions=target_uav,
-                slot_input=slot_input,
-                source_state_fingerprint=current_fingerprint,
-                proposal_source=str(action_payload.get("proposal_source", "replay")),
-            )
-        except (KeyError, TypeError, ValueError, IndexError, FloatingPointError) as exc:
-            raise CounterfactualInputError(
-                f"prior Slot {slot_id} target failed formal action validation: {exc}"
-            ) from exc
-        expected_candidate_id = str(
-            row.get("selected_candidate_id", row.get("candidate_id", ""))
-        )
-        if action.candidate_id != expected_candidate_id:
-            raise CounterfactualInputError(
-                f"prior Slot {slot_id} candidate ID does not match its target configuration"
-            )
-        if action.operation != str(row.get("operation", action.operation)):
-            raise CounterfactualInputError(
-                f"prior Slot {slot_id} operation does not match its target configuration"
-            )
-        cache_configuration.validate_cache_shape_and_capacity(
-            target_cache,
-            dict(environment.model.service_catalog),
-            dict(environment.model.cache_nodes),
-        )
-        environment.cache_state = target_cache.copy()
-        environment.uav_positions = {
-            key: value.copy() for key, value in target_uav.items()
-        }
-        environment.index = index + 1
-        _clear_observation_cache(environment)
-
-    if environment.index != target_index:
-        raise CounterfactualInputError("state restoration stopped at the wrong Slot index")
     restored_fingerprint = environment._current_state_hash()
     if str(target_step_record.get("state_fingerprint", "")) != restored_fingerprint:
         raise CounterfactualInputError(
@@ -427,7 +453,10 @@ def restore_pre_action_state_from_step_records(
         "episode_seed": environment.episode_seed,
         "target_slot_id": target_slot_id,
         "environment_index": target_index,
-        "prior_logged_slots_replayed_as_state_assignments": target_index,
+        "restoration_status": "RECONSTRUCTED_INITIAL_SLOT",
+        "prior_logged_slots_replayed": 0,
+        "lifecycle_manager_reset_to_formal_episode_initial_state": True,
+        "state_fingerprint_verified": True,
         "matching_or_kkt_called_during_restoration": False,
         "state_fingerprint": restored_fingerprint,
     }
@@ -443,25 +472,40 @@ def _transition_result(
     beta_ca = diagnostics.get("beta_ca")
     beta_q = diagnostics.get("beta_q")
     task_utility = diagnostics.get("actual_task_utility")
-    weighted_cache_cost = (
-        None if cache_cost is None or beta_ca is None else float(cache_cost) * float(beta_ca)
-    )
-    weighted_movement_cost = (
-        None
-        if movement_cost is None or beta_q is None
-        else float(movement_cost) * float(beta_q)
-    )
-    reconstructed_utility = (
-        None
-        if task_utility is None
-        or weighted_cache_cost is None
-        or weighted_movement_cost is None
-        else float(task_utility) - weighted_cache_cost - weighted_movement_cost
-    )
+    reward_components = {
+        "actual_task_utility_Q_task": task_utility,
+        "cache_cost_C_ca": cache_cost,
+        "movement_cost_C_q": movement_cost,
+    }
+    missing_reward_components = [
+        field for field, value in reward_components.items() if value is None
+    ]
+    if missing_reward_components:
+        recomposition = {
+            "status": "UNAVAILABLE_MISSING_COMPONENTS",
+            "formula": "G(t)=Q_task(t)-C_ca(t)-C_q(t)",
+            "value": None,
+            "residual": None,
+            "missing_components": missing_reward_components,
+        }
+    else:
+        recomposed_reward = system_model.lifecycle_system_reward(
+            float(task_utility), float(cache_cost), float(movement_cost)
+        )
+        recomposition = {
+            "status": "AVAILABLE",
+            "formula": "G(t)=Q_task(t)-C_ca(t)-C_q(t)",
+            "value": recomposed_reward,
+            "residual": float(transition.reward) - recomposed_reward,
+            "missing_components": [],
+        }
     return {
         "status": "SUCCEEDED",
         "roles": list(planned["roles"]),
-        "q_value_by_role": dict(planned.get("q_value_by_role", {})),
+        "logged_q_value_by_role": dict(
+            planned.get("logged_q_value_by_role", {})
+        ),
+        "logged_q_value_semantics": planned.get("logged_q_value_semantics"),
         "candidate_id": transition.candidate_id,
         "operation": transition.operation,
         "candidate_target": dict(planned["candidate_action"]),
@@ -473,23 +517,26 @@ def _transition_result(
         "candidate_target_matches_execution": bool(
             diagnostics.get("candidate_target_matches_execution_pass") is True
         ),
-        "actual_system_utility_G": float(transition.reward),
-        "actual_task_utility_Q_task": task_utility,
-        "cache_cost_C_ca": cache_cost,
-        "beta_ca": beta_ca,
-        "weighted_cache_cost": weighted_cache_cost,
-        "cache_download_delay_s": diagnostics.get("cache_download_delay_s"),
-        "movement_cost_C_q": movement_cost,
-        "beta_q": beta_q,
-        "weighted_movement_cost": weighted_movement_cost,
-        "uav_movement_energy_j": diagnostics.get("uav_movement_energy_j"),
-        "reward_formula": "G=Q_task-beta_ca*C_ca-beta_q*C_q",
-        "reconstructed_system_utility_G": reconstructed_utility,
-        "reward_recomposition_residual": (
-            None
-            if reconstructed_utility is None
-            else float(transition.reward) - reconstructed_utility
+        "counterfactual_slot_reward_G": float(transition.reward),
+        "counterfactual_task_utility_Q_task": task_utility,
+        "counterfactual_task_termination_events": diagnostics.get(
+            "task_termination_events"
         ),
+        "counterfactual_terminal_task_utility_by_task": diagnostics.get(
+            "terminal_task_utility_by_task"
+        ),
+        "actual_task_utility_semantics": (
+            "sum of one-time terminal utilities for tasks ending in this Slot; "
+            "not utility for tasks still active"
+        ),
+        "counterfactual_cache_cost_C_ca": cache_cost,
+        "legacy_beta_ca_config_not_applied": beta_ca,
+        "cache_download_delay_s": diagnostics.get("cache_download_delay_s"),
+        "counterfactual_movement_cost_C_q": movement_cost,
+        "legacy_beta_q_config_not_applied": beta_q,
+        "uav_movement_energy_j": diagnostics.get("uav_movement_energy_j"),
+        "slot_reward_formula": "G(t)=Q_task(t)-C_ca(t)-C_q(t)",
+        "reward_recomposition": recomposition,
         "actual_task_delay_sum_s": diagnostics.get("actual_total_task_delay_s"),
         "actual_vehicle_energy_sum_j": diagnostics.get("actual_total_vehicle_energy_j"),
         "actual_execution_nodes": diagnostics.get("actual_execution_nodes"),
@@ -498,15 +545,21 @@ def _transition_result(
         ),
         "matching_calls": transition.matching_calls,
         "kkt_solver_calls": transition.kkt_solver_calls,
-        "predicted_cache_coverage_before": diagnostics.get(
-            "predicted_cache_coverage_before"
-        ),
-        "predicted_cache_coverage_after": diagnostics.get(
-            "predicted_cache_coverage_after"
-        ),
-        "predicted_cache_coverage_delta": diagnostics.get(
-            "predicted_cache_coverage_delta"
-        ),
+        "predicted_features": {
+            "cache_coverage_before": diagnostics.get(
+                "predicted_cache_coverage_before"
+            ),
+            "cache_coverage_after": diagnostics.get(
+                "predicted_cache_coverage_after"
+            ),
+            "cache_coverage_delta": diagnostics.get(
+                "predicted_cache_coverage_delta"
+            ),
+            "semantics": (
+                "predicted demand-weighted cache serviceability feature; "
+                "not realized task utility or reward"
+            ),
+        },
         "executor_failure_reason": None,
     }
 
@@ -525,30 +578,6 @@ def review_frozen_slot(
         raise CounterfactualInputError(
             "candidate feature contract is missing or differs from the frozen environment"
         )
-    for field, config_path in (
-        ("beta_ca", "objective.beta_ca"),
-        ("beta_q", "objective.beta_q"),
-    ):
-        logged_weight = step_record.get(field)
-        if logged_weight is None:
-            raise CounterfactualInputError(f"logged {field} is unavailable")
-        try:
-            logged_weight = float(logged_weight)
-            configured_weight = float(
-                project_config.get_config_value(
-                    environment.model.project_cfg, config_path
-                )
-            )
-        except (TypeError, ValueError, KeyError) as exc:
-            raise CounterfactualInputError(
-                f"could not validate reward weight {field}: {exc}"
-            ) from exc
-        if not math.isclose(
-            logged_weight, configured_weight, rel_tol=0.0, abs_tol=1.0e-12
-        ):
-            raise CounterfactualInputError(
-                f"logged {field}={logged_weight} differs from frozen config value {configured_weight}"
-            )
     frozen_copy = copy.deepcopy(environment)
     if _environment_signature(frozen_copy) != before_signature:
         raise CounterfactualInputError(
@@ -579,7 +608,10 @@ def review_frozen_slot(
             ),
             None,
         )
-        if candidate is None or candidate.action.to_dict() != planned["candidate_action"]:
+        if (
+            candidate is None
+            or candidate.action.to_dict() != planned["candidate_action"]
+        ):
             raise CounterfactualInputError(
                 f"candidate {planned['candidate_id']} did not reconstruct in the isolated legal set"
             )
@@ -588,7 +620,12 @@ def review_frozen_slot(
             result = _transition_result(planned, transition)
         except Exception as exc:  # Preserve executor failures as per-candidate evidence.
             result = {
-                "q_value_by_role": dict(planned.get("q_value_by_role", {})),
+                "logged_q_value_by_role": dict(
+                    planned.get("logged_q_value_by_role", {})
+                ),
+                "logged_q_value_semantics": planned.get(
+                    "logged_q_value_semantics"
+                ),
                 "roles": list(planned["roles"]),
                 "candidate_id": planned["candidate_id"],
                 "operation": planned["operation"],
@@ -605,39 +642,107 @@ def review_frozen_slot(
             result
             for result in results
             if result.get("operation") == "KEEP_STAY"
-            and result.get("executor_failure_reason") is None
-            and "actual_system_utility_G" in result
+            and result.get("status") == "SUCCEEDED"
+            and result.get("candidate_target_matches_execution") is True
+            and "counterfactual_slot_reward_G" in result
         ),
         None,
     )
     keep_utility = (
-        None if keep_result is None else float(keep_result["actual_system_utility_G"])
+        None
+        if keep_result is None
+        else float(keep_result["counterfactual_slot_reward_G"])
     )
     for result in results:
-        if "actual_system_utility_G" in result and keep_utility is not None:
-            result["immediate_delta_G_vs_KEEP_STAY"] = (
-                float(result["actual_system_utility_G"]) - keep_utility
-            )
+        comparable = (
+            result.get("status") == "SUCCEEDED"
+            and result.get("candidate_target_matches_execution") is True
+            and keep_utility is not None
+        )
+        if comparable:
+            result["immediate_delta_G_vs_KEEP_STAY"] = float(
+                result["counterfactual_slot_reward_G"]
+            ) - keep_utility
+            result["immediate_comparison_status"] = "COMPUTED"
+            result["immediate_comparison_reason"] = None
         else:
             result["immediate_delta_G_vs_KEEP_STAY"] = None
-        result["long_horizon_return_difference"] = None
+            result["immediate_comparison_status"] = "UNAVAILABLE"
+            if keep_utility is None:
+                result["immediate_comparison_reason"] = (
+                    "KEEP_STAY did not complete with its requested target executed exactly"
+                )
+            elif result.get("status") != "SUCCEEDED":
+                result["immediate_comparison_reason"] = (
+                    "candidate execution did not complete successfully"
+                )
+            else:
+                result["immediate_comparison_reason"] = (
+                    "formal execution did not match the requested candidate target"
+                )
+        result["long_horizon_strategy_return"] = {
+            "status": "UNSUPPORTED",
+            "value": None,
+            "reason": (
+                "independent one-Slot counterfactuals do not roll out future "
+                "policy decisions"
+            ),
+        }
+        result["cache_uav_same_slot_interaction"] = {
+            "status": "UNSUPPORTED",
+            "value": None,
+            "reason": (
+                "the comparison evaluates single legal action candidates "
+                "independently and does not estimate a combined cache-plus-UAV effect"
+            ),
+        }
 
     original_unchanged = _environment_signature(environment) == before_signature
+    partial = any(
+        result.get("status") != "SUCCEEDED"
+        or result.get("candidate_target_matches_execution") is not True
+        or result.get("reward_recomposition", {}).get("status")
+        != "AVAILABLE"
+        or result.get("counterfactual_task_termination_events") is None
+        for result in results
+    ) or any(result.get("status") == "SKIPPED" for result in results)
     return {
-        "schema": "online_joint_dqn_counterfactual_review_v1",
+        "schema": "online_joint_dqn_counterfactual_review_v2",
+        "analysis_status": "PARTIAL" if partial else "COMPLETED",
         "episode_index": step_record.get("episode_index"),
         "slot_id": step_record.get("slot_id"),
         "state_fingerprint": before_signature["state_fingerprint"],
         "initial_state_signature": before_signature,
-        "state_reconstruction_mode": "logged target states with fingerprint and formal constraint validation",
-        "candidate_selection_used_only_logged_legal_ids": True,
+        "state_reconstruction_mode": "formal Episode initial state reset plus exact logged fingerprint match; cross-Slot replay is refused",
+        "supported_state_scope": "formal Episode initial Slot only (environment index 0)",
+        "candidate_comparisons_use_only_regenerated_legal_candidates": True,
+        "logged_candidate_ids_revalidated": True,
         "evaluation_used_as_dqn_input": False,
         "original_environment_unchanged": original_unchanged,
         "training_pool_config_and_existing_outputs_written": False,
+        "comparison_scope": {
+            "included": [
+                "unique legal KEEP_STAY candidate",
+                "logged DQN-selected candidate when its identity matches the regenerated legal set",
+                "logged Q-best CACHE_UPDATE candidate when its identity and category match the regenerated legal set",
+                "logged Q-best UAV_MOVE candidate when its identity and category match the regenerated legal set",
+            ],
+            "exhaustive_operation_category_search": False,
+            "logged_q_values_are_realized_rewards": False,
+            "predicted_features_are_realized_rewards": False,
+        },
+        "unsupported_metrics": {
+            "long_horizon_strategy_return": "not computed: future policy decisions are not rolled out",
+            "cache_uav_same_slot_interaction_gain": (
+                "not computed: combined cache-plus-UAV counterfactual is not evaluated"
+            ),
+        },
         "results": results,
         "interpretation": (
-            "immediate_delta_G_vs_KEEP_STAY is a same-Slot realized utility difference only; "
-            "it does not establish a long-horizon policy advantage"
+            "counterfactual_slot_reward_G is the immediate formal Slot reward; Q_task contains only "
+            "one-time terminal utilities of tasks ending in this Slot. Logged Q values and "
+            "predicted cache features are separate quantities. Same-Slot reward differences "
+            "do not establish long-horizon policy advantage or cache-UAV interaction gains."
         ),
     }
 
@@ -712,6 +817,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _write_result(result: Mapping[str, Any], output: Path | None) -> None:
+    payload = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
+    if output is None:
+        print(payload)
+    else:
+        with output.open("x", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.write("\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     step_records = _load_step_records(args.step_record)
@@ -724,18 +839,59 @@ def main(argv: list[str] | None = None) -> int:
         for row in step_records
         if row.get("episode_index") == step_record.get("episode_index")
     ]
-    restoration = restore_pre_action_state_from_step_records(
-        environment, episode_records, step_record
-    )
-    result = review_frozen_slot(environment, step_record)
+    try:
+        restoration = restore_pre_action_state_from_step_records(
+            environment, episode_records, step_record
+        )
+    except CounterfactualStateNotReconstructable as exc:
+        _write_result(
+            {
+                "schema": "online_joint_dqn_counterfactual_review_v2",
+                "analysis_status": "STATE_NOT_RECONSTRUCTABLE",
+                "episode_index": step_record.get("episode_index"),
+                "slot_id": step_record.get("slot_id"),
+                "state_restoration": {
+                    "status": "NOT_RECONSTRUCTABLE",
+                    "reason": str(exc),
+                    "state_fingerprint_verified": False,
+                },
+                "supported_state_scope": "formal Episode initial Slot only (environment index 0)",
+                "unsupported_metrics": {
+                    "long_horizon_strategy_return": "not computed: future policy decisions are not rolled out",
+                    "cache_uav_same_slot_interaction_gain": "not computed: combined cache-plus-UAV counterfactual is not evaluated",
+                },
+            },
+            args.output,
+        )
+        return 2
+    except CounterfactualInputError as exc:
+        _write_result(
+            {
+                "schema": "online_joint_dqn_counterfactual_review_v2",
+                "analysis_status": "REJECTED_INPUT_OR_STATE_MISMATCH",
+                "episode_index": step_record.get("episode_index"),
+                "slot_id": step_record.get("slot_id"),
+                "reason": str(exc),
+            },
+            args.output,
+        )
+        return 2
+    try:
+        result = review_frozen_slot(environment, step_record)
+    except CounterfactualInputError as exc:
+        _write_result(
+            {
+                "schema": "online_joint_dqn_counterfactual_review_v2",
+                "analysis_status": "REJECTED_INPUT_OR_STATE_MISMATCH",
+                "episode_index": step_record.get("episode_index"),
+                "slot_id": step_record.get("slot_id"),
+                "reason": str(exc),
+            },
+            args.output,
+        )
+        return 2
     result["state_restoration"] = restoration
-    payload = json.dumps(result, ensure_ascii=False, indent=2)
-    if args.output is None:
-        print(payload)
-    else:
-        with args.output.open("x", encoding="utf-8") as stream:
-            stream.write(payload)
-            stream.write("\n")
+    _write_result(result, args.output)
     return 0
 
 

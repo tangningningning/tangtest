@@ -8,7 +8,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from decision import uav_configuration
+from common import project_config
+from decision import cache_configuration, uav_configuration
 
 from .candidate_evaluator import (
     CandidateEvaluation,
@@ -91,6 +92,31 @@ class UavScheduler:
             raise ValueError("UAV positions must follow configured UAV ID order")
         triggers = {uav_id: 1 for uav_id in uav_ids}
         cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
+        project_cfg = dict(slot_input.model.project_cfg)
+        flight_boundary = tuple(float(value) for value in slot_input.model.flight_boundary)
+        # These snapshots are private to this synchronous, read-only proposal
+        # sweep. Reusing them avoids deep-copying the same forecast inputs once
+        # per UAV and again for the coordinated first proposal.
+        scenario_slice = copy.deepcopy(dict(slot_input.scenario_slice))
+        cache_nodes = copy.deepcopy(dict(slot_input.model.cache_nodes))
+        predicted_vehicle_positions = copy.deepcopy(
+            dict(slot_input.predicted_vehicle_positions)
+        )
+        prediction_horizon_mask = copy.deepcopy(slot_input.prediction_horizon_mask)
+        vehicle_service_demand = (
+            cache_configuration.predicted_vehicle_service_demand(
+                scenario_slice,
+                int(cache.shape[1]),
+                beta_discount=float(
+                    project_config.get_config_value(
+                        project_cfg, "cache.discount_beta", 1.0
+                    )
+                ),
+                prediction_horizon_mask=prediction_horizon_mask,
+            )
+            if uav_ids
+            else None
+        )
         per_uav_moves: dict[str, list[Any]] = {}
         raw_move_counts: dict[str, int] = {}
         complete = True
@@ -101,15 +127,14 @@ class UavScheduler:
                 previous,
                 uav_id,
                 triggers,
-                dict(slot_input.model.project_cfg),
-                tuple(float(value) for value in slot_input.model.flight_boundary),
-                scenario_slice=dict(slot_input.scenario_slice),
-                cache_state=cache.copy(),
-                cache_nodes=copy.deepcopy(dict(slot_input.model.cache_nodes)),
-                predicted_vehicle_positions=copy.deepcopy(
-                    dict(slot_input.predicted_vehicle_positions)
-                ),
-                prediction_horizon_mask=copy.deepcopy(slot_input.prediction_horizon_mask),
+                project_cfg,
+                flight_boundary,
+                scenario_slice=scenario_slice,
+                cache_state=cache,
+                cache_nodes=cache_nodes,
+                predicted_vehicle_positions=predicted_vehicle_positions,
+                prediction_horizon_mask=prediction_horizon_mask,
+                precomputed_vehicle_service_demand=vehicle_service_demand,
             )
             raw_move_counts[uav_id] = len(moves)
             if len(moves) > move_limit:
@@ -150,23 +175,30 @@ class UavScheduler:
         combined_positions = copy_uav_positions(current)
         combined_ids: list[str] = []
         combined_sources: list[str] = []
+        combined_matches_current = True
         for uav_id in uav_ids:
-            moves = uav_configuration.enumerate_uav_target_candidates(
-                combined_positions,
-                previous,
-                uav_id,
-                triggers,
-                dict(slot_input.model.project_cfg),
-                tuple(float(value) for value in slot_input.model.flight_boundary),
-                scenario_slice=dict(slot_input.scenario_slice),
-                cache_state=cache.copy(),
-                cache_nodes=copy.deepcopy(dict(slot_input.model.cache_nodes)),
-                predicted_vehicle_positions=copy.deepcopy(
-                    dict(slot_input.predicted_vehicle_positions)
-                ),
-                prediction_horizon_mask=copy.deepcopy(slot_input.prediction_horizon_mask),
-            )
-            if not moves or candidate_limit <= 1:
+            if candidate_limit <= 1:
+                continue
+            if combined_matches_current:
+                # This is the same proposal call already made above. Only its
+                # first result is consumed here, and move_limit is at least one.
+                moves = per_uav_moves[uav_id]
+            else:
+                moves = uav_configuration.enumerate_uav_target_candidates(
+                    combined_positions,
+                    previous,
+                    uav_id,
+                    triggers,
+                    project_cfg,
+                    flight_boundary,
+                    scenario_slice=scenario_slice,
+                    cache_state=cache,
+                    cache_nodes=cache_nodes,
+                    predicted_vehicle_positions=predicted_vehicle_positions,
+                    prediction_horizon_mask=prediction_horizon_mask,
+                    precomputed_vehicle_service_demand=vehicle_service_demand,
+                )
+            if not moves:
                 continue
             move = moves[0]
             try:
@@ -186,6 +218,7 @@ class UavScheduler:
             if not bool(applied["actual_moved"]):
                 continue
             combined_positions = copy_uav_positions(combined_positions)
+            combined_matches_current = False
             combined_ids.append(uav_id)
             combined_sources.append(str(move.proposal_source))
         append_candidate(

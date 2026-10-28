@@ -10,7 +10,7 @@ import pickle
 import sys
 import time
 from collections import Counter, OrderedDict
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -518,6 +518,23 @@ def _episode_rebuild_spec_sha256(payload: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
+def _clear_encoder_rebuild_runtime_cache(encoder: CandidateFeatureEncoder) -> None:
+    """Exclude derivable candidate-generation caches from rebuild identity."""
+
+    defaults = {
+        "_candidate_generation_demand_cache_scenario": None,
+        "_candidate_generation_demand_cache_horizon_mask": None,
+        "_candidate_generation_demand_cache_node_values": None,
+        "_candidate_generation_serviceability_cache_node_values": None,
+        "_candidate_generation_demand_cache_hits": 0,
+        "_candidate_generation_demand_cache_misses": 0,
+        "_candidate_generation_serviceability_cache_hits": 0,
+        "_candidate_generation_serviceability_cache_misses": 0,
+    }
+    for name, value in defaults.items():
+        setattr(encoder, name, value)
+
+
 def _canonical_episode_vehicle_slots(
     slot_input: SlotInput,
     forecast: DecisionForecast,
@@ -677,15 +694,11 @@ def _bounded_cross_node_pair_cache_targets(
             target = np.asarray(candidate.target_node_cache, dtype=np.int8).reshape(-1)
             if (
                 target.shape != (cache_state.shape[1],)
-                or not np.all(np.isin(target, [0, 1]))
-                or not cache_configuration.is_legal_cache_replacement(
-                    cache_state[node_index], target
-                )
-                or not cache_configuration.is_node_feasible(
-                    target, sizes, float(capacities[node_index])
-                )
+                or not np.all((target == 0) | (target == 1))
             ):
                 continue
+            # These candidates come directly from enumerate_all_cache_target_configurations,
+            # which has already checked replacement legality and node capacity.
             key = np.ascontiguousarray(target, dtype=np.int8).tobytes()
             source = str(candidate.proposal_source)
             previous = by_target.get(key)
@@ -755,16 +768,10 @@ def _bounded_cross_node_pair_cache_targets(
             int(index)
             for index in np.flatnonzero(np.any(target_state != cache_state, axis=1))
         )
+        # Each replaced row is an exact target already validated by the
+        # exhaustive single-node enumerator. Cache capacity is node-local, so
+        # combining two such rows cannot alter either row's feasibility.
         valid_pair = changed_indices == (left_node, right_node)
-        if valid_pair:
-            for node_index in changed_indices:
-                valid_pair = cache_configuration.is_legal_cache_replacement(
-                    cache_state[node_index], target_state[node_index]
-                ) and cache_configuration.is_node_feasible(
-                    target_state[node_index], sizes, float(capacities[node_index])
-                )
-                if not valid_pair:
-                    break
         if not valid_pair:
             rejected_legality_count += 1
             continue
@@ -1395,6 +1402,7 @@ class ExclusiveDQNEnvironment:
             previous_uav_positions=uav_positions,
             slot_input=candidate_input,
             decision_forecast=forecast,
+            prepare_unchanged_cache_cost=(include_keep or include_uav),
         )
         service_catalog = dict(candidate_input.model.service_catalog)
         cache_nodes = deepcopy(dict(candidate_input.model.cache_nodes))
@@ -1402,20 +1410,28 @@ class ExclusiveDQNEnvironment:
         cache_prediction_horizon_mask = deepcopy(
             candidate_input.prediction_horizon_mask
         )
-        node_predicted_demands = (
-            tuple(
-                cache_configuration.node_specific_predicted_demand(
-                    cache_scenario,
-                    node_index,
-                    cache_nodes,
-                    candidate_input.model.cache_config,
-                    prediction_horizon_mask=cache_prediction_horizon_mask,
+        node_predicted_demands = None
+        if include_cache:
+            cached_node_demands = (
+                self.encoder.cached_candidate_generation_node_demands(
+                    candidate_input.scenario_slice,
+                    self.encoder._forecast_mask(forecast),
                 )
-                for node_index in range(len(cache_nodes["node_ids"]))
             )
-            if include_cache
-            else None
-        )
+            node_predicted_demands = (
+                tuple(cached_node_demands[index] for index in range(len(cache_nodes["node_ids"])))
+                if cached_node_demands is not None
+                else tuple(
+                    cache_configuration.node_specific_predicted_demand(
+                        cache_scenario,
+                        node_index,
+                        cache_nodes,
+                        candidate_input.model.cache_config,
+                        prediction_horizon_mask=cache_prediction_horizon_mask,
+                    )
+                    for node_index in range(len(cache_nodes["node_ids"]))
+                )
+            )
         candidates: list[CandidateOption] = []
         if include_keep:
             keep = ActionCandidate.from_states(
@@ -1582,31 +1598,30 @@ class ExclusiveDQNEnvironment:
         if not cache_updates_allowed:
             forbidden_tail_candidate_count = len(cache_targets_by_key)
             cache_targets_by_key.clear()
-        for target_state, proposal_source in cache_targets_by_key.values():
-            action = ActionCandidate.from_states(
+        cache_target_items = tuple(cache_targets_by_key.values())
+        if cache_target_items:
+            cache_actions = ActionCandidate.from_cache_states(
                 previous_cache_state=cache_state,
                 previous_uav_positions=uav_positions,
-                target_cache_state=target_state,
-                target_uav_positions=uav_positions,
+                target_cache_states=tuple(item[0] for item in cache_target_items),
+                proposal_sources=tuple(item[1] for item in cache_target_items),
                 slot_input=candidate_input,
                 source_state_fingerprint=source_state_fingerprint,
-                proposal_source=proposal_source,
             )
-            if action.operation != "CACHE_UPDATE":
+            cache_features = self.encoder.encode_candidates(
+                cache_actions,
+                previous_cache_state=cache_state,
+                previous_uav_positions=uav_positions,
+                slot_input=candidate_input,
+                decision_forecast=forecast,
+                cache_complementarity_context=cache_complementarity_context,
+            )
+            if any(action.operation != "CACHE_UPDATE" for action in cache_actions):
                 raise RuntimeError("缓存候选枚举产生了非 REPLACE 或无变化动作")
-            candidates.append(
-                CandidateOption.create(
-                    action,
-                    self.encoder.encode_candidate(
-                        action,
-                        previous_cache_state=cache_state,
-                        previous_uav_positions=uav_positions,
-                        slot_input=candidate_input,
-                        decision_forecast=forecast,
-                        cache_complementarity_context=cache_complementarity_context,
-                    ),
-                )
+            candidates.extend(
+                CandidateOption.create_many(cache_actions, cache_features)
             )
+            del cache_features
         uav_generation_diagnostics: dict[str, Any] = {}
         if include_uav:
             moves, uav_generation_complete = self.uav_scheduler.enumerate_move_candidates(
@@ -2079,9 +2094,17 @@ class ExclusiveDQNEnvironment:
             raise ValueError(
                 "回放候选重建上下文缺少身份字段：" + ", ".join(missing_fields)
             )
-        if context.get("candidate_rebuild_payload_sha256") != (
-            _candidate_rebuild_payload_sha256(context)
-        ):
+        from .replay_buffer import _verified_candidate_rebuild_payload_digest
+
+        verified_payload_digest = _verified_candidate_rebuild_payload_digest(
+            context
+        )
+        recorded_payload_digest = context.get(
+            "candidate_rebuild_payload_sha256"
+        )
+        if verified_payload_digest is None:
+            verified_payload_digest = _candidate_rebuild_payload_sha256(context)
+        if recorded_payload_digest != verified_payload_digest:
             raise ValueError("回放候选重建上下文摘要不匹配")
         operation_identity = context.get("candidate_identity_by_operation")
         if not isinstance(operation_identity, Mapping) or set(operation_identity) != set(OPERATIONS):
@@ -2863,6 +2886,7 @@ class EpisodeCandidateRebuildAdapter:
     ) -> None:
         self.model = deepcopy(model)
         self.encoder = deepcopy(encoder)
+        _clear_encoder_rebuild_runtime_cache(self.encoder)
         self.context = SimpleNamespace(observation_spec=deepcopy(observation_spec))
         self.canonical_vehicle_ids = self.encoder.vehicle_ids
         self.canonical_cache_node_ids = self.encoder.node_ids
@@ -2906,6 +2930,7 @@ class EpisodeCandidateRebuildAdapter:
         # backed model/encoder state, making a valid Replay fail after reload.
         model = deepcopy(environment.model)
         encoder = deepcopy(environment.encoder)
+        _clear_encoder_rebuild_runtime_cache(encoder)
         observation_spec = deepcopy(environment.context.observation_spec)
         search_budget = deepcopy(environment.search_budget)
         return {
@@ -2958,11 +2983,13 @@ class EpisodeCandidateRebuildAdapter:
     def state_dict(self) -> dict[str, Any]:
         """序列化必要的 Episode 重建规格，不保存完整环境或真实任务。"""
 
+        encoder = copy(self.encoder)
+        _clear_encoder_rebuild_runtime_cache(encoder)
         return {
             "schema_version": EPISODE_REBUILD_SPEC_SCHEMA_VERSION,
             "episode_seed": self.episode_seed,
             "model": self.model,
-            "encoder": self.encoder,
+            "encoder": encoder,
             "observation_spec": self.context.observation_spec,
             "train_origin_start": self.train_origin_start,
             "train_origin_end": self.train_origin_end,

@@ -145,10 +145,11 @@ class ActionCandidate:
                 1.0e-6,
             )
         )
+        changed_node_indices = np.flatnonzero(
+            np.any(before_cache != after_cache, axis=1)
+        )
         changed_node_ids = tuple(
-            node_ids[index]
-            for index in range(len(node_ids))
-            if not np.array_equal(before_cache[index], after_cache[index])
+            node_ids[int(index)] for index in changed_node_indices
         )
         moved_uav_ids = tuple(
             uav_id
@@ -165,8 +166,10 @@ class ActionCandidate:
             operation = "CACHE_UPDATE"
         else:
             operation = "UAV_MOVE"
-        for index, node_id in enumerate(node_ids):
-            if not np.array_equal(before_cache[index], after_cache[index]) and not cache_configuration.is_legal_cache_replacement(
+        for raw_index in changed_node_indices:
+            index = int(raw_index)
+            node_id = node_ids[index]
+            if not cache_configuration.is_legal_cache_replacement(
                 before_cache[index], after_cache[index]
             ):
                 raise ValueError(f"缓存候选 {node_id} 不符合正式 REPLACE 规则")
@@ -209,6 +212,110 @@ class ActionCandidate:
             moved_uav_ids=moved_uav_ids,
             proposal_source=str(proposal_source),
         )
+
+    @classmethod
+    def from_cache_states(
+        cls,
+        *,
+        previous_cache_state: Any,
+        previous_uav_positions: Mapping[str, Any],
+        target_cache_states: Sequence[Any],
+        proposal_sources: Sequence[str],
+        slot_input: SlotInput,
+        source_state_fingerprint: str,
+    ) -> tuple["ActionCandidate", ...]:
+        """Build cache-only actions while sharing identical UAV validation."""
+
+        before_cache = np.asarray(previous_cache_state, dtype=np.int8).copy()
+        targets = np.asarray(target_cache_states, dtype=np.int8)
+        if targets.ndim != 3 or targets.shape[1:] != before_cache.shape:
+            raise ValueError("候选缓存矩阵必须与当前缓存形状一致")
+        if len(targets) != len(proposal_sources):
+            raise ValueError("候选缓存目标与 proposal source 数量不一致")
+        if not np.all((before_cache == 0) | (before_cache == 1)) or not np.all(
+            (targets == 0) | (targets == 1)
+        ):
+            raise ValueError("候选缓存矩阵必须只包含 0 和 1")
+        before_uav = copy_uav_positions(previous_uav_positions)
+        after_uav = copy_uav_positions(previous_uav_positions)
+        if not before_uav or tuple(before_uav) != tuple(after_uav):
+            raise ValueError("候选 UAV 顺序必须与当前状态一致")
+        node_ids = tuple(
+            str(value) for value in slot_input.model.cache_nodes["node_ids"]
+        )
+        if len(node_ids) != before_cache.shape[0]:
+            raise ValueError("候选缓存行与正式缓存节点顺序不匹配")
+        if not str(source_state_fingerprint):
+            raise ValueError("候选必须绑定到当前合法决策状态指纹")
+
+        # Every cache-only candidate has the same unchanged UAV transition.
+        # Validate that shared transition once; cache legality is still checked
+        # independently for every changed node in every target.
+        triggers = {uav_id: 0 for uav_id in before_uav}
+        uav_configuration.validate_uav_configuration_transition(
+            before_uav,
+            after_uav,
+            triggers,
+            dict(slot_input.model.project_cfg),
+            tuple(float(value) for value in slot_input.model.flight_boundary),
+        )
+        removed_by_node = np.any(
+            (before_cache[None, :, :] == 1) & (targets == 0), axis=2
+        )
+        added_by_node = np.any(
+            (before_cache[None, :, :] == 0) & (targets == 1), axis=2
+        )
+        legal_changed_nodes = removed_by_node & added_by_node
+        changed_masks = np.any(before_cache[None, :, :] != targets, axis=2)
+        illegal_rows = np.flatnonzero(
+            np.any(changed_masks & ~legal_changed_nodes, axis=1)
+        )
+        if illegal_rows.size:
+            row_index = int(illegal_rows[0])
+            invalid_nodes = np.flatnonzero(
+                changed_masks[row_index] & ~legal_changed_nodes[row_index]
+            )
+            node_id = node_ids[int(invalid_nodes[0])]
+            raise ValueError(f"缓存候选 {node_id} 不符合正式 REPLACE 规则")
+        target_uav_tuple = tuple(
+            (uav_id, float(after_uav[uav_id][0]), float(after_uav[uav_id][1]))
+            for uav_id in after_uav
+        )
+        actions: list[ActionCandidate] = []
+        state_hash = str(source_state_fingerprint)
+        for target, changed_mask, proposal_source in zip(
+            targets, changed_masks, proposal_sources, strict=True
+        ):
+            changed_indices = np.flatnonzero(changed_mask)
+            if not changed_indices.size:
+                raise ValueError("CACHE_UPDATE 必须改变至少一个缓存节点")
+            changed_node_ids = tuple(node_ids[int(index)] for index in changed_indices)
+            target_cache_tuple = tuple(
+                tuple(row) for row in target.tolist()
+            )
+            identity = json.dumps(
+                {
+                    "operation": "CACHE_UPDATE",
+                    "source_state": state_hash,
+                    "cache": target_cache_tuple,
+                    "uav": target_uav_tuple,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            actions.append(
+                cls(
+                    operation="CACHE_UPDATE",
+                    candidate_id=hashlib.sha256(identity).hexdigest(),
+                    source_state_fingerprint=state_hash,
+                    target_cache_state=target_cache_tuple,
+                    target_uav_positions=target_uav_tuple,
+                    changed_node_ids=changed_node_ids,
+                    moved_uav_ids=(),
+                    proposal_source=str(proposal_source),
+                )
+            )
+        return tuple(actions)
 
     def cache_array(self) -> np.ndarray:
         return np.asarray(self.target_cache_state, dtype=np.int8).copy()
@@ -268,6 +375,22 @@ class CandidateOption:
             raise ValueError("候选动作特征必须为有限数值")
         return cls(action, tuple(float(value) for value in vector))
 
+    @classmethod
+    def create_many(
+        cls, actions: Sequence[ActionCandidate], features: Any
+    ) -> tuple["CandidateOption", ...]:
+        """Validate a feature matrix once and materialize same-state options."""
+
+        matrix = np.asarray(features, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[0] != len(actions):
+            raise ValueError("批量候选特征矩阵与动作数量不一致")
+        if not np.all(np.isfinite(matrix)):
+            raise ValueError("候选动作特征必须为有限数值")
+        return tuple(
+            cls(action, tuple(map(float, row)))
+            for action, row in zip(actions, matrix, strict=True)
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {"action": self.action.to_dict(), "features": list(self.features)}
 
@@ -289,10 +412,19 @@ class _CacheComplementarityContext:
     demand_normalizer: float
     cache_coverage_before: float | None
     cache_coverage_available: bool
+    cache_coverage_before_by_horizon: np.ndarray
+    cache_coverage_top_values: np.ndarray
+    cache_coverage_top_node_indices: np.ndarray
+    fixed_cache_coverage_before: np.ndarray
+    fixed_cache_coverage_top_values: np.ndarray
+    fixed_cache_coverage_top_node_indices: np.ndarray
     prediction_forecast: DecisionForecast
     task_vehicle_predicted_positions: tuple[np.ndarray, ...]
     current_uav_positions: Mapping[str, tuple[float, float]]
     current_uav_mean_task_distance_normalized: Mapping[str, float]
+    previous_cache_state_source: np.ndarray
+    unchanged_cache_cost: float | None
+    unchanged_cache_download_delay_normalized: float | None
 
 
 class CandidateFeatureEncoder:
@@ -492,6 +624,14 @@ class CandidateFeatureEncoder:
             + 2 * node_count * service_count + 4 + 8 * uav_count
             + 7 * service_count + 4
         )
+        self._candidate_generation_demand_cache_scenario: Mapping[str, Any] | None = None
+        self._candidate_generation_demand_cache_horizon_mask: bytes | None = None
+        self._candidate_generation_demand_cache_node_values: np.ndarray | None = None
+        self._candidate_generation_serviceability_cache_node_values: np.ndarray | None = None
+        self._candidate_generation_demand_cache_hits = 0
+        self._candidate_generation_demand_cache_misses = 0
+        self._candidate_generation_serviceability_cache_hits = 0
+        self._candidate_generation_serviceability_cache_misses = 0
 
     def encode_state(
         self,
@@ -704,7 +844,7 @@ class CandidateFeatureEncoder:
             raise ValueError("预测场景车辆顺序与正式 ObservationSpec 不一致")
         if set(scenario_task_vehicle_ids) != set(self.task_vehicle_ids):
             raise ValueError("预测场景任务车辆身份与正式 ObservationSpec 不一致")
-        by_horizon = cache_configuration.predicted_vehicle_service_demand_by_horizon(
+        source_by_horizon = cache_configuration.predicted_vehicle_service_demand_by_horizon(
             scenario,
             len(self.service_ids),
             beta_discount=self.prediction_demand_beta,
@@ -715,10 +855,25 @@ class CandidateFeatureEncoder:
             len(self.vehicle_ids),
             len(self.service_ids),
         )
-        if by_horizon.shape != expected_shape or not np.isfinite(by_horizon).all():
+        if (
+            source_by_horizon.shape != expected_shape
+            or not np.isfinite(source_by_horizon).all()
+        ):
             raise ValueError("预测场景的车辆-服务需求统计维度或数值非法")
-        by_horizon = by_horizon[:, list(self.vehicle_reorder_indices), :]
+        by_horizon = source_by_horizon[:, list(self.vehicle_reorder_indices), :]
         vehicle_service_demand = np.sum(by_horizon, axis=0)
+        cache_node_serviceability = np.stack(
+            [
+                cache_configuration._node_predicted_serviceability_weights(
+                    scenario,
+                    node_index,
+                    self.cache_nodes,
+                    self.cache_config,
+                )
+                for node_index in range(len(self.node_ids))
+            ],
+            axis=0,
+        )
         cache_node_demand = np.stack(
             [
                 cache_configuration.node_specific_predicted_demand(
@@ -727,6 +882,10 @@ class CandidateFeatureEncoder:
                     self.cache_nodes,
                     self.cache_config,
                     prediction_horizon_mask=horizon_mask,
+                    precomputed_vehicle_service_demand_by_horizon=source_by_horizon,
+                    precomputed_serviceability_weights=(
+                        cache_node_serviceability[node_index]
+                    ),
                 )
                 for node_index in range(len(self.node_ids))
             ],
@@ -747,7 +906,70 @@ class CandidateFeatureEncoder:
             normalized > 1.0 + 1.0e-6
         ):
             raise ValueError("候选生成预测需求特征超出固定归一化范围")
+        cache_node_demand.setflags(write=False)
+        cache_node_serviceability.setflags(write=False)
+        self._candidate_generation_demand_cache_scenario = prediction_scenario
+        self._candidate_generation_demand_cache_horizon_mask = np.ascontiguousarray(
+            horizon_mask, dtype=np.int8
+        ).tobytes()
+        self._candidate_generation_demand_cache_node_values = cache_node_demand
+        self._candidate_generation_serviceability_cache_node_values = (
+            cache_node_serviceability
+        )
         return normalized
+
+    def cached_candidate_generation_node_demands(
+        self,
+        prediction_scenario: Mapping[str, Any],
+        horizon_mask: Any,
+    ) -> np.ndarray | None:
+        """Reuse demand rows computed moments earlier for this same scenario object."""
+
+        mask_key = np.ascontiguousarray(horizon_mask, dtype=np.int8).tobytes()
+        if (
+            prediction_scenario
+            is not self._candidate_generation_demand_cache_scenario
+            or mask_key != self._candidate_generation_demand_cache_horizon_mask
+            or self._candidate_generation_demand_cache_node_values is None
+        ):
+            self._candidate_generation_demand_cache_misses = int(
+                getattr(self, "_candidate_generation_demand_cache_misses", 0)
+            ) + 1
+            return None
+        self._candidate_generation_demand_cache_hits = int(
+            getattr(self, "_candidate_generation_demand_cache_hits", 0)
+        ) + 1
+        source_order = np.argsort(self.cache_node_reorder_indices)
+        return self._candidate_generation_demand_cache_node_values[source_order]
+
+    def cached_candidate_generation_serviceability_weights(
+        self,
+        prediction_scenario: Mapping[str, Any],
+        horizon_mask: Any,
+    ) -> np.ndarray | None:
+        """Reuse exact node geometry weights for the same scenario and mask."""
+
+        mask_key = np.ascontiguousarray(horizon_mask, dtype=np.int8).tobytes()
+        cached_weights = getattr(
+            self, "_candidate_generation_serviceability_cache_node_values", None
+        )
+        if (
+            prediction_scenario
+            is not getattr(self, "_candidate_generation_demand_cache_scenario", None)
+            or mask_key
+            != getattr(self, "_candidate_generation_demand_cache_horizon_mask", None)
+            or cached_weights is None
+        ):
+            self._candidate_generation_serviceability_cache_misses = int(
+                getattr(self, "_candidate_generation_serviceability_cache_misses", 0)
+            ) + 1
+            return None
+        self._candidate_generation_serviceability_cache_hits = int(
+            getattr(self, "_candidate_generation_serviceability_cache_hits", 0)
+        ) + 1
+        # The stored rows already use canonical ``self.node_ids`` order, which
+        # is also the order consumed by prepare_cache_complementarity_context.
+        return cached_weights
 
     def encode_candidate(
         self,
@@ -766,6 +988,7 @@ class CandidateFeatureEncoder:
             raise ValueError("候选缓存状态与本 Episode 的真实缓存节点顺序不匹配")
         before_cache = before_cache_source[list(self.cache_node_reorder_indices)].copy()
         after_cache = after_cache_source[list(self.cache_node_reorder_indices)].copy()
+        cache_unchanged = np.array_equal(before_cache_source, after_cache_source)
         before_uav = copy_uav_positions(previous_uav_positions)
         after_uav = action.uav_dict()
         if action.operation not in OPERATIONS:
@@ -797,23 +1020,44 @@ class CandidateFeatureEncoder:
         features.extend(removed.reshape(-1).tolist())
         features.extend(added.reshape(-1).tolist())
         added_mb = float(added.sum(axis=0) @ self.service_sizes_mb)
-        actual_changed_node_mask = np.asarray(
-            [float(node_id in action.changed_node_ids) for node_id in self.source_node_ids],
-            dtype=np.int8,
-        )
-        cache_details = cache_configuration.cache_update_cost_details(
-            before_cache_source,
-            after_cache_source,
-            actual_changed_node_mask,
-            self.service_sizes_mb,
-            dict(slot_input.model.cache_nodes),
-            slot_input.model.cache_config,
-        )
+        if (
+            cache_unchanged
+            and complementarity.unchanged_cache_cost is not None
+            and complementarity.unchanged_cache_download_delay_normalized is not None
+            and np.array_equal(
+                before_cache_source,
+                complementarity.previous_cache_state_source,
+            )
+        ):
+            # KEEP_STAY and UAV_MOVE repeatedly ask the formal cost routine to
+            # validate and reduce the same unchanged cache. The state context
+            # already ran that exact routine once for this immutable cache.
+            cache_cost = complementarity.unchanged_cache_cost
+            cache_download_delay_normalized = (
+                complementarity.unchanged_cache_download_delay_normalized
+            )
+        else:
+            actual_changed_node_mask = np.asarray(
+                [float(node_id in action.changed_node_ids) for node_id in self.source_node_ids],
+                dtype=np.int8,
+            )
+            cache_details = cache_configuration.cache_update_cost_details(
+                before_cache_source,
+                after_cache_source,
+                actual_changed_node_mask,
+                self.service_sizes_mb,
+                dict(slot_input.model.cache_nodes),
+                slot_input.model.cache_config,
+            )
+            cache_cost = float(cache_details["cache_cost"])
+            cache_download_delay_normalized = float(
+                cache_details["cache_download_delay_normalized"]
+            )
         features.extend(
             [
                 added_mb / self.total_service_size_mb,
-                float(cache_details["cache_cost"]),
-                float(cache_details["cache_download_delay_normalized"]),
+                cache_cost,
+                cache_download_delay_normalized,
             ]
         )
         for positions in (before_uav, after_uav):
@@ -901,15 +1145,258 @@ class CandidateFeatureEncoder:
                         raise ValueError("预测需求距离超出地图对角线归一化范围")
                     normalized_distance = min(normalized_distance, 1.0)
                 features.append(float(normalized_distance))
-        features.extend(
-            self._encode_cache_complementarity_candidate(
-                before_cache, after_cache, complementarity
+        if cache_unchanged:
+            unchanged_coverage = float(
+                complementarity.cache_coverage_before
+                if complementarity.cache_coverage_before is not None
+                else 0.0
             )
-        )
+            features.extend([0.0] * (7 * service_count))
+            features.extend(
+                [
+                    float(complementarity.cache_coverage_available),
+                    unchanged_coverage,
+                    unchanged_coverage,
+                    0.0,
+                ]
+            )
+        else:
+            features.extend(
+                self._encode_cache_complementarity_candidate(
+                    before_cache, after_cache, complementarity
+                )
+            )
         result = np.asarray(features, dtype=np.float32)
         if result.shape != (self.candidate_dim,) or not np.all(np.isfinite(result)):
             raise ValueError("候选动作特征维度或数值无效")
         return result
+
+    def encode_candidates(
+        self,
+        actions: Sequence[ActionCandidate],
+        *,
+        previous_cache_state: Any,
+        previous_uav_positions: Mapping[str, Any],
+        slot_input: SlotInput,
+        decision_forecast: DecisionForecast,
+        cache_complementarity_context: _CacheComplementarityContext | None = None,
+    ) -> np.ndarray:
+        """Encode a same-state CACHE_UPDATE group with shared invariant work."""
+
+        if not actions:
+            return np.empty((0, self.candidate_dim), dtype=np.float32)
+        if any(action.operation != "CACHE_UPDATE" for action in actions):
+            return np.asarray(
+                tuple(
+                    self.encode_candidate(
+                        action,
+                        previous_cache_state=previous_cache_state,
+                        previous_uav_positions=previous_uav_positions,
+                        slot_input=slot_input,
+                        decision_forecast=decision_forecast,
+                        cache_complementarity_context=cache_complementarity_context,
+                    )
+                    for action in actions
+                ),
+                dtype=np.float32,
+            )
+        before_source = np.asarray(previous_cache_state, dtype=np.int8)
+        expected_shape = (len(self.source_node_ids), len(self.service_ids))
+        if before_source.shape != expected_shape:
+            raise ValueError("候选缓存状态与本 Episode 的真实缓存节点顺序不匹配")
+        after_source = np.asarray(
+            [action.target_cache_state for action in actions], dtype=np.int8
+        )
+        if after_source.shape != (len(actions), *expected_shape) or not np.all(
+            (after_source == 0) | (after_source == 1)
+        ):
+            raise ValueError("批量候选缓存状态形状或二进制取值非法")
+        before_cache = before_source[list(self.cache_node_reorder_indices)]
+        after_cache = after_source[:, list(self.cache_node_reorder_indices), :]
+        if any(action.changed_node_ids == () or action.moved_uav_ids for action in actions):
+            raise ValueError("CACHE_UPDATE 必须只改变缓存")
+        changed_node_mask = np.any(
+            after_cache != before_cache[None, :, :], axis=2
+        )
+        if any(
+            {
+                self.node_ids[index]
+                for index in np.flatnonzero(changed_node_mask[row])
+            }
+            != set(action.changed_node_ids)
+            for row, action in enumerate(actions)
+        ):
+            raise ValueError("批量 CACHE_UPDATE 动作识别结果与目标缓存不一致")
+
+        complementarity = cache_complementarity_context
+        if complementarity is None:
+            complementarity = self.prepare_cache_complementarity_context(
+                previous_cache_state=before_cache,
+                previous_uav_positions=previous_uav_positions,
+                slot_input=slot_input,
+                decision_forecast=decision_forecast,
+            )
+        before_uav = copy_uav_positions(previous_uav_positions)
+        forecast_matches_context = (
+            decision_forecast is complementarity.prediction_forecast
+        )
+        if forecast_matches_context:
+            demand_xy = complementarity.task_vehicle_predicted_positions
+            cached_positions_match = all(
+                tuple(float(value) for value in before_uav[uav_id])
+                == complementarity.current_uav_positions[uav_id]
+                for uav_id in self.uav_ids
+            )
+        else:
+            horizon_mask = self._forecast_mask(decision_forecast)
+            demand_xy = tuple(
+                np.asarray(
+                    decision_forecast.predicted_vehicle_positions_horizon[horizon][vehicle_id],
+                    dtype=np.float64,
+                )
+                for horizon, valid in enumerate(horizon_mask)
+                if valid
+                for vehicle_id in self.task_vehicle_ids
+                if vehicle_id in decision_forecast.predicted_vehicle_positions_horizon[horizon]
+            )
+            cached_positions_match = False
+        if not demand_xy:
+            raise ValueError("合法预测时域中缺少任务车辆预测位置")
+
+        before_position_features = [
+            self._normalize_xy(before_uav[uav_id]) for uav_id in self.uav_ids
+        ]
+        before_distances: list[float] = []
+        for uav_id in self.uav_ids:
+            if cached_positions_match:
+                normalized_distance = complementarity.current_uav_mean_task_distance_normalized[
+                    uav_id
+                ]
+            else:
+                mean_distance = float(
+                    np.mean(
+                        [
+                            np.linalg.norm(before_uav[uav_id] - vehicle_xy)
+                            for vehicle_xy in demand_xy
+                        ]
+                    )
+                )
+                normalized_distance = mean_distance / self.map_diagonal_m
+                if (
+                    not np.isfinite(normalized_distance)
+                    or normalized_distance > 1.0 + 1.0e-6
+                ):
+                    raise ValueError("预测需求距离超出地图对角线归一化范围")
+                normalized_distance = min(normalized_distance, 1.0)
+            before_distances.append(float(normalized_distance))
+
+        added_rows = np.maximum(
+            after_cache - before_cache[None, :, :], 0
+        ).astype(np.float32)
+        removed_rows = np.maximum(
+            before_cache[None, :, :] - after_cache, 0
+        ).astype(np.float32)
+        cache_nodes = dict(slot_input.model.cache_nodes)
+        normalization = cache_nodes.get("cache_cost_normalization")
+        if not isinstance(normalization, dict):
+            raise RuntimeError("Cache 成本归一化参考量必须在环境初始化时固定。")
+        cache_backhaul_rates = np.asarray(
+            cache_nodes["cache_backhaul_rate_bps"], dtype=np.float64
+        )
+        cache_cost_references = np.asarray(
+            normalization["reference_s_by_node"], dtype=np.float64
+        )
+        if (
+            cache_backhaul_rates.shape != (len(self.source_node_ids),)
+            or cache_cost_references.shape != (len(self.source_node_ids),)
+            or not np.isfinite(cache_backhaul_rates).all()
+            or not np.isfinite(cache_cost_references).all()
+            or np.any(cache_backhaul_rates <= 0.0)
+            or np.any(cache_cost_references <= 0.0)
+        ):
+            raise ValueError("Cache 成本速率或归一化参考量无效")
+        cache_sizes = np.asarray(self.service_sizes_mb, dtype=np.float64)
+        complementarity_features = self._encode_cache_complementarity_candidates(
+            before_cache, after_cache, complementarity
+        )
+        candidate_count = len(actions)
+        feature_matrix = np.empty(
+            (candidate_count, self.candidate_dim), dtype=np.float32
+        )
+        cursor = 0
+        feature_matrix[:, cursor : cursor + 5] = np.asarray(
+            [0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32
+        )
+        cursor += 5
+        cache_width = len(self.node_ids) * len(self.service_ids)
+        feature_matrix[:, cursor : cursor + cache_width] = after_cache.astype(
+            np.float32
+        ).reshape(candidate_count, cache_width)
+        cursor += cache_width
+        node_width = len(self.node_ids)
+        feature_matrix[:, cursor : cursor + node_width] = changed_node_mask.astype(
+            np.float32
+        )
+        cursor += node_width
+        feature_matrix[:, cursor : cursor + cache_width] = removed_rows.reshape(
+            candidate_count, cache_width
+        )
+        cursor += cache_width
+        feature_matrix[:, cursor : cursor + cache_width] = added_rows.reshape(
+            candidate_count, cache_width
+        )
+        cursor += cache_width
+        added_fraction_column = cursor
+        cache_cost_column = cursor + 1
+        cursor += 3
+        position_row = np.asarray(
+            [value for position in before_position_features for value in position],
+            dtype=np.float32,
+        )
+        uav_position_width = len(self.uav_ids) * 2
+        feature_matrix[:, cursor : cursor + uav_position_width] = position_row
+        cursor += uav_position_width
+        feature_matrix[:, cursor : cursor + uav_position_width] = position_row
+        cursor += uav_position_width
+        feature_matrix[:, cursor : cursor + (2 * len(self.uav_ids) + 1)] = 0.0
+        cursor += 2 * len(self.uav_ids) + 1
+        before_distance_row = np.asarray(before_distances, dtype=np.float32)
+        feature_matrix[:, cursor : cursor + len(self.uav_ids)] = before_distance_row
+        cursor += len(self.uav_ids)
+        feature_matrix[:, cursor : cursor + len(self.uav_ids)] = before_distance_row
+        cursor += len(self.uav_ids)
+        complementarity_width = 7 * len(self.service_ids) + 4
+        feature_matrix[:, cursor : cursor + complementarity_width] = (
+            complementarity_features
+        )
+        cursor += complementarity_width
+        if cursor != self.candidate_dim:
+            raise RuntimeError("批量候选特征布局与合同维度不一致")
+        for row_index, (after_source_row, added) in enumerate(
+            zip(after_source, added_rows, strict=True)
+        ):
+            added_mb = float(added.sum(axis=0) @ self.service_sizes_mb)
+            additions_source = np.maximum(
+                after_source_row - before_source, 0
+            )
+            loaded_mb = additions_source @ cache_sizes
+            loaded_bits = loaded_mb * 8.0e6
+            download_delay_s = loaded_bits / cache_backhaul_rates
+            normalized_delay = download_delay_s / cache_cost_references
+            if (
+                not np.isfinite(normalized_delay).all()
+                or np.any(normalized_delay < 0.0)
+            ):
+                raise FloatingPointError("normalized cache cost is not finite")
+            cache_cost = float(np.sum(normalized_delay))
+            feature_matrix[row_index, added_fraction_column] = (
+                added_mb / self.total_service_size_mb
+            )
+            feature_matrix[row_index, cache_cost_column] = cache_cost
+            feature_matrix[row_index, cache_cost_column + 1] = cache_cost
+        if not np.all(np.isfinite(feature_matrix)):
+            raise ValueError("批量候选动作特征维度或数值无效")
+        return feature_matrix
 
     def prepare_cache_complementarity_context(
         self,
@@ -918,6 +1405,7 @@ class CandidateFeatureEncoder:
         previous_uav_positions: Mapping[str, Any],
         slot_input: SlotInput,
         decision_forecast: DecisionForecast,
+        prepare_unchanged_cache_cost: bool = True,
     ) -> _CacheComplementarityContext:
         """预先计算共享预测统计，避免对每个缓存候选重复做几何归约。"""
 
@@ -950,6 +1438,10 @@ class CandidateFeatureEncoder:
         if set(scenario_task_vehicle_ids) != set(self.task_vehicle_ids):
             raise ValueError("缓存互补性预测任务车辆身份与正式 ObservationSpec 不一致")
 
+        cached_serviceability = self.cached_candidate_generation_serviceability_weights(
+            slot_input.scenario_slice, mask
+        )
+
         demand = cache_configuration.predicted_vehicle_service_demand_by_horizon(
             scenario,
             len(self.service_ids),
@@ -978,12 +1470,33 @@ class CandidateFeatureEncoder:
 
         node_weights: list[np.ndarray] = []
         for node_index in range(len(self.node_ids)):
-            weights = cache_configuration._node_predicted_serviceability_weights(
-                scenario,
-                node_index,
-                feature_cache_nodes,
-                self.cache_config,
-            )
+            cache_static_geometry = cached_serviceability is not None
+            if (
+                cache_static_geometry
+                and str(feature_cache_nodes["node_roles"][node_index]).upper()
+                == "UAV"
+            ):
+                node_id = self.node_ids[node_index]
+                cache_static_geometry = np.array_equal(
+                    np.asarray(
+                        self.cache_nodes["fixed_positions"][node_id],
+                        dtype=np.float64,
+                    ),
+                    np.asarray(
+                        feature_cache_nodes["fixed_positions"][node_id],
+                        dtype=np.float64,
+                    ),
+                )
+            if cache_static_geometry:
+                assert cached_serviceability is not None
+                weights = cached_serviceability[node_index]
+            else:
+                weights = cache_configuration._node_predicted_serviceability_weights(
+                    scenario,
+                    node_index,
+                    feature_cache_nodes,
+                    self.cache_config,
+                )
             if weights.shape != (self.horizon_count, len(self.vehicle_ids)):
                 raise ValueError("缓存互补性节点服务性权重维度非法")
             # 无效时域即使含占位坐标也不参与任何需求统计。
@@ -1026,21 +1539,51 @@ class CandidateFeatureEncoder:
         cache_state_source = np.asarray(previous_cache_state, dtype=np.int8)
         if cache_state_source.shape != (len(self.source_node_ids), len(self.service_ids)):
             raise ValueError("缓存互补性输入缓存矩阵维度错误")
+        previous_cache_state_source = cache_state_source.copy()
+        previous_cache_state_source.setflags(write=False)
+        unchanged_cache_cost: float | None = None
+        unchanged_cache_download_delay_normalized: float | None = None
+        if prepare_unchanged_cache_cost:
+            unchanged_details = cache_configuration.cache_update_cost_details(
+                cache_state_source,
+                cache_state_source,
+                np.zeros(len(self.source_node_ids), dtype=np.int8),
+                self.service_sizes_mb,
+                dict(slot_input.model.cache_nodes),
+                slot_input.model.cache_config,
+            )
+            unchanged_cache_cost = float(unchanged_details["cache_cost"])
+            unchanged_cache_download_delay_normalized = float(
+                unchanged_details["cache_download_delay_normalized"]
+            )
         cache_state = cache_state_source[list(self.cache_node_reorder_indices)].copy()
         total_predicted_demand = float(np.sum(demand))
         coverage_available = total_predicted_demand > 1.0e-12
         cache_coverage_before: float | None = None
+        node_coverage = (
+            node_weights_array[:, :, :, None]
+            * cache_state[:, None, None, :]
+        )
+        coverage = np.zeros_like(demand)
+        for node_index in range(len(self.node_ids)):
+            coverage = np.maximum(coverage, node_coverage[node_index])
         if coverage_available:
-            coverage = np.zeros_like(demand, dtype=np.float64)
-            for node_index in range(len(self.node_ids)):
-                coverage = np.maximum(
-                    coverage,
-                    node_weights_array[node_index, :, :, None]
-                    * cache_state[node_index][None, None, :],
-                )
             cache_coverage_before = float(
-                np.sum(demand * np.clip(coverage, 0.0, 1.0)) / total_predicted_demand
+                np.sum(demand * np.clip(coverage, 0.0, 1.0))
+                / total_predicted_demand
             )
+        cache_coverage_top_values, cache_coverage_top_node_indices = (
+            self._top_node_coverage(node_coverage, tuple(range(len(self.node_ids))))
+        )
+        fixed_cache_coverage = np.zeros_like(demand)
+        for node_index in fixed_indices:
+            fixed_cache_coverage = np.maximum(
+                fixed_cache_coverage, node_coverage[node_index]
+            )
+        (
+            fixed_cache_coverage_top_values,
+            fixed_cache_coverage_top_node_indices,
+        ) = self._top_node_coverage(node_coverage, fixed_indices)
         task_predicted_positions = tuple(
             np.asarray(
                 decision_forecast.predicted_vehicle_positions_horizon[horizon][vehicle_id],
@@ -1073,7 +1616,18 @@ class CandidateFeatureEncoder:
             uav_mean_distance_normalized[uav_id] = min(normalized_distance, 1.0)
         task_vehicle_count = max(1, len(self.task_vehicle_ids))
         demand_normalizer = float(max(1, self.horizon_count * task_vehicle_count))
-        for array in (demand, node_weights_array, uav_local_demand, popularity):
+        for array in (
+            demand,
+            node_weights_array,
+            uav_local_demand,
+            popularity,
+            coverage,
+            cache_coverage_top_values,
+            cache_coverage_top_node_indices,
+            fixed_cache_coverage,
+            fixed_cache_coverage_top_values,
+            fixed_cache_coverage_top_node_indices,
+        ):
             array.setflags(write=False)
         for array in task_predicted_positions:
             array.setflags(write=False)
@@ -1087,11 +1641,60 @@ class CandidateFeatureEncoder:
             demand_normalizer=demand_normalizer,
             cache_coverage_before=cache_coverage_before,
             cache_coverage_available=coverage_available,
+            cache_coverage_before_by_horizon=coverage,
+            cache_coverage_top_values=cache_coverage_top_values,
+            cache_coverage_top_node_indices=cache_coverage_top_node_indices,
+            fixed_cache_coverage_before=fixed_cache_coverage,
+            fixed_cache_coverage_top_values=fixed_cache_coverage_top_values,
+            fixed_cache_coverage_top_node_indices=fixed_cache_coverage_top_node_indices,
             prediction_forecast=decision_forecast,
             task_vehicle_predicted_positions=task_predicted_positions,
             current_uav_positions=uav_position_tuples,
             current_uav_mean_task_distance_normalized=uav_mean_distance_normalized,
+            previous_cache_state_source=previous_cache_state_source,
+            unchanged_cache_cost=unchanged_cache_cost,
+            unchanged_cache_download_delay_normalized=(
+                unchanged_cache_download_delay_normalized
+            ),
         )
+
+    @staticmethod
+    def _top_node_coverage(
+        node_coverage: np.ndarray, node_indices: Sequence[int]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Keep the three strongest node contributions for exact small exclusions."""
+
+        indices = np.asarray(node_indices, dtype=np.intp)
+        contributions = node_coverage[indices]
+        top_count = min(3, len(indices))
+        top_local_indices = np.argpartition(
+            contributions, kth=len(indices) - top_count, axis=0
+        )[-top_count:]
+        top_values = np.take_along_axis(
+            contributions, top_local_indices, axis=0
+        )
+        top_node_indices = indices[top_local_indices]
+        return top_values, top_node_indices
+
+    @staticmethod
+    def _coverage_without_changed_nodes(
+        top_values: np.ndarray,
+        top_node_indices: np.ndarray,
+        changed_node_indices: Sequence[int],
+        *,
+        total_node_count: int,
+    ) -> np.ndarray | None:
+        """Return exact max coverage after excluding at most two old node rows."""
+
+        if len(changed_node_indices) > 2 or (
+            len(changed_node_indices) == top_values.shape[0]
+            and top_values.shape[0] < total_node_count
+        ):
+            return None
+        eligible = np.ones(top_node_indices.shape, dtype=bool)
+        for node_index in changed_node_indices:
+            eligible &= top_node_indices != int(node_index)
+        return np.max(np.where(eligible, top_values, 0.0), axis=0)
 
     def _encode_cache_complementarity_candidate(
         self,
@@ -1109,6 +1712,9 @@ class CandidateFeatureEncoder:
         """
 
         service_count = len(self.service_ids)
+        changed_node_indices = np.flatnonzero(
+            np.any(after_cache != before_cache, axis=1)
+        )
         added = np.maximum(after_cache - before_cache, 0).astype(np.float64)
         removed = np.maximum(before_cache - after_cache, 0).astype(np.float64)
         uav_added_demand = np.zeros(service_count, dtype=np.float64)
@@ -1134,12 +1740,42 @@ class CandidateFeatureEncoder:
 
         fixed_coverage = np.zeros_like(context.predicted_demand_by_horizon)
         if np.any(changed_uav_services > 0.0):
-            for node_index in context.fixed_node_indices:
-                fixed_coverage = np.maximum(
-                    fixed_coverage,
-                    context.node_serviceability_by_horizon[node_index, :, :, None]
-                    * after_cache[node_index][None, None, :],
+            changed_fixed_indices = tuple(
+                int(index)
+                for index in changed_node_indices
+                if int(index) in context.fixed_node_indices
+            )
+            if not changed_fixed_indices:
+                fixed_coverage = context.fixed_cache_coverage_before
+            else:
+                base_fixed_coverage = self._coverage_without_changed_nodes(
+                    context.fixed_cache_coverage_top_values,
+                    context.fixed_cache_coverage_top_node_indices,
+                    changed_fixed_indices,
+                    total_node_count=len(context.fixed_node_indices),
                 )
+                if base_fixed_coverage is None:
+                    for node_index in context.fixed_node_indices:
+                        fixed_coverage = np.maximum(
+                            fixed_coverage,
+                            context.node_serviceability_by_horizon[
+                                node_index, :, :, None
+                            ]
+                            * after_cache[node_index][None, None, :],
+                        )
+                else:
+                    fixed_coverage = np.zeros_like(
+                        context.predicted_demand_by_horizon
+                    )
+                    fixed_coverage[...] = base_fixed_coverage
+                    for node_index in changed_fixed_indices:
+                        fixed_coverage = np.maximum(
+                            fixed_coverage,
+                            context.node_serviceability_by_horizon[
+                                node_index, :, :, None
+                            ]
+                            * after_cache[node_index][None, None, :],
+                        )
             for node_index in context.uav_node_indices:
                 added_services = added[node_index]
                 if not np.any(added_services):
@@ -1170,20 +1806,45 @@ class CandidateFeatureEncoder:
         coverage_before = context.cache_coverage_before
         coverage_after: float | None = None
         if context.cache_coverage_available:
-            coverage = np.zeros_like(context.predicted_demand_by_horizon)
-            for node_index in range(len(self.node_ids)):
-                coverage = np.maximum(
-                    coverage,
-                    context.node_serviceability_by_horizon[node_index, :, :, None]
-                    * after_cache[node_index][None, None, :],
+            if not changed_node_indices.size:
+                coverage_after = coverage_before
+            else:
+                base_coverage = self._coverage_without_changed_nodes(
+                    context.cache_coverage_top_values,
+                    context.cache_coverage_top_node_indices,
+                    changed_node_indices,
+                    total_node_count=len(self.node_ids),
                 )
-            coverage_after = float(
-                np.sum(
-                    context.predicted_demand_by_horizon
-                    * np.clip(coverage, 0.0, 1.0)
+                if base_coverage is None:
+                    coverage = np.zeros_like(context.predicted_demand_by_horizon)
+                    for node_index in range(len(self.node_ids)):
+                        coverage = np.maximum(
+                            coverage,
+                            context.node_serviceability_by_horizon[
+                                node_index, :, :, None
+                            ]
+                            * after_cache[node_index][None, None, :],
+                        )
+                else:
+                    coverage = np.zeros_like(
+                        context.predicted_demand_by_horizon
+                    )
+                    coverage[...] = base_coverage
+                    for node_index in changed_node_indices:
+                        coverage = np.maximum(
+                            coverage,
+                            context.node_serviceability_by_horizon[
+                                node_index, :, :, None
+                            ]
+                            * after_cache[node_index][None, None, :],
+                        )
+                coverage_after = float(
+                    np.sum(
+                        context.predicted_demand_by_horizon
+                        * np.clip(coverage, 0.0, 1.0)
+                    )
+                    / total_demand
                 )
-                / total_demand
-            )
         coverage_available = float(context.cache_coverage_available)
         coverage_before_value = float(coverage_before) if coverage_before is not None else 0.0
         coverage_after_value = float(coverage_after) if coverage_after is not None else 0.0
@@ -1215,6 +1876,286 @@ class CandidateFeatureEncoder:
         if values.shape != (7 * service_count + 4,) or not np.isfinite(values).all():
             raise ValueError("缓存互补性候选特征维度或数值非法")
         return values.astype(np.float32).tolist()
+
+    def _encode_cache_complementarity_candidates(
+        self,
+        before_cache: np.ndarray,
+        after_cache: np.ndarray,
+        context: _CacheComplementarityContext,
+        *,
+        chunk_size: int = 512,
+    ) -> np.ndarray:
+        """Encode cache complementarity in bounded candidate batches.
+
+        The candidate axis is vectorized while horizon, vehicle, node, and
+        service reductions retain the scalar encoder's axes and ordering.
+        """
+
+        before = np.asarray(before_cache, dtype=np.int8)
+        after = np.asarray(after_cache, dtype=np.int8)
+        if (
+            before.ndim != 2
+            or after.ndim != 3
+            or after.shape[1:] != before.shape
+            or before.shape != (len(self.node_ids), len(self.service_ids))
+        ):
+            raise ValueError("批量互补性缓存矩阵形状无效")
+        if int(chunk_size) <= 0:
+            raise ValueError("互补性候选 chunk_size 必须为正数")
+        if not len(after):
+            return np.empty((0, 7 * len(self.service_ids) + 4), dtype=np.float32)
+
+        chunks: list[np.ndarray] = []
+        for start in range(0, len(after), int(chunk_size)):
+            chunks.append(
+                self._encode_cache_complementarity_candidate_chunk(
+                    before, after[start : start + int(chunk_size)], context
+                )
+            )
+        return np.concatenate(chunks, axis=0)
+
+    def _encode_cache_complementarity_candidate_chunk(
+        self,
+        before_cache: np.ndarray,
+        after_cache: np.ndarray,
+        context: _CacheComplementarityContext,
+    ) -> np.ndarray:
+        """Vectorized implementation of the scalar cache complementarity rule."""
+
+        candidate_count = len(after_cache)
+        service_count = len(self.service_ids)
+        node_count = len(self.node_ids)
+        delta = after_cache - before_cache[None, :, :]
+        changed_node_mask = np.any(delta != 0, axis=2)
+        changed_node_counts = np.count_nonzero(changed_node_mask, axis=1)
+        added = np.maximum(delta, 0).astype(np.float64)
+        removed = np.maximum(-delta, 0).astype(np.float64)
+        replicas_before = np.sum(before_cache, axis=0, dtype=np.float64)
+        uav_added_demand = np.zeros((candidate_count, service_count), dtype=np.float64)
+        uav_removed_demand = np.zeros_like(uav_added_demand)
+        fixed_available_added_demand = np.zeros_like(uav_added_demand)
+        uav_replica_before = np.zeros_like(uav_added_demand)
+        changed_uav_services = np.zeros_like(uav_added_demand)
+        replica_normalizer = float(max(1, node_count))
+
+        for uav_index, node_index in enumerate(context.uav_node_indices):
+            uav_added = added[:, node_index]
+            uav_removed = removed[:, node_index]
+            changed_uav_services = np.maximum(
+                changed_uav_services, np.maximum(uav_added, uav_removed)
+            )
+            local_by_service = context.uav_local_demand_by_service[uav_index]
+            uav_added_demand += local_by_service[None, :] * uav_added
+            uav_removed_demand += local_by_service[None, :] * uav_removed
+            uav_replica_before += (
+                replicas_before[None, :]
+                * np.maximum(uav_added, uav_removed)
+                / replica_normalizer
+            )
+
+        uav_changed_rows = np.any(changed_uav_services > 0.0, axis=1)
+        fixed_coverage = np.zeros(
+            (candidate_count, *context.predicted_demand_by_horizon.shape),
+            dtype=np.float64,
+        )
+        fixed_node_indices = tuple(int(index) for index in context.fixed_node_indices)
+        fixed_count = len(fixed_node_indices)
+        if fixed_count and np.any(uav_changed_rows):
+            changed_fixed_counts = np.count_nonzero(
+                changed_node_mask[:, fixed_node_indices], axis=1
+            )
+            unchanged_fixed_rows = uav_changed_rows & (changed_fixed_counts == 0)
+            fixed_coverage[unchanged_fixed_rows] = (
+                context.fixed_cache_coverage_before
+            )
+
+            top_values = context.fixed_cache_coverage_top_values
+            top_node_indices = context.fixed_cache_coverage_top_node_indices
+            top_count = top_values.shape[0]
+            fallback_fixed_rows = uav_changed_rows & (
+                (changed_fixed_counts > 2)
+                | (
+                    (changed_fixed_counts == top_count)
+                    & (top_count < fixed_count)
+                )
+            )
+            regular_fixed_rows = uav_changed_rows & (changed_fixed_counts > 0) & (
+                ~fallback_fixed_rows
+            )
+            if np.any(regular_fixed_rows):
+                eligible = np.ones(
+                    (candidate_count, *top_node_indices.shape), dtype=bool
+                )
+                for node_index in fixed_node_indices:
+                    eligible &= ~(
+                        changed_node_mask[:, node_index, None, None, None, None]
+                        & (top_node_indices[None, ...] == node_index)
+                    )
+                base_fixed_coverage = np.max(
+                    np.where(
+                        eligible,
+                        top_values[None, ...],
+                        0.0,
+                    ),
+                    axis=1,
+                )
+                fixed_coverage[regular_fixed_rows] = base_fixed_coverage[
+                    regular_fixed_rows
+                ]
+                for node_index in fixed_node_indices:
+                    rows = regular_fixed_rows & changed_node_mask[:, node_index]
+                    if not np.any(rows):
+                        continue
+                    changed_node_coverage = (
+                        context.node_serviceability_by_horizon[
+                            node_index, :, :, None
+                        ]
+                        * after_cache[rows, node_index, None, None, :]
+                    )
+                    fixed_coverage[rows] = np.maximum(
+                        fixed_coverage[rows], changed_node_coverage
+                    )
+
+            if np.any(fallback_fixed_rows):
+                fixed_coverage[fallback_fixed_rows] = 0.0
+                for node_index in fixed_node_indices:
+                    node_coverage = (
+                        context.node_serviceability_by_horizon[
+                            node_index, :, :, None
+                        ]
+                        * after_cache[
+                            fallback_fixed_rows, node_index, None, None, :
+                        ]
+                    )
+                    fixed_coverage[fallback_fixed_rows] = np.maximum(
+                        fixed_coverage[fallback_fixed_rows], node_coverage
+                    )
+
+            for uav_index, node_index in enumerate(context.uav_node_indices):
+                added_services = added[:, node_index]
+                if not np.any(added_services):
+                    continue
+                uav_weights = context.node_serviceability_by_horizon[node_index]
+                local_weights = (
+                    uav_weights[:, :, None]
+                    * context.predicted_demand_by_horizon
+                )
+                fixed_available_by_service = np.sum(
+                    local_weights[None, ...]
+                    * np.clip(fixed_coverage, 0.0, 1.0),
+                    axis=(1, 2),
+                )
+                fixed_available_added_demand += (
+                    fixed_available_by_service * added_services
+                )
+
+        uav_unavailable_added_demand = np.maximum(
+            uav_added_demand - fixed_available_added_demand, 0.0
+        )
+        cache_delta_by_service = np.sum(delta, axis=1, dtype=np.float64)
+        replica_normalizer = float(max(1, node_count))
+        popularity_delta = (
+            cache_delta_by_service * context.popularity_by_service[None, :]
+            / replica_normalizer
+        )
+        replica_delta = cache_delta_by_service / replica_normalizer
+
+        coverage_before_value = float(
+            context.cache_coverage_before
+            if context.cache_coverage_before is not None
+            else 0.0
+        )
+        coverage_after = np.zeros(candidate_count, dtype=np.float64)
+        coverage_delta = np.zeros(candidate_count, dtype=np.float64)
+        if context.cache_coverage_available:
+            unchanged_rows = changed_node_counts == 0
+            coverage_after[unchanged_rows] = coverage_before_value
+            total_demand = float(np.sum(context.predicted_demand_by_horizon))
+            for candidate_index in np.flatnonzero(~unchanged_rows):
+                changed_nodes = np.flatnonzero(
+                    changed_node_mask[candidate_index]
+                )
+                base_coverage = self._coverage_without_changed_nodes(
+                    context.cache_coverage_top_values,
+                    context.cache_coverage_top_node_indices,
+                    changed_nodes,
+                    total_node_count=node_count,
+                )
+                if base_coverage is None:
+                    candidate_coverage = np.zeros_like(
+                        context.predicted_demand_by_horizon
+                    )
+                    for node_index in range(node_count):
+                        candidate_coverage = np.maximum(
+                            candidate_coverage,
+                            context.node_serviceability_by_horizon[
+                                node_index, :, :, None
+                            ]
+                            * after_cache[
+                                candidate_index, node_index
+                            ][None, None, :],
+                        )
+                else:
+                    candidate_coverage = np.zeros_like(
+                        context.predicted_demand_by_horizon
+                    )
+                    candidate_coverage[...] = base_coverage
+                    for raw_node_index in changed_nodes:
+                        node_index = int(raw_node_index)
+                        candidate_coverage = np.maximum(
+                            candidate_coverage,
+                            context.node_serviceability_by_horizon[
+                                node_index, :, :, None
+                            ]
+                            * after_cache[
+                                candidate_index, node_index
+                            ][None, None, :],
+                        )
+                if np.array_equal(
+                    candidate_coverage,
+                    context.cache_coverage_before_by_horizon,
+                ):
+                    coverage_after[candidate_index] = coverage_before_value
+                else:
+                    # Preserve the scalar encoder's exact reduction order for
+                    # the coverage delta while vectorizing the service vectors.
+                    coverage_after[candidate_index] = float(
+                        np.sum(
+                            context.predicted_demand_by_horizon
+                            * np.clip(candidate_coverage, 0.0, 1.0)
+                        )
+                        / total_demand
+                    )
+            coverage_delta = coverage_after - coverage_before_value
+
+        coverage_available = float(context.cache_coverage_available)
+        coverage_features = np.column_stack(
+            (
+                np.full(candidate_count, coverage_available, dtype=np.float64),
+                np.full(
+                    candidate_count, coverage_before_value, dtype=np.float64
+                ),
+                coverage_after,
+                coverage_delta,
+            )
+        )
+        values = np.concatenate(
+            (
+                uav_added_demand / context.demand_normalizer,
+                fixed_available_added_demand / context.demand_normalizer,
+                uav_unavailable_added_demand / context.demand_normalizer,
+                uav_removed_demand / context.demand_normalizer,
+                popularity_delta,
+                uav_replica_before,
+                replica_delta,
+                coverage_features,
+            ),
+            axis=1,
+        )
+        expected_shape = (candidate_count, 7 * service_count + 4)
+        if values.shape != expected_shape or not np.isfinite(values).all():
+            raise ValueError("批量缓存互补性候选特征维度或数值非法")
+        return values.astype(np.float32)
 
     def _normalize_xy(self, position: Any) -> list[float]:
         x, y = np.asarray(position, dtype=np.float64).reshape(2)

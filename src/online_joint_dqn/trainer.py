@@ -485,6 +485,9 @@ def train_episode(
             if isinstance(matching_summary, Mapping)
             else {}
         )
+        kkt_resource_residual_sample_count = int(
+            matching_summary.get("KKT_RESOURCE_RESIDUAL_SAMPLE_COUNT", 0)
+        )
         per_task_slot_execution = transition.diagnostics.get(
             "per_task_slot_execution", {}
         )
@@ -856,6 +859,18 @@ def train_episode(
                     ),
                     "kkt_resource_residual_max": matching_summary.get(
                         "KKT_RESOURCE_RESIDUAL_MAX"
+                    ),
+                    "kkt_resource_residual_sample_count": (
+                        kkt_resource_residual_sample_count
+                    ),
+                    "kkt_resource_residual_available": (
+                        kkt_resource_residual_sample_count > 0
+                    ),
+                    "kkt_solve_count": int(
+                        matching_summary.get("KKT_SOLVE_COUNT", 0)
+                    ),
+                    "kkt_finite_solve_count": int(
+                        matching_summary.get("KKT_FINITE_COUNT", 0)
                     ),
                 },
                 "per_task_delay_s": transition.diagnostics.get(

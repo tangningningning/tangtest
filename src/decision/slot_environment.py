@@ -348,6 +348,15 @@ def _matching_summary(
         "KKT_CONVERGED_COUNT": result.kkt_converged_count,
         "KKT_MAX_ITER_HIT_COUNT": result.kkt_max_iterations_hit_count,
         "KKT_FINITE_COUNT": result.kkt_finite_count,
+        "KKT_RESOURCE_RESIDUAL_SAMPLE_COUNT": (
+            result.kkt_resource_residual_sample_count
+        ),
+        "KKT_STATIONARITY_RESIDUAL_SAMPLE_COUNT": (
+            result.kkt_stationarity_residual_sample_count
+        ),
+        "KKT_COMPLEMENTARY_SLACKNESS_RESIDUAL_SAMPLE_COUNT": (
+            result.kkt_complementary_slackness_residual_sample_count
+        ),
         "KKT_ITERATION_MEAN": result.kkt_iteration_mean,
         "KKT_ITERATION_P95": result.kkt_iteration_p95,
         "KKT_ITERATION_MAX": result.kkt_iteration_max,
