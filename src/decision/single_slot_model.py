@@ -123,7 +123,12 @@ class UtilityParameters:
             raise ValueError("omega_time must be in (0, 1]")
         if not (0.0 <= omega_energy < 1.0):
             raise ValueError("omega_energy must be in [0, 1)")
-        if omega_time + omega_energy != 1.0:
+        if not math.isclose(
+            omega_time + omega_energy,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
             raise ValueError("v3.3.5 requires omega_time + omega_energy == 1")
         if penalty <= 0.0:
             raise ValueError("failure_penalty must be positive")
@@ -189,34 +194,69 @@ class TaskExecutionResult:
 
 @dataclass(frozen=True)
 class JointResourceAllocationResult:
+    """One fixed subset's analytic status, checked primal point, and value.
+
+    The numerical flag means an L.8 certificate, not solver convergence. In this
+    implementation only the trivial empty subset has such an exact certificate.
+    """
+
     node_id: str
     task_ids: tuple[str, ...]
     bandwidth_fractions: tuple[tuple[str, float], ...]
     cpu_fractions: tuple[tuple[str, float], ...]
-    feasibility: bool | None
-    objective_cost_upper_bound: float | None
+    analytical_optimum_known: bool
+    primal_feasible: bool
+    numerical_optimality_certified: bool
+    primal_objective_value: float | None
+    certified_objective_upper_bound: float | None
     solver_status: str
     solver_call_count: int
-    optimality_certified: bool
 
 
 @dataclass(frozen=True)
 class P1RNodeSummary:
+    """Edge-node incumbent status and disjoint subset-search counters.
+
+    The node incumbent is primal feasible because the all-DROP subset is always
+    available. ``primal_feasible_subset_count`` counts checked feasible subsets,
+    including the empty subset; value certification counts only multi-task sets.
+    Numerical certification is stricter than analytic structure and remains
+    false for every non-empty node group under ordinary floating-point checks.
+    """
+
     node_id: str
     task_count: int
     accepted_task_ids: tuple[str, ...]
     enumerated_subset_count: int
-    unresolved_subset_count: int
+    unprocessed_subset_count: int
+    feasibility_unresolved_subset_count: int
+    primal_feasible_subset_count: int
+    value_uncertified_subset_count: int
     continuous_solver_call_count: int
     solver_status_counts: tuple[tuple[str, int], ...]
     all_subsets_enumerated: bool
-    optimality_certified: bool
+    analytical_optimum_known: bool
+    primal_feasible: bool
+    numerical_optimality_certified: bool
 
 
 @dataclass(frozen=True)
 class P1RSummary:
+    """Aggregate Edge subset counts and statuses for one fixed matching.
+
+    Cloud's direct fixed-resource comparison is analytically determined but is
+    not an L.8 numerical certificate. A non-empty task set therefore cannot set
+    ``numerical_optimality_certified`` in the current implementation.
+    """
+
     nodes: tuple[P1RNodeSummary, ...]
-    optimality_certified: bool
+    unprocessed_subset_count: int
+    feasibility_unresolved_subset_count: int
+    primal_feasible_subset_count: int
+    value_uncertified_subset_count: int
+    analytical_optimum_known: bool
+    primal_feasible: bool
+    numerical_optimality_certified: bool
     note: str
 
 
@@ -503,7 +543,7 @@ def _edge_subset_candidate(
     tasks: tuple[TaskDemand, ...],
     options: P1RSolverOptions,
 ) -> tuple[dict[str, tuple[float, float]] | None, str, bool, int]:
-    """Solve one fixed accepted subset; return a primal-feasible witness if found."""
+    """Solve one fixed subset and report whether its optimum is analytic."""
 
     if len(tasks) == 1:
         task = tasks[0]
@@ -520,7 +560,10 @@ def _edge_subset_candidate(
             else math.inf
         )
         if solo_delay <= SLOT_DURATION_S:
-            return {task.task_id: (1.0, 1.0)}, "singleton_closed_form", True, 0
+            point = {task.task_id: (1.0, 1.0)}
+            if _edge_point_is_feasible(request, node, tasks, point):
+                return point, "singleton_closed_form", True, 0
+            return None, "singleton_primal_check_failed", True, 0
         return None, "singleton_infeasible", True, 0
 
     try:
@@ -663,11 +706,11 @@ def allocate_joint_edge_resources(
     accepted_task_ids: Sequence[str],
     options: P1RSolverOptions = P1RSolverOptions(),
 ) -> JointResourceAllocationResult:
-    """Jointly allocate one Edge node's bandwidth and CPU for a fixed subset.
+    """Jointly allocate bandwidth and CPU for one fixed Edge subset.
 
-    ``feasibility=None`` means the numerical solver did not produce a verified
-    primal witness and did not provide a certified infeasibility result.
-    ``objective_cost_upper_bound`` is present only for a primal-feasible point.
+    A false ``primal_feasible`` means no checked point was produced; it does not
+    certify infeasibility. ``primal_objective_value`` is the value at a checked
+    point, while ``certified_objective_upper_bound`` is reserved for L.8 proof.
     """
 
     matching = validate_nominal_matching(request)
@@ -700,14 +743,16 @@ def allocate_joint_edge_resources(
             task_ids=(),
             bandwidth_fractions=(),
             cpu_fractions=(),
-            feasibility=True,
-            objective_cost_upper_bound=0.0,
+            analytical_optimum_known=True,
+            primal_feasible=True,
+            numerical_optimality_certified=True,
+            primal_objective_value=0.0,
+            certified_objective_upper_bound=0.0,
             solver_status="empty_subset",
             solver_call_count=0,
-            optimality_certified=True,
         )
 
-    point, status, exact, calls = _edge_subset_candidate(
+    point, status, analytical_optimum_known, calls = _edge_subset_candidate(
         request, node_by_id[node_id], tasks, options
     )
     if point is None:
@@ -716,11 +761,13 @@ def allocate_joint_edge_resources(
             task_ids=tuple(task.task_id for task in tasks),
             bandwidth_fractions=(),
             cpu_fractions=(),
-            feasibility=False if exact else None,
-            objective_cost_upper_bound=None,
+            analytical_optimum_known=analytical_optimum_known,
+            primal_feasible=False,
+            numerical_optimality_certified=False,
+            primal_objective_value=None,
+            certified_objective_upper_bound=None,
             solver_status=status,
             solver_call_count=calls,
-            optimality_certified=exact,
         )
 
     cost = 0.0
@@ -746,11 +793,13 @@ def allocate_joint_edge_resources(
         task_ids=tuple(task.task_id for task in tasks),
         bandwidth_fractions=tuple(bandwidth_items),
         cpu_fractions=tuple(cpu_items),
-        feasibility=True,
-        objective_cost_upper_bound=cost,
+        analytical_optimum_known=analytical_optimum_known,
+        primal_feasible=True,
+        numerical_optimality_certified=False,
+        primal_objective_value=cost,
+        certified_objective_upper_bound=None,
         solver_status=status,
         solver_call_count=calls,
-        optimality_certified=exact,
     )
 
 
@@ -769,7 +818,10 @@ def _solve_edge_group(
     best_value = -request.utility.failure_penalty * len(ordered)
     best_point: dict[str, tuple[float, float]] = {}
     best_ids: tuple[str, ...] = ()
-    unresolved = subset_total - enumerate_count
+    unprocessed_subset_count = subset_total - enumerate_count
+    feasibility_unresolved_subset_count = 0
+    primal_feasible_subset_count = 0
+    value_uncertified_subset_count = 0
     solver_calls = 0
     status_counts: dict[str, int] = {}
 
@@ -780,16 +832,21 @@ def _solve_edge_group(
             if mask & (1 << index)
         )
         if not subset:
+            primal_feasible_subset_count += 1
             continue
-        point, _status, exact, calls = _edge_subset_candidate(
+        point, _status, _analytical_optimum_known, calls = _edge_subset_candidate(
             request, node, subset, options
         )
         solver_calls += calls
         if calls:
             status_counts[_status] = status_counts.get(_status, 0) + 1
         if point is None:
-            if not exact:
-                unresolved += 1
+            if len(subset) > 1:
+                feasibility_unresolved_subset_count += 1
+            continue
+        if not _edge_point_is_feasible(request, node, subset, point):
+            if len(subset) > 1:
+                feasibility_unresolved_subset_count += 1
             continue
 
         candidate_value = 0.0
@@ -805,11 +862,17 @@ def _solve_edge_group(
                 cpu_fraction=point[task.task_id][1],
             )
             if result.status is not TaskStatus.SUCCESS:
-                # The original formulas are authoritative for final admission.
-                unresolved += 1
-                candidate_value = -math.inf
-                break
+                raise RuntimeError(
+                    "joint allocator primal check and task execution formula disagree "
+                    f"for task {task.task_id!r}"
+                )
             candidate_value += result.utility
+
+        primal_feasible_subset_count += 1
+        if len(subset) > 1:
+            # The primal point is checked, but no validated L.8 dual interval
+            # exists for this multi-task subset.
+            value_uncertified_subset_count += 1
 
         # Keeping the first exact tie gives a deterministic subset order; the
         # empty subset is visited first, so ties against all-DROP remain DROP.
@@ -819,19 +882,26 @@ def _solve_edge_group(
             best_ids = tuple(task.task_id for task in subset)
 
     complete = enumerate_count == subset_total
-    # Multi-task conic solves yield numerical witnesses; this implementation
-    # does not claim an L.8 primal/dual interval certificate from solver status.
-    certified = len(ordered) <= 1 and complete and unresolved == 0
+    analytical_optimum_known = len(ordered) <= 1 and complete
+    # A no-task node has only the exactly known empty subset. Any task choice or
+    # non-empty allocation still depends on ordinary floating-point comparisons.
+    numerical_optimality_certified = len(ordered) == 0 and complete
     summary = P1RNodeSummary(
         node_id=node.node_id,
         task_count=len(ordered),
         accepted_task_ids=best_ids,
         enumerated_subset_count=enumerate_count,
-        unresolved_subset_count=unresolved,
+        unprocessed_subset_count=unprocessed_subset_count,
+        feasibility_unresolved_subset_count=feasibility_unresolved_subset_count,
+        primal_feasible_subset_count=primal_feasible_subset_count,
+        value_uncertified_subset_count=value_uncertified_subset_count,
         continuous_solver_call_count=solver_calls,
         solver_status_counts=tuple(sorted(status_counts.items())),
         all_subsets_enumerated=complete,
-        optimality_certified=certified,
+        analytical_optimum_known=analytical_optimum_known,
+        # The returned incumbent is always at least the all-DROP point.
+        primal_feasible=True,
+        numerical_optimality_certified=numerical_optimality_certified,
     )
     return best_point, summary
 
@@ -902,14 +972,39 @@ def solve_p1r(
 
     ordered_results = tuple(results)
     task_utility_sum, _ = compute_system_reward(ordered_results, request.system_costs)
-    overall_certified = all(item.optimality_certified for item in node_summaries)
+    unprocessed_subset_count = sum(
+        item.unprocessed_subset_count for item in node_summaries
+    )
+    feasibility_unresolved_subset_count = sum(
+        item.feasibility_unresolved_subset_count for item in node_summaries
+    )
+    primal_feasible_subset_count = sum(
+        item.primal_feasible_subset_count for item in node_summaries
+    )
+    value_uncertified_subset_count = sum(
+        item.value_uncertified_subset_count for item in node_summaries
+    )
+    analytical_optimum_known = all(
+        item.analytical_optimum_known for item in node_summaries
+    )
+    numerical_optimality_certified = not request.tasks and all(
+        item.numerical_optimality_certified for item in node_summaries
+    )
     summary = P1RSummary(
         nodes=tuple(node_summaries),
-        optimality_certified=overall_certified,
+        unprocessed_subset_count=unprocessed_subset_count,
+        feasibility_unresolved_subset_count=feasibility_unresolved_subset_count,
+        primal_feasible_subset_count=primal_feasible_subset_count,
+        value_uncertified_subset_count=value_uncertified_subset_count,
+        analytical_optimum_known=analytical_optimum_known,
+        # The all-DROP fallback is feasible; validate_execution_result checks it.
+        primal_feasible=True,
+        numerical_optimality_certified=numerical_optimality_certified,
         note=(
-            "Singleton Edge groups and fixed Cloud decisions use closed-form "
-            "evaluation. Multi-task Edge groups use CLARABEL feasible points; "
-            "solver status alone is not an L.8 optimality certificate."
+            "Analytical structure, checked primal feasibility, and numerical "
+            "optimality certification are reported separately. Multi-task "
+            "primal values have no L.8 interval certificate; Cloud decisions "
+            "and non-empty singleton decisions are not numerically certified."
         ),
     )
     result = SingleSlotResult(
@@ -973,10 +1068,31 @@ def validate_execution_result(
         if actual.nominal_node_id != matching[actual.task_id]:
             raise ValueError(f"task {actual.task_id!r} nominal node changed in result")
         if actual.status is TaskStatus.DROPPED:
+            if actual.execution_node_id is not None:
+                raise ValueError("DROPPED task must have no execution node")
+            if actual.bandwidth_fraction is not None or actual.cpu_fraction is not None:
+                raise ValueError("DROPPED task must have no allocated resources")
+            if (
+                actual.rate_bps != 0.0
+                or actual.vehicle_energy_j != 0.0
+                or actual.utility != -request.utility.failure_penalty
+            ):
+                raise ValueError(
+                    "DROPPED task must have zero rate and energy and utility -failure_penalty"
+                )
+            if any(
+                value is not None
+                for value in (
+                    actual.upload_delay_s,
+                    actual.compute_delay_s,
+                    actual.total_delay_s,
+                )
+            ):
+                raise ValueError("DROPPED task must not have execution delays")
             expected = _dropped_result(
                 actual.task_id, matching[actual.task_id], request.utility
             )
-        else:
+        elif actual.status is TaskStatus.SUCCESS:
             if actual.execution_node_id is None:
                 raise ValueError("executed task must have an execution node")
             expected = evaluate_task_execution(
@@ -992,6 +1108,8 @@ def validate_execution_result(
                 )
             if actual.execution_node_id != request.cloud.node_id:
                 allocated_by_node[actual.execution_node_id].append(actual)
+        else:
+            raise ValueError("P1-R result may contain only SUCCESS or DROPPED tasks")
 
         for field_name in (
             "execution_node_id",
@@ -1030,10 +1148,6 @@ def validate_execution_result(
                 f"Edge node {node_id!r} exceeds a resource budget: "
                 f"bandwidth={bandwidth_sum}, cpu={cpu_sum}"
             )
-        if any(item.status is not TaskStatus.SUCCESS for item in allocations):
-            # P1-R only schedules tasks that complete. The standalone evaluator
-            # still exposes D.1 failed execution for explicit formula checks.
-            raise ValueError("P1-R result cannot contain an admitted failed Edge task")
         if node_id not in edge_by_id:
             raise ValueError(f"execution result references unknown Edge node {node_id!r}")
 
